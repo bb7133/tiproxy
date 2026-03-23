@@ -35,3 +35,8 @@ This currently benchmarks packet-header parse/encode as a tiny local signal, not
 - initial server handshake parsing (minimal)
 - client handshake response 4.1 parsing (minimal)
 - tiny local benchmark harness
+
+## Next Technical Targets
+- OK / ERR / EOF packet parsing
+- richer text resultset parsing
+- small query-path benchmark for Rust PoC versus baseline path

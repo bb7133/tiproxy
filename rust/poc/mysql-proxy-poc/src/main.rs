@@ -1,3 +1,4 @@
+mod message;
 mod resultset;
 mod client_handshake;
 mod benchmark;
