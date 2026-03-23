@@ -1,3 +1,4 @@
+mod mysql_packet;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::io;
