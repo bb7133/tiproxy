@@ -5,8 +5,9 @@ A minimal standalone Rust PoC for TiProxy data-plane exploration.
 ## What it does
 - listens on a local TCP port
 - connects to a configured backend
-- forwards bytes in both directions
-- serves as the first stepping stone toward packet-aware MySQL protocol experimentation
+- forwards MySQL packets in both directions using packet boundaries
+- detects the initial MySQL handshake v10 packet shape
+- serves as the first stepping stone toward packet-aware protocol experimentation
 
 ## Run
 ```bash
