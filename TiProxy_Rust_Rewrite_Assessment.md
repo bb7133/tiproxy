@@ -1,5 +1,28 @@
 # TiProxy Rust Rewrite Assessment
 
+**Document Type:** Technical Assessment / Migration Proposal  
+**Project:** TiProxy  
+**Topic:** Benefits, Risks, and Phased Migration Strategy for a Potential Rust Rewrite  
+**Language:** English  
+**Status:** Draft for Internal Discussion  
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#executive-summary)
+2. [Context](#1-context)
+3. [Potential Benefits of a Rust Rewrite](#2-potential-benefits-of-a-rust-rewrite)
+4. [Major Risks of a Rust Rewrite](#3-major-risks-of-a-rust-rewrite)
+5. [Recommended Technical Direction](#4-recommended-technical-direction)
+6. [Recommended Phased Migration Roadmap](#5-recommended-phased-migration-roadmap)
+7. [Recommended Team Structure](#6-recommended-team-structure)
+8. [Acceptance Criteria Across All Phases](#7-acceptance-criteria-across-all-phases)
+9. [Final Recommendation](#8-final-recommendation)
+10. [Reference Areas in the Current TiProxy Codebase](#9-reference-areas-in-the-current-tiproxy-codebase)
+
+---
+
 ## Executive Summary
 
 This document summarizes the potential benefits, risks, and a recommended phased migration plan for rewriting TiProxy in Rust.
