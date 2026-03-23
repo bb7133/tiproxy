@@ -1,3 +1,4 @@
+mod client_handshake;
 mod benchmark;
 mod handshake;
 mod mysql_packet;

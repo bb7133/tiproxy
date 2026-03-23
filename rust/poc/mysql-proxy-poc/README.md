@@ -28,3 +28,10 @@ cargo run -- --bench --bench-iterations 1000000
 ```
 
 This currently benchmarks packet-header parse/encode as a tiny local signal, not end-to-end TiProxy behavior.
+
+## Current PoC Coverage
+- MySQL packet header parse/encode
+- packet-aware forwarding loop
+- initial server handshake parsing (minimal)
+- client handshake response 4.1 parsing (minimal)
+- tiny local benchmark harness
