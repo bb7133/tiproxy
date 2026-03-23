@@ -1,3 +1,5 @@
+mod benchmark;
+mod handshake;
 mod mysql_packet;
 mod proxy;
 
@@ -14,6 +16,13 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1:4000")]
     backend: String,
+
+    /// Run a tiny local benchmark instead of starting the proxy.
+    #[arg(long, default_value_t = false)]
+    bench: bool,
+
+    #[arg(long, default_value_t = 1_000_000)]
+    bench_iterations: usize,
 }
 
 #[tokio::main]
@@ -23,6 +32,19 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.bench {
+        let result = benchmark::run_packet_header_bench(args.bench_iterations);
+        println!(
+            "packet-header-bench iterations={} total_bytes={} elapsed_ms={} throughput_bytes_per_sec={:.2}",
+            result.iterations,
+            result.total_bytes,
+            result.elapsed.as_millis(),
+            result.throughput_bytes_per_sec(),
+        );
+        return Ok(());
+    }
+
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;

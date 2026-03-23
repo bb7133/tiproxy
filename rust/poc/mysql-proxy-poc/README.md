@@ -21,3 +21,10 @@ This is intentionally minimal. It does **not** yet implement:
 - authentication logic
 - migration semantics
 - load balancing behavior
+
+## Benchmark
+```bash
+cargo run -- --bench --bench-iterations 1000000
+```
+
+This currently benchmarks packet-header parse/encode as a tiny local signal, not end-to-end TiProxy behavior.
