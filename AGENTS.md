@@ -82,6 +82,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `tests/compatibility/` - Versioned client-driver and MySQL capability contract shared by the Go/Rust dataplane integration tests.
 - `tests/dataplane/corpus/` - Deterministic, language-neutral Go dataplane protocol corpus.
 - `tests/dataplane/drift/` - Semantic CI gate that keeps Go dataplane changes synchronized with Rust parity artifacts.
+- `tests/dataplane/integration/` - Real TiDB topology, fault injection, readiness, diagnostics, and owned cleanup for Go/Rust dataplane validation.
 
 Guidelines:
 
