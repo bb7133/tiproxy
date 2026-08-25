@@ -40,9 +40,17 @@ caller-owned `Vec` where the API makes that explicit.
 - Incoming sequence mismatches preserve Go TiProxy behavior: report an
   observable mismatch, accept the packet, and resynchronize to
   `received.wrapping_add(1)`.
-- The strict rejection of non-canonical lengths and typed rejection of
-  malformed greetings are intentional safety fixes required by issue #17;
-  canonical Go corpus vectors have no wire-level difference.
+- The strict rejection of non-canonical lengths is required by issue #17 even
+  though Go accepts longer-than-needed length encodings. The undefined `0xff`
+  marker remains a distinct invalid-value error.
+- Protocol-4.1 ERR packets require the `#` SQLSTATE marker; Go currently skips
+  that byte without checking it.
+- Initial greetings require protocol version 10 and a zero filler, and every
+  capability-selected handshake/change-user field must be complete. Go's
+  unchecked or tolerant malformed-input paths are not copied.
+- These intentional safety differences are recorded in the parity manifest's
+  WIRE-00 decision ledger. Canonical Go corpus vectors have no wire-level
+  difference.
 
 ## Tests
 
