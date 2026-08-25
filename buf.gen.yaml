@@ -1,0 +1,11 @@
+version: v2
+plugins:
+  - local: bin/control-codegen/protoc-gen-go
+    out: .
+    opt:
+      - module=github.com/pingcap/tiproxy
+  - local: bin/control-codegen/protoc-gen-prost
+    out: rust/crates/control-proto/src/generated
+    opt:
+      - flat_output_dir
+      - btree_map=.

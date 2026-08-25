@@ -43,7 +43,7 @@ CARGO_DENY_VERSION := 0.20.2
 RUST_TOOL_ROOT ?= $(GOBIN)/rust-tools
 RUST_TOOL_BIN := $(RUST_TOOL_ROOT)/bin
 
-.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests dataplane-integration dataplane-integration-go dataplane-integration-self-test
+.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests control-proto-generate control-proto-generate-check dataplane-integration dataplane-integration-go dataplane-integration-self-test
 
 default: cmd
 
@@ -106,6 +106,13 @@ rust-supply-chain:
 
 rust-negative-tests:
 	PATH=$(RUST_TOOL_BIN):$(PATH) rust/ci/run-negative-tests.sh
+
+control-proto-generate:
+	./scripts/generate-control-proto.sh
+
+control-proto-generate-check:
+	./scripts/generate-control-proto.sh
+	git diff --exit-code -- pkg/controlbridge/pb/control.pb.go rust/crates/control-proto/src/generated proto/dataplane/v1/testdata
 
 # The default remains the intended Rust topology and fails its capability
 # preflight until the real bridge/dataplane exists. The Go target is a truthful

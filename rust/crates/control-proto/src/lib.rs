@@ -19,6 +19,19 @@
 
 #![forbid(unsafe_code)]
 
+mod codec;
+
+/// Generated protobuf v1 types.
+#[allow(missing_docs, clippy::all, clippy::pedantic)]
+pub mod v1 {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/generated/tiproxy.dataplane.v1.rs"
+    ));
+}
+
+pub use codec::{DEFAULT_MAX_FRAME_BYTES, FrameError, decode_frame, encode_frame, negotiate_hello};
+
 /// The first control-protocol version reserved by the production workspace.
 pub const CONTROL_PROTOCOL_V1: u16 = 1;
 

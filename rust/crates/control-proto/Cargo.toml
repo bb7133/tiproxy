@@ -10,5 +10,8 @@ repository.workspace = true
 [features]
 default = []
 
+[dependencies]
+prost.workspace = true
+
 [lints]
 workspace = true

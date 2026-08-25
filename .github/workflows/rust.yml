@@ -6,8 +6,14 @@ on:
       - ".github/workflows/rust.yml"
       - "AGENTS.md"
       - "Makefile"
+      - "buf.yaml"
+      - "buf.gen.yaml"
+      - "go.mod"
+      - "pkg/controlbridge/**"
+      - "proto/**"
       - "rust-toolchain.toml"
       - "rust/**"
+      - "scripts/generate-control-proto.sh"
   push:
     branches:
       - main
@@ -15,8 +21,14 @@ on:
       - ".github/workflows/rust.yml"
       - "AGENTS.md"
       - "Makefile"
+      - "buf.yaml"
+      - "buf.gen.yaml"
+      - "go.mod"
+      - "pkg/controlbridge/**"
+      - "proto/**"
       - "rust-toolchain.toml"
       - "rust/**"
+      - "scripts/generate-control-proto.sh"
 
 permissions:
   contents: read
@@ -45,6 +57,11 @@ jobs:
         run: |
           rustup show active-toolchain
           rustc --version --verbose
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Restore Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -52,8 +69,12 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
+            bin/control-codegen
+            bin/control-codegen-rust
             rust/target
           key: rust-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Verify generated control protocol sources and goldens
+        run: make control-proto-generate-check
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests
