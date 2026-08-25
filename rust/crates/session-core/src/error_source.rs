@@ -222,18 +222,54 @@ pub enum FailureKind {
 /// A client-safe error approved by the control plane.
 ///
 /// Go's `ErrProxyErr` branch unwraps an error supplied by the
-/// `HandshakeHandler`/`BackendFetcher`; the control-protocol ADR requires
-/// such client-facing errors to be "an enumerated code plus an approved
-/// message". This type is the only way to route a non-static message to a
-/// client: the session layer must construct it exclusively from a
-/// control-plane `HandshakeDecision` payload (already bounded by the
-/// diagnostic-text cap), never from internal error `Display`/`Debug` output.
+/// `HandshakeHandler`/`BackendFetcher`, and `MakeUserError` renders it as a
+/// fixed `1105`/`HY000` with the approved text. This type is **opaque and
+/// unforgeable outside `session-core`**: the fields are private and the only
+/// constructor is crate-internal, taking the message from a control-plane
+/// `HandshakeDecision` payload and clamping it to the diagnostic-text cap on
+/// a character boundary. Internal error `Display`/`Debug` output has no path
+/// into it from other crates by construction. The wire triple is always
+/// `1105`/`HY000`/clamped-message — the control `ErrorCode` enum is not a
+/// `MySQL` code and is never used as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApprovedClientError<'a> {
-    /// Enumerated `MySQL` error code from the control plane.
-    pub code: u16,
-    /// The approved, pre-bounded message.
-    pub message: &'a str,
+    message: &'a str,
+}
+
+impl<'a> ApprovedClientError<'a> {
+    /// Crate-internal constructor: session wiring passes the control-plane
+    /// approved text here; it is clamped to the ADR diagnostic cap.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the session wiring (#25+) is this constructor's production \
+                      caller; keeping it crate-private preserves unforgeability"
+        )
+    )]
+    pub(crate) fn from_control_approved(message: &'a str) -> Self {
+        Self {
+            message: mysql_wire::limits::clamp_diagnostic_text(message),
+        }
+    }
+
+    /// The fixed `MySQL` error code, matching Go `MakeUserError`.
+    #[must_use]
+    pub const fn code(&self) -> u16 {
+        ER_UNKNOWN_ERROR
+    }
+
+    /// The fixed SQLSTATE, matching Go `MakeUserError`.
+    #[must_use]
+    pub const fn sql_state(&self) -> [u8; 5] {
+        SQL_STATE_HY000
+    }
+
+    /// The approved, clamped message.
+    #[must_use]
+    pub const fn message(&self) -> &'a str {
+        self.message
+    }
 }
 
 /// Structured failure descriptor the session layer builds for classification.
@@ -611,10 +647,10 @@ mod tests {
     /// classifies as a proxy error (Go `TestRequireBackendTLS`).
     #[test]
     fn proxy_internal_and_no_tls_follow_go_routes() {
-        let approved = ApprovedClientError {
-            code: 1105,
-            message: "approved by handshake decision",
-        };
+        let approved = ApprovedClientError::from_control_approved("approved by handshake decision");
+        assert_eq!(approved.code(), 1105);
+        assert_eq!(approved.sql_state(), *b"HY000");
+        assert_eq!(approved.message(), "approved by handshake decision");
         let internal_with_approval = FailureDescriptor {
             kind: Some(FailureKind::ProxyInternal),
             approved_client_error: Some(approved),
@@ -635,6 +671,16 @@ mod tests {
             ..FailureDescriptor::default()
         };
         assert_eq!(ErrorSource::classify(&no_tls), ErrorSource::ProxyError);
+
+        // The constructor clamps oversized approved text to the diagnostic
+        // cap on a character boundary — an unbounded control payload cannot
+        // expand a client response.
+        let oversized = "a".repeat(mysql_wire::limits::MAX_DIAGNOSTIC_TEXT_LEN + 100);
+        let clamped = ApprovedClientError::from_control_approved(&oversized);
+        assert_eq!(
+            clamped.message().len(),
+            mysql_wire::limits::MAX_DIAGNOSTIC_TEXT_LEN
+        );
     }
 
     /// Responses are fixed static strings: no formatting of internal detail,

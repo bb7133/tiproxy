@@ -59,6 +59,61 @@ fn control_frame_cap_matches_codec_default() {
     );
 }
 
+/// Control outbound-queue defaults match the ADR table and stay within the
+/// registered hard maxima; control timing defaults match the ADR values.
+#[test]
+fn control_queue_and_timing_defaults_match_adr() {
+    use control_proto::control_transport::{ClientConfig, QueueLimits};
+    use mysql_wire::limits::{
+        CONTROL_QUEUE_BULK_MAX, CONTROL_QUEUE_CONTROL_MAX, CONTROL_QUEUE_CRITICAL_MAX,
+    };
+
+    let queues = QueueLimits::default();
+    assert_eq!(
+        (queues.critical.messages, queues.critical.bytes),
+        (1_024, 8 * 1024 * 1024)
+    );
+    assert_eq!(
+        (queues.control.messages, queues.control.bytes),
+        (4_096, 32 * 1024 * 1024)
+    );
+    assert_eq!(
+        (queues.bulk.messages, queues.bulk.bytes),
+        (256, 16 * 1024 * 1024)
+    );
+    for (lane, maxima) in [
+        (
+            (queues.critical.messages, queues.critical.bytes),
+            CONTROL_QUEUE_CRITICAL_MAX,
+        ),
+        (
+            (queues.control.messages, queues.control.bytes),
+            CONTROL_QUEUE_CONTROL_MAX,
+        ),
+        (
+            (queues.bulk.messages, queues.bulk.bytes),
+            CONTROL_QUEUE_BULK_MAX,
+        ),
+    ] {
+        assert!(
+            lane.0 <= maxima.0 && lane.1 <= maxima.1,
+            "default exceeds hard maxima"
+        );
+    }
+
+    let config = ClientConfig::with_defaults(
+        std::path::PathBuf::from("/tmp/conformance.sock"),
+        0,
+        control_proto::v1::Hello::default(),
+    );
+    assert_eq!(config.handshake_timeout, Duration::from_secs(5));
+    assert_eq!(config.heartbeat_interval, Duration::from_secs(1));
+    assert_eq!(config.peer_timeout, Duration::from_secs(3));
+    assert_eq!(config.write_timeout, Duration::from_secs(5));
+    assert_eq!(config.reconnect_base, Duration::from_millis(50));
+    assert_eq!(config.reconnect_cap, Duration::from_secs(5));
+}
+
 /// The physical payload maximum has exactly one definition.
 #[test]
 fn physical_payload_limit_is_single_sourced() {

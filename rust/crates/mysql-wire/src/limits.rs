@@ -35,6 +35,12 @@
 //! - compressed frame ≤ the u24 maximum, default expansion ratio 65536
 //! - control frame default/hard cap 1 MiB
 //!   (`control-proto::codec::DEFAULT_MAX_FRAME_BYTES`)
+//! - control outbound queues: defaults critical 1024 msgs/8 MiB, control
+//!   4096/32 MiB, bulk 256/16 MiB (`QueueLimits::default`), bounded by the
+//!   ADR hard maxima registered here
+//! - control timing defaults: handshake 5 s, heartbeat 1 s, peer 3 s,
+//!   write 5 s, reconnect 50 ms base with a 5 s cap
+//!   (`ClientConfig::with_defaults`)
 
 use core::fmt;
 
@@ -60,6 +66,13 @@ pub const MAX_CONNECTION_ATTRIBUTE_KV: usize = 4 * 1024;
 
 /// Control-protocol ADR: diagnostic detail text cap.
 pub const MAX_DIAGNOSTIC_TEXT_LEN: usize = 4 * 1024;
+
+/// Control-protocol ADR hard maxima for the critical outbound lane.
+pub const CONTROL_QUEUE_CRITICAL_MAX: (usize, usize) = (4_096, 32 * 1024 * 1024);
+/// Control-protocol ADR hard maxima for the control outbound lane.
+pub const CONTROL_QUEUE_CONTROL_MAX: (usize, usize) = (16_384, 128 * 1024 * 1024);
+/// Control-protocol ADR hard maxima for the bulk outbound lane.
+pub const CONTROL_QUEUE_BULK_MAX: (usize, usize) = (1_024, 64 * 1024 * 1024);
 
 /// The 24-bit physical-packet payload maximum (single source: this crate).
 pub const MAX_PHYSICAL_PAYLOAD_LEN: usize = crate::MAX_PAYLOAD_LEN as usize;
@@ -357,6 +370,11 @@ mod tests {
         assert_eq!(clamp_diagnostic_text(&exact).len(), MAX_DIAGNOSTIC_TEXT_LEN);
         let ascii = "a".repeat(MAX_DIAGNOSTIC_TEXT_LEN + 10);
         assert_eq!(clamp_diagnostic_text(&ascii).len(), MAX_DIAGNOSTIC_TEXT_LEN);
+        let exact_plus_one = "a".repeat(MAX_DIAGNOSTIC_TEXT_LEN + 1);
+        assert_eq!(
+            clamp_diagnostic_text(&exact_plus_one).len(),
+            MAX_DIAGNOSTIC_TEXT_LEN
+        );
         // A multibyte character straddling the cap is dropped, not split.
         let mut tricky = "a".repeat(MAX_DIAGNOSTIC_TEXT_LEN - 1);
         tricky.push('语');
