@@ -73,6 +73,18 @@ silently approximate the operation. Unknown optional protobuf fields and
 unknown enum values are preserved/ignored according to protobuf rules. An
 unknown body variant is not actionable and yields `PROTOCOL_VIOLATION`.
 
+The v1 capability registry is append-only:
+
+| Value | Name | Required for |
+| ---: | --- | --- |
+| 1 | `PER_CONNECTION_CLOSE` | `CloseCommand` / `CloseResult` |
+| 2 | `RECONCILE_CONNECTIONS` | the `ReconcileRequest.connections` field |
+
+A sender sets the corresponding value in `required_capabilities` whenever it
+uses one of these additions. An older peer therefore rejects the guarded
+operation instead of decoding an unknown oneof body or silently ignoring the
+active-connection inventory.
+
 ```mermaid
 sequenceDiagram
     participant G as Go control plane
@@ -158,6 +170,10 @@ No new route lease may outlive the grace deadline.
 On reconnect, Rust sends applied generation, active connection/backend pairs,
 pending redirect IDs, and last durable event/metric/metering sequences. Go
 rebuilds idempotency/accounting state before issuing new redirects or drain.
+The active pairs are carried in `ReconcileRequest.connections` and require the
+`RECONCILE_CONNECTIONS` capability. Go replies with `ReconcileSnapshot` after
+it has removed absent Rust connections from router accounting and identified
+any Rust connection unknown to the current Go lineage.
 
 ## Snapshots and generation application
 
@@ -238,6 +254,14 @@ Drain is keyed by `drain_id`. It first stops selected listeners or assignments,
 then asks sessions to close only at safe points until the graceful deadline,
 then force-closes at the force deadline. Repeating a drain ID returns current
 progress. A different concurrent drain is rejected as `DRAIN_IN_PROGRESS`.
+
+Router eviction uses `CloseCommand`, keyed by `(connection_id, close_id)`, and
+requires `PER_CONNECTION_CLOSE`. Rust replies once with `CloseResult` and then
+emits the ordinary terminal `ConnectionEvent(CLOSED)`. A duplicate close ID
+replays the cached result; a different close ID for an already-closing session
+returns its current state without scheduling a second close. `force=true`
+maps `RedirectableConn.ForceClose`; listener/backend-wide graceful shutdown
+continues to use `DrainCommand` and must not be overloaded for one connection.
 
 ## Error codes
 

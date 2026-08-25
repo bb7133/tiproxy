@@ -32,6 +32,24 @@ fn fixture(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn rust_decodes_go_close_golden_and_reencodes_identically() -> Result<(), Box<dyn std::error::Error>>
+{
+    let golden = fixture("go-close.frame")?;
+    let envelope = decode_frame(&golden, DEFAULT_MAX_FRAME_BYTES)?;
+    assert_eq!(envelope.control_epoch, 42);
+    assert_eq!(envelope.required_capabilities, vec![1]);
+    let Some(Body::CloseCommand(close)) = &envelope.body else {
+        return Err("Go golden did not contain CloseCommand".into());
+    };
+    assert_eq!(close.connection_id, 77);
+    assert_eq!(close.close_id, "evict-77");
+    assert!(close.force);
+    let encoded = encode_frame(&envelope, DEFAULT_MAX_FRAME_BYTES)?;
+    assert_eq!(encoded, golden);
+    Ok(())
+}
+
+#[test]
 fn rust_decodes_go_golden_and_reencodes_identically() -> Result<(), Box<dyn std::error::Error>> {
     let golden = fixture("go-hello.frame")?;
     let envelope = decode_frame(&golden, DEFAULT_MAX_FRAME_BYTES)?;

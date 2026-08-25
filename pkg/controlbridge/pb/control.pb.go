@@ -125,6 +125,57 @@ func (Role) EnumDescriptor() ([]byte, []int) {
 	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{1}
 }
 
+// ControlCapability values are advertised as uint64 values in Hello. Values
+// are never reused because they gate additive messages and required fields.
+type ControlCapability int32
+
+const (
+	ControlCapability_CONTROL_CAPABILITY_UNSPECIFIED           ControlCapability = 0
+	ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE  ControlCapability = 1
+	ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS ControlCapability = 2
+)
+
+// Enum value maps for ControlCapability.
+var (
+	ControlCapability_name = map[int32]string{
+		0: "CONTROL_CAPABILITY_UNSPECIFIED",
+		1: "CONTROL_CAPABILITY_PER_CONNECTION_CLOSE",
+		2: "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS",
+	}
+	ControlCapability_value = map[string]int32{
+		"CONTROL_CAPABILITY_UNSPECIFIED":           0,
+		"CONTROL_CAPABILITY_PER_CONNECTION_CLOSE":  1,
+		"CONTROL_CAPABILITY_RECONCILE_CONNECTIONS": 2,
+	}
+)
+
+func (x ControlCapability) Enum() *ControlCapability {
+	p := new(ControlCapability)
+	*p = x
+	return p
+}
+
+func (x ControlCapability) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ControlCapability) Descriptor() protoreflect.EnumDescriptor {
+	return file_dataplane_v1_control_proto_enumTypes[2].Descriptor()
+}
+
+func (ControlCapability) Type() protoreflect.EnumType {
+	return &file_dataplane_v1_control_proto_enumTypes[2]
+}
+
+func (x ControlCapability) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ControlCapability.Descriptor instead.
+func (ControlCapability) EnumDescriptor() ([]byte, []int) {
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{2}
+}
+
 type ProxyProtocolMode int32
 
 const (
@@ -158,11 +209,11 @@ func (x ProxyProtocolMode) String() string {
 }
 
 func (ProxyProtocolMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_dataplane_v1_control_proto_enumTypes[2].Descriptor()
+	return file_dataplane_v1_control_proto_enumTypes[3].Descriptor()
 }
 
 func (ProxyProtocolMode) Type() protoreflect.EnumType {
-	return &file_dataplane_v1_control_proto_enumTypes[2]
+	return &file_dataplane_v1_control_proto_enumTypes[3]
 }
 
 func (x ProxyProtocolMode) Number() protoreflect.EnumNumber {
@@ -171,7 +222,7 @@ func (x ProxyProtocolMode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ProxyProtocolMode.Descriptor instead.
 func (ProxyProtocolMode) EnumDescriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{2}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{3}
 }
 
 type ConnectionEventKind int32
@@ -210,11 +261,11 @@ func (x ConnectionEventKind) String() string {
 }
 
 func (ConnectionEventKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_dataplane_v1_control_proto_enumTypes[3].Descriptor()
+	return file_dataplane_v1_control_proto_enumTypes[4].Descriptor()
 }
 
 func (ConnectionEventKind) Type() protoreflect.EnumType {
-	return &file_dataplane_v1_control_proto_enumTypes[3]
+	return &file_dataplane_v1_control_proto_enumTypes[4]
 }
 
 func (x ConnectionEventKind) Number() protoreflect.EnumNumber {
@@ -223,7 +274,7 @@ func (x ConnectionEventKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ConnectionEventKind.Descriptor instead.
 func (ConnectionEventKind) EnumDescriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{3}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{4}
 }
 
 type ErrorSource int32
@@ -271,11 +322,11 @@ func (x ErrorSource) String() string {
 }
 
 func (ErrorSource) Descriptor() protoreflect.EnumDescriptor {
-	return file_dataplane_v1_control_proto_enumTypes[4].Descriptor()
+	return file_dataplane_v1_control_proto_enumTypes[5].Descriptor()
 }
 
 func (ErrorSource) Type() protoreflect.EnumType {
-	return &file_dataplane_v1_control_proto_enumTypes[4]
+	return &file_dataplane_v1_control_proto_enumTypes[5]
 }
 
 func (x ErrorSource) Number() protoreflect.EnumNumber {
@@ -284,7 +335,7 @@ func (x ErrorSource) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ErrorSource.Descriptor instead.
 func (ErrorSource) EnumDescriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{4}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{5}
 }
 
 type ErrorCode int32
@@ -380,11 +431,11 @@ func (x ErrorCode) String() string {
 }
 
 func (ErrorCode) Descriptor() protoreflect.EnumDescriptor {
-	return file_dataplane_v1_control_proto_enumTypes[5].Descriptor()
+	return file_dataplane_v1_control_proto_enumTypes[6].Descriptor()
 }
 
 func (ErrorCode) Type() protoreflect.EnumType {
-	return &file_dataplane_v1_control_proto_enumTypes[5]
+	return &file_dataplane_v1_control_proto_enumTypes[6]
 }
 
 func (x ErrorCode) Number() protoreflect.EnumNumber {
@@ -393,7 +444,7 @@ func (x ErrorCode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ErrorCode.Descriptor instead.
 func (ErrorCode) EnumDescriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{5}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{6}
 }
 
 // ControlEnvelope is the only top-level protobuf value written to the control
@@ -430,6 +481,8 @@ type ControlEnvelope struct {
 	//	*ControlEnvelope_ReconcileSnapshot
 	//	*ControlEnvelope_Heartbeat
 	//	*ControlEnvelope_Error
+	//	*ControlEnvelope_CloseCommand
+	//	*ControlEnvelope_CloseResult
 	Body          isControlEnvelope_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -710,6 +763,24 @@ func (x *ControlEnvelope) GetError() *ProtocolError {
 	return nil
 }
 
+func (x *ControlEnvelope) GetCloseCommand() *CloseCommand {
+	if x != nil {
+		if x, ok := x.Body.(*ControlEnvelope_CloseCommand); ok {
+			return x.CloseCommand
+		}
+	}
+	return nil
+}
+
+func (x *ControlEnvelope) GetCloseResult() *CloseResult {
+	if x != nil {
+		if x, ok := x.Body.(*ControlEnvelope_CloseResult); ok {
+			return x.CloseResult
+		}
+	}
+	return nil
+}
+
 type isControlEnvelope_Body interface {
 	isControlEnvelope_Body()
 }
@@ -798,6 +869,14 @@ type ControlEnvelope_Error struct {
 	Error *ProtocolError `protobuf:"bytes,40,opt,name=error,proto3,oneof"`
 }
 
+type ControlEnvelope_CloseCommand struct {
+	CloseCommand *CloseCommand `protobuf:"bytes,41,opt,name=close_command,json=closeCommand,proto3,oneof"`
+}
+
+type ControlEnvelope_CloseResult struct {
+	CloseResult *CloseResult `protobuf:"bytes,42,opt,name=close_result,json=closeResult,proto3,oneof"`
+}
+
 func (*ControlEnvelope_Hello) isControlEnvelope_Body() {}
 
 func (*ControlEnvelope_HelloAck) isControlEnvelope_Body() {}
@@ -839,6 +918,10 @@ func (*ControlEnvelope_ReconcileSnapshot) isControlEnvelope_Body() {}
 func (*ControlEnvelope_Heartbeat) isControlEnvelope_Body() {}
 
 func (*ControlEnvelope_Error) isControlEnvelope_Body() {}
+
+func (*ControlEnvelope_CloseCommand) isControlEnvelope_Body() {}
+
+func (*ControlEnvelope_CloseResult) isControlEnvelope_Body() {}
 
 type Hello struct {
 	state                    protoimpl.MessageState `protogen:"open.v1"`
@@ -2722,6 +2805,158 @@ func (x *RedirectResult) GetDetail() string {
 	return ""
 }
 
+type CloseCommand struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ConnectionId  uint64                 `protobuf:"varint,1,opt,name=connection_id,json=connectionId,proto3" json:"connection_id,omitempty"`
+	CloseId       string                 `protobuf:"bytes,2,opt,name=close_id,json=closeId,proto3" json:"close_id,omitempty"`
+	ErrorSource   ErrorSource            `protobuf:"varint,3,opt,name=error_source,json=errorSource,proto3,enum=tiproxy.dataplane.v1.ErrorSource" json:"error_source,omitempty"`
+	Reason        string                 `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
+	Force         bool                   `protobuf:"varint,5,opt,name=force,proto3" json:"force,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CloseCommand) Reset() {
+	*x = CloseCommand{}
+	mi := &file_dataplane_v1_control_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CloseCommand) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CloseCommand) ProtoMessage() {}
+
+func (x *CloseCommand) ProtoReflect() protoreflect.Message {
+	mi := &file_dataplane_v1_control_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CloseCommand.ProtoReflect.Descriptor instead.
+func (*CloseCommand) Descriptor() ([]byte, []int) {
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *CloseCommand) GetConnectionId() uint64 {
+	if x != nil {
+		return x.ConnectionId
+	}
+	return 0
+}
+
+func (x *CloseCommand) GetCloseId() string {
+	if x != nil {
+		return x.CloseId
+	}
+	return ""
+}
+
+func (x *CloseCommand) GetErrorSource() ErrorSource {
+	if x != nil {
+		return x.ErrorSource
+	}
+	return ErrorSource_ERROR_SOURCE_UNSPECIFIED
+}
+
+func (x *CloseCommand) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *CloseCommand) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
+}
+
+type CloseResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ConnectionId  uint64                 `protobuf:"varint,1,opt,name=connection_id,json=connectionId,proto3" json:"connection_id,omitempty"`
+	CloseId       string                 `protobuf:"bytes,2,opt,name=close_id,json=closeId,proto3" json:"close_id,omitempty"`
+	Accepted      bool                   `protobuf:"varint,3,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	Code          ErrorCode              `protobuf:"varint,4,opt,name=code,proto3,enum=tiproxy.dataplane.v1.ErrorCode" json:"code,omitempty"`
+	Detail        string                 `protobuf:"bytes,5,opt,name=detail,proto3" json:"detail,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CloseResult) Reset() {
+	*x = CloseResult{}
+	mi := &file_dataplane_v1_control_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CloseResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CloseResult) ProtoMessage() {}
+
+func (x *CloseResult) ProtoReflect() protoreflect.Message {
+	mi := &file_dataplane_v1_control_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CloseResult.ProtoReflect.Descriptor instead.
+func (*CloseResult) Descriptor() ([]byte, []int) {
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *CloseResult) GetConnectionId() uint64 {
+	if x != nil {
+		return x.ConnectionId
+	}
+	return 0
+}
+
+func (x *CloseResult) GetCloseId() string {
+	if x != nil {
+		return x.CloseId
+	}
+	return ""
+}
+
+func (x *CloseResult) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *CloseResult) GetCode() ErrorCode {
+	if x != nil {
+		return x.Code
+	}
+	return ErrorCode_ERROR_CODE_UNSPECIFIED
+}
+
+func (x *CloseResult) GetDetail() string {
+	if x != nil {
+		return x.Detail
+	}
+	return ""
+}
+
 type DrainCommand struct {
 	state                      protoimpl.MessageState `protogen:"open.v1"`
 	DrainId                    string                 `protobuf:"bytes,1,opt,name=drain_id,json=drainId,proto3" json:"drain_id,omitempty"`
@@ -2735,7 +2970,7 @@ type DrainCommand struct {
 
 func (x *DrainCommand) Reset() {
 	*x = DrainCommand{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[23]
+	mi := &file_dataplane_v1_control_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2747,7 +2982,7 @@ func (x *DrainCommand) String() string {
 func (*DrainCommand) ProtoMessage() {}
 
 func (x *DrainCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[23]
+	mi := &file_dataplane_v1_control_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2760,7 +2995,7 @@ func (x *DrainCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DrainCommand.ProtoReflect.Descriptor instead.
 func (*DrainCommand) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{23}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *DrainCommand) GetDrainId() string {
@@ -2813,7 +3048,7 @@ type DrainResult struct {
 
 func (x *DrainResult) Reset() {
 	*x = DrainResult{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[24]
+	mi := &file_dataplane_v1_control_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2825,7 +3060,7 @@ func (x *DrainResult) String() string {
 func (*DrainResult) ProtoMessage() {}
 
 func (x *DrainResult) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[24]
+	mi := &file_dataplane_v1_control_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2838,7 +3073,7 @@ func (x *DrainResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DrainResult.ProtoReflect.Descriptor instead.
 func (*DrainResult) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{24}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *DrainResult) GetDrainId() string {
@@ -2903,7 +3138,7 @@ type MetricDelta struct {
 
 func (x *MetricDelta) Reset() {
 	*x = MetricDelta{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[25]
+	mi := &file_dataplane_v1_control_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2915,7 +3150,7 @@ func (x *MetricDelta) String() string {
 func (*MetricDelta) ProtoMessage() {}
 
 func (x *MetricDelta) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[25]
+	mi := &file_dataplane_v1_control_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2928,7 +3163,7 @@ func (x *MetricDelta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricDelta.ProtoReflect.Descriptor instead.
 func (*MetricDelta) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{25}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *MetricDelta) GetName() string {
@@ -2976,7 +3211,7 @@ type MetricsBatch struct {
 
 func (x *MetricsBatch) Reset() {
 	*x = MetricsBatch{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[26]
+	mi := &file_dataplane_v1_control_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2988,7 +3223,7 @@ func (x *MetricsBatch) String() string {
 func (*MetricsBatch) ProtoMessage() {}
 
 func (x *MetricsBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[26]
+	mi := &file_dataplane_v1_control_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3001,7 +3236,7 @@ func (x *MetricsBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricsBatch.ProtoReflect.Descriptor instead.
 func (*MetricsBatch) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{26}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *MetricsBatch) GetSequence() uint64 {
@@ -3031,7 +3266,7 @@ type MeteringDelta struct {
 
 func (x *MeteringDelta) Reset() {
 	*x = MeteringDelta{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[27]
+	mi := &file_dataplane_v1_control_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3043,7 +3278,7 @@ func (x *MeteringDelta) String() string {
 func (*MeteringDelta) ProtoMessage() {}
 
 func (x *MeteringDelta) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[27]
+	mi := &file_dataplane_v1_control_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3056,7 +3291,7 @@ func (x *MeteringDelta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MeteringDelta.ProtoReflect.Descriptor instead.
 func (*MeteringDelta) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{27}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *MeteringDelta) GetKeyspace() string {
@@ -3104,7 +3339,7 @@ type MeteringBatch struct {
 
 func (x *MeteringBatch) Reset() {
 	*x = MeteringBatch{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[28]
+	mi := &file_dataplane_v1_control_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3116,7 +3351,7 @@ func (x *MeteringBatch) String() string {
 func (*MeteringBatch) ProtoMessage() {}
 
 func (x *MeteringBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[28]
+	mi := &file_dataplane_v1_control_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3129,7 +3364,7 @@ func (x *MeteringBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MeteringBatch.ProtoReflect.Descriptor instead.
 func (*MeteringBatch) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{28}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *MeteringBatch) GetSequence() uint64 {
@@ -3152,13 +3387,14 @@ type ReconcileRequest struct {
 	LastConnectionEventSequence uint64                 `protobuf:"varint,2,opt,name=last_connection_event_sequence,json=lastConnectionEventSequence,proto3" json:"last_connection_event_sequence,omitempty"`
 	LastMetricsSequence         uint64                 `protobuf:"varint,3,opt,name=last_metrics_sequence,json=lastMetricsSequence,proto3" json:"last_metrics_sequence,omitempty"`
 	LastMeteringSequence        uint64                 `protobuf:"varint,4,opt,name=last_metering_sequence,json=lastMeteringSequence,proto3" json:"last_metering_sequence,omitempty"`
+	Connections                 []*ReconcileConnection `protobuf:"bytes,5,rep,name=connections,proto3" json:"connections,omitempty"`
 	unknownFields               protoimpl.UnknownFields
 	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *ReconcileRequest) Reset() {
 	*x = ReconcileRequest{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[29]
+	mi := &file_dataplane_v1_control_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3170,7 +3406,7 @@ func (x *ReconcileRequest) String() string {
 func (*ReconcileRequest) ProtoMessage() {}
 
 func (x *ReconcileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[29]
+	mi := &file_dataplane_v1_control_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3183,7 +3419,7 @@ func (x *ReconcileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReconcileRequest.ProtoReflect.Descriptor instead.
 func (*ReconcileRequest) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{29}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ReconcileRequest) GetKnownGeneration() uint64 {
@@ -3214,6 +3450,13 @@ func (x *ReconcileRequest) GetLastMeteringSequence() uint64 {
 	return 0
 }
 
+func (x *ReconcileRequest) GetConnections() []*ReconcileConnection {
+	if x != nil {
+		return x.Connections
+	}
+	return nil
+}
+
 type ReconcileConnection struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ConnectionId    uint64                 `protobuf:"varint,1,opt,name=connection_id,json=connectionId,proto3" json:"connection_id,omitempty"`
@@ -3226,7 +3469,7 @@ type ReconcileConnection struct {
 
 func (x *ReconcileConnection) Reset() {
 	*x = ReconcileConnection{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[30]
+	mi := &file_dataplane_v1_control_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3238,7 +3481,7 @@ func (x *ReconcileConnection) String() string {
 func (*ReconcileConnection) ProtoMessage() {}
 
 func (x *ReconcileConnection) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[30]
+	mi := &file_dataplane_v1_control_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3251,7 +3494,7 @@ func (x *ReconcileConnection) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReconcileConnection.ProtoReflect.Descriptor instead.
 func (*ReconcileConnection) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{30}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ReconcileConnection) GetConnectionId() uint64 {
@@ -3295,7 +3538,7 @@ type ReconcileSnapshot struct {
 
 func (x *ReconcileSnapshot) Reset() {
 	*x = ReconcileSnapshot{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[31]
+	mi := &file_dataplane_v1_control_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3307,7 +3550,7 @@ func (x *ReconcileSnapshot) String() string {
 func (*ReconcileSnapshot) ProtoMessage() {}
 
 func (x *ReconcileSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[31]
+	mi := &file_dataplane_v1_control_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3320,7 +3563,7 @@ func (x *ReconcileSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReconcileSnapshot.ProtoReflect.Descriptor instead.
 func (*ReconcileSnapshot) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{31}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ReconcileSnapshot) GetAppliedGeneration() uint64 {
@@ -3370,7 +3613,7 @@ type Heartbeat struct {
 
 func (x *Heartbeat) Reset() {
 	*x = Heartbeat{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[32]
+	mi := &file_dataplane_v1_control_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3382,7 +3625,7 @@ func (x *Heartbeat) String() string {
 func (*Heartbeat) ProtoMessage() {}
 
 func (x *Heartbeat) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[32]
+	mi := &file_dataplane_v1_control_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3395,7 +3638,7 @@ func (x *Heartbeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Heartbeat.ProtoReflect.Descriptor instead.
 func (*Heartbeat) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{32}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *Heartbeat) GetMonotonicMillis() uint64 {
@@ -3438,7 +3681,7 @@ type ProtocolError struct {
 
 func (x *ProtocolError) Reset() {
 	*x = ProtocolError{}
-	mi := &file_dataplane_v1_control_proto_msgTypes[33]
+	mi := &file_dataplane_v1_control_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3450,7 +3693,7 @@ func (x *ProtocolError) String() string {
 func (*ProtocolError) ProtoMessage() {}
 
 func (x *ProtocolError) ProtoReflect() protoreflect.Message {
-	mi := &file_dataplane_v1_control_proto_msgTypes[33]
+	mi := &file_dataplane_v1_control_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3463,7 +3706,7 @@ func (x *ProtocolError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProtocolError.ProtoReflect.Descriptor instead.
 func (*ProtocolError) Descriptor() ([]byte, []int) {
-	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{33}
+	return file_dataplane_v1_control_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ProtocolError) GetCode() ErrorCode {
@@ -3498,7 +3741,7 @@ var File_dataplane_v1_control_proto protoreflect.FileDescriptor
 
 const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\n" +
-	"\x1adataplane/v1/control.proto\x12\x14tiproxy.dataplane.v1\"\x9e\x0f\n" +
+	"\x1adataplane/v1/control.proto\x12\x14tiproxy.dataplane.v1\"\xb1\x10\n" +
 	"\x0fControlEnvelope\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12#\n" +
 	"\rcontrol_epoch\x18\x02 \x01(\x04R\fcontrolEpoch\x12\x1e\n" +
@@ -3530,7 +3773,9 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x11reconcile_request\x18% \x01(\v2&.tiproxy.dataplane.v1.ReconcileRequestH\x00R\x10reconcileRequest\x12X\n" +
 	"\x12reconcile_snapshot\x18& \x01(\v2'.tiproxy.dataplane.v1.ReconcileSnapshotH\x00R\x11reconcileSnapshot\x12?\n" +
 	"\theartbeat\x18' \x01(\v2\x1f.tiproxy.dataplane.v1.HeartbeatH\x00R\theartbeat\x12;\n" +
-	"\x05error\x18( \x01(\v2#.tiproxy.dataplane.v1.ProtocolErrorH\x00R\x05errorB\x06\n" +
+	"\x05error\x18( \x01(\v2#.tiproxy.dataplane.v1.ProtocolErrorH\x00R\x05error\x12I\n" +
+	"\rclose_command\x18) \x01(\v2\".tiproxy.dataplane.v1.CloseCommandH\x00R\fcloseCommand\x12F\n" +
+	"\fclose_result\x18* \x01(\v2!.tiproxy.dataplane.v1.CloseResultH\x00R\vcloseResultB\x06\n" +
 	"\x04body\"\xd8\x02\n" +
 	"\x05Hello\x12.\n" +
 	"\x04role\x18\x01 \x01(\x0e2\x1a.tiproxy.dataplane.v1.RoleR\x04role\x12\x1d\n" +
@@ -3723,7 +3968,19 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"backend_id\x18\x04 \x01(\tR\tbackendId\x12\x1c\n" +
 	"\tsucceeded\x18\x05 \x01(\bR\tsucceeded\x123\n" +
 	"\x04code\x18\x06 \x01(\x0e2\x1f.tiproxy.dataplane.v1.ErrorCodeR\x04code\x12\x16\n" +
-	"\x06detail\x18\a \x01(\tR\x06detail\"\xf1\x01\n" +
+	"\x06detail\x18\a \x01(\tR\x06detail\"\xc2\x01\n" +
+	"\fCloseCommand\x12#\n" +
+	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x19\n" +
+	"\bclose_id\x18\x02 \x01(\tR\acloseId\x12D\n" +
+	"\ferror_source\x18\x03 \x01(\x0e2!.tiproxy.dataplane.v1.ErrorSourceR\verrorSource\x12\x16\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\x12\x14\n" +
+	"\x05force\x18\x05 \x01(\bR\x05force\"\xb6\x01\n" +
+	"\vCloseResult\x12#\n" +
+	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x19\n" +
+	"\bclose_id\x18\x02 \x01(\tR\acloseId\x12\x1a\n" +
+	"\baccepted\x18\x03 \x01(\bR\baccepted\x123\n" +
+	"\x04code\x18\x04 \x01(\x0e2\x1f.tiproxy.dataplane.v1.ErrorCodeR\x04code\x12\x16\n" +
+	"\x06detail\x18\x05 \x01(\tR\x06detail\"\xf1\x01\n" +
 	"\fDrainCommand\x12\x19\n" +
 	"\bdrain_id\x18\x01 \x01(\tR\adrainId\x12%\n" +
 	"\x0elistener_names\x18\x02 \x03(\tR\rlistenerNames\x12\x1f\n" +
@@ -3760,12 +4017,13 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x14cross_location_bytes\x18\x05 \x01(\x04R\x12crossLocationBytes\"h\n" +
 	"\rMeteringBatch\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12;\n" +
-	"\x06deltas\x18\x02 \x03(\v2#.tiproxy.dataplane.v1.MeteringDeltaR\x06deltas\"\xec\x01\n" +
+	"\x06deltas\x18\x02 \x03(\v2#.tiproxy.dataplane.v1.MeteringDeltaR\x06deltas\"\xb9\x02\n" +
 	"\x10ReconcileRequest\x12)\n" +
 	"\x10known_generation\x18\x01 \x01(\x04R\x0fknownGeneration\x12C\n" +
 	"\x1elast_connection_event_sequence\x18\x02 \x01(\x04R\x1blastConnectionEventSequence\x122\n" +
 	"\x15last_metrics_sequence\x18\x03 \x01(\x04R\x13lastMetricsSequence\x124\n" +
-	"\x16last_metering_sequence\x18\x04 \x01(\x04R\x14lastMeteringSequence\"\xa2\x01\n" +
+	"\x16last_metering_sequence\x18\x04 \x01(\x04R\x14lastMeteringSequence\x12K\n" +
+	"\vconnections\x18\x05 \x03(\v2).tiproxy.dataplane.v1.ReconcileConnectionR\vconnections\"\xa2\x01\n" +
 	"\x13ReconcileConnection\x12#\n" +
 	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x1d\n" +
 	"\n" +
@@ -3796,7 +4054,11 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fROLE_GO_CONTROL\x10\x01\x12\x17\n" +
-	"\x13ROLE_RUST_DATAPLANE\x10\x02*v\n" +
+	"\x13ROLE_RUST_DATAPLANE\x10\x02*\x92\x01\n" +
+	"\x11ControlCapability\x12\"\n" +
+	"\x1eCONTROL_CAPABILITY_UNSPECIFIED\x10\x00\x12+\n" +
+	"'CONTROL_CAPABILITY_PER_CONNECTION_CLOSE\x10\x01\x12,\n" +
+	"(CONTROL_CAPABILITY_RECONCILE_CONNECTIONS\x10\x02*v\n" +
 	"\x11ProxyProtocolMode\x12#\n" +
 	"\x1fPROXY_PROTOCOL_MODE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cPROXY_PROTOCOL_MODE_DISABLED\x10\x01\x12\x1a\n" +
@@ -3852,117 +4114,125 @@ func file_dataplane_v1_control_proto_rawDescGZIP() []byte {
 	return file_dataplane_v1_control_proto_rawDescData
 }
 
-var file_dataplane_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_dataplane_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_dataplane_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
+var file_dataplane_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
 var file_dataplane_v1_control_proto_goTypes = []any{
 	(Priority)(0),                  // 0: tiproxy.dataplane.v1.Priority
 	(Role)(0),                      // 1: tiproxy.dataplane.v1.Role
-	(ProxyProtocolMode)(0),         // 2: tiproxy.dataplane.v1.ProxyProtocolMode
-	(ConnectionEventKind)(0),       // 3: tiproxy.dataplane.v1.ConnectionEventKind
-	(ErrorSource)(0),               // 4: tiproxy.dataplane.v1.ErrorSource
-	(ErrorCode)(0),                 // 5: tiproxy.dataplane.v1.ErrorCode
-	(*ControlEnvelope)(nil),        // 6: tiproxy.dataplane.v1.ControlEnvelope
-	(*Hello)(nil),                  // 7: tiproxy.dataplane.v1.Hello
-	(*HelloAck)(nil),               // 8: tiproxy.dataplane.v1.HelloAck
-	(*StateSnapshot)(nil),          // 9: tiproxy.dataplane.v1.StateSnapshot
-	(*SnapshotResult)(nil),         // 10: tiproxy.dataplane.v1.SnapshotResult
-	(*ConfigSnapshot)(nil),         // 11: tiproxy.dataplane.v1.ConfigSnapshot
-	(*KeepalivePolicy)(nil),        // 12: tiproxy.dataplane.v1.KeepalivePolicy
-	(*Listener)(nil),               // 13: tiproxy.dataplane.v1.Listener
-	(*TlsPolicy)(nil),              // 14: tiproxy.dataplane.v1.TlsPolicy
-	(*BackendSnapshot)(nil),        // 15: tiproxy.dataplane.v1.BackendSnapshot
-	(*NamespaceSnapshot)(nil),      // 16: tiproxy.dataplane.v1.NamespaceSnapshot
-	(*ConnectionIdentity)(nil),     // 17: tiproxy.dataplane.v1.ConnectionIdentity
-	(*HandshakeMetadata)(nil),      // 18: tiproxy.dataplane.v1.HandshakeMetadata
-	(*HandshakeResponseEvent)(nil), // 19: tiproxy.dataplane.v1.HandshakeResponseEvent
-	(*HandshakeDecision)(nil),      // 20: tiproxy.dataplane.v1.HandshakeDecision
-	(*HandshakeResult)(nil),        // 21: tiproxy.dataplane.v1.HandshakeResult
-	(*MysqlError)(nil),             // 22: tiproxy.dataplane.v1.MysqlError
-	(*RouteRequest)(nil),           // 23: tiproxy.dataplane.v1.RouteRequest
-	(*RouteAssignment)(nil),        // 24: tiproxy.dataplane.v1.RouteAssignment
-	(*RouteResult)(nil),            // 25: tiproxy.dataplane.v1.RouteResult
-	(*ConnectionEvent)(nil),        // 26: tiproxy.dataplane.v1.ConnectionEvent
-	(*RedirectCommand)(nil),        // 27: tiproxy.dataplane.v1.RedirectCommand
-	(*RedirectResult)(nil),         // 28: tiproxy.dataplane.v1.RedirectResult
-	(*DrainCommand)(nil),           // 29: tiproxy.dataplane.v1.DrainCommand
-	(*DrainResult)(nil),            // 30: tiproxy.dataplane.v1.DrainResult
-	(*MetricDelta)(nil),            // 31: tiproxy.dataplane.v1.MetricDelta
-	(*MetricsBatch)(nil),           // 32: tiproxy.dataplane.v1.MetricsBatch
-	(*MeteringDelta)(nil),          // 33: tiproxy.dataplane.v1.MeteringDelta
-	(*MeteringBatch)(nil),          // 34: tiproxy.dataplane.v1.MeteringBatch
-	(*ReconcileRequest)(nil),       // 35: tiproxy.dataplane.v1.ReconcileRequest
-	(*ReconcileConnection)(nil),    // 36: tiproxy.dataplane.v1.ReconcileConnection
-	(*ReconcileSnapshot)(nil),      // 37: tiproxy.dataplane.v1.ReconcileSnapshot
-	(*Heartbeat)(nil),              // 38: tiproxy.dataplane.v1.Heartbeat
-	(*ProtocolError)(nil),          // 39: tiproxy.dataplane.v1.ProtocolError
-	nil,                            // 40: tiproxy.dataplane.v1.BackendSnapshot.LabelsEntry
-	nil,                            // 41: tiproxy.dataplane.v1.HandshakeMetadata.ConnectionAttributesEntry
-	nil,                            // 42: tiproxy.dataplane.v1.MetricDelta.LabelsEntry
+	(ControlCapability)(0),         // 2: tiproxy.dataplane.v1.ControlCapability
+	(ProxyProtocolMode)(0),         // 3: tiproxy.dataplane.v1.ProxyProtocolMode
+	(ConnectionEventKind)(0),       // 4: tiproxy.dataplane.v1.ConnectionEventKind
+	(ErrorSource)(0),               // 5: tiproxy.dataplane.v1.ErrorSource
+	(ErrorCode)(0),                 // 6: tiproxy.dataplane.v1.ErrorCode
+	(*ControlEnvelope)(nil),        // 7: tiproxy.dataplane.v1.ControlEnvelope
+	(*Hello)(nil),                  // 8: tiproxy.dataplane.v1.Hello
+	(*HelloAck)(nil),               // 9: tiproxy.dataplane.v1.HelloAck
+	(*StateSnapshot)(nil),          // 10: tiproxy.dataplane.v1.StateSnapshot
+	(*SnapshotResult)(nil),         // 11: tiproxy.dataplane.v1.SnapshotResult
+	(*ConfigSnapshot)(nil),         // 12: tiproxy.dataplane.v1.ConfigSnapshot
+	(*KeepalivePolicy)(nil),        // 13: tiproxy.dataplane.v1.KeepalivePolicy
+	(*Listener)(nil),               // 14: tiproxy.dataplane.v1.Listener
+	(*TlsPolicy)(nil),              // 15: tiproxy.dataplane.v1.TlsPolicy
+	(*BackendSnapshot)(nil),        // 16: tiproxy.dataplane.v1.BackendSnapshot
+	(*NamespaceSnapshot)(nil),      // 17: tiproxy.dataplane.v1.NamespaceSnapshot
+	(*ConnectionIdentity)(nil),     // 18: tiproxy.dataplane.v1.ConnectionIdentity
+	(*HandshakeMetadata)(nil),      // 19: tiproxy.dataplane.v1.HandshakeMetadata
+	(*HandshakeResponseEvent)(nil), // 20: tiproxy.dataplane.v1.HandshakeResponseEvent
+	(*HandshakeDecision)(nil),      // 21: tiproxy.dataplane.v1.HandshakeDecision
+	(*HandshakeResult)(nil),        // 22: tiproxy.dataplane.v1.HandshakeResult
+	(*MysqlError)(nil),             // 23: tiproxy.dataplane.v1.MysqlError
+	(*RouteRequest)(nil),           // 24: tiproxy.dataplane.v1.RouteRequest
+	(*RouteAssignment)(nil),        // 25: tiproxy.dataplane.v1.RouteAssignment
+	(*RouteResult)(nil),            // 26: tiproxy.dataplane.v1.RouteResult
+	(*ConnectionEvent)(nil),        // 27: tiproxy.dataplane.v1.ConnectionEvent
+	(*RedirectCommand)(nil),        // 28: tiproxy.dataplane.v1.RedirectCommand
+	(*RedirectResult)(nil),         // 29: tiproxy.dataplane.v1.RedirectResult
+	(*CloseCommand)(nil),           // 30: tiproxy.dataplane.v1.CloseCommand
+	(*CloseResult)(nil),            // 31: tiproxy.dataplane.v1.CloseResult
+	(*DrainCommand)(nil),           // 32: tiproxy.dataplane.v1.DrainCommand
+	(*DrainResult)(nil),            // 33: tiproxy.dataplane.v1.DrainResult
+	(*MetricDelta)(nil),            // 34: tiproxy.dataplane.v1.MetricDelta
+	(*MetricsBatch)(nil),           // 35: tiproxy.dataplane.v1.MetricsBatch
+	(*MeteringDelta)(nil),          // 36: tiproxy.dataplane.v1.MeteringDelta
+	(*MeteringBatch)(nil),          // 37: tiproxy.dataplane.v1.MeteringBatch
+	(*ReconcileRequest)(nil),       // 38: tiproxy.dataplane.v1.ReconcileRequest
+	(*ReconcileConnection)(nil),    // 39: tiproxy.dataplane.v1.ReconcileConnection
+	(*ReconcileSnapshot)(nil),      // 40: tiproxy.dataplane.v1.ReconcileSnapshot
+	(*Heartbeat)(nil),              // 41: tiproxy.dataplane.v1.Heartbeat
+	(*ProtocolError)(nil),          // 42: tiproxy.dataplane.v1.ProtocolError
+	nil,                            // 43: tiproxy.dataplane.v1.BackendSnapshot.LabelsEntry
+	nil,                            // 44: tiproxy.dataplane.v1.HandshakeMetadata.ConnectionAttributesEntry
+	nil,                            // 45: tiproxy.dataplane.v1.MetricDelta.LabelsEntry
 }
 var file_dataplane_v1_control_proto_depIdxs = []int32{
 	0,  // 0: tiproxy.dataplane.v1.ControlEnvelope.priority:type_name -> tiproxy.dataplane.v1.Priority
-	7,  // 1: tiproxy.dataplane.v1.ControlEnvelope.hello:type_name -> tiproxy.dataplane.v1.Hello
-	8,  // 2: tiproxy.dataplane.v1.ControlEnvelope.hello_ack:type_name -> tiproxy.dataplane.v1.HelloAck
-	9,  // 3: tiproxy.dataplane.v1.ControlEnvelope.state_snapshot:type_name -> tiproxy.dataplane.v1.StateSnapshot
-	10, // 4: tiproxy.dataplane.v1.ControlEnvelope.snapshot_result:type_name -> tiproxy.dataplane.v1.SnapshotResult
-	19, // 5: tiproxy.dataplane.v1.ControlEnvelope.handshake_response:type_name -> tiproxy.dataplane.v1.HandshakeResponseEvent
-	20, // 6: tiproxy.dataplane.v1.ControlEnvelope.handshake_decision:type_name -> tiproxy.dataplane.v1.HandshakeDecision
-	21, // 7: tiproxy.dataplane.v1.ControlEnvelope.handshake_result:type_name -> tiproxy.dataplane.v1.HandshakeResult
-	23, // 8: tiproxy.dataplane.v1.ControlEnvelope.route_request:type_name -> tiproxy.dataplane.v1.RouteRequest
-	24, // 9: tiproxy.dataplane.v1.ControlEnvelope.route_assignment:type_name -> tiproxy.dataplane.v1.RouteAssignment
-	25, // 10: tiproxy.dataplane.v1.ControlEnvelope.route_result:type_name -> tiproxy.dataplane.v1.RouteResult
-	26, // 11: tiproxy.dataplane.v1.ControlEnvelope.connection_event:type_name -> tiproxy.dataplane.v1.ConnectionEvent
-	27, // 12: tiproxy.dataplane.v1.ControlEnvelope.redirect_command:type_name -> tiproxy.dataplane.v1.RedirectCommand
-	28, // 13: tiproxy.dataplane.v1.ControlEnvelope.redirect_result:type_name -> tiproxy.dataplane.v1.RedirectResult
-	29, // 14: tiproxy.dataplane.v1.ControlEnvelope.drain_command:type_name -> tiproxy.dataplane.v1.DrainCommand
-	30, // 15: tiproxy.dataplane.v1.ControlEnvelope.drain_result:type_name -> tiproxy.dataplane.v1.DrainResult
-	32, // 16: tiproxy.dataplane.v1.ControlEnvelope.metrics_batch:type_name -> tiproxy.dataplane.v1.MetricsBatch
-	34, // 17: tiproxy.dataplane.v1.ControlEnvelope.metering_batch:type_name -> tiproxy.dataplane.v1.MeteringBatch
-	35, // 18: tiproxy.dataplane.v1.ControlEnvelope.reconcile_request:type_name -> tiproxy.dataplane.v1.ReconcileRequest
-	37, // 19: tiproxy.dataplane.v1.ControlEnvelope.reconcile_snapshot:type_name -> tiproxy.dataplane.v1.ReconcileSnapshot
-	38, // 20: tiproxy.dataplane.v1.ControlEnvelope.heartbeat:type_name -> tiproxy.dataplane.v1.Heartbeat
-	39, // 21: tiproxy.dataplane.v1.ControlEnvelope.error:type_name -> tiproxy.dataplane.v1.ProtocolError
-	1,  // 22: tiproxy.dataplane.v1.Hello.role:type_name -> tiproxy.dataplane.v1.Role
-	5,  // 23: tiproxy.dataplane.v1.HelloAck.rejection_code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	11, // 24: tiproxy.dataplane.v1.StateSnapshot.config:type_name -> tiproxy.dataplane.v1.ConfigSnapshot
-	15, // 25: tiproxy.dataplane.v1.StateSnapshot.backends:type_name -> tiproxy.dataplane.v1.BackendSnapshot
-	16, // 26: tiproxy.dataplane.v1.StateSnapshot.namespaces:type_name -> tiproxy.dataplane.v1.NamespaceSnapshot
-	5,  // 27: tiproxy.dataplane.v1.SnapshotResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	12, // 28: tiproxy.dataplane.v1.ConfigSnapshot.frontend_keepalive:type_name -> tiproxy.dataplane.v1.KeepalivePolicy
-	12, // 29: tiproxy.dataplane.v1.ConfigSnapshot.healthy_backend_keepalive:type_name -> tiproxy.dataplane.v1.KeepalivePolicy
-	12, // 30: tiproxy.dataplane.v1.ConfigSnapshot.unhealthy_backend_keepalive:type_name -> tiproxy.dataplane.v1.KeepalivePolicy
-	2,  // 31: tiproxy.dataplane.v1.ConfigSnapshot.proxy_protocol:type_name -> tiproxy.dataplane.v1.ProxyProtocolMode
-	13, // 32: tiproxy.dataplane.v1.ConfigSnapshot.listeners:type_name -> tiproxy.dataplane.v1.Listener
-	14, // 33: tiproxy.dataplane.v1.ConfigSnapshot.frontend_tls:type_name -> tiproxy.dataplane.v1.TlsPolicy
-	14, // 34: tiproxy.dataplane.v1.ConfigSnapshot.backend_tls:type_name -> tiproxy.dataplane.v1.TlsPolicy
-	40, // 35: tiproxy.dataplane.v1.BackendSnapshot.labels:type_name -> tiproxy.dataplane.v1.BackendSnapshot.LabelsEntry
-	41, // 36: tiproxy.dataplane.v1.HandshakeMetadata.connection_attributes:type_name -> tiproxy.dataplane.v1.HandshakeMetadata.ConnectionAttributesEntry
-	17, // 37: tiproxy.dataplane.v1.HandshakeResponseEvent.connection:type_name -> tiproxy.dataplane.v1.ConnectionIdentity
-	18, // 38: tiproxy.dataplane.v1.HandshakeResponseEvent.handshake:type_name -> tiproxy.dataplane.v1.HandshakeMetadata
-	5,  // 39: tiproxy.dataplane.v1.HandshakeDecision.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	4,  // 40: tiproxy.dataplane.v1.HandshakeResult.error_source:type_name -> tiproxy.dataplane.v1.ErrorSource
-	5,  // 41: tiproxy.dataplane.v1.HandshakeResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	22, // 42: tiproxy.dataplane.v1.HandshakeResult.mysql_error:type_name -> tiproxy.dataplane.v1.MysqlError
-	17, // 43: tiproxy.dataplane.v1.RouteRequest.connection:type_name -> tiproxy.dataplane.v1.ConnectionIdentity
-	18, // 44: tiproxy.dataplane.v1.RouteRequest.handshake:type_name -> tiproxy.dataplane.v1.HandshakeMetadata
-	5,  // 45: tiproxy.dataplane.v1.RouteAssignment.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	4,  // 46: tiproxy.dataplane.v1.RouteResult.error_source:type_name -> tiproxy.dataplane.v1.ErrorSource
-	5,  // 47: tiproxy.dataplane.v1.RouteResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	3,  // 48: tiproxy.dataplane.v1.ConnectionEvent.kind:type_name -> tiproxy.dataplane.v1.ConnectionEventKind
-	17, // 49: tiproxy.dataplane.v1.ConnectionEvent.connection:type_name -> tiproxy.dataplane.v1.ConnectionIdentity
-	4,  // 50: tiproxy.dataplane.v1.ConnectionEvent.error_source:type_name -> tiproxy.dataplane.v1.ErrorSource
-	5,  // 51: tiproxy.dataplane.v1.RedirectResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	5,  // 52: tiproxy.dataplane.v1.DrainResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	42, // 53: tiproxy.dataplane.v1.MetricDelta.labels:type_name -> tiproxy.dataplane.v1.MetricDelta.LabelsEntry
-	31, // 54: tiproxy.dataplane.v1.MetricsBatch.metrics:type_name -> tiproxy.dataplane.v1.MetricDelta
-	33, // 55: tiproxy.dataplane.v1.MeteringBatch.deltas:type_name -> tiproxy.dataplane.v1.MeteringDelta
-	36, // 56: tiproxy.dataplane.v1.ReconcileSnapshot.connections:type_name -> tiproxy.dataplane.v1.ReconcileConnection
-	5,  // 57: tiproxy.dataplane.v1.ProtocolError.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	58, // [58:58] is the sub-list for method output_type
-	58, // [58:58] is the sub-list for method input_type
-	58, // [58:58] is the sub-list for extension type_name
-	58, // [58:58] is the sub-list for extension extendee
-	0,  // [0:58] is the sub-list for field type_name
+	8,  // 1: tiproxy.dataplane.v1.ControlEnvelope.hello:type_name -> tiproxy.dataplane.v1.Hello
+	9,  // 2: tiproxy.dataplane.v1.ControlEnvelope.hello_ack:type_name -> tiproxy.dataplane.v1.HelloAck
+	10, // 3: tiproxy.dataplane.v1.ControlEnvelope.state_snapshot:type_name -> tiproxy.dataplane.v1.StateSnapshot
+	11, // 4: tiproxy.dataplane.v1.ControlEnvelope.snapshot_result:type_name -> tiproxy.dataplane.v1.SnapshotResult
+	20, // 5: tiproxy.dataplane.v1.ControlEnvelope.handshake_response:type_name -> tiproxy.dataplane.v1.HandshakeResponseEvent
+	21, // 6: tiproxy.dataplane.v1.ControlEnvelope.handshake_decision:type_name -> tiproxy.dataplane.v1.HandshakeDecision
+	22, // 7: tiproxy.dataplane.v1.ControlEnvelope.handshake_result:type_name -> tiproxy.dataplane.v1.HandshakeResult
+	24, // 8: tiproxy.dataplane.v1.ControlEnvelope.route_request:type_name -> tiproxy.dataplane.v1.RouteRequest
+	25, // 9: tiproxy.dataplane.v1.ControlEnvelope.route_assignment:type_name -> tiproxy.dataplane.v1.RouteAssignment
+	26, // 10: tiproxy.dataplane.v1.ControlEnvelope.route_result:type_name -> tiproxy.dataplane.v1.RouteResult
+	27, // 11: tiproxy.dataplane.v1.ControlEnvelope.connection_event:type_name -> tiproxy.dataplane.v1.ConnectionEvent
+	28, // 12: tiproxy.dataplane.v1.ControlEnvelope.redirect_command:type_name -> tiproxy.dataplane.v1.RedirectCommand
+	29, // 13: tiproxy.dataplane.v1.ControlEnvelope.redirect_result:type_name -> tiproxy.dataplane.v1.RedirectResult
+	32, // 14: tiproxy.dataplane.v1.ControlEnvelope.drain_command:type_name -> tiproxy.dataplane.v1.DrainCommand
+	33, // 15: tiproxy.dataplane.v1.ControlEnvelope.drain_result:type_name -> tiproxy.dataplane.v1.DrainResult
+	35, // 16: tiproxy.dataplane.v1.ControlEnvelope.metrics_batch:type_name -> tiproxy.dataplane.v1.MetricsBatch
+	37, // 17: tiproxy.dataplane.v1.ControlEnvelope.metering_batch:type_name -> tiproxy.dataplane.v1.MeteringBatch
+	38, // 18: tiproxy.dataplane.v1.ControlEnvelope.reconcile_request:type_name -> tiproxy.dataplane.v1.ReconcileRequest
+	40, // 19: tiproxy.dataplane.v1.ControlEnvelope.reconcile_snapshot:type_name -> tiproxy.dataplane.v1.ReconcileSnapshot
+	41, // 20: tiproxy.dataplane.v1.ControlEnvelope.heartbeat:type_name -> tiproxy.dataplane.v1.Heartbeat
+	42, // 21: tiproxy.dataplane.v1.ControlEnvelope.error:type_name -> tiproxy.dataplane.v1.ProtocolError
+	30, // 22: tiproxy.dataplane.v1.ControlEnvelope.close_command:type_name -> tiproxy.dataplane.v1.CloseCommand
+	31, // 23: tiproxy.dataplane.v1.ControlEnvelope.close_result:type_name -> tiproxy.dataplane.v1.CloseResult
+	1,  // 24: tiproxy.dataplane.v1.Hello.role:type_name -> tiproxy.dataplane.v1.Role
+	6,  // 25: tiproxy.dataplane.v1.HelloAck.rejection_code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	12, // 26: tiproxy.dataplane.v1.StateSnapshot.config:type_name -> tiproxy.dataplane.v1.ConfigSnapshot
+	16, // 27: tiproxy.dataplane.v1.StateSnapshot.backends:type_name -> tiproxy.dataplane.v1.BackendSnapshot
+	17, // 28: tiproxy.dataplane.v1.StateSnapshot.namespaces:type_name -> tiproxy.dataplane.v1.NamespaceSnapshot
+	6,  // 29: tiproxy.dataplane.v1.SnapshotResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	13, // 30: tiproxy.dataplane.v1.ConfigSnapshot.frontend_keepalive:type_name -> tiproxy.dataplane.v1.KeepalivePolicy
+	13, // 31: tiproxy.dataplane.v1.ConfigSnapshot.healthy_backend_keepalive:type_name -> tiproxy.dataplane.v1.KeepalivePolicy
+	13, // 32: tiproxy.dataplane.v1.ConfigSnapshot.unhealthy_backend_keepalive:type_name -> tiproxy.dataplane.v1.KeepalivePolicy
+	3,  // 33: tiproxy.dataplane.v1.ConfigSnapshot.proxy_protocol:type_name -> tiproxy.dataplane.v1.ProxyProtocolMode
+	14, // 34: tiproxy.dataplane.v1.ConfigSnapshot.listeners:type_name -> tiproxy.dataplane.v1.Listener
+	15, // 35: tiproxy.dataplane.v1.ConfigSnapshot.frontend_tls:type_name -> tiproxy.dataplane.v1.TlsPolicy
+	15, // 36: tiproxy.dataplane.v1.ConfigSnapshot.backend_tls:type_name -> tiproxy.dataplane.v1.TlsPolicy
+	43, // 37: tiproxy.dataplane.v1.BackendSnapshot.labels:type_name -> tiproxy.dataplane.v1.BackendSnapshot.LabelsEntry
+	44, // 38: tiproxy.dataplane.v1.HandshakeMetadata.connection_attributes:type_name -> tiproxy.dataplane.v1.HandshakeMetadata.ConnectionAttributesEntry
+	18, // 39: tiproxy.dataplane.v1.HandshakeResponseEvent.connection:type_name -> tiproxy.dataplane.v1.ConnectionIdentity
+	19, // 40: tiproxy.dataplane.v1.HandshakeResponseEvent.handshake:type_name -> tiproxy.dataplane.v1.HandshakeMetadata
+	6,  // 41: tiproxy.dataplane.v1.HandshakeDecision.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	5,  // 42: tiproxy.dataplane.v1.HandshakeResult.error_source:type_name -> tiproxy.dataplane.v1.ErrorSource
+	6,  // 43: tiproxy.dataplane.v1.HandshakeResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	23, // 44: tiproxy.dataplane.v1.HandshakeResult.mysql_error:type_name -> tiproxy.dataplane.v1.MysqlError
+	18, // 45: tiproxy.dataplane.v1.RouteRequest.connection:type_name -> tiproxy.dataplane.v1.ConnectionIdentity
+	19, // 46: tiproxy.dataplane.v1.RouteRequest.handshake:type_name -> tiproxy.dataplane.v1.HandshakeMetadata
+	6,  // 47: tiproxy.dataplane.v1.RouteAssignment.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	5,  // 48: tiproxy.dataplane.v1.RouteResult.error_source:type_name -> tiproxy.dataplane.v1.ErrorSource
+	6,  // 49: tiproxy.dataplane.v1.RouteResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	4,  // 50: tiproxy.dataplane.v1.ConnectionEvent.kind:type_name -> tiproxy.dataplane.v1.ConnectionEventKind
+	18, // 51: tiproxy.dataplane.v1.ConnectionEvent.connection:type_name -> tiproxy.dataplane.v1.ConnectionIdentity
+	5,  // 52: tiproxy.dataplane.v1.ConnectionEvent.error_source:type_name -> tiproxy.dataplane.v1.ErrorSource
+	6,  // 53: tiproxy.dataplane.v1.RedirectResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	5,  // 54: tiproxy.dataplane.v1.CloseCommand.error_source:type_name -> tiproxy.dataplane.v1.ErrorSource
+	6,  // 55: tiproxy.dataplane.v1.CloseResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	6,  // 56: tiproxy.dataplane.v1.DrainResult.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	45, // 57: tiproxy.dataplane.v1.MetricDelta.labels:type_name -> tiproxy.dataplane.v1.MetricDelta.LabelsEntry
+	34, // 58: tiproxy.dataplane.v1.MetricsBatch.metrics:type_name -> tiproxy.dataplane.v1.MetricDelta
+	36, // 59: tiproxy.dataplane.v1.MeteringBatch.deltas:type_name -> tiproxy.dataplane.v1.MeteringDelta
+	39, // 60: tiproxy.dataplane.v1.ReconcileRequest.connections:type_name -> tiproxy.dataplane.v1.ReconcileConnection
+	39, // 61: tiproxy.dataplane.v1.ReconcileSnapshot.connections:type_name -> tiproxy.dataplane.v1.ReconcileConnection
+	6,  // 62: tiproxy.dataplane.v1.ProtocolError.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	63, // [63:63] is the sub-list for method output_type
+	63, // [63:63] is the sub-list for method input_type
+	63, // [63:63] is the sub-list for extension type_name
+	63, // [63:63] is the sub-list for extension extendee
+	0,  // [0:63] is the sub-list for field type_name
 }
 
 func init() { file_dataplane_v1_control_proto_init() }
@@ -3992,14 +4262,16 @@ func file_dataplane_v1_control_proto_init() {
 		(*ControlEnvelope_ReconcileSnapshot)(nil),
 		(*ControlEnvelope_Heartbeat)(nil),
 		(*ControlEnvelope_Error)(nil),
+		(*ControlEnvelope_CloseCommand)(nil),
+		(*ControlEnvelope_CloseResult)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_dataplane_v1_control_proto_rawDesc), len(file_dataplane_v1_control_proto_rawDesc)),
-			NumEnums:      6,
-			NumMessages:   37,
+			NumEnums:      7,
+			NumMessages:   39,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

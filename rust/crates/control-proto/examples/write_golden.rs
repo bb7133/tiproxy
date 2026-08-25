@@ -19,8 +19,9 @@ use std::path::PathBuf;
 
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
-    BackendSnapshot, ConfigSnapshot, ControlEnvelope, KeepalivePolicy, Listener, NamespaceSnapshot,
-    Priority, ProxyProtocolMode, StateSnapshot,
+    BackendSnapshot, ConfigSnapshot, ControlCapability, ControlEnvelope, KeepalivePolicy, Listener,
+    NamespaceSnapshot, Priority, ProxyProtocolMode, ReconcileConnection, ReconcileRequest,
+    StateSnapshot,
 };
 use control_proto::{DEFAULT_MAX_FRAME_BYTES, encode_frame};
 
@@ -81,9 +82,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }],
         })),
     };
-    let frame = encode_frame(&envelope, DEFAULT_MAX_FRAME_BYTES)?;
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let path = repository.join("proto/dataplane/v1/testdata/rust-snapshot.frame");
+    write_frame(&repository, "rust-snapshot.frame", &envelope)?;
+    write_frame(
+        &repository,
+        "rust-reconcile.frame",
+        &ControlEnvelope {
+            protocol_version: 1,
+            control_epoch: 53,
+            request_id: 102,
+            priority: Priority::Critical.into(),
+            required_capabilities: vec![ControlCapability::ReconcileConnections as u64],
+            body: Some(Body::ReconcileRequest(ReconcileRequest {
+                known_generation: 11,
+                last_connection_event_sequence: 21,
+                last_metrics_sequence: 22,
+                last_metering_sequence: 23,
+                connections: vec![ReconcileConnection {
+                    connection_id: 77,
+                    backend_id: "backend-1".into(),
+                    namespace: "default".into(),
+                    redirect_pending: true,
+                }],
+            })),
+            ..Default::default()
+        },
+    )?;
+    Ok(())
+}
+
+fn write_frame(
+    repository: &std::path::Path,
+    name: &str,
+    envelope: &ControlEnvelope,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let frame = encode_frame(envelope, DEFAULT_MAX_FRAME_BYTES)?;
+    let path = repository.join("proto/dataplane/v1/testdata").join(name);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

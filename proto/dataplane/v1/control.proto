@@ -40,6 +40,8 @@ message ControlEnvelope {
     ReconcileSnapshot reconcile_snapshot = 38;
     Heartbeat heartbeat = 39;
     ProtocolError error = 40;
+    CloseCommand close_command = 41;
+    CloseResult close_result = 42;
   }
 }
 
@@ -54,6 +56,14 @@ enum Role {
   ROLE_UNSPECIFIED = 0;
   ROLE_GO_CONTROL = 1;
   ROLE_RUST_DATAPLANE = 2;
+}
+
+// ControlCapability values are advertised as uint64 values in Hello. Values
+// are never reused because they gate additive messages and required fields.
+enum ControlCapability {
+  CONTROL_CAPABILITY_UNSPECIFIED = 0;
+  CONTROL_CAPABILITY_PER_CONNECTION_CLOSE = 1;
+  CONTROL_CAPABILITY_RECONCILE_CONNECTIONS = 2;
 }
 
 message Hello {
@@ -273,6 +283,22 @@ message RedirectResult {
   string detail = 7;
 }
 
+message CloseCommand {
+  uint64 connection_id = 1;
+  string close_id = 2;
+  ErrorSource error_source = 3;
+  string reason = 4;
+  bool force = 5;
+}
+
+message CloseResult {
+  uint64 connection_id = 1;
+  string close_id = 2;
+  bool accepted = 3;
+  ErrorCode code = 4;
+  string detail = 5;
+}
+
 message DrainCommand {
   string drain_id = 1;
   repeated string listener_names = 2;
@@ -322,6 +348,7 @@ message ReconcileRequest {
   uint64 last_connection_event_sequence = 2;
   uint64 last_metrics_sequence = 3;
   uint64 last_metering_sequence = 4;
+  repeated ReconcileConnection connections = 5;
 }
 
 message ReconcileConnection {
