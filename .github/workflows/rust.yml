@@ -75,6 +75,8 @@ jobs:
           key: rust-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
       - name: Verify generated control protocol sources and goldens
         run: make control-proto-generate-check
+      - name: Run Go control bridge tests
+        run: go test -race ./pkg/controlbridge/...
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests
