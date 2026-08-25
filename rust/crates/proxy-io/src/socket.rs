@@ -35,6 +35,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream, lookup_host};
@@ -260,8 +261,10 @@ pub async fn dial_with_backoff(
     let started = Instant::now();
     let deadline = started + policy.total_timeout;
     let mut backoff = policy.backoff_initial;
-    // Deterministic jitter state; randomization 0 disables jitter entirely.
-    let mut jitter_state = 0x9e37_79b9_u64;
+    // Per-dial jitter seed: a shared fixed seed would synchronize backoff
+    // across connections and defeat the thundering-herd randomization that
+    // Go's backoff provides. Randomization 0 disables jitter entirely.
+    let mut jitter_state = next_dial_seed();
     let mut cancelled = cancel.subscribe();
     let mut last_error: Option<io::Error> = None;
 
@@ -348,6 +351,16 @@ fn budget_error(target: &str, policy: DialPolicy, last_error: Option<io::Error>)
     )
 }
 
+static DIAL_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+/// Returns a distinct odd seed per dial without a global RNG dependency.
+fn next_dial_seed() -> u64 {
+    DIAL_SEED
+        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        .wrapping_mul(0x2545_f491_4f6c_dd1d)
+        | 1
+}
+
 /// Bounded multiplicative jitter without a global RNG: xorshift over the
 /// caller-scoped state, scaled into `[1 - r, 1 + r]` like Go's backoff.
 fn jittered(base: Duration, randomization: f64, state: &mut u64) -> Duration {
@@ -390,6 +403,10 @@ pub struct KeepaliveReadback {
     pub idle: Option<Duration>,
     /// `TCP_KEEPINTVL` when readable on this platform.
     pub interval: Option<Duration>,
+    /// `TCP_KEEPCNT` when readable on this platform.
+    pub probes: Option<u32>,
+    /// `TCP_USER_TIMEOUT` when readable on this platform (Linux).
+    pub user_timeout: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -437,6 +454,17 @@ mod keepalive_unix {
                     source,
                 })?;
         }
+        // Go's darwin build maps the timeout to TCP_RXT_CONNDROPTIME; this
+        // crate forbids unsafe code and socket2 exposes no equivalent, so a
+        // nonzero request must fail with a diagnostic instead of silently
+        // succeeding with weaker semantics.
+        #[cfg(not(target_os = "linux"))]
+        if !policy.user_timeout.is_zero() {
+            return Err(SocketError::UnsupportedPlatform {
+                feature: "TCP_USER_TIMEOUT (Go darwin uses TCP_RXT_CONNDROPTIME; \
+                          not exposed without unsafe code on this platform)",
+            });
+        }
         Ok(())
     }
 
@@ -449,10 +477,17 @@ mod keepalive_unix {
         })?;
         let idle: Option<Duration> = socket.tcp_keepalive_time().ok();
         let interval: Option<Duration> = socket.tcp_keepalive_interval().ok();
+        let probes: Option<u32> = socket.tcp_keepalive_retries().ok();
+        #[cfg(target_os = "linux")]
+        let user_timeout: Option<Duration> = socket.tcp_user_timeout().ok().flatten();
+        #[cfg(not(target_os = "linux"))]
+        let user_timeout: Option<Duration> = None;
         Ok(KeepaliveReadback {
             enabled,
             idle,
             interval,
+            probes,
+            user_timeout,
         })
     }
 }
@@ -516,19 +551,33 @@ pub struct OwnedProxyHeader {
     pub tlvs: Vec<(u8, Vec<u8>)>,
 }
 
-/// Reads a PROXY v2 header off a live socket when one is present.
+/// Result of probing a live socket for a PROXY v2 header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyProbeOutcome {
+    /// The decoded header, when the client sent one.
+    pub header: Option<OwnedProxyHeader>,
+    /// Application bytes consumed by the probe that belong to the `MySQL`
+    /// stream. Empty when disabled or when a header was consumed exactly;
+    /// nonempty only for a non-PROXY client, whose probed bytes must be
+    /// replayed (for example through [`crate::tls::PrefixedIo`]) before the
+    /// stream is used.
+    pub replay: Vec<u8>,
+}
+
+/// Probes a live socket for a PROXY v2 header.
 ///
-/// This is the production integration of the WIRE-05 codec, matching Go
-/// `pkg/proxy/net/proxy.go`:
+/// Mechanics match Go `pkg/proxy/net/proxy.go`: a four-byte probe decides
+/// most non-PROXY clients, then the full magic confirms, then exactly the
+/// header is consumed. Like Go's `bufio` peek — which also consumes from the
+/// kernel into a userspace buffer and replays it — a non-PROXY client's
+/// probed bytes are returned in `replay` so the application stream remains
+/// byte-identical. Reads block for data instead of spinning on readiness,
+/// so a slow or stalled client is bounded by `deadline` without burning CPU.
 ///
-/// - `enabled == false`: nothing is peeked or consumed — zero bytes.
-/// - Enabled with a non-PROXY client: bytes are only peeked; the `MySQL`
-///   stream is untouched (fallback mode consumes nothing).
-/// - Enabled with a PROXY client: exactly the header bytes are consumed and
-///   the remainder of the stream starts at the first `MySQL` byte.
-///
-/// The four-byte probe happens first, like Go, so a non-PROXY client that
-/// sent at least four bytes is classified without waiting for twelve.
+/// - `enabled == false`: nothing is read — zero bytes touched, empty replay.
+/// - Enabled, non-PROXY client: probed bytes are returned for replay; the
+///   stream carries the rest untouched.
+/// - Enabled, PROXY client: exactly the header is consumed; empty replay.
 ///
 /// # Errors
 ///
@@ -538,9 +587,12 @@ pub async fn read_proxy_header_if_present(
     stream: &mut TcpStream,
     enabled: bool,
     deadline: Duration,
-) -> Result<Option<OwnedProxyHeader>, SocketError> {
+) -> Result<ProxyProbeOutcome, SocketError> {
     if !enabled {
-        return Ok(None);
+        return Ok(ProxyProbeOutcome {
+            header: None,
+            replay: Vec::new(),
+        });
     }
     let result = timeout(deadline, read_proxy_header_inner(stream)).await;
     match result {
@@ -549,30 +601,37 @@ pub async fn read_proxy_header_if_present(
     }
 }
 
-async fn read_proxy_header_inner(
-    stream: &mut TcpStream,
-) -> Result<Option<OwnedProxyHeader>, SocketError> {
+async fn read_proxy_header_inner(stream: &mut TcpStream) -> Result<ProxyProbeOutcome, SocketError> {
     use tokio::io::AsyncReadExt;
 
-    // Go probes four bytes first to avoid blocking for a full magic when the
-    // client never sends one.
+    // Go probes four bytes first to avoid waiting for a full magic when the
+    // client never sends one. read_exact parks until data arrives, so there
+    // is no readiness spin and the outer deadline stays enforceable.
     let mut probe = [0_u8; FIXED_HEADER_LEN];
-    peek_exact(stream, &mut probe).await?;
-    if probe != MAGIC_V2[..FIXED_HEADER_LEN] {
-        return Ok(None);
-    }
-    let mut magic = [0_u8; MAGIC_V2.len()];
-    peek_exact(stream, &mut magic).await?;
-    if sniff_magic(&magic) != MagicSniff::Proxy {
-        return Ok(None);
-    }
-
-    // Confirmed PROXY: consume the magic and the fixed header, then the body.
-    let mut consumed_magic = [0_u8; MAGIC_V2.len()];
     stream
-        .read_exact(&mut consumed_magic)
+        .read_exact(&mut probe)
         .await
         .map_err(|source| SocketError::ProxyHeader { source })?;
+    if probe != MAGIC_V2[..FIXED_HEADER_LEN] {
+        return Ok(ProxyProbeOutcome {
+            header: None,
+            replay: probe.to_vec(),
+        });
+    }
+    let mut magic = [0_u8; MAGIC_V2.len()];
+    magic[..FIXED_HEADER_LEN].copy_from_slice(&probe);
+    stream
+        .read_exact(&mut magic[FIXED_HEADER_LEN..])
+        .await
+        .map_err(|source| SocketError::ProxyHeader { source })?;
+    if sniff_magic(&magic) != MagicSniff::Proxy {
+        return Ok(ProxyProbeOutcome {
+            header: None,
+            replay: magic.to_vec(),
+        });
+    }
+
+    // Confirmed PROXY: consume the fixed header, then the declared body.
     let mut fixed = [0_u8; FIXED_HEADER_LEN];
     stream
         .read_exact(&mut fixed)
@@ -598,17 +657,20 @@ async fn read_proxy_header_inner(
                 }
                 ProxyAddresses::Unix { .. } | ProxyAddresses::None => (None, None),
             };
-            Ok(Some(OwnedProxyHeader {
-                version: header.version,
-                command: header.command,
-                source,
-                destination,
-                tlvs: header
-                    .tlvs
-                    .iter()
-                    .map(|tlv| (tlv.type_byte, tlv.content.to_vec()))
-                    .collect(),
-            }))
+            Ok(ProxyProbeOutcome {
+                header: Some(OwnedProxyHeader {
+                    version: header.version,
+                    command: header.command,
+                    source,
+                    destination,
+                    tlvs: header
+                        .tlvs
+                        .iter()
+                        .map(|tlv| (tlv.type_byte, tlv.content.to_vec()))
+                        .collect(),
+                }),
+                replay: Vec::new(),
+            })
         }
         ProxyV2Decode::Incomplete { .. } => Err(SocketError::ProxyHeader {
             source: io::Error::new(
@@ -619,26 +681,32 @@ async fn read_proxy_header_inner(
     }
 }
 
-/// Peeks until `buffer` is filled without consuming any bytes.
-async fn peek_exact(stream: &TcpStream, buffer: &mut [u8]) -> Result<(), SocketError> {
-    loop {
-        let peeked = stream
-            .peek(buffer)
-            .await
-            .map_err(|source| SocketError::ProxyHeader { source })?;
-        if peeked == buffer.len() {
-            return Ok(());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dial_seeds_differ_and_zero_randomization_is_deterministic() {
+        let first = next_dial_seed();
+        let second = next_dial_seed();
+        assert_ne!(first, second, "each dial must get a distinct jitter seed");
+
+        // With randomization 0 the jitter is the identity regardless of seed.
+        let mut state_a = first;
+        let mut state_b = second;
+        let base = Duration::from_millis(100);
+        assert_eq!(jittered(base, 0.0, &mut state_a), base);
+        assert_eq!(jittered(base, 0.0, &mut state_b), base);
+
+        // With randomization on, distinct seeds produce distinct sequences
+        // bounded inside [1 - r, 1 + r].
+        let mut state_a = first;
+        let mut state_b = second;
+        let sequence_a: Vec<Duration> = (0..4).map(|_| jittered(base, 0.5, &mut state_a)).collect();
+        let sequence_b: Vec<Duration> = (0..4).map(|_| jittered(base, 0.5, &mut state_b)).collect();
+        assert_ne!(sequence_a, sequence_b, "sequences must not synchronize");
+        for value in sequence_a.iter().chain(sequence_b.iter()) {
+            assert!(*value >= base / 2 && *value <= base * 3 / 2);
         }
-        if peeked == 0 {
-            return Err(SocketError::ProxyHeader {
-                source: io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed during probe"),
-            });
-        }
-        // Yield until more bytes arrive; peek does not consume, so a tight
-        // loop would spin. readable() parks until the socket has new data.
-        stream
-            .readable()
-            .await
-            .map_err(|source| SocketError::ProxyHeader { source })?;
     }
 }

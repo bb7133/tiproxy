@@ -29,6 +29,7 @@ use proxy_io::socket::{
     DialPolicy, KeepalivePolicy, SocketError, apply_keepalive, bind_listeners, configure_stream,
     dial_with_backoff, read_keepalive, read_proxy_header_if_present,
 };
+use proxy_io::tls::PrefixedIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
@@ -149,16 +150,28 @@ async fn dial_budget_is_enforced() -> Result<(), Box<dyn Error>> {
 /// the platform exposes it; enablement is observable everywhere on Unix.
 #[tokio::test]
 #[cfg(unix)]
-async fn keepalive_switch_is_observable() -> Result<(), Box<dyn Error>> {
+async fn keepalive_switch_is_observable_portable() -> Result<(), Box<dyn Error>> {
     let bound = bind_listeners(&[loopback(0)]).await?;
     let client = TcpStream::connect(bound[0].actual_address).await?;
     let (server, _) = bound[0].listener.accept().await?;
 
-    apply_keepalive(&server, KeepalivePolicy::backend_healthy_default())?;
+    // Off-Linux, a nonzero user timeout must be an explicit diagnostic; use
+    // zeroed values in the portable test and assert the diagnostic directly.
+    let zero_timeout = |policy: KeepalivePolicy| KeepalivePolicy {
+        user_timeout: Duration::ZERO,
+        ..policy
+    };
+    apply_keepalive(
+        &server,
+        zero_timeout(KeepalivePolicy::backend_healthy_default()),
+    )?;
     let healthy = read_keepalive(&server)?;
     assert!(healthy.enabled);
 
-    apply_keepalive(&server, KeepalivePolicy::backend_unhealthy_default())?;
+    apply_keepalive(
+        &server,
+        zero_timeout(KeepalivePolicy::backend_unhealthy_default()),
+    )?;
     let unhealthy = read_keepalive(&server)?;
     assert!(unhealthy.enabled);
     if let (Some(healthy_idle), Some(unhealthy_idle)) = (healthy.idle, unhealthy.idle) {
@@ -167,16 +180,66 @@ async fn keepalive_switch_is_observable() -> Result<(), Box<dyn Error>> {
         assert_ne!(healthy_idle, unhealthy_idle, "switch must be observable");
     }
 
-    // Disabled probing still applies cleanly (Go still sets the user timeout).
     apply_keepalive(
         &server,
         KeepalivePolicy {
             enabled: false,
-            ..KeepalivePolicy::backend_healthy_default()
+            ..zero_timeout(KeepalivePolicy::backend_healthy_default())
         },
     )?;
     let disabled = read_keepalive(&server)?;
     assert!(!disabled.enabled);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let result = apply_keepalive(&server, KeepalivePolicy::backend_healthy_default());
+        assert!(
+            matches!(result, Err(SocketError::UnsupportedPlatform { .. })),
+            "nonzero user timeout must not silently succeed off-Linux"
+        );
+    }
+    drop(client);
+    Ok(())
+}
+
+/// Linux CI: exact Go `DefaultKeepAlive` values are observable, including
+/// probes and `TCP_USER_TIMEOUT`, and a disabled policy retains the user
+/// timeout exactly like Go's `setTimeout` outside the enabled branch.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn keepalive_exact_values_on_linux() -> Result<(), Box<dyn Error>> {
+    let bound = bind_listeners(&[loopback(0)]).await?;
+    let client = TcpStream::connect(bound[0].actual_address).await?;
+    let (server, _) = bound[0].listener.accept().await?;
+
+    apply_keepalive(&server, KeepalivePolicy::backend_healthy_default())?;
+    let healthy = read_keepalive(&server)?;
+    assert_eq!(healthy.idle, Some(Duration::from_secs(60)));
+    assert_eq!(healthy.probes, Some(5));
+    assert_eq!(healthy.interval, Some(Duration::from_secs(3)));
+    assert_eq!(healthy.user_timeout, Some(Duration::from_secs(15)));
+
+    apply_keepalive(&server, KeepalivePolicy::backend_unhealthy_default())?;
+    let unhealthy = read_keepalive(&server)?;
+    assert_eq!(unhealthy.idle, Some(Duration::from_secs(10)));
+    assert_eq!(unhealthy.probes, Some(5));
+    assert_eq!(unhealthy.interval, Some(Duration::from_secs(1)));
+    assert_eq!(unhealthy.user_timeout, Some(Duration::from_secs(5)));
+
+    apply_keepalive(
+        &server,
+        KeepalivePolicy {
+            enabled: false,
+            ..KeepalivePolicy::backend_unhealthy_default()
+        },
+    )?;
+    let disabled = read_keepalive(&server)?;
+    assert!(!disabled.enabled);
+    assert_eq!(
+        disabled.user_timeout,
+        Some(Duration::from_secs(5)),
+        "user timeout must apply even when probing is disabled, like Go"
+    );
     drop(client);
     Ok(())
 }
@@ -187,23 +250,27 @@ async fn keepalive_switch_is_observable() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 async fn proxy_disabled_and_fallback_consume_nothing_on_live_socket() -> Result<(), Box<dyn Error>>
 {
-    // Disabled: not even a peek — client sends nothing and the call returns.
+    // Disabled: nothing is read — client sends nothing and the call returns.
     let bound = bind_listeners(&[loopback(0)]).await?;
     let _client = TcpStream::connect(bound[0].actual_address).await?;
     let (mut server, _) = bound[0].listener.accept().await?;
-    let header = read_proxy_header_if_present(&mut server, false, PROXY_DEADLINE).await?;
-    assert!(header.is_none());
+    let outcome = read_proxy_header_if_present(&mut server, false, PROXY_DEADLINE).await?;
+    assert!(outcome.header.is_none());
+    assert!(outcome.replay.is_empty());
 
-    // Enabled + plain client: peeked only, every byte still readable.
+    // Enabled + plain client: probed bytes come back in `replay`; replaying
+    // them ahead of the stream reconstructs the exact application bytes.
     let bound = bind_listeners(&[loopback(0)]).await?;
     let mut client = TcpStream::connect(bound[0].actual_address).await?;
     let (mut server, _) = bound[0].listener.accept().await?;
     client.write_all(b"plain mysql bytes").await?;
     client.flush().await?;
-    let header = read_proxy_header_if_present(&mut server, true, PROXY_DEADLINE).await?;
-    assert!(header.is_none());
+    let outcome = read_proxy_header_if_present(&mut server, true, PROXY_DEADLINE).await?;
+    assert!(outcome.header.is_none());
+    assert_eq!(outcome.replay, b"plai");
+    let mut replayed = PrefixedIo::new(server, outcome.replay);
     let mut received = vec![0_u8; 17];
-    server.read_exact(&mut received).await?;
+    replayed.read_exact(&mut received).await?;
     assert_eq!(&received, b"plain mysql bytes");
     Ok(())
 }
@@ -232,9 +299,9 @@ async fn proxy_header_is_consumed_exactly_on_live_socket() -> Result<(), Box<dyn
     client.write_all(&wire).await?;
     client.flush().await?;
 
-    let header = read_proxy_header_if_present(&mut server, true, PROXY_DEADLINE)
-        .await?
-        .ok_or("expected a PROXY header")?;
+    let outcome = read_proxy_header_if_present(&mut server, true, PROXY_DEADLINE).await?;
+    assert!(outcome.replay.is_empty());
+    let header = outcome.header.ok_or("expected a PROXY header")?;
     assert_eq!(header.command, ProxyCommand::PROXY);
     assert_eq!(
         header.source,
@@ -249,5 +316,53 @@ async fn proxy_header_is_consumed_exactly_on_live_socket() -> Result<(), Box<dyn
     let mut rest = vec![0_u8; 16];
     server.read_exact(&mut rest).await?;
     assert_eq!(&rest, b"mysql-first-byte");
+    Ok(())
+}
+
+/// Regression for the probe busy-loop: a client that sends only part of the
+/// magic and stalls must trip the deadline on time, on the single-threaded
+/// runtime, while other tasks keep making progress.
+#[tokio::test]
+async fn partial_magic_times_out_without_starving_runtime() -> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let bound = bind_listeners(&[loopback(0)]).await?;
+    let mut client = TcpStream::connect(bound[0].actual_address).await?;
+    let (mut server, _) = bound[0].listener.accept().await?;
+
+    // Two bytes of magic, then silence.
+    client
+        .write_all(&proxy_io::proxy_protocol::MAGIC_V2[..2])
+        .await?;
+    client.flush().await?;
+
+    // A heartbeat task that must keep advancing while the probe waits.
+    let beats = Arc::new(AtomicU64::new(0));
+    let beat_counter = Arc::clone(&beats);
+    let heartbeat = tokio::spawn(async move {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            beat_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let deadline = Duration::from_millis(300);
+    let started = Instant::now();
+    let result = read_proxy_header_if_present(&mut server, true, deadline).await;
+    let elapsed = started.elapsed();
+    assert!(matches!(
+        result,
+        Err(SocketError::ProxyHeaderTimeout { .. })
+    ));
+    assert!(
+        elapsed >= deadline && elapsed < deadline + Duration::from_secs(1),
+        "deadline must fire on time, got {elapsed:?}"
+    );
+    assert!(
+        beats.load(Ordering::Relaxed) >= 10,
+        "runtime was starved during the probe wait"
+    );
+    heartbeat.await?;
     Ok(())
 }
