@@ -19,6 +19,7 @@ repository = "https://github.com/pingcap/tiproxy"
 
 [workspace.dependencies]
 control-proto = { path = "crates/control-proto", version = "0.1.0" }
+criterion = { version = "=0.8.2", default-features = false }
 dataplane = { path = "crates/dataplane", version = "0.1.0" }
 displaydoc = { version = "=0.2.5", default-features = false }
 flate2 = { version = "=1.1.2", default-features = false, features = ["rust_backend"] }
@@ -35,6 +36,8 @@ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["rin
 tokio = { version = "=1.47.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 thiserror = { version = "=2.0.17", default-features = false }
 x509-parser = { version = "=0.18.1", default-features = false }
+zstd-pure-rs = { version = "=0.1.2", default-features = false, features = ["std"] }
+zstd-zero = { version = "=0.1.0", default-features = false }
 
 [workspace.lints.rust]
 missing_docs = "deny"

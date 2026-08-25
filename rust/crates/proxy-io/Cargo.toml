@@ -13,6 +13,7 @@ default = []
 
 [dependencies]
 control-proto.workspace = true
+flate2.workspace = true
 mysql-wire.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
@@ -20,10 +21,16 @@ socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+zstd-pure-rs.workspace = true
+zstd-zero.workspace = true
 
 [dev-dependencies]
-flate2.workspace = true
+criterion.workspace = true
 rcgen.workspace = true
+
+[[bench]]
+name = "compression"
+harness = false
 
 [lints]
 workspace = true
