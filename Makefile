@@ -43,7 +43,7 @@ CARGO_DENY_VERSION := 0.20.2
 RUST_TOOL_ROOT ?= $(GOBIN)/rust-tools
 RUST_TOOL_BIN := $(RUST_TOOL_ROOT)/bin
 
-.PHONY: cmd_% test lint docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests
+.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests
 
 default: cmd
 
@@ -121,6 +121,15 @@ test: gocovmerge
 	tail -1 .cover.func
 	rm -f .cover.*
 #	$(GO) tool cover -html=.cover -o .cover.html
+
+PARITY_DRIFT_BASE ?= origin/main
+PARITY_DRIFT_HEAD ?= HEAD
+
+parity-drift:
+	$(GO) run ./tests/dataplane/drift/cmd/drift -mode check -base "$(PARITY_DRIFT_BASE)" -head "$(PARITY_DRIFT_HEAD)"
+
+parity-drift-weekly:
+	tests/dataplane/drift/report-weekly.sh
 
 clean:
 	rm -rf bin dist grafonnet-lib rust/target

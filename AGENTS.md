@@ -80,6 +80,8 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/dataplane/` - Rust dataplane orchestration across wire, transport, session, and control components.
 - `rust/crates/tiproxy-rs/` - Rust dataplane executable and build/version metadata.
 - `tests/compatibility/` - Versioned client-driver and MySQL capability contract shared by the Go/Rust dataplane integration tests.
+- `tests/dataplane/corpus/` - Deterministic, language-neutral Go dataplane protocol corpus.
+- `tests/dataplane/drift/` - Semantic CI gate that keeps Go dataplane changes synchronized with Rust parity artifacts.
 
 Guidelines:
 

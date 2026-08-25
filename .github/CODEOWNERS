@@ -1,0 +1,10 @@
+# Rust dataplane parity contract and the Go surfaces it mirrors.
+/docs/design/rust-dataplane-parity.md @bb7133 @xhebox @djshow832 @YangKeao
+/tests/dataplane/corpus/ @bb7133 @xhebox @djshow832 @YangKeao
+/tests/dataplane/drift/ @bb7133 @xhebox @djshow832 @YangKeao
+/.github/parity-no-impact/ @bb7133 @xhebox @djshow832 @YangKeao
+
+/pkg/proxy/ @bb7133 @xhebox @djshow832 @YangKeao
+/pkg/metrics/ @bb7133 @xhebox @djshow832 @YangKeao
+/pkg/balance/router/ @bb7133 @xhebox @djshow832 @YangKeao
+/lib/config/ @bb7133 @xhebox @djshow832 @YangKeao

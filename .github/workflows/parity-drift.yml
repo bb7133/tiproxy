@@ -1,0 +1,99 @@
+name: Dataplane parity drift
+
+on:
+  pull_request:
+    paths:
+      - ".github/CODEOWNERS"
+      - ".github/parity-no-impact/**"
+      - ".github/pull_request_template.md"
+      - ".github/workflows/parity-drift.yml"
+      - "Makefile"
+      - "docs/design/rust-dataplane-parity.md"
+      - "lib/config/**"
+      - "pkg/balance/router/**"
+      - "pkg/metrics/**"
+      - "pkg/proxy/**"
+      - "tests/dataplane/corpus/**"
+      - "tests/dataplane/drift/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/CODEOWNERS"
+      - ".github/parity-no-impact/**"
+      - ".github/pull_request_template.md"
+      - ".github/workflows/parity-drift.yml"
+      - "Makefile"
+      - "docs/design/rust-dataplane-parity.md"
+      - "lib/config/**"
+      - "pkg/balance/router/**"
+      - "pkg/metrics/**"
+      - "pkg/proxy/**"
+      - "tests/dataplane/corpus/**"
+      - "tests/dataplane/drift/**"
+  schedule:
+    - cron: "23 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parity-drift-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  change-gate:
+    name: Check changed Go dataplane behavior
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Resolve comparison base
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE"
+          else
+            base="$PUSH_BASE"
+          fi
+          if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+            base="HEAD^"
+          fi
+          git rev-parse --verify "$base^{commit}"
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+      - name: Enforce parity updates or an exact reviewed declaration
+        run: make parity-drift PARITY_DRIFT_BASE="${{ steps.range.outputs.base }}" PARITY_DRIFT_HEAD=HEAD
+
+  weekly-report:
+    name: Report drift from the audited Go baseline
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Generate audited-baseline report
+        run: make parity-drift-weekly
