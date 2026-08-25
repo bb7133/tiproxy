@@ -79,6 +79,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
 - `rust/crates/dataplane/` - Rust dataplane orchestration across wire, transport, session, and control components.
 - `rust/crates/tiproxy-rs/` - Rust dataplane executable and build/version metadata.
+- `tests/compatibility/` - Versioned client-driver and MySQL capability contract shared by the Go/Rust dataplane integration tests.
 
 Guidelines:
 
