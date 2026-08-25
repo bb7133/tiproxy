@@ -43,7 +43,7 @@ CARGO_DENY_VERSION := 0.20.2
 RUST_TOOL_ROOT ?= $(GOBIN)/rust-tools
 RUST_TOOL_BIN := $(RUST_TOOL_ROOT)/bin
 
-.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests
+.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests dataplane-integration dataplane-integration-go dataplane-integration-self-test
 
 default: cmd
 
@@ -106,6 +106,18 @@ rust-supply-chain:
 
 rust-negative-tests:
 	PATH=$(RUST_TOOL_BIN):$(PATH) rust/ci/run-negative-tests.sh
+
+# The default remains the intended Rust topology and fails its capability
+# preflight until the real bridge/dataplane exists. The Go target is a truthful
+# end-to-end baseline for the shared topology infrastructure.
+dataplane-integration:
+	./tests/dataplane/integration/run.sh --mode rust --variant all
+
+dataplane-integration-go:
+	./tests/dataplane/integration/run.sh --mode go --variant all
+
+dataplane-integration-self-test:
+	./tests/dataplane/integration/self-test.sh
 
 metrics:
 	$(GO) install github.com/google/go-jsonnet/cmd/jsonnet@latest
