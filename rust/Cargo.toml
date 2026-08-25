@@ -24,6 +24,7 @@ mysql-wire = { path = "crates/mysql-wire", version = "0.1.0" }
 proxy-io = { path = "crates/proxy-io", version = "0.1.0" }
 session-core = { path = "crates/session-core", version = "0.1.0" }
 prost = { version = "=0.14.1", default-features = false, features = ["derive", "std"] }
+tokio = { version = "=1.47.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [workspace.lints.rust]
 missing_docs = "deny"

@@ -12,6 +12,7 @@ default = []
 
 [dependencies]
 prost.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
