@@ -135,7 +135,11 @@ jobs:
           rust/ci/verify-version.sh "$binary" "$version" "$GITHUB_SHA" "$build_time"
           mkdir -p dist
           cp "$binary" "dist/tiproxy-rs-linux-${{ matrix.arch }}"
-          sha256sum "dist/tiproxy-rs-linux-${{ matrix.arch }}" >"dist/tiproxy-rs-linux-${{ matrix.arch }}.sha256"
+          (
+            cd dist
+            sha256sum "tiproxy-rs-linux-${{ matrix.arch }}" >"tiproxy-rs-linux-${{ matrix.arch }}.sha256"
+            sha256sum -c "tiproxy-rs-linux-${{ matrix.arch }}.sha256"
+          )
       - name: Upload release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
