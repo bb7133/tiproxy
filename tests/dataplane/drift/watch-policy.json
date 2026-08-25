@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "parity_manifest": "docs/design/rust-dataplane-parity.md",
+  "corpus_manifest": "tests/dataplane/corpus/v1/manifest.json",
+  "corpus_material_prefixes": [
+    "tests/dataplane/corpus/internal/",
+    "tests/dataplane/corpus/v1/cases/"
+  ],
+  "no_impact_directory": ".github/parity-no-impact",
+  "areas": [
+    {
+      "id": "command",
+      "description": "MySQL command dispatch and response state machines",
+      "path_exact": ["pkg/proxy/net/command.go"],
+      "path_prefix": ["pkg/proxy/backend/cmd_processor"],
+      "manifest_prefixes": ["CMD", "RSP", "PS"],
+      "corpus_required": true
+    },
+    {
+      "id": "config",
+      "description": "Dataplane configuration and reload behavior",
+      "path_prefix": ["lib/config/"],
+      "manifest_prefixes": ["CFG", "TLS", "ADM", "TOPO", "KA"],
+      "corpus_required": false
+    },
+    {
+      "id": "metric",
+      "description": "Dataplane metrics and metering labels",
+      "path_exact": ["pkg/proxy/backend/metrics.go"],
+      "path_prefix": ["pkg/metrics/"],
+      "manifest_prefixes": ["MTR"],
+      "corpus_required": false
+    },
+    {
+      "id": "error_source",
+      "description": "Client-visible errors, disconnect classes, and error-source labels",
+      "path_exact": [
+        "pkg/proxy/errno.go",
+        "pkg/proxy/backend/error.go",
+        "pkg/proxy/net/error.go"
+      ],
+      "manifest_prefixes": ["HS", "RSP", "LIFE", "MTR", "PKT"],
+      "corpus_required": true
+    },
+    {
+      "id": "routing",
+      "description": "Router and handshake routing interfaces used by the dataplane",
+      "path_exact": ["pkg/proxy/backend/handshake_handler.go"],
+      "path_prefix": ["pkg/balance/router/"],
+      "manifest_prefixes": ["ADM", "MIG", "TOPO"],
+      "corpus_required": false
+    },
+    {
+      "id": "dataplane",
+      "description": "All other Go SQL dataplane behavior",
+      "path_prefix": ["pkg/proxy/"],
+      "manifest_prefixes": [
+        "PKT", "PP2", "TLS", "CMP", "HS", "RSP", "CMD", "PS",
+        "MIG", "ADM", "CFG", "TOPO", "KA", "MTR", "LIFE", "EXCL"
+      ],
+      "corpus_required": false
+    }
+  ]
+}

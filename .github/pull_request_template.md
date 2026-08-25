@@ -42,6 +42,13 @@ Notable changes
 - [ ] Has tiproxyctl change
 - [ ] Other user behavior changes
 
+Dataplane parity drift (choose one when monitored Go dataplane files change)
+
+- [ ] Not applicable: only comments, formatting, or `*_test.go` files changed
+- [ ] Updated `docs/design/rust-dataplane-parity.md` and the protocol corpus when required
+- [ ] Added an exact-hash declaration under `.github/parity-no-impact/` and obtained CODEOWNERS approval
+- [ ] Ran `make parity-drift PARITY_DRIFT_BASE=<target-base> PARITY_DRIFT_HEAD=HEAD`
+
 ### Release note
 
 <!-- compatibility change, improvement, bugfix, and new feature need a release note -->
