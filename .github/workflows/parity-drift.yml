@@ -1,20 +1,12 @@
 name: Dataplane parity drift
 
 on:
+  # No paths filter on pull_request: the change-gate job is a required status
+  # check on main, and a path-filtered required check never reports on PRs
+  # outside the filter, leaving them permanently blocked as "Expected".
+  # The job itself resolves the comparison base and exits quickly when the PR
+  # does not change observable dataplane behavior.
   pull_request:
-    paths:
-      - ".github/CODEOWNERS"
-      - ".github/parity-no-impact/**"
-      - ".github/pull_request_template.md"
-      - ".github/workflows/parity-drift.yml"
-      - "Makefile"
-      - "docs/design/rust-dataplane-parity.md"
-      - "lib/config/**"
-      - "pkg/balance/router/**"
-      - "pkg/metrics/**"
-      - "pkg/proxy/**"
-      - "tests/dataplane/corpus/**"
-      - "tests/dataplane/drift/**"
   push:
     branches:
       - main
