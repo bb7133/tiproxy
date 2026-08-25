@@ -149,7 +149,17 @@ impl ErrorSource {
             // Go's ErrProxyNoTLS reaches the switch's default branch:
             // TestRequireBackendTLS pins its source as SrcProxyErr.
             Some(FailureKind::ProxyNoTls) => Self::ProxyError,
-            None | Some(FailureKind::ProxyInternal) => {
+            // Typed shutdown mirrors the `cancelled` route exactly: an
+            // already-delivered MySQL error still wins, matching Go's
+            // IsMySQLError check ahead of context.Canceled.
+            Some(FailureKind::Shutdown) => {
+                if failure.mysql_error {
+                    Self::ClientSqlError
+                } else {
+                    Self::ProxyQuit
+                }
+            }
+            None | Some(FailureKind::ProxyInternal | FailureKind::ControlPlane) => {
                 if failure.mysql_error {
                     Self::ClientSqlError
                 } else if failure.cancelled {
@@ -192,7 +202,10 @@ pub enum DisconnectState {
     Attributed(SideMarker),
 }
 
-/// Specific failure classes mirroring Go's typed sentinel errors.
+/// Specific failure classes mirroring Go's typed sentinel errors, plus the
+/// typed control/shutdown domains issue #24 requires (Go expresses those two
+/// through `ErrProxyErr` wrapping and `context.Canceled` rather than
+/// dedicated sentinels; no new metric label exists for either).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// Go `ErrClientHandshake`.
@@ -217,6 +230,13 @@ pub enum FailureKind {
     ProxyNoTls,
     /// Go `ErrProxyErr`.
     ProxyInternal,
+    /// A control-plane transport or protocol failure. Classifies under the
+    /// existing `proxy error` label and is always silent to the client:
+    /// the approved-error unwrap is exclusive to [`Self::ProxyInternal`].
+    ControlPlane,
+    /// Proxy shutdown as a typed domain, carrying Go's `context.Canceled`
+    /// semantics (`proxy shutdown` label, silent to the client).
+    Shutdown,
 }
 
 /// A client-safe error approved by the control plane.
@@ -379,6 +399,15 @@ pub const fn client_response<'a>(failure: &FailureDescriptor<'a>) -> Option<Clie
                 None => None,
             };
         }
+        // The control and shutdown domains are always silent: control-plane
+        // detail never reaches the client, and the approved unwrap belongs
+        // exclusively to the `ProxyInternal` (Go `ErrProxyErr`) route.
+        #[expect(
+            clippy::match_same_arms,
+            reason = "control/shutdown silence is a distinct pinned policy \
+                      decision, kept as its own arm for auditability"
+        )]
+        Some(FailureKind::ControlPlane | FailureKind::Shutdown) => return None,
         // All remaining failures are silent by Go parity.
         _ => return None,
     };
@@ -681,6 +710,53 @@ mod tests {
             clamped.message().len(),
             mysql_wire::limits::MAX_DIAGNOSTIC_TEXT_LEN
         );
+    }
+
+    /// Issue #24's typed control/internal/shutdown domains, table-driven:
+    /// each row pins the Go metric label and the client-response policy with
+    /// an approved payload present, proving the approved unwrap is exclusive
+    /// to the internal domain and no new label string exists.
+    #[test]
+    fn control_internal_shutdown_domains_pin_source_and_response() {
+        let approved = ApprovedClientError::from_control_approved("control approved");
+        let matrix: [(FailureKind, &str, bool); 3] = [
+            (FailureKind::ControlPlane, "proxy error", false),
+            (FailureKind::ProxyInternal, "proxy error", true),
+            (FailureKind::Shutdown, "proxy shutdown", false),
+        ];
+        for (kind, label, forwards_approved) in matrix {
+            let descriptor = FailureDescriptor {
+                kind: Some(kind),
+                approved_client_error: Some(approved),
+                ..FailureDescriptor::default()
+            };
+            assert_eq!(ErrorSource::classify(&descriptor).metric_label(), label);
+            if forwards_approved {
+                assert_eq!(
+                    client_response(&descriptor),
+                    Some(ClientResponse::Approved(approved))
+                );
+            } else {
+                assert_eq!(
+                    client_response(&descriptor),
+                    None,
+                    "{kind:?} must stay silent even with an approved payload"
+                );
+            }
+        }
+
+        // The typed shutdown domain keeps the cancelled-route precedence: a
+        // MySQL error already delivered to the client still wins.
+        let shutdown_after_sql = FailureDescriptor {
+            kind: Some(FailureKind::Shutdown),
+            mysql_error: true,
+            ..FailureDescriptor::default()
+        };
+        assert_eq!(
+            ErrorSource::classify(&shutdown_after_sql),
+            ErrorSource::ClientSqlError
+        );
+        assert_eq!(client_response(&shutdown_after_sql), None);
     }
 
     /// Responses are fixed static strings: no formatting of internal detail,

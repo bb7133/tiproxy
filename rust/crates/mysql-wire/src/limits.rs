@@ -67,11 +67,16 @@ pub const MAX_CONNECTION_ATTRIBUTE_KV: usize = 4 * 1024;
 /// Control-protocol ADR: diagnostic detail text cap.
 pub const MAX_DIAGNOSTIC_TEXT_LEN: usize = 4 * 1024;
 
-/// Control-protocol ADR hard maxima for the critical outbound lane.
+/// Control-protocol ADR hard maxima for the critical outbound lane
+/// (messages, bytes). The enforcement-side single source is
+/// `control-proto`'s `HARD_QUEUE_MAXIMA`, which `ControlClient::new`
+/// applies; conformance pins this registry mirror exactly equal to it.
 pub const CONTROL_QUEUE_CRITICAL_MAX: (usize, usize) = (4_096, 32 * 1024 * 1024);
-/// Control-protocol ADR hard maxima for the control outbound lane.
+/// Control-protocol ADR hard maxima for the control outbound lane
+/// (messages, bytes); enforcement anchor as for the critical lane.
 pub const CONTROL_QUEUE_CONTROL_MAX: (usize, usize) = (16_384, 128 * 1024 * 1024);
-/// Control-protocol ADR hard maxima for the bulk outbound lane.
+/// Control-protocol ADR hard maxima for the bulk outbound lane
+/// (messages, bytes); enforcement anchor as for the critical lane.
 pub const CONTROL_QUEUE_BULK_MAX: (usize, usize) = (1_024, 64 * 1024 * 1024);
 
 /// The 24-bit physical-packet payload maximum (single source: this crate).

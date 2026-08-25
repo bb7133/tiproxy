@@ -114,6 +114,85 @@ fn control_queue_and_timing_defaults_match_adr() {
     assert_eq!(config.reconnect_cap, Duration::from_secs(5));
 }
 
+/// The registry queue maxima equal `control-proto`'s enforcement constant in
+/// both directions, and the real `ControlClient::new` accepts each lane and
+/// dimension at `maximum - 1` and `maximum` while rejecting `maximum + 1`.
+/// The reconnect cap is proven the same way at `cap` and `cap + 1 ns`.
+#[test]
+fn control_hard_maxima_are_bidirectionally_anchored() {
+    use control_proto::CONTROL_PROTOCOL_V1;
+    use control_proto::control_transport::{
+        ClientConfig, ControlClient, HARD_QUEUE_MAXIMA, MAX_RECONNECT_BACKOFF, QueueLimit,
+        QueueLimits,
+    };
+    use control_proto::v1::{Hello, Role};
+    use mysql_wire::limits::{
+        CONTROL_QUEUE_BULK_MAX, CONTROL_QUEUE_CONTROL_MAX, CONTROL_QUEUE_CRITICAL_MAX,
+    };
+
+    type LanePick = fn(&mut QueueLimits) -> &mut QueueLimit;
+
+    let as_tuple = |lane: QueueLimit| (lane.messages, lane.bytes);
+    assert_eq!(
+        as_tuple(HARD_QUEUE_MAXIMA.critical),
+        CONTROL_QUEUE_CRITICAL_MAX
+    );
+    assert_eq!(
+        as_tuple(HARD_QUEUE_MAXIMA.control),
+        CONTROL_QUEUE_CONTROL_MAX
+    );
+    assert_eq!(as_tuple(HARD_QUEUE_MAXIMA.bulk), CONTROL_QUEUE_BULK_MAX);
+
+    let valid_config = || {
+        ClientConfig::with_defaults(
+            std::path::PathBuf::from("/tmp/conformance.sock"),
+            0,
+            Hello {
+                role: Role::RustDataplane as i32,
+                supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
+                ..Hello::default()
+            },
+        )
+    };
+    assert!(ControlClient::new(valid_config()).is_ok());
+
+    let lanes: [(LanePick, (usize, usize)); 3] = [
+        (|limits| &mut limits.critical, CONTROL_QUEUE_CRITICAL_MAX),
+        (|limits| &mut limits.control, CONTROL_QUEUE_CONTROL_MAX),
+        (|limits| &mut limits.bulk, CONTROL_QUEUE_BULK_MAX),
+    ];
+    for (pick_lane, (max_messages, max_bytes)) in lanes {
+        for (dimension, maximum) in [("messages", max_messages), ("bytes", max_bytes)] {
+            for (configured, accepted) in
+                [(maximum - 1, true), (maximum, true), (maximum + 1, false)]
+            {
+                let mut config = valid_config();
+                let lane = pick_lane(&mut config.queue_limits);
+                if dimension == "messages" {
+                    lane.messages = configured;
+                } else {
+                    lane.bytes = configured;
+                }
+                assert_eq!(
+                    ControlClient::new(config).is_ok(),
+                    accepted,
+                    "lane {dimension} at {configured} against hard maximum {maximum}"
+                );
+            }
+        }
+    }
+
+    let mut config = valid_config();
+    config.reconnect_cap = MAX_RECONNECT_BACKOFF;
+    assert!(ControlClient::new(config).is_ok(), "reconnect cap at limit");
+    let mut config = valid_config();
+    config.reconnect_cap = MAX_RECONNECT_BACKOFF + Duration::from_nanos(1);
+    assert!(
+        ControlClient::new(config).is_err(),
+        "reconnect cap one tick past the limit"
+    );
+}
+
 /// The physical payload maximum has exactly one definition.
 #[test]
 fn physical_payload_limit_is_single_sourced() {

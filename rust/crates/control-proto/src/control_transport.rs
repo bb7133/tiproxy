@@ -42,7 +42,9 @@ const FRAME_PREFIX_BYTES: usize = 4;
 // Reserve the length prefix plus fields populated by the active session
 // (epoch and timestamp) so queue and frame accounting never undercount.
 const QUEUE_ENTRY_OVERHEAD: usize = 32;
-const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+/// ADR v1 hard cap on the reconnect backoff window: [`ControlClient::new`]
+/// rejects any configured `reconnect_cap` above this value.
+pub const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
 /// One priority lane's count and byte bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,28 @@ pub struct QueueLimits {
     /// Metrics and metering traffic.
     pub bulk: QueueLimit,
 }
+
+/// ADR v1 hard per-lane outbound-queue maxima.
+///
+/// This constant is the enforcement-side single source: [`ControlClient::new`]
+/// rejects any configured lane whose message or byte bound exceeds it. The
+/// cross-crate limits registry in `mysql-wire` mirrors these values, and the
+/// `proxy-io` conformance suite pins the two sides exactly equal and proves
+/// the accept/reject boundary against the real constructor.
+pub const HARD_QUEUE_MAXIMA: QueueLimits = QueueLimits {
+    critical: QueueLimit {
+        messages: 4_096,
+        bytes: 32 * 1_024 * 1_024,
+    },
+    control: QueueLimit {
+        messages: 16_384,
+        bytes: 128 * 1_024 * 1_024,
+    },
+    bulk: QueueLimit {
+        messages: 1_024,
+        bytes: 64 * 1_024 * 1_024,
+    },
+};
 
 impl Default for QueueLimits {
     fn default() -> Self {
@@ -1021,20 +1045,7 @@ fn normalize_config(config: &mut ClientConfig) -> Result<(), TransportError> {
 }
 
 fn validate_queue_limits(limits: QueueLimits) -> Result<(), TransportError> {
-    let hard = QueueLimits {
-        critical: QueueLimit {
-            messages: 4_096,
-            bytes: 32 * 1_024 * 1_024,
-        },
-        control: QueueLimit {
-            messages: 16_384,
-            bytes: 128 * 1_024 * 1_024,
-        },
-        bulk: QueueLimit {
-            messages: 1_024,
-            bytes: 64 * 1_024 * 1_024,
-        },
-    };
+    let hard = HARD_QUEUE_MAXIMA;
     for (name, configured, maximum) in [
         ("critical", limits.critical, hard.critical),
         ("control", limits.control, hard.control),
