@@ -6,9 +6,10 @@ packet streaming, sequence/accounting state, bounded prefix capture, and the
 transport-facing equivalents of Go TiProxy's `ForwardPacketTo` and
 `ForwardUntil`.
 
-TLS, compression, PROXY protocol, socket admission, backend selection, and
-session transitions remain separate WIRE/session tasks. This crate does not
-make routing decisions.
+TLS, compression, socket-level PROXY protocol integration, socket admission,
+backend selection, and session transitions remain separate WIRE/session tasks
+(the sans-I/O PROXY v2 codec below is already implemented here). This crate
+does not make routing decisions.
 
 ## Buffer and sequence ownership
 
