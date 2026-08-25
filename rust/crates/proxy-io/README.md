@@ -6,10 +6,10 @@ packet streaming, sequence/accounting state, bounded prefix capture, and the
 transport-facing equivalents of Go TiProxy's `ForwardPacketTo` and
 `ForwardUntil`.
 
-TLS, compression, socket-level PROXY protocol integration, socket admission,
-backend selection, and session transitions remain separate WIRE/session tasks
-(the sans-I/O PROXY v2 codec below is already implemented here). This crate
-does not make routing decisions.
+Socket-level PROXY protocol integration, socket admission, backend selection,
+and session transitions remain separate WIRE/session tasks (the sans-I/O
+PROXY v2 codec, TLS adapters, and compression transport below are already
+implemented here). This crate does not make routing decisions.
 
 ## Buffer and sequence ownership
 
@@ -80,6 +80,63 @@ cargo test --locked --manifest-path rust/Cargo.toml -p proxy-io
 cargo clippy --locked --manifest-path rust/Cargo.toml \
   -p proxy-io --all-targets --all-features -- -D warnings
 ```
+
+## MySQL compressed protocol (`compression`)
+
+WIRE-03 supplies both a sans-I/O `CompressionCodec` and an async
+`CompressedIo<T>` adapter. The transport has one compressed sequence shared by
+reads and writes. `begin_read` / `begin_write` return the sequence that the
+uncompressed `PacketReader` / `PacketWriter` must adopt on a direction change;
+`reset_sequence` starts the next command at zero.
+
+- zlib is fixed at MySQL's level 6. zstd accepts only negotiated levels 1–22.
+  `negotiate_compression` applies Go's zlib-first rule when both capability
+  flags are present and can be called independently for client capabilities
+  and the client/backend intersection.
+- Writes coalesce until flush or the 24-bit frame limit, leave payloads below
+  50 bytes uncompressed, and split larger streams at `0x00ff_ffff` bytes.
+- Reads validate the shared sequence before allocating the body, enforce a
+  caller-selected absolute output bound and declared expansion ratio, require
+  exact decoded length, and reject truncated, corrupt, or trailing codec data.
+- The network-facing zstd decoder is exact-pinned `zstd-zero`: it has no
+  dependencies, allocates nothing itself, and declares `forbid(unsafe_code)`.
+  The adapter supplies a history buffer bounded by the configured frame limit,
+  two fixed 128-KiB scratch buffers, and an output vector that cannot grow past
+  the MySQL header declaration. Exact-pinned `zstd-pure-rs` remains only on the
+  encoder side to preserve all negotiated levels 1–22; it introduces no C
+  library, `-sys` crate, cgo, or FFI, but its translated implementation does
+  contain internal unsafe code. This trust split and residual encoder risk are
+  recorded as `WIRE-03-D3` pending a mature, MSRV-compatible, full-level safe
+  encoder. Compression itself is synchronous CPU work; the future session
+  runtime must account for that cost when choosing scheduling limits.
+- The async adapter deliberately rejects a read/write direction change while
+  output or decoded response bytes remain buffered. Session owners must flush
+  requests and consume responses before calling the opposite `begin_*` hook;
+  Go switches silently, but a correct owner observes identical wire behavior.
+
+`tests/compression_go_vectors.rs` and Go's
+`pkg/proxy/net/compression_vectors_test.go` freeze both production encoders and
+prove both decoders accept the other implementation's zlib and zstd frames.
+The Rust suite also covers threshold and 24-bit boundaries, merge/split,
+one-byte transport chunks, sequence wrap/reset and `BeginRW`, independent
+client/backend algorithms, malformed-frame sweeps, bombs, and packet-layer
+peek/read/flush behavior. These are codec-level CMP-001/002/003 artifacts; the
+manifest stays `RUST-TODO` until session/runtime wiring plus live Go/Rust
+differential driver records exist.
+
+Run the focused suite and Criterion cases from the repository root:
+
+```sh
+cargo test --locked --manifest-path rust/Cargo.toml -p proxy-io \
+  --test compression --test compression_go_vectors
+cargo bench --locked --manifest-path rust/Cargo.toml -p proxy-io \
+  --bench compression
+go test ./pkg/proxy/net -run TestCompressionGoldenVectors -count=1
+```
+
+Two intentional malformed-input differences and the zstd dependency trust
+decision are recorded as `WIRE-03-D1` through `WIRE-03-D3` in the parity
+manifest. Canonical Go/Rust frames remain mutually decodable.
 
 ## Bounded duplex transport
 
