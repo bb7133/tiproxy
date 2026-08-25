@@ -16,6 +16,7 @@ control-proto.workspace = true
 mysql-wire.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
