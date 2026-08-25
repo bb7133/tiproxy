@@ -225,15 +225,16 @@ RSP-001 through RSP-008 where applicable.
 
 ## Audit and sign-off rules
 
-### Rust wire-codec safety decisions
+### Rust wire and transport safety decisions
 
-The rows below record intentional WIRE-00 parser differences from permissive
-or unchecked Go helpers. They are not additional parity items and do not have
-independent `PARITY-*` test IDs; their tests remain attached to the related
-manifest items. A later compatibility change must update this ledger and add a
-focused regression test instead of silently widening a parser.
+The rows below record intentional Rust wire-codec or transport differences
+from permissive, unchecked, or internally inconsistent Go paths. They are not
+additional parity items and do not have independent `PARITY-*` test IDs; their
+tests remain attached to the related manifest items. A later compatibility
+change must update this ledger and add a focused regression test instead of
+silently changing the boundary.
 
-| Decision | Related items | Go behavior | Rust WIRE-00 behavior | Rationale and compatibility impact |
+| Decision | Related items | Go behavior | Rust behavior | Rationale and compatibility impact |
 | --- | --- | --- | --- | --- |
 | `WIRE-00-D1` canonical length-encoded integers | HS-003, RSP-001, RSP-003 | `ParseLengthEncodedInt` accepts `0xfc`, `0xfd`, or `0xfe` encodings that use more bytes than the value needs. | Return `DecodeError::NonCanonicalLength`; keep the undefined `0xff` marker as a separate `DecodeError::InvalidValue`. | Issue #17 explicitly requires typed errors for non-canonical lengths. This deliberately rejects a non-canonical peer packet that Go may accept, including in OK packet counters; canonical corpus bytes are unchanged. |
 | `WIRE-00-D2` protocol-4.1 ERR marker | RSP-001 | `ParseErrorPacket` skips the byte before SQLSTATE without checking that it is `#`. | Require `#` and return `DecodeError::InvalidValue` otherwise. | Prevent a malformed ERR layout from being reinterpreted as a different SQLSTATE/message boundary. Canonical ERR packets are unchanged. |
