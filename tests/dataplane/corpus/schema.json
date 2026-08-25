@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pingcap/tiproxy/tests/dataplane/corpus/schema-v1.json",
+  "title": "TiProxy dataplane corpus manifest",
+  "type": "object",
+  "required": ["schema_version", "generated_by", "cases"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_by": { "const": "tiproxy-go-oracle/v1" },
+    "cases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/case" }
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "parity_ids", "go_source_refs", "capabilities", "initial_state", "trace_file", "trace_sha256", "uncompressed_bytes", "records", "expected"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+        "description": { "type": "string", "minLength": 1 },
+        "parity_ids": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[A-Z]+-[0-9]{3}$" } },
+        "go_source_refs": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "capabilities": { "type": "array", "items": { "type": "string" } },
+        "initial_state": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+        "trace_file": { "type": "string", "pattern": "^cases/.+\\.trace\\.gz$" },
+        "trace_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "uncompressed_bytes": { "type": "integer", "minimum": 12 },
+        "records": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["direction", "sequence_start", "logical_payload_bytes", "physical_packets"],
+            "properties": {
+              "direction": { "enum": ["client_to_proxy", "proxy_to_client", "backend_to_proxy", "proxy_to_backend"] },
+              "sequence_start": { "type": "integer", "minimum": 0, "maximum": 255 },
+              "logical_payload_bytes": { "type": "integer", "minimum": 0 },
+              "physical_packets": { "type": "integer", "minimum": 0 },
+              "transport_chunks": { "type": "array", "items": { "type": "integer", "minimum": 1 } }
+            }
+          }
+        },
+        "expected": { "$ref": "#/$defs/expected" }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "terminal_state", "effects"],
+      "properties": {
+        "outcome": { "type": "string", "minLength": 1 },
+        "terminal_state": { "type": "string", "minLength": 1 },
+        "server_status": { "type": "array", "items": { "type": "string" } },
+        "error_code": { "type": "integer", "minimum": 0 },
+        "effects": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    },
+    "observation_set": {
+      "type": "object",
+      "required": ["schema_version", "implementation", "cases"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "implementation": { "type": "string", "minLength": 1 },
+        "cases": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/expected" },
+              { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" } } }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

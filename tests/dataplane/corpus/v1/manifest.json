@@ -1,0 +1,1761 @@
+{
+  "schema_version": 1,
+  "generated_by": "tiproxy-go-oracle/v1",
+  "cases": [
+    {
+      "id": "auth-caching-sha-full",
+      "description": "caching_sha2_password requests the full-authentication path.",
+      "parity_ids": [
+        "HS-005"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/authenticator_test.go:TestAuthPlugin"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "handshake",
+        "state": "authenticating_backend"
+      },
+      "trace_file": "cases/auth-caching-sha-full.trace.gz",
+      "trace_sha256": "092530e046cc2d9f590cc08d90193ceaa32af4867242332ef483b051133feec8",
+      "uncompressed_bytes": 27,
+      "records": [
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 2,
+          "logical_payload_bytes": 2,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "awaiting_client_auth_data",
+        "effects": [
+          "fast-auth failure byte is recognized"
+        ]
+      }
+    },
+    {
+      "id": "auth-switch-native",
+      "description": "Backend requests mysql_native_password authentication.",
+      "parity_ids": [
+        "HS-004"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/authenticator_test.go:TestAuthPlugin"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "handshake",
+        "state": "authenticating_backend"
+      },
+      "trace_file": "cases/auth-switch-native.trace.gz",
+      "trace_sha256": "f415973220d1336ab1b9dff4a2703436f01b9863375874e95e4eb562c3db6235",
+      "uncompressed_bytes": 86,
+      "records": [
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 2,
+          "logical_payload_bytes": 44,
+          "physical_packets": 1
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 3,
+          "logical_payload_bytes": 4,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward_rewritten",
+        "terminal_state": "authenticating_backend",
+        "effects": [
+          "auth switch is relayed with backend salt"
+        ]
+      }
+    },
+    {
+      "id": "change-user",
+      "description": "COM_CHANGE_USER is parsed and rewritten for backend authentication.",
+      "parity_ids": [
+        "CMD-017",
+        "HS-006",
+        "PS-005"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands",
+        "pkg/proxy/backend/backend_conn_mgr_test.go:TestSpecialCmds"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/change-user.trace.gz",
+      "trace_sha256": "e99f8cddb4114d6acd9a8fe51508a16dcfc9d0fe53dc1f172da97da5b30438d8",
+      "uncompressed_bytes": 74,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 49,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward_rewritten",
+        "terminal_state": "authenticating_backend",
+        "effects": [
+          "user and database update only after success",
+          "backend salt is requested"
+        ]
+      }
+    },
+    {
+      "id": "change-user-malformed",
+      "description": "Truncated COM_CHANGE_USER authentication data.",
+      "parity_ids": [
+        "CMD-017",
+        "HS-008"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestNetworkError"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/change-user-malformed.trace.gz",
+      "trace_sha256": "f396a874875763a4570146862ae855a0af40efc07f38d643be5724a0b3ceb96c",
+      "uncompressed_bytes": 30,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 5,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "reject",
+        "terminal_state": "closed",
+        "error_code": 1835,
+        "effects": [
+          "malformed command is not forwarded"
+        ]
+      }
+    },
+    {
+      "id": "field-list",
+      "description": "COM_FIELD_LIST ends with a legacy EOF packet.",
+      "parity_ids": [
+        "CMD-004"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/field-list.trace.gz",
+      "trace_sha256": "435cc5028810d89011be3ff9fb754e7b21bf18905f81f2b4e412abaab7b8b037",
+      "uncompressed_bytes": 83,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 4,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 37,
+          "physical_packets": 2
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "field metadata is forwarded through EOF"
+        ]
+      }
+    },
+    {
+      "id": "handshake-initial-native",
+      "description": "Server initial handshake using mysql_native_password.",
+      "parity_ids": [
+        "HS-001"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/authenticator_test.go:TestAuthPlugin",
+        "pkg/proxy/net/mysql_test.go:TestHandshakeResp"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "handshake",
+        "state": "new"
+      },
+      "trace_file": "cases/handshake-initial-native.trace.gz",
+      "trace_sha256": "873af19de70c627a6af3ee8a936363d612b608da408c74b96c9995eca877d43b",
+      "uncompressed_bytes": 104,
+      "records": [
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 79,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward_rewritten",
+        "terminal_state": "awaiting_client_response",
+        "effects": [
+          "server version and salt are parsed",
+          "frontend connection ID is independently owned"
+        ]
+      }
+    },
+    {
+      "id": "handshake-missing-protocol41",
+      "description": "Frontend omits mandatory CLIENT_PROTOCOL_41.",
+      "parity_ids": [
+        "HS-002",
+        "HS-008"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/authenticator_test.go:TestUnsupportedCapability"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "handshake",
+        "state": "awaiting_client_response"
+      },
+      "trace_file": "cases/handshake-missing-protocol41.trace.gz",
+      "trace_sha256": "dc63645fc5028f92cc89289b809199d758ec97ef0f52e7ec15fe1539fff4cd0f",
+      "uncompressed_bytes": 95,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 70,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "reject",
+        "terminal_state": "closed",
+        "effects": [
+          "error source is client handshake",
+          "no MySQL error is synthesized for an invalid frontend capability set"
+        ]
+      }
+    },
+    {
+      "id": "handshake-response-modern",
+      "description": "Client response with attributes, zstd, and deprecated EOF.",
+      "parity_ids": [
+        "HS-003",
+        "HS-006",
+        "CMP-002"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/authenticator_test.go:TestCapability",
+        "pkg/proxy/backend/authenticator_test.go:TestCompressProtocol",
+        "pkg/proxy/backend/backend_conn_mgr_test.go:TestConnAttrs"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_DEPRECATE_EOF",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION",
+        "CLIENT_ZSTD_COMPRESSION_ALGORITHM"
+      ],
+      "initial_state": {
+        "phase": "handshake",
+        "state": "awaiting_client_response"
+      },
+      "trace_file": "cases/handshake-response-modern.trace.gz",
+      "trace_sha256": "16aa17385d0f0783b4ad82ffee436a96134f352c98c8317da0610cb6b47cb249",
+      "uncompressed_bytes": 136,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 111,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward_rewritten",
+        "terminal_state": "authenticating_backend",
+        "effects": [
+          "connection attributes are retained",
+          "zstd level is negotiated",
+          "deprecated EOF mode is enabled"
+        ]
+      }
+    },
+    {
+      "id": "handshake-response-native",
+      "description": "Client handshake response with database and deterministic authentication bytes.",
+      "parity_ids": [
+        "HS-003",
+        "HS-006"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/authenticator_test.go:TestCapability",
+        "pkg/proxy/net/mysql_test.go:TestHandshakeResp"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "handshake",
+        "state": "awaiting_client_response"
+      },
+      "trace_file": "cases/handshake-response-native.trace.gz",
+      "trace_sha256": "2f7bdb8070e22466ecc2418634c76d7c14c14573bf40ba71037c900cda5a744f",
+      "uncompressed_bytes": 107,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 82,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward_rewritten",
+        "terminal_state": "authenticating_backend",
+        "effects": [
+          "user and database become session state",
+          "authentication bytes are synthetic"
+        ]
+      }
+    },
+    {
+      "id": "handshake-ssl-request",
+      "description": "A 32-byte SSLRequest before the TLS upgrade.",
+      "parity_ids": [
+        "TLS-001",
+        "HS-002"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/authenticator_test.go:TestEnableTLS"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION",
+        "CLIENT_SSL"
+      ],
+      "initial_state": {
+        "phase": "handshake",
+        "state": "awaiting_client_response"
+      },
+      "trace_file": "cases/handshake-ssl-request.trace.gz",
+      "trace_sha256": "f35713250cd55d536a59731c009d0b7d73fc5f63556ee341866dca14cbd41e9a",
+      "uncompressed_bytes": 57,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 32,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "tls_upgrade",
+        "terminal_state": "tls_handshake",
+        "effects": [
+          "no credentials are parsed before TLS"
+        ]
+      }
+    },
+    {
+      "id": "init-db",
+      "description": "COM_INIT_DB updates the current database on success.",
+      "parity_ids": [
+        "CMD-002"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/authenticator_test.go:TestSecondHandshake"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/init-db.trace.gz",
+      "trace_sha256": "c6f7d8c1a0ed3f5b963c9bd2b0389b08d98d9287aaf841e1183da842326d9e6b",
+      "uncompressed_bytes": 53,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 8,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "current database becomes next_db"
+        ]
+      }
+    },
+    {
+      "id": "local-infile",
+      "description": "LOCAL INFILE request, client chunks, empty terminator, and final OK.",
+      "parity_ids": [
+        "CMD-003",
+        "RSP-005"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "awaiting_response"
+      },
+      "trace_file": "cases/local-infile.trace.gz",
+      "trace_sha256": "8c157977a293e0e8b638f11b9cf7c96ecc6d6ce12cb6a6a0ccea33305f00904a",
+      "uncompressed_bytes": 95,
+      "records": [
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 14,
+          "physical_packets": 1
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 2,
+          "logical_payload_bytes": 15,
+          "physical_packets": 3,
+          "transport_chunks": [
+            1,
+            4,
+            2
+          ]
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 5,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "all file chunks are forwarded",
+          "empty packet terminates upload"
+        ]
+      }
+    },
+    {
+      "id": "migration-session-state",
+      "description": "Internal SHOW SESSION_STATES result contains sanitized state and a session token.",
+      "parity_ids": [
+        "MIG-002",
+        "MIG-004",
+        "RSP-007"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/backend_conn_mgr_test.go:TestNormalRedirect",
+        "pkg/proxy/backend/backend_conn_mgr.go:querySessionStates"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_DEPRECATE_EOF",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION",
+        "CLIENT_ZSTD_COMPRESSION_ALGORITHM"
+      ],
+      "initial_state": {
+        "phase": "migration",
+        "state": "querying_session_state"
+      },
+      "trace_file": "cases/migration-session-state.trace.gz",
+      "trace_sha256": "3396295a038b7e77c85f60dc0e72387339c6e56efa3ec1feabf27ea2d60cd5dc",
+      "uncompressed_bytes": 248,
+      "records": [
+        {
+          "direction": "proxy_to_backend",
+          "sequence_start": 0,
+          "logical_payload_bytes": 20,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 170,
+          "physical_packets": 6
+        }
+      ],
+      "expected": {
+        "outcome": "capture_internal_result",
+        "terminal_state": "ready_to_reconnect",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "session state JSON is retained",
+          "session token is retained",
+          "ordinary result payloads remain opaque"
+        ]
+      }
+    },
+    {
+      "id": "packet-empty-payload",
+      "description": "A legal zero-length MySQL packet.",
+      "parity_ids": [
+        "PKT-005"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/packetio_test.go:TestReadPacketEmptyPayload"
+      ],
+      "capabilities": null,
+      "initial_state": {
+        "phase": "packet",
+        "state": "reading"
+      },
+      "trace_file": "cases/packet-empty-payload.trace.gz",
+      "trace_sha256": "b13f9aba286215411a82442d54eea6baeedb74b186c5bd4e15e6a28a9ae0780f",
+      "uncompressed_bytes": 25,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 0,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "accept",
+        "terminal_state": "packet_complete",
+        "effects": [
+          "logical payload is empty"
+        ]
+      }
+    },
+    {
+      "id": "packet-exact-max-tail",
+      "description": "An exact MaxPayloadLen payload requires a trailing empty physical packet.",
+      "parity_ids": [
+        "PKT-002"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/packetio_test.go:TestForwardUntilLongData"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/packet-exact-max-tail.trace.gz",
+      "trace_sha256": "968fa07fc23ebf8d05232856365ac907e489d5de76c3cfb2fdd89538f3aac260",
+      "uncompressed_bytes": 16777244,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 16777215,
+          "physical_packets": 2
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "awaiting_response",
+        "effects": [
+          "empty terminating physical packet is preserved"
+        ]
+      }
+    },
+    {
+      "id": "packet-fragmented-query",
+      "description": "COM_QUERY split across deliberately awkward TCP read boundaries.",
+      "parity_ids": [
+        "PKT-001",
+        "CMD-003"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/packetio_test.go:TestPacketIO",
+        "pkg/proxy/net/packetio_test.go:TestForwardUntil"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/packet-fragmented-query.trace.gz",
+      "trace_sha256": "e2eafb37ead45ffec6aba7176bdcfdb813bb0ce666cf95fab28420fd00950bba",
+      "uncompressed_bytes": 34,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 9,
+          "physical_packets": 1,
+          "transport_chunks": [
+            1,
+            2,
+            1,
+            3,
+            5
+          ]
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "awaiting_response",
+        "effects": [
+          "one logical request is forwarded byte-for-byte"
+        ]
+      }
+    },
+    {
+      "id": "packet-large-query",
+      "description": "A logical COM_QUERY larger than one maximum MySQL physical packet.",
+      "parity_ids": [
+        "PKT-002",
+        "PKT-003",
+        "CMD-003"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/packetio_test.go:TestForwardUntilLongData",
+        "pkg/proxy/backend/backend_conn_mgr_test.go:TestExecuteCmdStreamingForwardLargeQuery"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/packet-large-query.trace.gz",
+      "trace_sha256": "22ced8e58eb31b96b9245a6df1cde7fe835ebfa222257beb1592ecdcbc916ca4",
+      "uncompressed_bytes": 16777277,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 16777248,
+          "physical_packets": 2
+        }
+      ],
+      "expected": {
+        "outcome": "stream_forward",
+        "terminal_state": "awaiting_response",
+        "effects": [
+          "two physical packets form one logical request",
+          "capture is prefix-bounded"
+        ]
+      }
+    },
+    {
+      "id": "packet-sequence-mismatch",
+      "description": "A packet whose sequence does not match the local counter.",
+      "parity_ids": [
+        "PKT-004"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/packetio_test.go:TestPacketSequence"
+      ],
+      "capabilities": null,
+      "initial_state": {
+        "phase": "packet",
+        "state": "expect_sequence_0"
+      },
+      "trace_file": "cases/packet-sequence-mismatch.trace.gz",
+      "trace_sha256": "beeac6da23f033a2fe835d2d89106ad3d5b19b8e7ef3d54d5e2c33f2eddaa9c6",
+      "uncompressed_bytes": 26,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 7,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "accept_with_warning",
+        "terminal_state": "packet_complete",
+        "effects": [
+          "sequence advances from received value",
+          "sequence mismatch is logged"
+        ]
+      }
+    },
+    {
+      "id": "packet-truncated-header",
+      "description": "EOF in the middle of a physical packet header.",
+      "parity_ids": [
+        "PKT-007"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/packetio_test.go:TestForwardUntilError"
+      ],
+      "capabilities": null,
+      "initial_state": {
+        "phase": "packet",
+        "state": "reading_header"
+      },
+      "trace_file": "cases/packet-truncated-header.trace.gz",
+      "trace_sha256": "f4a5af824938b4f579423ebaa1a20f58060dd960d59cc85a2da2741c9327e3b8",
+      "uncompressed_bytes": 23,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 0,
+          "physical_packets": 0
+        }
+      ],
+      "expected": {
+        "outcome": "reject",
+        "terminal_state": "closed",
+        "effects": [
+          "read error is attributed to the client source"
+        ]
+      }
+    },
+    {
+      "id": "ping",
+      "description": "COM_PING receives a normal OK response.",
+      "parity_ids": [
+        "CMD-014"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/ping.trace.gz",
+      "trace_sha256": "81f3c6ec0b43f0dfd1daf5ff11f9339de416b4eba563b3e1c6ffd048cd720a4c",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "liveness response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "process-info",
+      "description": "COM_PROCESS_INFO uses result-set forwarding.",
+      "parity_ids": [
+        "CMD-010"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/process-info.trace.gz",
+      "trace_sha256": "0acf7cf4075b4a27997368f7562b3a7b374b85e56fcad636314d3982396ccb95",
+      "uncompressed_bytes": 104,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 49,
+          "physical_packets": 5
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "result set is streamed"
+        ]
+      }
+    },
+    {
+      "id": "query-error",
+      "description": "COM_QUERY followed by a synthetic parse error.",
+      "parity_ids": [
+        "CMD-003",
+        "RSP-001"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestQueryError"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/query-error.trace.gz",
+      "trace_sha256": "33e8e0a28875e001241188da53986ea39abcf1c22cb7983d11368d5eba50a418",
+      "uncompressed_bytes": 91,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 23,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "error packet is forwarded",
+          "error source is backend command"
+        ]
+      }
+    },
+    {
+      "id": "query-multi-results",
+      "description": "Two COM_QUERY results linked by SERVER_MORE_RESULTS_EXISTS.",
+      "parity_ids": [
+        "CMD-003",
+        "RSP-004"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestMultiStmt"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_DEPRECATE_EOF",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION",
+        "CLIENT_ZSTD_COMPRESSION_ALGORITHM"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "awaiting_response"
+      },
+      "trace_file": "cases/query-multi-results.trace.gz",
+      "trace_sha256": "a59e541d9a757f907414d88241c5016847297463c6238c5175455b0e42045a57",
+      "uncompressed_bytes": 43,
+      "records": [
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 14,
+          "physical_packets": 2
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "proxy continues after first result",
+          "proxy stops after final result"
+        ]
+      }
+    },
+    {
+      "id": "query-ok",
+      "description": "COM_QUERY followed by a normal OK response.",
+      "parity_ids": [
+        "CMD-003",
+        "RSP-001",
+        "RSP-008"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/query-ok.trace.gz",
+      "trace_sha256": "5020158b20dfd20176ffa34d5557164849abb7139fd8c4ed9e7983fba607349b",
+      "uncompressed_bytes": 54,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 9,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "server status is updated"
+        ]
+      }
+    },
+    {
+      "id": "quit",
+      "description": "COM_QUIT closes the session without a response.",
+      "parity_ids": [
+        "CMD-001"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/quit.trace.gz",
+      "trace_sha256": "50ed2c7cd81da896dea990f8d8fd1113ecd17370d7fece9a569259e94416e46f",
+      "uncompressed_bytes": 26,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "disconnect",
+        "terminal_state": "closed",
+        "effects": [
+          "quit status is set",
+          "no backend response is awaited"
+        ]
+      }
+    },
+    {
+      "id": "reset-connection",
+      "description": "COM_RESET_CONNECTION clears session-scoped state.",
+      "parity_ids": [
+        "CMD-031",
+        "PS-005"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "session_modified"
+      },
+      "trace_file": "cases/reset-connection.trace.gz",
+      "trace_sha256": "d2216b7f95e2fcf99ac37f1d7030f486ae41cbc3dd2b21cf5507c91536e8f845",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "transaction, prepared statement, database, and session-state tracking are reset"
+        ]
+      }
+    },
+    {
+      "id": "resultset-deprecate-eof",
+      "description": "Single-column result set using OK-as-EOF.",
+      "parity_ids": [
+        "CMD-003",
+        "RSP-003",
+        "RSP-008"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_DEPRECATE_EOF",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION",
+        "CLIENT_ZSTD_COMPRESSION_ALGORITHM"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "awaiting_response"
+      },
+      "trace_file": "cases/resultset-deprecate-eof.trace.gz",
+      "trace_sha256": "5f357543670de81862a4ef79324d964acb1214291afdc23603c8e460f8df3aa2",
+      "uncompressed_bytes": 83,
+      "records": [
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 46,
+          "physical_packets": 4
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "final OK-as-EOF is recognized"
+        ]
+      }
+    },
+    {
+      "id": "resultset-legacy-eof",
+      "description": "Single-column result set using legacy EOF terminators.",
+      "parity_ids": [
+        "CMD-003",
+        "RSP-002",
+        "RSP-008"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "awaiting_response"
+      },
+      "trace_file": "cases/resultset-legacy-eof.trace.gz",
+      "trace_sha256": "c2e8e10b57e1e439847a5f2aac49b16f39432b60d8aea0bf966b247c5c58f3cd",
+      "uncompressed_bytes": 90,
+      "records": [
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 49,
+          "physical_packets": 5,
+          "transport_chunks": [
+            2,
+            3,
+            5,
+            8
+          ]
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "column EOF and row EOF are recognized",
+          "row payload is streamed"
+        ]
+      }
+    },
+    {
+      "id": "set-option",
+      "description": "COM_SET_OPTION toggles multi-statements and receives EOF.",
+      "parity_ids": [
+        "CMD-027"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/backend_conn_mgr_test.go:TestSpecialCmds"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/set-option.trace.gz",
+      "trace_sha256": "83d7d5e1714410f45a4666ac806ad5b447b10744cd79339ad06e7ebd1be6a561",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 3,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 5,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "multi-statement capability is enabled"
+        ]
+      }
+    },
+    {
+      "id": "statistics",
+      "description": "COM_STATISTICS returns a raw human-readable payload.",
+      "parity_ids": [
+        "CMD-009"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/statistics.trace.gz",
+      "trace_sha256": "21509fbc278e9b9bd0c45e603ed44efae1510950519f80f7223db02b4580e5ca",
+      "uncompressed_bytes": 60,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 21,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "effects": [
+          "raw statistics payload is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "stmt-close",
+      "description": "COM_STMT_CLOSE releases local prepared-statement state.",
+      "parity_ids": [
+        "CMD-025",
+        "PS-006"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "statement_7_prepared"
+      },
+      "trace_file": "cases/stmt-close.trace.gz",
+      "trace_sha256": "419c2ab5fa73f980426a5aa4541e5637a9e98891e746e52fc15e6cbc0efa1de0",
+      "uncompressed_bytes": 30,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 5,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward_no_response",
+        "terminal_state": "ready",
+        "effects": [
+          "statement ID 7 is removed",
+          "no backend response is awaited"
+        ]
+      }
+    },
+    {
+      "id": "stmt-execute-cursor",
+      "description": "COM_STMT_EXECUTE opens a read-only cursor.",
+      "parity_ids": [
+        "CMD-023",
+        "PS-002",
+        "PS-004"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "statement_7_prepared"
+      },
+      "trace_file": "cases/stmt-execute-cursor.trace.gz",
+      "trace_sha256": "3e28ea7eafcb22a1fb0126d1ab2d90a827134635fdf00541ec010185e5f40861",
+      "uncompressed_bytes": 101,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 13,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 42,
+          "physical_packets": 3
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "cursor_open",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT",
+          "SERVER_STATUS_CURSOR_EXISTS"
+        ],
+        "effects": [
+          "statement remains pending",
+          "rows are deferred until fetch"
+        ]
+      }
+    },
+    {
+      "id": "stmt-fetch",
+      "description": "COM_STMT_FETCH returns cursor rows and closes the cursor.",
+      "parity_ids": [
+        "CMD-028",
+        "PS-002"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "cursor_open"
+      },
+      "trace_file": "cases/stmt-fetch.trace.gz",
+      "trace_sha256": "94e120695bdb42be295001b4405e34c52ea510952685337641f9ed712e6ac393",
+      "uncompressed_bytes": 58,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 9,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 2
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "statement_7_prepared",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT",
+          "SERVER_STATUS_LAST_ROW_SENT"
+        ],
+        "effects": [
+          "cursor-open status is cleared"
+        ]
+      }
+    },
+    {
+      "id": "stmt-long-data",
+      "description": "COM_STMT_SEND_LONG_DATA carries a synthetic parameter fragment.",
+      "parity_ids": [
+        "CMD-024",
+        "PS-001"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "statement_7_prepared"
+      },
+      "trace_file": "cases/stmt-long-data.trace.gz",
+      "trace_sha256": "e46d5bf636005562a3ea2cc3e5832afa517a139feeef50dcc6f5b18e0a6d107a",
+      "uncompressed_bytes": 35,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 10,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward_no_response",
+        "terminal_state": "statement_7_prepared",
+        "effects": [
+          "long-data fragment is forwarded",
+          "no backend response is awaited"
+        ]
+      }
+    },
+    {
+      "id": "stmt-prepare-metadata",
+      "description": "COM_STMT_PREPARE with parameter and column metadata.",
+      "parity_ids": [
+        "CMD-022",
+        "PS-004",
+        "RSP-006"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/stmt-prepare-metadata.trace.gz",
+      "trace_sha256": "cfa5800efd6c547919e2802b74ddac84f62f11ace06fe53a8932b959d0351495",
+      "uncompressed_bytes": 153,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 9,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 90,
+          "physical_packets": 5
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "effects": [
+          "statement ID 7 becomes pending",
+          "parameter and column metadata are forwarded"
+        ]
+      }
+    },
+    {
+      "id": "stmt-reset",
+      "description": "COM_STMT_RESET clears cursor and long-data state but keeps the statement.",
+      "parity_ids": [
+        "CMD-026",
+        "PS-001",
+        "PS-002"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "statement_7_has_long_data"
+      },
+      "trace_file": "cases/stmt-reset.trace.gz",
+      "trace_sha256": "3162ff106a57c4a12d93f81449401c0df298912fc306e62bc0f7883923c59b72",
+      "uncompressed_bytes": 50,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 5,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "statement_7_prepared",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "cursor and buffered parameter state are cleared",
+          "statement ID 7 remains pending"
+        ]
+      }
+    }
+  ]
+}
