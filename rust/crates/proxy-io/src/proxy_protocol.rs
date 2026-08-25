@@ -237,7 +237,7 @@ pub fn decode_after_magic(input: &[u8]) -> ProxyV2Decode<'_> {
     }
     let body = &input[FIXED_HEADER_LEN..total];
 
-    let (addresses, tlv_bytes) = decode_addresses(address_family, body);
+    let (addresses, tlv_bytes) = decode_addresses(address_family, transport, body);
     let tlvs = decode_tlvs(tlv_bytes);
     ProxyV2Decode::Done {
         header: ProxyHeader {
@@ -253,7 +253,17 @@ pub fn decode_after_magic(input: &[u8]) -> ProxyV2Decode<'_> {
 }
 
 /// Splits the body into recovered addresses and the bytes Go would scan as TLVs.
-fn decode_addresses(family: AddressFamily, body: &[u8]) -> (ProxyAddresses<'_>, &[u8]) {
+///
+/// Go's inner `switch network` populates addresses only for STREAM/DGRAM; an
+/// unknown transport with a known family still advances past the address block
+/// (unlike the short-body case, which leaves the cursor unadvanced).
+fn decode_addresses(
+    family: AddressFamily,
+    transport: TransportProtocol,
+    body: &[u8],
+) -> (ProxyAddresses<'_>, &[u8]) {
+    let known_transport =
+        transport == TransportProtocol::STREAM || transport == TransportProtocol::DGRAM;
     match family {
         AddressFamily::INET | AddressFamily::INET6 => {
             let ip_len = if family == AddressFamily::INET { 4 } else { 16 };
@@ -262,6 +272,9 @@ fn decode_addresses(family: AddressFamily, body: &[u8]) -> (ProxyAddresses<'_>, 
                 // Go breaks without advancing the cursor: the short address
                 // body is rescanned as TLV bytes.
                 return (ProxyAddresses::None, body);
+            }
+            if !known_transport {
+                return (ProxyAddresses::None, &body[need..]);
             }
             let src_port = u16::from_be_bytes([body[2 * ip_len], body[2 * ip_len + 1]]);
             let dst_port = u16::from_be_bytes([body[2 * ip_len + 2], body[2 * ip_len + 3]]);
@@ -282,6 +295,9 @@ fn decode_addresses(family: AddressFamily, body: &[u8]) -> (ProxyAddresses<'_>, 
             if body.len() < UNIX_ADDRESS_PAIR_LEN {
                 // Same Go behavior as the short INET body above.
                 return (ProxyAddresses::None, body);
+            }
+            if !known_transport {
+                return (ProxyAddresses::None, &body[UNIX_ADDRESS_PAIR_LEN..]);
             }
             (
                 ProxyAddresses::Unix {
@@ -397,6 +413,11 @@ pub enum ProxyEncodeError {
         /// Supplied path length.
         length: usize,
     },
+    /// The aggregate body (addresses plus TLVs) exceeds the u16 length field.
+    BodyTooLong {
+        /// Computed body length.
+        length: usize,
+    },
 }
 
 impl fmt::Display for ProxyEncodeError {
@@ -409,6 +430,10 @@ impl fmt::Display for ProxyEncodeError {
             Self::UnixNameTooLong { length } => write!(
                 f,
                 "PROXY v2 unix path length {length} exceeds the {UNIX_NAME_MAX}-byte block"
+            ),
+            Self::BodyTooLong { length } => write!(
+                f,
+                "PROXY v2 body length {length} exceeds the u16 length field"
             ),
         }
     }
@@ -426,8 +451,9 @@ impl std::error::Error for ProxyEncodeError {}
 ///
 /// # Errors
 ///
-/// Returns a typed error for a TLV above `u16::MAX` bytes or a Unix path
-/// above 108 bytes instead of Go's silent corruption.
+/// Returns a typed error for a TLV above `u16::MAX` bytes, a Unix path above
+/// 108 bytes, or an aggregate body (addresses plus TLVs) above the u16 length
+/// field, instead of Go's silent corruption at each of those points.
 pub fn encode_proxy_v2(
     version: ProxyVersion,
     command: ProxyCommand,
@@ -485,9 +511,13 @@ pub fn encode_proxy_v2(
     }
 
     let body_length = output.len() - MAGIC_V2.len() - FIXED_HEADER_LEN;
-    // The body cannot exceed u16::MAX: addresses are bounded and every TLV
-    // was length-checked above, but saturate defensively rather than mask.
-    let body_length = u16::try_from(body_length).unwrap_or(u16::MAX);
+    // Individually legal TLVs can still overflow the aggregate u16 body
+    // length; reject instead of writing a header that lies about its body.
+    let Ok(body_length) = u16::try_from(body_length) else {
+        return Err(ProxyEncodeError::BodyTooLong {
+            length: body_length,
+        });
+    };
     output[MAGIC_V2.len() + 1] = (family.as_nibble() << 4) | (transport.as_nibble() & 0x0f);
     let length_bytes = body_length.to_be_bytes();
     output[MAGIC_V2.len() + 2] = length_bytes[0];
@@ -588,6 +618,24 @@ mod tests {
         assert_eq!(header.tlvs[0].content, &[0xaa, 0xbb]);
         assert_eq!(header.tlvs[1].type_byte, 0x09);
         assert_eq!(header.tlvs[1].content, &[] as &[u8]);
+        Ok(())
+    }
+
+    #[test]
+    fn known_family_unknown_transport_skips_addresses_but_scans_tlvs_like_go() -> TestResult {
+        // Go's inner network switch leaves Src/DstAddress nil for an unknown
+        // transport but still advances past the address block, so trailing
+        // bytes are scanned as TLVs.
+        let mut input = vec![0x21, 0x13, 0x00, 0x10];
+        input.extend_from_slice(&[0x7f, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x02]);
+        input.extend_from_slice(&[0x00, 0x22, 0x16, 0x2e]);
+        input.extend_from_slice(&[0x04, 0x00, 0x01, 0xaa]);
+        let (header, _) = expect_done(&input)?;
+        assert_eq!(header.transport, TransportProtocol::from_nibble(3));
+        assert_eq!(header.addresses, ProxyAddresses::None);
+        assert_eq!(header.tlvs.len(), 1);
+        assert_eq!(header.tlvs[0].type_byte, 0x04);
+        assert_eq!(header.tlvs[0].content, &[0xaa]);
         Ok(())
     }
 

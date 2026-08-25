@@ -216,6 +216,44 @@ fn encode_strictness_returns_typed_errors() {
     );
 }
 
+/// Individually legal TLVs whose aggregate body exceeds the u16 length field
+/// return a typed error; a body at exactly the u16 boundary still encodes.
+#[test]
+fn encode_aggregate_body_length_is_checked() -> TestResult {
+    let half = vec![0_u8; 32_768];
+    let result = encode_proxy_v2(
+        ProxyVersion::V2,
+        ProxyCommand::PROXY,
+        TransportProtocol::STREAM,
+        EncodeAddresses::Unspec,
+        &[(0x04, &half), (0x04, &half)],
+    );
+    assert_eq!(
+        result,
+        Err(ProxyEncodeError::BodyTooLong {
+            length: 32_768 * 2 + 6,
+        })
+    );
+
+    // Addresses + TLV landing exactly on u16::MAX must still encode.
+    let addr = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1_u16);
+    let fill = vec![0_u8; usize::from(u16::MAX) - 12 - 3];
+    let encoded = encode_proxy_v2(
+        ProxyVersion::V2,
+        ProxyCommand::PROXY,
+        TransportProtocol::STREAM,
+        EncodeAddresses::Ip {
+            src: addr,
+            dst: addr,
+        },
+        &[(0x04, &fill)],
+    )?;
+    let length = usize::from(u16::from_be_bytes([encoded[14], encoded[15]]));
+    assert_eq!(length, usize::from(u16::MAX));
+    assert_eq!(encoded.len(), 12 + 4 + usize::from(u16::MAX));
+    Ok(())
+}
+
 /// Adversarial: random bytes never panic and never falsely claim a magic.
 #[test]
 fn adversarial_random_inputs_do_not_panic() {
