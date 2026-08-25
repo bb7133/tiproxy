@@ -24,6 +24,7 @@
 
 mod error;
 mod packet;
+mod pump;
 
 pub mod proxy_protocol;
 
@@ -32,6 +33,11 @@ pub use packet::{
     DEFAULT_STREAM_BUFFER_SIZE, ForwardProgress, ForwardStatus, ForwardUntilDecision,
     ForwardUntilResult, ForwardUntilStatus, LogicalPacket, PacketPreview, PacketReader,
     PacketWriter,
+};
+pub use pump::{
+    BufferPool, BufferPoolStats, DEFAULT_PUMP_BUFFER_SIZE, DEFAULT_WRITE_HIGH_WATER,
+    DirectionReport, DirectionTermination, DuplexPump, DuplexPumpConfig, DuplexPumpReport,
+    PumpCancellation, PumpConfigError, PumpDirection, PumpError, PumpOperation,
 };
 
 /// Stable description used by workspace-level topology checks.

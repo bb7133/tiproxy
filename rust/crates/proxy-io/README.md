@@ -81,6 +81,50 @@ cargo clippy --locked --manifest-path rust/Cargo.toml \
   -p proxy-io --all-targets --all-features -- -D warnings
 ```
 
+## Bounded duplex transport
+
+WIRE-02 adds `DuplexPump` for future runtime/session phases that intentionally
+proxy raw transport bytes after protocol negotiation. It does not replace the
+packet-aware session state machine. Each joined direction owns one reusable
+`BufferPool` lease and one fixed staging area:
+
+- active userspace memory is bounded by
+  `2 * (read_buffer_size + write_high_water)` per duplex connection;
+- the shared pool retains at most `max_idle * buffer_size` bytes between
+  connections and never waits for a lease, so unrelated session owners cannot
+  deadlock one another;
+- a destination write starts when the staging area reaches
+  `write_high_water`, on EOF, or after `max_flush_delay`; while that write is
+  pending, the direction performs no more source reads, applying slow-peer
+  backpressure at the configured high-water mark;
+- optional read-idle, write/flush, and half-close deadlines are explicit and
+  direction-attributed in `PumpError`.
+
+`DuplexPump::run` uses two futures held by one `tokio::join!`; it does not spawn
+or detach tasks. The first EOF, connection reset/error, or
+`PumpCancellation::cancel` wakes the peer direction, and both directions call
+`AsyncWrite::shutdown` before the owner returns. Cancellation observed while a
+staged write is pending discards only the unwritten staged suffix and reports
+that count. This hard termination can therefore leave a partially written
+staged byte range at the destination; it does not promise a message boundary.
+Its upper termination bound is the configured write/flush deadline plus
+`shutdown_timeout`.
+
+This owner cancellation is a hard connection termination path. Resumable
+packet forwarding must continue to use WIRE-01's cooperative packet-boundary
+APIs; dropping a packet future mid-frame is still forbidden.
+
+`tests/pump.rs` contains the Rust-side `PARITY-PKT-006` evidence for fixed pool
+reuse, high-water backpressure, timer batching, EOF/reset/cancel propagation,
+read/write deadlines, half-close, and joined owner termination. The release
+benchmark uses 256-byte synthetic reads and asserts at least 32:1 write-call
+coalescing while checking the exact high-water bound:
+
+```sh
+cargo run --locked --release --manifest-path rust/Cargo.toml \
+  -p proxy-io --example duplex_pump_bench -- --quick
+```
+
 ## PROXY protocol v2 (`proxy_protocol`)
 
 Sans-I/O codecs matching Go TiProxy's observable behavior
