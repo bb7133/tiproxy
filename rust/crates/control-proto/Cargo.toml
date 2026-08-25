@@ -11,8 +11,19 @@ repository.workspace = true
 default = []
 
 [dependencies]
+# These direct pins keep x509-parser's proc-macro graph single-versioned under
+# the workspace cargo-deny policy.
+displaydoc.workspace = true
+libc.workspace = true
 prost.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
 
 [lints]
 workspace = true

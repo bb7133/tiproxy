@@ -21,6 +21,7 @@
 
 mod codec;
 pub mod control_transport;
+pub mod snapshot;
 
 /// Generated protobuf v1 types.
 #[allow(missing_docs, clippy::all, clippy::pedantic)]

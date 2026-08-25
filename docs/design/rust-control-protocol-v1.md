@@ -192,6 +192,38 @@ bound before the swap but cannot accept until commit; listener removals stop
 accepting at commit and drain existing sessions. Fields documented as
 restart-required cause snapshot rejection rather than partial application.
 
+`pkg/controlbridge.SnapshotBuilder` is the Go translation boundary. It clones
+and runs `Config.Check`, normalizes listener/CIDR/duration values, resolves the
+default connection buffer, canonicalizes allowlisted TLS paths, and emits a
+complete `StateSnapshot` in the control lane. `control-proto::snapshot` is the
+Rust validation boundary. It parses every certificate, key, and CA into an
+isolated candidate, checks certificate validity and key pairing, and swaps one
+`Arc<ValidatedSnapshot>` under a write lock only after every field succeeds.
+An equal generation with identical contents reuses the same `Arc`; stale,
+conflicting, invalid, or unsupported generations return a redacted reason and
+leave the old `Arc` untouched. A session captures that immutable handle when it
+starts, so later certificate rotation affects new sessions without mutating an
+established session's TLS context.
+
+The Rust-mode reload contract is:
+
+| Snapshot field or source setting | Rust-mode behavior | Reason |
+| --- | --- | --- |
+| `max-connections`, memory threshold, connection buffer | Reloadable; new admission/session state uses the committed generation. | No listener or process identity changes. |
+| Frontend/healthy-backend/unhealthy-backend keepalive | Reloadable for new connections; the runtime may separately refresh health-driven backend keepalive as specified by `CFG-001`. | Connection-scoped socket settings are immutable unless explicitly refreshed. |
+| PROXY v2 mode, backend TLS requirement, graceful timers, public CIDRs | Reloadable for new connections and new drain operations. | Complete snapshot replacement avoids mixed policy. |
+| Frontend/backend certificate, key, CA paths; TLS minimum; allowed CNs; skip-CA policy | Reloadable after Rust rereads and validates every referenced regular file beneath the configured TLS roots. Atomic rename to a new file path is supported. | Existing sessions retain their captured generation; invalid/expired/mismatched material keeps last-good. |
+| Backend discovery and namespace routing entries | Reloadable as part of the same generation. | A session's selected namespace/backend identity remains connection-stable. |
+| `proxy.addr` and `proxy.port-range` | Restart-required; the Go builder rejects a changed listener set. | Listener ownership and bind lifecycle are established at process startup in v1. |
+| Process work directory, API listener, log encoding, metering sink, HA/VIP identity | Restart-required and absent from the dataplane snapshot. | These remain Go process/control-plane ownership. |
+| `auto-certs` | Unsupported in Rust mode; use shared certificate files. | Ephemeral Go in-memory keys must never cross IPC. |
+| Traffic capture/replay | Unsupported; snapshot application fails fast. | This is the explicit dataplane rewrite exclusion. |
+
+Go and Rust both require absolute, canonical certificate paths below a
+deployment-provided directory allowlist. Diagnostics identify only the policy
+field and failure class; they never include file contents, authentication data,
+or key material.
+
 ## Handshake and routing lifecycle
 
 Rust sends decoded, bounded handshake metadata only. `AuthData`, salt, auth
