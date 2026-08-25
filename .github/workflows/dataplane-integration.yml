@@ -95,7 +95,9 @@ jobs:
           tar -xzf "$archive" -C "$install_root"
           "$install_root/bin/tiup" --version
           echo "$install_root/bin" >>"$GITHUB_PATH"
-          echo "TIUP_HOME=$RUNNER_TEMP/tiup-home" >>"$GITHUB_ENV"
+          # The release archive keeps its signed repository root at
+          # <extract>/bin/root.json, which TiUP resolves through TIUP_HOME.
+          echo "TIUP_HOME=$install_root" >>"$GITHUB_ENV"
       - name: Verify host prerequisites
         run: |
           command -v mysql
