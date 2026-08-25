@@ -49,6 +49,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `pkg/balance/observer/` - Queries backend list and checks backend health, then notifies the router.
 - `pkg/balance/policy/` - The `BalancePolicy` interface and implementations such as `SimpleBalancePolicy`.
 - `pkg/balance/router/` - Load-balance and routing service. Rebalances and routes connections based on a `BalancePolicy`.
+- `pkg/controlbridge/` - Versioned Go/Rust control-protocol codecs, bounded transport, and control-plane adapters; SQL packet payloads never enter this package.
 - `pkg/manager/cert/` - Auto-reloads certificates and provides interfaces to query them.
 - `pkg/manager/config/` - Auto-reloads configuration files and provides interfaces to query them.
 - `pkg/manager/elect/` - Manages TiProxy owner elections (for example, metrics reader and VIP modules need an owner).
