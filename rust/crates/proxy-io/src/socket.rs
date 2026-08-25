@@ -496,9 +496,10 @@ mod keepalive_unix {
 ///
 /// Linux implements the full Go contract (`TCP_KEEPIDLE`/`CNT`/`INTVL` plus
 /// `TCP_USER_TIMEOUT` even when probing is disabled). Other Unix systems
-/// apply the portable subset; the user-timeout knob silently has no effect
-/// there today, matching the reality that Go's darwin variant uses different
-/// constants. Non-Unix platforms return a diagnostic error.
+/// apply the portable subset and reject a nonzero user timeout with an
+/// explicit [`SocketError::UnsupportedPlatform`] (Go's darwin variant uses
+/// `TCP_RXT_CONNDROPTIME`, which is unreachable without unsafe code here).
+/// Non-Unix platforms return a diagnostic error for the whole policy.
 ///
 /// # Errors
 ///
