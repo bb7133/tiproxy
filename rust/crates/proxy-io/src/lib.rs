@@ -27,6 +27,7 @@ mod packet;
 mod pump;
 
 pub mod proxy_protocol;
+pub mod tls;
 
 pub use error::{IoSide, PacketIoError};
 pub use packet::{

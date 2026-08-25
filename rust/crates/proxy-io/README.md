@@ -164,3 +164,37 @@ note: Go's `listener.go` returns the PROXY **destination** address from
 `RemoteAddr` while the production path in `net/proxy.go` returns the
 **source** address (both pass Go's tests only because src == dst there);
 the Rust adapter must follow `net/proxy.go`.
+
+## TLS (`tls`)
+
+WIRE-04: frontend `SSLRequest` upgrade and backend client TLS over rustls
+(the workspace-approved library; no openssl/native-tls).
+
+- `accept_frontend` completes the server handshake through a
+  `PrefixedIo` that replays already-buffered bytes first — Go's "handshake
+  must read from the buffered reader" rule — bounded by an explicit timeout.
+- `build_backend_config` derives the client configuration exclusively from
+  `control-proto`'s `ValidatedTlsPolicy`: snapshot CA roots,
+  `skip_ca_verification` (Go `InsecureSkipVerify`), optional client
+  certificate/key, and the `""`/`"1.2"`/`"1.3"` minimum-version contract.
+- `connect_backend` takes the routing-selected backend host as the server
+  name; DNS names and IP literals both parse (Go's "use the DNS name as much
+  as possible").
+- `tls_buffer_sizes` is byte-for-byte Go `tlsBufferSizes` parity: reads clamp
+  `size/4` into `[1 KiB, 4 KiB]`, writes clamp `size/2` into
+  `[1 KiB, 16 KiB]`, zero normalizes to 32 KiB — a large base buffer never
+  duplicates full-size TLS memory.
+- Reload safety comes from the snapshot store: sessions capture an immutable
+  `Arc` at establishment, a failed reload keeps last-good for new sessions,
+  and a valid new certificate applies only to sessions created after it
+  (integration-tested against `SnapshotStore`).
+- Handshake facts exposed to upper layers are metadata-only
+  (`TlsHandshakeInfo`); certificates, keys, and raw TLS bytes never leave the
+  transport layer.
+
+One safety-ledger row: `WIRE-04-D1` — Go's backend client TLS never
+verifies the hostname even with a CA (`InsecureSkipVerify` plus a custom
+verifier that omits `DNSName`); Rust's standard WebPKI path verifies the
+routing-selected backend hostname. A deliberate strengthening, recorded in
+the parity manifest with its compatibility impact. The TLS 1.2/1.3 floor was
+already frozen by `control-proto` snapshot validation and adds no new row.
