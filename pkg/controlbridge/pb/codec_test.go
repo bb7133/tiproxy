@@ -29,6 +29,21 @@ func TestDecodeRustGolden(t *testing.T) {
 	require.Equal(t, golden, encoded)
 }
 
+func TestDecodeRustReconcileGolden(t *testing.T) {
+	golden, err := os.ReadFile("../../../proto/dataplane/v1/testdata/rust-reconcile.frame")
+	require.NoError(t, err)
+	envelope, err := ReadFrame(bytes.NewReader(golden), DefaultMaxFrameBytes)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{uint64(ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS)}, envelope.GetRequiredCapabilities())
+	connections := envelope.GetReconcileRequest().GetConnections()
+	require.Len(t, connections, 1)
+	require.Equal(t, uint64(77), connections[0].GetConnectionId())
+	require.True(t, connections[0].GetRedirectPending())
+	encoded, err := MarshalFrame(envelope, DefaultMaxFrameBytes)
+	require.NoError(t, err)
+	require.Equal(t, golden, encoded)
+}
+
 func TestFrameBoundsAndPartialIO(t *testing.T) {
 	envelope := &ControlEnvelope{
 		ProtocolVersion: ProtocolV1,

@@ -21,7 +21,7 @@ pub struct ControlEnvelope {
     pub sent_unix_millis: u64,
     #[prost(uint64, repeated, tag="7")]
     pub required_capabilities: ::prost::alloc::vec::Vec<u64>,
-    #[prost(oneof="control_envelope::Body", tags="20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40")]
+    #[prost(oneof="control_envelope::Body", tags="20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42")]
     pub body: ::core::option::Option<control_envelope::Body>,
 }
 /// Nested message and enum types in `ControlEnvelope`.
@@ -70,6 +70,10 @@ pub mod control_envelope {
         Heartbeat(super::Heartbeat),
         #[prost(message, tag="40")]
         Error(super::ProtocolError),
+        #[prost(message, tag="41")]
+        CloseCommand(super::CloseCommand),
+        #[prost(message, tag="42")]
+        CloseResult(super::CloseResult),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -413,6 +417,32 @@ pub struct RedirectResult {
     pub detail: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CloseCommand {
+    #[prost(uint64, tag="1")]
+    pub connection_id: u64,
+    #[prost(string, tag="2")]
+    pub close_id: ::prost::alloc::string::String,
+    #[prost(enumeration="ErrorSource", tag="3")]
+    pub error_source: i32,
+    #[prost(string, tag="4")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(bool, tag="5")]
+    pub force: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CloseResult {
+    #[prost(uint64, tag="1")]
+    pub connection_id: u64,
+    #[prost(string, tag="2")]
+    pub close_id: ::prost::alloc::string::String,
+    #[prost(bool, tag="3")]
+    pub accepted: bool,
+    #[prost(enumeration="ErrorCode", tag="4")]
+    pub code: i32,
+    #[prost(string, tag="5")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DrainCommand {
     #[prost(string, tag="1")]
     pub drain_id: ::prost::alloc::string::String,
@@ -482,7 +512,7 @@ pub struct MeteringBatch {
     #[prost(message, repeated, tag="2")]
     pub deltas: ::prost::alloc::vec::Vec<MeteringDelta>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReconcileRequest {
     #[prost(uint64, tag="1")]
     pub known_generation: u64,
@@ -492,6 +522,8 @@ pub struct ReconcileRequest {
     pub last_metrics_sequence: u64,
     #[prost(uint64, tag="4")]
     pub last_metering_sequence: u64,
+    #[prost(message, repeated, tag="5")]
+    pub connections: ::prost::alloc::vec::Vec<ReconcileConnection>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReconcileConnection {
@@ -596,6 +628,37 @@ impl Role {
             "ROLE_UNSPECIFIED" => Some(Self::Unspecified),
             "ROLE_GO_CONTROL" => Some(Self::GoControl),
             "ROLE_RUST_DATAPLANE" => Some(Self::RustDataplane),
+            _ => None,
+        }
+    }
+}
+/// ControlCapability values are advertised as uint64 values in Hello. Values
+/// are never reused because they gate additive messages and required fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ControlCapability {
+    Unspecified = 0,
+    PerConnectionClose = 1,
+    ReconcileConnections = 2,
+}
+impl ControlCapability {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CONTROL_CAPABILITY_UNSPECIFIED",
+            Self::PerConnectionClose => "CONTROL_CAPABILITY_PER_CONNECTION_CLOSE",
+            Self::ReconcileConnections => "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONTROL_CAPABILITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "CONTROL_CAPABILITY_PER_CONNECTION_CLOSE" => Some(Self::PerConnectionClose),
+            "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS" => Some(Self::ReconcileConnections),
             _ => None,
         }
     }

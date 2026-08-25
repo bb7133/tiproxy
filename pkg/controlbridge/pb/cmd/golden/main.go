@@ -42,11 +42,33 @@ func run() error {
 			BuildCommit:              "0123456789abcdef",
 		}},
 	}
+	if err := writeFrame(root, "go-hello.frame", envelope); err != nil {
+		return err
+	}
+	return writeFrame(root, "go-close.frame", &controlpb.ControlEnvelope{
+		ProtocolVersion: controlpb.ProtocolV1,
+		ControlEpoch:    42,
+		RequestId:       100,
+		Priority:        controlpb.Priority_PRIORITY_CRITICAL,
+		RequiredCapabilities: []uint64{
+			uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE),
+		},
+		Body: &controlpb.ControlEnvelope_CloseCommand{CloseCommand: &controlpb.CloseCommand{
+			ConnectionId: 77,
+			CloseId:      "evict-77",
+			ErrorSource:  controlpb.ErrorSource_ERROR_SOURCE_SHUTDOWN,
+			Reason:       "router eviction",
+			Force:        true,
+		}},
+	})
+}
+
+func writeFrame(root, name string, envelope *controlpb.ControlEnvelope) error {
 	frame, err := controlpb.MarshalFrame(envelope, controlpb.DefaultMaxFrameBytes)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(root, "proto", "dataplane", "v1", "testdata", "go-hello.frame")
+	path := filepath.Join(root, "proto", "dataplane", "v1", "testdata", name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
