@@ -12,3 +12,4 @@ coverage.dat
 grafonnet-lib
 dist
 rust/target
+__pycache__/

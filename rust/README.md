@@ -29,6 +29,7 @@ repository root, use:
 ```sh
 make rust-build
 make rust-test
+make rust-doc-test
 make rust-lint
 make rust-release RUST_TARGET=x86_64-unknown-linux-gnu
 make rust-release RUST_TARGET=aarch64-unknown-linux-gnu
@@ -41,3 +42,6 @@ be available. CI installs those prerequisites on matching Linux builders.
 time. Release automation can override them with `TIPROXY_VERSION`,
 `TIPROXY_COMMIT`, and `TIPROXY_BUILD_TIME`; otherwise the build script derives
 local values.
+
+Supply-chain policy, pinned CI tools, vulnerability exceptions, and the CI
+negative-test strategy are documented in [`ci/README.md`](ci/README.md).

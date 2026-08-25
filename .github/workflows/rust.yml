@@ -1,0 +1,147 @@
+name: Rust
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/rust.yml"
+      - "AGENTS.md"
+      - "Makefile"
+      - "rust-toolchain.toml"
+      - "rust/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/rust.yml"
+      - "AGENTS.md"
+      - "Makefile"
+      - "rust-toolchain.toml"
+      - "rust/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_AUDIT_VERSION: 0.22.2
+  CARGO_DENY_VERSION: 0.20.2
+
+jobs:
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/target
+          key: rust-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Check formatting and Clippy
+        run: make rust-lint
+      - name: Run unit tests
+        run: make rust-test
+      - name: Run doc tests
+        run: make rust-doc-test
+      - name: Reject a stale lockfile
+        run: cargo check --locked --workspace --manifest-path rust/Cargo.toml
+
+  supply-chain:
+    name: Audit dependencies and policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Restore Cargo and scanner caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            bin/rust-tools
+          key: rust-supply-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}-${{ env.CARGO_AUDIT_VERSION }}-${{ env.CARGO_DENY_VERSION }}
+      - name: Install pinned scanners
+        run: make rust-install-tools
+      - name: Enforce supply-chain policy
+        run: make rust-supply-chain
+      - name: Prove quality gates reject violations
+        run: make rust-negative-tests
+
+  release:
+    name: Release (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add "${{ matrix.target }}"
+      - name: Restore release cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/target/${{ matrix.target }}
+          key: rust-release-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Build and verify release artifact
+        id: build
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          version=$(git describe --tags --always)
+          build_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          make rust-release RUST_TARGET="$RUST_TARGET" VERSION="$version" COMMIT="$GITHUB_SHA" BUILD_TIME="$build_time"
+          binary="rust/target/$RUST_TARGET/release/tiproxy-rs"
+          rust/ci/verify-version.sh "$binary" "$version" "$GITHUB_SHA" "$build_time"
+          mkdir -p dist
+          cp "$binary" "dist/tiproxy-rs-linux-${{ matrix.arch }}"
+          sha256sum "dist/tiproxy-rs-linux-${{ matrix.arch }}" >"dist/tiproxy-rs-linux-${{ matrix.arch }}.sha256"
+      - name: Upload release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tiproxy-rs-linux-${{ matrix.arch }}
+          path: |
+            dist/tiproxy-rs-linux-${{ matrix.arch }}
+            dist/tiproxy-rs-linux-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+          retention-days: 14
