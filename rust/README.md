@@ -1,12 +1,14 @@
 # TiProxy Rust workspace
 
-This workspace is the production home of the TiProxy Rust dataplane. It starts
-with explicit crate boundaries and build policy only; protocol behavior is added
-under separately reviewed parity tasks.
+This workspace is the production home of the TiProxy Rust dataplane. Protocol
+behavior is added under separately reviewed parity tasks while the crate
+boundaries and build policy remain stable.
 
 ## Crate boundaries
 
-- `mysql-wire` owns wire-format types and codecs, but not sockets.
+- `mysql-wire` owns runtime-independent wire-format types and codecs, but not
+  sockets or logical-message streaming. Its borrowing and safety contract is
+  documented in [`crates/mysql-wire/README.md`](crates/mysql-wire/README.md).
 - `proxy-io` owns client/backend transports and their future TLS, compression,
   and PROXY protocol layers, but not routing policy.
 - `session-core` owns the protocol-independent session lifecycle and migration
