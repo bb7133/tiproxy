@@ -45,11 +45,12 @@ type sessionConfig struct {
 
 // Session is one negotiated, epoch-bound Go/Rust control stream.
 type Session struct {
-	conn   *net.UnixConn
-	epoch  uint64
-	config sessionConfig
-	queues *outboundQueues
-	done   chan struct{}
+	conn         *net.UnixConn
+	epoch        uint64
+	capabilities map[uint64]struct{}
+	config       sessionConfig
+	queues       *outboundQueues
+	done         chan struct{}
 
 	cancelMu sync.Mutex
 	cancel   context.CancelFunc
@@ -58,16 +59,27 @@ type Session struct {
 	nextID   atomic.Uint64
 }
 
-func newSession(conn *net.UnixConn, epoch uint64, config sessionConfig) *Session {
+func newSession(conn *net.UnixConn, epoch uint64, capabilities []uint64, config sessionConfig) *Session {
+	negotiated := make(map[uint64]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		negotiated[capability] = struct{}{}
+	}
 	session := &Session{
-		conn:   conn,
-		epoch:  epoch,
-		config: config,
-		queues: newOutboundQueues(config.queues),
-		done:   make(chan struct{}),
+		conn:         conn,
+		epoch:        epoch,
+		capabilities: negotiated,
+		config:       config,
+		queues:       newOutboundQueues(config.queues),
+		done:         make(chan struct{}),
 	}
 	session.lastRecv.Store(time.Now().UnixNano())
 	return session
+}
+
+// HasCapability reports whether Hello negotiation enabled an additive protocol capability.
+func (session *Session) HasCapability(capability uint64) bool {
+	_, ok := session.capabilities[capability]
+	return ok
 }
 
 // Epoch returns the Go-assigned owner epoch.

@@ -31,7 +31,8 @@ func (handler *StaticHandshakeHandler) HandleHandshakeErr(ConnContext, *mysql.My
 	return false
 }
 
-func (handler *StaticHandshakeHandler) GetRouter(ConnContext, *pnet.HandshakeResp) (router.Router, error) {
+func (handler *StaticHandshakeHandler) GetRouter(ctx ConnContext, _ *pnet.HandshakeResp) (router.Router, error) {
+	ctx.SetValue(ConnContextKeyNamespace, "default")
 	return handler.rt, nil
 }
 

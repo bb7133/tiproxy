@@ -256,7 +256,7 @@ func (server *Server) handshake(conn *net.UnixConn) (_ *Session, returnErr error
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return nil, fmt.Errorf("clear control handshake deadline: %w", err)
 	}
-	session := newSession(conn, epoch, sessionConfig{
+	session := newSession(conn, epoch, ack.GetNegotiatedCapabilities(), sessionConfig{
 		maxFrameBytes:     ack.GetMaxFrameBytes(),
 		queues:            server.config.QueueLimits,
 		heartbeatInterval: server.config.HeartbeatInterval,

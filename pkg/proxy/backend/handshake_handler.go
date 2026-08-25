@@ -21,6 +21,9 @@ const (
 	ConnContextKeyTLSState ConnContextKey = "tls-state"
 	ConnContextKeyConnID   ConnContextKey = "conn-id"
 	ConnContextKeyConnAddr ConnContextKey = "conn-addr"
+	// ConnContextKeyNamespace records the namespace selected by GetRouter so
+	// the Rust dataplane can retain it for lifecycle and reconciliation events.
+	ConnContextKeyNamespace ConnContextKey = "namespace"
 )
 
 var _ HandshakeHandler = (*DefaultHandshakeHandler)(nil)
@@ -77,6 +80,7 @@ func (handler *DefaultHandshakeHandler) GetRouter(ctx ConnContext, resp *pnet.Ha
 	if !ok {
 		return nil, errors.New("failed to find a namespace")
 	}
+	ctx.SetValue(ConnContextKeyNamespace, ns.Name())
 	ctx.UpdateLogger(zap.String("ns", ns.Name()))
 	return ns.GetRouter(), nil
 }
