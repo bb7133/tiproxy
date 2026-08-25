@@ -41,6 +41,11 @@
 //! - control timing defaults: handshake 5 s, heartbeat 1 s, peer 3 s,
 //!   write 5 s, reconnect 50 ms base with a 5 s cap
 //!   (`ClientConfig::with_defaults`)
+//! - control timing hard rules, enforced by `ControlClient::new` and
+//!   boundary-proven in conformance: handshake, heartbeat, and write
+//!   timeouts must be nonzero; peer timeout must exceed the heartbeat
+//!   interval; the reconnect base must be nonzero; the reconnect cap must
+//!   be at least the base and at most 5 s (`MAX_RECONNECT_BACKOFF`)
 
 use core::fmt;
 

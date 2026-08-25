@@ -193,6 +193,80 @@ fn control_hard_maxima_are_bidirectionally_anchored() {
     );
 }
 
+/// The timing hard rules `ControlClient::new` enforces cannot drift
+/// silently: each zero/ordering rule is proven at its reject and
+/// minimal-accept boundary through the real constructor. The reconnect
+/// cap's 5-second upper bound is proven in the maxima test above.
+#[test]
+fn control_timing_hard_rules_match_registered_bounds() {
+    use control_proto::CONTROL_PROTOCOL_V1;
+    use control_proto::control_transport::{ClientConfig, ControlClient};
+    use control_proto::v1::{Hello, Role};
+
+    type ApplyTiming = fn(&mut ClientConfig, Duration);
+
+    let valid_config = || {
+        ClientConfig::with_defaults(
+            std::path::PathBuf::from("/tmp/conformance.sock"),
+            0,
+            Hello {
+                role: Role::RustDataplane as i32,
+                supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
+                ..Hello::default()
+            },
+        )
+    };
+
+    let tick = Duration::from_nanos(1);
+    let cases: [(&str, ApplyTiming, bool); 12] = [
+        (
+            "handshake zero",
+            |c, _| c.handshake_timeout = Duration::ZERO,
+            false,
+        ),
+        ("handshake one tick", |c, t| c.handshake_timeout = t, true),
+        (
+            "heartbeat zero",
+            |c, _| c.heartbeat_interval = Duration::ZERO,
+            false,
+        ),
+        ("heartbeat one tick", |c, t| c.heartbeat_interval = t, true),
+        ("write zero", |c, _| c.write_timeout = Duration::ZERO, false),
+        ("write one tick", |c, t| c.write_timeout = t, true),
+        (
+            "peer equal to heartbeat",
+            |c, _| c.peer_timeout = c.heartbeat_interval,
+            false,
+        ),
+        (
+            "peer one tick above heartbeat",
+            |c, t| c.peer_timeout = c.heartbeat_interval + t,
+            true,
+        ),
+        (
+            "reconnect base zero",
+            |c, _| c.reconnect_base = Duration::ZERO,
+            false,
+        ),
+        ("reconnect base one tick", |c, t| c.reconnect_base = t, true),
+        (
+            "reconnect cap below base",
+            |c, t| c.reconnect_cap = c.reconnect_base - t,
+            false,
+        ),
+        (
+            "reconnect cap equal to base",
+            |c, _| c.reconnect_cap = c.reconnect_base,
+            true,
+        ),
+    ];
+    for (name, mutate, accepted) in cases {
+        let mut config = valid_config();
+        mutate(&mut config, tick);
+        assert_eq!(ControlClient::new(config).is_ok(), accepted, "{name}");
+    }
+}
+
 /// The physical payload maximum has exactly one definition.
 #[test]
 fn physical_payload_limit_is_single_sourced() {
