@@ -70,3 +70,15 @@ including `PARITY-PKT-001/002/004/005/007`, `PARITY-HS-001/003/006/011`,
 `PARITY-RSP-001/002/003`, and `PARITY-CMD-017`. Property-style deterministic
 tests cover 20,000 packet-header and length-encoded-integer values; adversarial
 tests exercise every prefix of valid messages plus pseudo-random hostile input.
+
+## External-input limits (`limits`)
+
+WIRE-07 centralizes every registered bound on peer-supplied lengths — the
+Go 1-MiB pre-handshake cap, the command-prefix capture size, and the
+control-protocol ADR caps (frame, connection attributes, diagnostic text) —
+with check helpers that reject a hostile declaration **before** any
+allocation and error messages that never echo input bytes or paths.
+Transport-owned defaults stay in `proxy-io` and are anchored by conformance
+tests there. LOCAL INFILE's aggregate size is recorded as unbounded Go
+parity pending bounded streaming in the session/runtime layers — not as an
+accepted terminal state.

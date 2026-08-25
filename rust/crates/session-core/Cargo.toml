@@ -1,11 +1,15 @@
 [package]
 name = "session-core"
 description = "Session lifecycle for the TiProxy Rust dataplane"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+mysql-wire.workspace = true
 
 [features]
 default = []

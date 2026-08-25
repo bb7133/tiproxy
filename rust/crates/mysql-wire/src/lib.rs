@@ -33,6 +33,8 @@ mod packet;
 mod primitives;
 mod response;
 
+pub mod limits;
+
 pub use attributes::{
     Attribute, AttributeIter, ConnectionAttributes, encode_connection_attributes,
 };
