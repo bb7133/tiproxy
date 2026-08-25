@@ -7,8 +7,10 @@ payloads, protocol-10 handshakes, connection attributes, and
 `COM_CHANGE_USER` fields.
 
 It does not read sockets, join multi-packet logical messages, buffer or flush
-writes, negotiate TLS/compression, or choose session transitions. Those layers
-belong to WIRE-01 and later `proxy-io` / `session-core` tasks.
+writes, negotiate TLS/compression, or choose session transitions. WIRE-01's
+`proxy-io` adapter owns the first three; later transport and `session-core`
+tasks own the rest. This crate provides only the allocation-free logical
+fragment plan shared by bounded writers.
 
 ## Ownership and allocation
 

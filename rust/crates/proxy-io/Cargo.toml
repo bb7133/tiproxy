@@ -10,5 +10,13 @@ repository.workspace = true
 [features]
 default = []
 
+[dependencies]
+mysql-wire.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+
 [lints]
 workspace = true

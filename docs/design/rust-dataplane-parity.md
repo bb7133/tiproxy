@@ -225,20 +225,23 @@ RSP-001 through RSP-008 where applicable.
 
 ## Audit and sign-off rules
 
-### Rust wire-codec safety decisions
+### Rust wire and transport safety decisions
 
-The rows below record intentional WIRE-00 parser differences from permissive
-or unchecked Go helpers. They are not additional parity items and do not have
-independent `PARITY-*` test IDs; their tests remain attached to the related
-manifest items. A later compatibility change must update this ledger and add a
-focused regression test instead of silently widening a parser.
+The rows below record intentional Rust wire-codec or transport differences
+from permissive, unchecked, or internally inconsistent Go paths. They are not
+additional parity items and do not have independent `PARITY-*` test IDs; their
+tests remain attached to the related manifest items. A later compatibility
+change must update this ledger and add a focused regression test instead of
+silently changing the boundary.
 
-| Decision | Related items | Go behavior | Rust WIRE-00 behavior | Rationale and compatibility impact |
+| Decision | Related items | Go behavior | Rust behavior | Rationale and compatibility impact |
 | --- | --- | --- | --- | --- |
 | `WIRE-00-D1` canonical length-encoded integers | HS-003, RSP-001, RSP-003 | `ParseLengthEncodedInt` accepts `0xfc`, `0xfd`, or `0xfe` encodings that use more bytes than the value needs. | Return `DecodeError::NonCanonicalLength`; keep the undefined `0xff` marker as a separate `DecodeError::InvalidValue`. | Issue #17 explicitly requires typed errors for non-canonical lengths. This deliberately rejects a non-canonical peer packet that Go may accept, including in OK packet counters; canonical corpus bytes are unchanged. |
 | `WIRE-00-D2` protocol-4.1 ERR marker | RSP-001 | `ParseErrorPacket` skips the byte before SQLSTATE without checking that it is `#`. | Require `#` and return `DecodeError::InvalidValue` otherwise. | Prevent a malformed ERR layout from being reinterpreted as a different SQLSTATE/message boundary. Canonical ERR packets are unchanged. |
 | `WIRE-00-D3` initial-greeting invariants | HS-001, HS-011 | `ParseInitialHandshake` indexes the assumed layout without checking protocol version 10 or the zero filler byte. | Require protocol version 10 and filler `0x00`, returning typed errors on mismatch. | Converts unchecked malformed-backend behavior into an explicit handshake failure without changing a valid greeting. |
 | `WIRE-00-D4` negotiated connection fields | HS-003, HS-006, CMD-017 | Some missing database/attribute tails or NULL attribute lengths are tolerated, collapsed to empty state, or downgraded to a warning. | Require every capability-selected field to be present and terminated; reject NULL connection-attribute lengths and malformed attribute pairs. | Prevents ambiguous partial identities and attribute boundaries. Valid empty database/attribute values remain representable with their canonical terminator/zero length. |
+| `WIRE-01-D1` forwarded physical sequence | PKT-004 | `ForwardPacketTo` and materialized `ForwardUntil` regenerate a destination header, but the no-data `ForwardUntil` fast path copies the source header byte-for-byte while only advancing the destination's sequence tracker. | Every streaming path regenerates the physical header from the destination sequence. | Keeps the destination's wire bytes and tracked sequence consistent. Canonical traffic is unchanged; only a tolerated mismatched source sequence differs. |
+| `WIRE-01-D2` empty-packet peek | PKT-005, RSP-005 | `ForwardUntil` always peeks five bytes, so a zero-length physical packet blocks at EOF or reads one byte across the packet boundary; LOCAL INFILE bypasses this path. | Peek the four-byte header first and return `first_byte = None` without reading beyond an empty packet. | Makes empty-packet classification non-consuming and boundary-safe. Non-empty packets are unchanged; callers must handle `None` explicitly. |
 
 Before changing an item to `PARITY-VERIFIED`:
 

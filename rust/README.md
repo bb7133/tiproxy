@@ -9,8 +9,10 @@ boundaries and build policy remain stable.
 - `mysql-wire` owns runtime-independent wire-format types and codecs, but not
   sockets or logical-message streaming. Its borrowing and safety contract is
   documented in [`crates/mysql-wire/README.md`](crates/mysql-wire/README.md).
-- `proxy-io` owns client/backend transports and their future TLS, compression,
-  and PROXY protocol layers, but not routing policy.
+- `proxy-io` owns bounded async physical/logical packet streaming and the
+  client/backend transport layers that later add TLS, compression, and PROXY
+  protocol, but not routing policy. Its buffering and cancellation contract is
+  documented in [`crates/proxy-io/README.md`](crates/proxy-io/README.md).
 - `session-core` owns the protocol-independent session lifecycle and migration
   state.
 - `control-proto` owns the versioned control-plane contract between Go and Rust.
