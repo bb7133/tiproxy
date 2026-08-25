@@ -437,7 +437,7 @@ func Write(dir string) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(filepath.Join(dir, "manifest.json"), data, 0o644)
+	return os.WriteFile(filepath.Join(dir, "manifest.json"), data, 0o600)
 }
 
 func writeGzip(path string, data []byte) error {
