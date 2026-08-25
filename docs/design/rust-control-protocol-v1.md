@@ -352,9 +352,9 @@ the issue remains open.
 
 | Role | Reviewer | Revision | Result | Date |
 | --- | --- | --- | --- | --- |
-| Go router | _Pending_ | `proto/dataplane/v1/control.proto` | _Pending_ | — |
-| Rust dataplane | _Pending_ | `proto/dataplane/v1/control.proto` | _Pending_ | — |
-| SRE/operations | _Pending_ | this ADR | _Pending_ | — |
+| Go router | bb7133 (owner; approval recorded by owner merge of the signoff PR) | `proto/dataplane/v1/control.proto` | PASS | 2026-08-25 |
+| Rust dataplane | ClaudeHome (agent; independent of the CTL implementation) | `proto/dataplane/v1/control.proto` | PASS — semantics implementable as specified; bulk-lane metering durability format is deferred to the DPL-06 implementation | 2026-08-25 |
+| SRE/operations | bb7133 (owner; approval recorded by owner merge of the signoff PR) | this ADR | PASS | 2026-08-25 |
 
 Any correction to the frozen failure, ordering, or security semantics requires
 a new ADR and protocol v2. Additive v1 fields still require cross-language
