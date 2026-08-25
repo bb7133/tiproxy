@@ -38,8 +38,12 @@ EXECUTABLE_TARGETS := $(patsubst cmd/%,cmd_%,$(wildcard cmd/*))
 RUST_MANIFEST := rust/Cargo.toml
 RUST_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 RUST_BUILD_ENV := TIPROXY_VERSION=$(VERSION) TIPROXY_COMMIT=$(COMMIT) TIPROXY_BUILD_TIME=$(BUILD_TIME)
+CARGO_AUDIT_VERSION := 0.22.2
+CARGO_DENY_VERSION := 0.20.2
+RUST_TOOL_ROOT ?= $(GOBIN)/rust-tools
+RUST_TOOL_BIN := $(RUST_TOOL_ROOT)/bin
 
-.PHONY: cmd_% test lint docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-lint rust-release
+.PHONY: cmd_% test lint docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests
 
 default: cmd
 
@@ -83,12 +87,25 @@ rust-build:
 rust-test:
 	$(RUST_BUILD_ENV) $(CARGO) test --locked --workspace --manifest-path $(RUST_MANIFEST)
 
+rust-doc-test:
+	$(RUST_BUILD_ENV) $(CARGO) test --locked --workspace --doc --manifest-path $(RUST_MANIFEST)
+
 rust-lint:
 	$(CARGO) fmt --all --manifest-path $(RUST_MANIFEST) -- --check
 	$(RUST_BUILD_ENV) $(CARGO) clippy --locked --workspace --all-targets --all-features --manifest-path $(RUST_MANIFEST) -- -D warnings
 
 rust-release:
 	$(RUST_BUILD_ENV) $(CARGO) build --locked --workspace --release --target $(RUST_TARGET) --manifest-path $(RUST_MANIFEST)
+
+rust-install-tools:
+	$(CARGO) install --locked --root $(RUST_TOOL_ROOT) cargo-audit --version $(CARGO_AUDIT_VERSION)
+	$(CARGO) install --locked --root $(RUST_TOOL_ROOT) cargo-deny --version $(CARGO_DENY_VERSION)
+
+rust-supply-chain:
+	PATH=$(RUST_TOOL_BIN):$(PATH) rust/ci/check-supply-chain.sh
+
+rust-negative-tests:
+	PATH=$(RUST_TOOL_BIN):$(PATH) rust/ci/run-negative-tests.sh
 
 metrics:
 	$(GO) install github.com/google/go-jsonnet/cmd/jsonnet@latest
