@@ -1,0 +1,207 @@
+{
+  "schema_version": "tiproxy-compat-workloads/v1",
+  "workload_version": "2026-08-25.1",
+  "workloads": [
+    {
+      "id": "WL-CONNECT-SELECT",
+      "summary": "Open one connection, execute SELECT 1 AS value, and close cleanly.",
+      "operation": "query",
+      "statement": "SELECT 1 AS value",
+      "assertions": ["one_result_set", "one_row", "column:value=1"]
+    },
+    {
+      "id": "WL-CONNECT-BAD-PASSWORD",
+      "summary": "Connect with the correct user and a deterministic incorrect password.",
+      "operation": "connect",
+      "connection_mutation": "password=TIPROXY_WRONG_PASSWORD",
+      "assertions": ["mysql_error_code=1045", "sqlstate=28000", "no_query_executed"]
+    },
+    {
+      "id": "WL-AUTH-CACHING-SHA2",
+      "summary": "Connect to the caching_sha2_password test account twice to exercise full and cached fast authentication.",
+      "operation": "connect_twice_then_query",
+      "account": "TIPROXY_CACHING_SHA2_USER",
+      "statement": "SELECT CURRENT_USER()",
+      "assertions": ["both_connections_authenticated", "auth_plugin=caching_sha2_password", "one_row"]
+    },
+    {
+      "id": "WL-AUTH-UNKNOWN-PLUGIN",
+      "summary": "A wire probe responds with an unknown client authentication plugin.",
+      "operation": "wire_fault",
+      "fault": "auth_plugin=tiproxy_unknown_auth_plugin",
+      "assertions": ["connection_rejected", "no_authenticated_session", "explicit_auth_error"]
+    },
+    {
+      "id": "WL-TLS-VERIFIED",
+      "summary": "Require TLS, trust only TIPROXY_CA_FILE, verify TIPROXY_TLS_SERVER_NAME, and execute SELECT 1.",
+      "operation": "connect_then_query",
+      "connection_profile": "tls_verify_identity",
+      "statement": "SELECT 1",
+      "assertions": ["tls_used", "peer_chain_verified", "peer_identity_verified", "one_row"]
+    },
+    {
+      "id": "WL-TLS-WRONG-IDENTITY",
+      "summary": "Require TLS with the trusted CA but use a hostname absent from the certificate SANs.",
+      "operation": "connect",
+      "connection_profile": "tls_wrong_identity",
+      "assertions": ["tls_verification_error", "no_plaintext_fallback", "no_mysql_auth_data_sent"]
+    },
+    {
+      "id": "WL-COMPRESS-ROUNDTRIP",
+      "summary": "Require the named compression algorithm and round-trip a compressible 256 KiB value.",
+      "operation": "query",
+      "statement": "SELECT LENGTH(REPEAT('z', 262144)) AS bytes",
+      "assertions": ["column:bytes=262144", "negotiated_algorithm=requested_algorithm", "compressed_frame_observed"]
+    },
+    {
+      "id": "WL-COMPRESS-BAD-SEQUENCE",
+      "summary": "After compression negotiation, send a compressed frame with a sequence number one greater than expected.",
+      "operation": "wire_fault",
+      "fault": "compressed_sequence=expected+1",
+      "assertions": ["connection_rejected", "tiproxy_error_class=invalid_compressed_sequence", "no_query_executed"]
+    },
+    {
+      "id": "WL-COMPRESS-UNAVAILABLE",
+      "summary": "Require one exact compression algorithm against a server profile that does not advertise it.",
+      "operation": "connect",
+      "connection_profile": "compression_exact",
+      "server_profile": "requested_compression_disabled",
+      "assertions": ["explicit_unsupported_error", "no_uncompressed_fallback", "no_query_executed"]
+    },
+    {
+      "id": "WL-ADAPTER-UNSUPPORTED",
+      "summary": "Ask a driver adapter for a capability that its pinned client library cannot express.",
+      "operation": "adapter_validation",
+      "assertions": ["explicit_adapter_unsupported_error", "no_connection_attempted", "no_fallback_profile_selected"]
+    },
+    {
+      "id": "WL-RESULTSET-EOF",
+      "summary": "Negotiate the selected EOF mode and read a two-column, two-row result set.",
+      "operation": "query",
+      "statement": "SELECT 1 AS n, 'a' AS s UNION ALL SELECT 2, 'b'",
+      "assertions": ["two_rows", "column_terminator_matches_negotiated_mode", "row_terminator_matches_negotiated_mode"]
+    },
+    {
+      "id": "WL-RESULTSET-WRONG-TERMINATOR",
+      "summary": "A fault backend sends an OK terminator to a legacy-EOF session.",
+      "operation": "backend_wire_fault",
+      "fault": "terminator=ok_for_legacy_eof_session",
+      "assertions": ["connection_rejected", "tiproxy_error_class=malformed_resultset", "no_partial_success"]
+    },
+    {
+      "id": "WL-MULTI-RESULT",
+      "summary": "Execute two SELECT statements in one command and drain both result sets in order.",
+      "operation": "query_multi",
+      "statement": "SELECT 1 AS first_value; SELECT 2 AS second_value",
+      "assertions": ["two_result_sets", "result_1:first_value=1", "result_2:second_value=2", "no_unread_packets"]
+    },
+    {
+      "id": "WL-MULTI-DISABLED",
+      "summary": "Execute two statements while multi-statements are disabled in the driver.",
+      "operation": "query_multi",
+      "statement": "SELECT 1; SELECT 2",
+      "connection_profile": "multi_statements_disabled",
+      "assertions": ["explicit_driver_or_mysql_error", "no_second_statement_effect", "no_implicit_enable"]
+    },
+    {
+      "id": "WL-PREPARED-LONG-DATA",
+      "summary": "Prepare SELECT LENGTH(?), bind a 256 KiB parameter, execute twice, reset, and close.",
+      "operation": "prepared_statement",
+      "statement": "SELECT LENGTH(?) AS bytes",
+      "parameter": "repeat:x:262144",
+      "assertions": ["both_executions:bytes=262144", "long_data_path_used_when_supported", "reset_clears_parameter", "close_succeeds"]
+    },
+    {
+      "id": "WL-PREPARED-UNKNOWN-ID",
+      "summary": "A wire probe executes a statement ID that was never prepared.",
+      "operation": "wire_fault",
+      "fault": "com_stmt_execute_id=4294967294",
+      "assertions": ["mysql_error_code=1243", "connection_remains_protocol_synchronized", "no_query_executed"]
+    },
+    {
+      "id": "WL-CURSOR-FETCH",
+      "summary": "Prepare a three-row query with a server cursor and fetch one row at a time until LAST_ROW_SENT.",
+      "operation": "prepared_cursor",
+      "statement": "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3",
+      "fetch_size": 1,
+      "assertions": ["rows=1,2,3", "cursor_exists_status_seen", "last_row_sent_status_seen", "no_duplicate_rows"]
+    },
+    {
+      "id": "WL-CURSOR-UNKNOWN-ID",
+      "summary": "A wire probe fetches from a statement ID that has no open cursor.",
+      "operation": "wire_fault",
+      "fault": "com_stmt_fetch_id=4294967294",
+      "assertions": ["explicit_mysql_error", "no_rows_returned", "connection_remains_protocol_synchronized"]
+    },
+    {
+      "id": "WL-LOCAL-INFILE-ALLOWLIST",
+      "summary": "Load only tests/compatibility/fixtures/local-infile.csv through an exact-path client allowlist.",
+      "operation": "local_infile",
+      "fixture": "fixtures/local-infile.csv",
+      "statement": "LOAD DATA LOCAL INFILE 'tiproxy-compat-local-infile.csv' INTO TABLE compat_local FIELDS TERMINATED BY ','",
+      "assertions": ["affected_rows=3", "loaded_rows_match_fixture", "requested_path_matches_allowlist"]
+    },
+    {
+      "id": "WL-LOCAL-INFILE-DENY",
+      "summary": "Request LOCAL INFILE while the driver's local-file handler and allowlist are disabled.",
+      "operation": "local_infile",
+      "connection_profile": "local_infile_disabled",
+      "statement": "LOAD DATA LOCAL INFILE 'tiproxy-compat-local-infile.csv' INTO TABLE compat_local FIELDS TERMINATED BY ','",
+      "assertions": ["explicit_client_or_mysql_error", "affected_rows=0", "no_file_bytes_sent"]
+    },
+    {
+      "id": "WL-CONNECTION-ATTRS",
+      "summary": "Connect with deterministic custom attributes and verify the backend receives exact key/value pairs.",
+      "operation": "connect_then_inspect",
+      "connection_attributes": {"tiproxy_matrix_case": "${CASE_ID}", "tiproxy_matrix_version": "2026-08-25.1"},
+      "assertions": ["attrs_preserved_exactly_once", "driver_default_attrs_preserved", "no_reserved_attr_overwrite"]
+    },
+    {
+      "id": "WL-CONNECTION-ATTRS-OVERSIZE",
+      "summary": "A wire probe sends a handshake response whose connection attributes make the packet exceed 1 MiB.",
+      "operation": "wire_fault",
+      "fault": "handshake_packet_bytes=1048577",
+      "assertions": ["connection_rejected", "tiproxy_error_class=handshake_packet_too_large", "no_backend_connection"]
+    },
+    {
+      "id": "WL-LARGE-PACKET",
+      "summary": "Send and return a 16 MiB plus one byte value so the logical packet spans physical MySQL packets.",
+      "operation": "prepared_statement",
+      "statement": "SELECT LENGTH(?) AS bytes",
+      "parameter": "repeat:p:16777217",
+      "assertions": ["column:bytes=16777217", "logical_packet_split", "streaming_forward_no_full_buffer"]
+    },
+    {
+      "id": "WL-PACKET-TOO-LARGE",
+      "summary": "Send max_allowed_packet plus one byte using a driver limit larger than the server limit.",
+      "operation": "prepared_statement",
+      "statement": "SELECT LENGTH(?)",
+      "parameter": "repeat:q:${SERVER_MAX_ALLOWED_PACKET_PLUS_ONE}",
+      "assertions": ["explicit_packet_too_large_error", "no_partial_query", "proxy_process_healthy"]
+    },
+    {
+      "id": "WL-COMBO-TLS-ZLIB-PREPARED",
+      "summary": "On one connection combine verified TLS, exact zlib negotiation, prepared statements, long data, and reset.",
+      "operation": "combined",
+      "connection_profile": "tls_verify_identity+compression_zlib_exact+server_prepared",
+      "steps": ["WL-TLS-VERIFIED", "WL-COMPRESS-ROUNDTRIP", "WL-PREPARED-LONG-DATA"],
+      "assertions": ["all_nested_assertions", "single_connection", "negotiated_algorithm=zlib"]
+    },
+    {
+      "id": "WL-COMBO-TLS-ZSTD-MULTI-LARGE",
+      "summary": "On one connection combine verified TLS, exact zstd negotiation, multi-results, and a large packet.",
+      "operation": "combined",
+      "connection_profile": "tls_verify_identity+compression_zstd_exact+multi_statements",
+      "steps": ["WL-TLS-VERIFIED", "WL-COMPRESS-ROUNDTRIP", "WL-MULTI-RESULT", "WL-LARGE-PACKET"],
+      "assertions": ["all_nested_assertions", "single_connection", "negotiated_algorithm=zstd"]
+    },
+    {
+      "id": "WL-COMBO-TLS-LOCAL-INFILE",
+      "summary": "Load the allowlisted fixture over a verified TLS connection and then deny an unlisted path.",
+      "operation": "combined",
+      "connection_profile": "tls_verify_identity+local_infile_allowlist",
+      "steps": ["WL-TLS-VERIFIED", "WL-LOCAL-INFILE-ALLOWLIST", "WL-LOCAL-INFILE-DENY"],
+      "assertions": ["all_nested_assertions", "single_connection", "tls_used_for_file_bytes"]
+    }
+  ]
+}

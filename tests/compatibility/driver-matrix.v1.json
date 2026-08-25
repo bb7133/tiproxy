@@ -1,0 +1,358 @@
+{
+  "schema_version": "tiproxy-driver-matrix/v1",
+  "matrix_version": "2026-08-25.1",
+  "frozen_at": "2026-08-25",
+  "objective": "Compare supported MySQL clients against the Go and Rust TiProxy dataplanes without silent capability downgrade.",
+  "go_dataplane_baseline": {
+    "repository": "https://github.com/pingcap/tiproxy",
+    "commit": "e3371098480c4d644b070544f9c1aef63fcee9b1",
+    "ref": "main",
+    "source_evidence": [
+      "pkg/proxy/backend/authenticator.go: SupportedServerCapabilities and handshake negotiation",
+      "pkg/proxy/backend/authenticator_test.go: TestUnsupportedCapability, TestCapability, TestEnableTLS, TestCompressProtocol",
+      "pkg/proxy/backend/cmd_processor_exec.go: query, multi-result, LOCAL INFILE, prepared statement, and cursor response state machines",
+      "pkg/proxy/backend/cmd_processor_test.go: TestDirectQuery, TestPreparedStmts, TestMultiStmt",
+      "pkg/proxy/backend/backend_conn_mgr_test.go: TestConnAttrs and TestExecuteCmdStreamingForwardLargeQuery",
+      "pkg/proxy/net/compress_test.go: zlib, zstd, compressed sequence, and framing tests",
+      "pkg/proxy/net/packetio_test.go: long logical packet and sequence tests"
+    ],
+    "known_contract_gaps": [
+      "The Go handshake intersects optional client capabilities and logs unsupported bits; an exact-capability live case must fail if this produces a silent downgrade.",
+      "The current setCompress implementation prefers zlib when both CLIENT_COMPRESS and CLIENT_ZSTD_COMPRESSION_ALGORITHM are present; exact zstd cases must record the negotiated algorithm and expose any fallback.",
+      "Some malformed-handshake paths are transport rejections rather than MySQL ERR packets; the runner must correlate the client error with the stable TiProxy log class."
+    ]
+  },
+  "protocol_references": [
+    "https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html",
+    "https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression.html",
+    "https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html",
+    "https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_command_phase.html"
+  ],
+  "execution_environment": {
+    "architectures": ["linux/amd64", "linux/arm64"],
+    "tidb_image": "docker.io/pingcap/tidb:v8.5.7@sha256:41708a564e47e96d346fed433c3b9bc40d1950fdcc9c768812daeff6aadd930c",
+    "network": "One isolated bridge network; clients can reach only TiProxy SQL listeners, never TiDB directly.",
+    "dataplane_variants": ["go", "rust"],
+    "required_server_profiles": [
+      "plain",
+      "frontend_tls_valid",
+      "frontend_tls_wrong_identity",
+      "requested_compression_disabled",
+      "fault_backend_legacy_eof_wrong_terminator"
+    ],
+    "required_environment_variables": [
+      "TIPROXY_DATAPLANE",
+      "TIPROXY_HOST",
+      "TIPROXY_PORT",
+      "TIPROXY_USER",
+      "TIPROXY_PASSWORD",
+      "TIPROXY_WRONG_PASSWORD",
+      "TIPROXY_DATABASE",
+      "TIPROXY_CA_FILE",
+      "TIPROXY_TLS_SERVER_NAME",
+      "TIPROXY_CACHING_SHA2_USER",
+      "TIPROXY_CACHING_SHA2_PASSWORD"
+    ],
+    "result_recording": [
+      "case_id",
+      "matrix_version",
+      "workload_version",
+      "architecture",
+      "dataplane_variant",
+      "tiproxy_commit",
+      "tiproxy_image_digest",
+      "tidb_image_digest",
+      "driver_version",
+      "runtime_image_digest",
+      "advertised_capabilities",
+      "requested_capabilities",
+      "negotiated_capabilities",
+      "negotiated_compression_algorithm",
+      "normalized_outcome",
+      "mysql_error_code",
+      "sqlstate",
+      "transport_error_class",
+      "assertions",
+      "duration_ms"
+    ]
+  },
+  "drivers": [
+    {
+      "id": "go-database-sql",
+      "display_name": "Go database/sql with go-sql-driver/mysql",
+      "artifact": "github.com/go-sql-driver/mysql",
+      "version": "v1.10.0",
+      "runtime": "Go 1.25.12",
+      "runtime_image": "docker.io/library/golang:1.25.12-bookworm@sha256:6359592445455f2dbe2412bed411336035bc019a50017720d77454ffdd6d0f82",
+      "source": "https://github.com/go-sql-driver/mysql/tree/v1.10.0",
+      "adapter_options": {
+        "tls_verification": "mysql.RegisterTLSConfig with RootCAs and ServerName; DSN tls=tiproxy-verify",
+        "compression_zlib": "DSN compress=true",
+        "multi_statements_results": "DSN multiStatements=true and Rows.NextResultSet",
+        "prepared_statements": "database/sql PrepareContext and Stmt.QueryContext",
+        "local_infile": "mysql.RegisterLocalFile with the exact fixture path",
+        "connection_attributes": "DSN connectionAttributes=tiproxy_matrix_case:<case-id>",
+        "large_packets": "DSN maxAllowedPacket=67108864"
+      },
+      "capability_support": {
+        "auth": "required",
+        "tls_verification": "required",
+        "compression_zlib": "required",
+        "compression_zstd": "unsupported_explicit",
+        "deprecated_eof": "supported_not_configurable",
+        "multi_statements_results": "required",
+        "prepared_statements": "required",
+        "cursor_fetch": "unsupported_explicit",
+        "local_infile": "required",
+        "connection_attributes": "required",
+        "large_packets": "required"
+      }
+    },
+    {
+      "id": "jdbc",
+      "display_name": "MySQL Connector/J",
+      "artifact": "com.mysql:mysql-connector-j",
+      "version": "26.7.0",
+      "runtime": "Eclipse Temurin JDK 21.0.8+9",
+      "runtime_image": "docker.io/library/eclipse-temurin:21.0.8_9-jdk@sha256:7d1d666ddafac14da0ded6b4b076becf76cf88b31f9d7953a76555cc82f86511",
+      "source": "https://dev.mysql.com/doc/connector-j/en/connector-j-versions.html",
+      "adapter_options": {
+        "tls_verification": "sslMode=VERIFY_IDENTITY, trustCertificateKeyStoreUrl=<generated store>",
+        "compression_zlib": "useCompression=true, compressionAlgorithms=zlib",
+        "compression_zstd": "useCompression=true, compressionAlgorithms=zstd",
+        "multi_statements_results": "allowMultiQueries=true and Statement.getMoreResults",
+        "prepared_statements": "useServerPrepStmts=true",
+        "cursor_fetch": "useServerPrepStmts=true, useCursorFetch=true, defaultFetchSize=1",
+        "local_infile": "allowLoadLocalInfile=true, allowUrlInLocalInfile=false",
+        "connection_attributes": "connectionAttributes=tiproxy_matrix_case:<case-id>",
+        "large_packets": "maxAllowedPacket=67108864"
+      },
+      "capability_support": {
+        "auth": "required",
+        "tls_verification": "required",
+        "compression_zlib": "required",
+        "compression_zstd": "required",
+        "deprecated_eof": "supported_not_configurable",
+        "multi_statements_results": "required",
+        "prepared_statements": "required",
+        "cursor_fetch": "required",
+        "local_infile": "required",
+        "connection_attributes": "required",
+        "large_packets": "required"
+      }
+    },
+    {
+      "id": "python",
+      "display_name": "MySQL Connector/Python",
+      "artifact": "mysql-connector-python",
+      "version": "26.7.0",
+      "runtime": "CPython 3.13.7",
+      "runtime_image": "docker.io/library/python:3.13.7-slim-bookworm@sha256:adafcc17694d715c905b4c7bebd96907a1fd5cf183395f0ebc4d3428bd22d92d",
+      "source": "https://dev.mysql.com/doc/connector-python/en/",
+      "adapter_options": {
+        "tls_verification": "ssl_ca=<CA>, ssl_verify_cert=True, ssl_verify_identity=True",
+        "compression_zlib": "compress=True",
+        "multi_statements_results": "cursor.execute and cursor.nextset",
+        "prepared_statements": "connection.cursor(prepared=True)",
+        "local_infile": "allow_local_infile=True",
+        "connection_attributes": "conn_attrs={'tiproxy_matrix_case': case_id}",
+        "large_packets": "prepared parameter with 67108864-byte client limit"
+      },
+      "capability_support": {
+        "auth": "required",
+        "tls_verification": "required",
+        "compression_zlib": "required",
+        "compression_zstd": "unsupported_explicit",
+        "deprecated_eof": "supported_not_configurable",
+        "multi_statements_results": "required",
+        "prepared_statements": "required",
+        "cursor_fetch": "unsupported_explicit",
+        "local_infile": "required",
+        "connection_attributes": "required",
+        "large_packets": "required"
+      }
+    },
+    {
+      "id": "nodejs",
+      "display_name": "Node.js mysql2",
+      "artifact": "mysql2",
+      "version": "3.22.3",
+      "runtime": "Node.js 24.7.0",
+      "runtime_image": "docker.io/library/node:24.7.0-bookworm-slim@sha256:0104d9447ea3ddf7373643be7f9915fc7b7c896e41d0d33229338e457217cd78",
+      "source": "https://github.com/sidorares/node-mysql2/tree/v3.22.3",
+      "adapter_options": {
+        "tls_verification": "ssl={ca, rejectUnauthorized:true}",
+        "compression_zlib": "compress=true",
+        "multi_statements_results": "multipleStatements=true",
+        "prepared_statements": "connection.execute",
+        "local_infile": "infileStreamFactory returns a stream only for the exact fixture basename",
+        "connection_attributes": "connectAttributes={tiproxy_matrix_case:caseId}",
+        "large_packets": "execute with a Buffer parameter"
+      },
+      "capability_support": {
+        "auth": "required",
+        "tls_verification": "required",
+        "compression_zlib": "required",
+        "compression_zstd": "unsupported_explicit",
+        "deprecated_eof": "supported_not_configurable",
+        "multi_statements_results": "required",
+        "prepared_statements": "required",
+        "cursor_fetch": "unsupported_explicit",
+        "local_infile": "required",
+        "connection_attributes": "required",
+        "large_packets": "required"
+      }
+    },
+    {
+      "id": "rust",
+      "display_name": "Rust mysql_async",
+      "artifact": "mysql_async",
+      "version": "0.37.0",
+      "runtime": "Rust 1.89.0",
+      "runtime_image": "docker.io/library/rust:1.89.0-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff",
+      "source": "https://github.com/blackbeam/mysql_async/tree/v0.37.0",
+      "adapter_options": {
+        "tls_verification": "SslOpts with root certificates; dangerous certificate/domain bypasses forbidden",
+        "compression_zlib": "OptsBuilder.compression(Compression::default())",
+        "multi_statements_results": "Queryable::query_iter and QueryResult::iter",
+        "prepared_statements": "Conn::prep and Conn::exec_iter",
+        "local_infile": "OptsBuilder.local_infile_handler with exact-path GlobalHandler",
+        "connection_attributes": "OptsBuilder.connect_attributes",
+        "large_packets": "OptsBuilder.max_allowed_packet(Some(67108864))"
+      },
+      "capability_support": {
+        "auth": "required",
+        "tls_verification": "required",
+        "compression_zlib": "required",
+        "compression_zstd": "unsupported_explicit",
+        "deprecated_eof": "supported_not_configurable",
+        "multi_statements_results": "required",
+        "prepared_statements": "required",
+        "cursor_fetch": "unsupported_explicit",
+        "local_infile": "required",
+        "connection_attributes": "required",
+        "large_packets": "required"
+      }
+    },
+    {
+      "id": "mysql-cli",
+      "display_name": "MySQL command-line client",
+      "artifact": "mysql-community-client",
+      "version": "8.4.11",
+      "runtime": "Oracle Linux 9",
+      "runtime_image": "docker.io/library/mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb",
+      "source": "https://dev.mysql.com/doc/refman/8.4/en/mysql-command-options.html",
+      "adapter_options": {
+        "tls_verification": "--ssl-mode=VERIFY_IDENTITY --ssl-ca=<CA>",
+        "compression_zlib": "--compression-algorithms=zlib",
+        "compression_zstd": "--compression-algorithms=zstd --zstd-compression-level=3",
+        "multi_statements_results": "batch input containing both statements",
+        "local_infile": "--local-infile=1 with the fixture mounted read-only",
+        "connection_attributes": "The client sends its built-in attributes; custom attributes are not configurable in mysql CLI 8.4.11.",
+        "large_packets": "--max-allowed-packet=67108864"
+      },
+      "capability_support": {
+        "auth": "required",
+        "tls_verification": "required",
+        "compression_zlib": "required",
+        "compression_zstd": "required",
+        "deprecated_eof": "supported_not_configurable",
+        "multi_statements_results": "required",
+        "prepared_statements": "unsupported_explicit",
+        "cursor_fetch": "unsupported_explicit",
+        "local_infile": "required",
+        "connection_attributes": "supported_not_configurable",
+        "large_packets": "required"
+      }
+    },
+    {
+      "id": "wire-probe",
+      "display_name": "Language-neutral MySQL protocol probe",
+      "artifact": "tests/dataplane/integration/cmd/mysql-wire-probe",
+      "version": "same-commit",
+      "runtime": "integration topology toolchain",
+      "runtime_image": "same-as-tiproxy-build",
+      "source": "pkg/proxy/net",
+      "adapter_options": {
+        "purpose": "Exercise exact capability combinations and malformed packets that supported application drivers cannot request safely."
+      },
+      "capability_support": {
+        "auth": "probe_only",
+        "tls_verification": "probe_only",
+        "compression_zlib": "probe_only",
+        "compression_zstd": "probe_only",
+        "deprecated_eof": "probe_only",
+        "multi_statements_results": "probe_only",
+        "prepared_statements": "probe_only",
+        "cursor_fetch": "probe_only",
+        "local_infile": "probe_only",
+        "connection_attributes": "probe_only",
+        "large_packets": "probe_only"
+      }
+    }
+  ],
+  "capabilities": [
+    {"id": "auth", "summary": "Native-password switch and caching_sha2 fast authentication", "parity_case_ids": ["HS-004", "HS-005"]},
+    {"id": "tls_verification", "summary": "Frontend TLS with certificate-chain and server-identity verification", "parity_case_ids": ["TLS-001", "TLS-002", "TLS-004"]},
+    {"id": "compression_zlib", "summary": "Exact zlib compressed-protocol negotiation and sequencing", "parity_case_ids": ["CMP-001", "CMP-003", "HS-010"]},
+    {"id": "compression_zstd", "summary": "Exact zstd compressed-protocol negotiation and sequencing", "parity_case_ids": ["CMP-002", "CMP-003", "HS-010"]},
+    {"id": "deprecated_eof", "summary": "Legacy EOF and CLIENT_DEPRECATE_EOF result-set terminators", "parity_case_ids": ["RSP-002", "RSP-003"]},
+    {"id": "multi_statements_results", "summary": "CLIENT_MULTI_STATEMENTS and ordered CLIENT_MULTI_RESULTS draining", "parity_case_ids": ["CMD-003", "RSP-004"]},
+    {"id": "prepared_statements", "summary": "Prepare, execute, long data, reset, and close lifecycle", "parity_case_ids": ["CMD-022", "CMD-023", "CMD-024", "PS-001", "PS-004", "PS-005"]},
+    {"id": "cursor_fetch", "summary": "Prepared-statement cursor execute and COM_STMT_FETCH lifecycle", "parity_case_ids": ["CMD-028", "PS-002", "PS-004"]},
+    {"id": "local_infile", "summary": "LOCAL INFILE relay with exact-path client authorization", "parity_case_ids": ["RSP-005"]},
+    {"id": "connection_attributes", "summary": "CLIENT_CONNECT_ATTRS parsing, forwarding, and size limits", "parity_case_ids": ["HS-003", "HS-006"]},
+    {"id": "large_packets", "summary": "Logical packets larger than 16 MiB and explicit server-limit errors", "parity_case_ids": ["PKT-002", "PKT-003"]}
+  ],
+  "cases": [
+    {"id":"DRV-GO-001","driver_id":"go-database-sql","workload_id":"WL-CONNECT-SELECT","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"success","detail":"One authenticated result row; clean COM_QUIT or socket close."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/authenticator_test.go and cmd_processor_test.go"}},
+    {"id":"DRV-GO-002","driver_id":"go-database-sql","workload_id":"WL-CONNECT-BAD-PASSWORD","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"error","detail":"MySQL 1045 / SQLSTATE 28000; no authenticated session."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/authenticator_test.go: TestAuthFail"}},
+    {"id":"DRV-JDBC-001","driver_id":"jdbc","workload_id":"WL-CONNECT-SELECT","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"success","detail":"One authenticated result row."},"go_baseline":{"status":"covered","evidence":"Generic protocol path; live driver evidence required."}},
+    {"id":"DRV-JDBC-002","driver_id":"jdbc","workload_id":"WL-CONNECT-BAD-PASSWORD","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"error","detail":"SQLInvalidAuthorizationSpecException carrying MySQL 1045 / 28000."},"go_baseline":{"status":"covered","evidence":"Handshake error forwarding is covered; live driver evidence required."}},
+    {"id":"DRV-PY-001","driver_id":"python","workload_id":"WL-CONNECT-SELECT","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"success","detail":"One authenticated result row."},"go_baseline":{"status":"covered","evidence":"Generic protocol path; live driver evidence required."}},
+    {"id":"DRV-PY-002","driver_id":"python","workload_id":"WL-CONNECT-BAD-PASSWORD","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"error","detail":"mysql.connector Error carrying MySQL 1045 / 28000."},"go_baseline":{"status":"covered","evidence":"Handshake error forwarding is covered; live driver evidence required."}},
+    {"id":"DRV-NODE-001","driver_id":"nodejs","workload_id":"WL-CONNECT-SELECT","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"success","detail":"One authenticated result row."},"go_baseline":{"status":"covered","evidence":"Generic protocol path; live driver evidence required."}},
+    {"id":"DRV-NODE-002","driver_id":"nodejs","workload_id":"WL-CONNECT-BAD-PASSWORD","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"error","detail":"ER_ACCESS_DENIED_ERROR carrying errno 1045 / 28000."},"go_baseline":{"status":"covered","evidence":"Handshake error forwarding is covered; live driver evidence required."}},
+    {"id":"DRV-RUST-001","driver_id":"rust","workload_id":"WL-CONNECT-SELECT","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"success","detail":"One authenticated result row."},"go_baseline":{"status":"covered","evidence":"Generic protocol path; live driver evidence required."}},
+    {"id":"DRV-RUST-002","driver_id":"rust","workload_id":"WL-CONNECT-BAD-PASSWORD","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"error","detail":"mysql_async server error carrying MySQL 1045 / 28000."},"go_baseline":{"status":"covered","evidence":"Handshake error forwarding is covered; live driver evidence required."}},
+    {"id":"DRV-CLI-001","driver_id":"mysql-cli","workload_id":"WL-CONNECT-SELECT","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"success","detail":"Batch client prints value 1 and exits zero."},"go_baseline":{"status":"covered","evidence":"Generic protocol path; live client evidence required."}},
+    {"id":"DRV-CLI-002","driver_id":"mysql-cli","workload_id":"WL-CONNECT-BAD-PASSWORD","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"error","detail":"Client prints ERROR 1045 (28000) and exits nonzero."},"go_baseline":{"status":"covered","evidence":"Handshake error forwarding is covered; live client evidence required."}},
+
+    {"id":"DRV-GO-003","driver_id":"go-database-sql","workload_id":"WL-TLS-VERIFIED","capability_ids":["tls_verification"],"parity_case_ids":["TLS-001","TLS-002"],"classification":"blocking","expected":{"outcome":"success","detail":"TLS chain and identity verified; no plaintext fallback."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/authenticator_test.go: TestEnableTLS"}},
+    {"id":"DRV-JDBC-003","driver_id":"jdbc","workload_id":"WL-TLS-WRONG-IDENTITY","capability_ids":["tls_verification"],"parity_case_ids":["TLS-004"],"classification":"blocking","expected":{"outcome":"rejection","detail":"Certificate identity verification fails before authentication; no fallback."},"go_baseline":{"status":"covered","evidence":"Frontend TLS uses crypto/tls; live VERIFY_IDENTITY evidence required."}},
+    {"id":"DRV-GO-004","driver_id":"go-database-sql","workload_id":"WL-COMPRESS-ROUNDTRIP","capability_ids":["compression_zlib"],"parity_case_ids":["CMP-001","CMP-003"],"classification":"blocking","case_parameters":{"requested_algorithm":"zlib"},"expected":{"outcome":"success","detail":"Exact zlib negotiated; 262144-byte result verified."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/authenticator_test.go: TestCompressProtocol; pkg/proxy/net/compress_test.go: TestCompressZlib"}},
+    {"id":"DRV-WIRE-001","driver_id":"wire-probe","workload_id":"WL-COMPRESS-BAD-SEQUENCE","capability_ids":["compression_zlib"],"parity_case_ids":["CMP-001","CMP-003"],"classification":"blocking","case_parameters":{"requested_algorithm":"zlib"},"expected":{"outcome":"rejection","detail":"Connection closes and TiProxy reports invalid_compressed_sequence."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/net/compress_test.go: TestCompressSequence"}},
+    {"id":"DRV-CLI-003","driver_id":"mysql-cli","workload_id":"WL-COMPRESS-ROUNDTRIP","capability_ids":["compression_zstd"],"parity_case_ids":["CMP-002","CMP-003"],"classification":"blocking","case_parameters":{"requested_algorithm":"zstd","zstd_level":3},"expected":{"outcome":"success","detail":"Exact zstd negotiated; zlib or uncompressed fallback fails the case."},"go_baseline":{"status":"known_gap","evidence":"setCompress prefers zlib if both compression capability bits are set; live mysql 8.4.11 negotiation must establish baseline."}},
+    {"id":"DRV-CLI-004","driver_id":"mysql-cli","workload_id":"WL-COMPRESS-UNAVAILABLE","capability_ids":["compression_zstd"],"parity_case_ids":["CMP-002"],"classification":"blocking","case_parameters":{"requested_algorithm":"zstd"},"expected":{"outcome":"error","detail":"Explicit unsupported-compression error; no zlib or uncompressed connection."},"go_baseline":{"status":"known_gap","evidence":"Optional capabilities are intersected during Go handshake; live exact-algorithm enforcement required."}},
+    {"id":"DRV-WIRE-002","driver_id":"wire-probe","workload_id":"WL-RESULTSET-EOF","capability_ids":["deprecated_eof"],"parity_case_ids":["RSP-003"],"classification":"blocking","case_parameters":{"client_deprecate_eof":true},"expected":{"outcome":"success","detail":"OK packets terminate columns and rows."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/cmd_processor_test.go and cmd_processor_exec.go"}},
+    {"id":"DRV-WIRE-003","driver_id":"wire-probe","workload_id":"WL-RESULTSET-EOF","capability_ids":["deprecated_eof"],"parity_case_ids":["RSP-002"],"classification":"blocking","case_parameters":{"client_deprecate_eof":false},"expected":{"outcome":"success","detail":"Legacy EOF packets terminate columns and rows."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/cmd_processor_test.go exercises ClientDeprecateEOF on and off."}},
+    {"id":"DRV-WIRE-004","driver_id":"wire-probe","workload_id":"WL-RESULTSET-WRONG-TERMINATOR","capability_ids":["deprecated_eof"],"parity_case_ids":["RSP-002","RSP-003"],"classification":"blocking","expected":{"outcome":"rejection","detail":"Malformed terminator is rejected; no partial result succeeds."},"go_baseline":{"status":"known_gap","evidence":"The Go legacy-EOF scanner does not classify a long 0xfe OK terminator as EOF; live fault execution must freeze its eventual transport/error behavior before Rust implementation."}},
+    {"id":"DRV-NODE-003","driver_id":"nodejs","workload_id":"WL-MULTI-RESULT","capability_ids":["multi_statements_results"],"parity_case_ids":["CMD-003","RSP-004"],"classification":"blocking","expected":{"outcome":"success","detail":"Two result sets returned and fully drained in order."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/cmd_processor_test.go: TestMultiStmt"}},
+    {"id":"DRV-NODE-004","driver_id":"nodejs","workload_id":"WL-MULTI-DISABLED","capability_ids":["multi_statements_results"],"parity_case_ids":["CMD-003"],"classification":"blocking","expected":{"outcome":"error","detail":"Explicit syntax/capability error; second statement has no effect."},"go_baseline":{"status":"covered","evidence":"Capability follows client request; live default-disabled driver evidence required."}},
+    {"id":"DRV-GO-005","driver_id":"go-database-sql","workload_id":"WL-PREPARED-LONG-DATA","capability_ids":["prepared_statements"],"parity_case_ids":["CMD-022","CMD-023","CMD-024","PS-001","PS-004","PS-005"],"classification":"blocking","expected":{"outcome":"success","detail":"Prepare/execute/long-data/reset/close lifecycle stays synchronized."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/cmd_processor_test.go: TestPreparedStmts"}},
+    {"id":"DRV-WIRE-005","driver_id":"wire-probe","workload_id":"WL-PREPARED-UNKNOWN-ID","capability_ids":["prepared_statements"],"parity_case_ids":["CMD-023","PS-004"],"classification":"blocking","expected":{"outcome":"error","detail":"MySQL 1243; connection remains usable for SELECT 1."},"go_baseline":{"status":"covered","evidence":"Prepared command errors are forwarded by cmd_processor_exec.go."}},
+    {"id":"DRV-JDBC-004","driver_id":"jdbc","workload_id":"WL-CURSOR-FETCH","capability_ids":["cursor_fetch","prepared_statements","deprecated_eof"],"parity_case_ids":["CMD-023","CMD-028","PS-002","PS-004","RSP-002","RSP-003"],"classification":"blocking","expected":{"outcome":"success","detail":"Rows 1,2,3 fetched once with correct cursor status transitions in either EOF mode."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/cmd_processor_exec.go cursor path and changelog fix #440; live JDBC evidence required."}},
+    {"id":"DRV-WIRE-006","driver_id":"wire-probe","workload_id":"WL-CURSOR-UNKNOWN-ID","capability_ids":["cursor_fetch"],"parity_case_ids":["CMD-028","PS-002"],"classification":"blocking","expected":{"outcome":"error","detail":"Explicit MySQL error, zero rows, and subsequent SELECT 1 succeeds."},"go_baseline":{"status":"covered","evidence":"COM_STMT_FETCH response is parsed and errors are forwarded."}},
+    {"id":"DRV-PY-003","driver_id":"python","workload_id":"WL-LOCAL-INFILE-ALLOWLIST","capability_ids":["local_infile"],"parity_case_ids":["RSP-005"],"classification":"blocking","expected":{"outcome":"success","detail":"Exactly three fixture rows loaded; only the allowed path is opened."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/cmd_processor_exec.go: forwardLoadInFile"}},
+    {"id":"DRV-NODE-005","driver_id":"nodejs","workload_id":"WL-LOCAL-INFILE-DENY","capability_ids":["local_infile"],"parity_case_ids":["RSP-005"],"classification":"blocking","expected":{"outcome":"rejection","detail":"No handler means no file bytes and zero affected rows."},"go_baseline":{"status":"covered","evidence":"TiProxy relays the client decision; live infileStreamFactory denial evidence required."}},
+    {"id":"DRV-RUST-003","driver_id":"rust","workload_id":"WL-CONNECTION-ATTRS","capability_ids":["connection_attributes"],"parity_case_ids":["HS-006"],"classification":"blocking","expected":{"outcome":"success","detail":"Custom and default attributes reach the backend exactly once."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/backend_conn_mgr_test.go: TestConnAttrs"}},
+    {"id":"DRV-WIRE-007","driver_id":"wire-probe","workload_id":"WL-CONNECTION-ATTRS-OVERSIZE","capability_ids":["connection_attributes"],"parity_case_ids":["HS-003","HS-006"],"classification":"blocking","expected":{"outcome":"rejection","detail":"Handshake over 1 MiB rejected before backend connection; stable packet-too-large log class."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/authenticator_test.go: TestHandshakePacketSizeLimit"}},
+    {"id":"DRV-GO-006","driver_id":"go-database-sql","workload_id":"WL-LARGE-PACKET","capability_ids":["large_packets"],"parity_case_ids":["PKT-002","PKT-003"],"classification":"blocking","expected":{"outcome":"success","detail":"16777217-byte parameter crosses a physical packet boundary and returns exact length."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/backend_conn_mgr_test.go: TestExecuteCmdStreamingForwardLargeQuery"}},
+    {"id":"DRV-GO-007","driver_id":"go-database-sql","workload_id":"WL-PACKET-TOO-LARGE","capability_ids":["large_packets"],"parity_case_ids":["PKT-002","PKT-003"],"classification":"blocking","expected":{"outcome":"error","detail":"Explicit server packet-too-large error; no partial query and proxy remains healthy."},"go_baseline":{"status":"covered","evidence":"Packet limits are forwarded; live TiDB error evidence required."}},
+    {"id":"DRV-JDBC-005","driver_id":"jdbc","workload_id":"WL-AUTH-CACHING-SHA2","capability_ids":["auth","tls_verification"],"parity_case_ids":["HS-005","TLS-001"],"classification":"blocking","expected":{"outcome":"success","detail":"Full and cached fast caching_sha2_password authentication both succeed only over verified TLS."},"go_baseline":{"status":"covered","evidence":"pkg/proxy/backend/authenticator.go handles caching_sha2 fast path; live JDBC evidence required."}},
+    {"id":"DRV-WIRE-008","driver_id":"wire-probe","workload_id":"WL-AUTH-UNKNOWN-PLUGIN","capability_ids":["auth"],"parity_case_ids":["HS-004"],"classification":"blocking","expected":{"outcome":"rejection","detail":"Explicit unsupported-auth error; no authenticated or downgraded session."},"go_baseline":{"status":"not_covered","evidence":"TestAuthPlugin covers native/caching_sha2 combinations, not an unknown plugin; live Go-oracle capture is required."}},
+
+    {"id":"DRV-GO-008","driver_id":"go-database-sql","workload_id":"WL-COMBO-TLS-ZLIB-PREPARED","capability_ids":["tls_verification","compression_zlib","prepared_statements","large_packets"],"parity_case_ids":["TLS-001","CMP-001","CMP-003","CMD-022","CMD-023","CMD-024","PS-001","PS-004","PS-005","PKT-002","PKT-003"],"classification":"blocking","expected":{"outcome":"success","detail":"All nested assertions hold on one verified TLS+zlib prepared session."},"go_baseline":{"status":"not_covered_as_combination","evidence":"Individual paths have Go unit coverage; live combined baseline is required."}},
+    {"id":"DRV-CLI-005","driver_id":"mysql-cli","workload_id":"WL-COMBO-TLS-ZSTD-MULTI-LARGE","capability_ids":["tls_verification","compression_zstd","multi_statements_results","large_packets"],"parity_case_ids":["TLS-001","CMP-002","CMP-003","CMD-003","RSP-004","PKT-002","PKT-003"],"classification":"blocking","expected":{"outcome":"success","detail":"All nested assertions hold on one verified TLS+zstd multi-result session."},"go_baseline":{"status":"known_gap","evidence":"Individual paths exist; exact zstd selection and combined live baseline are required."}},
+    {"id":"DRV-PY-004","driver_id":"python","workload_id":"WL-COMBO-TLS-LOCAL-INFILE","capability_ids":["tls_verification","local_infile"],"parity_case_ids":["TLS-001","RSP-005"],"classification":"blocking","expected":{"outcome":"success","detail":"Allowlisted file bytes use verified TLS and an unlisted path is denied on the same session."},"go_baseline":{"status":"not_covered_as_combination","evidence":"Individual paths have Go coverage; live combined baseline is required."}},
+
+    {"id":"DRV-GO-009","driver_id":"go-database-sql","workload_id":"WL-ADAPTER-UNSUPPORTED","capability_ids":["compression_zstd"],"parity_case_ids":["CMP-002","HS-010"],"classification":"non_blocking","case_parameters":{"requested_capability":"compression_zstd"},"expected":{"outcome":"rejection","detail":"Adapter reports that go-sql-driver/mysql v1.10.0 cannot request zstd and does not connect with zlib."},"go_baseline":{"status":"not_applicable","evidence":"Pinned driver exposes zlib compress=true but no zstd option."}},
+    {"id":"DRV-NODE-006","driver_id":"nodejs","workload_id":"WL-ADAPTER-UNSUPPORTED","capability_ids":["cursor_fetch"],"parity_case_ids":["CMD-028","PS-002"],"classification":"non_blocking","case_parameters":{"requested_capability":"cursor_fetch"},"expected":{"outcome":"rejection","detail":"Adapter reports that mysql2 v3.22.3 has no COM_STMT_FETCH cursor API and does not substitute text streaming."},"go_baseline":{"status":"not_applicable","evidence":"This is a pinned client API limitation, not a Go dataplane behavior."}},
+    {"id":"DRV-CLI-006","driver_id":"mysql-cli","workload_id":"WL-ADAPTER-UNSUPPORTED","capability_ids":["prepared_statements"],"parity_case_ids":["CMD-022","CMD-023","PS-004"],"classification":"non_blocking","case_parameters":{"requested_capability":"binary_prepared_statements"},"expected":{"outcome":"rejection","detail":"Adapter reports that SQL PREPARE is not COM_STMT_PREPARE and does not claim binary prepared coverage."},"go_baseline":{"status":"not_applicable","evidence":"This is a pinned client interface limitation, not a Go dataplane behavior."}}
+  ],
+  "approval": {
+    "status": "pending",
+    "required_roles": ["product_owner", "mysql_protocol_owner"],
+    "records": []
+  }
+}
