@@ -1,0 +1,390 @@
+// Copyright 2026 PingCAP, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package tiproxy.dataplane.v1;
+
+option go_package = "github.com/pingcap/tiproxy/pkg/controlbridge/pb;controlpb";
+
+// ControlEnvelope is the only top-level protobuf value written to the control
+// stream. The transport adds a four-byte big-endian length prefix.
+message ControlEnvelope {
+  uint32 protocol_version = 1;
+  uint64 control_epoch = 2;
+  uint64 generation = 3;
+  uint64 request_id = 4;
+  Priority priority = 5;
+  uint64 sent_unix_millis = 6;
+  repeated uint64 required_capabilities = 7;
+
+  oneof body {
+    Hello hello = 20;
+    HelloAck hello_ack = 21;
+    StateSnapshot state_snapshot = 22;
+    SnapshotResult snapshot_result = 23;
+    HandshakeResponseEvent handshake_response = 24;
+    HandshakeDecision handshake_decision = 25;
+    HandshakeResult handshake_result = 26;
+    RouteRequest route_request = 27;
+    RouteAssignment route_assignment = 28;
+    RouteResult route_result = 29;
+    ConnectionEvent connection_event = 30;
+    RedirectCommand redirect_command = 31;
+    RedirectResult redirect_result = 32;
+    DrainCommand drain_command = 33;
+    DrainResult drain_result = 34;
+    MetricsBatch metrics_batch = 35;
+    MeteringBatch metering_batch = 36;
+    ReconcileRequest reconcile_request = 37;
+    ReconcileSnapshot reconcile_snapshot = 38;
+    Heartbeat heartbeat = 39;
+    ProtocolError error = 40;
+  }
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_CRITICAL = 1;
+  PRIORITY_CONTROL = 2;
+  PRIORITY_BULK = 3;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_GO_CONTROL = 1;
+  ROLE_RUST_DATAPLANE = 2;
+}
+
+message Hello {
+  Role role = 1;
+  string process_id = 2;
+  uint64 process_started_unix_millis = 3;
+  repeated uint32 supported_versions = 4;
+  repeated uint64 capabilities = 5;
+  uint32 max_frame_bytes = 6;
+  string build_version = 7;
+  string build_commit = 8;
+}
+
+message HelloAck {
+  uint32 selected_version = 1;
+  repeated uint64 negotiated_capabilities = 2;
+  uint32 max_frame_bytes = 3;
+  uint64 control_epoch = 4;
+  ErrorCode rejection_code = 5;
+  string rejection_detail = 6;
+}
+
+message StateSnapshot {
+  ConfigSnapshot config = 1;
+  repeated BackendSnapshot backends = 2;
+  repeated NamespaceSnapshot namespaces = 3;
+}
+
+message SnapshotResult {
+  uint64 applied_generation = 1;
+  ErrorCode code = 2;
+  string detail = 3;
+}
+
+message ConfigSnapshot {
+  uint64 max_connections = 1;
+  double high_memory_reject_threshold = 2;
+  uint32 connection_buffer_bytes = 3;
+  KeepalivePolicy frontend_keepalive = 4;
+  KeepalivePolicy healthy_backend_keepalive = 5;
+  KeepalivePolicy unhealthy_backend_keepalive = 6;
+  ProxyProtocolMode proxy_protocol = 7;
+  bool require_backend_tls = 8;
+  uint64 graceful_wait_millis = 9;
+  uint64 graceful_close_millis = 10;
+  repeated Listener listeners = 11;
+  repeated string public_cidrs = 12;
+  uint32 advertised_capability = 13;
+  string server_version = 14;
+  TlsPolicy frontend_tls = 15;
+  TlsPolicy backend_tls = 16;
+  bool traffic_replay_enabled = 17;
+}
+
+message KeepalivePolicy {
+  bool enabled = 1;
+  uint64 idle_millis = 2;
+  uint32 probe_count = 3;
+  uint64 interval_millis = 4;
+  uint64 user_timeout_millis = 5;
+}
+
+enum ProxyProtocolMode {
+  PROXY_PROTOCOL_MODE_UNSPECIFIED = 0;
+  PROXY_PROTOCOL_MODE_DISABLED = 1;
+  PROXY_PROTOCOL_MODE_V2 = 2;
+}
+
+message Listener {
+  string address = 1;
+  uint32 port = 2;
+  string name = 3;
+}
+
+message TlsPolicy {
+  string certificate_path = 1;
+  string private_key_path = 2;
+  string ca_path = 3;
+  string minimum_version = 4;
+  repeated string allowed_common_names = 5;
+  bool skip_ca_verification = 6;
+}
+
+message BackendSnapshot {
+  string backend_id = 1;
+  string address = 2;
+  string cluster_name = 3;
+  string keyspace = 4;
+  bool healthy = 5;
+  bool local = 6;
+  bool draining = 7;
+  repeated string cidrs = 8;
+  map<string, string> labels = 9;
+}
+
+message NamespaceSnapshot {
+  string name = 1;
+  repeated string users = 2;
+  string backend_cluster = 3;
+}
+
+message ConnectionIdentity {
+  uint64 connection_id = 1;
+  string listener_address = 2;
+  string client_address = 3;
+  string proxy_address = 4;
+  bool public_endpoint = 5;
+}
+
+// HandshakeMetadata deliberately excludes authentication response bytes and
+// every other raw MySQL packet field. Rust retains those values locally.
+message HandshakeMetadata {
+  string user = 1;
+  string database = 2;
+  string auth_plugin = 3;
+  uint32 capability = 4;
+  uint32 collation = 5;
+  uint32 zstd_level = 6;
+  map<string, string> connection_attributes = 7;
+  bool tls = 8;
+}
+
+message HandshakeResponseEvent {
+  ConnectionIdentity connection = 1;
+  HandshakeMetadata handshake = 2;
+}
+
+message HandshakeDecision {
+  uint64 connection_id = 1;
+  bool accept = 2;
+  bool retry = 3;
+  ErrorCode code = 4;
+  string client_message = 5;
+  string namespace = 6;
+}
+
+message HandshakeResult {
+  uint64 connection_id = 1;
+  string backend_id = 2;
+  string backend_address = 3;
+  ErrorSource error_source = 4;
+  ErrorCode code = 5;
+  string detail = 6;
+  MysqlError mysql_error = 7;
+}
+
+message MysqlError {
+  uint32 code = 1;
+  string sql_state = 2;
+  string message = 3;
+}
+
+message RouteRequest {
+  ConnectionIdentity connection = 1;
+  HandshakeMetadata handshake = 2;
+  string namespace_hint = 3;
+  repeated string excluded_backend_ids = 4;
+}
+
+message RouteAssignment {
+  uint64 connection_id = 1;
+  string assignment_id = 2;
+  string backend_id = 3;
+  string backend_address = 4;
+  string cluster_name = 5;
+  string keyspace = 6;
+  bool healthy = 7;
+  bool local = 8;
+  ErrorCode code = 9;
+  string detail = 10;
+}
+
+message RouteResult {
+  uint64 connection_id = 1;
+  string assignment_id = 2;
+  bool connected = 3;
+  ErrorSource error_source = 4;
+  ErrorCode code = 5;
+  string detail = 6;
+}
+
+enum ConnectionEventKind {
+  CONNECTION_EVENT_KIND_UNSPECIFIED = 0;
+  CONNECTION_EVENT_KIND_OPENED = 1;
+  CONNECTION_EVENT_KIND_TRAFFIC = 2;
+  CONNECTION_EVENT_KIND_CLOSED = 3;
+}
+
+message ConnectionEvent {
+  ConnectionEventKind kind = 1;
+  ConnectionIdentity connection = 2;
+  string backend_id = 3;
+  string namespace = 4;
+  ErrorSource error_source = 5;
+  uint64 client_in_bytes = 6;
+  uint64 client_out_bytes = 7;
+  uint64 backend_in_bytes = 8;
+  uint64 backend_out_bytes = 9;
+}
+
+message RedirectCommand {
+  uint64 connection_id = 1;
+  string redirect_id = 2;
+  string backend_id = 3;
+  string backend_address = 4;
+  string cluster_name = 5;
+  uint64 deadline_unix_millis = 6;
+}
+
+message RedirectResult {
+  uint64 connection_id = 1;
+  string redirect_id = 2;
+  string previous_backend_id = 3;
+  string backend_id = 4;
+  bool succeeded = 5;
+  ErrorCode code = 6;
+  string detail = 7;
+}
+
+message DrainCommand {
+  string drain_id = 1;
+  repeated string listener_names = 2;
+  repeated string backend_ids = 3;
+  uint64 graceful_deadline_unix_millis = 4;
+  uint64 force_deadline_unix_millis = 5;
+}
+
+message DrainResult {
+  string drain_id = 1;
+  uint64 active_connections = 2;
+  uint64 gracefully_closed = 3;
+  uint64 force_closed = 4;
+  bool complete = 5;
+  ErrorCode code = 6;
+  string detail = 7;
+}
+
+message MetricDelta {
+  string name = 1;
+  map<string, string> labels = 2;
+  sint64 counter_delta = 3;
+  double gauge = 4;
+  repeated uint64 histogram_bucket_deltas = 5;
+}
+
+message MetricsBatch {
+  uint64 sequence = 1;
+  repeated MetricDelta metrics = 2;
+}
+
+message MeteringDelta {
+  string keyspace = 1;
+  string backend_id = 2;
+  bool public_endpoint = 3;
+  uint64 response_bytes = 4;
+  uint64 cross_location_bytes = 5;
+}
+
+message MeteringBatch {
+  uint64 sequence = 1;
+  repeated MeteringDelta deltas = 2;
+}
+
+message ReconcileRequest {
+  uint64 known_generation = 1;
+  uint64 last_connection_event_sequence = 2;
+  uint64 last_metrics_sequence = 3;
+  uint64 last_metering_sequence = 4;
+}
+
+message ReconcileConnection {
+  uint64 connection_id = 1;
+  string backend_id = 2;
+  string namespace = 3;
+  bool redirect_pending = 4;
+}
+
+message ReconcileSnapshot {
+  uint64 applied_generation = 1;
+  uint64 connection_event_sequence = 2;
+  uint64 metrics_sequence = 3;
+  uint64 metering_sequence = 4;
+  repeated ReconcileConnection connections = 5;
+}
+
+message Heartbeat {
+  uint64 monotonic_millis = 1;
+  uint64 applied_generation = 2;
+  uint64 active_connections = 3;
+  uint64 last_received_request_id = 4;
+}
+
+enum ErrorSource {
+  ERROR_SOURCE_UNSPECIFIED = 0;
+  ERROR_SOURCE_CLIENT_NETWORK = 1;
+  ERROR_SOURCE_BACKEND_NETWORK = 2;
+  ERROR_SOURCE_BACKEND_SQL = 3;
+  ERROR_SOURCE_PROXY = 4;
+  ERROR_SOURCE_CONTROL = 5;
+  ERROR_SOURCE_SHUTDOWN = 6;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_OK = 1;
+  ERROR_CODE_UNSUPPORTED_VERSION = 2;
+  ERROR_CODE_MISSING_CAPABILITY = 3;
+  ERROR_CODE_FRAME_TOO_LARGE = 4;
+  ERROR_CODE_MALFORMED_FRAME = 5;
+  ERROR_CODE_PROTOCOL_VIOLATION = 6;
+  ERROR_CODE_STALE_EPOCH = 7;
+  ERROR_CODE_STALE_GENERATION = 8;
+  ERROR_CODE_DUPLICATE_REQUEST = 9;
+  ERROR_CODE_QUEUE_FULL = 10;
+  ERROR_CODE_CONTROL_UNAVAILABLE = 11;
+  ERROR_CODE_GRACE_EXPIRED = 12;
+  ERROR_CODE_INVALID_SNAPSHOT = 13;
+  ERROR_CODE_UNSUPPORTED_CONFIGURATION = 14;
+  ERROR_CODE_NO_BACKEND = 15;
+  ERROR_CODE_BACKEND_DIAL_FAILED = 16;
+  ERROR_CODE_HANDSHAKE_REJECTED = 17;
+  ERROR_CODE_REDIRECT_UNSAFE = 18;
+  ERROR_CODE_REDIRECT_FAILED = 19;
+  ERROR_CODE_DRAIN_IN_PROGRESS = 20;
+  ERROR_CODE_RECONCILIATION_REQUIRED = 21;
+  ERROR_CODE_INTERNAL = 22;
+}
+
+message ProtocolError {
+  ErrorCode code = 1;
+  uint64 offending_request_id = 2;
+  bool retryable = 3;
+  string detail = 4;
+}
