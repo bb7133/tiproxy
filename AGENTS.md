@@ -26,6 +26,12 @@ The goal is to:
 - **Formatting and linting**
   - Always run `make lint` after your changes.
 
+- **Rust toolchain and dependencies**
+  - Use the pinned toolchain in `rust-toolchain.toml`; do not change the MSRV or edition as part of an unrelated change.
+  - Add dependencies at workspace scope in `rust/Cargo.toml`, use `workspace = true` from member crates, and keep default features empty unless the feature is required in every deployment.
+  - Keep `rust/Cargo.lock` committed and use `--locked` for builds and tests. Do not edit the lockfile manually.
+  - Run `make rust-lint`, `make rust-test`, and `make rust-build` after Rust changes.
+
 ## Code Organization
 
 When adding or modifying features, prefer extending existing packages before creating new ones. If a new package is required, document it here so future contributors understand its purpose.
@@ -67,6 +73,12 @@ When adding or modifying features, prefer extending existing packages before cre
 - `pkg/sqlreplay/` - Captures and replays traffic.
 - `pkg/testkit/` - Common test utilities.
 - `pkg/util/` - Utilities, including buffered IO, etcd wrapper, HTTP wrapper, simple MySQL lexer, and others.
+- `rust/crates/mysql-wire/` - MySQL wire-format types and codec boundaries; it does not own sockets or routing decisions.
+- `rust/crates/proxy-io/` - Client/backend transport ownership, including future TLS, compression, and PROXY protocol support.
+- `rust/crates/session-core/` - Protocol-independent session lifecycle and migration state.
+- `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
+- `rust/crates/dataplane/` - Rust dataplane orchestration across wire, transport, session, and control components.
+- `rust/crates/tiproxy-rs/` - Rust dataplane executable and build/version metadata.
 
 Guidelines:
 
@@ -81,6 +93,7 @@ Guidelines:
   - When creating new source files (for example `*.go`), include the TiProxy copyright and Apache 2.0
     license header at the top.
   - Copy the header from an existing file in the same directory and update the year if needed.
+  - Rust source and build-script files use the same header in line-comment form.
 
 - **Structs and pointers**
   - Use pointers for large structs or structs that are frequently passed around.

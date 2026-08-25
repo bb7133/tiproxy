@@ -14,10 +14,12 @@
 # limitations under the License.
 
 GO := go
+CARGO := cargo
 GOBIN := $(shell pwd)/bin
 VERSION ?= $(shell git describe --tags --dirty --always)
 BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
 COMMIT ?= $(shell git describe --match=NeVeRmAtCh --always --abbrev=40 --dirty)
+BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 DEBUG ?=
 DOCKERPREFIX ?=
 BUILD_TAGS ?=
@@ -33,8 +35,11 @@ ifneq ("$(DEBUG)", "")
 endif
 IMAGE_TAG ?= latest
 EXECUTABLE_TARGETS := $(patsubst cmd/%,cmd_%,$(wildcard cmd/*))
+RUST_MANIFEST := rust/Cargo.toml
+RUST_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
+RUST_BUILD_ENV := TIPROXY_VERSION=$(VERSION) TIPROXY_COMMIT=$(COMMIT) TIPROXY_BUILD_TIME=$(BUILD_TIME)
 
-.PHONY: cmd_% test lint docker docker-release golangci-lint gocovmerge clean
+.PHONY: cmd_% test lint docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-lint rust-release
 
 default: cmd
 
@@ -72,6 +77,19 @@ build:
 	cd lib && $(GO) build ./...
 	$(GO) build ./...
 
+rust-build:
+	$(RUST_BUILD_ENV) $(CARGO) build --locked --workspace --manifest-path $(RUST_MANIFEST)
+
+rust-test:
+	$(RUST_BUILD_ENV) $(CARGO) test --locked --workspace --manifest-path $(RUST_MANIFEST)
+
+rust-lint:
+	$(CARGO) fmt --all --manifest-path $(RUST_MANIFEST) -- --check
+	$(RUST_BUILD_ENV) $(CARGO) clippy --locked --workspace --all-targets --all-features --manifest-path $(RUST_MANIFEST) -- -D warnings
+
+rust-release:
+	$(RUST_BUILD_ENV) $(CARGO) build --locked --workspace --release --target $(RUST_TARGET) --manifest-path $(RUST_MANIFEST)
+
 metrics:
 	$(GO) install github.com/google/go-jsonnet/cmd/jsonnet@latest
 	[ -e "grafonnet-lib" ] || git clone --depth=1 https://github.com/grafana/grafonnet-lib
@@ -88,7 +106,7 @@ test: gocovmerge
 #	$(GO) tool cover -html=.cover -o .cover.html
 
 clean:
-	rm -rf bin dist grafonnet-lib
+	rm -rf bin dist grafonnet-lib rust/target
 
 docker:
 	docker build -t "$(DOCKERPREFIX)tiproxy:$(IMAGE_TAG)" --build-arg "GOPROXY=$(shell $(GO) env GOPROXY)" --build-arg "VERSION=$(VERSION)" --build-arg "COMMIT=$(COMMIT)" --build-arg "BRANCH=$(BRANCH)" -f docker/Dockerfile .
