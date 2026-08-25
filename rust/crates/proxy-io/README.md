@@ -83,9 +83,10 @@ cargo clippy --locked --manifest-path rust/Cargo.toml \
 
 ## Bounded duplex transport
 
-WIRE-02 adds `DuplexPump` for phases that intentionally proxy raw transport
-bytes. It does not replace the packet-aware session state machine. Each joined
-direction owns one reusable `BufferPool` lease and one fixed staging area:
+WIRE-02 adds `DuplexPump` for future runtime/session phases that intentionally
+proxy raw transport bytes after protocol negotiation. It does not replace the
+packet-aware session state machine. Each joined direction owns one reusable
+`BufferPool` lease and one fixed staging area:
 
 - active userspace memory is bounded by
   `2 * (read_buffer_size + write_high_water)` per duplex connection;
@@ -104,8 +105,10 @@ or detach tasks. The first EOF, connection reset/error, or
 `PumpCancellation::cancel` wakes the peer direction, and both directions call
 `AsyncWrite::shutdown` before the owner returns. Cancellation observed while a
 staged write is pending discards only the unwritten staged suffix and reports
-that count. Its upper termination bound is the configured write/flush deadline
-plus `shutdown_timeout`.
+that count. This hard termination can therefore leave a partially written
+staged byte range at the destination; it does not promise a message boundary.
+Its upper termination bound is the configured write/flush deadline plus
+`shutdown_timeout`.
 
 This owner cancellation is a hard connection termination path. Resumable
 packet forwarding must continue to use WIRE-01's cooperative packet-boundary
