@@ -1,0 +1,1113 @@
+// Copyright 2026 PingCAP, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package controlbridge adapts Rust-owned SQL connections to the existing Go
+// handshake and routing lifecycle. MySQL packets and authentication bytes are
+// deliberately absent from this package.
+package controlbridge
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"net"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/pingcap/tiproxy/pkg/balance/router"
+	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
+	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
+	"github.com/pingcap/tiproxy/pkg/proxy/backend"
+	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
+	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
+)
+
+const maxControlDetailBytes = 4 * 1024
+const maxClosedConnectionTombstones = 4 * 1024
+const maxConnectionEventKeys = 64
+
+// EnvelopeSender is the negotiated control-session surface used by the
+// adapter. The small interface also permits a deterministic fake Rust peer.
+type EnvelopeSender interface {
+	Send(context.Context, *controlpb.ControlEnvelope) error
+	Epoch() uint64
+	HasCapability(uint64) bool
+}
+
+var _ transport.Handler = (*RouterAdapter)(nil)
+
+// RouterAdapter owns Go-side lifecycle state for Rust dataplane connections.
+// A connection's callbacks are serialized by connectionState.mu; the global
+// mutex is never held while invoking a HandshakeHandler or router callback.
+type RouterAdapter struct {
+	handler backend.HandshakeHandler
+
+	mu          sync.Mutex
+	connections map[uint64]*connectionState
+	closedIDs   map[uint64]struct{}
+	closedOrder []uint64
+	sender      EnvelopeSender
+	senderEpoch uint64
+	nextID      atomic.Uint64
+}
+
+type connectionState struct {
+	mu sync.Mutex
+
+	identity  *controlpb.ConnectionIdentity
+	handshake *controlpb.HandshakeMetadata
+	conn      *projectedConn
+	router    router.Router
+	selector  *router.BackendSelector
+	namespace string
+
+	decision       *controlpb.HandshakeDecision
+	assignment     *routeAssignment
+	currentBackend router.BackendInst
+	handshakeDone  bool
+	opened         bool
+	closed         bool
+	eventKeys      map[connectionEventKey]struct{}
+	eventOrder     []connectionEventKey
+}
+
+type connectionEventKey struct {
+	epoch     uint64
+	requestID uint64
+}
+
+type routeAssignment struct {
+	id       string
+	backend  router.BackendInst
+	finished bool
+}
+
+// NewRouterAdapter creates a lifecycle adapter for one HandshakeHandler.
+func NewRouterAdapter(handler backend.HandshakeHandler) (*RouterAdapter, error) {
+	if handler == nil {
+		return nil, errors.New("handshake handler is required")
+	}
+	return &RouterAdapter{
+		handler:     handler,
+		connections: make(map[uint64]*connectionState),
+		closedIDs:   make(map[uint64]struct{}),
+	}, nil
+}
+
+// HandleControlMessage implements transport.Handler.
+func (adapter *RouterAdapter) HandleControlMessage(
+	ctx context.Context,
+	session *transport.Session,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	return adapter.HandleEnvelope(ctx, session, envelope)
+}
+
+// HandleEnvelope processes one Rust control event. It is exported so the
+// router lifecycle can be tested without creating a UDS.
+func (adapter *RouterAdapter) HandleEnvelope(
+	ctx context.Context,
+	sender EnvelopeSender,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	if sender == nil || envelope == nil {
+		return errors.New("control sender and envelope are required")
+	}
+	adapter.rememberSender(sender)
+	if missing := missingCapability(sender, envelope.GetRequiredCapabilities()); missing != 0 {
+		return adapter.sendProtocolError(ctx, sender, envelope.GetRequestId(),
+			controlpb.ErrorCode_ERROR_CODE_MISSING_CAPABILITY,
+			fmt.Sprintf("required control capability %d was not negotiated", missing))
+	}
+
+	switch body := envelope.GetBody().(type) {
+	case *controlpb.ControlEnvelope_HandshakeResponse:
+		return adapter.handleHandshakeResponse(ctx, sender, envelope.GetRequestId(), body.HandshakeResponse)
+	case *controlpb.ControlEnvelope_RouteRequest:
+		return adapter.handleRouteRequest(ctx, sender, envelope.GetRequestId(), body.RouteRequest)
+	case *controlpb.ControlEnvelope_RouteResult:
+		return adapter.handleRouteResult(ctx, sender, envelope.GetRequestId(), body.RouteResult)
+	case *controlpb.ControlEnvelope_HandshakeResult:
+		return adapter.handleHandshakeResult(ctx, sender, envelope.GetRequestId(), body.HandshakeResult)
+	case *controlpb.ControlEnvelope_ConnectionEvent:
+		return adapter.handleConnectionEvent(sender.Epoch(), envelope.GetRequestId(), body.ConnectionEvent)
+	case *controlpb.ControlEnvelope_RedirectResult:
+		return adapter.handleRedirectResult(body.RedirectResult)
+	case *controlpb.ControlEnvelope_CloseResult:
+		return adapter.handleCloseResult(body.CloseResult)
+	case *controlpb.ControlEnvelope_ReconcileRequest:
+		return adapter.handleReconcile(ctx, sender, envelope.GetRequestId(), envelope.GetGeneration(), body.ReconcileRequest)
+	case *controlpb.ControlEnvelope_Heartbeat, *controlpb.ControlEnvelope_Error:
+		return nil
+	default:
+		// Snapshot, drain, metrics, and metering bodies are owned by adjacent
+		// control-plane adapters and may share a composite transport handler.
+		return nil
+	}
+}
+
+func (adapter *RouterAdapter) handleHandshakeResponse(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	event *controlpb.HandshakeResponseEvent,
+) error {
+	if event == nil || event.GetConnection() == nil || event.GetHandshake() == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "incomplete handshake response event")
+	}
+	state, err := adapter.getOrCreate(event.GetConnection())
+	if err != nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, err.Error())
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.decision != nil {
+		return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CONTROL,
+			&controlpb.ControlEnvelope_HandshakeDecision{HandshakeDecision: cloneDecision(state.decision)})
+	}
+	if state.closed {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "handshake event for closed connection")
+	}
+	if event.GetHandshake().GetCollation() > 255 {
+		return adapter.rejectHandshakeLocked(ctx, sender, requestID, state,
+			errors.New("handshake collation exceeds one byte"))
+	}
+
+	state.handshake = cloneHandshake(event.GetHandshake())
+	response := projectHandshake(state.handshake)
+	if err := adapter.handler.HandleHandshakeResp(state.conn, response); err != nil {
+		return adapter.rejectHandshakeLocked(ctx, sender, requestID, state, err)
+	}
+	rt, err := adapter.handler.GetRouter(state.conn, response)
+	if err != nil || rt == nil {
+		if err == nil {
+			err = errors.New("handshake handler returned no router")
+		}
+		return adapter.rejectHandshakeLocked(ctx, sender, requestID, state, err)
+	}
+	state.router = rt
+	if namespace, ok := state.conn.Value(backend.ConnContextKeyNamespace).(string); ok {
+		state.namespace = bounded(namespace)
+	}
+	state.decision = &controlpb.HandshakeDecision{
+		ConnectionId: state.conn.ConnectionID(),
+		Accept:       true,
+		Code:         controlpb.ErrorCode_ERROR_CODE_OK,
+		Namespace:    state.namespace,
+	}
+	return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CONTROL,
+		&controlpb.ControlEnvelope_HandshakeDecision{HandshakeDecision: cloneDecision(state.decision)})
+}
+
+func (adapter *RouterAdapter) rejectHandshakeLocked(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	state *connectionState,
+	err error,
+) error {
+	state.decision = &controlpb.HandshakeDecision{
+		ConnectionId:  state.conn.ConnectionID(),
+		Accept:        false,
+		Code:          controlpb.ErrorCode_ERROR_CODE_HANDSHAKE_REJECTED,
+		ClientMessage: "handshake rejected",
+	}
+	adapter.notifyHandshakeLocked(state, "", err, backend.SrcProxyErr)
+	return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CONTROL,
+		&controlpb.ControlEnvelope_HandshakeDecision{HandshakeDecision: cloneDecision(state.decision)})
+}
+
+func (adapter *RouterAdapter) handleRouteRequest(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	request *controlpb.RouteRequest,
+) error {
+	if request == nil || request.GetConnection() == nil || request.GetHandshake() == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "incomplete route request")
+	}
+	state := adapter.get(request.GetConnection().GetConnectionId())
+	if state == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_RECONCILIATION_REQUIRED, "unknown connection")
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !sameIdentity(state.identity, request.GetConnection()) || !proto.Equal(state.handshake, request.GetHandshake()) {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "route identity differs from handshake event")
+	}
+	if state.closed || state.decision == nil || !state.decision.GetAccept() || state.router == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_HANDSHAKE_REJECTED, "connection is not eligible for routing")
+	}
+	if state.assignment != nil {
+		return adapter.sendAssignmentLocked(ctx, sender, requestID, state, state.assignment)
+	}
+	if state.namespace == "" {
+		state.namespace = bounded(request.GetNamespaceHint())
+	}
+	selector := state.router.GetBackendSelector(projectClientInfo(state.identity))
+	state.selector = &selector
+	return adapter.nextAssignmentLocked(ctx, sender, requestID, state, request.GetExcludedBackendIds())
+}
+
+func (adapter *RouterAdapter) nextAssignmentLocked(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	state *connectionState,
+	excludedIDs []string,
+) error {
+	if state.selector == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "route selector is not initialized")
+	}
+	excluded := make(map[string]struct{}, len(excludedIDs))
+	for _, id := range excludedIDs {
+		excluded[id] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(excluded)+1)
+	for {
+		selected, err := state.selector.Next()
+		if err != nil {
+			code := controlpb.ErrorCode_ERROR_CODE_INTERNAL
+			if errors.Is(err, router.ErrNoBackend) {
+				code = controlpb.ErrorCode_ERROR_CODE_NO_BACKEND
+				err = backend.ErrProxyNoBackend
+			}
+			adapter.notifyHandshakeLocked(state, "", err, backend.Error2Source(err))
+			return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CONTROL,
+				&controlpb.ControlEnvelope_RouteAssignment{RouteAssignment: &controlpb.RouteAssignment{
+					ConnectionId: state.conn.ConnectionID(),
+					Code:         code,
+					Detail:       bounded(err.Error()),
+				}})
+		}
+		if _, duplicate := seen[selected.ID()]; duplicate {
+			state.selector.Finish(state.conn, false)
+			adapter.notifyHandshakeLocked(state, "", backend.ErrProxyNoBackend, backend.SrcProxyNoBackend)
+			return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CONTROL,
+				&controlpb.ControlEnvelope_RouteAssignment{RouteAssignment: &controlpb.RouteAssignment{
+					ConnectionId: state.conn.ConnectionID(),
+					Code:         controlpb.ErrorCode_ERROR_CODE_NO_BACKEND,
+					Detail:       bounded(backend.ErrProxyNoBackend.Error()),
+				}})
+		}
+		seen[selected.ID()] = struct{}{}
+		if _, skip := excluded[selected.ID()]; skip {
+			state.selector.Finish(state.conn, false)
+			continue
+		}
+		assignment := &routeAssignment{
+			id:      adapter.newOperationID("assignment", sender.Epoch(), state.conn.ConnectionID()),
+			backend: selected,
+		}
+		state.assignment = assignment
+		return adapter.sendAssignmentLocked(ctx, sender, requestID, state, assignment)
+	}
+}
+
+func (adapter *RouterAdapter) sendAssignmentLocked(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	state *connectionState,
+	assignment *routeAssignment,
+) error {
+	return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CONTROL,
+		&controlpb.ControlEnvelope_RouteAssignment{RouteAssignment: &controlpb.RouteAssignment{
+			ConnectionId:   state.conn.ConnectionID(),
+			AssignmentId:   assignment.id,
+			BackendId:      assignment.backend.ID(),
+			BackendAddress: assignment.backend.Addr(),
+			ClusterName:    assignment.backend.ClusterName(),
+			Keyspace:       assignment.backend.Keyspace(),
+			Healthy:        assignment.backend.Healthy(),
+			Local:          assignment.backend.Local(),
+			Code:           controlpb.ErrorCode_ERROR_CODE_OK,
+		}})
+}
+
+func (adapter *RouterAdapter) handleRouteResult(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	result *controlpb.RouteResult,
+) error {
+	if result == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "missing route result")
+	}
+	state := adapter.get(result.GetConnectionId())
+	if state == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_RECONCILIATION_REQUIRED, "route result for unknown connection")
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	assignment := state.assignment
+	if assignment == nil || assignment.id != result.GetAssignmentId() {
+		return nil // stale or duplicate results never repeat selector effects.
+	}
+	if assignment.finished {
+		return nil
+	}
+	assignment.finished = true
+	state.selector.Finish(state.conn, result.GetConnected())
+	if result.GetConnected() {
+		state.currentBackend = assignment.backend
+		state.conn.setBackend(assignment.backend)
+		// ScoreBasedRouter installs its receiver from Finish. Static/custom
+		// routers may expose the receiver directly instead.
+		if state.conn.eventReceiver() == nil {
+			if receiver, ok := state.router.(router.ConnEventReceiver); ok {
+				state.conn.SetEventReceiver(receiver)
+			}
+		}
+		return nil
+	}
+	state.assignment = nil
+	return adapter.nextAssignmentLocked(ctx, sender, requestID, state, nil)
+}
+
+func (adapter *RouterAdapter) handleHandshakeResult(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	result *controlpb.HandshakeResult,
+) error {
+	if result == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "missing handshake result")
+	}
+	state := adapter.get(result.GetConnectionId())
+	if state == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_RECONCILIATION_REQUIRED, "handshake result for unknown connection")
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.handshakeDone || state.closed {
+		return nil
+	}
+	if mysqlErr := result.GetMysqlError(); mysqlErr != nil {
+		projected := &mysql.MyError{
+			Code:    uint16(mysqlErr.GetCode()),
+			State:   bounded(mysqlErr.GetSqlState()),
+			Message: bounded(mysqlErr.GetMessage()),
+		}
+		if adapter.handler.HandleHandshakeErr(state.conn, projected) {
+			adapter.abandonBackendLocked(state)
+			state.assignment = nil
+			return adapter.nextAssignmentLocked(ctx, sender, requestID, state, nil)
+		}
+		adapter.notifyHandshakeLocked(state, result.GetBackendAddress(), projected, backend.SrcClientAuthFail)
+		return nil
+	}
+	if result.GetCode() != controlpb.ErrorCode_ERROR_CODE_OK {
+		err := errors.New(bounded(result.GetDetail()))
+		adapter.notifyHandshakeLocked(state, result.GetBackendAddress(), err, fromControlSource(result.GetErrorSource()))
+		return nil
+	}
+	state.opened = true
+	adapter.notifyHandshakeLocked(state, result.GetBackendAddress(), nil, backend.SrcNone)
+	return nil
+}
+
+func (adapter *RouterAdapter) handleConnectionEvent(
+	epoch, requestID uint64,
+	event *controlpb.ConnectionEvent,
+) error {
+	if event == nil || event.GetConnection() == nil {
+		return errors.New("incomplete connection event")
+	}
+	state := adapter.get(event.GetConnection().GetConnectionId())
+	if state == nil {
+		// A duplicate close after cleanup is idempotent. Other events require
+		// the Rust peer to reconcile before they can mutate routing state.
+		if event.GetKind() == controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED {
+			return nil
+		}
+		return errors.New("connection event for unknown connection")
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !sameIdentity(state.identity, event.GetConnection()) {
+		return errors.New("connection event identity differs from handshake event")
+	}
+	if state.seenConnectionEvent(epoch, requestID) {
+		return nil
+	}
+	switch event.GetKind() {
+	case controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_OPENED:
+		if !state.closed {
+			state.opened = true
+		}
+	case controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_TRAFFIC:
+		if !state.closed {
+			state.conn.setTraffic(event.GetClientInBytes(), event.GetClientOutBytes())
+			adapter.handler.OnTraffic(state.conn)
+		}
+	case controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED:
+		adapter.closeStateLocked(state, fromControlSource(event.GetErrorSource()))
+	default:
+		return errors.New("unspecified connection event kind")
+	}
+	return nil
+}
+
+func (adapter *RouterAdapter) handleRedirectResult(result *controlpb.RedirectResult) error {
+	if result == nil {
+		return errors.New("missing redirect result")
+	}
+	state := adapter.get(result.GetConnectionId())
+	if state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	pending, receiver := state.conn.takeRedirect(result.GetRedirectId())
+	if pending == nil || receiver == nil || state.closed {
+		return nil
+	}
+	if result.GetSucceeded() {
+		state.currentBackend = pending
+		state.conn.setBackend(pending)
+		return receiver.OnRedirectSucceed(result.GetPreviousBackendId(), result.GetBackendId(), state.conn)
+	}
+	return receiver.OnRedirectFail(result.GetPreviousBackendId(), result.GetBackendId(), state.conn)
+}
+
+func (adapter *RouterAdapter) handleCloseResult(result *controlpb.CloseResult) error {
+	if result == nil {
+		return errors.New("missing close result")
+	}
+	state := adapter.get(result.GetConnectionId())
+	if state == nil {
+		return nil
+	}
+	state.conn.finishClose(result.GetCloseId(), result.GetAccepted())
+	return nil
+}
+
+func (adapter *RouterAdapter) handleReconcile(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	generation uint64,
+	request *controlpb.ReconcileRequest,
+) error {
+	if request == nil {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "missing reconcile request")
+	}
+	rust := make(map[uint64]*controlpb.ReconcileConnection, len(request.GetConnections()))
+	for _, connection := range request.GetConnections() {
+		if connection == nil || connection.GetConnectionId() == 0 {
+			return adapter.sendProtocolError(ctx, sender, requestID,
+				controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "invalid reconcile connection")
+		}
+		if _, duplicate := rust[connection.GetConnectionId()]; duplicate {
+			return adapter.sendProtocolError(ctx, sender, requestID,
+				controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "duplicate reconcile connection")
+		}
+		rust[connection.GetConnectionId()] = connection
+	}
+
+	adapter.mu.Lock()
+	states := make([]*connectionState, 0, len(adapter.connections))
+	for _, state := range adapter.connections {
+		states = append(states, state)
+	}
+	adapter.mu.Unlock()
+	snapshot := make([]*controlpb.ReconcileConnection, 0, len(states))
+	for _, state := range states {
+		state.mu.Lock()
+		id := state.conn.ConnectionID()
+		if !state.closed {
+			if _, present := rust[id]; !present {
+				adapter.closeStateLocked(state, backend.SrcProxyQuit)
+			} else {
+				snapshot = append(snapshot, &controlpb.ReconcileConnection{
+					ConnectionId:    id,
+					BackendId:       state.conn.backendID(),
+					Namespace:       state.namespace,
+					RedirectPending: state.conn.redirectPending(),
+				})
+			}
+		}
+		state.mu.Unlock()
+	}
+	slices.SortFunc(snapshot, func(a, b *controlpb.ReconcileConnection) int {
+		return int64Compare(a.GetConnectionId(), b.GetConnectionId())
+	})
+	return sendBodyWithOptions(ctx, sender, requestID, generation, controlpb.Priority_PRIORITY_CRITICAL,
+		[]uint64{uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS)},
+		&controlpb.ControlEnvelope_ReconcileSnapshot{ReconcileSnapshot: &controlpb.ReconcileSnapshot{
+			AppliedGeneration:       request.GetKnownGeneration(),
+			ConnectionEventSequence: request.GetLastConnectionEventSequence(),
+			MetricsSequence:         request.GetLastMetricsSequence(),
+			MeteringSequence:        request.GetLastMeteringSequence(),
+			Connections:             snapshot,
+		}})
+}
+
+func (adapter *RouterAdapter) closeStateLocked(state *connectionState, source backend.ErrorSource) {
+	if state.closed {
+		return
+	}
+	state.closed = true
+	if state.assignment != nil && !state.assignment.finished && state.selector != nil {
+		state.assignment.finished = true
+		state.selector.Finish(state.conn, false)
+	}
+	adapter.abandonBackendLocked(state)
+	if !state.handshakeDone {
+		adapter.notifyHandshakeLocked(state, state.conn.ServerAddr(), errors.New("connection closed during handshake"), source)
+	}
+	_ = adapter.handler.OnConnClose(state.conn, source)
+	state.conn.markClosed()
+	adapter.forgetClosedState(state)
+}
+
+func (adapter *RouterAdapter) abandonBackendLocked(state *connectionState) {
+	receiver := state.conn.takeEventReceiver()
+	if receiver != nil && state.currentBackend != nil {
+		_ = receiver.OnConnClosed(state.currentBackend.ID(), state.conn)
+	}
+	state.currentBackend = nil
+	state.conn.clearBackend()
+}
+
+func (adapter *RouterAdapter) notifyHandshakeLocked(
+	state *connectionState,
+	address string,
+	err error,
+	source backend.ErrorSource,
+) {
+	if state.handshakeDone {
+		return
+	}
+	state.handshakeDone = true
+	adapter.handler.OnHandshake(state.conn, bounded(address), err, source)
+}
+
+func (adapter *RouterAdapter) getOrCreate(identity *controlpb.ConnectionIdentity) (*connectionState, error) {
+	if identity.GetConnectionId() == 0 {
+		return nil, errors.New("connection ID must be nonzero")
+	}
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if _, closed := adapter.closedIDs[identity.GetConnectionId()]; closed {
+		return nil, errors.New("closed connection ID was reused")
+	}
+	if state := adapter.connections[identity.GetConnectionId()]; state != nil {
+		if !sameIdentity(state.identity, identity) {
+			return nil, errors.New("connection ID reused with different identity")
+		}
+		return state, nil
+	}
+	cloned := cloneIdentity(identity)
+	conn := newProjectedConn(adapter, cloned)
+	state := &connectionState{
+		identity:  cloned,
+		conn:      conn,
+		eventKeys: make(map[connectionEventKey]struct{}),
+	}
+	adapter.connections[identity.GetConnectionId()] = state
+	return state, nil
+}
+
+func (state *connectionState) seenConnectionEvent(epoch, requestID uint64) bool {
+	if requestID == 0 {
+		return false
+	}
+	key := connectionEventKey{epoch: epoch, requestID: requestID}
+	if _, seen := state.eventKeys[key]; seen {
+		return true
+	}
+	state.eventKeys[key] = struct{}{}
+	state.eventOrder = append(state.eventOrder, key)
+	if len(state.eventOrder) > maxConnectionEventKeys {
+		oldest := state.eventOrder[0]
+		state.eventOrder = state.eventOrder[1:]
+		delete(state.eventKeys, oldest)
+	}
+	return false
+}
+
+func (adapter *RouterAdapter) forgetClosedState(state *connectionState) {
+	id := state.conn.ConnectionID()
+	adapter.mu.Lock()
+	if adapter.connections[id] == state {
+		delete(adapter.connections, id)
+	}
+	if _, exists := adapter.closedIDs[id]; !exists {
+		adapter.closedIDs[id] = struct{}{}
+		adapter.closedOrder = append(adapter.closedOrder, id)
+		if len(adapter.closedOrder) > maxClosedConnectionTombstones {
+			oldest := adapter.closedOrder[0]
+			adapter.closedOrder = adapter.closedOrder[1:]
+			delete(adapter.closedIDs, oldest)
+		}
+	}
+	adapter.mu.Unlock()
+}
+
+func (adapter *RouterAdapter) get(connectionID uint64) *connectionState {
+	adapter.mu.Lock()
+	state := adapter.connections[connectionID]
+	adapter.mu.Unlock()
+	return state
+}
+
+func (adapter *RouterAdapter) rememberSender(sender EnvelopeSender) {
+	adapter.mu.Lock()
+	if adapter.sender == nil || sender.Epoch() >= adapter.senderEpoch {
+		adapter.sender = sender
+		adapter.senderEpoch = sender.Epoch()
+	}
+	adapter.mu.Unlock()
+}
+
+func (adapter *RouterAdapter) currentSender() EnvelopeSender {
+	adapter.mu.Lock()
+	sender := adapter.sender
+	adapter.mu.Unlock()
+	return sender
+}
+
+func (adapter *RouterAdapter) newOperationID(kind string, epoch, connectionID uint64) string {
+	return fmt.Sprintf("%s-%d-%d-%d", kind, epoch, connectionID, adapter.nextID.Add(1))
+}
+
+func (adapter *RouterAdapter) sendProtocolError(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	code controlpb.ErrorCode,
+	detail string,
+) error {
+	return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CRITICAL,
+		&controlpb.ControlEnvelope_Error{Error: &controlpb.ProtocolError{
+			Code:               code,
+			OffendingRequestId: requestID,
+			Detail:             bounded(detail),
+		}})
+}
+
+// ConnectionCount returns current Go router-accounted Rust connections.
+func (adapter *RouterAdapter) ConnectionCount() int {
+	adapter.mu.Lock()
+	states := make([]*connectionState, 0, len(adapter.connections))
+	for _, state := range adapter.connections {
+		states = append(states, state)
+	}
+	adapter.mu.Unlock()
+	count := 0
+	for _, state := range states {
+		state.mu.Lock()
+		if !state.closed {
+			count++
+		}
+		state.mu.Unlock()
+	}
+	return count
+}
+
+type projectedConn struct {
+	adapter *RouterAdapter
+	id      uint64
+	client  string
+
+	mu sync.Mutex
+
+	server     string
+	backend    router.BackendInst
+	clientIn   uint64
+	clientOut  uint64
+	values     map[any]any
+	logFields  []zap.Field
+	receiver   router.ConnEventReceiver
+	redirect   router.BackendInst
+	redirectID string
+	closeID    string
+	closing    bool
+	closed     bool
+}
+
+func newProjectedConn(adapter *RouterAdapter, identity *controlpb.ConnectionIdentity) *projectedConn {
+	conn := &projectedConn{
+		adapter: adapter,
+		id:      identity.GetConnectionId(),
+		client:  bounded(identity.GetClientAddress()),
+		values:  make(map[any]any),
+	}
+	conn.values[backend.ConnContextKeyConnID] = conn.id
+	conn.values[backend.ConnContextKeyConnAddr] = bounded(identity.GetListenerAddress())
+	return conn
+}
+
+func (conn *projectedConn) ClientAddr() string { return conn.client }
+
+func (conn *projectedConn) ServerAddr() string {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.server
+}
+
+func (conn *projectedConn) ClientInBytes() uint64 {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.clientIn
+}
+
+func (conn *projectedConn) ClientOutBytes() uint64 {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.clientOut
+}
+
+func (conn *projectedConn) UpdateLogger(fields ...zap.Field) {
+	conn.mu.Lock()
+	conn.logFields = append(conn.logFields, fields...)
+	conn.mu.Unlock()
+}
+
+func (conn *projectedConn) SetValue(key, value any) {
+	conn.mu.Lock()
+	conn.values[key] = value
+	conn.mu.Unlock()
+}
+
+func (conn *projectedConn) Value(key any) any {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.values[key]
+}
+
+func (conn *projectedConn) SetEventReceiver(receiver router.ConnEventReceiver) {
+	conn.mu.Lock()
+	conn.receiver = receiver
+	conn.mu.Unlock()
+}
+
+func (conn *projectedConn) Redirect(target router.BackendInst) bool {
+	if target == nil {
+		return false
+	}
+	conn.mu.Lock()
+	if conn.closed || conn.closing || conn.redirect != nil {
+		conn.mu.Unlock()
+		return false
+	}
+	sender := conn.adapter.currentSender()
+	if sender == nil {
+		conn.mu.Unlock()
+		return false
+	}
+	redirectID := conn.adapter.newOperationID("redirect", sender.Epoch(), conn.id)
+	envelope := &controlpb.ControlEnvelope{
+		RequestId: conn.adapter.nextID.Add(1),
+		Priority:  controlpb.Priority_PRIORITY_CRITICAL,
+		Body: &controlpb.ControlEnvelope_RedirectCommand{RedirectCommand: &controlpb.RedirectCommand{
+			ConnectionId:   conn.id,
+			RedirectId:     redirectID,
+			BackendId:      target.ID(),
+			BackendAddress: target.Addr(),
+			ClusterName:    target.ClusterName(),
+		}},
+	}
+	if err := trySend(sender, envelope); err != nil {
+		conn.mu.Unlock()
+		return false
+	}
+	conn.redirect = target
+	conn.redirectID = redirectID
+	conn.mu.Unlock()
+	return true
+}
+
+func (conn *projectedConn) ForceClose() bool {
+	conn.mu.Lock()
+	if conn.closed || conn.closing {
+		conn.mu.Unlock()
+		return false
+	}
+	sender := conn.adapter.currentSender()
+	capability := uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE)
+	if sender == nil || !sender.HasCapability(capability) {
+		conn.mu.Unlock()
+		return false
+	}
+	closeID := conn.adapter.newOperationID("close", sender.Epoch(), conn.id)
+	envelope := &controlpb.ControlEnvelope{
+		RequestId:            conn.adapter.nextID.Add(1),
+		Priority:             controlpb.Priority_PRIORITY_CRITICAL,
+		RequiredCapabilities: []uint64{capability},
+		Body: &controlpb.ControlEnvelope_CloseCommand{CloseCommand: &controlpb.CloseCommand{
+			ConnectionId: conn.id,
+			CloseId:      closeID,
+			ErrorSource:  controlpb.ErrorSource_ERROR_SOURCE_PROXY,
+			Reason:       "router eviction",
+			Force:        true,
+		}},
+	}
+	if err := trySend(sender, envelope); err != nil {
+		conn.mu.Unlock()
+		return false
+	}
+	conn.closeID = closeID
+	conn.closing = true
+	conn.mu.Unlock()
+	return true
+}
+
+func (conn *projectedConn) ConnectionID() uint64 { return conn.id }
+
+func (conn *projectedConn) ConnInfo() []zap.Field {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	fields := slices.Clone(conn.logFields)
+	fields = append(fields, zap.String("client_addr", conn.client), zap.String("backend_addr", conn.server))
+	return fields
+}
+
+func (conn *projectedConn) setBackend(selected router.BackendInst) {
+	conn.mu.Lock()
+	conn.backend = selected
+	conn.server = bounded(selected.Addr())
+	conn.mu.Unlock()
+}
+
+func (conn *projectedConn) clearBackend() {
+	conn.mu.Lock()
+	conn.backend = nil
+	conn.server = ""
+	conn.mu.Unlock()
+}
+
+func (conn *projectedConn) backendID() string {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.backend == nil {
+		return ""
+	}
+	return conn.backend.ID()
+}
+
+func (conn *projectedConn) setTraffic(clientIn, clientOut uint64) {
+	conn.mu.Lock()
+	conn.clientIn = clientIn
+	conn.clientOut = clientOut
+	conn.mu.Unlock()
+}
+
+func (conn *projectedConn) eventReceiver() router.ConnEventReceiver {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.receiver
+}
+
+func (conn *projectedConn) takeEventReceiver() router.ConnEventReceiver {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	receiver := conn.receiver
+	conn.receiver = nil
+	conn.redirect = nil
+	conn.redirectID = ""
+	return receiver
+}
+
+func (conn *projectedConn) takeRedirect(id string) (router.BackendInst, router.ConnEventReceiver) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if id == "" || id != conn.redirectID {
+		return nil, nil
+	}
+	pending := conn.redirect
+	conn.redirect = nil
+	conn.redirectID = ""
+	return pending, conn.receiver
+}
+
+func (conn *projectedConn) redirectPending() bool {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.redirect != nil
+}
+
+func (conn *projectedConn) finishClose(id string, accepted bool) {
+	conn.mu.Lock()
+	if id == conn.closeID && !accepted {
+		conn.closeID = ""
+		conn.closing = false
+	}
+	conn.mu.Unlock()
+}
+
+func (conn *projectedConn) markClosed() {
+	conn.mu.Lock()
+	conn.closed = true
+	conn.closing = true
+	conn.redirect = nil
+	conn.redirectID = ""
+	conn.mu.Unlock()
+}
+
+type reportedAddr string
+
+func (address reportedAddr) Network() string { return "tcp" }
+func (address reportedAddr) String() string  { return string(address) }
+
+func projectClientInfo(identity *controlpb.ConnectionIdentity) router.ClientInfo {
+	return router.ClientInfo{
+		ClientAddr:   reportedAddr(bounded(identity.GetClientAddress())),
+		ProxyAddr:    reportedAddr(bounded(identity.GetProxyAddress())),
+		ListenerPort: listenerPort(identity.GetListenerAddress()),
+	}
+}
+
+func listenerPort(address string) string {
+	_, port, err := net.SplitHostPort(address)
+	if err == nil {
+		return port
+	}
+	if value, parseErr := strconv.ParseUint(address, 10, 16); parseErr == nil && value > 0 {
+		return address
+	}
+	return ""
+}
+
+func projectHandshake(metadata *controlpb.HandshakeMetadata) *pnet.HandshakeResp {
+	return &pnet.HandshakeResp{
+		Attrs:      maps.Clone(metadata.GetConnectionAttributes()),
+		User:       bounded(metadata.GetUser()),
+		DB:         bounded(metadata.GetDatabase()),
+		AuthPlugin: bounded(metadata.GetAuthPlugin()),
+		AuthData:   nil,
+		Capability: pnet.Capability(metadata.GetCapability()),
+		ZstdLevel:  int(metadata.GetZstdLevel()),
+		Collation:  uint8(metadata.GetCollation()),
+	}
+}
+
+func fromControlSource(source controlpb.ErrorSource) backend.ErrorSource {
+	switch source {
+	case controlpb.ErrorSource_ERROR_SOURCE_CLIENT_NETWORK:
+		return backend.SrcClientNetwork
+	case controlpb.ErrorSource_ERROR_SOURCE_BACKEND_NETWORK:
+		return backend.SrcBackendNetwork
+	case controlpb.ErrorSource_ERROR_SOURCE_BACKEND_SQL:
+		return backend.SrcClientSQLErr
+	case controlpb.ErrorSource_ERROR_SOURCE_SHUTDOWN:
+		return backend.SrcProxyQuit
+	case controlpb.ErrorSource_ERROR_SOURCE_PROXY, controlpb.ErrorSource_ERROR_SOURCE_CONTROL:
+		return backend.SrcProxyErr
+	default:
+		return backend.SrcNone
+	}
+}
+
+func sendBody(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	priority controlpb.Priority,
+	body any,
+) error {
+	return sendBodyWithOptions(ctx, sender, requestID, 0, priority, nil, body)
+}
+
+func sendBodyWithOptions(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID, generation uint64,
+	priority controlpb.Priority,
+	required []uint64,
+	body any,
+) error {
+	envelope := &controlpb.ControlEnvelope{
+		RequestId:            requestID,
+		Generation:           generation,
+		Priority:             priority,
+		RequiredCapabilities: required,
+	}
+	switch typed := body.(type) {
+	case *controlpb.ControlEnvelope_HandshakeDecision:
+		envelope.Body = typed
+	case *controlpb.ControlEnvelope_RouteAssignment:
+		envelope.Body = typed
+	case *controlpb.ControlEnvelope_ReconcileSnapshot:
+		envelope.Body = typed
+	case *controlpb.ControlEnvelope_Error:
+		envelope.Body = typed
+	default:
+		return fmt.Errorf("unsupported control response %T", body)
+	}
+	return sender.Send(ctx, envelope)
+}
+
+func trySend(sender EnvelopeSender, envelope *controlpb.ControlEnvelope) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return sender.Send(ctx, envelope)
+}
+
+func missingCapability(sender EnvelopeSender, required []uint64) uint64 {
+	for _, capability := range required {
+		if !sender.HasCapability(capability) {
+			return capability
+		}
+	}
+	return 0
+}
+
+func cloneIdentity(identity *controlpb.ConnectionIdentity) *controlpb.ConnectionIdentity {
+	cloned, _ := proto.Clone(identity).(*controlpb.ConnectionIdentity)
+	return cloned
+}
+
+func cloneHandshake(handshake *controlpb.HandshakeMetadata) *controlpb.HandshakeMetadata {
+	cloned, _ := proto.Clone(handshake).(*controlpb.HandshakeMetadata)
+	return cloned
+}
+
+func cloneDecision(decision *controlpb.HandshakeDecision) *controlpb.HandshakeDecision {
+	cloned, _ := proto.Clone(decision).(*controlpb.HandshakeDecision)
+	return cloned
+}
+
+func sameIdentity(left, right *controlpb.ConnectionIdentity) bool {
+	return proto.Equal(left, right)
+}
+
+func bounded(value string) string {
+	value = strings.ToValidUTF8(value, "?")
+	if len(value) <= maxControlDetailBytes {
+		return value
+	}
+	return strings.ToValidUTF8(value[:maxControlDetailBytes], "")
+}
+
+func int64Compare(left, right uint64) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}

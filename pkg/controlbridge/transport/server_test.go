@@ -43,6 +43,9 @@ func TestServerHandshakeLifecycleAndReconnect(t *testing.T) {
 	peer, ack := connectPeer(t, server.config.SocketPath, rustHello(1), true)
 	first := waitActive(t, server)
 	require.Equal(t, first.Epoch(), ack.GetControlEpoch())
+	require.True(t, first.HasCapability(1))
+	require.False(t, first.HasCapability(2))
+	require.True(t, first.HasCapability(3))
 
 	peerHeartbeat := &controlpb.ControlEnvelope{
 		ProtocolVersion: controlpb.ProtocolV1,
