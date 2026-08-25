@@ -25,6 +25,8 @@
 mod error;
 mod packet;
 
+pub mod proxy_protocol;
+
 pub use error::{IoSide, PacketIoError};
 pub use packet::{
     DEFAULT_STREAM_BUFFER_SIZE, ForwardProgress, ForwardStatus, ForwardUntilDecision,

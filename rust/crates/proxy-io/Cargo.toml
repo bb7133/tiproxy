@@ -1,6 +1,7 @@
 [package]
 name = "proxy-io"
 description = "Transport ownership for the TiProxy Rust dataplane"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

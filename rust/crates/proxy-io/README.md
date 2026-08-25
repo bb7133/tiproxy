@@ -79,3 +79,43 @@ cargo test --locked --manifest-path rust/Cargo.toml -p proxy-io
 cargo clippy --locked --manifest-path rust/Cargo.toml \
   -p proxy-io --all-targets --all-features -- -D warnings
 ```
+
+## PROXY protocol v2 (`proxy_protocol`)
+
+Sans-I/O codecs matching Go TiProxy's observable behavior
+(`pkg/proxy/proxyprotocol`, `pkg/proxy/net/proxy.go`):
+
+- `sniff_magic` reduces both Go sniffing integrations (four-byte fast probe in
+  `net/proxy.go`, incremental buffering in `listener.go`) to one pure prefix
+  comparison: partial magic → need more, divergence → all buffered bytes are
+  application data and none may be consumed, full match → decode.
+- A known family with an unknown transport matches Go's inner network switch:
+  no addresses are populated, but the cursor still advances past the address
+  block before TLV scanning (unlike the short-body case, which does not
+  advance).
+- `decode_after_magic` is exactly as tolerant as Go `ParseProxyV2`: no field
+  value is rejected, a short address body yields no addresses **and the
+  address bytes are rescanned as TLVs** (Go leaves its cursor unadvanced —
+  bug-for-bug, covered by tests), truncated TLV declarations are clamped, and
+  sub-3-byte tails are dropped. Insufficient input reports the exact total
+  needed instead of blocking.
+- `encode_proxy_v2` reproduces Go `ToBytes` byte-for-byte for canonical
+  inputs, including `unifyIPFamily` (v4/v4-mapped pairs stay v4, otherwise
+  both widen to v6) and Go's unpadded Unix path write.
+
+Intentional differences from Go are limited to the encode side and recorded
+in the parity manifest's `WIRE-05` decision-ledger rows: a single TLV or the
+aggregate body (addresses plus TLVs) exceeding the u16 length field
+(`WIRE-05-D1`) and a Unix path above 108 bytes (`WIRE-05-D2`) return typed
+errors instead of Go's silent frame corruption.
+
+Zero-copy: decoded TLV contents and Unix path blocks borrow the caller's
+buffer; the only allocations are the TLV `Vec` and encoder output.
+
+The outbound PROXY-before-TLS ordering, socket integration, and the
+`RemoteAddr`/`ProxyAddr` override policy stay with the async adapters
+(WIRE-06) and session layers; this module is deliberately pure. Adapter
+note: Go's `listener.go` returns the PROXY **destination** address from
+`RemoteAddr` while the production path in `net/proxy.go` returns the
+**source** address (both pass Go's tests only because src == dst there);
+the Rust adapter must follow `net/proxy.go`.
