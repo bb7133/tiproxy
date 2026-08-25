@@ -198,3 +198,29 @@ verifier that omits `DNSName`); Rust's standard WebPKI path verifies the
 routing-selected backend hostname. A deliberate strengthening, recorded in
 the parity manifest with its compatibility impact. The TLS 1.2/1.3 floor was
 already frozen by `control-proto` snapshot validation and adds no new row.
+
+## Socket policy (`socket`)
+
+WIRE-06: TCP listen, dial, keepalive, and per-stream socket policy, matching
+Go's observable behavior:
+
+- `bind_listeners` binds every address up front and reports OS-assigned
+  ports; dropping a listener releases its accept and port.
+- `dial_with_backoff` reproduces the Go constants exactly (1 s per attempt,
+  15 s total, 100 ms exponential backoff ×2 capped at 4 s, randomization
+  0.5) with cancellation that also interrupts backoff sleeps. DNS input is
+  resolved per attempt.
+- `apply_keepalive` mirrors `pkg/proxy/keepalive`: `SO_KEEPALIVE` plus
+  idle/count/interval on Linux, `TCP_USER_TIMEOUT` applied even when probing
+  is disabled (Go runs `setTimeout` outside the enabled branch), zero values
+  skipped like Go's `val > 0` guards. Healthy/unhealthy switches are
+  observable through `read_keepalive`. Non-Unix platforms return diagnostic
+  errors instead of silently mis-configured sockets.
+- `configure_stream` sets `TCP_NODELAY`: Go inherits it from the runtime
+  default, Tokio does not, so it is explicit here.
+- `read_proxy_header_if_present` is the production integration of the
+  WIRE-05 codec on live sockets: disabled mode performs zero reads, fallback
+  mode only peeks (a non-PROXY client's bytes arrive untouched), and a PROXY
+  client has exactly its header consumed. This closes the WIRE-05 adapter
+  acceptance for disabled/fallback zero-consumption; the PROXY-before-TLS
+  ordering check against a real TiDB still waits for the FND-04 topology.
