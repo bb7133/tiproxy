@@ -1,0 +1,12 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # The issue contract fixes the public schema path at proto/dataplane/v1.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - FILE
