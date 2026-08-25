@@ -120,7 +120,7 @@ impl ErrorSource {
 
     /// Classifies a failure descriptor with `Error2Source`'s exact precedence.
     #[must_use]
-    pub const fn classify(failure: &FailureDescriptor) -> Self {
+    pub const fn classify(failure: &FailureDescriptor<'_>) -> Self {
         // 1. Disconnects attributed to a side win over every wrapped context.
         match failure.disconnect {
             DisconnectState::Attributed(SideMarker::Client) => return Self::ClientNetwork,
@@ -146,6 +146,9 @@ impl ErrorSource {
                 | FailureKind::BackendProxyProtocol,
             ) => Self::BackendHandshake,
             Some(FailureKind::NoBackend) => Self::ProxyNoBackend,
+            // Go's ErrProxyNoTLS reaches the switch's default branch:
+            // TestRequireBackendTLS pins its source as SrcProxyErr.
+            Some(FailureKind::ProxyNoTls) => Self::ProxyError,
             None | Some(FailureKind::ProxyInternal) => {
                 if failure.mysql_error {
                     Self::ClientSqlError
@@ -210,8 +213,27 @@ pub enum FailureKind {
     BackendProxyProtocol,
     /// Go `ErrProxyNoBackend`.
     NoBackend,
+    /// Go `ErrProxyNoTLS` (`require-backend-tls=true` without proxy TLS).
+    ProxyNoTls,
     /// Go `ErrProxyErr`.
     ProxyInternal,
+}
+
+/// A client-safe error approved by the control plane.
+///
+/// Go's `ErrProxyErr` branch unwraps an error supplied by the
+/// `HandshakeHandler`/`BackendFetcher`; the control-protocol ADR requires
+/// such client-facing errors to be "an enumerated code plus an approved
+/// message". This type is the only way to route a non-static message to a
+/// client: the session layer must construct it exclusively from a
+/// control-plane `HandshakeDecision` payload (already bounded by the
+/// diagnostic-text cap), never from internal error `Display`/`Debug` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovedClientError<'a> {
+    /// Enumerated `MySQL` error code from the control plane.
+    pub code: u16,
+    /// The approved, pre-bounded message.
+    pub message: &'a str,
 }
 
 /// Structured failure descriptor the session layer builds for classification.
@@ -219,7 +241,7 @@ pub enum FailureKind {
 /// This replaces Go's `errors.Is` chain walking: each field corresponds to a
 /// wrapped marker or sentinel in the Go error tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FailureDescriptor {
+pub struct FailureDescriptor<'a> {
     /// Disconnect status with optional side attribution
     /// (EOF/reset/refused/timeout plus Go's side-marker wrapping).
     pub disconnect: DisconnectState,
@@ -231,6 +253,9 @@ pub struct FailureDescriptor {
     pub mysql_error: bool,
     /// The enclosing context was cancelled (Go `context.Canceled`).
     pub cancelled: bool,
+    /// A control-plane-approved client error carried by a
+    /// [`FailureKind::ProxyInternal`] failure (Go's `ErrProxyErr` unwrap).
+    pub approved_client_error: Option<ApprovedClientError<'a>>,
 }
 
 /// A fixed, client-safe `MySQL` error response.
@@ -269,19 +294,32 @@ pub const MSG_NET_PACKET_TOO_LARGE: &str = "Got a packet bigger than 'max_allowe
 const SQL_STATE_HY000: [u8; 5] = *b"HY000";
 const SQL_STATE_08S01: [u8; 5] = *b"08S01";
 
+/// A client-visible response: either a fixed allowlisted text or a
+/// control-plane-approved passthrough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientResponse<'a> {
+    /// One of the fixed static responses from the allowlist.
+    Fixed(ClientErrorResponse),
+    /// A control-plane-approved error (Go's `ErrProxyErr` unwrap route).
+    Approved(ApprovedClientError<'a>),
+}
+
 /// Which client-visible failure to send, when any.
 ///
-/// Mirrors Go `ErrToClient`: an allowlist of fixed responses. A failure that
-/// already delivered a `MySQL` error sends nothing more; every unlisted
-/// failure is silent, so internal detail cannot leak by construction.
+/// Mirrors Go `ErrToClient` completely: the seven allowlisted failure
+/// classes produce fixed static responses; a [`FailureKind::ProxyInternal`]
+/// failure forwards only its control-plane-approved error; a failure that
+/// already delivered a `MySQL` error sends nothing more; every other failure
+/// is silent, so internal detail cannot leak by construction.
 #[must_use]
-pub const fn client_response(failure: &FailureDescriptor) -> Option<ClientErrorResponse> {
+pub const fn client_response<'a>(failure: &FailureDescriptor<'a>) -> Option<ClientResponse<'a>> {
     if failure.mysql_error {
         // Already sent to the client by the backend.
         return None;
     }
     let (code, sql_state, message) = match failure.kind {
         Some(FailureKind::NoBackend) => (ER_UNKNOWN_ERROR, SQL_STATE_HY000, MSG_NO_BACKEND),
+        Some(FailureKind::ProxyNoTls) => (ER_UNKNOWN_ERROR, SQL_STATE_HY000, MSG_PROXY_NO_TLS),
         Some(FailureKind::BackendCapability) => {
             (ER_UNKNOWN_ERROR, SQL_STATE_HY000, MSG_BACKEND_CAPABILITY)
         }
@@ -297,17 +335,22 @@ pub const fn client_response(failure: &FailureDescriptor) -> Option<ClientErrorR
             SQL_STATE_08S01,
             MSG_NET_PACKET_TOO_LARGE,
         ),
-        // ErrProxyNoTLS carries a fixed text as well but is reported through
-        // the proxy-internal path in Go; keep it reachable via ProxyInternal
-        // once the session layer wires configuration errors. All remaining
-        // failures are silent by Go parity.
+        Some(FailureKind::ProxyInternal) => {
+            // Go unwraps the handler-provided error; here only a typed,
+            // control-plane-approved payload may pass through.
+            return match failure.approved_client_error {
+                Some(approved) => Some(ClientResponse::Approved(approved)),
+                None => None,
+            };
+        }
+        // All remaining failures are silent by Go parity.
         _ => return None,
     };
-    Some(ClientErrorResponse {
+    Some(ClientResponse::Fixed(ClientErrorResponse {
         code,
         sql_state,
         message,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -464,11 +507,11 @@ mod tests {
         let response = client_response(&no_backend);
         assert_eq!(
             response,
-            Some(ClientErrorResponse {
+            Some(ClientResponse::Fixed(ClientErrorResponse {
                 code: 1105,
                 sql_state: *b"HY000",
                 message: "No available TiDB instances, please make sure TiDB is available",
-            })
+            }))
         );
 
         let too_large = FailureDescriptor {
@@ -478,12 +521,57 @@ mod tests {
         let response = client_response(&too_large);
         assert_eq!(
             response,
-            Some(ClientErrorResponse {
+            Some(ClientResponse::Fixed(ClientErrorResponse {
                 code: 1153,
                 sql_state: *b"08S01",
                 message: "Got a packet bigger than 'max_allowed_packet' bytes",
-            })
+            }))
         );
+
+        // The full fixed allowlist pins code/state/message for every branch.
+        let fixed_expectations: [(FailureKind, u16, &[u8; 5], &str); 6] = [
+            (FailureKind::ProxyNoTls, 1105, b"HY000", MSG_PROXY_NO_TLS),
+            (
+                FailureKind::BackendCapability,
+                1105,
+                b"HY000",
+                MSG_BACKEND_CAPABILITY,
+            ),
+            (
+                FailureKind::BackendHandshake,
+                1105,
+                b"HY000",
+                MSG_BACKEND_HANDSHAKE,
+            ),
+            (
+                FailureKind::BackendNoTls,
+                1105,
+                b"HY000",
+                MSG_BACKEND_NO_TLS,
+            ),
+            (
+                FailureKind::BackendProxyProtocol,
+                1105,
+                b"HY000",
+                MSG_BACKEND_PPV2,
+            ),
+            (FailureKind::NoBackend, 1105, b"HY000", MSG_NO_BACKEND),
+        ];
+        for (kind, code, sql_state, message) in fixed_expectations {
+            let descriptor = FailureDescriptor {
+                kind: Some(kind),
+                ..FailureDescriptor::default()
+            };
+            assert_eq!(
+                client_response(&descriptor),
+                Some(ClientResponse::Fixed(ClientErrorResponse {
+                    code,
+                    sql_state: *sql_state,
+                    message,
+                })),
+                "{kind:?} must send its fixed response"
+            );
+        }
 
         // Already-sent MySQL errors add nothing, even for listed kinds.
         let already_sent = FailureDescriptor {
@@ -516,6 +604,37 @@ mod tests {
         ] {
             assert_eq!(client_response(&silent), None, "{silent:?} must be silent");
         }
+    }
+
+    /// The Go `ErrProxyErr` route: only a typed control-plane-approved
+    /// payload passes through a proxy-internal failure, and `ProxyNoTls`
+    /// classifies as a proxy error (Go `TestRequireBackendTLS`).
+    #[test]
+    fn proxy_internal_and_no_tls_follow_go_routes() {
+        let approved = ApprovedClientError {
+            code: 1105,
+            message: "approved by handshake decision",
+        };
+        let internal_with_approval = FailureDescriptor {
+            kind: Some(FailureKind::ProxyInternal),
+            approved_client_error: Some(approved),
+            ..FailureDescriptor::default()
+        };
+        assert_eq!(
+            client_response(&internal_with_approval),
+            Some(ClientResponse::Approved(approved))
+        );
+        let internal_without_approval = FailureDescriptor {
+            kind: Some(FailureKind::ProxyInternal),
+            ..FailureDescriptor::default()
+        };
+        assert_eq!(client_response(&internal_without_approval), None);
+
+        let no_tls = FailureDescriptor {
+            kind: Some(FailureKind::ProxyNoTls),
+            ..FailureDescriptor::default()
+        };
+        assert_eq!(ErrorSource::classify(&no_tls), ErrorSource::ProxyError);
     }
 
     /// Responses are fixed static strings: no formatting of internal detail,

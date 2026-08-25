@@ -26,6 +26,15 @@
 //! **before** allocating for any length a peer declared. The helpers never
 //! allocate and their errors never echo input bytes — only the field name,
 //! the declared value, and the limit.
+//!
+//! Delegated transport-owned bounds (anchored by `proxy-io`'s conformance
+//! tests so values cannot drift silently):
+//! - stream/pump buffers 32 KiB; write high-water 64 KiB
+//! - pump flush delay 1 ms, write/flush timeout 30 s, shutdown timeout 1 s
+//! - dial budgets 1 s per attempt / 15 s total
+//! - compressed frame ≤ the u24 maximum, default expansion ratio 65536
+//! - control frame default/hard cap 1 MiB
+//!   (`control-proto::codec::DEFAULT_MAX_FRAME_BYTES`)
 
 use core::fmt;
 
@@ -54,6 +63,13 @@ pub const MAX_DIAGNOSTIC_TEXT_LEN: usize = 4 * 1024;
 
 /// The 24-bit physical-packet payload maximum (single source: this crate).
 pub const MAX_PHYSICAL_PAYLOAD_LEN: usize = crate::MAX_PAYLOAD_LEN as usize;
+
+/// Identity fields (username, database, auth-plugin name) carry **no
+/// dedicated Go limit**: they are bounded only by the enclosing
+/// pre-handshake packet cap. Registered as an explicit alias so the absence
+/// of a per-field bound is a recorded decision with boundary coverage, not
+/// an omission.
+pub const MAX_IDENTITY_FIELD_LEN: usize = MAX_PRE_HANDSHAKE_PACKET_LEN;
 
 /// LOCAL INFILE aggregate upload size: **unbounded in Go today** — only the
 /// per-packet 24-bit framing applies, and the stream ends at the client's
@@ -126,6 +142,9 @@ pub const fn check_pre_handshake_packet(declared: usize) -> Result<(), LimitExce
 /// Control-frame body length check (ADR 1-MiB hard limit, or a smaller
 /// negotiated limit).
 ///
+/// `negotiated_limit == 0` means "no negotiated limit" and falls back to the
+/// hard cap, matching `control-proto::codec`'s `normalized_limit` semantics.
+///
 /// # Errors
 ///
 /// Returns [`LimitExceeded`] above the effective limit.
@@ -133,12 +152,26 @@ pub const fn check_control_frame(
     declared: usize,
     negotiated_limit: usize,
 ) -> Result<(), LimitExceeded> {
-    let limit = if negotiated_limit < MAX_CONTROL_FRAME_LEN {
-        negotiated_limit
-    } else {
+    let limit = if negotiated_limit == 0 || negotiated_limit > MAX_CONTROL_FRAME_LEN {
         MAX_CONTROL_FRAME_LEN
+    } else {
+        negotiated_limit
     };
     check_declared_length("control frame", declared, limit)
+}
+
+/// Clamps a command-prefix capture length to the registered bound.
+///
+/// This is a truncation bound, not a rejection: matching Go's
+/// `ForwardPacketTo(backendIO, 1024)`, at most
+/// [`COMMAND_PREFIX_CAPTURE_LEN`] bytes of a streamed command are retained.
+#[must_use]
+pub const fn clamp_command_prefix(declared: usize) -> usize {
+    if declared > COMMAND_PREFIX_CAPTURE_LEN {
+        COMMAND_PREFIX_CAPTURE_LEN
+    } else {
+        declared
+    }
 }
 
 /// Connection-attribute bounds check (ADR totals, entries, per-entry sizes).
@@ -215,8 +248,55 @@ mod tests {
         assert!(check_control_frame(MAX_CONTROL_FRAME_LEN, usize::MAX).is_ok());
         assert!(check_control_frame(MAX_CONTROL_FRAME_LEN + 1, usize::MAX).is_err());
         // A smaller negotiated limit wins.
+        assert!(check_control_frame(511, 512).is_ok());
         assert!(check_control_frame(512, 512).is_ok());
         assert!(check_control_frame(513, 512).is_err());
+        // Zero means "no negotiated limit" and falls back to the hard cap,
+        // matching control-proto's normalized_limit — not a zero-size limit.
+        assert!(check_control_frame(MAX_CONTROL_FRAME_LEN, 0).is_ok());
+        assert!(check_control_frame(MAX_CONTROL_FRAME_LEN + 1, 0).is_err());
+
+        // Command-prefix capture is a truncation bound with full boundary
+        // coverage: below stays, at stays, above clamps.
+        assert_eq!(
+            clamp_command_prefix(COMMAND_PREFIX_CAPTURE_LEN - 1),
+            COMMAND_PREFIX_CAPTURE_LEN - 1
+        );
+        assert_eq!(
+            clamp_command_prefix(COMMAND_PREFIX_CAPTURE_LEN),
+            COMMAND_PREFIX_CAPTURE_LEN
+        );
+        assert_eq!(
+            clamp_command_prefix(COMMAND_PREFIX_CAPTURE_LEN + 1),
+            COMMAND_PREFIX_CAPTURE_LEN
+        );
+
+        // Identity fields are bounded only by the pre-handshake cap (alias).
+        assert_eq!(MAX_IDENTITY_FIELD_LEN, MAX_PRE_HANDSHAKE_PACKET_LEN);
+        assert!(
+            check_declared_length(
+                "username",
+                MAX_IDENTITY_FIELD_LEN - 1,
+                MAX_IDENTITY_FIELD_LEN
+            )
+            .is_ok()
+        );
+        assert!(
+            check_declared_length("username", MAX_IDENTITY_FIELD_LEN, MAX_IDENTITY_FIELD_LEN)
+                .is_ok()
+        );
+        assert!(
+            check_declared_length(
+                "username",
+                MAX_IDENTITY_FIELD_LEN + 1,
+                MAX_IDENTITY_FIELD_LEN
+            )
+            .is_err()
+        );
+
+        // Attribute entry-count bound at -1 as well as = and +1 (below).
+        let under_entries = (0..MAX_CONNECTION_ATTRIBUTE_ENTRIES - 1).map(|_| (1_usize, 1_usize));
+        assert!(check_connection_attributes(under_entries).is_ok());
 
         // Attribute per-entry bound.
         let kv = MAX_CONNECTION_ATTRIBUTE_KV;
@@ -224,10 +304,14 @@ mod tests {
         assert!(check_connection_attributes([(kv, 0)]).is_ok());
         assert!(check_connection_attributes([(kv + 1, 0)]).is_err());
 
-        // Attribute total bound at the exact boundary: eight maximum-size
-        // entries land exactly on the 64-KiB total; one more byte exceeds it.
+        // Attribute total bound at -1 / exact / +1: eight maximum-size
+        // entries land exactly on the 64-KiB total.
         let total = MAX_CONNECTION_ATTRIBUTES_TOTAL;
         let full_entries = total / (2 * kv);
+        let one_short = (0..full_entries - 1)
+            .map(|_| (kv, kv))
+            .chain([(kv, kv - 1)]);
+        assert!(check_connection_attributes(one_short).is_ok());
         let exact = (0..full_entries).map(|_| (kv, kv));
         assert!(check_connection_attributes(exact.clone()).is_ok());
         assert!(check_connection_attributes(exact.chain([(1, 0)])).is_err());
@@ -263,6 +347,14 @@ mod tests {
 
     #[test]
     fn diagnostic_text_clamps_on_char_boundary() {
+        // -1 / exact / +1 around the cap.
+        let under = "a".repeat(MAX_DIAGNOSTIC_TEXT_LEN - 1);
+        assert_eq!(
+            clamp_diagnostic_text(&under).len(),
+            MAX_DIAGNOSTIC_TEXT_LEN - 1
+        );
+        let exact = "a".repeat(MAX_DIAGNOSTIC_TEXT_LEN);
+        assert_eq!(clamp_diagnostic_text(&exact).len(), MAX_DIAGNOSTIC_TEXT_LEN);
         let ascii = "a".repeat(MAX_DIAGNOSTIC_TEXT_LEN + 10);
         assert_eq!(clamp_diagnostic_text(&ascii).len(), MAX_DIAGNOSTIC_TEXT_LEN);
         // A multibyte character straddling the cap is dropped, not split.
