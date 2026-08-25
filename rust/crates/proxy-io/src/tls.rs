@@ -122,12 +122,25 @@ fn protocol_label(version: rustls::ProtocolVersion) -> &'static str {
 /// stream, then passes reads and writes through unchanged.
 ///
 /// The frontend `SSLRequest` upgrade needs this: TLS client-hello bytes may
-/// already be buffered above the socket when the upgrade starts.
-#[derive(Debug)]
+/// already be buffered above the socket when the upgrade starts. The prefix
+/// buffer is zeroed and released as soon as it is fully replayed, and `Debug`
+/// never prints its bytes — buffered client-hello material must not reach
+/// logs or outlive its use.
 pub struct PrefixedIo<S> {
     inner: S,
     prefix: Vec<u8>,
     position: usize,
+}
+
+impl<S> std::fmt::Debug for PrefixedIo<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefixedIo")
+            .field(
+                "remaining_prefix_bytes",
+                &(self.prefix.len() - self.position),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> PrefixedIo<S> {
@@ -165,6 +178,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
             let take = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..take]);
             self.position += take;
+            if self.position == self.prefix.len() {
+                // Zero and free the replayed client-hello bytes immediately.
+                self.prefix.fill(0);
+                self.prefix = Vec::new();
+                self.position = 0;
+            }
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.inner).poll_read(context, buf)
@@ -293,7 +312,7 @@ pub fn build_backend_config(
     let builder = if policy.skip_ca_verification {
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
     } else {
         let mut roots = RootCertStore::empty();
         for root in &policy.roots.roots {
@@ -360,10 +379,23 @@ where
     })
 }
 
-/// Accepts any backend certificate, mirroring Go `InsecureSkipVerify` when the
-/// validated snapshot explicitly sets `skip_ca_verification`.
+/// Skips certificate-chain and hostname verification, mirroring Go
+/// `InsecureSkipVerify` exactly: the handshake's `CertificateVerify`
+/// signature is still validated against the presented certificate through the
+/// crypto provider, so the peer must actually hold the certificate's private
+/// key even when the chain is not trusted.
 #[derive(Debug)]
-struct SkipServerVerification;
+struct SkipServerVerification {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl SkipServerVerification {
+    fn new() -> Self {
+        Self {
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+}
 
 impl ServerCertVerifier for SkipServerVerification {
     fn verify_server_cert(
@@ -379,34 +411,36 @@ impl ServerCertVerifier for SkipServerVerification {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-        ]
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -431,5 +465,66 @@ mod tests {
     fn invalid_server_name_is_typed() {
         let error = ServerName::try_from("bad name with spaces".to_owned());
         assert!(error.is_err());
+    }
+
+    /// The skip-CA verifier must still reject a forged handshake signature:
+    /// only chain/hostname checks are skipped, matching Go `InsecureSkipVerify`.
+    #[test]
+    fn skip_verifier_rejects_bad_signatures() {
+        // DigitallySignedStruct's constructor is crate-private; decode one
+        // from its wire form (scheme 0x0403 = ecdsa_secp256r1_sha256, then a
+        // u16-length-prefixed bogus signature) via the public Codec API.
+        use rustls::internal::msgs::codec::{Codec, Reader};
+
+        let verifier = SkipServerVerification::new();
+        assert!(!verifier.supported_verify_schemes().is_empty());
+        let bogus_cert = CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
+        let wire = [0x04, 0x03, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef];
+        let mut reader = Reader::init(&wire);
+        let Ok(dss) = DigitallySignedStruct::read(&mut reader) else {
+            unreachable!("fixed wire form must decode")
+        };
+        assert!(
+            verifier
+                .verify_tls13_signature(b"handshake transcript", &bogus_cert, &dss)
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_tls12_signature(b"handshake transcript", &bogus_cert, &dss)
+                .is_err()
+        );
+    }
+
+    /// `Debug` must never print buffered client-hello bytes, and the prefix
+    /// buffer must be released once fully replayed.
+    #[tokio::test]
+    async fn prefixed_io_redacts_debug_and_releases_prefix() -> Result<(), io::Error> {
+        use tokio::io::AsyncReadExt;
+
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut prefixed = PrefixedIo::new(reader, vec![0xab, 0xcd, 0xef]);
+        let rendered = format!("{prefixed:?}");
+        assert!(rendered.contains("remaining_prefix_bytes: 3"), "{rendered}");
+        assert!(
+            !rendered.contains("0xab") && !rendered.contains("171"),
+            "{rendered}"
+        );
+
+        let mut first = [0_u8; 2];
+        prefixed.read_exact(&mut first).await?;
+        assert_eq!(first, [0xab, 0xcd]);
+        let mut second = [0_u8; 1];
+        prefixed.read_exact(&mut second).await?;
+        assert_eq!(second, [0xef]);
+        assert!(prefixed.remaining_prefix().is_empty());
+        assert_eq!(
+            prefixed.prefix.capacity(),
+            0,
+            "prefix allocation must be released"
+        );
+        let rendered = format!("{prefixed:?}");
+        assert!(rendered.contains("remaining_prefix_bytes: 0"), "{rendered}");
+        Ok(())
     }
 }

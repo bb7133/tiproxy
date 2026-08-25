@@ -192,6 +192,9 @@ WIRE-04: frontend `SSLRequest` upgrade and backend client TLS over rustls
   (`TlsHandshakeInfo`); certificates, keys, and raw TLS bytes never leave the
   transport layer.
 
-No new safety-ledger rows: decode/encode behavior is not touched, and the
-minimum-version constraint to TLS 1.2/1.3 was already frozen by
-`control-proto` snapshot validation.
+One safety-ledger row: `WIRE-04-D1` — Go's backend client TLS never
+verifies the hostname even with a CA (`InsecureSkipVerify` plus a custom
+verifier that omits `DNSName`); Rust's standard WebPKI path verifies the
+routing-selected backend hostname. A deliberate strengthening, recorded in
+the parity manifest with its compatibility impact. The TLS 1.2/1.3 floor was
+already frozen by `control-proto` snapshot validation and adds no new row.
