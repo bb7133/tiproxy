@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "crates/control-proto",
+    "crates/dataplane",
+    "crates/mysql-wire",
+    "crates/proxy-io",
+    "crates/session-core",
+    "crates/tiproxy-rs",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89.0"
+license = "Apache-2.0"
+repository = "https://github.com/pingcap/tiproxy"
+
+[workspace.dependencies]
+control-proto = { path = "crates/control-proto", version = "0.1.0" }
+dataplane = { path = "crates/dataplane", version = "0.1.0" }
+mysql-wire = { path = "crates/mysql-wire", version = "0.1.0" }
+proxy-io = { path = "crates/proxy-io", version = "0.1.0" }
+session-core = { path = "crates/session-core", version = "0.1.0" }
+
+[workspace.lints.rust]
+missing_docs = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_code = "forbid"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+pedantic = { level = "warn", priority = -1 }
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[workspace.metadata.tiproxy]
+default-feature-policy = "Default features stay empty; deployment-specific behavior requires an explicit, additive feature."
+protocol-policy = "MySQL packet payloads stay inside the Rust dataplane and never cross control IPC or FFI."
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

@@ -1,0 +1,20 @@
+[package]
+name = "dataplane"
+description = "Composition root for the TiProxy Rust dataplane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+control-proto.workspace = true
+mysql-wire.workspace = true
+proxy-io.workspace = true
+session-core.workspace = true
+
+[lints]
+workspace = true

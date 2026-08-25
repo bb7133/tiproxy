@@ -1,0 +1,14 @@
+[package]
+name = "session-core"
+description = "Session lifecycle for the TiProxy Rust dataplane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true
