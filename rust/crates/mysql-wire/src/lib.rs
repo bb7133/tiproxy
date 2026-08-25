@@ -45,8 +45,9 @@ pub use handshake::{
     parse_handshake_response, parse_initial_handshake, parse_ssl_request,
 };
 pub use packet::{
-    CommandPacket, PHYSICAL_PACKET_HEADER_LEN, PacketHeader, PhysicalPacket, SequenceObservation,
-    SequenceTracker, encode_command_packet, encode_physical_packet,
+    CommandPacket, LogicalPacketFragments, PHYSICAL_PACKET_HEADER_LEN, PacketHeader,
+    PhysicalPacket, SequenceObservation, SequenceTracker, encode_command_packet,
+    encode_physical_packet, physical_packet_count,
 };
 pub use primitives::{
     Cursor, LengthEncodedInt, MAX_PAYLOAD_LEN, decode_length_encoded_bytes,

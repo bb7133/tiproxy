@@ -17,6 +17,88 @@ use crate::{CommandCode, Cursor, DecodeError, EncodeError, MAX_PAYLOAD_LEN, enco
 /// Size of a `MySQL` physical-packet header.
 pub const PHYSICAL_PACKET_HEADER_LEN: usize = 4;
 
+/// Returns the number of physical packets required for one logical payload.
+///
+/// The count always includes a final packet shorter than [`MAX_PAYLOAD_LEN`].
+/// Consequently an empty logical payload is one empty physical packet, and an
+/// exact multiple of the maximum ends with an additional empty packet.
+#[must_use]
+pub const fn physical_packet_count(logical_payload_length: u64) -> u64 {
+    logical_payload_length / MAX_PAYLOAD_LEN as u64 + 1
+}
+
+/// Allocation-free physical-fragment plan for one logical `MySQL` payload.
+///
+/// This iterator yields only payload lengths. Sequence assignment belongs to
+/// the directional reader or writer because source and destination sequences
+/// are independent while a proxy forwards a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalPacketFragments {
+    remaining: u64,
+    emit_terminator: bool,
+    finished: bool,
+}
+
+impl LogicalPacketFragments {
+    /// Creates a fragment plan for `logical_payload_length` bytes.
+    #[must_use]
+    pub const fn new(logical_payload_length: u64) -> Self {
+        Self {
+            remaining: logical_payload_length,
+            emit_terminator: logical_payload_length % MAX_PAYLOAD_LEN as u64 == 0,
+            finished: false,
+        }
+    }
+
+    /// Returns the logical payload bytes not yet assigned to a fragment.
+    #[must_use]
+    pub const fn remaining_payload(&self) -> u64 {
+        self.remaining
+    }
+}
+
+impl Iterator for LogicalPacketFragments {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        if self.remaining > 0 {
+            let length = if self.remaining >= u64::from(MAX_PAYLOAD_LEN) {
+                MAX_PAYLOAD_LEN
+            } else {
+                // This branch is strictly below the 24-bit packet maximum.
+                u32::try_from(self.remaining).unwrap_or(MAX_PAYLOAD_LEN)
+            };
+            self.remaining -= u64::from(length);
+            if self.remaining == 0 && length < MAX_PAYLOAD_LEN {
+                self.finished = true;
+            }
+            return Some(length);
+        }
+        if self.emit_terminator {
+            self.emit_terminator = false;
+            self.finished = true;
+            return Some(0);
+        }
+        self.finished = true;
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining_fragments = if self.finished {
+            0
+        } else {
+            physical_packet_count(self.remaining)
+        };
+        match usize::try_from(remaining_fragments) {
+            Ok(remaining_fragments) => (remaining_fragments, Some(remaining_fragments)),
+            Err(_) => (usize::MAX, None),
+        }
+    }
+}
+
 /// The three-byte payload length and one-byte sequence of a physical packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketHeader {
@@ -277,6 +359,8 @@ impl SequenceTracker {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use super::*;
 
     #[test]
@@ -296,6 +380,44 @@ mod tests {
             assert_eq!(PacketHeader::decode(&header.encode())?, header);
         }
         Ok(())
+    }
+
+    #[test]
+    fn logical_fragment_boundaries_include_exact_multiple_terminator() {
+        let maximum = u64::from(MAX_PAYLOAD_LEN);
+        let cases: &[(u64, &[u32])] = &[
+            (0, &[0]),
+            (1, &[1]),
+            (maximum - 1, &[MAX_PAYLOAD_LEN - 1]),
+            (maximum, &[MAX_PAYLOAD_LEN, 0]),
+            (maximum + 1, &[MAX_PAYLOAD_LEN, 1]),
+            (maximum * 2, &[MAX_PAYLOAD_LEN, MAX_PAYLOAD_LEN, 0]),
+        ];
+        for (logical_length, expected) in cases {
+            assert_eq!(
+                LogicalPacketFragments::new(*logical_length).collect::<Vec<_>>(),
+                *expected
+            );
+            assert_eq!(
+                physical_packet_count(*logical_length),
+                u64::try_from(expected.len()).unwrap_or(u64::MAX)
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_gib_fragment_plan_is_constant_space() {
+        let logical_length = 1_u64 << 30;
+        let fragments = LogicalPacketFragments::new(logical_length);
+        assert_eq!(
+            fragments.clone().map(u64::from).sum::<u64>(),
+            logical_length
+        );
+        assert_eq!(
+            u64::try_from(fragments.count()).unwrap_or(u64::MAX),
+            physical_packet_count(logical_length)
+        );
+        assert!(size_of::<LogicalPacketFragments>() <= 32);
     }
 
     #[test]

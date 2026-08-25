@@ -432,6 +432,12 @@ dependencies = [
 [[package]]
 name = "proxy-io"
 version = "0.1.0"
+dependencies = [
+ "flate2",
+ "mysql-wire",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "quote"
