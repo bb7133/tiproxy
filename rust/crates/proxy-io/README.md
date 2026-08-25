@@ -59,8 +59,18 @@ Unit tests add 1-byte, `MaxPayloadLen - 1`, `MaxPayloadLen`,
 `MaxPayloadLen + 1`, sequence wrap/reset, non-consuming peek, independent
 destination sequence, source/destination error attribution, resumable
 cancellation, bounded oversized reads, `ForwardUntil`, and the synthetic 1-GiB
-case. WIRE-01 introduces no peer-visible strictness difference from these Go
-paths, so it adds no safety-decision ledger entry.
+case.
+
+Two intentional boundary decisions are recorded in the parity manifest:
+
+- `WIRE-01-D1`: all Rust forwarding paths regenerate the physical header from
+  the destination sequence. Go's no-data `ForwardUntil` fast path instead
+  copies the source sequence byte while advancing a separate destination
+  tracker; canonical traffic is identical, but a tolerated mismatch differs.
+- `WIRE-01-D2`: peeking an empty physical packet returns `first_byte = None`
+  after reading only its four-byte header. Go's unconditional five-byte peek
+  blocks at EOF or reads across the packet boundary, which is why its LOCAL
+  INFILE path must bypass `ForwardUntil`.
 
 From the repository root:
 

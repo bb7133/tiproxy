@@ -1246,6 +1246,15 @@ mod tests {
         encode_physical_packet(b"z", 2, &mut wire)?;
         let mut reader = PacketReader::new(wire.as_slice());
 
+        assert_eq!(
+            reader.peek_packet().await?,
+            PacketPreview {
+                first_byte: None,
+                first_packet_length: 0,
+                sequence_id: 0,
+            }
+        );
+        assert_eq!(reader.in_bytes(), 0);
         let empty = reader.read_logical(0).await?;
         assert!(empty.payload.is_empty());
         let error = reader
@@ -1317,7 +1326,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_until_peeks_and_captures_only_final_packet() -> Result<(), Box<dyn Error>> {
+    async fn forward_until_regenerates_destination_sequence_and_captures_final()
+    -> Result<(), Box<dyn Error>> {
         let mut wire = encoded_physical_packet(&[1], 0)?;
         encode_physical_packet(&[0xfe, 0], 1, &mut wire)?;
         let mut reader = PacketReader::new(wire.as_slice());
