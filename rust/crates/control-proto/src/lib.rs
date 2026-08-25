@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+pub mod control_transport;
 
 /// Generated protobuf v1 types.
 #[allow(missing_docs, clippy::all, clippy::pedantic)]
