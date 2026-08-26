@@ -12,7 +12,9 @@ build = "build.rs"
 default = []
 
 [dependencies]
+control-proto.workspace = true
 dataplane.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

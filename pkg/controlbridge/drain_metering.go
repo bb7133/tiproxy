@@ -147,9 +147,16 @@ func (issuer *DrainIssuer) RestoreSequence(watermark uint64) {
 // batches, and routes drain results to the issuer. Everything else goes
 // to the RouterAdapter.
 type CompositeControlHandler struct {
-	adapter  *RouterAdapter
-	issuer   *DrainIssuer
-	consumer *MeteringConsumer
+	adapter   *RouterAdapter
+	issuer    *DrainIssuer
+	consumer  *MeteringConsumer
+	publisher *SnapshotPublisher
+}
+
+// AttachSnapshotPublisher routes correlated Rust apply/reject answers to the
+// Go generation owner. It is optional for legacy Go-dataplane compositions.
+func (handler *CompositeControlHandler) AttachSnapshotPublisher(publisher *SnapshotPublisher) {
+	handler.publisher = publisher
 }
 
 // NewCompositeControlHandler wires the three owners together; the
@@ -187,6 +194,11 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 		return errors.New("control envelope is required")
 	}
 	switch body := envelope.GetBody().(type) {
+	case *controlpb.ControlEnvelope_SnapshotResult:
+		if handler.publisher == nil {
+			return errors.New("snapshot result received without a publisher")
+		}
+		return handler.publisher.HandleResult(sender, envelope)
 	case *controlpb.ControlEnvelope_MeteringBatch:
 		// Dedup by contiguous sequence; the acknowledgement flows back
 		// through the reconcile snapshot. Refused batches are the

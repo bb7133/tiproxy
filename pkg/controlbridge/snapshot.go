@@ -4,6 +4,7 @@
 package controlbridge
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -20,6 +21,11 @@ import (
 	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
 	"google.golang.org/protobuf/proto"
 )
+
+// ErrListenerRestartRequired identifies a valid config candidate whose SQL
+// listener set differs from startup. Control protocol v1 deliberately keeps
+// proxy.addr and proxy.port-range restart-required.
+var ErrListenerRestartRequired = errors.New("proxy.addr and proxy.port-range are restart-required")
 
 // SnapshotBuilder translates Go-validated configuration into complete,
 // deterministic Rust dataplane snapshots. It remembers listener configuration
@@ -87,7 +93,7 @@ func (builder *SnapshotBuilder) Build(
 	}
 	if !proto.Equal(&controlpb.StateSnapshot{Config: &controlpb.ConfigSnapshot{Listeners: builder.listeners}},
 		&controlpb.StateSnapshot{Config: &controlpb.ConfigSnapshot{Listeners: listeners}}) {
-		return nil, fmt.Errorf("proxy.addr and proxy.port-range are restart-required")
+		return nil, ErrListenerRestartRequired
 	}
 
 	frontendKeepalive, err := buildKeepalive("proxy.frontend-keepalive", normalized.Proxy.FrontendKeepalive)

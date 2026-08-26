@@ -82,6 +82,20 @@ func TestServerHandshakeLifecycleAndReconnect(t *testing.T) {
 	require.NoError(t, secondPeer.Close())
 }
 
+func TestSessionRequestIDAllocatorIsMonotonicAndFailsClosed(t *testing.T) {
+	session := &Session{}
+	first, err := session.AllocateRequestID()
+	require.NoError(t, err)
+	second, err := session.AllocateRequestID()
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), first)
+	require.Equal(t, uint64(2), second)
+
+	session.nextID.Store(^uint64(0))
+	_, err = session.AllocateRequestID()
+	require.ErrorIs(t, err, ErrRequestIDExhausted)
+}
+
 func TestServerRejectsDuplicateVersionAndCredential(t *testing.T) {
 	server, cancel, serveErr := startTestServer(t, testServerConfig(t), nil)
 	firstPeer, _ := connectPeer(t, server.config.SocketPath, rustHello(1), false)

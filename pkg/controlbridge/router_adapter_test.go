@@ -12,6 +12,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
+	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
 	"github.com/pingcap/tiproxy/pkg/manager/namespace"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
 	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
@@ -166,6 +167,8 @@ func TestRouterAdapterRedirectEvictionAndReconcile(t *testing.T) {
 	require.True(t, conn.Redirect(target))
 	redirect := lastEnvelope(t, peer).GetRedirectCommand()
 	require.NotNil(t, redirect)
+	require.Equal(t, uint64(1), lastEnvelope(t, peer).GetRequestId(),
+		"application commands share the sender's checked request-id lineage")
 	redirectResult := &controlpb.ControlEnvelope{
 		RequestId: 40,
 		Body: &controlpb.ControlEnvelope_RedirectResult{RedirectResult: &controlpb.RedirectResult{
@@ -185,6 +188,7 @@ func TestRouterAdapterRedirectEvictionAndReconcile(t *testing.T) {
 	require.False(t, conn.ForceClose())
 	closeCommand := lastEnvelope(t, peer).GetCloseCommand()
 	require.NotNil(t, closeCommand)
+	require.Equal(t, uint64(2), lastEnvelope(t, peer).GetRequestId())
 	require.True(t, closeCommand.GetForce())
 	require.Equal(t, []uint64{uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE)},
 		lastEnvelope(t, peer).GetRequiredCapabilities())
@@ -256,6 +260,7 @@ func TestRouterAdapterRequiresNegotiatedCapability(t *testing.T) {
 type fakeSender struct {
 	mu           sync.Mutex
 	epoch        uint64
+	nextID       uint64
 	capabilities map[uint64]struct{}
 	messages     []*controlpb.ControlEnvelope
 }
@@ -285,6 +290,16 @@ func (peer *fakeSender) Epoch() uint64 { return peer.epoch }
 func (peer *fakeSender) HasCapability(capability uint64) bool {
 	_, ok := peer.capabilities[capability]
 	return ok
+}
+
+func (peer *fakeSender) AllocateRequestID() (uint64, error) {
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if peer.nextID == ^uint64(0) {
+		return 0, transport.ErrRequestIDExhausted
+	}
+	peer.nextID++
+	return peer.nextID, nil
 }
 
 type recordingHandler struct {

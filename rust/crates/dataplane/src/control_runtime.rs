@@ -44,10 +44,13 @@
 //! with the initiating request id and feeds the applied generation
 //! into drain provenance.
 //!
-//! Application `main` wiring (live listener sessions feeding this
-//! runtime) lands with the DPL-03/05 integrations; issue #16's
-//! end-to-end lost-event/restart acceptance stays open until then.
+//! DPL-03's `tiproxy-rs` main starts this runtime and feeds its
+//! snapshot owner into the live listener generation manager. Terminal
+//! session effects, metering producers, and topology projection remain
+//! DPL-04/06/07 work, so issue #16's end-to-end lost-event/restart
+//! acceptance stays open until those integrations land.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,14 +77,21 @@ pub trait SnapshotConsumer: Send + 'static {
     /// # Errors
     ///
     /// Returns the rejection reported to the peer.
-    fn apply(&mut self, snapshot: &Arc<ValidatedSnapshot>) -> Result<(), SnapshotError>;
+    fn apply(
+        &mut self,
+        snapshot: &Arc<ValidatedSnapshot>,
+    ) -> impl Future<Output = Result<(), SnapshotError>> + Send;
 }
 
-impl<F> SnapshotConsumer for F
+impl<F, Fut> SnapshotConsumer for F
 where
-    F: FnMut(&Arc<ValidatedSnapshot>) -> Result<(), SnapshotError> + Send + 'static,
+    F: FnMut(&Arc<ValidatedSnapshot>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), SnapshotError>> + Send,
 {
-    fn apply(&mut self, snapshot: &Arc<ValidatedSnapshot>) -> Result<(), SnapshotError> {
+    fn apply(
+        &mut self,
+        snapshot: &Arc<ValidatedSnapshot>,
+    ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
         self(snapshot)
     }
 }
@@ -300,7 +310,7 @@ pub fn spawn_control_runtime<C: SnapshotConsumer>(
 /// answer plus the applied generation when (and only when) the commit
 /// succeeded. Public so the transaction semantics are directly
 /// testable.
-pub fn process_state_snapshot<C: SnapshotConsumer>(
+pub async fn process_state_snapshot<C: SnapshotConsumer>(
     store: &SnapshotStore,
     consumer: &mut C,
     envelope: &ControlEnvelope,
@@ -312,7 +322,7 @@ pub fn process_state_snapshot<C: SnapshotConsumer>(
             match store.stage(generation, snapshot.clone(), now) {
                 Ok(staged) => {
                     let consumer_verdict = if staged.is_changed() {
-                        consumer.apply(staged.snapshot())
+                        consumer.apply(staged.snapshot()).await
                     } else {
                         // Already committed — which implies the whole
                         // two-phase apply (consumer included) succeeded
@@ -407,16 +417,17 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     envelope: &ControlEnvelope,
 ) -> Result<SnapshotStep, TransportError> {
     let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
-    let (answer, applied) = process_state_snapshot(store, consumer, envelope, now);
-    if let Some(generation) = applied
-        && !handle.applied_generation(generation).await
-    {
-        if client.is_shutdown() {
-            return Ok(SnapshotStep::CleanExit);
+    let (answer, applied) = process_state_snapshot(store, consumer, envelope, now).await;
+    if let Some(generation) = applied {
+        client.mark_last_good_snapshot(generation);
+        if !handle.applied_generation(generation).await {
+            if client.is_shutdown() {
+                return Ok(SnapshotStep::CleanExit);
+            }
+            return Err(TransportError::Configuration(
+                "dispatch task gone before the applied-generation barrier".to_owned(),
+            ));
         }
-        return Err(TransportError::Configuration(
-            "dispatch task gone before the applied-generation barrier".to_owned(),
-        ));
     }
     match client.send(answer).await {
         Ok(()) => Ok(SnapshotStep::Continue),

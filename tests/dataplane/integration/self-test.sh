@@ -88,7 +88,7 @@ PATH="$temp_dir/tools:$PATH" TIPROXY_RS_BIN="$temp_dir/tiproxy-rs" \
 preflight_status=$?
 set -e
 if ((preflight_status != 78)); then
-	echo "Rust skeleton preflight returned $preflight_status, expected 78" >&2
+	echo "incomplete Rust proxy preflight returned $preflight_status, expected 78" >&2
 	exit 1
 fi
 grep -q 'will not substitute a raw TCP relay or the Go dataplane' "$temp_dir/rust-preflight.out"
@@ -104,7 +104,7 @@ PATH="$temp_dir/tools:$PATH" TIPROXY_RS_BIN="$temp_dir/tiproxy-rs" TIUP_HOME="$t
 run_status=$?
 set -e
 if ((run_status != 78)); then
-	echo "Rust skeleton run returned $run_status, expected 78" >&2
+	echo "incomplete Rust proxy run returned $run_status, expected 78" >&2
 	cat "$temp_dir/rust-run.out" >&2
 	exit 1
 fi

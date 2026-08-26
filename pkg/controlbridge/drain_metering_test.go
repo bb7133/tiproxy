@@ -23,6 +23,7 @@ import (
 
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
+	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
 )
 
 // mustDrainIssuer builds an issuer or fails the test: crypto/rand is
@@ -38,6 +39,7 @@ func mustDrainIssuer(t *testing.T) *DrainIssuer {
 
 type recordingSender struct {
 	mu        sync.Mutex
+	nextID    uint64
 	envelopes []*controlpb.ControlEnvelope
 }
 
@@ -50,6 +52,16 @@ func (sender *recordingSender) Send(_ context.Context, envelope *controlpb.Contr
 
 func (sender *recordingSender) Epoch() uint64             { return 1 }
 func (sender *recordingSender) HasCapability(uint64) bool { return true }
+
+func (sender *recordingSender) AllocateRequestID() (uint64, error) {
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if sender.nextID == ^uint64(0) {
+		return 0, transport.ErrRequestIDExhausted
+	}
+	sender.nextID++
+	return sender.nextID, nil
+}
 
 func (sender *recordingSender) sent() []*controlpb.ControlEnvelope {
 	sender.mu.Lock()

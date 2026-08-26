@@ -5,8 +5,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pingcap/tiproxy/lib/util/logger"
@@ -52,6 +55,45 @@ func TestServerWithoutBackendCluster(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, server.Close())
+}
+
+func TestRustDataplaneGateOwnsNoGoListenerAndCloses(t *testing.T) {
+	restore := resetPromRegistry()
+	defer restore()
+
+	dir, err := os.MkdirTemp("", "tiproxy-rust-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	controlSocket := filepath.Join(dir, "control.sock")
+	configFile := filepath.Join(dir, "config.toml")
+	content := []byte("workdir = \"" + filepath.Join(dir, "work") + "\"\n" +
+		"enable-traffic-replay = false\n" +
+		"[rust-dataplane]\n" +
+		"enabled = true\n" +
+		"control-socket = \"" + controlSocket + "\"\n" +
+		"allowed-uid = -1\n" +
+		"[proxy]\n" +
+		"pd-addrs = \"\"\n" +
+		"addr = \"127.0.0.1:6000\"\n")
+	require.NoError(t, os.WriteFile(configFile, content, 0o644))
+
+	server, err := NewServer(context.Background(), &sctx.Context{ConfigFile: configFile})
+	require.NoError(t, err)
+	require.Nil(t, server.proxy)
+	require.NotNil(t, server.controlBridge)
+	_, err = os.Stat(controlSocket)
+	require.NoError(t, err)
+
+	closed := make(chan error, 1)
+	go func() { closed <- server.Close() }()
+	select {
+	case err = <-closed:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Rust dataplane server close did not join its config watcher")
+	}
+	_, err = os.Stat(controlSocket)
+	require.True(t, errors.Is(err, os.ErrNotExist), "control socket survives close: %v", err)
 }
 
 func resetPromRegistry() func() {

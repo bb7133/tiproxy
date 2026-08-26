@@ -77,7 +77,8 @@ if [[ ! -x $rust_binary ]]; then
 	cat >&2 <<EOF
 Rust dataplane integration preflight failed: executable not found at $rust_binary.
 Build it with 'make rust-build' or set TIPROXY_RS_BIN.
-The current FND-01 skeleton is intentionally not an operational proxy.
+DPL-03 provides the control/generation owner, but the complete Rust SQL proxy
+still depends on the DPL-04 session owner and DPL-07 topology projection.
 EOF
 	exit 78
 fi
@@ -91,11 +92,12 @@ if ((capability_status != 0)); then
 Rust dataplane integration preflight failed: '$rust_binary --integration-capabilities' exited $capability_status.
 The topology will not substitute a raw TCP relay or the Go dataplane for Rust.
 
-Minimum implementation dependencies for SELECT 1:
-  control bridge: #10-#15
-  wire/transport: #17-#19 and #21-#24 (#20 for compression variants)
-  session path:   #25-#29
-  runtime path:   #34-#37
+Remaining implementation dependencies for truthful SELECT 1:
+  session lifecycle/effects: #38
+  namespace/topology path:   #41
+
+DPL-03 deliberately does not advertise end-to-end integration capabilities
+until those owners replace its typed parked-session/topology seams.
 
 Executable output:
 $capabilities

@@ -10,6 +10,7 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/pkg/controlbridge"
 	"github.com/pingcap/tiproxy/pkg/manager/backendcluster"
 	"github.com/pingcap/tiproxy/pkg/manager/cert"
 	mgrcfg "github.com/pingcap/tiproxy/pkg/manager/config"
@@ -51,7 +52,8 @@ type Server struct {
 	// HTTP server
 	apiServer *api.Server
 	// L7 proxy
-	proxy *proxy.SQLServer
+	proxy         *proxy.SQLServer
+	controlBridge *controlbridge.Bridge
 }
 
 func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error) {
@@ -169,8 +171,14 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 		}
 	}
 
-	// setup proxy server
-	{
+	// Exactly one dataplane owns the configured SQL listeners. The Rust
+	// process receives its complete initial snapshot over the control bridge;
+	// otherwise the legacy in-process Go SQL server remains unchanged.
+	if cfg.RustDataplane.Enabled {
+		if err = srv.startRustDataplane(ctx, cfg, hsHandler, lg.Named("rust-dataplane")); err != nil {
+			return
+		}
+	} else {
 		srv.proxy, err = proxy.NewSQLServer(lg.Named("proxy"), cfg, srv.certManager, idMgr, srv.replay.GetCapture(), srv.meter, hsHandler, srv.memManager)
 		if err != nil {
 			return
@@ -186,6 +194,9 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 		CertMgr:       srv.certManager,
 		BackendReader: srv.clusterManager.MetricsQuerier(),
 		ReplayJobMgr:  srv.replay,
+	}
+	if srv.controlBridge != nil {
+		mgrs.DataplaneStatus = srv.controlBridge.Publisher()
 	}
 	if srv.apiServer, err = api.NewServer(cfg.API, lg.Named("api"), mgrs, handler, ready); err != nil {
 		return
@@ -254,6 +265,9 @@ func (s *Server) Close() error {
 	}
 	if s.proxy != nil {
 		errs = append(errs, s.proxy.Close())
+	}
+	if s.controlBridge != nil {
+		errs = append(errs, s.controlBridge.Close())
 	}
 	if s.meter != nil {
 		errs = append(errs, s.meter.Close())

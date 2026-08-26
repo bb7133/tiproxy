@@ -1,5 +1,15 @@
 # workdir = "./work"
 
+# Experimental out-of-process Rust SQL dataplane. When enabled, set
+# enable-traffic-replay = false and start tiproxy-rs with the same absolute
+# control socket, allowed UID, and TLS allowlist roots.
+# enable-traffic-replay = false
+# [rust-dataplane]
+# enabled = true
+# control-socket = "/var/run/tiproxy/tiproxy-rust-control.sock"
+# allowed-uid = 1000
+# tls-allowed-roots = ["/etc/tiproxy/tls"]
+
 [proxy]
 # addr = "0.0.0.0:6000"
 # advertise-addr = ""

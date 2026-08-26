@@ -18,6 +18,7 @@ import (
 	"github.com/pingcap/sysutil"
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/pkg/controlbridge"
 	mgrcrt "github.com/pingcap/tiproxy/pkg/manager/cert"
 	mgrns "github.com/pingcap/tiproxy/pkg/manager/namespace"
 	"github.com/pingcap/tiproxy/pkg/proxy/proxyprotocol"
@@ -54,11 +55,18 @@ type ConfigManager interface {
 }
 
 type Managers struct {
-	CfgMgr        ConfigManager
-	NsMgr         mgrns.NamespaceManager
-	CertMgr       *mgrcrt.CertManager
-	BackendReader BackendReader
-	ReplayJobMgr  mgrrp.JobManager
+	CfgMgr          ConfigManager
+	NsMgr           mgrns.NamespaceManager
+	CertMgr         *mgrcrt.CertManager
+	BackendReader   BackendReader
+	ReplayJobMgr    mgrrp.JobManager
+	DataplaneStatus DataplaneStatusReader
+}
+
+// DataplaneStatusReader exposes the Go snapshot publisher without coupling the
+// HTTP surface to Bridge lifecycle operations.
+type DataplaneStatusReader interface {
+	Status() controlbridge.SnapshotStatus
 }
 
 type Server struct {
@@ -239,6 +247,7 @@ func (h *Server) registerAPI(g *gin.RouterGroup) {
 	h.registerDebug(g.Group("debug"))
 	h.registerBackend(g.Group("backend"))
 	h.registerTraffic(g.Group("traffic"))
+	h.registerDataplane(g.Group("dataplane"))
 }
 
 func (h *Server) PreClose() {

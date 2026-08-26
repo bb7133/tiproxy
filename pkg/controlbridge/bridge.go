@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/lib/util/waitgroup"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
@@ -16,6 +17,10 @@ import (
 // DefaultOrphanResolveInterval paces the rehydration/orphan cadence
 // when the configuration leaves it zero.
 const DefaultOrphanResolveInterval = 5 * time.Second
+
+// DefaultSnapshotSyncInterval bounds config-to-wire and reconnect-to-resend
+// latency without coupling snapshot progress to the slower orphan cadence.
+const DefaultSnapshotSyncInterval = 50 * time.Millisecond
 
 // BridgeConfig configures the Go control-plane composition.
 type BridgeConfig struct {
@@ -30,20 +35,26 @@ type BridgeConfig struct {
 	// OrphanResolveInterval paces ResolveOrphans; zero uses the
 	// default.
 	OrphanResolveInterval time.Duration
+	// Publisher owns complete StateSnapshot generations. Nil keeps the
+	// bridge in the legacy Go-dataplane composition.
+	Publisher *SnapshotPublisher
+	// SnapshotSyncInterval paces desired-generation and reconnect sync.
+	SnapshotSyncInterval time.Duration
 }
 
 // Bridge is the single Go composition entry for the control plane
 // (CTL-06): it owns the transport listener, the composite handler
 // (router adapter + drain issuer + metering consumer), and the
-// orphan-resolution cadence. Application bootstrap wiring (the proxy
-// server starting a Bridge next to its SQL listeners) lands with the
-// DPL-03/05 integrations.
+// orphan-resolution and snapshot cadences. DPL-03's proxy bootstrap
+// starts it behind the explicit Rust dataplane config gate.
 type Bridge struct {
-	server   *transport.Server
-	adapter  *RouterAdapter
-	issuer   *DrainIssuer
-	consumer *MeteringConsumer
-	interval time.Duration
+	server           *transport.Server
+	adapter          *RouterAdapter
+	issuer           *DrainIssuer
+	consumer         *MeteringConsumer
+	interval         time.Duration
+	publisher        *SnapshotPublisher
+	snapshotInterval time.Duration
 }
 
 // NewBridge builds and binds the whole composition: adapter, issuer
@@ -69,6 +80,9 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
+	if config.Publisher != nil {
+		composite.AttachSnapshotPublisher(config.Publisher)
+	}
 	server, err := transport.Listen(config.Transport, composite)
 	if err != nil {
 		return nil, err
@@ -77,12 +91,18 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	if interval <= 0 {
 		interval = DefaultOrphanResolveInterval
 	}
+	snapshotInterval := config.SnapshotSyncInterval
+	if snapshotInterval <= 0 {
+		snapshotInterval = DefaultSnapshotSyncInterval
+	}
 	return &Bridge{
-		server:   server,
-		adapter:  adapter,
-		issuer:   issuer,
-		consumer: consumer,
-		interval: interval,
+		server:           server,
+		adapter:          adapter,
+		issuer:           issuer,
+		consumer:         consumer,
+		interval:         interval,
+		publisher:        config.Publisher,
+		snapshotInterval: snapshotInterval,
 	}, nil
 }
 
@@ -103,32 +123,42 @@ func (bridge *Bridge) Consumer() *MeteringConsumer {
 	return bridge.consumer
 }
 
+// Publisher exposes the snapshot generation owner, when configured.
+func (bridge *Bridge) Publisher() *SnapshotPublisher {
+	return bridge.publisher
+}
+
 // Run serves the control socket and drives the orphan-resolution
 // cadence until ctx cancels or Close is called; it returns the serve
 // result after the cadence worker has stopped.
 func (bridge *Bridge) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cadenceDone := make(chan struct{})
-	go func() {
-		defer close(cadenceDone)
-		ticker := time.NewTicker(bridge.interval)
-		defer ticker.Stop()
+	var cadence waitgroup.WaitGroup
+	cadence.Run(func() {
+		orphanTicker := time.NewTicker(bridge.interval)
+		defer orphanTicker.Stop()
+		snapshotTicker := time.NewTicker(bridge.snapshotInterval)
+		defer snapshotTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-orphanTicker.C:
 				// Bounded-retry convergence: unresolvable orphans end
 				// in a per-connection close; send errors keep the
 				// obligation for the next tick.
 				_ = bridge.adapter.ResolveOrphans(ctx)
+			case <-snapshotTicker.C:
+				if bridge.publisher != nil {
+					_ = bridge.publisher.Sync(ctx, bridge.server.Active())
+				}
 			}
 		}
-	}()
+	})
 	err := bridge.server.Serve(ctx)
 	cancel()
-	<-cadenceDone
+	cadence.Wait()
 	return err
 }
 

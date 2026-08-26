@@ -27,8 +27,10 @@ pub mod control_runtime;
 pub mod registry;
 pub mod route;
 pub mod route_control;
+pub mod runtime_config;
 pub mod server;
 pub mod session;
+pub mod session_control;
 
 pub use admission::{
     AdmissionController, AdmissionMetricsSnapshot, AdmissionPolicy, AdmissionPolicyError,
@@ -53,9 +55,15 @@ pub use route_control::{
     AssignmentRouter, ControlRouteChannel, EnvelopeSink, TcpDialer, TrafficTotals,
     connection_closed, connection_opened,
 };
+pub use runtime_config::{
+    DataplaneServingHandle, DataplaneSnapshotConsumer, GenerationStatus, GenerationStatusSnapshot,
+};
 pub use server::{
     AcceptedConnection, BoundListenerInfo, ConnectionHandler, DataplaneHandle, DataplaneServer,
     ListenerSpec, ServerError, ServerMetricsSnapshot, preflight_snapshot,
+};
+pub use session_control::{
+    BoundSessionHandler, DispatchConnectionHandler, DispatchHandleInstaller, SessionControlBinding,
 };
 
 /// Names and stable roles of the library crates composed by the dataplane.

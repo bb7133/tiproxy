@@ -920,7 +920,9 @@ dependencies = [
 name = "tiproxy-rs"
 version = "0.1.0"
 dependencies = [
+ "control-proto",
  "dataplane",
+ "tokio",
 ]
 
 [[package]]

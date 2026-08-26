@@ -33,11 +33,14 @@ const maxClosedConnectionTombstones = 4 * 1024
 const maxConnectionEventKeys = 64
 
 // EnvelopeSender is the negotiated control-session surface used by the
-// adapter. The small interface also permits a deterministic fake Rust peer.
+// adapter. Every application command allocates from the same checked lineage
+// as heartbeats and snapshots; responses reuse the initiating request ID.
+// The small interface also permits a deterministic fake Rust peer.
 type EnvelopeSender interface {
 	Send(context.Context, *controlpb.ControlEnvelope) error
 	Epoch() uint64
 	HasCapability(uint64) bool
+	AllocateRequestID() (uint64, error)
 }
 
 var _ transport.Handler = (*RouterAdapter)(nil)
@@ -61,7 +64,7 @@ type RouterAdapter struct {
 	closedOrder []uint64
 	sender      EnvelopeSender
 	senderEpoch uint64
-	nextID      atomic.Uint64
+	operationID atomic.Uint64
 
 	// metering, when attached, owns deduplicated cumulative metering;
 	// its highest applied sequence is the reconcile acknowledgement the
@@ -924,8 +927,12 @@ func (adapter *RouterAdapter) resolveOneOrphan(
 		!current.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION)) {
 		return nil
 	}
+	requestID, err := current.AllocateRequestID()
+	if err != nil {
+		return err
+	}
 	envelope := &controlpb.ControlEnvelope{
-		RequestId:  adapter.nextID.Add(1),
+		RequestId:  requestID,
 		Generation: orphan.remote.GetGeneration(),
 		Priority:   controlpb.Priority_PRIORITY_CRITICAL,
 		RequiredCapabilities: []uint64{
@@ -1129,7 +1136,7 @@ func (adapter *RouterAdapter) currentSender() EnvelopeSender {
 }
 
 func (adapter *RouterAdapter) newOperationID(kind string, epoch, connectionID uint64) string {
-	return fmt.Sprintf("%s-%d-%d-%d", kind, epoch, connectionID, adapter.nextID.Add(1))
+	return fmt.Sprintf("%s-%d-%d-%d", kind, epoch, connectionID, adapter.operationID.Add(1))
 }
 
 func (adapter *RouterAdapter) sendProtocolError(
@@ -1277,10 +1284,15 @@ func (conn *projectedConn) Redirect(target router.BackendInst) bool {
 		conn.mu.Unlock()
 		return false
 	}
+	requestID, err := sender.AllocateRequestID()
+	if err != nil {
+		conn.mu.Unlock()
+		return false
+	}
 	redirectID := conn.adapter.newOperationID("redirect", sender.Epoch(), conn.id)
 	sequence := conn.redirectSeq + 1
 	envelope := &controlpb.ControlEnvelope{
-		RequestId:  conn.adapter.nextID.Add(1),
+		RequestId:  requestID,
 		Generation: conn.generation,
 		Priority:   controlpb.Priority_PRIORITY_CRITICAL,
 		Body: &controlpb.ControlEnvelope_RedirectCommand{RedirectCommand: &controlpb.RedirectCommand{
@@ -1315,9 +1327,14 @@ func (conn *projectedConn) ForceClose() bool {
 		conn.mu.Unlock()
 		return false
 	}
+	requestID, err := sender.AllocateRequestID()
+	if err != nil {
+		conn.mu.Unlock()
+		return false
+	}
 	closeID := conn.adapter.newOperationID("close", sender.Epoch(), conn.id)
 	envelope := &controlpb.ControlEnvelope{
-		RequestId:            conn.adapter.nextID.Add(1),
+		RequestId:            requestID,
 		Generation:           conn.generation,
 		Priority:             controlpb.Priority_PRIORITY_CRITICAL,
 		RequiredCapabilities: []uint64{capability},

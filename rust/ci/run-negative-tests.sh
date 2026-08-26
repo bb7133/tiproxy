@@ -42,7 +42,7 @@ import sys
 manifest = pathlib.Path(sys.argv[1])
 dependency = sys.argv[2]
 contents = manifest.read_text()
-needle = "[dependencies]\ndataplane.workspace = true\n"
+needle = "[dependencies]\n"
 if needle not in contents:
     raise SystemExit(f"dependency insertion point not found in {manifest}")
 manifest.write_text(contents.replace(needle, f"{needle}{dependency}\n", 1))
