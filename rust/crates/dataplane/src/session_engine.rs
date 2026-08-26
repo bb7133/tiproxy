@@ -318,6 +318,7 @@ pub struct EngineSessionOwner {
     client: Arc<ControlClient>,
     namespace: Arc<str>,
     shutdown: watch::Receiver<bool>,
+    drain: watch::Receiver<bool>,
     loop_config: SessionLoopConfig,
 }
 
@@ -328,12 +329,14 @@ impl EngineSessionOwner {
         client: Arc<ControlClient>,
         namespace: impl Into<Arc<str>>,
         shutdown: watch::Receiver<bool>,
+        drain: watch::Receiver<bool>,
         loop_config: SessionLoopConfig,
     ) -> Self {
         Self {
             client,
             namespace: namespace.into(),
             shutdown,
+            drain,
             loop_config,
         }
     }
@@ -348,9 +351,13 @@ impl BoundSessionHandler for EngineSessionOwner {
         let client = Arc::clone(&self.client);
         let namespace = self.namespace.to_string();
         let shutdown = self.shutdown.clone();
+        let drain = self.drain.clone();
         let config = self.loop_config;
         Box::pin(async move {
-            run_bound_session(connection, binding, client, namespace, shutdown, config).await;
+            run_bound_session(
+                connection, binding, client, namespace, shutdown, drain, config,
+            )
+            .await;
         })
     }
 }
@@ -366,6 +373,7 @@ pub async fn run_bound_session(
     client: Arc<ControlClient>,
     namespace: String,
     shutdown: watch::Receiver<bool>,
+    mut drain: watch::Receiver<bool>,
     loop_config: SessionLoopConfig,
 ) {
     let (stream, seat) = connection.into_session_io();
@@ -435,10 +443,28 @@ pub async fn run_bound_session(
     let mut redirect_token: Option<CommandToken> = None;
     let mut close_token: Option<CommandToken> = None;
     let mut directives_open = true;
+    let mut drain_signaled = *drain.borrow();
+    if drain_signaled {
+        // Admitted after stop-accept began: close at the first safe
+        // boundary.
+        let _ = control_tx.send(SessionControl::GracefulClose).await;
+    }
     let summary: Option<SessionSummary> = loop {
         tokio::select! {
             joined = &mut loop_task => {
                 break joined.ok();
+            }
+            changed = drain.changed(), if !drain_signaled => {
+                if changed.is_ok() && *drain.borrow() {
+                    drain_signaled = true;
+                    // Local coordinated shutdown: graceful close at the
+                    // next safe boundary; the loop's drain deadline is
+                    // the per-session force. No command token — this is
+                    // not a gate-admitted command.
+                    let _ = control_tx.send(SessionControl::GracefulClose).await;
+                } else if changed.is_err() {
+                    drain_signaled = true;
+                }
             }
             directive = directives.recv(), if directives_open => {
                 let Some(directive) = directive else {

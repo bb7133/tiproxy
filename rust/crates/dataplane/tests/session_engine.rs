@@ -197,9 +197,11 @@ async fn run_fake_backend(listener: TcpListener) {
 
 /// The whole stack under test.
 struct Stack {
+    server_handle: dataplane::DataplaneHandle,
     sender: Arc<FakeSender>,
     _state_tx: watch::Sender<ConnectionState>,
     _shutdown_tx: watch::Sender<bool>,
+    drain_tx: watch::Sender<bool>,
     forwarder: Arc<dataplane::control_dispatch::InboundForwarder>,
     sql_port: u16,
     _server_task: tokio::task::JoinHandle<()>,
@@ -232,10 +234,12 @@ async fn spawn_stack() -> Stack {
     // The engine owner over a real (never-connecting) control client.
     let client = control_client();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (drain_tx, drain_rx) = watch::channel(false);
     let owner: Arc<dyn BoundSessionHandler> = Arc::new(EngineSessionOwner::new(
         Arc::clone(&client),
         "default",
         shutdown_rx,
+        drain_rx,
         SessionLoopConfig {
             handshake_deadline: Duration::from_secs(5),
             drain_deadline: Duration::from_millis(400),
@@ -259,14 +263,17 @@ async fn spawn_stack() -> Stack {
     else {
         unreachable!("dataplane bind")
     };
+    let server_handle = server.handle();
     let server_task = tokio::spawn(async move {
         let _ = server.run(connection_handler).await;
     });
 
     Stack {
+        server_handle,
         sender,
         _state_tx: state_tx,
         _shutdown_tx: shutdown_tx,
+        drain_tx,
         forwarder: Arc::new(forwarder),
         sql_port: sql_addr.port(),
         _server_task: server_task,
@@ -651,4 +658,47 @@ async fn control_detach_keeps_session_serving() {
         "control detach is last-good: the session keeps serving"
     );
     client.quit().await;
+}
+
+/// The coordinated local shutdown order: stop-accept first (new
+/// connections refused, existing sessions untouched), then the drain
+/// signal closes idle sessions at their safe boundary — no force
+/// needed for an idle session.
+#[tokio::test]
+async fn coordinated_shutdown_stops_accept_then_drains() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("SELECT 1").await);
+
+    // Phase 1: stop-accept. The live session keeps serving.
+    stack.server_handle.stop_accepting();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        TcpStream::connect(("127.0.0.1", stack.sql_port))
+            .await
+            .is_err(),
+        "new connections are refused after stop-accept"
+    );
+    assert!(
+        client.query_ok("SELECT 2").await,
+        "existing sessions keep serving through stop-accept"
+    );
+
+    // Phase 2: graceful drain. The idle session closes at its safe
+    // boundary and the CLOSED lifecycle event goes out.
+    stack.drain_tx.send_replace(true);
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(closed.is_some(), "the drained session closes and reports");
+    stack.dispatch_task.abort();
 }

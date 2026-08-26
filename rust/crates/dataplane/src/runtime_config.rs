@@ -217,6 +217,16 @@ impl DataplaneServingHandle {
         self.status.snapshot()
     }
 
+    /// Stops accepting new connections while existing sessions keep
+    /// running (the first coordinated-shutdown phase); a no-op before
+    /// the first bind.
+    pub async fn stop_accepting(&self) {
+        let serving = self.state.lock().await;
+        if let Some(handle) = &serving.handle {
+            handle.stop_accepting();
+        }
+    }
+
     /// Requests listener/session shutdown and joins the one SQL server owner.
     /// Repeated calls are harmless.
     ///

@@ -24,12 +24,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_proto::CONTROL_PROTOCOL_V1;
 use control_proto::control_transport::ClientConfig;
+use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
-use dataplane::control_runtime::{ControlRuntimeConfig, spawn_control_runtime};
+use dataplane::control_runtime::spawn_control_runtime_with_client;
+use dataplane::session::SessionLoopConfig;
+use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, DataplaneSnapshotConsumer, DispatchConnectionHandler, SystemMemoryProbe,
 };
+use tokio::sync::watch;
 
 const VERSION: &str = env!("TIPROXY_BUILD_VERSION");
 const COMMIT: &str = env!("TIPROXY_BUILD_COMMIT");
@@ -44,6 +48,7 @@ struct Options {
     control_socket: PathBuf,
     control_uid: u32,
     tls_roots: Vec<PathBuf>,
+    drain_grace: Duration,
 }
 
 enum Command {
@@ -107,31 +112,52 @@ async fn run(options: Options) -> Result<(), String> {
     let store = SnapshotStore::new(options.tls_roots)
         .map_err(|error| format!("create snapshot store: {error}"))?;
 
-    // DPL-03 installs the typed live-session control seam. DPL-04 replaces
-    // this parked owner with the concrete SessionLoop/effect composition;
-    // until then admitted sockets stay owned and cancellable instead of
-    // running an incomplete forwarding path.
-    let parked: Arc<dyn BoundSessionHandler> = Arc::new(|_connection, _binding| async move {
-        std::future::pending::<()>().await;
-    });
-    let (connection_handler, installer) = DispatchConnectionHandler::new("default", parked);
+    // DPL-04: the real session owner replaces DPL-03's parked handler.
+    // Sessions share the control client with the runtime; the drain and
+    // session-shutdown watches drive the coordinated local shutdown.
+    let shared_client = Arc::new(ControlClient::new(client).map_err(|error| error.to_string())?);
+    let (drain_tx, drain_rx) = watch::channel(false);
+    let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+    let owner: Arc<dyn BoundSessionHandler> = Arc::new(EngineSessionOwner::new(
+        Arc::clone(&shared_client),
+        "default",
+        session_shutdown_rx,
+        drain_rx,
+        SessionLoopConfig::default(),
+    ));
+    let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
     let (consumer, serving) = DataplaneSnapshotConsumer::new(
         Arc::new(SystemMemoryProbe::new()),
         Arc::new(connection_handler),
     );
-    let runtime = spawn_control_runtime(
-        ControlRuntimeConfig {
-            client,
-            tick_interval: Duration::from_millis(100),
-            snapshot_queue: 8,
-        },
+    let runtime = spawn_control_runtime_with_client(
+        Arc::clone(&shared_client),
+        Duration::from_millis(100),
+        8,
         store,
         consumer,
-    )
-    .map_err(|error| error.to_string())?;
+    );
     if !installer.install(runtime.handle()) {
         runtime.shutdown();
         return Err("install control dispatch handle exactly once".to_owned());
+    }
+
+    // Coordinated shutdown on SIGTERM/SIGINT:
+    // stop-accept → graceful drain (per-session force at the loop's
+    // drain deadline) → absolute grace deadline force → join everything.
+    {
+        let serving = serving.clone();
+        let runtime_client = Arc::clone(&shared_client);
+        let grace = options.drain_grace;
+        tokio::spawn(async move {
+            wait_for_termination_signal().await;
+            serving.stop_accepting().await;
+            drain_tx.send_replace(true);
+            tokio::time::sleep(grace).await;
+            session_shutdown_tx.send_replace(true);
+            let _ = serving.shutdown().await;
+            runtime_client.shutdown();
+        });
     }
 
     let control_result = runtime.join().await;
@@ -140,6 +166,22 @@ async fn run(options: Options) -> Result<(), String> {
         (Err(error), _) => Err(error.to_string()),
         (Ok(()), Err(error)) => Err(format!("shut down SQL listeners: {error}")),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Resolves on SIGTERM or SIGINT.
+async fn wait_for_termination_signal() {
+    let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        return std::future::pending::<()>().await;
+    };
+    let Ok(mut sigint) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    else {
+        return std::future::pending::<()>().await;
+    };
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
     }
 }
 
@@ -153,6 +195,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let mut tls_roots: Vec<PathBuf> = env::var_os(TLS_ROOTS_ENV)
         .map(|value| env::split_paths(&value).collect())
         .unwrap_or_default();
+    let mut drain_grace = Duration::from_secs(30);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--version" | "-V" => return Ok(Command::Version),
@@ -175,6 +218,15 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                     .next()
                     .ok_or_else(|| "--tls-root requires a path".to_owned())?,
             )),
+            "--drain-grace-seconds" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--drain-grace-seconds requires a number".to_owned())?;
+                let seconds: u64 = value
+                    .parse()
+                    .map_err(|_| format!("drain grace must be a u64, got {value:?}"))?;
+                drain_grace = Duration::from_secs(seconds);
+            }
             _ => return Err(format!("unknown argument {argument:?}")),
         }
     }
@@ -191,6 +243,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         control_uid: uid
             .ok_or_else(|| format!("--control-uid or {CONTROL_UID_ENV} is required"))?,
         tls_roots,
+        drain_grace,
     }))
 }
 
@@ -201,7 +254,8 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: tiproxy-rs --control-socket <absolute-path> --control-uid <uid> [--tls-root <absolute-path>]...\n\
+    "Usage: tiproxy-rs --control-socket <absolute-path> --control-uid <uid> \
+     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>]\n\
      Environment: TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 
@@ -242,6 +296,7 @@ mod tests {
                 control_socket: PathBuf::from("/tmp/control.sock"),
                 control_uid: 42,
                 tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
+                drain_grace: std::time::Duration::from_secs(30),
             }
         );
     }

@@ -162,6 +162,7 @@ pub struct ServerMetricsSnapshot {
 pub struct DataplaneHandle {
     snapshot_tx: watch::Sender<Arc<ValidatedSnapshot>>,
     shutdown_tx: watch::Sender<bool>,
+    draining_tx: watch::Sender<bool>,
     listener_signature: ListenerSignature,
     listeners: Arc<[BoundListenerInfo]>,
     admission: AdmissionController,
@@ -191,6 +192,20 @@ impl DataplaneHandle {
     /// Requests idempotent listener and session-task shutdown.
     pub fn shutdown(&self) {
         self.shutdown_tx.send_replace(true);
+    }
+
+    /// Stops accepting new connections on every listener while existing
+    /// sessions keep running — the first phase of the coordinated
+    /// shutdown order (stop-accept → graceful drain → deadline force →
+    /// join). [`DataplaneHandle::shutdown`] remains the force phase.
+    pub fn stop_accepting(&self) {
+        self.draining_tx.send_replace(true);
+    }
+
+    /// Whether accepting has been stopped.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        *self.draining_tx.borrow()
     }
 
     /// Returns whether shutdown has been requested.
@@ -390,12 +405,14 @@ impl DataplaneServer {
         }
         let (snapshot_tx, _) = watch::channel(Arc::clone(&snapshot));
         let (shutdown_tx, _) = watch::channel(false);
+        let (draining_tx, _) = watch::channel(false);
         let admission = AdmissionController::new(memory);
         let registry = ConnectionRegistry::new();
         let counters = Arc::new(ServerCounters::default());
         let handle = DataplaneHandle {
             snapshot_tx,
             shutdown_tx,
+            draining_tx,
             listener_signature: ListenerSignature::from_snapshot(&snapshot)?,
             listeners: listener_info.into(),
             admission,
@@ -430,6 +447,7 @@ impl DataplaneServer {
                 Arc::clone(&handler),
                 self.handle.snapshot_tx.subscribe(),
                 self.handle.shutdown_tx.subscribe(),
+                self.handle.draining_tx.subscribe(),
                 self.handle.admission.clone(),
                 self.handle.registry.clone(),
                 Arc::clone(&self.handle.counters),
@@ -625,11 +643,13 @@ fn format_listener_address(host: &str, port: u16) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_listener(
     named: NamedListener,
     handler: Arc<dyn ConnectionHandler>,
     snapshot_rx: watch::Receiver<Arc<ValidatedSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
+    mut draining: watch::Receiver<bool>,
     admission: AdmissionController,
     registry: ConnectionRegistry,
     counters: Arc<ServerCounters>,
@@ -642,13 +662,20 @@ async fn run_listener(
     let mut sessions = JoinSet::new();
     let mut backoff = AcceptBackoff::new();
     loop {
-        if *shutdown.borrow() {
+        if *shutdown.borrow() || *draining.borrow() {
             break;
         }
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            changed = draining.changed() => {
+                if changed.is_err() || *draining.borrow() {
+                    // Stop-accept phase: close the listener but keep
+                    // every running session alive.
                     break;
                 }
             }
@@ -693,6 +720,35 @@ async fn run_listener(
         }
     }
     drop(listener);
+    // Drain mode: sessions keep running until they finish on their own
+    // (the composition injects graceful closes and per-session drain
+    // deadlines); the shutdown signal remains the force phase that
+    // aborts whatever is left.
+    if !*shutdown.borrow() {
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                joined = sessions.join_next(), if !sessions.is_empty() => {
+                    match joined {
+                        Some(result) => {
+                            if result.is_err_and(|error| error.is_panic()) {
+                                counters.handler_panics.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+            if sessions.is_empty() {
+                break;
+            }
+        }
+    }
     sessions.abort_all();
     while let Some(joined) = sessions.join_next().await {
         if joined.is_err_and(|error| error.is_panic()) {

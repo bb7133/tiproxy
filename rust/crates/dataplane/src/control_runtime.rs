@@ -284,9 +284,30 @@ pub fn spawn_control_runtime<C: SnapshotConsumer>(
     consumer: C,
 ) -> Result<ControlRuntime, TransportError> {
     let client = Arc::new(ControlClient::new(config.client)?);
-    let (snapshot_tx, snapshot_rx) = mpsc::channel(config.snapshot_queue.max(1));
+    Ok(spawn_control_runtime_with_client(
+        client,
+        config.tick_interval,
+        config.snapshot_queue,
+        store,
+        consumer,
+    ))
+}
+
+/// [`spawn_control_runtime`] over a pre-built client — the seam for
+/// compositions whose session owner needs the shared client before the
+/// runtime exists (the dispatch handle already has the same one-shot
+/// installer shape).
+#[must_use]
+pub fn spawn_control_runtime_with_client<C: SnapshotConsumer>(
+    client: Arc<ControlClient>,
+    tick_interval: Duration,
+    snapshot_queue: usize,
+    store: SnapshotStore,
+    consumer: C,
+) -> ControlRuntime {
+    let (snapshot_tx, snapshot_rx) = mpsc::channel(snapshot_queue.max(1));
     let (handle, forwarder, dispatch) =
-        spawn_control_dispatch(Arc::clone(&client), snapshot_tx, config.tick_interval);
+        spawn_control_dispatch(Arc::clone(&client), snapshot_tx, tick_interval);
     let transport = {
         let client = Arc::clone(&client);
         tokio::spawn(async move { client.run(&forwarder).await })
@@ -298,9 +319,7 @@ pub fn spawn_control_runtime<C: SnapshotConsumer>(
         consumer,
         snapshot_rx,
     ));
-    Ok(ControlRuntime::supervise(
-        client, handle, transport, dispatch, snapshots,
-    ))
+    ControlRuntime::supervise(client, handle, transport, dispatch, snapshots)
 }
 
 /// Applies one `StateSnapshot` envelope through the two-phase
