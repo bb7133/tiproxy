@@ -540,6 +540,12 @@ impl ControlClient {
         self.enqueue(envelope, Some(epoch)).await
     }
 
+    /// Whether shutdown has been requested on this client.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
+
     /// Requests cancellation of connect, queue, I/O, heartbeat, and backoff waits.
     pub fn shutdown(&self) {
         self.shutdown_tx.send_replace(true);
@@ -1477,7 +1483,7 @@ mod tests {
             role: Role::RustDataplane as i32,
             process_id: "rust-fake-client".to_owned(),
             supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
-            capabilities: vec![3, 7],
+            capabilities: vec![2, 3, 7],
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             ..Default::default()
         }
@@ -1488,7 +1494,7 @@ mod tests {
             role: Role::GoControl as i32,
             process_id: "go-fake-server".to_owned(),
             supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
-            capabilities: vec![3, 5],
+            capabilities: vec![2, 3, 5],
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             ..Default::default()
         }

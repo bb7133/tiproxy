@@ -59,6 +59,7 @@
 //! the next tick, a closed one converges through the close path.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -77,6 +78,21 @@ use crate::control_commands::{
     RedirectAdmission,
 };
 use crate::session::SessionControl;
+
+/// Observable dispatch counters, shared between the loop's handler and
+/// the runtime (metrics/diagnostics export). Every "counted, never
+/// silent" path in the dispatcher lands here.
+#[derive(Debug, Default)]
+pub struct DispatchStats {
+    /// Inbound bodies with no legal route (each also answered).
+    pub unrouted: AtomicU64,
+    /// Stale-epoch inbound bodies discarded by policy.
+    pub stale_dropped: AtomicU64,
+    /// Terminal outbound send failures (converge via reconcile).
+    pub send_failures: AtomicU64,
+    /// Fail-closed metering rejections (record and seal).
+    pub metering_failures: AtomicU64,
+}
 
 /// Longest accepted distance between "now" and a wire drain deadline:
 /// anything further ahead is a malformed command, not a schedule.
@@ -146,10 +162,14 @@ enum ForwardOutcome {
 /// lost result needs cross-epoch replay.
 pub struct ControlCommandHandler {
     gate: CommandGate,
-    /// The negotiated epoch of the current control session (0 before
-    /// the first `Connected`); inbound envelopes carry their origin
-    /// epoch on the wire, so staleness is decidable per frame.
-    current_epoch: u64,
+    /// The active control session's atomic `(epoch, capability mask)`
+    /// snapshot — `None` whenever the last observed transport state is
+    /// not `Connected` (watch coalescing can collapse
+    /// `Connected(N) → Disconnected` into one observation, so absence
+    /// must be modeled, not just an old epoch left behind). Inbound
+    /// envelopes carry their origin epoch on the wire, so staleness is
+    /// decidable per frame against this.
+    active_session: Option<(u64, u64)>,
     /// Whether the current session negotiated `RECONCILE_CONNECTIONS`:
     /// gates both sending reconcile requests and accepting snapshots.
     reconcile_capable: bool,
@@ -168,20 +188,8 @@ pub struct ControlCommandHandler {
     initiating_close: HashMap<(u64, String), u64>,
     /// Initiating request id for the admitted drain, by wire drain id.
     initiating_drain: HashMap<String, u64>,
-    /// Inbound bodies that had no legal route here (each also answered
-    /// with a typed protocol error — never silently dropped).
-    unrouted: u64,
-    /// Stale-epoch inbound bodies discarded by policy (superseded
-    /// reconcile snapshots and session responses whose owner converges
-    /// through its own deadline) — counted, never silent.
-    stale_dropped: u64,
-    /// Outbound envelopes whose transport send failed terminally; the
-    /// state they carried converges through reconcile omission or
-    /// duplicate-command replay.
-    send_failures: u64,
-    /// Metering deltas or seals rejected by the ledger's fail-closed
-    /// bounds.
-    metering_failures: u64,
+    /// Shared observable counters (see [`DispatchStats`]).
+    stats: Arc<DispatchStats>,
 }
 
 impl Default for ControlCommandHandler {
@@ -197,7 +205,7 @@ impl ControlCommandHandler {
     pub fn new() -> Self {
         Self {
             gate: CommandGate::new(),
-            current_epoch: 0,
+            active_session: None,
             reconcile_capable: true,
             metering: MeteringLedger::new(),
             sessions: HashMap::new(),
@@ -205,10 +213,7 @@ impl ControlCommandHandler {
             initiating_redirect: HashMap::new(),
             initiating_close: HashMap::new(),
             initiating_drain: HashMap::new(),
-            unrouted: 0,
-            stale_dropped: 0,
-            send_failures: 0,
-            metering_failures: 0,
+            stats: Arc::new(DispatchStats::default()),
         }
     }
 
@@ -222,15 +227,29 @@ impl ControlCommandHandler {
     }
 
     /// Applies a new session's **atomic** epoch + capability snapshot:
-    /// records the epoch inbound staleness is judged against and
-    /// derives the peer mode and reconcile availability from the mask.
+    /// records the active session inbound staleness is judged against
+    /// and derives the peer mode and reconcile availability from the
+    /// mask. Rehydration is enabled only under the full capability
+    /// closure `RECONCILE_CONNECTIONS && RECONCILE_SESSION_REHYDRATION`
+    /// (the handshake already rejects the illegal cap-3-only
+    /// combination; this is the defensive derivation).
     pub fn on_connected(&mut self, epoch: u64, capabilities: u64) {
-        self.current_epoch = epoch;
-        self.reconcile_capable =
-            (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
-        let rehydration =
-            (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1;
+        self.active_session = Some((epoch, capabilities));
+        let reconcile = (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
+        let rehydration = reconcile
+            && (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1;
+        self.reconcile_capable = reconcile;
         self.gate.set_legacy_peer(!rehydration);
+    }
+
+    /// The transport left `Connected`: there is no active session, so
+    /// nothing inbound can match "the current epoch" until the next
+    /// `Connected` — watch coalescing can hide the intermediate
+    /// `Connected`, and modeling absence (rather than keeping the old
+    /// epoch) is what keeps a dead session's snapshot from being
+    /// accepted as current.
+    pub fn on_disconnected(&mut self) {
+        self.active_session = None;
     }
 
     /// Whether the current session can reconcile (`RECONCILE_CONNECTIONS`).
@@ -239,10 +258,10 @@ impl ControlCommandHandler {
         self.reconcile_capable
     }
 
-    /// The current session's negotiated epoch (0 before the first).
+    /// The active session's negotiated epoch, if connected.
     #[must_use]
-    pub const fn current_epoch(&self) -> u64 {
-        self.current_epoch
+    pub fn active_epoch(&self) -> Option<u64> {
+        self.active_session.map(|(epoch, _)| epoch)
     }
 
     /// Records the applied config snapshot generation (drain
@@ -299,52 +318,60 @@ impl ControlCommandHandler {
         }
     }
 
+    /// The shared observable counters.
+    #[must_use]
+    pub fn stats(&self) -> Arc<DispatchStats> {
+        Arc::clone(&self.stats)
+    }
+
     /// Inbound bodies that had no legal route so far.
     #[must_use]
-    pub const fn unrouted(&self) -> u64 {
-        self.unrouted
+    pub fn unrouted(&self) -> u64 {
+        self.stats.unrouted.load(Ordering::Relaxed)
     }
 
     /// Stale-epoch inbound bodies discarded by policy so far.
     #[must_use]
-    pub const fn stale_dropped(&self) -> u64 {
-        self.stale_dropped
+    pub fn stale_dropped(&self) -> u64 {
+        self.stats.stale_dropped.load(Ordering::Relaxed)
+    }
+
+    fn count_unrouted(&self) {
+        self.stats.unrouted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records one stale-epoch discard.
-    pub fn count_stale_dropped(&mut self) {
-        self.stale_dropped = self.stale_dropped.saturating_add(1);
-    }
-
-    /// Terminal outbound send failures so far.
-    #[must_use]
-    pub const fn send_failures(&self) -> u64 {
-        self.send_failures
+    pub fn count_stale_dropped(&self) {
+        self.stats.stale_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records one terminal outbound send failure.
-    pub fn count_send_failure(&mut self) {
-        self.send_failures = self.send_failures.saturating_add(1);
+    pub fn count_send_failure(&self) {
+        self.stats.send_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Fail-closed metering rejections so far.
-    #[must_use]
-    pub const fn metering_failures(&self) -> u64 {
-        self.metering_failures
-    }
-
-    /// Records one metering delta into the ledger; rejections are
-    /// counted fail-closed (the delta is not silently retried).
-    pub fn record_metering(&mut self, delta: control_proto::v1::MeteringDelta) {
-        if self.metering.record(delta).is_err() {
-            self.metering_failures = self.metering_failures.saturating_add(1);
+    /// Records one metering delta into the ledger. The result is the
+    /// **producer's**: an error means the delta was not absorbed and
+    /// its ownership stays with the caller (fail-closed, counted).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the ledger's fail-closed bounds.
+    pub fn record_metering(
+        &mut self,
+        delta: control_proto::v1::MeteringDelta,
+    ) -> Result<(), MeteringError> {
+        let result = self.metering.record(delta);
+        if result.is_err() {
+            self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
         }
+        result
     }
 
     /// Records one fail-closed seal rejection (for example: the
     /// unacked bound is reached because no reconcile ack path exists).
-    pub fn count_metering_seal_failure(&mut self) {
-        self.metering_failures = self.metering_failures.saturating_add(1);
+    pub fn count_metering_seal_failure(&self) {
+        self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The metering producer (record/seal/replay flow).
@@ -442,7 +469,7 @@ impl ControlCommandHandler {
                 if !self.reconcile_capable {
                     // We never sent a ReconcileRequest this session: an
                     // unsolicited snapshot is a protocol violation.
-                    self.unrouted = self.unrouted.saturating_add(1);
+                    self.count_unrouted();
                     return vec![result_envelope(
                         OutboundControl::ProtocolError {
                             code: ErrorCode::ProtocolViolation,
@@ -453,16 +480,22 @@ impl ControlCommandHandler {
                         request_id,
                     )];
                 }
-                if envelope.control_epoch != 0
-                    && self.current_epoch != 0
-                    && envelope.control_epoch != self.current_epoch
-                {
-                    // A snapshot from a dead epoch is superseded: the
-                    // current session's automatic ReconcileRequest gets
-                    // a fresh one, and applying the stale view could
-                    // regress acked metering / ghost state.
-                    self.count_stale_dropped();
-                    return Vec::new();
+                if envelope.control_epoch != 0 {
+                    // A snapshot is applied only while a session is
+                    // actually active AND it originated in exactly that
+                    // session. `None` (disconnected, or a coalesced
+                    // Connected→Disconnected the loop never saw as
+                    // Connected) and any epoch mismatch are superseded:
+                    // the next session's automatic ReconcileRequest
+                    // gets a fresh snapshot, and applying the stale
+                    // view could regress acked metering / ghost state.
+                    match self.active_session {
+                        Some((epoch, _)) if epoch == envelope.control_epoch => {}
+                        _ => {
+                            self.count_stale_dropped();
+                            return Vec::new();
+                        }
+                    }
                 }
                 let snapshot = snapshot.clone();
                 self.dispatch_reconcile_snapshot(&snapshot)
@@ -485,7 +518,7 @@ impl ControlCommandHandler {
             // events, batches): tell the peer instead of silently
             // dropping.
             Some(_) | None => {
-                self.unrouted = self.unrouted.saturating_add(1);
+                self.count_unrouted();
                 vec![result_envelope(
                     OutboundControl::ProtocolError {
                         code: ErrorCode::ProtocolViolation,
@@ -527,7 +560,7 @@ impl ControlCommandHandler {
             )];
         };
         let Some(responses) = &entry.responses else {
-            self.unrouted = self.unrouted.saturating_add(1);
+            self.count_unrouted();
             return vec![result_envelope(
                 OutboundControl::ProtocolError {
                     code: ErrorCode::ProtocolViolation,
@@ -1116,7 +1149,9 @@ fn closed_event_envelope(
 pub enum DispatchNotice {
     /// A config snapshot generation was applied (CTL-05).
     AppliedGeneration(u64),
-    /// An admitted session registers its channels.
+    /// An admitted session registers its channels. `applied` is the
+    /// causal barrier: interact with the session's registration (send
+    /// requests, expect commands to find it) only after it fires.
     RegisterSession {
         /// Admission identity.
         identity: ConnectionIdentity,
@@ -1131,6 +1166,8 @@ pub enum DispatchNotice {
         /// Correlated Go answers (route assignments, handshake
         /// decisions/results) for this session, when it routes.
         responses: Option<mpsc::Sender<ControlEnvelope>>,
+        /// Completed when the registration is applied.
+        applied: tokio::sync::oneshot::Sender<()>,
     },
     /// The session's backend attached or changed.
     SetBackend {
@@ -1147,10 +1184,21 @@ pub enum DispatchNotice {
         request_id: u64,
         /// The body kind the answer must have.
         kind: ResponseKind,
+        /// Completed when the expectation is armed — the causal
+        /// barrier: the session sends its request to Go only after
+        /// this fires, so the answer cannot exist before the arm.
+        applied: tokio::sync::oneshot::Sender<()>,
     },
-    /// One metering delta from a session's accounting (fail-closed:
-    /// ledger rejections are counted, not retried).
-    Metering(Box<control_proto::v1::MeteringDelta>),
+    /// One metering delta from a session's accounting. The ack carries
+    /// the ledger's fail-closed verdict; on `Err` the delta was NOT
+    /// absorbed and its ownership stays with the producer (retry or
+    /// declare the stream unhealthy per the ledger contract).
+    Metering {
+        /// The delta.
+        delta: Box<control_proto::v1::MeteringDelta>,
+        /// The producer's verdict channel.
+        ack: tokio::sync::oneshot::Sender<Result<(), MeteringError>>,
+    },
     /// The session terminated.
     SessionClosed {
         /// Connection id.
@@ -1182,16 +1230,189 @@ pub enum DispatchNotice {
     },
 }
 
-/// Cloneable session-facing handle to the dispatch task.
+/// Cloneable session-facing handle to the dispatch task. The typed
+/// methods are the production surface — `register_session` and
+/// `expect_response` await the dispatch-applied acknowledgement, the
+/// **causal barrier** callers must respect: send a request to Go only
+/// after its expectation ack fired (so the answer cannot exist before
+/// the arm), and if that send then fails, re-arm or replace the
+/// expectation before the next exchange.
 #[derive(Clone)]
 pub struct ControlDispatchHandle {
     notices: mpsc::Sender<DispatchNotice>,
+    stats: Arc<DispatchStats>,
+}
+
+/// A metering delta could not be handed to the ledger; ownership stays
+/// with the producer in every case.
+#[derive(Debug)]
+pub enum MeteringRecordError {
+    /// The ledger rejected the delta (fail-closed verdict).
+    Rejected(MeteringError),
+    /// The dispatch task is gone (or its ack channel closed before
+    /// answering); the delta was not absorbed.
+    DispatchUnavailable,
 }
 
 impl ControlDispatchHandle {
-    /// Submits one notice; returns false when the dispatch task is gone.
-    pub async fn notify(&self, notice: DispatchNotice) -> bool {
+    /// Submits one notice; returns false when the dispatch task is
+    /// gone. Crate-internal: production callers use the typed methods
+    /// so the applied-ack causal contracts cannot be bypassed.
+    pub(crate) async fn notify(&self, notice: DispatchNotice) -> bool {
         self.notices.send(notice).await.is_ok()
+    }
+
+    /// The dispatcher's observable counters.
+    #[must_use]
+    pub fn stats(&self) -> Arc<DispatchStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// Records the applied config snapshot generation.
+    pub async fn applied_generation(&self, generation: u64) -> bool {
+        self.notify(DispatchNotice::AppliedGeneration(generation))
+            .await
+    }
+
+    /// Registers an admitted session and **waits until the dispatcher
+    /// applied it** — only then may the session be referenced (by
+    /// requests, backends, or expected responses).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_session(
+        &self,
+        identity: ConnectionIdentity,
+        namespace: String,
+        snapshot_generation: u64,
+        listener_name: String,
+        control: mpsc::Sender<SessionControl>,
+        responses: Option<mpsc::Sender<ControlEnvelope>>,
+    ) -> bool {
+        let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::RegisterSession {
+                identity,
+                namespace,
+                snapshot_generation,
+                listener_name,
+                control,
+                responses,
+                applied: applied_tx,
+            })
+            .await
+        {
+            return false;
+        }
+        applied_rx.await.is_ok()
+    }
+
+    /// Records the session's current backend.
+    pub async fn set_backend(&self, connection_id: u64, backend_id: String) -> bool {
+        self.notify(DispatchNotice::SetBackend {
+            connection_id,
+            backend_id,
+        })
+        .await
+    }
+
+    /// Arms the session's response expectation and **waits until the
+    /// dispatcher applied it**: the caller must send the corresponding
+    /// request to Go only after this returns true, which is what makes
+    /// the fail-closed correlation race-free.
+    pub async fn expect_response(
+        &self,
+        connection_id: u64,
+        request_id: u64,
+        kind: ResponseKind,
+    ) -> bool {
+        let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::ExpectResponse {
+                connection_id,
+                request_id,
+                kind,
+                applied: applied_tx,
+            })
+            .await
+        {
+            return false;
+        }
+        applied_rx.await.is_ok()
+    }
+
+    /// Hands one metering delta to the ledger and returns the ledger's
+    /// own fail-closed verdict. On `Err` the delta was **not**
+    /// absorbed: ownership stays with the producer, which retries
+    /// (`BacklogFull` clears on a reconcile ack) or declares its
+    /// stream unhealthy per the ledger contract. Awaiting the verdict
+    /// is itself the backpressure.
+    ///
+    /// # Errors
+    ///
+    /// [`MeteringRecordError::Rejected`] with the ledger's verdict, or
+    /// [`MeteringRecordError::DispatchUnavailable`] when the dispatch
+    /// task is gone.
+    pub async fn record_metering(
+        &self,
+        delta: control_proto::v1::MeteringDelta,
+    ) -> Result<(), MeteringRecordError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::Metering {
+                delta: Box::new(delta),
+                ack: ack_tx,
+            })
+            .await
+        {
+            return Err(MeteringRecordError::DispatchUnavailable);
+        }
+        match ack_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(MeteringRecordError::Rejected(error)),
+            Err(_) => Err(MeteringRecordError::DispatchUnavailable),
+        }
+    }
+
+    /// The session terminated.
+    pub async fn session_closed(
+        &self,
+        connection_id: u64,
+        forced: bool,
+        error_source: ErrorSource,
+    ) -> bool {
+        self.notify(DispatchNotice::SessionClosed {
+            connection_id,
+            forced,
+            error_source,
+        })
+        .await
+    }
+
+    /// A session's redirect finished.
+    pub async fn redirect_finished(
+        &self,
+        connection_id: u64,
+        redirect_id: String,
+        succeeded: bool,
+        backend_id: String,
+        code: ErrorCode,
+    ) -> bool {
+        self.notify(DispatchNotice::RedirectFinished {
+            connection_id,
+            redirect_id,
+            succeeded,
+            backend_id,
+            code,
+        })
+        .await
+    }
+
+    /// A session's accepted close finished.
+    pub async fn close_finished(&self, connection_id: u64, close_id: String) -> bool {
+        self.notify(DispatchNotice::CloseFinished {
+            connection_id,
+            close_id,
+        })
+        .await
     }
 }
 
@@ -1382,12 +1603,30 @@ enum SendScope {
     Session(u64),
 }
 
-/// A condition the dispatch loop cannot continue past.
-enum LoopFatal {
+/// A condition the dispatch loop cannot continue past: the loop exits
+/// with it, and the runtime supervisor cancels its sibling tasks and
+/// propagates it as the join error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchFatal {
     /// The sender's checked request-id space is exhausted.
     IdSpaceExhausted,
     /// The CTL-05 snapshot owner is gone.
     SnapshotOwnerGone,
+    /// The metering ledger's strictly monotonic sequence space is
+    /// exhausted; continuing would freeze or reuse a sequence.
+    MeteringSequenceExhausted,
+}
+
+impl std::fmt::Display for DispatchFatal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IdSpaceExhausted => formatter.write_str("control request-id space is exhausted"),
+            Self::SnapshotOwnerGone => formatter.write_str("CTL-05 snapshot owner is gone"),
+            Self::MeteringSequenceExhausted => {
+                formatter.write_str("metering sequence space is exhausted")
+            }
+        }
+    }
 }
 
 /// Stamps self-originated envelopes with allocator ids and sends under
@@ -1400,12 +1639,12 @@ async fn dispatch_send<S: DispatchSender>(
     handler: &mut ControlCommandHandler,
     mut envelope: ControlEnvelope,
     scope: SendScope,
-) -> Result<(), LoopFatal> {
+) -> Result<(), DispatchFatal> {
     if envelope.request_id == NEEDS_ALLOCATION {
         let Some(id) = sender.allocate_request_id() else {
             // The id space is exhausted: every future send would have
             // to reuse or wrap, so the loop fails closed instead.
-            return Err(LoopFatal::IdSpaceExhausted);
+            return Err(DispatchFatal::IdSpaceExhausted);
         };
         envelope.request_id = id;
     }
@@ -1440,6 +1679,11 @@ async fn dispatch_send<S: DispatchSender>(
 /// by a busy neighbor. This is the long-lived single owner of
 /// [`ControlCommandHandler`]; it survives control reconnects and exits
 /// only on fatal conditions (owner channels gone, id space exhausted).
+///
+/// # Errors
+///
+/// Returns the [`DispatchFatal`] the loop cannot continue past; clean
+/// channel-close cascades exit with `Ok`.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run_control_dispatch<S: DispatchSender>(
     mut handler: ControlCommandHandler,
@@ -1450,34 +1694,39 @@ pub async fn run_control_dispatch<S: DispatchSender>(
     snapshot_tx: mpsc::Sender<ControlEnvelope>,
     tick_interval: Duration,
     unix_now_millis: UnixMillisFn,
-) {
+) -> Result<(), DispatchFatal> {
     let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let step = tokio::select! {
             changed = state.changed() => {
                 if changed.is_err() {
-                    break;
+                    // The transport is gone: shutdown cascade, clean.
+                    return Ok(());
                 }
-                let snapshot = *state.borrow_and_update();
-                if let ConnectionState::Connected { epoch, capabilities } = snapshot {
-                    on_connected_transition(
-                        &sender,
-                        &mut handler,
-                        epoch,
-                        capabilities,
-                    )
-                    .await
-                } else {
-                    Ok(())
+                // `changed()` marked the newest value seen: apply it
+                // directly, then drain anything that raced in after.
+                let snapshot = *state.borrow();
+                let applied = apply_state(&sender, &mut handler, snapshot).await;
+                match applied {
+                    Ok(()) => {
+                        apply_state_transitions(&sender, &mut handler, &mut state).await
+                    }
+                    Err(fatal) => Err(fatal),
                 }
             }
             notice = notices.recv() => {
-                let Some(notice) = notice else { break };
+                let Some(notice) = notice else { return Ok(()) };
                 apply_notice(&sender, &mut handler, notice).await
             }
             envelope = inbound.recv() => {
-                let Some(envelope) = envelope else { break };
+                let Some(envelope) = envelope else { return Ok(()) };
+                // Deterministic state barrier: whatever order the
+                // select observed things in, any pending connection
+                // transition is applied BEFORE this envelope — a frame
+                // pumped from a previous session can never be judged
+                // against a session snapshot that predates it.
+                apply_state_transitions(&sender, &mut handler, &mut state).await?;
                 process_inbound(
                     &sender,
                     &mut handler,
@@ -1491,8 +1740,43 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 run_tick(&sender, &mut handler).await
             }
         };
-        if step.is_err() {
-            break;
+        step?;
+    }
+}
+
+/// Drains every pending connection-state observation: `Connected`
+/// applies the atomic epoch/caps snapshot (with its automatic
+/// reconcile and metering replay), every other state clears the
+/// active session. Watch coalescing may have collapsed a `Connected`
+/// away, and
+/// modeling that absence is what keeps a dead session's frames from
+/// matching "the current epoch".
+async fn apply_state_transitions<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+    state: &mut watch::Receiver<ConnectionState>,
+) -> Result<(), DispatchFatal> {
+    while state.has_changed().unwrap_or(false) {
+        let snapshot = *state.borrow_and_update();
+        apply_state(sender, handler, snapshot).await?;
+    }
+    Ok(())
+}
+
+/// Applies one observed connection state to the handler.
+async fn apply_state<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+    snapshot: ConnectionState,
+) -> Result<(), DispatchFatal> {
+    match snapshot {
+        ConnectionState::Connected {
+            epoch,
+            capabilities,
+        } => on_connected_transition(sender, handler, epoch, capabilities).await,
+        ConnectionState::Disconnected | ConnectionState::Connecting | ConnectionState::Shutdown => {
+            handler.on_disconnected();
+            Ok(())
         }
     }
 }
@@ -1510,7 +1794,7 @@ async fn on_connected_transition<S: DispatchSender>(
     handler: &mut ControlCommandHandler,
     epoch: u64,
     capabilities: u64,
-) -> Result<(), LoopFatal> {
+) -> Result<(), DispatchFatal> {
     handler.on_connected(epoch, capabilities);
     if handler.reconcile_capable() {
         let request = handler.build_reconcile_request(handler.applied_generation());
@@ -1546,7 +1830,7 @@ async fn apply_notice<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
     notice: DispatchNotice,
-) -> Result<(), LoopFatal> {
+) -> Result<(), DispatchFatal> {
     match notice {
         DispatchNotice::AppliedGeneration(generation) => {
             handler.set_applied_generation(generation);
@@ -1558,6 +1842,7 @@ async fn apply_notice<S: DispatchSender>(
             listener_name,
             control,
             responses,
+            applied,
         } => {
             handler.register_session(
                 identity,
@@ -1567,6 +1852,7 @@ async fn apply_notice<S: DispatchSender>(
                 control,
                 responses,
             );
+            let _ = applied.send(());
         }
         DispatchNotice::SetBackend {
             connection_id,
@@ -1578,11 +1864,24 @@ async fn apply_notice<S: DispatchSender>(
             connection_id,
             request_id,
             kind,
+            applied,
         } => {
             handler.expect_response(connection_id, request_id, kind);
+            let _ = applied.send(());
         }
-        DispatchNotice::Metering(delta) => {
-            handler.record_metering(*delta);
+        DispatchNotice::Metering { delta, ack } => {
+            // Record and ack in one await-free step: the verdict the
+            // producer sees is exactly the ledger's, and the delta is
+            // either absorbed or still owned by the producer — never
+            // accepted-then-dropped.
+            let result = handler.record_metering(*delta);
+            let fatal = matches!(result, Err(MeteringError::SequenceExhausted));
+            let _ = ack.send(result);
+            if fatal {
+                // The strictly monotonic sequence space is gone:
+                // every future seal would fail; stop fail-closed.
+                return Err(DispatchFatal::MeteringSequenceExhausted);
+            }
         }
         DispatchNotice::SessionClosed {
             connection_id,
@@ -1628,7 +1927,7 @@ async fn process_inbound<S: DispatchSender>(
     snapshot_tx: &mpsc::Sender<ControlEnvelope>,
     envelope: ControlEnvelope,
     unix_now_millis: UnixMillisFn,
-) -> Result<(), LoopFatal> {
+) -> Result<(), DispatchFatal> {
     if matches!(envelope.body, Some(Body::StateSnapshot(_))) {
         // The CTL-05 snapshot owner is a required dependency: the send
         // is awaited (its backpressure reaches the transport read
@@ -1636,7 +1935,7 @@ async fn process_inbound<S: DispatchSender>(
         return snapshot_tx
             .send(envelope)
             .await
-            .map_err(|_| LoopFatal::SnapshotOwnerGone);
+            .map_err(|_| DispatchFatal::SnapshotOwnerGone);
     }
     let outbound = handler.handle_envelope(&envelope, Instant::now(), unix_now_millis());
     for out in outbound {
@@ -1648,7 +1947,7 @@ async fn process_inbound<S: DispatchSender>(
 async fn run_tick<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
-) -> Result<(), LoopFatal> {
+) -> Result<(), DispatchFatal> {
     for envelope in handler.tick(Instant::now()) {
         dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
     }
@@ -1665,7 +1964,9 @@ async fn run_tick<S: DispatchSender>(
         Ok(None) => {}
         Err(_) => {
             // Fail-closed bound reached (for example: no reconcile ack
-            // path): counted; sealed batches stay retained.
+            // path): counted, and nothing is lost — a failed seal
+            // leaves the open accumulation intact and sealed batches
+            // stay retained until acknowledged.
             handler.count_metering_seal_failure();
         }
     }
@@ -1690,7 +1991,7 @@ pub fn spawn_control_dispatch(
 ) -> (
     ControlDispatchHandle,
     InboundForwarder,
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), DispatchFatal>>,
 ) {
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let (notice_tx, notice_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
@@ -1700,8 +2001,10 @@ pub fn spawn_control_dispatch(
         state: client.subscribe_state(),
         retained: Arc::new(StdMutex::new(None)),
     };
+    let handler = ControlCommandHandler::new();
+    let handler_stats = handler.stats();
     let task = tokio::spawn(run_control_dispatch(
-        ControlCommandHandler::new(),
+        handler,
         client,
         state,
         inbound_rx,
@@ -1711,7 +2014,10 @@ pub fn spawn_control_dispatch(
         system_unix_millis,
     ));
     (
-        ControlDispatchHandle { notices: notice_tx },
+        ControlDispatchHandle {
+            notices: notice_tx,
+            stats: handler_stats,
+        },
         forwarder,
         task,
     )

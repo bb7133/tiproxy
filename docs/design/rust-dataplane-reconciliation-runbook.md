@@ -136,9 +136,15 @@ The gates are on the real message paths on both sides:
   `RECONCILE_CONNECTIONS` no request is sent and no ack can arrive:
   the ledger's bounded unacked retention (fail-closed seal at the
   bound) is then the explicit backpressure. Metering has its full
-  production lifecycle here: sessions record deltas via
-  `DispatchNotice::Metering`, the tick seals batches onto the wire,
-  reconnects replay everything unacknowledged.
+  production lifecycle with **producer-owned failure**: sessions call
+  `ControlDispatchHandle::record_metering` and await the ledger's own
+  fail-closed verdict (recorded and acknowledged in one await-free
+  step) — on error the delta was **not** absorbed and stays with the
+  producer, which retries (`BacklogFull` clears on a reconcile ack) or
+  declares its stream unhealthy; sequence exhaustion is a dispatch
+  fatal. The tick seals batches onto the wire, reconnects replay
+  everything unacknowledged, and every counted path is exported
+  through the shared `DispatchStats`.
 
   **Request-id lineage**: every application-originated envelope takes
   its id from the sender's single checked allocator (heartbeats

@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, RwLock};
 
 use rustls::client::danger::HandshakeSignatureValid;
 pub use rustls::pki_types::UnixTime;
@@ -70,7 +70,9 @@ pub struct SnapshotError {
 }
 
 impl SnapshotError {
-    fn invalid(detail: impl Into<String>) -> Self {
+    /// An invalid-input rejection (public for composition owners that
+    /// must answer malformed snapshot traffic).
+    pub fn invalid(detail: impl Into<String>) -> Self {
         Self {
             kind: SnapshotErrorKind::Invalid,
             detail: detail.into(),
@@ -254,6 +256,45 @@ impl ValidatedSnapshot {
     }
 }
 
+/// A validated-but-uncommitted snapshot between the two phases of
+/// [`SnapshotStore::stage`] / [`SnapshotStore::commit`]. The token
+/// holds the store's writer reservation for its whole lifetime:
+/// dropping it without committing releases the reservation with the
+/// committed state untouched, and no concurrent writer can advance the
+/// store while it is held — so a downstream success between the phases
+/// can never be invalidated by a racing commit.
+#[derive(Debug)]
+pub struct Staged<'store> {
+    _writer: StdMutexGuard<'store, ()>,
+    state: StagedState,
+}
+
+#[derive(Debug)]
+enum StagedState {
+    /// The exact generation+content is already committed: the earlier
+    /// two-phase apply (downstream included) succeeded — answer
+    /// success without re-running anything.
+    Unchanged(Arc<ValidatedSnapshot>),
+    /// Validated against the committed state; not yet committed.
+    Validated(Arc<ValidatedSnapshot>),
+}
+
+impl Staged<'_> {
+    /// The staged snapshot's validated view.
+    #[must_use]
+    pub fn snapshot(&self) -> &Arc<ValidatedSnapshot> {
+        match &self.state {
+            StagedState::Unchanged(snapshot) | StagedState::Validated(snapshot) => snapshot,
+        }
+    }
+
+    /// Whether commit would change the committed state.
+    #[must_use]
+    pub const fn is_changed(&self) -> bool {
+        matches!(self.state, StagedState::Validated(_))
+    }
+}
+
 /// Result of an atomic apply attempt.
 #[derive(Debug)]
 pub struct ApplyOutcome {
@@ -283,6 +324,12 @@ impl ApplyOutcome {
 pub struct SnapshotStore {
     allowed_tls_roots: Vec<PathBuf>,
     current: RwLock<Option<Arc<ValidatedSnapshot>>>,
+    /// Serializes the whole two-phase apply: a [`Staged`] token holds
+    /// this guard, so no other writer — `apply` included — can advance
+    /// the committed state between `stage` and `commit`. A downstream
+    /// consumer success can therefore never be followed by a
+    /// stale/conflict commit failure.
+    writer: StdMutex<()>,
 }
 
 impl SnapshotStore {
@@ -317,6 +364,7 @@ impl SnapshotStore {
         Ok(Self {
             allowed_tls_roots: roots,
             current: RwLock::new(None),
+            writer: StdMutex::new(()),
         })
     }
 
@@ -348,6 +396,32 @@ impl SnapshotStore {
         snapshot: StateSnapshot,
         now: UnixTime,
     ) -> Result<ApplyOutcome, SnapshotError> {
+        let staged = self.stage(generation, snapshot, now)?;
+        self.commit(staged)
+    }
+
+    /// Phase one of a two-phase apply: validates the snapshot against
+    /// the committed state **without advancing it**. The caller runs
+    /// its downstream application (serving-side consumer) between
+    /// `stage` and [`SnapshotStore::commit`]; a downstream rejection
+    /// leaves the store untouched, so a replay of the same generation
+    /// re-validates and re-runs the downstream instead of answering a
+    /// false success off an already-advanced store.
+    ///
+    /// # Errors
+    ///
+    /// Returns stale/invalid/internal errors exactly like
+    /// [`SnapshotStore::apply`].
+    pub fn stage(
+        &self,
+        generation: u64,
+        snapshot: StateSnapshot,
+        now: UnixTime,
+    ) -> Result<Staged<'_>, SnapshotError> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| SnapshotError::internal("snapshot writer reservation poisoned"))?;
         if generation == 0 {
             return Err(SnapshotError::invalid(
                 "snapshot generation must be nonzero",
@@ -367,9 +441,12 @@ impl SnapshotStore {
                 }
                 if generation == current.generation {
                     if snapshot == current.raw {
-                        return Ok(ApplyOutcome {
-                            snapshot: Arc::clone(current),
-                            changed: false,
+                        // Committed already — which implies the whole
+                        // two-phase apply (downstream included)
+                        // succeeded when it was committed.
+                        return Ok(Staged {
+                            _writer: writer,
+                            state: StagedState::Unchanged(Arc::clone(current)),
                         });
                     }
                     return Err(SnapshotError::invalid(
@@ -378,31 +455,39 @@ impl SnapshotStore {
                 }
             }
         }
-
         let candidate = Arc::new(self.validate(generation, snapshot, now)?);
+        Ok(Staged {
+            _writer: writer,
+            state: StagedState::Validated(candidate),
+        })
+    }
+
+    /// Phase two: commits a staged snapshot, re-checking monotonicity
+    /// under the write lock (a concurrent writer may have advanced the
+    /// store between the phases).
+    ///
+    /// # Errors
+    ///
+    /// Returns stale/invalid/internal errors exactly like
+    /// [`SnapshotStore::apply`].
+    pub fn commit(&self, staged: Staged<'_>) -> Result<ApplyOutcome, SnapshotError> {
+        let Staged { _writer, state } = staged;
+        let candidate = match state {
+            StagedState::Unchanged(current) => {
+                return Ok(ApplyOutcome {
+                    snapshot: current,
+                    changed: false,
+                });
+            }
+            StagedState::Validated(candidate) => candidate,
+        };
+        // The writer reservation is still held (the token carries it),
+        // so the committed state cannot have moved since `stage`: this
+        // write is a plain publication, not a re-negotiation.
         let mut guard = self
             .current
             .write()
             .map_err(|_| SnapshotError::internal("snapshot store lock poisoned"))?;
-        if let Some(current) = guard.as_ref() {
-            if generation < current.generation {
-                return Err(SnapshotError::stale(format!(
-                    "snapshot generation {generation} is older than {}",
-                    current.generation
-                )));
-            }
-            if generation == current.generation {
-                if candidate.raw == current.raw {
-                    return Ok(ApplyOutcome {
-                        snapshot: Arc::clone(current),
-                        changed: false,
-                    });
-                }
-                return Err(SnapshotError::invalid(
-                    "same snapshot generation has different contents",
-                ));
-            }
-        }
         *guard = Some(Arc::clone(&candidate));
         Ok(ApplyOutcome {
             snapshot: candidate,

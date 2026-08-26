@@ -174,10 +174,18 @@ pub fn negotiate_hello(
     }
 
     let local_capabilities: BTreeSet<u64> = local.capabilities.iter().copied().collect();
-    let negotiated_capabilities = local_capabilities
+    let negotiated_capabilities: Vec<u64> = local_capabilities
         .intersection(&remote_capabilities)
         .copied()
         .collect();
+    // Capability closure: RECONCILE_SESSION_REHYDRATION (3) extends the
+    // reconcile exchange, so it is meaningless — and dangerous, since a
+    // gate would go strict with no reconcile path — without
+    // RECONCILE_CONNECTIONS (2). Reject the illegal combination instead
+    // of silently negotiating it.
+    if negotiated_capabilities.contains(&3) && !negotiated_capabilities.contains(&2) {
+        return Err(FrameError::MissingCapability(2));
+    }
     let local_limit = normalized_limit(local.max_frame_bytes);
     let remote_limit = normalized_limit(remote.max_frame_bytes);
 

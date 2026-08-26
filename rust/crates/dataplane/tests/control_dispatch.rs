@@ -35,8 +35,8 @@ use control_proto::v1::{
     RouteAssignment,
 };
 use dataplane::control_dispatch::{
-    ControlCommandHandler, DispatchNotice, DispatchSender, InboundForwarder, ResponseKind,
-    run_control_dispatch,
+    ControlCommandHandler, DispatchFatal, DispatchNotice, DispatchSender, InboundForwarder,
+    ResponseKind, run_control_dispatch,
 };
 use dataplane::session::SessionControl;
 use tokio::sync::{mpsc, watch};
@@ -765,7 +765,7 @@ struct LoopHarness {
     notice_tx: mpsc::Sender<DispatchNotice>,
     inbound_tx: mpsc::Sender<ControlEnvelope>,
     snapshot_rx: mpsc::Receiver<ControlEnvelope>,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Result<(), DispatchFatal>>,
 }
 
 fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopHarness {
@@ -944,6 +944,7 @@ async fn closed_event_ids_feed_reconcile_watermark() {
             listener_name: "sql-a".to_owned(),
             control: control_tx,
             responses: None,
+            applied: tokio::sync::oneshot::channel().0,
         })
         .await
         .ok();
@@ -1167,17 +1168,24 @@ async fn reconcile_snapshot_epoch_and_capability_policy() {
 async fn metering_notices_seal_and_send_on_tick() {
     let handler = ControlCommandHandler::new();
     let harness = spawn_loop_with_tick(handler, Duration::from_millis(50));
+    let (metering_ack_tx, metering_ack_rx) = tokio::sync::oneshot::channel();
     harness
         .notice_tx
-        .send(DispatchNotice::Metering(Box::new(MeteringDelta {
-            keyspace: "ks-1".to_owned(),
-            backend_id: "tidb-a".to_owned(),
-            public_endpoint: false,
-            response_bytes: 256,
-            cross_location_bytes: 0,
-        })))
+        .send(DispatchNotice::Metering {
+            delta: Box::new(MeteringDelta {
+                keyspace: "ks-1".to_owned(),
+                backend_id: "tidb-a".to_owned(),
+                public_endpoint: false,
+                response_bytes: 256,
+                cross_location_bytes: 0,
+            }),
+            ack: metering_ack_tx,
+        })
         .await
         .ok();
+    let Ok(Ok(())) = metering_ack_rx.await else {
+        unreachable!("the ledger absorbed the delta and acked the producer")
+    };
     // Paused clock: sleeping past the tick interval fires the ticker.
     tokio::time::sleep(Duration::from_millis(120)).await;
     let sent = wait_for_sent(&harness.sender, 1).await;
@@ -1395,4 +1403,326 @@ async fn futures_poll_once<F: Future + Unpin>(future: &mut F) -> Option<F::Outpu
         },
     )
     .await
+}
+
+/// The ordering barrier end to end: an unacked metering batch is
+/// retained; `Connected(2)` and an epoch-2-claimed `ReconcileSnapshot`
+/// acking it race through the two queues — the barrier applies the
+/// state first, the snapshot is CURRENT and acks; then a coalesced
+/// `Connected(3) → Disconnected` swallows epoch 3 entirely, and an
+/// epoch-3 snapshot arriving afterwards must be dropped as stale
+/// (no active session), never acking. The retained batch reappears in
+/// the next session's replay if and only if it was never acked.
+#[tokio::test(start_paused = true)]
+async fn stale_snapshot_after_coalesced_connect_never_acks() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7);
+    assert!(
+        handler
+            .metering()
+            .record(MeteringDelta {
+                keyspace: "ks-1".to_owned(),
+                backend_id: "tidb-a".to_owned(),
+                public_endpoint: false,
+                response_bytes: 64,
+                cross_location_bytes: 0,
+            })
+            .is_ok()
+    );
+    let Ok(Some(batch)) = handler.seal_metering() else {
+        unreachable!("one batch seals")
+    };
+    let harness = spawn_loop(handler);
+
+    // Coalesced connect: Connected(2) collapses into Disconnected
+    // before the dispatcher can observe it (same watch slot).
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+    harness.state_tx.send(ConnectionState::Disconnected).ok();
+    // An epoch-2 snapshot claiming the metering ack arrives afterwards:
+    // there is NO active session — it must be dropped, not applied.
+    let stale_ack = ControlEnvelope {
+        request_id: 50,
+        generation: 7,
+        control_epoch: 2,
+        body: Some(Body::ReconcileSnapshot(ReconcileSnapshot {
+            applied_generation: 7,
+            connection_event_sequence: 0,
+            metrics_sequence: 0,
+            metering_sequence: batch.sequence,
+            connections: Vec::new(),
+        })),
+        ..ControlEnvelope::default()
+    };
+    harness.inbound_tx.send(stale_ack).await.ok();
+
+    // The next real session replays everything unacknowledged: the
+    // batch MUST still be there — the stale ack never applied.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 3,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    assert!(
+        sent.iter().any(|envelope| matches!(
+            &envelope.body,
+            Some(Body::MeteringBatch(replayed)) if replayed.sequence == batch.sequence
+        )),
+        "the unacked batch replays: the dead session's ack was refused"
+    );
+    harness.task.abort();
+}
+
+/// The deterministic inbound-first barrier: a `Connected(2)` state
+/// change and an old-epoch-1 snapshot are both queued before the loop
+/// observes either. Whichever select arm wins, the pending state is
+/// applied BEFORE the envelope — so the old snapshot is judged against
+/// epoch 2 and dropped, never acking.
+#[tokio::test(start_paused = true)]
+async fn pending_connected_applies_before_queued_inbound() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7);
+    assert!(
+        handler
+            .metering()
+            .record(MeteringDelta {
+                keyspace: "ks-2".to_owned(),
+                backend_id: "tidb-a".to_owned(),
+                public_endpoint: false,
+                response_bytes: 32,
+                cross_location_bytes: 0,
+            })
+            .is_ok()
+    );
+    let Ok(Some(batch)) = handler.seal_metering() else {
+        unreachable!("one batch seals")
+    };
+    // Queue BOTH before spawning the loop: the select's first pick is
+    // genuinely arbitrary, and the barrier must make it irrelevant.
+    let sender = FakeSender::new();
+    let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+    let (inbound_tx, inbound_rx) = mpsc::channel(16);
+    let (notice_tx, notice_rx) = mpsc::channel(16);
+    let (snapshot_tx, _snapshot_rx) = mpsc::channel::<ControlEnvelope>(4);
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let old_ack = ControlEnvelope {
+        request_id: 51,
+        generation: 7,
+        control_epoch: 1,
+        body: Some(Body::ReconcileSnapshot(ReconcileSnapshot {
+            applied_generation: 7,
+            connection_event_sequence: 0,
+            metrics_sequence: 0,
+            metering_sequence: batch.sequence,
+            connections: Vec::new(),
+        })),
+        ..ControlEnvelope::default()
+    };
+    inbound_tx.try_send(old_ack).ok();
+    let task = tokio::spawn(run_control_dispatch(
+        handler,
+        Arc::clone(&sender),
+        state_rx,
+        inbound_rx,
+        notice_rx,
+        snapshot_tx,
+        Duration::from_secs(3600),
+        || 1_000_000,
+    ));
+    let _ = &notice_tx;
+
+    // Epoch 2's automatic replay proves the ordering: the reconcile
+    // request went out AND the batch is still unacked (the old-epoch
+    // snapshot was refused even if the inbound arm won the select).
+    let sent = wait_for_sent(&sender, 2).await;
+    assert!(sent.iter().any(|envelope| matches!(
+        &envelope.body,
+        Some(Body::MeteringBatch(replayed)) if replayed.sequence == batch.sequence
+    )));
+    // A second session still replays it: never acked.
+    state_tx.send(ConnectionState::Disconnected).ok();
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 3,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let sent = wait_for_sent(&sender, 4).await;
+    let replays = sent
+        .iter()
+        .filter(|envelope| {
+            matches!(
+                &envelope.body,
+                Some(Body::MeteringBatch(replayed)) if replayed.sequence == batch.sequence
+            )
+        })
+        .count();
+    assert!(replays >= 2, "the stale ack never applied: {replays}");
+    task.abort();
+}
+
+/// The applied-ack causal contract through the REAL double-queue path:
+/// registration and expectation are acknowledged by the dispatcher
+/// before the session would send its request, so the answer — arriving
+/// on the other queue — always finds the armed expectation.
+#[tokio::test(start_paused = true)]
+async fn applied_acks_order_arming_before_responses() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+
+    let (control_tx, _control_rx) = mpsc::channel(8);
+    let (resp_tx, mut resp_rx) = mpsc::channel(1);
+    let (register_ack_tx, register_ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::RegisterSession {
+            identity: identity(1),
+            namespace: "ns-a".to_owned(),
+            snapshot_generation: 7,
+            listener_name: "sql-a".to_owned(),
+            control: control_tx,
+            responses: Some(resp_tx),
+            applied: register_ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = register_ack_rx.await else {
+        unreachable!("registration is acknowledged when applied")
+    };
+    let (expect_ack_tx, expect_ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::ExpectResponse {
+            connection_id: 1,
+            request_id: 90,
+            kind: ResponseKind::RouteAssignment,
+            applied: expect_ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = expect_ack_rx.await else {
+        unreachable!("the expectation is acknowledged when armed")
+    };
+
+    // Only now would the session send its request — so the answer
+    // cannot precede the arm. Inject it on the inbound queue.
+    let answer = envelope(
+        90,
+        7,
+        Body::RouteAssignment(RouteAssignment {
+            connection_id: 1,
+            assignment_id: "a-1".to_owned(),
+            backend_id: "tidb-a".to_owned(),
+            backend_address: "10.0.0.1:4000".to_owned(),
+            cluster_name: String::new(),
+            keyspace: String::new(),
+            healthy: true,
+            local: true,
+            code: 0,
+            detail: String::new(),
+        }),
+    );
+    harness.inbound_tx.send(answer).await.ok();
+    let delivered = tokio::time::timeout(Duration::from_secs(1), resp_rx.recv()).await;
+    let Ok(Some(delivered)) = delivered else {
+        unreachable!("the armed answer is delivered: {delivered:?}")
+    };
+    assert_eq!(delivered.request_id, 90);
+    harness.task.abort();
+}
+
+/// Metering ownership under saturation: when the ledger cannot absorb
+/// a delta (open accumulation full AND the unacked retention bound
+/// reached), the producer's ack carries the fail-closed verdict and
+/// the delta is NOT silently dropped — its ownership stays with the
+/// producer. Malformed deltas (oversized keys) are rejected the same
+/// way. Nothing already retained is touched.
+#[tokio::test(start_paused = true)]
+async fn metering_saturation_rejects_producer_instead_of_dropping() {
+    let mut handler = ControlCommandHandler::new();
+    // Saturate: fill the unacked retention bound with sealed batches…
+    for index in 0..1024_u32 {
+        assert!(
+            handler
+                .metering()
+                .record(MeteringDelta {
+                    keyspace: format!("ks-{index}"),
+                    backend_id: "tidb-a".to_owned(),
+                    public_endpoint: false,
+                    response_bytes: 1,
+                    cross_location_bytes: 0,
+                })
+                .is_ok()
+        );
+        assert!(handler.seal_metering().is_ok());
+    }
+    // …and fill the open accumulation with distinct keys.
+    for index in 0..1024_u32 {
+        assert!(
+            handler
+                .metering()
+                .record(MeteringDelta {
+                    keyspace: format!("open-{index}"),
+                    backend_id: "tidb-a".to_owned(),
+                    public_endpoint: false,
+                    response_bytes: 1,
+                    cross_location_bytes: 0,
+                })
+                .is_ok()
+        );
+    }
+    let harness = spawn_loop(handler);
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::Metering {
+            delta: Box::new(MeteringDelta {
+                keyspace: "one-too-many".to_owned(),
+                backend_id: "tidb-a".to_owned(),
+                public_endpoint: false,
+                response_bytes: 1,
+                cross_location_bytes: 0,
+            }),
+            ack: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(Err(_)) = ack_rx.await else {
+        unreachable!("saturation must reject the producer, not drop the delta")
+    };
+
+    // Malformed input is rejected through the same ownership channel.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::Metering {
+            delta: Box::new(MeteringDelta {
+                keyspace: "k".repeat(4096),
+                backend_id: "tidb-a".to_owned(),
+                public_endpoint: false,
+                response_bytes: 1,
+                cross_location_bytes: 0,
+            }),
+            ack: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(Err(_)) = ack_rx.await else {
+        unreachable!("oversized keys are rejected to the producer")
+    };
+    harness.task.abort();
 }

@@ -53,7 +53,7 @@ func run() error {
 		Role:              controlpb.Role_ROLE_GO_CONTROL,
 		ProcessId:         "go-cross-language-fake",
 		SupportedVersions: []uint32{controlpb.ProtocolV1},
-		Capabilities:      []uint64{3, 5, 7},
+		Capabilities:      []uint64{2, 3, 5, 7},
 		MaxFrameBytes:     controlpb.DefaultMaxFrameBytes,
 	}
 	if err := controlpb.WriteFrame(conn, helloEnvelope(localHello), controlpb.DefaultMaxFrameBytes); err != nil {

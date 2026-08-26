@@ -119,7 +119,7 @@ async fn rust_client_exchanges_messages_with_go_codec_peer() -> Result<(), Box<d
         role: Role::RustDataplane as i32,
         process_id: "rust-cross-language-client".to_owned(),
         supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
-        capabilities: vec![3, 7],
+        capabilities: vec![2, 3, 7],
         max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
         ..Default::default()
     };
