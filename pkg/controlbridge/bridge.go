@@ -5,13 +5,17 @@ package controlbridge
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
+	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
+	"google.golang.org/protobuf/proto"
 )
 
 // DefaultOrphanResolveInterval paces the rehydration/orphan cadence
@@ -42,6 +46,47 @@ type BridgeConfig struct {
 	SnapshotSyncInterval time.Duration
 }
 
+// DrainScope selects which sessions a drain covers; empty lists mean
+// the whole instance.
+type DrainScope struct {
+	// ListenerNames restricts the drain to sessions admitted on these
+	// listeners.
+	ListenerNames []string
+	// BackendIDs restricts the drain to sessions currently attached to
+	// these backends.
+	BackendIDs []string
+}
+
+// DrainRequest is one operator drain: a stable caller id, its scope,
+// and one absolute time budget (graceful wait, then force).
+type DrainRequest struct {
+	// DrainID is the operator's stable id; repeating it is idempotent.
+	DrainID string
+	// Scope selects the covered sessions.
+	Scope DrainScope
+	// GracefulWait is how long sessions may finish at safe boundaries.
+	GracefulWait time.Duration
+	// ForceTimeout is the additional window before force close.
+	ForceTimeout time.Duration
+}
+
+// ErrForeignDrainActive reports that a previous incarnation's drain is
+// still running on the dataplane; the operator retries after it
+// resolves.
+var ErrForeignDrainActive = errors.New("a previous incarnation's drain is still active on the dataplane")
+
+// ErrNoDataplaneSession reports that no negotiated control session
+// exists to carry the drain.
+var ErrNoDataplaneSession = errors.New("no active Rust dataplane control session")
+
+// activeDrainState retains the wire-independent request so reconnects
+// re-send the same operation idempotently.
+type activeDrainState struct {
+	request       DrainRequest
+	command       *controlpb.DrainCommand
+	lastSyncEpoch uint64
+}
+
 // Bridge is the single Go composition entry for the control plane
 // (CTL-06): it owns the transport listener, the composite handler
 // (router adapter + drain issuer + metering consumer), and the
@@ -55,6 +100,9 @@ type Bridge struct {
 	interval         time.Duration
 	publisher        *SnapshotPublisher
 	snapshotInterval time.Duration
+
+	drainMu     sync.Mutex
+	activeDrain *activeDrainState
 }
 
 // NewBridge builds and binds the whole composition: adapter, issuer
@@ -128,6 +176,126 @@ func (bridge *Bridge) Publisher() *SnapshotPublisher {
 	return bridge.publisher
 }
 
+// StartDrain issues (or idempotently re-issues) one operator drain.
+// The wire command carries absolute deadlines computed from one budget
+// at first issuance, the issuer's single-flight and sequence binding
+// apply, and a send failure keeps the responsibility with the
+// operator's next retry (the reservation is released, never the
+// binding). A still-active foreign drain (a previous incarnation's)
+// is reported for retry; its resolution signal is consumed here.
+func (bridge *Bridge) StartDrain(ctx context.Context, request DrainRequest) error {
+	if request.DrainID == "" {
+		return errors.New("drain id is required")
+	}
+	sender := bridge.server.Active()
+	if sender == nil {
+		return ErrNoDataplaneSession
+	}
+	// Consume a resolved foreign drain first: after resolution the
+	// operator's own drain may proceed.
+	_ = bridge.issuer.ForeignDrainResolved()
+	if foreign := bridge.issuer.ForeignActiveDrain(); foreign != nil {
+		return fmt.Errorf("%w: %s", ErrForeignDrainActive, foreign.GetDrainId())
+	}
+
+	bridge.drainMu.Lock()
+	state := bridge.activeDrain
+	if state == nil || state.request.DrainID != request.DrainID {
+		now := time.Now()
+		graceful := now.Add(request.GracefulWait)
+		force := graceful.Add(request.ForceTimeout)
+		state = &activeDrainState{
+			request: request,
+			command: &controlpb.DrainCommand{
+				DrainId:                    request.DrainID,
+				ListenerNames:              request.Scope.ListenerNames,
+				BackendIds:                 request.Scope.BackendIDs,
+				GracefulDeadlineUnixMillis: uint64(graceful.UnixMilli()),
+				ForceDeadlineUnixMillis:    uint64(force.UnixMilli()),
+			},
+		}
+	}
+	command, ok := proto.Clone(state.command).(*controlpb.DrainCommand)
+	if !ok {
+		bridge.drainMu.Unlock()
+		return errors.New("clone drain command")
+	}
+	bridge.drainMu.Unlock()
+
+	requestID, err := sender.AllocateRequestID()
+	if err != nil {
+		return err
+	}
+	generation := uint64(0)
+	if bridge.publisher != nil {
+		generation = bridge.publisher.Status().AppliedGeneration
+	}
+	if err := bridge.issuer.StartDrain(ctx, sender, requestID, generation, command); err != nil {
+		return err
+	}
+	bridge.drainMu.Lock()
+	state.lastSyncEpoch = sender.Epoch()
+	bridge.activeDrain = state
+	bridge.drainMu.Unlock()
+	return nil
+}
+
+// DrainStatus reports the latest observed result for the operator's
+// drain id plus whether that drain completed. A nil result means the
+// id is unknown to this incarnation.
+func (bridge *Bridge) DrainStatus(drainID string) (*controlpb.DrainResult, bool) {
+	result, completed := bridge.issuer.Progress(drainID)
+	return result, completed
+}
+
+// syncDrain re-issues the active drain after a control reconnect (a
+// restarted Rust lineage lost the gate state; the reconcile watermark
+// plus this idempotent replay converge it) and clears the record once
+// its terminal result arrived.
+func (bridge *Bridge) syncDrain(ctx context.Context) {
+	sender := bridge.server.Active()
+	if sender == nil {
+		return
+	}
+	bridge.drainMu.Lock()
+	state := bridge.activeDrain
+	if state == nil {
+		bridge.drainMu.Unlock()
+		return
+	}
+	if result, completed := bridge.issuer.Progress(state.request.DrainID); completed &&
+		result != nil {
+		bridge.activeDrain = nil
+		bridge.drainMu.Unlock()
+		return
+	}
+	epoch := sender.Epoch()
+	if state.lastSyncEpoch == epoch {
+		bridge.drainMu.Unlock()
+		return
+	}
+	command, ok := proto.Clone(state.command).(*controlpb.DrainCommand)
+	bridge.drainMu.Unlock()
+	if !ok {
+		return
+	}
+	requestID, err := sender.AllocateRequestID()
+	if err != nil {
+		return
+	}
+	generation := uint64(0)
+	if bridge.publisher != nil {
+		generation = bridge.publisher.Status().AppliedGeneration
+	}
+	if bridge.issuer.StartDrain(ctx, sender, requestID, generation, command) == nil {
+		bridge.drainMu.Lock()
+		if bridge.activeDrain != nil {
+			bridge.activeDrain.lastSyncEpoch = epoch
+		}
+		bridge.drainMu.Unlock()
+	}
+}
+
 // Run serves the control socket and drives the orphan-resolution
 // cadence until ctx cancels or Close is called; it returns the serve
 // result after the cadence worker has stopped.
@@ -153,6 +321,7 @@ func (bridge *Bridge) Run(ctx context.Context) error {
 				if bridge.publisher != nil {
 					_ = bridge.publisher.Sync(ctx, bridge.server.Active())
 				}
+				bridge.syncDrain(ctx)
 			}
 		}
 	})
