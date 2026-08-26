@@ -444,3 +444,135 @@ fn stale_generations_never_affect_new_connections() {
     assert_eq!(request.connections[0].connection_id, 2);
     assert_eq!(request.connections[0].backend_id, "tidb-b");
 }
+
+/// Metering is deduplicated cumulative state: the open accumulation
+/// merges by key, sealed batches carry strictly monotonic sequences,
+/// replay after a reconnect is byte-identical under the original
+/// sequences (the peer's greater-than dedup absorbs duplicates), a
+/// reconcile ack drops exactly the acknowledged prefix, and the
+/// retention bound fails closed instead of dropping.
+#[test]
+fn metering_is_deduplicated_cumulative_and_replayable() {
+    use control_proto::v1::MeteringDelta;
+    use dataplane::control_commands::{MAX_UNACKED_METERING_BATCHES, MeteringLedger};
+
+    let delta = |keyspace: &str, bytes: u64| MeteringDelta {
+        keyspace: keyspace.to_owned(),
+        backend_id: "tidb-a".to_owned(),
+        public_endpoint: false,
+        response_bytes: bytes,
+        cross_location_bytes: bytes / 2,
+    };
+
+    let mut ledger = MeteringLedger::new();
+    assert_eq!(ledger.seal(), Ok(None), "nothing accumulated, nothing sealed");
+
+    // Same key merges cumulatively; different key stays separate.
+    ledger.record(delta("ks-a", 100));
+    ledger.record(delta("ks-a", 50));
+    ledger.record(delta("ks-b", 10));
+    let Ok(Some(first)) = ledger.seal() else {
+        unreachable!("first seal")
+    };
+    assert_eq!(first.sequence, 1);
+    assert_eq!(first.deltas.len(), 2);
+    let merged = first
+        .deltas
+        .iter()
+        .find(|entry| entry.keyspace == "ks-a")
+        .map(|entry| (entry.response_bytes, entry.cross_location_bytes));
+    assert_eq!(merged, Some((150, 75)), "same-key deltas merge cumulatively");
+
+    ledger.record(delta("ks-a", 7));
+    let Ok(Some(second)) = ledger.seal() else {
+        unreachable!("second seal")
+    };
+    assert_eq!(second.sequence, 2, "sequences are strictly monotonic");
+
+    // Reconnect before any ack: replay is byte-identical, in order,
+    // under the original sequences.
+    assert_eq!(ledger.replay(), vec![first.clone(), second.clone()]);
+    assert_eq!(ledger.last_sequence(), 2);
+
+    // The peer's reconcile acknowledges through sequence 1: exactly the
+    // acknowledged prefix drops; re-acking is idempotent.
+    ledger.acked_through(1);
+    assert_eq!(ledger.replay(), vec![second.clone()]);
+    ledger.acked_through(1);
+    assert_eq!(ledger.unacked_len(), 1);
+    ledger.acked_through(2);
+    assert_eq!(ledger.unacked_len(), 0, "fully acknowledged");
+
+    // The retention bound fails closed: the accumulation stays intact
+    // and no batch is dropped.
+    let mut full = MeteringLedger::new();
+    for index in 0..MAX_UNACKED_METERING_BATCHES {
+        full.record(delta("ks", u64::try_from(index).unwrap_or(u64::MAX) + 1));
+        assert!(full.seal().is_ok());
+    }
+    full.record(delta("ks", 5));
+    let backlog = full.seal();
+    assert!(backlog.is_err(), "backlog full fails closed, never drops");
+    // The accumulation survives for a later seal after acks arrive.
+    full.acked_through(1);
+    let Ok(Some(late)) = full.seal() else {
+        unreachable!("seal succeeds once space exists")
+    };
+    assert_eq!(
+        late.sequence,
+        u64::try_from(MAX_UNACKED_METERING_BATCHES).unwrap_or(u64::MAX) + 1
+    );
+}
+
+/// Redirect terminal replay survives a control reconnect (a new Go
+/// epoch): the gate's caches are keyed by `(connection_id,
+/// redirect_id)` alone, deliberately independent of transport epochs
+/// and request ids — while snapshot generations, a separate dimension,
+/// only travel with connection incarnations and reconciliation.
+#[test]
+fn redirect_replay_survives_epochs_and_generations_stay_separate() {
+    let mut gate = gate_with_connection(1, "tidb-a");
+    let _ = gate.admit_redirect(&redirect(1, "r-1"));
+    let Some(result) = gate.complete_redirect(1, "r-1", true, "tidb-b", ErrorCode::Ok) else {
+        unreachable!("completion produces the result")
+    };
+
+    // The control stream reconnects: a new epoch replays the duplicate
+    // command (new request ids, same redirect id). The cached terminal
+    // replays verbatim — no epoch or request-id dimension exists in the
+    // key, by design.
+    assert_eq!(
+        gate.admit_redirect(&redirect(1, "r-1")),
+        RedirectAdmission::Replay(result.clone())
+    );
+
+    // Reconcile after the reconnect: Go still believes r-1 pending →
+    // the same terminal result is the repair, regardless of epoch.
+    let repairs = gate.apply_reconcile_snapshot(&ReconcileSnapshot {
+        applied_generation: 11,
+        connection_event_sequence: 0,
+        metrics_sequence: 0,
+        metering_sequence: 0,
+        connections: vec![ReconcileConnection {
+            connection_id: 1,
+            backend_id: "tidb-a".to_owned(),
+            namespace: "ns-a".to_owned(),
+            redirect_pending: true,
+        }],
+    });
+    assert_eq!(repairs.replay_redirect_results, vec![result]);
+
+    // Generations are a different dimension: a new connection admitted
+    // under generation 11 shares nothing with the closed generation-7
+    // incarnation, and the old incarnation's commands never touch it.
+    gate.unregister_connection(1);
+    gate.register_connection(2, "ns-a", 11);
+    assert_eq!(
+        gate.admit_redirect(&redirect(1, "r-2")),
+        RedirectAdmission::UnknownConnection,
+        "the retired incarnation's id space is dead"
+    );
+    let request = gate.build_reconcile_request(11, 0, 0);
+    assert_eq!(request.connections.len(), 1);
+    assert_eq!(request.connections[0].connection_id, 2);
+}

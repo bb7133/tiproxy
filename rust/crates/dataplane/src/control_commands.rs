@@ -60,9 +60,11 @@
 
 use std::collections::HashMap;
 
+use std::collections::VecDeque;
+
 use control_proto::v1::{
-    CloseResult, DrainCommand, DrainResult, ErrorCode, ReconcileConnection, ReconcileRequest,
-    ReconcileSnapshot, RedirectCommand, RedirectResult,
+    CloseResult, DrainCommand, DrainResult, ErrorCode, MeteringBatch, MeteringDelta,
+    ReconcileConnection, ReconcileRequest, ReconcileSnapshot, RedirectCommand, RedirectResult,
 };
 use tokio::time::Instant;
 
@@ -585,4 +587,124 @@ pub struct ReconcileRepairs {
     /// Connections the peer lists but this side does not know: answer
     /// with terminal CLOSED events (never negative counts).
     pub ghost_connections: Vec<u64>,
+}
+
+/// Producer-side metering with **deduplicated cumulative** semantics
+/// (CTL-06 scope): deltas accumulate into an open batch (merged by
+/// `(keyspace, backend_id, public_endpoint)`), sealed batches carry a
+/// strictly monotonic sequence and are retained until the peer's
+/// reconcile acknowledges them. The consumer applies a batch only when
+/// its sequence exceeds the last applied one, so at-least-once replay
+/// with stable sequences never double-counts.
+///
+/// Sealed batches are **never coalesced**: a batch the peer may already
+/// have applied must replay byte-identical under its original sequence,
+/// or the dedup rule would double-count its deltas. Only the open
+/// (never-sent) accumulation merges. Metrics, by contrast, are best
+/// effort end to end: the transport sheds `MetricsBatch` bodies under
+/// bulk-lane pressure with a typed local counter
+/// (`control-proto::control_transport`), and nothing here depends on a
+/// metrics sequence.
+#[derive(Debug, Default)]
+pub struct MeteringLedger {
+    last_sealed_sequence: u64,
+    open: Vec<MeteringDelta>,
+    unacked: VecDeque<MeteringBatch>,
+}
+
+/// The unacked-batch retention bound was hit: the control plane has not
+/// acknowledged metering for too long. Metering must never be dropped,
+/// so the caller applies backpressure or declares the control stream
+/// unhealthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteringBacklogFull {
+    /// Retained sealed-but-unacknowledged batches.
+    pub unacked: usize,
+}
+
+/// Hard bound on retained sealed batches awaiting acknowledgement.
+pub const MAX_UNACKED_METERING_BATCHES: usize = 1024;
+
+impl MeteringLedger {
+    /// Creates an empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accumulates one delta into the open batch, merging with an
+    /// existing entry for the same `(keyspace, backend_id,
+    /// public_endpoint)` key (cumulative, saturating).
+    pub fn record(&mut self, delta: MeteringDelta) {
+        if let Some(existing) = self.open.iter_mut().find(|entry| {
+            entry.keyspace == delta.keyspace
+                && entry.backend_id == delta.backend_id
+                && entry.public_endpoint == delta.public_endpoint
+        }) {
+            existing.response_bytes = existing.response_bytes.saturating_add(delta.response_bytes);
+            existing.cross_location_bytes = existing
+                .cross_location_bytes
+                .saturating_add(delta.cross_location_bytes);
+            return;
+        }
+        self.open.push(delta);
+    }
+
+    /// Seals the open accumulation into the next sequenced batch for
+    /// sending; returns `None` when nothing accumulated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backlog error (leaving the accumulation intact) when
+    /// the unacked retention bound is reached — metering is never
+    /// dropped, so the caller must apply backpressure instead.
+    pub fn seal(&mut self) -> Result<Option<MeteringBatch>, MeteringBacklogFull> {
+        if self.open.is_empty() {
+            return Ok(None);
+        }
+        if self.unacked.len() >= MAX_UNACKED_METERING_BATCHES {
+            return Err(MeteringBacklogFull {
+                unacked: self.unacked.len(),
+            });
+        }
+        self.last_sealed_sequence = self.last_sealed_sequence.saturating_add(1);
+        let batch = MeteringBatch {
+            sequence: self.last_sealed_sequence,
+            deltas: std::mem::take(&mut self.open),
+        };
+        self.unacked.push_back(batch.clone());
+        Ok(Some(batch))
+    }
+
+    /// The last sealed sequence (for `ReconcileRequest`).
+    #[must_use]
+    pub const fn last_sequence(&self) -> u64 {
+        self.last_sealed_sequence
+    }
+
+    /// Applies the peer's acknowledged sequence (from its reconcile
+    /// snapshot): every retained batch at or below it is dropped.
+    pub fn acked_through(&mut self, sequence: u64) {
+        while self
+            .unacked
+            .front()
+            .is_some_and(|batch| batch.sequence <= sequence)
+        {
+            let _ = self.unacked.pop_front();
+        }
+    }
+
+    /// Sealed batches the peer has not acknowledged, in sequence order:
+    /// replayed verbatim after a reconnect. The peer's
+    /// sequence-greater-than dedup makes the replay idempotent.
+    #[must_use]
+    pub fn replay(&self) -> Vec<MeteringBatch> {
+        self.unacked.iter().cloned().collect()
+    }
+
+    /// Retained unacknowledged batch count.
+    #[must_use]
+    pub fn unacked_len(&self) -> usize {
+        self.unacked.len()
+    }
 }

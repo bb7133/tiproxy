@@ -55,6 +55,12 @@ type RouterAdapter struct {
 	sender      EnvelopeSender
 	senderEpoch uint64
 	nextID      atomic.Uint64
+
+	// metering, when attached, owns deduplicated cumulative metering;
+	// its highest applied sequence is the reconcile acknowledgement the
+	// Rust producer uses to drop retained batches (CTL-06). Without a
+	// consumer the snapshot echoes the request's claimed sequence.
+	metering *MeteringConsumer
 }
 
 type connectionState struct {
@@ -558,9 +564,27 @@ func (adapter *RouterAdapter) handleReconcile(
 			AppliedGeneration:       request.GetKnownGeneration(),
 			ConnectionEventSequence: request.GetLastConnectionEventSequence(),
 			MetricsSequence:         request.GetLastMetricsSequence(),
-			MeteringSequence:        request.GetLastMeteringSequence(),
+			MeteringSequence:        adapter.meteringAcknowledgement(request.GetLastMeteringSequence()),
 			Connections:             snapshot,
 		}})
+}
+
+// AttachMetering installs the deduplicated cumulative metering consumer
+// whose applied sequence acknowledges producer retention on reconcile.
+func (adapter *RouterAdapter) AttachMetering(consumer *MeteringConsumer) {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	adapter.metering = consumer
+}
+
+func (adapter *RouterAdapter) meteringAcknowledgement(claimed uint64) uint64 {
+	adapter.mu.Lock()
+	consumer := adapter.metering
+	adapter.mu.Unlock()
+	if consumer == nil {
+		return claimed
+	}
+	return consumer.LastApplied()
 }
 
 func (adapter *RouterAdapter) closeStateLocked(state *connectionState, source backend.ErrorSource) {
