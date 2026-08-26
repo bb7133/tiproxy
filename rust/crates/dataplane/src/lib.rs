@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod control_commands;
 pub mod registry;
 pub mod route;
 pub mod route_control;
@@ -30,6 +31,9 @@ pub mod session;
 pub use admission::{
     AdmissionController, AdmissionMetricsSnapshot, AdmissionPolicy, AdmissionPolicyError,
     AdmissionRejection, MemoryProbe, MemoryProbeError, MemorySample, SystemMemoryProbe,
+};
+pub use control_commands::{
+    CloseAdmission, CommandGate, DrainAdmission, DrainPhase, ReconcileRepairs, RedirectAdmission,
 };
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,
