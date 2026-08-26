@@ -56,3 +56,30 @@ cargo test --locked --manifest-path rust/Cargo.toml -p dataplane
 cargo clippy --locked --manifest-path rust/Cargo.toml \
   -p dataplane --all-targets --all-features -- -D warnings
 ```
+
+## Session event loop (`session`, DPL-01)
+
+`SessionLoop` is the single owner of one session's mutable state: the
+SES-00 FSM, the armed one-shot deadline (handshake until authentication,
+drain when `BeginDrainTimer` fires), the backend-active probe cadence
+(Go `checkBackendActive`), and the child-operation `JoinSet`. There is no
+session mutex: the `SessionEventSource` (SES-layer classification; the
+loop never sees packet bytes) and the `EffectHandler` (which may spawn
+**tracked** children but cannot own session state) borrow `&mut` for one
+call at a time.
+
+Biased select order: server shutdown, control commands, the armed
+deadline, the probe, finished children, transport events. When the FSM
+enters `Closing` the loop itself drains children under the cleanup
+deadline and seals the machine with `TeardownComplete`. Every exit path
+(client/backend/control EOF, server shutdown, control-channel loss,
+normal close) drives the FSM's teardown effects exactly once and
+reports deadline-bounded cleanup accounting in `SessionSummary`.
+
+`tests/session_loop.rs` runs under Tokio's paused-time deterministic
+scheduler: scripted lifecycle with exact effect order, stuck-child
+release within the cleanup deadline, an explicit enumeration of all six
+redirect × graceful-close × shutdown arrival orders (no deadlock), the
+handshake deadline firing only before authentication, dead-probe
+teardown, and control-loss/rejection accounting. The no-detached-task
+property is structural: handlers only ever receive `&mut JoinSet`.

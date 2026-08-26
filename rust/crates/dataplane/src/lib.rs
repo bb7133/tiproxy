@@ -23,6 +23,7 @@
 pub mod admission;
 pub mod registry;
 pub mod server;
+pub mod session;
 
 pub use admission::{
     AdmissionController, AdmissionMetricsSnapshot, AdmissionPolicy, AdmissionPolicyError,
