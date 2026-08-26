@@ -24,7 +24,7 @@ use session_core::fsm::{
 
 /// Every event, so exploration and illegal-pair checks cover the whole
 /// alphabet. A new variant that is not added here fails the count pin.
-const ALL_EVENTS: [SessionEvent; 30] = [
+const ALL_EVENTS: [SessionEvent; 37] = [
     SessionEvent::ConnectionAccepted,
     SessionEvent::BackendGreetingReceived,
     SessionEvent::ClientSslRequest,
@@ -35,7 +35,14 @@ const ALL_EVENTS: [SessionEvent; 30] = [
     SessionEvent::ClientCommand,
     SessionEvent::ClientCommandQuit,
     SessionEvent::NoResponseCommandComplete,
+    SessionEvent::InternalResponseTxnDone,
+    SessionEvent::InternalResponseTxnOpen,
+    SessionEvent::BackendStateUnknown,
+    SessionEvent::BackendResponseErrorComplete,
+    SessionEvent::InternalResponseError,
     SessionEvent::BackendResponsePart,
+    SessionEvent::BackendResponsePartTxnDone,
+    SessionEvent::BackendResponsePartTxnOpen,
     SessionEvent::BackendResponseTxnDone,
     SessionEvent::BackendResponseTxnOpen,
     SessionEvent::BackendLocalInfileRequest,

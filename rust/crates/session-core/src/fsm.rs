@@ -150,6 +150,42 @@ pub enum SessionEvent {
     /// SES-05 reports that no prepared statement has pending long data or an
     /// unread cursor.
     PreparedStateClear,
+    /// An **internal** command's response completed with the transaction
+    /// finished (SES-07 held-`BEGIN` `COMMIT`): boundary logic runs but
+    /// nothing is forwarded to the client.
+    InternalResponseTxnDone,
+    /// An internal command's response completed with an authoritative
+    /// status still showing an open transaction; nothing is forwarded.
+    /// An internal ERR is **not** this event — it carries no status and
+    /// must enter as [`SessionEvent::InternalResponseError`].
+    InternalResponseTxnOpen,
+    /// A disruption (cancellation, aborted exchange, unclassifiable
+    /// failure) made the backend transaction state unknowable. Migration
+    /// and immediate graceful close are blocked until an authoritative
+    /// response status refreshes the knowledge (SES-07 hardening).
+    BackendStateUnknown,
+    /// A non-final result inside one command (`MORE_RESULTS`) ended with
+    /// an authoritative OK/EOF whose status says the transaction is
+    /// **finished**. The command continues (no boundary crossing), but the
+    /// status is applied exactly like Go's per-terminator
+    /// `updateServerStatus`, restoring unknown-state knowledge.
+    BackendResponsePartTxnDone,
+    /// A non-final result ended with an authoritative status saying the
+    /// transaction is still **open**; applied without crossing the
+    /// command boundary.
+    BackendResponsePartTxnOpen,
+    /// The backend response completed with an ERR packet. An ERR carries
+    /// no server status (Go `handleErrorPacket` keeps `serverStatus`), so
+    /// the boundary is decided on the **retained** transaction state —
+    /// including any status applied by an earlier result of the same
+    /// multi-result command — and unknown-state knowledge is **not**
+    /// restored.
+    BackendResponseErrorComplete,
+    /// An internal command completed with an ERR packet: no client
+    /// forwarding (the SES-07 hold machine owns the one-shot error
+    /// forward), retained transaction state, and no unknown-state
+    /// restoration.
+    InternalResponseError,
     /// Control plane: migrate this session to a new backend.
     ControlRedirect,
     /// Control plane: close gracefully at the next safe boundary.
@@ -249,7 +285,7 @@ impl std::error::Error for TransitionError {}
 /// Extended-state flags; exposed read-only for observability and tests.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "these are seven independent extended-state dimensions of the \
+    reason = "these are eight independent extended-state dimensions of the \
               model; folding them into nested enums would obscure the \
               reachable-space enumeration the model test performs"
 )]
@@ -263,6 +299,9 @@ pub struct SessionFlags {
     pub in_txn: bool,
     /// SES-05 has at least one pending long-data/cursor guard.
     pub prepared_pending: bool,
+    /// The backend transaction state is unknowable after a disruption;
+    /// never a safe boundary until an authoritative status clears it.
+    pub txn_unknown: bool,
     /// A control-plane redirect awaits the next transaction boundary.
     pub redirect_pending: bool,
     /// A graceful close awaits the next transaction boundary.
@@ -332,6 +371,10 @@ impl SessionFsm {
                 }
                 SessionEvent::PreparedStateClear => {
                     self.flags.prepared_pending = false;
+                    return Ok(Effects::new());
+                }
+                SessionEvent::BackendStateUnknown => {
+                    self.flags.txn_unknown = true;
                     return Ok(Effects::new());
                 }
                 _ => {}
@@ -527,9 +570,35 @@ impl SessionFsm {
         }
     }
 
-    /// Go `finishedTxn`: no open transaction and no pending prepared guard.
+    /// The single authoritative safe-boundary decision (issue #32):
+    /// Go `finishedTxn` — no open transaction, no pending prepared guard —
+    /// plus the SES-07 hardening that unknown backend state is never safe.
+    /// Phase gating (command in flight, `MORE_RESULTS`, LOCAL INFILE,
+    /// change-user, migration, closing) is inherent: those are states in
+    /// which redirect/drain queue instead of firing, so every migration and
+    /// drain decision in this machine flows through this one predicate at
+    /// state-completion points.
+    /// True only when the session is **between commands** (`Ready` or
+    /// `Draining`) with clear flags. Every in-flight phase — a command
+    /// awaiting its response, a `MORE_RESULTS` window, LOCAL INFILE,
+    /// change-user, an in-flight migration, teardown — returns false:
+    /// those phases queue redirect/drain instead of firing them.
+    #[must_use]
+    pub const fn is_safe_boundary(&self) -> bool {
+        matches!(self.state, SessionState::Ready | SessionState::Draining)
+            && self.flags_permit_boundary()
+    }
+
+    /// The flag half of the authority (Go `finishedTxn` + unknown-state
+    /// hardening). Command-completion handlers reuse exactly this while
+    /// the machine is still in the completing phase — completion *is* the
+    /// boundary point, so the phase term is supplied by construction.
+    const fn flags_permit_boundary(&self) -> bool {
+        !self.flags.in_txn && !self.flags.prepared_pending && !self.flags.txn_unknown
+    }
+
     const fn at_migration_boundary(&self) -> bool {
-        !self.flags.in_txn && !self.flags.prepared_pending
+        self.flags_permit_boundary()
     }
 
     /// Shared safe-boundary handling after prepared/transaction state is
@@ -553,9 +622,48 @@ impl SessionFsm {
     }
 
     /// Shared response-boundary handling for `Command` and `Response`.
+    /// An authoritative status also restores transaction knowledge.
     fn response_complete(&mut self, txn_done: bool) -> (SessionState, Effects) {
         self.flags.in_txn = !txn_done;
+        self.flags.txn_unknown = false;
         self.finish_command(vec![SessionEffect::ForwardResponseToClient])
+    }
+
+    /// Internal-command boundary (SES-07 held-`BEGIN` `COMMIT`): identical
+    /// boundary logic but **nothing is forwarded to the client** — the OK
+    /// of an internal `COMMIT` must never leak, and the runtime owns the
+    /// one-shot forwarding of an internal `COMMIT`'s error.
+    fn internal_response_complete(&mut self, txn_done: bool) -> (SessionState, Effects) {
+        self.flags.in_txn = !txn_done;
+        self.flags.txn_unknown = false;
+        self.finish_command(Effects::new())
+    }
+
+    /// ERR completion: the client sees the forwarded ERR, the command
+    /// ends, and the boundary is decided on the **retained** flags — an
+    /// ERR carries no status, so it can neither change the transaction
+    /// state nor restore unknown-state knowledge.
+    fn error_response_complete(&mut self) -> (SessionState, Effects) {
+        self.finish_command(vec![SessionEffect::ForwardResponseToClient])
+    }
+
+    /// Mid-command authoritative status (a `MORE_RESULTS` terminator):
+    /// applied exactly like Go's per-terminator `updateServerStatus` —
+    /// including restoring unknown-state knowledge — while the command
+    /// stays in flight (no boundary evaluation).
+    fn part_status(&mut self, txn_done: bool) -> (SessionState, Effects) {
+        self.flags.in_txn = !txn_done;
+        self.flags.txn_unknown = false;
+        (
+            SessionState::Response,
+            vec![SessionEffect::ForwardResponseToClient],
+        )
+    }
+
+    /// Internal ERR completion: retained flags, no forwarding, no
+    /// unknown-state restoration.
+    fn internal_error_complete(&mut self) -> (SessionState, Effects) {
+        self.finish_command(Effects::new())
     }
 
     fn on_command(&mut self, event: SessionEvent) -> Option<(SessionState, Effects)> {
@@ -566,7 +674,13 @@ impl SessionFsm {
             )),
             SessionEvent::BackendResponseTxnDone => Some(self.response_complete(true)),
             SessionEvent::BackendResponseTxnOpen => Some(self.response_complete(false)),
+            SessionEvent::BackendResponsePartTxnDone => Some(self.part_status(true)),
+            SessionEvent::BackendResponsePartTxnOpen => Some(self.part_status(false)),
             SessionEvent::NoResponseCommandComplete => Some(self.finish_command(Effects::new())),
+            SessionEvent::InternalResponseTxnDone => Some(self.internal_response_complete(true)),
+            SessionEvent::InternalResponseTxnOpen => Some(self.internal_response_complete(false)),
+            SessionEvent::BackendResponseErrorComplete => Some(self.error_response_complete()),
+            SessionEvent::InternalResponseError => Some(self.internal_error_complete()),
             SessionEvent::BackendLocalInfileRequest => Some((
                 SessionState::LocalInfile,
                 vec![SessionEffect::RequestLocalInfileFromClient],
@@ -617,6 +731,9 @@ impl SessionFsm {
             )),
             SessionEvent::BackendResponseTxnDone => Some(self.response_complete(true)),
             SessionEvent::BackendResponseTxnOpen => Some(self.response_complete(false)),
+            SessionEvent::BackendResponsePartTxnDone => Some(self.part_status(true)),
+            SessionEvent::BackendResponsePartTxnOpen => Some(self.part_status(false)),
+            SessionEvent::BackendResponseErrorComplete => Some(self.error_response_complete()),
             SessionEvent::ControlRedirect => {
                 // Duplicate signals are illegal (one outstanding per session).
                 if self.flags.redirect_pending {
@@ -770,6 +887,13 @@ impl SessionFsm {
             | SessionEvent::BackendResponsePart
             | SessionEvent::BackendResponseTxnDone
             | SessionEvent::BackendResponseTxnOpen
+            | SessionEvent::BackendResponsePartTxnDone
+            | SessionEvent::BackendResponsePartTxnOpen
+            | SessionEvent::BackendResponseErrorComplete
+            | SessionEvent::InternalResponseTxnDone
+            | SessionEvent::InternalResponseTxnOpen
+            | SessionEvent::InternalResponseError
+            | SessionEvent::BackendStateUnknown
             | SessionEvent::BackendLocalInfileRequest
             | SessionEvent::ClientInfileChunk
             | SessionEvent::ClientInfileEnd
@@ -1017,6 +1141,11 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Ready,
+        SessionEvent::BackendStateUnknown,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Ready,
         SessionEvent::ControlRedirect,
         SessionState::RedirectPending,
     ),
@@ -1068,6 +1197,16 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Command,
+        SessionEvent::BackendResponsePartTxnDone,
+        SessionState::Response,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponsePartTxnOpen,
+        SessionState::Response,
+    ),
+    t(
+        SessionState::Command,
         SessionEvent::BackendResponseTxnDone,
         SessionState::Ready,
     ),
@@ -1094,6 +1233,96 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::Command,
         SessionEvent::BackendResponseTxnOpen,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::RedirectPending,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseError,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseError,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseError,
+        SessionState::RedirectPending,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseError,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::RedirectPending,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseTxnDone,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseTxnDone,
+        SessionState::RedirectPending,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseTxnDone,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseTxnDone,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseTxnOpen,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseTxnOpen,
         SessionState::Draining,
     ),
     t(
@@ -1124,6 +1353,11 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::Command,
         SessionEvent::PreparedStateClear,
+        SessionState::Command,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendStateUnknown,
         SessionState::Command,
     ),
     t(
@@ -1179,6 +1413,16 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Response,
+        SessionEvent::BackendResponsePartTxnDone,
+        SessionState::Response,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponsePartTxnOpen,
+        SessionState::Response,
+    ),
+    t(
+        SessionState::Response,
         SessionEvent::BackendLocalInfileRequest,
         SessionState::LocalInfile,
     ),
@@ -1220,6 +1464,11 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::Response,
         SessionEvent::PreparedStateClear,
+        SessionState::Response,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendStateUnknown,
         SessionState::Response,
     ),
     t(
@@ -1281,6 +1530,11 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::LocalInfile,
         SessionEvent::PreparedStateClear,
+        SessionState::LocalInfile,
+    ),
+    t(
+        SessionState::LocalInfile,
+        SessionEvent::BackendStateUnknown,
         SessionState::LocalInfile,
     ),
     t(
@@ -1387,6 +1641,11 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Draining,
+        SessionEvent::BackendStateUnknown,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Draining,
         SessionEvent::ControlRedirect,
         SessionState::Draining,
     ),
@@ -1469,6 +1728,41 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::Closing,
         SessionEvent::BackendResponseTxnOpen,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::BackendResponsePartTxnDone,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::BackendResponsePartTxnOpen,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::InternalResponseTxnDone,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::InternalResponseTxnOpen,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::InternalResponseError,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::BackendStateUnknown,
         SessionState::Closing,
     ),
     t(

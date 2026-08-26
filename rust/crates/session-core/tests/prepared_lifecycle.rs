@@ -265,8 +265,7 @@ fn change_user_clears_all_only_after_relay_success() -> Result<(), Box<dyn std::
     let mut registry = PreparedRegistry::new();
     registry.register(metadata(1, 0));
     registry.apply_mutation(PreparedMutation::LongData(1));
-    let failed =
-        ChangeUserRelay::new(false).on_event(ChangeUserEvent::BackendError { code: 1045 })?;
+    let failed = ChangeUserRelay::new().on_event(ChangeUserEvent::BackendError { code: 1045 })?;
     assert!(
         failed
             .effects
@@ -277,7 +276,7 @@ fn change_user_clears_all_only_after_relay_success() -> Result<(), Box<dyn std::
         "failure must not apply after_success"
     );
 
-    let succeeded = ChangeUserRelay::new(false).on_event(ChangeUserEvent::BackendOk {
+    let succeeded = ChangeUserRelay::new().on_event(ChangeUserEvent::BackendOk {
         in_transaction: false,
     })?;
     assert!(
