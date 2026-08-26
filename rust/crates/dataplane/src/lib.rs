@@ -64,10 +64,10 @@ pub use server::{
     AcceptedConnection, BoundListenerInfo, ConnectionHandler, DataplaneHandle, DataplaneServer,
     ListenerSpec, ServerError, ServerMetricsSnapshot, preflight_snapshot,
 };
-pub use session_engine::{EngineSessionOwner, run_bound_session};
 pub use session_control::{
     BoundSessionHandler, DispatchConnectionHandler, DispatchHandleInstaller, SessionControlBinding,
 };
+pub use session_engine::{EngineSessionOwner, run_bound_session};
 
 /// Names and stable roles of the library crates composed by the dataplane.
 #[must_use]

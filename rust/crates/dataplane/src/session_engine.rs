@@ -764,15 +764,20 @@ impl Engine {
         if forwarded.len() >= 4 {
             forwarded[..4].copy_from_slice(&planned);
         }
-        if let Some(backend) = self.backend.as_mut()
-            && backend
+        if let Some(backend) = self.backend.as_mut() {
+            // Continue the backend channel's connection-phase counter
+            // after its greeting.
+            let next = backend.reader.expected_sequence();
+            backend.writer.reset_sequence(next);
+            if backend
                 .writer
                 .write_logical(&forwarded, true)
                 .await
                 .is_err()
-        {
-            let _ = self.events.send(SessionEvent::BackendIoError).await;
-            return Some(WireErrorSource::BackendNetwork);
+            {
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+                return Some(WireErrorSource::BackendNetwork);
+            }
         }
 
         // Engine-internal authentication relay; the FSM sees only the
@@ -1254,10 +1259,18 @@ impl Engine {
                         return Err(WireErrorSource::BackendNetwork);
                     }
                 }
+                AuthEffect::ActivateClientCompression(
+                    session_core::auth::CompressionSelection::None,
+                )
+                | AuthEffect::ActivateBackendCompression(
+                    session_core::auth::CompressionSelection::None,
+                ) => {}
                 AuthEffect::ActivateClientCompression(_)
                 | AuthEffect::ActivateBackendCompression(_)
                 | AuthEffect::ReconnectBackend => {
-                    // Never negotiated / never approved in this slice.
+                    // Compression is never negotiated (the greeting
+                    // withholds it) and reconnect is never approved in
+                    // this slice.
                     return Err(WireErrorSource::Proxy);
                 }
             }

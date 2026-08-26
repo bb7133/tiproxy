@@ -2185,18 +2185,37 @@ pub fn spawn_control_dispatch_with_handler(
     InboundForwarder,
     tokio::task::JoinHandle<Result<(), DispatchFatal>>,
 ) {
+    let state = client.subscribe_state();
+    spawn_control_dispatch_parts(handler, client, state, snapshot_tx, tick_interval)
+}
+
+/// The fully generic assembly seam: any [`DispatchSender`] plus an
+/// externally owned connection-state watch. Compositions and
+/// regressions that need an observable sender (or a driven state
+/// watch) build here; the production paths delegate to it.
+#[must_use]
+pub fn spawn_control_dispatch_parts<S: DispatchSender + 'static>(
+    handler: ControlCommandHandler,
+    sender: Arc<S>,
+    state: watch::Receiver<ConnectionState>,
+    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    tick_interval: Duration,
+) -> (
+    ControlDispatchHandle,
+    InboundForwarder,
+    tokio::task::JoinHandle<Result<(), DispatchFatal>>,
+) {
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let (notice_tx, notice_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
-    let state = client.subscribe_state();
     let forwarder = InboundForwarder {
         inbound: inbound_tx,
-        state: client.subscribe_state(),
+        state: state.clone(),
         retained: Arc::new(StdMutex::new(None)),
     };
     let handler_stats = handler.stats();
     let task = tokio::spawn(run_control_dispatch(
         handler,
-        client,
+        sender,
         state,
         inbound_rx,
         notice_rx,
