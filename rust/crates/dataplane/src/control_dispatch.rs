@@ -59,7 +59,7 @@
 //! the next tick, a closed one converges through the close path.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use control_proto::control_transport::{ConnectionState, ControlClient, Handler, TransportError};
@@ -107,11 +107,27 @@ pub enum OutboundControl {
     },
 }
 
+/// The body kind a session's outstanding request expects back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseKind {
+    /// A `RouteRequest` awaits `RouteAssignment` pushes.
+    RouteAssignment,
+    /// A `HandshakeResponseEvent` awaits the `HandshakeDecision`.
+    HandshakeDecision,
+}
+
 /// One registered live session: its control channel, its correlated
-/// Go-response channel, and the drain-scoping metadata.
+/// Go-response channel, the currently armed response expectation, and
+/// the drain-scoping metadata.
 struct SessionEntry {
     control: mpsc::Sender<SessionControl>,
     responses: Option<mpsc::Sender<ControlEnvelope>>,
+    /// Fail-closed correlation: only a response matching the armed
+    /// `(initiating request id, body kind)` is delivered; everything
+    /// else — unsolicited, wrong id, wrong kind — is answered as a
+    /// protocol violation so a stale answer can neither occupy the
+    /// one-slot channel nor be mis-consumed by a newer exchange.
+    expected: Option<(u64, ResponseKind)>,
     listener_name: String,
 }
 
@@ -130,6 +146,13 @@ enum ForwardOutcome {
 /// lost result needs cross-epoch replay.
 pub struct ControlCommandHandler {
     gate: CommandGate,
+    /// The negotiated epoch of the current control session (0 before
+    /// the first `Connected`); inbound envelopes carry their origin
+    /// epoch on the wire, so staleness is decidable per frame.
+    current_epoch: u64,
+    /// Whether the current session negotiated `RECONCILE_CONNECTIONS`:
+    /// gates both sending reconcile requests and accepting snapshots.
+    reconcile_capable: bool,
     metering: MeteringLedger,
     sessions: HashMap<u64, SessionEntry>,
     /// Matched sessions whose force-phase `CloseImmediate` was
@@ -148,6 +171,17 @@ pub struct ControlCommandHandler {
     /// Inbound bodies that had no legal route here (each also answered
     /// with a typed protocol error — never silently dropped).
     unrouted: u64,
+    /// Stale-epoch inbound bodies discarded by policy (superseded
+    /// reconcile snapshots and session responses whose owner converges
+    /// through its own deadline) — counted, never silent.
+    stale_dropped: u64,
+    /// Outbound envelopes whose transport send failed terminally; the
+    /// state they carried converges through reconcile omission or
+    /// duplicate-command replay.
+    send_failures: u64,
+    /// Metering deltas or seals rejected by the ledger's fail-closed
+    /// bounds.
+    metering_failures: u64,
 }
 
 impl Default for ControlCommandHandler {
@@ -163,6 +197,8 @@ impl ControlCommandHandler {
     pub fn new() -> Self {
         Self {
             gate: CommandGate::new(),
+            current_epoch: 0,
+            reconcile_capable: true,
             metering: MeteringLedger::new(),
             sessions: HashMap::new(),
             force_notified: BTreeSet::new(),
@@ -170,14 +206,43 @@ impl ControlCommandHandler {
             initiating_close: HashMap::new(),
             initiating_drain: HashMap::new(),
             unrouted: 0,
+            stale_dropped: 0,
+            send_failures: 0,
+            metering_failures: 0,
         }
     }
 
     /// Applies a new control session's negotiation: peer mode follows
     /// the `RECONCILE_SESSION_REHYDRATION` capability. The gate is
-    /// deliberately **not** rebuilt.
+    /// deliberately **not** rebuilt. (`RECONCILE_CONNECTIONS` is
+    /// assumed here; production uses [`Self::on_connected`], which
+    /// derives both from the negotiated mask.)
     pub fn on_session_negotiated(&mut self, rehydration_capability: bool) {
         self.gate.set_legacy_peer(!rehydration_capability);
+    }
+
+    /// Applies a new session's **atomic** epoch + capability snapshot:
+    /// records the epoch inbound staleness is judged against and
+    /// derives the peer mode and reconcile availability from the mask.
+    pub fn on_connected(&mut self, epoch: u64, capabilities: u64) {
+        self.current_epoch = epoch;
+        self.reconcile_capable =
+            (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
+        let rehydration =
+            (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1;
+        self.gate.set_legacy_peer(!rehydration);
+    }
+
+    /// Whether the current session can reconcile (`RECONCILE_CONNECTIONS`).
+    #[must_use]
+    pub const fn reconcile_capable(&self) -> bool {
+        self.reconcile_capable
+    }
+
+    /// The current session's negotiated epoch (0 before the first).
+    #[must_use]
+    pub const fn current_epoch(&self) -> u64 {
+        self.current_epoch
     }
 
     /// Records the applied config snapshot generation (drain
@@ -211,6 +276,7 @@ impl ControlCommandHandler {
             SessionEntry {
                 control,
                 responses,
+                expected: None,
                 listener_name: listener_name.to_owned(),
             },
         );
@@ -221,10 +287,64 @@ impl ControlCommandHandler {
         self.gate.set_backend(connection_id, backend_id);
     }
 
+    /// Arms the session's response expectation: the initiating request
+    /// id it just sent and the body kind it awaits. Re-arming replaces
+    /// the previous expectation (one outstanding exchange per session).
+    /// The expectation stays armed after a match — Go may push an
+    /// updated `RouteAssignment` under the same initiating id — until
+    /// the next arm or the session closes.
+    pub fn expect_response(&mut self, connection_id: u64, request_id: u64, kind: ResponseKind) {
+        if let Some(entry) = self.sessions.get_mut(&connection_id) {
+            entry.expected = Some((request_id, kind));
+        }
+    }
+
     /// Inbound bodies that had no legal route so far.
     #[must_use]
     pub const fn unrouted(&self) -> u64 {
         self.unrouted
+    }
+
+    /// Stale-epoch inbound bodies discarded by policy so far.
+    #[must_use]
+    pub const fn stale_dropped(&self) -> u64 {
+        self.stale_dropped
+    }
+
+    /// Records one stale-epoch discard.
+    pub fn count_stale_dropped(&mut self) {
+        self.stale_dropped = self.stale_dropped.saturating_add(1);
+    }
+
+    /// Terminal outbound send failures so far.
+    #[must_use]
+    pub const fn send_failures(&self) -> u64 {
+        self.send_failures
+    }
+
+    /// Records one terminal outbound send failure.
+    pub fn count_send_failure(&mut self) {
+        self.send_failures = self.send_failures.saturating_add(1);
+    }
+
+    /// Fail-closed metering rejections so far.
+    #[must_use]
+    pub const fn metering_failures(&self) -> u64 {
+        self.metering_failures
+    }
+
+    /// Records one metering delta into the ledger; rejections are
+    /// counted fail-closed (the delta is not silently retried).
+    pub fn record_metering(&mut self, delta: control_proto::v1::MeteringDelta) {
+        if self.metering.record(delta).is_err() {
+            self.metering_failures = self.metering_failures.saturating_add(1);
+        }
+    }
+
+    /// Records one fail-closed seal rejection (for example: the
+    /// unacked bound is reached because no reconcile ack path exists).
+    pub fn count_metering_seal_failure(&mut self) {
+        self.metering_failures = self.metering_failures.saturating_add(1);
     }
 
     /// The metering producer (record/seal/replay flow).
@@ -260,6 +380,13 @@ impl ControlCommandHandler {
         self.gate.unregister_connection(connection_id);
         self.sessions.remove(&connection_id);
         self.force_notified.remove(&connection_id);
+        // The session's pending initiating-id records die with it: any
+        // later terminal for these ids is suppressed by the gate, so
+        // the entries would otherwise leak forever.
+        self.initiating_redirect
+            .retain(|(id, _), _| *id != connection_id);
+        self.initiating_close
+            .retain(|(id, _), _| *id != connection_id);
 
         let mut outbound = Vec::new();
         if let Some(identity) = identity {
@@ -271,10 +398,11 @@ impl ControlCommandHandler {
             ));
         }
         if let Some(terminal) = drain_terminal {
+            // The terminal consumes the drain's initiating record: the
+            // map holds at most the active drain's entry, never grows.
             let initiating = self
                 .initiating_drain
-                .get(&terminal.drain_id)
-                .copied()
+                .remove(&terminal.drain_id)
                 .unwrap_or(NEEDS_ALLOCATION);
             outbound.push(result_envelope(
                 OutboundControl::DrainResult(terminal),
@@ -311,19 +439,51 @@ impl ControlCommandHandler {
                 self.dispatch_drain(request_id, generation, &command, now, now_unix_millis)
             }
             Some(Body::ReconcileSnapshot(snapshot)) => {
+                if !self.reconcile_capable {
+                    // We never sent a ReconcileRequest this session: an
+                    // unsolicited snapshot is a protocol violation.
+                    self.unrouted = self.unrouted.saturating_add(1);
+                    return vec![result_envelope(
+                        OutboundControl::ProtocolError {
+                            code: ErrorCode::ProtocolViolation,
+                            request_id,
+                            detail: "reconcile snapshot without RECONCILE_CONNECTIONS",
+                        },
+                        generation,
+                        request_id,
+                    )];
+                }
+                if envelope.control_epoch != 0
+                    && self.current_epoch != 0
+                    && envelope.control_epoch != self.current_epoch
+                {
+                    // A snapshot from a dead epoch is superseded: the
+                    // current session's automatic ReconcileRequest gets
+                    // a fresh one, and applying the stale view could
+                    // regress acked metering / ghost state.
+                    self.count_stale_dropped();
+                    return Vec::new();
+                }
                 let snapshot = snapshot.clone();
                 self.dispatch_reconcile_snapshot(&snapshot)
             }
-            Some(
-                Body::RouteAssignment(_) | Body::HandshakeDecision(_) | Body::HandshakeResult(_),
-            ) => self.dispatch_session_response(request_id, envelope),
+            // Correlated Go answers are delivered to their owning
+            // session in EVERY epoch — the (connection_id, assignment /
+            // decision) correlation makes late answers safe, and there
+            // is no retry owner that would regenerate a dropped one.
+            Some(Body::RouteAssignment(_) | Body::HandshakeDecision(_)) => {
+                self.dispatch_session_response(request_id, envelope)
+            }
             // The transport owns these bodies; reaching here is a legal
             // no-op, not a violation.
             Some(Body::Heartbeat(_) | Body::Error(_) | Body::Hello(_) | Body::HelloAck(_)) => {
                 Vec::new()
             }
-            // Every remaining body is Rust-originated or unroutable on
-            // this side: tell the peer instead of silently dropping.
+            // Every remaining body is unroutable here — including
+            // Rust→Go-direction bodies arriving inbound
+            // (`HandshakeResult`, `SnapshotResult`, `RouteResult`,
+            // events, batches): tell the peer instead of silently
+            // dropping.
             Some(_) | None => {
                 self.unrouted = self.unrouted.saturating_add(1);
                 vec![result_envelope(
@@ -344,11 +504,14 @@ impl ControlCommandHandler {
         request_id: u64,
         envelope: &ControlEnvelope,
     ) -> Vec<ControlEnvelope> {
-        let connection_id = match &envelope.body {
-            Some(Body::RouteAssignment(assignment)) => assignment.connection_id,
-            Some(Body::HandshakeDecision(decision)) => decision.connection_id,
-            Some(Body::HandshakeResult(result)) => result.connection_id,
-            _ => 0,
+        let (connection_id, kind) = match &envelope.body {
+            Some(Body::RouteAssignment(assignment)) => {
+                (assignment.connection_id, ResponseKind::RouteAssignment)
+            }
+            Some(Body::HandshakeDecision(decision)) => {
+                (decision.connection_id, ResponseKind::HandshakeDecision)
+            }
+            _ => (0, ResponseKind::RouteAssignment),
         };
         let Some(entry) = self.sessions.get(&connection_id) else {
             // The session is gone: close accounting owns the epilogue,
@@ -375,13 +538,46 @@ impl ControlCommandHandler {
                 request_id,
             )];
         };
+        // Fail-closed correlation: deliver only the armed
+        // `(initiating id, kind)` pair. This is what makes late
+        // answers from a previous epoch safe to keep delivering — a
+        // stale or foreign answer is refused here instead of occupying
+        // the slot or being mistaken for the current exchange's.
+        match entry.expected {
+            Some((expected_id, expected_kind))
+                if expected_id == request_id && expected_kind == kind => {}
+            Some(_) => {
+                return vec![result_envelope(
+                    OutboundControl::ProtocolError {
+                        code: ErrorCode::ProtocolViolation,
+                        request_id,
+                        detail: "session response correlation mismatch",
+                    },
+                    envelope.generation,
+                    request_id,
+                )];
+            }
+            None => {
+                return vec![result_envelope(
+                    OutboundControl::ProtocolError {
+                        code: ErrorCode::ProtocolViolation,
+                        request_id,
+                        detail: "unsolicited session response",
+                    },
+                    envelope.generation,
+                    request_id,
+                )];
+            }
+        }
         // The per-session slot bounds the adapter to one outstanding
         // answer; overflow is a protocol violation the peer must hear
         // about, not a silent drop. A closed channel means the session
-        // ended between routing and delivery — its CLOSED event
-        // already reconciles both sides.
-        if let Err(mpsc::error::TrySendError::Full(_)) = responses.try_send(envelope.clone()) {
-            return vec![result_envelope(
+        // ended between routing and delivery — answered like an
+        // unknown connection so the peer reconciles instead of
+        // mistaking silence for delivery.
+        match responses.try_send(envelope.clone()) {
+            Ok(()) => Vec::new(),
+            Err(mpsc::error::TrySendError::Full(_)) => vec![result_envelope(
                 OutboundControl::ProtocolError {
                     code: ErrorCode::ProtocolViolation,
                     request_id,
@@ -389,9 +585,17 @@ impl ControlCommandHandler {
                 },
                 envelope.generation,
                 request_id,
-            )];
+            )],
+            Err(mpsc::error::TrySendError::Closed(_)) => vec![result_envelope(
+                OutboundControl::ProtocolError {
+                    code: ErrorCode::ReconciliationRequired,
+                    request_id,
+                    detail: "session ended before its response was delivered",
+                },
+                envelope.generation,
+                request_id,
+            )],
         }
-        Vec::new()
     }
 
     fn dispatch_redirect(
@@ -935,6 +1139,18 @@ pub enum DispatchNotice {
         /// New backend id.
         backend_id: String,
     },
+    /// The session sent a request and awaits its correlated answer.
+    ExpectResponse {
+        /// Connection id.
+        connection_id: u64,
+        /// The initiating request id the answer must carry.
+        request_id: u64,
+        /// The body kind the answer must have.
+        kind: ResponseKind,
+    },
+    /// One metering delta from a session's accounting (fail-closed:
+    /// ledger rejections are counted, not retried).
+    Metering(Box<control_proto::v1::MeteringDelta>),
     /// The session terminated.
     SessionClosed {
         /// Connection id.
@@ -979,22 +1195,125 @@ impl ControlDispatchHandle {
     }
 }
 
-/// The transport receive half: forwards every post-Hello envelope into
-/// the bounded dispatch queue with a **real await** — the read loop
-/// stalls while the dispatcher is behind, propagating backpressure
-/// through TCP to the Go sender's bounded lanes instead of dropping a
-/// command the peer already considers delivered. A closed queue (the
-/// dispatch task died) errors the stream and triggers reconnect.
+/// The transport receive half with **global single in-flight
+/// ownership**. `handle` awaits a bounded queue reservation (real
+/// backpressure through the read loop and TCP); on session teardown
+/// the one in-flight envelope is retained in a slot instead of being
+/// dropped or blocking the join. `resume_session` — invoked by the
+/// transport after the next session's write path is live but **before
+/// its first read** — pumps the retained envelope into dispatch, so a
+/// second retained frame can never come into existence: the next
+/// reader starts only once the slot is empty.
 pub struct InboundForwarder {
     inbound: mpsc::Sender<ControlEnvelope>,
+    state: watch::Receiver<ConnectionState>,
+    retained: Arc<StdMutex<Option<ControlEnvelope>>>,
+}
+
+/// Construction and observability for the forwarder.
+impl InboundForwarder {
+    /// Builds a forwarder over the dispatch inbound queue and the
+    /// transport's connection-state watch (composition/tests; the
+    /// production path is [`spawn_control_dispatch`]).
+    #[must_use]
+    pub fn new(
+        inbound: mpsc::Sender<ControlEnvelope>,
+        state: watch::Receiver<ConnectionState>,
+    ) -> Self {
+        Self {
+            inbound,
+            state,
+            retained: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    /// Whether a frame from a torn-down session is currently retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the slot lock is poisoned.
+    pub fn retains_frame(&self) -> Result<bool, TransportError> {
+        let Ok(slot) = self.retained.lock() else {
+            return Err(TransportError::Configuration(
+                "retained slot poisoned".to_owned(),
+            ));
+        };
+        Ok(slot.is_some())
+    }
 }
 
 impl Handler for InboundForwarder {
     async fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
-        self.inbound
-            .send(envelope)
-            .await
-            .map_err(|_| TransportError::Configuration("control dispatch task is gone".to_owned()))
+        let mut state = self.state.clone();
+        tokio::select! {
+            biased;
+            permit = self.inbound.reserve() => {
+                let Ok(permit) = permit else {
+                    return Err(TransportError::Configuration(
+                        "control dispatch task is gone".to_owned(),
+                    ));
+                };
+                permit.send(envelope);
+                Ok(())
+            }
+            _ = state.wait_for(|s| !matches!(s, ConnectionState::Connected { .. })) => {
+                // Session teardown while the dispatcher is jammed:
+                // retain the one in-flight frame (the slot is empty by
+                // the resume invariant) and end the stream without
+                // depending on outbound drain.
+                let Ok(mut slot) = self.retained.lock() else {
+                    return Err(TransportError::Configuration(
+                        "retained slot poisoned".to_owned(),
+                    ));
+                };
+                *slot = Some(envelope);
+                Err(TransportError::Closed)
+            }
+        }
+    }
+
+    async fn resume_session(&self, _epoch: u64) -> Result<(), TransportError> {
+        loop {
+            // Clone-then-take keeps this cancel-safe: if the session
+            // dies (or this future is dropped) mid-send, the slot still
+            // owns the frame for the next resume — no loss, and the
+            // take happens in the same poll as the successful send, so
+            // no double delivery either.
+            let pending = {
+                let Ok(slot) = self.retained.lock() else {
+                    return Err(TransportError::Configuration(
+                        "retained slot poisoned".to_owned(),
+                    ));
+                };
+                slot.clone()
+            };
+            let Some(envelope) = pending else {
+                return Ok(());
+            };
+            let mut state = self.state.clone();
+            tokio::select! {
+                biased;
+                permit = self.inbound.reserve() => {
+                    let Ok(permit) = permit else {
+                        return Err(TransportError::Configuration(
+                            "control dispatch task is gone".to_owned(),
+                        ));
+                    };
+                    permit.send(envelope);
+                    let Ok(mut slot) = self.retained.lock() else {
+                        return Err(TransportError::Configuration(
+                            "retained slot poisoned".to_owned(),
+                        ));
+                    };
+                    *slot = None;
+                }
+                _ = state.wait_for(|s| !matches!(s, ConnectionState::Connected { .. })) => {
+                    // The session died before the pump finished: keep
+                    // the frame retained for the next session's resume.
+                    return Err(TransportError::Closed);
+                }
+            }
+        }
     }
 }
 
@@ -1012,15 +1331,25 @@ pub fn system_unix_millis() -> u64 {
 }
 
 /// The abstract sender the dispatch loop needs from the transport:
-/// checked request-id allocation plus the send itself. Implemented by
-/// the production [`ControlClient`]; tests substitute a fake.
+/// checked request-id allocation plus the durable and session-scoped
+/// sends. Implemented by the production [`ControlClient`]; tests
+/// substitute a fake.
 pub trait DispatchSender: Send + Sync {
     /// Allocates the next request id (fail-closed at exhaustion).
     fn allocate_request_id(&self) -> Option<u64>;
-    /// Sends one envelope on the control stream.
+    /// Sends one durable (cross-reconnect) envelope.
     fn send_envelope(
         &self,
         envelope: ControlEnvelope,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+    /// Sends one envelope bound to exactly the given negotiated epoch;
+    /// a stale binding fails with
+    /// [`TransportError::StaleSessionEpoch`] (the owner regenerates on
+    /// the next `Connected`).
+    fn send_session_scoped(
+        &self,
+        envelope: ControlEnvelope,
+        epoch: u64,
     ) -> impl Future<Output = Result<(), TransportError>> + Send;
 }
 
@@ -1032,35 +1361,85 @@ impl DispatchSender for ControlClient {
     async fn send_envelope(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
         self.send(envelope).await
     }
+
+    async fn send_session_scoped(
+        &self,
+        envelope: ControlEnvelope,
+        epoch: u64,
+    ) -> Result<(), TransportError> {
+        ControlClient::send_session_scoped(self, envelope, epoch).await
+    }
 }
 
-/// Stamps self-originated envelopes with allocator ids (recording
-/// connection-event ids as the event sequence) and sends. Free-standing
-/// so both selves of the loop borrow-split cleanly.
+/// Delivery policy for one outbound envelope.
+#[derive(Clone, Copy)]
+enum SendScope {
+    /// Cross-reconnect retention: results, lifecycle events, metering
+    /// batches — the peer dedups by request id / sequence.
+    Durable,
+    /// Valid only under exactly this negotiated epoch; regenerated by
+    /// the next `Connected` transition when dropped as stale.
+    Session(u64),
+}
+
+/// A condition the dispatch loop cannot continue past.
+enum LoopFatal {
+    /// The sender's checked request-id space is exhausted.
+    IdSpaceExhausted,
+    /// The CTL-05 snapshot owner is gone.
+    SnapshotOwnerGone,
+}
+
+/// Stamps self-originated envelopes with allocator ids and sends under
+/// the given scope. The connection-event watermark advances only
+/// **after** a successful send — a failed send converges through
+/// reconcile omission instead of poisoning the watermark. Terminal
+/// send failures are counted, never silent.
 async fn dispatch_send<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
     mut envelope: ControlEnvelope,
-) {
+    scope: SendScope,
+) -> Result<(), LoopFatal> {
     if envelope.request_id == NEEDS_ALLOCATION {
         let Some(id) = sender.allocate_request_id() else {
-            // Id space exhausted: fail closed rather than reuse.
-            return;
+            // The id space is exhausted: every future send would have
+            // to reuse or wrap, so the loop fails closed instead.
+            return Err(LoopFatal::IdSpaceExhausted);
         };
         envelope.request_id = id;
-        if matches!(envelope.body, Some(Body::ConnectionEvent(_))) {
-            handler.record_event_sequence(id);
-        }
     }
-    let _ = sender.send_envelope(envelope).await;
+    let is_event = matches!(envelope.body, Some(Body::ConnectionEvent(_)));
+    let request_id = envelope.request_id;
+    let result = match scope {
+        SendScope::Durable => sender.send_envelope(envelope).await,
+        SendScope::Session(epoch) => sender.send_session_scoped(envelope, epoch).await,
+    };
+    match result {
+        Ok(()) => {
+            if is_event {
+                handler.record_event_sequence(request_id);
+            }
+        }
+        // Regenerated by the next Connected transition by design.
+        Err(TransportError::StaleSessionEpoch) => {}
+        Err(_) => handler.count_send_failure(),
+    }
+    Ok(())
 }
 
 /// Runs the production dispatch loop: connection-state transitions
-/// (peer-mode update + automatic reconcile + metering replay, bound to
-/// one atomic epoch/capabilities snapshot), inbound envelopes (snapshot
-/// bodies forwarded — awaited — to the CTL-05 owner), session notices,
-/// and the periodic drain tick. This is the long-lived single owner of
-/// [`ControlCommandHandler`]; it survives control reconnects.
+/// (peer-mode update + capability-gated automatic reconcile + metering
+/// replay, all bound to one atomic epoch/capabilities snapshot),
+/// inbound envelopes (from the live read path and from the retained
+/// slot via `resume_session`, with `StateSnapshot` forwarded — awaited
+/// — to the mandatory CTL-05 owner), session and metering notices, and
+/// the periodic tick (drain force phase + metering seal). Select arms
+/// are unbiased: tokio polls ready arms in random order, so no arm —
+/// in particular the drain-deadline tick — can be starved indefinitely
+/// by a busy neighbor. This is the long-lived single owner of
+/// [`ControlCommandHandler`]; it survives control reconnects and exits
+/// only on fatal conditions (owner channels gone, id space exhausted).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run_control_dispatch<S: DispatchSender>(
     mut handler: ControlCommandHandler,
@@ -1068,137 +1447,229 @@ pub async fn run_control_dispatch<S: DispatchSender>(
     mut state: watch::Receiver<ConnectionState>,
     mut inbound: mpsc::Receiver<ControlEnvelope>,
     mut notices: mpsc::Receiver<DispatchNotice>,
-    snapshot_tx: Option<mpsc::Sender<ControlEnvelope>>,
+    snapshot_tx: mpsc::Sender<ControlEnvelope>,
     tick_interval: Duration,
     unix_now_millis: UnixMillisFn,
 ) {
     let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            biased;
+        let step = tokio::select! {
             changed = state.changed() => {
                 if changed.is_err() {
                     break;
                 }
                 let snapshot = *state.borrow_and_update();
-                if let ConnectionState::Connected { capabilities, .. } = snapshot {
-                    // One atomic snapshot binds the epoch to the
-                    // negotiated capabilities, so the peer-mode update,
-                    // the reconcile request, and the metering replay
-                    // below all act for exactly this session.
-                    let rehydration = (capabilities
-                        >> (ControlCapability::ReconcileSessionRehydration as u64))
-                        & 1
-                        == 1;
-                    handler.on_session_negotiated(rehydration);
-                    let request =
-                        handler.build_reconcile_request(handler.applied_generation());
-                    let envelope = ControlEnvelope {
-                        request_id: NEEDS_ALLOCATION,
-                        generation: request.known_generation,
-                        priority: Priority::Critical.into(),
-                        body: Some(Body::ReconcileRequest(request)),
-                        ..ControlEnvelope::default()
-                    };
-                    dispatch_send(&sender, &mut handler, envelope).await;
-                    for batch in handler.metering_replay() {
-                        let envelope = ControlEnvelope {
-                            request_id: NEEDS_ALLOCATION,
-                            priority: Priority::Bulk.into(),
-                            body: Some(Body::MeteringBatch(batch)),
-                            ..ControlEnvelope::default()
-                        };
-                        dispatch_send(&sender, &mut handler, envelope).await;
-                    }
+                if let ConnectionState::Connected { epoch, capabilities } = snapshot {
+                    on_connected_transition(
+                        &sender,
+                        &mut handler,
+                        epoch,
+                        capabilities,
+                    )
+                    .await
+                } else {
+                    Ok(())
                 }
             }
             notice = notices.recv() => {
                 let Some(notice) = notice else { break };
-                match notice {
-                    DispatchNotice::AppliedGeneration(generation) => {
-                        handler.set_applied_generation(generation);
-                    }
-                    DispatchNotice::RegisterSession {
-                        identity,
-                        namespace,
-                        snapshot_generation,
-                        listener_name,
-                        control,
-                        responses,
-                    } => {
-                        handler.register_session(
-                            identity,
-                            &namespace,
-                            snapshot_generation,
-                            &listener_name,
-                            control,
-                            responses,
-                        );
-                    }
-                    DispatchNotice::SetBackend { connection_id, backend_id } => {
-                        handler.set_backend(connection_id, &backend_id);
-                    }
-                    DispatchNotice::SessionClosed { connection_id, forced, error_source } => {
-                        for envelope in
-                            handler.session_closed(connection_id, forced, error_source)
-                        {
-                            dispatch_send(&sender, &mut handler, envelope).await;
-                        }
-                    }
-                    DispatchNotice::RedirectFinished {
-                        connection_id,
-                        redirect_id,
-                        succeeded,
-                        backend_id,
-                        code,
-                    } => {
-                        if let Some(envelope) = handler.redirect_completed(
-                            connection_id,
-                            &redirect_id,
-                            succeeded,
-                            &backend_id,
-                            code,
-                        ) {
-                            dispatch_send(&sender, &mut handler, envelope).await;
-                        }
-                    }
-                    DispatchNotice::CloseFinished { connection_id, close_id } => {
-                        if let Some(envelope) =
-                            handler.close_completed(connection_id, &close_id)
-                        {
-                            dispatch_send(&sender, &mut handler, envelope).await;
-                        }
-                    }
-                }
+                apply_notice(&sender, &mut handler, notice).await
             }
             envelope = inbound.recv() => {
                 let Some(envelope) = envelope else { break };
-                if let Some(Body::StateSnapshot(_) | Body::SnapshotResult(_)) = &envelope.body {
-                    // The CTL-05 snapshot owner consumes these; the
-                    // send is awaited so its backpressure reaches the
-                    // transport read loop too.
-                    if let Some(snapshots) = &snapshot_tx {
-                        let _ = snapshots.send(envelope).await;
-                    }
-                } else {
-                    let outbound = handler.handle_envelope(
-                        &envelope,
-                        Instant::now(),
-                        unix_now_millis(),
-                    );
-                    for out in outbound {
-                        dispatch_send(&sender, &mut handler, out).await;
-                    }
-                }
+                process_inbound(
+                    &sender,
+                    &mut handler,
+                    &snapshot_tx,
+                    envelope,
+                    unix_now_millis,
+                )
+                .await
             }
             _ = ticker.tick() => {
-                for envelope in handler.tick(Instant::now()) {
-                    dispatch_send(&sender, &mut handler, envelope).await;
-                }
+                run_tick(&sender, &mut handler).await
+            }
+        };
+        if step.is_err() {
+            break;
+        }
+    }
+}
+
+/// One atomic `Connected { epoch, capabilities }` snapshot drives the
+/// peer mode, the capability-gated reconcile request (declaring
+/// `RECONCILE_CONNECTIONS`, plus rehydration when negotiated), and the
+/// metering replay — the session-scoped pieces are bound to exactly
+/// this epoch and regenerated on the next transition if the session
+/// dies first. Without `RECONCILE_CONNECTIONS` no request is sent and
+/// no ack can ever arrive: the ledger's bounded unacked retention then
+/// IS the backpressure (sealing fails closed at the bound).
+async fn on_connected_transition<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+    epoch: u64,
+    capabilities: u64,
+) -> Result<(), LoopFatal> {
+    handler.on_connected(epoch, capabilities);
+    if handler.reconcile_capable() {
+        let request = handler.build_reconcile_request(handler.applied_generation());
+        let mut required = vec![ControlCapability::ReconcileConnections as u64];
+        if (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1 {
+            required.push(ControlCapability::ReconcileSessionRehydration as u64);
+        }
+        let envelope = ControlEnvelope {
+            request_id: NEEDS_ALLOCATION,
+            generation: request.known_generation,
+            priority: Priority::Critical.into(),
+            required_capabilities: required,
+            body: Some(Body::ReconcileRequest(request)),
+            ..ControlEnvelope::default()
+        };
+        dispatch_send(sender, handler, envelope, SendScope::Session(epoch)).await?;
+    }
+    // Unacked metering is durable: delivery matters with or without an
+    // ack path, and the consumer dedups by contiguous sequence.
+    for batch in handler.metering_replay() {
+        let envelope = ControlEnvelope {
+            request_id: NEEDS_ALLOCATION,
+            priority: Priority::Bulk.into(),
+            body: Some(Body::MeteringBatch(batch)),
+            ..ControlEnvelope::default()
+        };
+        dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+    }
+    Ok(())
+}
+
+async fn apply_notice<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+    notice: DispatchNotice,
+) -> Result<(), LoopFatal> {
+    match notice {
+        DispatchNotice::AppliedGeneration(generation) => {
+            handler.set_applied_generation(generation);
+        }
+        DispatchNotice::RegisterSession {
+            identity,
+            namespace,
+            snapshot_generation,
+            listener_name,
+            control,
+            responses,
+        } => {
+            handler.register_session(
+                identity,
+                &namespace,
+                snapshot_generation,
+                &listener_name,
+                control,
+                responses,
+            );
+        }
+        DispatchNotice::SetBackend {
+            connection_id,
+            backend_id,
+        } => {
+            handler.set_backend(connection_id, &backend_id);
+        }
+        DispatchNotice::ExpectResponse {
+            connection_id,
+            request_id,
+            kind,
+        } => {
+            handler.expect_response(connection_id, request_id, kind);
+        }
+        DispatchNotice::Metering(delta) => {
+            handler.record_metering(*delta);
+        }
+        DispatchNotice::SessionClosed {
+            connection_id,
+            forced,
+            error_source,
+        } => {
+            for envelope in handler.session_closed(connection_id, forced, error_source) {
+                dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+            }
+        }
+        DispatchNotice::RedirectFinished {
+            connection_id,
+            redirect_id,
+            succeeded,
+            backend_id,
+            code,
+        } => {
+            if let Some(envelope) = handler.redirect_completed(
+                connection_id,
+                &redirect_id,
+                succeeded,
+                &backend_id,
+                code,
+            ) {
+                dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+            }
+        }
+        DispatchNotice::CloseFinished {
+            connection_id,
+            close_id,
+        } => {
+            if let Some(envelope) = handler.close_completed(connection_id, &close_id) {
+                dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
             }
         }
     }
+    Ok(())
+}
+
+async fn process_inbound<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+    snapshot_tx: &mpsc::Sender<ControlEnvelope>,
+    envelope: ControlEnvelope,
+    unix_now_millis: UnixMillisFn,
+) -> Result<(), LoopFatal> {
+    if matches!(envelope.body, Some(Body::StateSnapshot(_))) {
+        // The CTL-05 snapshot owner is a required dependency: the send
+        // is awaited (its backpressure reaches the transport read
+        // loop), and its loss is fatal rather than a silent drop.
+        return snapshot_tx
+            .send(envelope)
+            .await
+            .map_err(|_| LoopFatal::SnapshotOwnerGone);
+    }
+    let outbound = handler.handle_envelope(&envelope, Instant::now(), unix_now_millis());
+    for out in outbound {
+        dispatch_send(sender, handler, out, SendScope::Durable).await?;
+    }
+    Ok(())
+}
+
+async fn run_tick<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+) -> Result<(), LoopFatal> {
+    for envelope in handler.tick(Instant::now()) {
+        dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+    }
+    match handler.seal_metering() {
+        Ok(Some(batch)) => {
+            let envelope = ControlEnvelope {
+                request_id: NEEDS_ALLOCATION,
+                priority: Priority::Bulk.into(),
+                body: Some(Body::MeteringBatch(batch)),
+                ..ControlEnvelope::default()
+            };
+            dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+        }
+        Ok(None) => {}
+        Err(_) => {
+            // Fail-closed bound reached (for example: no reconcile ack
+            // path): counted; sealed batches stay retained.
+            handler.count_metering_seal_failure();
+        }
+    }
+    Ok(())
 }
 
 /// Capacity of the bounded inbound dispatch queue: overflow stalls the
@@ -1207,13 +1678,14 @@ const INBOUND_QUEUE_CAPACITY: usize = 256;
 
 /// Spawns the production control-dispatch task bound to the shared
 /// control client: the returned [`InboundForwarder`] is the transport
-/// handler for [`ControlClient::run`], the [`ControlDispatchHandle`] is
-/// the session-facing surface, and snapshot bodies forward to
-/// `snapshot_tx` when the CTL-05 owner provides one.
+/// handler for [`ControlClient::run`] (including the `resume_session`
+/// retained-frame pump), the [`ControlDispatchHandle`] is the
+/// session-facing surface, and `snapshot_tx` is the **required**
+/// CTL-05 snapshot owner (its loss terminates the dispatch task).
 #[must_use]
 pub fn spawn_control_dispatch(
     client: Arc<ControlClient>,
-    snapshot_tx: Option<mpsc::Sender<ControlEnvelope>>,
+    snapshot_tx: mpsc::Sender<ControlEnvelope>,
     tick_interval: Duration,
 ) -> (
     ControlDispatchHandle,
@@ -1223,6 +1695,11 @@ pub fn spawn_control_dispatch(
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let (notice_tx, notice_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let state = client.subscribe_state();
+    let forwarder = InboundForwarder {
+        inbound: inbound_tx,
+        state: client.subscribe_state(),
+        retained: Arc::new(StdMutex::new(None)),
+    };
     let task = tokio::spawn(run_control_dispatch(
         ControlCommandHandler::new(),
         client,
@@ -1235,9 +1712,7 @@ pub fn spawn_control_dispatch(
     ));
     (
         ControlDispatchHandle { notices: notice_tx },
-        InboundForwarder {
-            inbound: inbound_tx,
-        },
+        forwarder,
         task,
     )
 }

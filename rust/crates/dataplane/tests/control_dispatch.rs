@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use control_proto::control_transport::{ConnectionState, TransportError};
+use control_proto::control_transport::{ConnectionState, Handler, TransportError};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     CloseCommand, ConnectionIdentity, ControlCapability, ControlEnvelope, DrainCommand, ErrorCode,
@@ -35,7 +35,8 @@ use control_proto::v1::{
     RouteAssignment,
 };
 use dataplane::control_dispatch::{
-    ControlCommandHandler, DispatchNotice, DispatchSender, run_control_dispatch,
+    ControlCommandHandler, DispatchNotice, DispatchSender, InboundForwarder, ResponseKind,
+    run_control_dispatch,
 };
 use dataplane::session::SessionControl;
 use tokio::sync::{mpsc, watch};
@@ -553,6 +554,8 @@ async fn session_responses_route_to_owner() {
     let (control_tx, _control_rx) = mpsc::channel(8);
     let (resp_tx, mut resp_rx) = mpsc::channel(1);
     handler.register_session(identity(1), "ns-a", 7, "sql-a", control_tx, Some(resp_tx));
+    // The session sent RouteRequest id=90 and awaits its assignment.
+    handler.expect_response(1, 90, ResponseKind::RouteAssignment);
 
     let assignment = envelope(
         90,
@@ -703,7 +706,7 @@ async fn force_close_marks_only_on_delivery() {
 /// plus a capture of every sent envelope.
 struct FakeSender {
     next: AtomicU64,
-    sent: Mutex<Vec<ControlEnvelope>>,
+    sent: Mutex<Vec<(ControlEnvelope, Option<u64>)>>,
 }
 
 impl FakeSender {
@@ -715,10 +718,24 @@ impl FakeSender {
     }
 
     fn sent(&self) -> Vec<ControlEnvelope> {
+        self.sent_with_scope()
+            .into_iter()
+            .map(|(envelope, _)| envelope)
+            .collect()
+    }
+
+    fn sent_with_scope(&self) -> Vec<(ControlEnvelope, Option<u64>)> {
         let Ok(sent) = self.sent.lock() else {
             unreachable!("sent lock poisoned")
         };
         sent.clone()
+    }
+
+    fn push(&self, envelope: ControlEnvelope, scope: Option<u64>) {
+        let Ok(mut sent) = self.sent.lock() else {
+            unreachable!("sent lock poisoned")
+        };
+        sent.push((envelope, scope));
     }
 }
 
@@ -728,10 +745,16 @@ impl DispatchSender for FakeSender {
     }
 
     async fn send_envelope(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
-        let Ok(mut sent) = self.sent.lock() else {
-            unreachable!("sent lock poisoned")
-        };
-        sent.push(envelope);
+        self.push(envelope, None);
+        Ok(())
+    }
+
+    async fn send_session_scoped(
+        &self,
+        envelope: ControlEnvelope,
+        epoch: u64,
+    ) -> Result<(), TransportError> {
+        self.push(envelope, Some(epoch));
         Ok(())
     }
 }
@@ -740,32 +763,45 @@ struct LoopHarness {
     sender: Arc<FakeSender>,
     state_tx: watch::Sender<ConnectionState>,
     notice_tx: mpsc::Sender<DispatchNotice>,
-    _inbound_tx: mpsc::Sender<ControlEnvelope>,
+    inbound_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_rx: mpsc::Receiver<ControlEnvelope>,
     task: tokio::task::JoinHandle<()>,
 }
 
-fn spawn_loop(handler: ControlCommandHandler) -> LoopHarness {
+fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopHarness {
     let sender = FakeSender::new();
     let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let (notice_tx, notice_rx) = mpsc::channel(16);
+    let (snapshot_tx, snapshot_rx) = mpsc::channel(4);
     let task = tokio::spawn(run_control_dispatch(
         handler,
         Arc::clone(&sender),
         state_rx,
         inbound_rx,
         notice_rx,
-        None,
-        Duration::from_secs(3600),
+        snapshot_tx,
+        tick,
         || 1_000_000,
     ));
     LoopHarness {
         sender,
         state_tx,
         notice_tx,
-        _inbound_tx: inbound_tx,
+        inbound_tx,
+        snapshot_rx,
         task,
     }
+}
+
+fn spawn_loop(handler: ControlCommandHandler) -> LoopHarness {
+    spawn_loop_with_tick(handler, Duration::from_secs(3600))
+}
+
+/// Both capability bits the production reconnect automation gates on.
+fn full_caps() -> u64 {
+    (1u64 << (ControlCapability::ReconcileConnections as u64))
+        | (1u64 << (ControlCapability::ReconcileSessionRehydration as u64))
 }
 
 async fn wait_for_sent(sender: &Arc<FakeSender>, count: usize) -> Vec<ControlEnvelope> {
@@ -806,31 +842,86 @@ async fn connected_transition_reconciles_and_replays_metering() {
     };
 
     let harness = spawn_loop(handler);
-    let rehydration_bit = 1u64 << (ControlCapability::ReconcileSessionRehydration as u64);
     harness
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
-            capabilities: rehydration_bit,
+            capabilities: full_caps(),
         })
         .ok();
 
     let sent = wait_for_sent(&harness.sender, 2).await;
+    let scoped = harness.sender.sent_with_scope();
     let Some(Body::ReconcileRequest(request)) = &sent[0].body else {
         unreachable!("first automatic send is the reconcile request")
     };
     assert_eq!(request.known_generation, 7);
     assert_eq!(request.last_metering_sequence, batch.sequence);
     assert!(sent[0].request_id > 0, "allocator-issued id");
+    assert_eq!(
+        scoped[0].1,
+        Some(1),
+        "the reconcile request is session-scoped to its exact epoch"
+    );
+    assert_eq!(
+        sent[0].required_capabilities,
+        vec![
+            ControlCapability::ReconcileConnections as u64,
+            ControlCapability::ReconcileSessionRehydration as u64,
+        ],
+        "the request declares the capabilities it rides on"
+    );
     let Some(Body::MeteringBatch(replayed)) = &sent[1].body else {
         unreachable!("unacked metering replays after the reconcile")
     };
     assert_eq!(replayed, &batch, "the exact sealed batch replays");
+    assert_eq!(scoped[1].1, None, "metering batches are durable");
     assert!(
         sent[1].request_id > sent[0].request_id,
         "one checked allocator: ids strictly increase"
     );
 
+    harness.task.abort();
+}
+
+/// Without `RECONCILE_CONNECTIONS` no reconcile request is sent — no
+/// ack path can exist, so the ledger's bounded unacked retention is
+/// the explicit backpressure — while durable metering still replays.
+#[tokio::test(start_paused = true)]
+async fn no_reconcile_capability_skips_request_and_replays_durably() {
+    let mut handler = ControlCommandHandler::new();
+    assert!(
+        handler
+            .metering()
+            .record(MeteringDelta {
+                keyspace: "ks-1".to_owned(),
+                backend_id: "tidb-a".to_owned(),
+                public_endpoint: false,
+                response_bytes: 64,
+                cross_location_bytes: 0,
+            })
+            .is_ok()
+    );
+    assert!(handler.seal_metering().is_ok());
+    let harness = spawn_loop(handler);
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            capabilities: 0,
+        })
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    assert!(
+        matches!(sent[0].body, Some(Body::MeteringBatch(_))),
+        "only the durable metering replay goes out"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|envelope| matches!(envelope.body, Some(Body::ReconcileRequest(_)))),
+        "no ReconcileRequest without RECONCILE_CONNECTIONS"
+    );
     harness.task.abort();
 }
 
@@ -842,7 +933,6 @@ async fn closed_event_ids_feed_reconcile_watermark() {
     let mut handler = ControlCommandHandler::new();
     handler.set_applied_generation(7);
     let harness = spawn_loop(handler);
-    let rehydration_bit = 1u64 << (ControlCapability::ReconcileSessionRehydration as u64);
 
     let (control_tx, _control_rx) = mpsc::channel(8);
     harness
@@ -880,7 +970,7 @@ async fn closed_event_ids_feed_reconcile_watermark() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
-            capabilities: rehydration_bit,
+            capabilities: full_caps(),
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
@@ -893,4 +983,416 @@ async fn closed_event_ids_feed_reconcile_watermark() {
     );
 
     harness.task.abort();
+}
+
+/// Fail-closed response correlation: an answer with the wrong
+/// initiating id, the wrong body kind, or no armed expectation is
+/// refused as a protocol violation — a stale answer can neither occupy
+/// the one-slot channel nor be mis-consumed by a newer exchange.
+#[tokio::test(start_paused = true)]
+async fn session_response_correlation_is_fail_closed() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    let now = Instant::now();
+    let (control_tx, _control_rx) = mpsc::channel(8);
+    let (resp_tx, mut resp_rx) = mpsc::channel(1);
+    handler.register_session(identity(1), "ns-a", 7, "sql-a", control_tx, Some(resp_tx));
+
+    let assignment_body = |request_id: u64| {
+        envelope(
+            request_id,
+            7,
+            Body::RouteAssignment(RouteAssignment {
+                connection_id: 1,
+                assignment_id: "a-1".to_owned(),
+                backend_id: "tidb-a".to_owned(),
+                backend_address: "10.0.0.1:4000".to_owned(),
+                cluster_name: String::new(),
+                keyspace: String::new(),
+                healthy: true,
+                local: true,
+                code: 0,
+                detail: String::new(),
+            }),
+        )
+    };
+
+    // Nothing armed: unsolicited.
+    let out = handler.handle_envelope(&assignment_body(90), now, 1);
+    assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+    assert!(resp_rx.try_recv().is_err(), "nothing delivered");
+
+    // Armed for id 90: a stale answer under id 41 is refused.
+    handler.expect_response(1, 90, ResponseKind::RouteAssignment);
+    let out = handler.handle_envelope(&assignment_body(41), now, 2);
+    assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+    assert!(resp_rx.try_recv().is_err(), "mismatched id never delivered");
+
+    // Wrong body kind under the right id is refused too.
+    let decision = envelope(
+        90,
+        7,
+        Body::HandshakeDecision(control_proto::v1::HandshakeDecision {
+            connection_id: 1,
+            accept: true,
+            retry: false,
+            code: 0,
+            client_message: String::new(),
+            namespace: String::new(),
+        }),
+    );
+    let out = handler.handle_envelope(&decision, now, 3);
+    assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+    assert!(
+        resp_rx.try_recv().is_err(),
+        "mismatched kind never delivered"
+    );
+
+    // The exact pair delivers — and stays armed for an updated push
+    // under the same initiating id.
+    assert!(
+        handler
+            .handle_envelope(&assignment_body(90), now, 4)
+            .is_empty()
+    );
+    let Ok(delivered) = resp_rx.try_recv() else {
+        unreachable!("the armed pair delivers")
+    };
+    assert_eq!(delivered.request_id, 90);
+    assert!(
+        handler
+            .handle_envelope(&assignment_body(90), now, 5)
+            .is_empty()
+    );
+    assert!(resp_rx.try_recv().is_ok(), "updated push under the same id");
+}
+
+/// Direction enforcement: Rust→Go bodies arriving inbound
+/// (`HandshakeResult`, `SnapshotResult`) are protocol violations, not
+/// routable responses.
+#[tokio::test(start_paused = true)]
+async fn wrong_direction_bodies_are_violations() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    let _session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+
+    let result = envelope(
+        60,
+        7,
+        Body::HandshakeResult(control_proto::v1::HandshakeResult {
+            connection_id: 1,
+            backend_id: "tidb-a".to_owned(),
+            ..control_proto::v1::HandshakeResult::default()
+        }),
+    );
+    let out = handler.handle_envelope(&result, now, 1);
+    assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+
+    let snapshot_result = envelope(
+        61,
+        7,
+        Body::SnapshotResult(control_proto::v1::SnapshotResult {
+            applied_generation: 7,
+            code: 0,
+            detail: String::new(),
+        }),
+    );
+    let out = handler.handle_envelope(&snapshot_result, now, 2);
+    assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+    assert_eq!(handler.unrouted(), 2);
+}
+
+/// Stale-epoch reconcile snapshots are superseded — the current
+/// session\'s automatic request gets a fresh one — while commands from
+/// any epoch still flow through the gate\'s own cross-epoch invariants;
+/// without `RECONCILE_CONNECTIONS` an inbound snapshot is unsolicited.
+#[tokio::test(start_paused = true)]
+async fn reconcile_snapshot_epoch_and_capability_policy() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_connected(5, full_caps());
+    let now = Instant::now();
+
+    let snapshot_from = |origin: u64| ControlEnvelope {
+        request_id: 50,
+        generation: 7,
+        control_epoch: origin,
+        body: Some(Body::ReconcileSnapshot(ReconcileSnapshot {
+            applied_generation: 7,
+            connection_event_sequence: 0,
+            metrics_sequence: 0,
+            metering_sequence: 0,
+            connections: Vec::new(),
+        })),
+        ..ControlEnvelope::default()
+    };
+
+    // Origin epoch 4 under current epoch 5: superseded, counted.
+    assert!(
+        handler
+            .handle_envelope(&snapshot_from(4), now, 1)
+            .is_empty()
+    );
+    assert_eq!(handler.stale_dropped(), 1);
+
+    // The current epoch\'s snapshot processes normally.
+    assert!(
+        handler
+            .handle_envelope(&snapshot_from(5), now, 2)
+            .is_empty()
+    );
+    assert_eq!(handler.stale_dropped(), 1);
+
+    // A stale-epoch COMMAND still flows through the gate.
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let mut command = envelope(51, 7, Body::RedirectCommand(redirect(1, "r-old", 1)));
+    command.control_epoch = 4;
+    assert!(handler.handle_envelope(&command, now, 3).is_empty());
+    assert_eq!(session.control.try_recv(), Ok(SessionControl::Redirect));
+
+    // Without cap 2 an inbound snapshot is unsolicited.
+    let mut legacy = ControlCommandHandler::new();
+    legacy.on_connected(
+        6,
+        1u64 << (ControlCapability::ReconcileSessionRehydration as u64),
+    );
+    let out = legacy.handle_envelope(&snapshot_from(6), now, 4);
+    assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+}
+
+/// The metering production path end to end: session deltas arrive as
+/// notices, the tick seals the batch onto the wire durably, and the
+/// ledger retains it until a reconcile ack.
+#[tokio::test(start_paused = true)]
+async fn metering_notices_seal_and_send_on_tick() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop_with_tick(handler, Duration::from_millis(50));
+    harness
+        .notice_tx
+        .send(DispatchNotice::Metering(Box::new(MeteringDelta {
+            keyspace: "ks-1".to_owned(),
+            backend_id: "tidb-a".to_owned(),
+            public_endpoint: false,
+            response_bytes: 256,
+            cross_location_bytes: 0,
+        })))
+        .await
+        .ok();
+    // Paused clock: sleeping past the tick interval fires the ticker.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    let Some(Body::MeteringBatch(batch)) = &sent[0].body else {
+        unreachable!("the tick seals and sends the recorded delta")
+    };
+    assert_eq!(batch.deltas.len(), 1);
+    assert_eq!(batch.deltas[0].response_bytes, 256);
+    let scoped = harness.sender.sent_with_scope();
+    assert_eq!(scoped[0].1, None, "metering batches are durable");
+    harness.task.abort();
+}
+
+/// `StateSnapshot` bodies forward — awaited — to the mandatory CTL-05
+/// owner with their wire metadata intact.
+#[tokio::test(start_paused = true)]
+async fn state_snapshots_forward_to_owner() {
+    let handler = ControlCommandHandler::new();
+    let mut harness = spawn_loop(handler);
+    let snapshot = ControlEnvelope {
+        request_id: 77,
+        generation: 9,
+        body: Some(Body::StateSnapshot(control_proto::v1::StateSnapshot {
+            config: None,
+            backends: Vec::new(),
+            namespaces: Vec::new(),
+        })),
+        ..ControlEnvelope::default()
+    };
+    harness.inbound_tx.send(snapshot).await.ok();
+    let Some(forwarded) = harness.snapshot_rx.recv().await else {
+        unreachable!("the snapshot owner receives the envelope")
+    };
+    assert_eq!(forwarded.request_id, 77);
+    assert_eq!(forwarded.generation, 9);
+    harness.task.abort();
+}
+
+// ---------------------------------------------------------------------
+// B2 forwarder regressions: retained-frame ownership and the resume
+// pump (global ≤1, exactly-once, cancel-safe).
+// ---------------------------------------------------------------------
+
+fn forwarder_fixture(
+    capacity: usize,
+) -> (
+    InboundForwarder,
+    mpsc::Receiver<ControlEnvelope>,
+    watch::Sender<ConnectionState>,
+) {
+    let (inbound_tx, inbound_rx) = mpsc::channel(capacity);
+    let (state_tx, state_rx) = watch::channel(ConnectionState::Connected {
+        epoch: 1,
+        capabilities: full_caps(),
+    });
+    (
+        InboundForwarder::new(inbound_tx, state_rx),
+        inbound_rx,
+        state_tx,
+    )
+}
+
+fn frame(request_id: u64) -> ControlEnvelope {
+    envelope(request_id, 7, Body::RedirectCommand(redirect(1, "r-f", 1)))
+}
+
+/// Regression: handler blocked (inbound full) + session teardown. The
+/// in-flight frame is retained — not dropped, not blocking — and
+/// `handle` errors so the read loop joins.
+#[tokio::test(start_paused = true)]
+async fn blocked_handle_retains_frame_on_teardown() {
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let Ok(()) = forwarder.handle(frame(1)).await else {
+        unreachable!("first frame fits the queue")
+    };
+
+    let blocked = forwarder.handle(frame(2));
+    tokio::pin!(blocked);
+    // The queue is full: the handle must be pending (backpressure).
+    assert!(
+        futures_pending(&mut blocked).await,
+        "full inbound applies real backpressure"
+    );
+    // Teardown: the transport publishes Disconnected before joining.
+    state_tx.send(ConnectionState::Disconnected).ok();
+    let result = blocked.await;
+    assert!(result.is_err(), "the read loop converges with an error");
+    let Ok(true) = forwarder.retains_frame() else {
+        unreachable!("exactly the in-flight frame is retained")
+    };
+    // Nothing was lost or double-delivered into the queue.
+    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    assert!(inbound_rx.try_recv().is_err());
+}
+
+/// Regression: the retained frame is pumped by `resume_session` —
+/// independent of any new inbound — exactly once, after which the slot
+/// is empty and a new session\'s frames flow normally.
+#[tokio::test(start_paused = true)]
+async fn resume_pumps_retained_frame_exactly_once() {
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let Ok(()) = forwarder.handle(frame(1)).await else {
+        unreachable!("first frame fits")
+    };
+    let blocked = forwarder.handle(frame(2));
+    tokio::pin!(blocked);
+    assert!(futures_pending(&mut blocked).await);
+    state_tx.send(ConnectionState::Disconnected).ok();
+    assert!(blocked.await.is_err());
+
+    // Reconnect: drain the queue (the dispatcher made progress), then
+    // the transport calls resume before reading any new frame.
+    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let Ok(()) = forwarder.resume_session(2).await else {
+        unreachable!("the pump delivers the retained frame")
+    };
+    assert_eq!(
+        inbound_rx.try_recv().map(|e| e.request_id),
+        Ok(2),
+        "the retained frame arrives exactly once"
+    );
+    let Ok(false) = forwarder.retains_frame() else {
+        unreachable!("the slot is empty after the pump")
+    };
+    // A second resume is a no-op: no duplicate delivery.
+    let Ok(()) = forwarder.resume_session(2).await else {
+        unreachable!("empty pump succeeds")
+    };
+    assert!(inbound_rx.try_recv().is_err(), "no double delivery");
+}
+
+/// Regression: the session dies again while the resume pump is still
+/// backpressured — the pump aborts, the slot stays intact, and the
+/// NEXT session\'s resume delivers exactly once. The reader never
+/// started, so no second frame can exist (global ≤ 1).
+#[tokio::test(start_paused = true)]
+async fn teardown_during_resume_keeps_single_frame() {
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let Ok(()) = forwarder.handle(frame(1)).await else {
+        unreachable!("first frame fits")
+    };
+    let blocked = forwarder.handle(frame(2));
+    tokio::pin!(blocked);
+    assert!(futures_pending(&mut blocked).await);
+    state_tx.send(ConnectionState::Disconnected).ok();
+    assert!(blocked.await.is_err());
+
+    // Session 2 starts its pump while the queue is STILL full — and
+    // dies before the pump can deliver.
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let resume = forwarder.resume_session(2);
+    tokio::pin!(resume);
+    assert!(
+        futures_pending(&mut resume).await,
+        "the pump is backpressured by the full queue"
+    );
+    state_tx.send(ConnectionState::Disconnected).ok();
+    assert!(resume.await.is_err(), "the pump aborts on teardown");
+    let Ok(true) = forwarder.retains_frame() else {
+        unreachable!("the frame is still retained — never lost")
+    };
+
+    // Session 3: the queue drains, the pump completes, exactly once.
+    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 3,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let Ok(()) = forwarder.resume_session(3).await else {
+        unreachable!("the third session\'s pump delivers")
+    };
+    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(2));
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "exactly once across sessions"
+    );
+    let Ok(false) = forwarder.retains_frame() else {
+        unreachable!("slot empty at the end")
+    };
+}
+
+/// Polls a pinned future a bounded number of times and reports whether
+/// it is still pending (paused-clock friendly).
+async fn futures_pending<F: Future + Unpin>(future: &mut F) -> bool {
+    for _ in 0..50 {
+        let poll = futures_poll_once(future).await;
+        if poll.is_some() {
+            return false;
+        }
+        tokio::task::yield_now().await;
+    }
+    true
+}
+
+async fn futures_poll_once<F: Future + Unpin>(future: &mut F) -> Option<F::Output> {
+    use std::future::poll_fn;
+    use std::task::Poll;
+    poll_fn(
+        |context| match std::pin::Pin::new(&mut *future).poll(context) {
+            Poll::Ready(output) => Poll::Ready(Some(output)),
+            Poll::Pending => Poll::Ready(None),
+        },
+    )
+    .await
 }

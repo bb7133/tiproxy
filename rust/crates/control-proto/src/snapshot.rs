@@ -25,7 +25,8 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use rustls::client::danger::HandshakeSignatureValid;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime, pem::PemObject};
+pub use rustls::pki_types::UnixTime;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{

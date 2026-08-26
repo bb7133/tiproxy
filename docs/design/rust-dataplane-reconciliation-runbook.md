@@ -75,53 +75,94 @@ lifecycle).
 
 The gates are on the real message paths on both sides:
 
-- **Rust** — `dataplane::control_dispatch`: `spawn_control_dispatch`
-  binds the **process-long-lived** `ControlCommandHandler` to the shared
-  control client. The returned `InboundForwarder` is the transport
-  `Handler` for `ControlClient::run`: its `handle` **awaits** a bounded
-  channel send, so a slow dispatcher stalls the read loop and the
+- **Rust** — `dataplane::control_runtime::spawn_control_runtime` is
+  the **single composition entry**: it constructs the `ControlClient`,
+  runs it with the dispatch `InboundForwarder`, owns the CTL-05
+  snapshot task (validate → apply through the monotonic
+  `SnapshotStore` → serving-side consumer → `SnapshotResult` with the
+  initiating request id → `AppliedGeneration` into drain provenance),
+  and owns shutdown/join/error propagation. The **process-long-lived**
+  `ControlCommandHandler` lives on the dispatch task. The
+  `InboundForwarder`'s `handle` **awaits** a bounded queue
+  reservation, so a slow dispatcher stalls the read loop and the
   backpressure is real — through TCP to the Go sender's bounded lanes —
-  instead of an unbounded Rust-side queue (Go frees lane quota once a
-  frame is written, so only await-backpressure actually bounds memory)
-  or a dropped command the peer considers delivered. The dispatch loop
-  is the explicit multiplexer for **every** inbound body: commands and
-  reconcile snapshots consult the gate; `RouteAssignment` /
-  `HandshakeDecision` / `HandshakeResult` forward to the owning
-  session's registered response channel (slot overflow is answered as a
-  protocol violation, a closed channel defers to close accounting);
-  snapshot bodies forward — awaited — to the CTL-05 owner; transport
-  bodies terminate; anything else is answered with a typed protocol
-  error and counted. Nothing is silently dropped. Reconnect is
-  automatic and atomic: the loop watches the client's connection
-  state, whose `Connected { epoch, capabilities }` snapshot carries
-  both values in one atomic read — on every new session it updates the
-  peer mode from the negotiated capability mask, sends the reconcile
-  request built from the gate, and replays unacknowledged metering,
-  all bound to exactly that session. Control reconnects update the
-  peer mode only; the gate, its tombstones, unacked results, and
-  watermarks are never rebuilt — cross-epoch replay depends on them.
-  `handle_envelope` consumes real `ControlEnvelope`s (wire deadlines
-  validated — force before graceful or absurdly far ahead is a
-  protocol violation — then converted against an injected clock pair;
-  a command arriving past its force deadline force-closes immediately)
-  and emits complete outbound envelopes. **Request-id lineage**: every
-  application-originated envelope takes its id from the sender's
-  single checked allocator (heartbeats included; fail-closed at
-  exhaustion, never wrapping), while **responses reuse the initiating
-  request id** — inline answers carry the inbound command's id and
-  asynchronous terminals carry the id saved at admission. CLOSED
-  lifecycle events (session terminations and reconcile ghosts) take
-  allocator ids, and the recorded maximum is the reconcile
-  `last_connection_event_sequence` both Go's per-epoch dedup and
-  rehydration key on. **Terminal `DrainResult`s are produced
-  proactively on the completion transition** — the last matched
-  session closing (or a zero-match admission) answers the issuer with
-  the initiating id, never waiting for a command replay — and
-  force-phase `CloseImmediate` is marked delivered only when the send
-  succeeds: a full session channel retries on the next tick, a closed
-  one converges through the close path.
-- **Go** — `pkg/controlbridge.CompositeControlHandler` (transport
-  handler) composes the `RouterAdapter`, `DrainIssuer`, and
+  instead of an unbounded Rust-side queue or a dropped command the
+  peer considers delivered. **Teardown cannot deadlock on that await**:
+  the transport publishes `Disconnected` before joining its loops, the
+  forwarder then retains its one in-flight frame in a slot, and the
+  next session runs **two-phase**: the write path goes live first
+  (draining the lanes a jammed dispatcher waits on), then the
+  transport awaits the handler's `resume_session` pump — selected
+  against session stop, cancel-safe, retention intact under
+  cancellation — and only after the slot is empty does the new reader
+  start. At most one retained frame can therefore exist globally, it
+  is delivered to dispatch exactly once, and old read paths always
+  join (no detached tasks).
+
+  The dispatch loop is the explicit multiplexer for **every** inbound
+  body, with **wire-epoch policy** (each envelope carries its origin
+  `control_epoch`, validated on read): commands (redirect/close/drain)
+  from any epoch consult the gate — its generation, sequence-watermark,
+  and tombstone invariants are exactly the cross-epoch safety
+  argument; a `ReconcileSnapshot` from a dead epoch is superseded
+  (dropped, counted — the current session's automatic request gets a
+  fresh one) and one arriving without negotiated
+  `RECONCILE_CONNECTIONS` is an unsolicited protocol violation;
+  `RouteAssignment` / `HandshakeDecision` deliver to the owning
+  session in every epoch under **fail-closed correlation** — the
+  session arms `(initiating request id, body kind)` via
+  `ExpectResponse`, and an unsolicited, wrong-id, or wrong-kind answer
+  is refused as a violation instead of occupying the one-slot channel
+  or being mis-consumed by a newer exchange (a closed response channel
+  is answered `RECONCILIATION_REQUIRED`, not treated as delivered);
+  `StateSnapshot` forwards — awaited — to the **required** snapshot
+  owner (its loss terminates dispatch); Rust→Go-direction bodies
+  arriving inbound (`HandshakeResult`, `SnapshotResult`, results,
+  events, batches) are protocol violations. Nothing is silently
+  dropped, and the select is unbiased so no arm — in particular the
+  drain-force tick — can be starved indefinitely.
+
+  Reconnect is automatic, atomic, and **capability-gated**: the
+  `Connected { epoch, capabilities }` watch snapshot carries both
+  values in one read; the peer mode updates from the mask, and — only
+  when `RECONCILE_CONNECTIONS` was negotiated — the reconcile request
+  (declaring `[RECONCILE_CONNECTIONS, RECONCILE_SESSION_REHYDRATION]`
+  as negotiated) is sent **session-scoped**: the transport queue entry
+  is bound to that exact epoch and is dropped (counted) rather than
+  written under a later epoch, because the next `Connected` transition
+  regenerates it. Durable work — command results, CLOSED events,
+  metering batches — is never epoch-dropped: it survives reconnects
+  and the peer dedups it by request id / sequence. Without
+  `RECONCILE_CONNECTIONS` no request is sent and no ack can arrive:
+  the ledger's bounded unacked retention (fail-closed seal at the
+  bound) is then the explicit backpressure. Metering has its full
+  production lifecycle here: sessions record deltas via
+  `DispatchNotice::Metering`, the tick seals batches onto the wire,
+  reconnects replay everything unacknowledged.
+
+  **Request-id lineage**: every application-originated envelope takes
+  its id from the sender's single checked allocator (heartbeats
+  included; compare-and-swap at the terminal value, so concurrent
+  callers can never observe a transient wrap), while **responses reuse
+  the initiating request id** — inline answers carry the inbound
+  command's id and asynchronous terminals carry the id saved at
+  admission (records are consumed at terminal production and die with
+  their session, so the maps are bounded). CLOSED lifecycle events
+  take allocator ids, and the recorded maximum — advanced only
+  **after a successful send** — is the reconcile
+  `last_connection_event_sequence`; a failed send is counted and
+  converges through reconcile omission. Allocator exhaustion
+  terminates the dispatch loop fail-closed. **Terminal `DrainResult`s
+  are produced proactively on the completion transition** with the
+  initiating id, and force-phase `CloseImmediate` is marked delivered
+  only when the send succeeds. Wire drain deadlines are validated
+  (force before graceful, or an absurd horizon, is a protocol
+  violation) before any clock conversion.
+- **Go** — `pkg/controlbridge.NewBridge` is the single composition
+  entry: it owns the mode-0600 control listener (`transport.Listen` +
+  `Serve`), the `CompositeControlHandler`, and the orphan-resolution
+  cadence, torn down together on context cancellation. The composite
+  (transport handler) composes the `RouterAdapter`, `DrainIssuer`, and
   `MeteringConsumer`: metering batches apply with contiguous-sequence
   dedup, drain results route to the issuer, and every
   `ReconcileRequest` restores the issuer's drain watermark before the
@@ -132,6 +173,14 @@ The gates are on the real message paths on both sides:
   wire id answered `DRAIN_IN_PROGRESS`) clears when its terminal
   result arrives and arms the consume-once `ForeignDrainResolved`
   retry signal.
+
+**Scope honesty**: the application `main`s do not start these
+composition entries yet — `tiproxy-rs` is still a version-only stub
+and the Go proxy bootstrap has no dataplane branch. That wiring, and
+live listener sessions feeding the runtime, land with the DPL-03/05
+integrations (tracked as acceptance checklist items on those issues);
+issue #16's end-to-end lost Assigned/Closed and restart acceptance
+stays **open** until then.
 
 **Lineage is the control epoch, not the config generation**: a Rust
 restart can keep the same snapshot generation, so closed-connection
@@ -190,11 +239,15 @@ the adapter closes the session with a generation-stamped
 per-connection `CloseCommand` — and responsibility transfers only when
 that close actually reached the **current** negotiated sender with the
 `PER_CONNECTION_CLOSE` capability. Failed sends keep the orphan for
-the next attempt, and a **compare-and-delete** re-reads the current
-sender after a successful send: a stale sender's in-flight `Send`
-returning nil after a reconnect rotation does not transfer the
-obligation into the dead lineage — the orphan is retained and the next
-cadence re-sends on the live sender. `AttachRouterLookup`/`ResolveOrphans` are seams:
+the next attempt, and a **compare-and-delete in one critical section**
+(the current-sender comparison and the deletion share the same
+`adapter.mu` hold, linearized with `rememberSender` and reconcile)
+guards the deletion: a stale sender's in-flight `Send` returning nil
+after a reconnect rotation does not transfer the obligation into the
+dead lineage — and no rotation-plus-reconcile can land between a
+separate compare and delete, because there is no window between them.
+The orphan is retained and the next cadence re-sends on the live
+sender. `AttachRouterLookup`/`ResolveOrphans` are seams:
 the composition wiring (namespace manager, maintenance cadence) lands
 with the DPL-03/05 integrations, and the no-leak property holds *given
 that cadence* — it is not claimed for an unwired binary. A reused
