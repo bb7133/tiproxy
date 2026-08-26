@@ -31,6 +31,7 @@ pub mod runtime_config;
 pub mod server;
 pub mod session;
 pub mod session_control;
+pub mod session_engine;
 
 pub use admission::{
     AdmissionController, AdmissionMetricsSnapshot, AdmissionPolicy, AdmissionPolicyError,
@@ -63,6 +64,7 @@ pub use server::{
     AcceptedConnection, BoundListenerInfo, ConnectionHandler, DataplaneHandle, DataplaneServer,
     ListenerSpec, ServerError, ServerMetricsSnapshot, preflight_snapshot,
 };
+pub use session_engine::{EngineSessionOwner, run_bound_session};
 pub use session_control::{
     BoundSessionHandler, DispatchConnectionHandler, DispatchHandleInstaller, SessionControlBinding,
 };

@@ -258,7 +258,12 @@ async fn drain_dispatch_runs_graceful_then_force() {
 
     // One session drains gracefully: its CLOSED event is owed, but the
     // drain is not complete yet — no premature terminal.
-    let closed = handler.session_closed(1, false, ErrorSource::ClientNetwork);
+    let closed = handler.session_closed(
+        1,
+        false,
+        ErrorSource::ClientNetwork,
+        dataplane::route_control::TrafficTotals::default(),
+    );
     assert_eq!(closed.len(), 1, "CLOSED lifecycle event only");
     assert!(matches!(closed[0].body, Some(Body::ConnectionEvent(_))));
 
@@ -280,7 +285,12 @@ async fn drain_dispatch_runs_graceful_then_force() {
     // The LAST matched session closing is the completion transition:
     // the terminal DrainResult goes out proactively, addressed with
     // the initiating request id.
-    let closed = handler.session_closed(2, true, ErrorSource::Proxy);
+    let closed = handler.session_closed(
+        2,
+        true,
+        ErrorSource::Proxy,
+        dataplane::route_control::TrafficTotals::default(),
+    );
     assert_eq!(closed.len(), 2, "CLOSED event plus the proactive terminal");
     assert!(matches!(closed[0].body, Some(Body::ConnectionEvent(_))));
     assert_eq!(
@@ -973,6 +983,7 @@ async fn closed_event_ids_feed_reconcile_watermark() {
             connection_id: 1,
             forced: false,
             error_source: ErrorSource::ClientNetwork,
+            traffic: dataplane::route_control::TrafficTotals::default(),
         })
         .await
         .ok();

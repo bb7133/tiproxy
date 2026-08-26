@@ -270,6 +270,42 @@ impl AcceptedConnection {
     pub const fn stream_mut(&mut self) -> &mut TcpStream {
         &mut self.stream
     }
+
+    /// Consumes the admission into the owned stream plus a seat that
+    /// keeps the registry lease (and the captured snapshot) alive for
+    /// the session's whole lifetime. Dropping the seat releases the
+    /// admission exactly as dropping the connection would.
+    #[must_use]
+    pub fn into_session_io(self) -> (TcpStream, SessionSeat) {
+        (
+            self.stream,
+            SessionSeat {
+                snapshot: self.snapshot,
+                lease: self.lease,
+            },
+        )
+    }
+}
+
+/// The non-I/O remainder of an admitted connection: the captured
+/// snapshot and the registry lease, alive until dropped.
+pub struct SessionSeat {
+    snapshot: Arc<ValidatedSnapshot>,
+    lease: ConnectionLease,
+}
+
+impl SessionSeat {
+    /// The immutable snapshot captured at admission.
+    #[must_use]
+    pub fn snapshot(&self) -> &Arc<ValidatedSnapshot> {
+        &self.snapshot
+    }
+
+    /// Payload-free identity and accounting metadata.
+    #[must_use]
+    pub const fn metadata(&self) -> &ConnectionMetadata {
+        self.lease.metadata()
+    }
 }
 
 impl fmt::Debug for AcceptedConnection {

@@ -77,6 +77,7 @@ use crate::control_commands::{
     CloseAdmission, CommandGate, DrainAdmission, DrainPhase, MeteringError, MeteringLedger,
     RedirectAdmission,
 };
+use crate::route_control::TrafficTotals;
 use crate::session::SessionControl;
 
 /// Observable dispatch counters, shared between the loop's handler and
@@ -468,6 +469,7 @@ impl ControlCommandHandler {
         connection_id: u64,
         forced: bool,
         error_source: ErrorSource,
+        traffic: TrafficTotals,
     ) -> Vec<ControlEnvelope> {
         let identity = self.gate.connection_identity(connection_id);
         let generation = self.gate.connection_generation(connection_id).unwrap_or(0);
@@ -494,6 +496,7 @@ impl ControlCommandHandler {
                 &backend_id,
                 generation,
                 error_source,
+                traffic,
             ));
         }
         if let Some(terminal) = drain_terminal {
@@ -1005,7 +1008,12 @@ impl ControlCommandHandler {
                     // Real backpressure: retry on the next tick.
                 }
                 ForwardOutcome::Gone => {
-                    outbound.extend(self.session_closed(id, true, ErrorSource::Proxy));
+                    outbound.extend(self.session_closed(
+                        id,
+                        true,
+                        ErrorSource::Proxy,
+                        TrafficTotals::default(),
+                    ));
                 }
             }
         }
@@ -1121,6 +1129,7 @@ impl ControlCommandHandler {
                     &remote.backend_id,
                     remote.generation,
                     ErrorSource::Proxy,
+                    TrafficTotals::default(),
                 );
                 event.required_capabilities =
                     vec![ControlCapability::ReconcileSessionRehydration as u64];
@@ -1204,6 +1213,7 @@ fn closed_event_envelope(
     backend_id: &str,
     generation: u64,
     error_source: ErrorSource,
+    traffic: TrafficTotals,
 ) -> ControlEnvelope {
     ControlEnvelope {
         protocol_version: 0,
@@ -1222,10 +1232,10 @@ fn closed_event_envelope(
             backend_id: backend_id.to_owned(),
             namespace: String::new(),
             error_source: error_source.into(),
-            client_in_bytes: 0,
-            client_out_bytes: 0,
-            backend_in_bytes: 0,
-            backend_out_bytes: 0,
+            client_in_bytes: traffic.client_in,
+            client_out_bytes: traffic.client_out,
+            backend_in_bytes: traffic.backend_in,
+            backend_out_bytes: traffic.backend_out,
         })),
     }
 }
@@ -1303,6 +1313,8 @@ pub enum DispatchNotice {
         forced: bool,
         /// Failure attribution for the CLOSED event.
         error_source: ErrorSource,
+        /// Final byte totals for the CLOSED lifecycle event.
+        traffic: TrafficTotals,
     },
     /// A session's redirect finished.
     RedirectFinished {
@@ -1522,11 +1534,13 @@ impl ControlDispatchHandle {
         connection_id: u64,
         forced: bool,
         error_source: ErrorSource,
+        traffic: TrafficTotals,
     ) -> bool {
         self.notify(DispatchNotice::SessionClosed {
             connection_id,
             forced,
             error_source,
+            traffic,
         })
         .await
     }
@@ -2035,8 +2049,9 @@ async fn apply_notice<S: DispatchSender>(
             connection_id,
             forced,
             error_source,
+            traffic,
         } => {
-            for envelope in handler.session_closed(connection_id, forced, error_source) {
+            for envelope in handler.session_closed(connection_id, forced, error_source, traffic) {
                 dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
             }
         }
