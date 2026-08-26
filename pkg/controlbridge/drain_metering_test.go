@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/pingcap/tiproxy/pkg/balance/router"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 )
 
@@ -185,4 +186,57 @@ func TestDrainCommandRoundTripContract(t *testing.T) {
 	final, done := issuer.Progress("d-rt")
 	require.True(t, done)
 	require.EqualValues(t, 3, final.GetActiveConnections())
+}
+
+// Go-restart direction of the reconcile contract: a fresh adapter (no
+// memory of any Rust session) answers a ReconcileRequest by identifying
+// the Rust connections as unknown to this lineage — an empty snapshot —
+// without inventing accounting for them or crashing; the Rust side
+// preserves those sessions (proven in the Rust model tests). With a
+// metering consumer attached, the snapshot acknowledges the consumer's
+// actually-applied sequence, not the producer's claim.
+func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler := &recordingHandler{rt: rt}
+	adapter := newTestAdapter(t, handler)
+	consumer := NewMeteringConsumer()
+	require.True(t, consumer.Apply(&controlpb.MeteringBatch{
+		Sequence: 4,
+		Deltas: []*controlpb.MeteringDelta{{
+			Keyspace: "ks-a", BackendId: "tidb-a", ResponseBytes: 10,
+		}},
+	}))
+	adapter.AttachMetering(consumer)
+
+	peer := newFakeSender(11,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS))
+	// Rust survived a Go restart and reports two live sessions plus a
+	// producer metering sequence beyond what this consumer ever saw.
+	reconcile := &controlpb.ControlEnvelope{
+		RequestId:  60,
+		Generation: 12,
+		Body: &controlpb.ControlEnvelope_ReconcileRequest{ReconcileRequest: &controlpb.ReconcileRequest{
+			KnownGeneration:      12,
+			LastMeteringSequence: 9,
+			Connections: []*controlpb.ReconcileConnection{
+				{ConnectionId: 70, BackendId: "tidb-a:4000", Namespace: "ns-a", RedirectPending: true},
+				{ConnectionId: 71, BackendId: "tidb-a:4000", Namespace: "ns-a"},
+			},
+		}},
+	}
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcile))
+	snapshot := lastEnvelope(t, peer).GetReconcileSnapshot()
+	require.NotNil(t, snapshot)
+	require.Empty(t, snapshot.GetConnections(),
+		"unknown-to-lineage connections are identified by omission, never adopted blindly")
+	require.EqualValues(t, 4, snapshot.GetMeteringSequence(),
+		"the acknowledgement is the consumer's applied sequence, not the producer's claim")
+	require.Equal(t, 0, handler.closeCalls, "no phantom accounting, no negative counts")
+	require.Equal(t, 0, rt.ConnCount())
+
+	// Idempotent re-apply: the same request yields the same answer with
+	// no accounting drift.
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcile))
+	require.Equal(t, 0, handler.closeCalls)
+	require.Equal(t, 0, rt.ConnCount())
 }

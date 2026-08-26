@@ -465,7 +465,11 @@ fn metering_is_deduplicated_cumulative_and_replayable() {
     };
 
     let mut ledger = MeteringLedger::new();
-    assert_eq!(ledger.seal(), Ok(None), "nothing accumulated, nothing sealed");
+    assert_eq!(
+        ledger.seal(),
+        Ok(None),
+        "nothing accumulated, nothing sealed"
+    );
 
     // Same key merges cumulatively; different key stays separate.
     ledger.record(delta("ks-a", 100));
@@ -481,7 +485,11 @@ fn metering_is_deduplicated_cumulative_and_replayable() {
         .iter()
         .find(|entry| entry.keyspace == "ks-a")
         .map(|entry| (entry.response_bytes, entry.cross_location_bytes));
-    assert_eq!(merged, Some((150, 75)), "same-key deltas merge cumulatively");
+    assert_eq!(
+        merged,
+        Some((150, 75)),
+        "same-key deltas merge cumulatively"
+    );
 
     ledger.record(delta("ks-a", 7));
     let Ok(Some(second)) = ledger.seal() else {
