@@ -1464,7 +1464,7 @@ fn is_clean_eof(error: &proxy_io::PacketIoError) -> bool {
 /// Fills the greeting salt from OS entropy.
 fn fill_salt(salt: &mut [u8; 20]) {
     let mut buffer = [0_u8; 20];
-    if getrandom::fill(&mut buffer).is_ok() {
+    if getrandom::getrandom(&mut buffer).is_ok() {
         *salt = buffer;
         // MySQL salts avoid NUL bytes (NUL-terminated on the wire).
         for byte in salt.iter_mut() {
