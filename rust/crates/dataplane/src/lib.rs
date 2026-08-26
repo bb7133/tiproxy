@@ -22,6 +22,7 @@
 
 pub mod admission;
 pub mod registry;
+pub mod route;
 pub mod server;
 pub mod session;
 
@@ -31,6 +32,10 @@ pub use admission::{
 };
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,
+};
+pub use route::{
+    AcquireError, AcquireStats, AcquiredBackend, BackendDialer, BackendInfo, DialFailure,
+    DialSchedule, RouteChannel, RouteChannelError, RouteEngine,
 };
 pub use server::{
     AcceptedConnection, BoundListenerInfo, ConnectionHandler, DataplaneHandle, DataplaneServer,

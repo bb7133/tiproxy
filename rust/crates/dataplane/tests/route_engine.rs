@@ -1,0 +1,474 @@
+// Copyright 2026 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! DPL-02 model tests: the route/dial engine against a scripted adapter
+//! (Go `RouterAdapter` semantics: one request, assignments pushed after
+//! every failed result) and a scripted dialer, under Tokio's paused-time
+//! deterministic scheduler. The two-backend failure matrix, budget
+//! bounds, deterministic backoff, exactly-once assignment retirement,
+//! terminal adapter answers, control loss, and handshake-driven
+//! re-selection are covered explicitly.
+
+use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
+
+use control_proto::v1::{ErrorCode, ErrorSource, RouteAssignment, RouteResult};
+use dataplane::route::{
+    AcquireError, BackendDialer, DialFailure, DialSchedule, RouteChannel, RouteChannelError,
+    RouteEngine,
+};
+use tokio::time::Instant;
+
+const CONN_ID: u64 = 7;
+
+fn assignment(id: &str, backend: &str, address: &str) -> RouteAssignment {
+    RouteAssignment {
+        connection_id: CONN_ID,
+        assignment_id: id.to_owned(),
+        backend_id: backend.to_owned(),
+        backend_address: address.to_owned(),
+        cluster_name: "cluster-a".to_owned(),
+        keyspace: "ks".to_owned(),
+        healthy: true,
+        local: true,
+        code: ErrorCode::Ok.into(),
+        detail: String::new(),
+    }
+}
+
+fn terminal(code: ErrorCode, detail: &str) -> RouteAssignment {
+    RouteAssignment {
+        connection_id: CONN_ID,
+        code: code.into(),
+        detail: detail.to_owned(),
+        ..assignment("", "", "")
+    }
+}
+
+/// Scripted adapter: assignments are delivered in order, each awaited
+/// only after the previous one's failed result (the engine's await *is*
+/// the adapter's push); every result is recorded.
+#[derive(Default)]
+struct FakeAdapter {
+    assignments: VecDeque<RouteAssignment>,
+    results: Vec<RouteResult>,
+    requests: u32,
+    /// When the queue empties, answer this instead of hanging.
+    on_empty: Option<RouteChannelError>,
+}
+
+impl RouteChannel for FakeAdapter {
+    async fn request_route(
+        &mut self,
+        _excluded_backend_ids: Vec<String>,
+    ) -> Result<(), RouteChannelError> {
+        self.requests += 1;
+        Ok(())
+    }
+
+    async fn next_assignment(&mut self) -> Result<RouteAssignment, RouteChannelError> {
+        match self.assignments.pop_front() {
+            Some(assignment) => Ok(assignment),
+            None => match self.on_empty {
+                Some(error) => Err(error),
+                None => std::future::pending().await,
+            },
+        }
+    }
+
+    async fn report_result(&mut self, result: RouteResult) -> Result<(), RouteChannelError> {
+        self.results.push(result);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Outcome {
+    Connect,
+    Refuse,
+    Hang,
+}
+
+/// Scripted dialer keyed by address; records each attempt's address,
+/// cluster, and start time for schedule assertions.
+struct FakeDialer {
+    outcomes: HashMap<String, Outcome>,
+    attempts: Vec<(String, String, Instant)>,
+}
+
+impl FakeDialer {
+    fn new(outcomes: &[(&str, Outcome)]) -> Self {
+        Self {
+            outcomes: outcomes
+                .iter()
+                .map(|(addr, outcome)| ((*addr).to_owned(), *outcome))
+                .collect(),
+            attempts: Vec::new(),
+        }
+    }
+}
+
+impl BackendDialer for FakeDialer {
+    type Conn = String;
+
+    async fn dial(&mut self, address: &str, cluster_name: &str) -> Result<String, DialFailure> {
+        self.attempts
+            .push((address.to_owned(), cluster_name.to_owned(), Instant::now()));
+        match self.outcomes.get(address) {
+            Some(Outcome::Connect) => Ok(address.to_owned()),
+            Some(Outcome::Refuse) => Err(DialFailure::Connect),
+            Some(Outcome::Hang) | None => std::future::pending().await,
+        }
+    }
+}
+
+fn schedule() -> DialSchedule {
+    // Centered jitter (the default) makes every delay exactly nominal.
+    DialSchedule::default()
+}
+
+fn engine(
+    adapter: FakeAdapter,
+    dialer: FakeDialer,
+    schedule: DialSchedule,
+) -> RouteEngine<FakeAdapter, FakeDialer> {
+    RouteEngine::new(adapter, dialer, schedule, CONN_ID)
+}
+
+fn results_for<'r>(results: &'r [RouteResult], id: &str) -> Vec<&'r RouteResult> {
+    results
+        .iter()
+        .filter(|result| result.assignment_id == id)
+        .collect()
+}
+
+/// Backend A fails, backend B connects: the failed result retires A
+/// (score released), the engine awaits the pushed B, backs off exactly
+/// one initial interval, and surfaces B's metadata. Exactly one result
+/// per assignment id.
+#[tokio::test(start_paused = true)]
+async fn second_backend_connects_after_first_fails() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    adapter
+        .assignments
+        .push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
+    let dialer = FakeDialer::new(&[
+        ("10.0.0.1:4000", Outcome::Refuse),
+        ("10.0.0.2:4000", Outcome::Connect),
+    ]);
+    let start = Instant::now();
+    let mut engine = engine(adapter, dialer, schedule());
+    let acquired = match engine.acquire(Vec::new()).await {
+        Ok(acquired) => acquired,
+        Err(error) => unreachable!("acquire failed: {error:?}"),
+    };
+    assert_eq!(acquired.conn, "10.0.0.2:4000");
+    assert_eq!(acquired.backend.backend_id, "tidb-b");
+    assert_eq!(acquired.backend.cluster_name, "cluster-a");
+    assert_eq!(acquired.assignment_id, "a-2");
+    assert_eq!(acquired.attempts, 2);
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_millis(100),
+        "one initial backoff between the attempts"
+    );
+
+    let (engine_channel, _) = engine.into_parts();
+    assert_eq!(engine_channel.requests, 1, "one RouteRequest total");
+    let failed = results_for(&engine_channel.results, "a-1");
+    assert_eq!(failed.len(), 1, "A retired exactly once");
+    assert!(!failed[0].connected);
+    assert_eq!(failed[0].error_source(), ErrorSource::BackendNetwork);
+    assert_eq!(failed[0].code(), ErrorCode::BackendDialFailed);
+    let connected = results_for(&engine_channel.results, "a-2");
+    assert_eq!(connected.len(), 1, "B retired exactly once");
+    assert!(connected[0].connected);
+}
+
+/// Every candidate down: each failed assignment is retired exactly once
+/// and the adapter's `NO_BACKEND` terminal is surfaced deterministically.
+#[tokio::test(start_paused = true)]
+async fn all_backends_down_reaches_no_backend() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    adapter
+        .assignments
+        .push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
+    adapter
+        .assignments
+        .push_back(terminal(ErrorCode::NoBackend, "no backend available"));
+    let dialer = FakeDialer::new(&[
+        ("10.0.0.1:4000", Outcome::Refuse),
+        ("10.0.0.2:4000", Outcome::Refuse),
+    ]);
+    let mut engine = engine(adapter, dialer, schedule());
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!("all-down must not connect")
+    };
+    assert_eq!(
+        error,
+        AcquireError::NoBackend {
+            detail: "no backend available".to_owned()
+        }
+    );
+    let (channel, _) = engine.into_parts();
+    assert_eq!(results_for(&channel.results, "a-1").len(), 1);
+    assert_eq!(results_for(&channel.results, "a-2").len(), 1);
+    assert_eq!(channel.results.len(), 2, "the terminal needs no result");
+}
+
+/// A hanging backend consumes exactly the per-dial timeout and reports a
+/// timeout-classified failure; the next candidate still connects.
+#[tokio::test(start_paused = true)]
+async fn per_dial_timeout_bounds_each_attempt() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    adapter
+        .assignments
+        .push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
+    let dialer = FakeDialer::new(&[
+        ("10.0.0.1:4000", Outcome::Hang),
+        ("10.0.0.2:4000", Outcome::Connect),
+    ]);
+    let start = Instant::now();
+    let mut engine = engine(adapter, dialer, schedule());
+    let acquired = match engine.acquire(Vec::new()).await {
+        Ok(acquired) => acquired,
+        Err(error) => unreachable!("acquire failed: {error:?}"),
+    };
+    assert_eq!(acquired.conn, "10.0.0.2:4000");
+    // 1s hang (per-dial bound) + 100ms backoff + instant second dial.
+    assert_eq!(start.elapsed(), Duration::from_millis(1100));
+    let (channel, _) = engine.into_parts();
+    let timed_out = results_for(&channel.results, "a-1");
+    assert_eq!(timed_out.len(), 1);
+    assert!(!timed_out[0].connected);
+}
+
+/// The total budget bounds the acquisition: with every candidate failing
+/// and assignments never running out, the engine stops at the budget,
+/// having retired every assignment it consumed exactly once.
+#[tokio::test(start_paused = true)]
+async fn total_budget_bounds_acquisition() {
+    let mut adapter = FakeAdapter::default();
+    for index in 0..64 {
+        adapter
+            .assignments
+            .push_back(assignment(&format!("a-{index}"), "tidb-a", "10.0.0.1:4000"));
+    }
+    let dialer = FakeDialer::new(&[("10.0.0.1:4000", Outcome::Refuse)]);
+    let config = DialSchedule {
+        total: Duration::from_secs(3),
+        ..schedule()
+    };
+    let start = Instant::now();
+    let mut engine = engine(adapter, dialer, config);
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!("must exhaust")
+    };
+    assert!(
+        matches!(error, AcquireError::BudgetExhausted { .. }),
+        "{error:?}"
+    );
+    assert!(
+        start.elapsed() <= Duration::from_secs(3),
+        "bounded by the total budget: {:?}",
+        start.elapsed()
+    );
+    let stats = engine.stats();
+    let (channel, _) = engine.into_parts();
+    assert_eq!(
+        u32::try_from(channel.results.len()).unwrap_or(u32::MAX),
+        stats.assignments,
+        "every consumed assignment retired exactly once"
+    );
+    for result in &channel.results {
+        assert!(!result.connected);
+    }
+}
+
+/// With centered jitter the backoff schedule is exactly Go's nominal
+/// series: 100ms, 200ms, 400ms, 800ms, 1600ms, then capped at 2s.
+#[tokio::test(start_paused = true)]
+async fn backoff_schedule_matches_go_nominal_series() {
+    let mut adapter = FakeAdapter {
+        on_empty: Some(RouteChannelError::ControlLost),
+        ..FakeAdapter::default()
+    };
+    for index in 0..7 {
+        adapter
+            .assignments
+            .push_back(assignment(&format!("a-{index}"), "tidb-a", "10.0.0.1:4000"));
+    }
+    let dialer = FakeDialer::new(&[("10.0.0.1:4000", Outcome::Refuse)]);
+    let config = DialSchedule {
+        total: Duration::from_secs(60),
+        ..schedule()
+    };
+    let mut engine = engine(adapter, dialer, config);
+    // Exhaust the scripted assignments, then fail terminally.
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!("must not connect")
+    };
+    assert_eq!(error, AcquireError::Channel(RouteChannelError::ControlLost));
+    let (_, dialer) = engine.into_parts();
+    let times: Vec<Duration> = dialer
+        .attempts
+        .windows(2)
+        .map(|pair| pair[1].2.duration_since(pair[0].2))
+        .collect();
+    assert_eq!(
+        times,
+        vec![
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
+            Duration::from_millis(1600),
+            Duration::from_millis(2000),
+        ],
+        "nominal exponential series, capped"
+    );
+}
+
+/// A terminal internal routing failure is surfaced with its code.
+#[tokio::test(start_paused = true)]
+async fn terminal_routing_error_is_surfaced() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(terminal(ErrorCode::Internal, "router broke"));
+    let dialer = FakeDialer::new(&[]);
+    let mut engine = engine(adapter, dialer, schedule());
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!()
+    };
+    assert_eq!(
+        error,
+        AcquireError::Routing {
+            code: ErrorCode::Internal,
+            detail: "router broke".to_owned()
+        }
+    );
+}
+
+/// Control loss mid-acquisition surfaces as a channel error with no
+/// assignment left unretired.
+#[tokio::test(start_paused = true)]
+async fn control_loss_mid_acquisition() {
+    let mut adapter = FakeAdapter {
+        on_empty: Some(RouteChannelError::ControlLost),
+        ..FakeAdapter::default()
+    };
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    let dialer = FakeDialer::new(&[("10.0.0.1:4000", Outcome::Refuse)]);
+    let mut engine = engine(adapter, dialer, schedule());
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!()
+    };
+    assert_eq!(error, AcquireError::Channel(RouteChannelError::ControlLost));
+    let (channel, _) = engine.into_parts();
+    assert_eq!(
+        results_for(&channel.results, "a-1").len(),
+        1,
+        "the consumed assignment was retired before the loss surfaced"
+    );
+}
+
+/// Handshake-driven re-selection: after a connected backend's
+/// authentication fails and the Go handler permits a retry, the engine
+/// resumes on the adapter's next pushed assignment under a fresh budget;
+/// both assignments end with exactly one result each.
+#[tokio::test(start_paused = true)]
+async fn handshake_failure_reselects_distinct_backend() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    adapter
+        .assignments
+        .push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
+    let dialer = FakeDialer::new(&[
+        ("10.0.0.1:4000", Outcome::Connect),
+        ("10.0.0.2:4000", Outcome::Connect),
+    ]);
+    let mut engine = engine(adapter, dialer, schedule());
+    let first = match engine.acquire(Vec::new()).await {
+        Ok(acquired) => acquired,
+        Err(error) => unreachable!("first acquire failed: {error:?}"),
+    };
+    assert_eq!(first.backend.backend_id, "tidb-a");
+
+    // Authentication failed against tidb-a; the handler permitted a
+    // retry and the adapter pushed the next assignment.
+    let second = match engine.reacquire_after_handshake().await {
+        Ok(acquired) => acquired,
+        Err(error) => unreachable!("re-selection failed: {error:?}"),
+    };
+    assert_eq!(second.backend.backend_id, "tidb-b", "distinct backend");
+    let (channel, _) = engine.into_parts();
+    assert_eq!(channel.requests, 1, "re-selection reuses the exchange");
+    for id in ["a-1", "a-2"] {
+        let results = results_for(&channel.results, id);
+        assert_eq!(results.len(), 1, "{id} retired exactly once");
+        assert!(results[0].connected);
+    }
+}
+
+/// When the remaining budget cannot fit the next backoff, the pending
+/// assignment is still retired (with a not-attempted failure) before the
+/// engine reports exhaustion — nothing leaks router score.
+#[tokio::test(start_paused = true)]
+async fn pre_dial_exhaustion_still_retires_the_assignment() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    adapter
+        .assignments
+        .push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
+    let dialer = FakeDialer::new(&[
+        ("10.0.0.1:4000", Outcome::Refuse),
+        ("10.0.0.2:4000", Outcome::Connect),
+    ]);
+    // Budget fits the first dial but not the backoff before the second.
+    let config = DialSchedule {
+        total: Duration::from_millis(50),
+        ..schedule()
+    };
+    let mut engine = engine(adapter, dialer, config);
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!("budget cannot fit the retry")
+    };
+    assert!(matches!(error, AcquireError::BudgetExhausted { .. }));
+    let (channel, _) = engine.into_parts();
+    assert_eq!(
+        results_for(&channel.results, "a-1").len(),
+        1,
+        "failed dial retired"
+    );
+    let unattempted = results_for(&channel.results, "a-2");
+    assert_eq!(unattempted.len(), 1, "unattempted assignment retired too");
+    assert!(!unattempted[0].connected);
+    assert_eq!(unattempted[0].error_source(), ErrorSource::Proxy);
+}
