@@ -107,7 +107,8 @@ Pure backend-auth policy frozen from Go `authenticator.go`:
   round-trips, `caching_sha2_password` fast path (plugin-gated — sm3 and
   everything else is plain pass-through), handler-approved backend
   reconnect (state reset), first-packet PROXY-protocol error routing
-  (`1156`/`8052`/`1105`+"PROXY Protocol" → `BackendProxyProtocol`, later
+  (`1156`/`8052` by code, or the "PROXY Protocol" message substring under
+  any code, → `BackendProxyProtocol`, later
   errors → `AuthenticationFailed`), and per-side compression activation
   only on the final OK (client = negotiated mask, backend =
   negotiated∩backend, zlib-wins order).

@@ -339,14 +339,15 @@ pub fn classify_backend_auth_packet(
     }
 }
 
-/// Classified backend error during authentication. The wire layer performs
-/// the classification (codes `1156`/`8052`; the `1105` "PROXY Protocol"
-/// message sniff); the event carries only the class.
+/// Classified backend error during authentication.
+/// [`classify_backend_auth_packet`] performs the classification (codes
+/// `1156`/`8052`, or the "PROXY Protocol" message substring under **any**
+/// code); the event carries only the class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthErrorClass {
-    /// `1156` packets out of order, `8052` `TiDB` invalid sequence, or a
-    /// `1105` mentioning "PROXY Protocol" — a PROXY-protocol mismatch when
-    /// seen in the **first** backend packet.
+    /// `1156` packets out of order, `8052` `TiDB` invalid sequence, or any
+    /// error whose message mentions "PROXY Protocol" (no code guard) — a
+    /// PROXY-protocol mismatch when seen in the **first** backend packet.
     ProxyProtocolSuspect,
     /// Any other backend error.
     Other,
