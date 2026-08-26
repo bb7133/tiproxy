@@ -88,3 +88,30 @@ layouts live in `mysql-wire::handshake`):
   libmysqlclient, zstd, TLS-with-dropped-SSL-bit) end-to-end through
   codec + policy, plus exhaustive truncation sweeps (no prefix panics or
   decodes).
+
+## Authentication relay (`auth`, SES-02)
+
+Pure backend-auth policy frozen from Go `authenticator.go`:
+
+- `plan_backend_handshake` (Go `writeAuthHandshake`): backend mask =
+  negotiated∩backend (+`CONNECT_ATTRS` when attrs exist, ±`SSL` by TLS
+  mode); `require-backend-tls` without a config → `ProxyNoTls` route;
+  otherwise TLS is opportunistic (client `SSL` && backend `SSL` &&
+  config). Backend TLS always activates between the 32-byte `SSLRequest`
+  prefix and the credentials; TLS failure routes as
+  `BackendProxyProtocol` (Go quirk), write failures as
+  `BackendHandshake`. The plan takes the `RoutingHandshake` gate, so it
+  cannot run before negotiation succeeded.
+- `AuthRelay` (Go's auth-forward loop): pure turn machine relaying
+  backend↔client auth exchanges without interpreting them. Plugin switch
+  round-trips, `caching_sha2_password` fast path (plugin-gated — sm3 and
+  everything else is plain pass-through), handler-approved backend
+  reconnect (state reset), first-packet PROXY-protocol error routing
+  (`1156`/`8052`/`1105`+"PROXY Protocol" → `BackendProxyProtocol`, later
+  errors → `AuthenticationFailed`), and per-side compression activation
+  only on the final OK (client = negotiated mask, backend =
+  negotiated∩backend, zlib-wins order).
+- Secrets cannot leak by construction: events/effects/errors are
+  classifications that carry no auth bytes; a test sweeps the whole
+  `Debug` surface. Live-TiDB authentication tests belong to the runtime
+  acceptance phases.

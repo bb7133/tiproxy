@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod error_source;
 pub mod fsm;
 pub mod handshake;
