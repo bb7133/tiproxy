@@ -710,7 +710,7 @@ async fn coordinated_shutdown_stops_accept_then_drains() {
 
 /// A drain whose force deadline lands while a command is in flight
 /// (never a safe boundary) force-closes the session: the terminal
-/// DrainResult counts it as force-closed and the CLOSED lifecycle
+/// `DrainResult` counts it as force-closed and the CLOSED lifecycle
 /// event carries the proxy-shutdown attribution.
 #[tokio::test]
 async fn drain_force_deadline_preempts_in_flight_command() {

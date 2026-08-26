@@ -502,15 +502,15 @@ pub async fn run_bound_session(
     // absolute cleanup budget the loop uses, then hard-cancel — the
     // sockets drop with the task, which IS the force close.
     let mut engine_task = engine_task;
-    let engine_exit =
-        match tokio::time::timeout(loop_config.cleanup_deadline, &mut engine_task).await {
-            Ok(joined) => joined.ok(),
-            Err(_) => {
-                engine_task.abort();
-                let _ = engine_task.await;
-                None
-            }
-        };
+    let engine_exit = if let Ok(joined) =
+        tokio::time::timeout(loop_config.cleanup_deadline, &mut engine_task).await
+    {
+        joined.ok()
+    } else {
+        engine_task.abort();
+        let _ = engine_task.await;
+        None
+    };
     while let Ok(report) = report_rx.try_recv() {
         consume_report(report, &commander, &mut redirect_token).await;
     }
