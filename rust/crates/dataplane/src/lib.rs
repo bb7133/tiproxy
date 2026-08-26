@@ -23,6 +23,7 @@
 pub mod admission;
 pub mod registry;
 pub mod route;
+pub mod route_control;
 pub mod server;
 pub mod session;
 
@@ -37,6 +38,10 @@ pub use route::{
     AcquireError, AcquireStats, AcquiredBackend, BackendDialer, BackendInfo, CenteredJitter,
     DialFailure, DialSchedule, JitterSource, RouteChannel, RouteChannelError, RouteEngine,
     SplitMixJitter,
+};
+pub use route_control::{
+    AssignmentRouter, ControlRouteChannel, EnvelopeSink, TcpDialer, TrafficTotals,
+    connection_closed, connection_opened,
 };
 pub use server::{
     AcceptedConnection, BoundListenerInfo, ConnectionHandler, DataplaneHandle, DataplaneServer,
