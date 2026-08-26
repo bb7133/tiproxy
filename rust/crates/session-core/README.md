@@ -78,9 +78,11 @@ layouts live in `mysql-wire::handshake`):
   reported for logging and otherwise ignored (excluding `SSL`).
 - Size gates: 1-MiB pre-read cap (shared limits registry) and the
   32-byte minimum for the first client packet.
-- `RoutingHandshake` is the routing gate: constructible only from a
-  parsed response, so `DialBackend` cannot run before username and
-  client metadata exist.
+- `RoutingHandshake` is the routing gate: opaque, constructible only
+  via `FrontendNegotiation::routing_handshake` (itself only obtainable
+  from a successful negotiation), and carrying the listener and real
+  client addresses — `DialBackend` cannot run before negotiation
+  succeeded and username, listener, and client metadata exist.
 - `tests/handshake_matrix.rs` runs representative driver capability
   profiles (mysql CLI 8.0, go-sql-driver, Connector/J, legacy
   libmysqlclient, zstd, TLS-with-dropped-SSL-bit) end-to-end through

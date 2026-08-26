@@ -24,9 +24,22 @@ use mysql_wire::{
     encode_handshake_response,
 };
 use session_core::handshake::{
-    MIN_CLIENT_HANDSHAKE_LEN, RoutingHandshake, SUPPORTED_SERVER_CAPABILITIES,
+    ConnectionEndpoints, MIN_CLIENT_HANDSHAKE_LEN, SUPPORTED_SERVER_CAPABILITIES,
     check_min_client_handshake, negotiate_frontend, reconcile_tls_capabilities,
 };
+
+fn endpoints() -> ConnectionEndpoints {
+    ConnectionEndpoints {
+        listener_addr: match "10.0.0.1:6000".parse() {
+            Ok(addr) => addr,
+            Err(error) => unreachable!("listener addr: {error}"),
+        },
+        client_addr: match "192.0.2.7:51234".parse() {
+            Ok(addr) => addr,
+            Err(error) => unreachable!("client addr: {error}"),
+        },
+    }
+}
 
 struct DriverProfile {
     name: &'static str,
@@ -189,12 +202,14 @@ fn driver_matrix_negotiates_like_go() {
                 Err(error) => unreachable!("{}: {error}", profile.name),
             };
         assert_eq!(
-            negotiation.plugin_auth_forced, profile.expect_plugin_auth_forced,
+            negotiation.plugin_auth_forced(),
+            profile.expect_plugin_auth_forced,
             "{}",
             profile.name
         );
         assert_eq!(
-            negotiation.unsupported_by_proxy, profile.expect_unsupported,
+            negotiation.unsupported_by_proxy(),
+            profile.expect_unsupported,
             "{}",
             profile.name
         );
@@ -204,18 +219,28 @@ fn driver_matrix_negotiates_like_go() {
             profile.capabilities.bits() & SUPPORTED_SERVER_CAPABILITIES.bits(),
         )
         .union(CapabilityFlags::PLUGIN_AUTH);
-        assert_eq!(negotiation.negotiated, expected, "{}", profile.name);
+        assert_eq!(negotiation.negotiated(), expected, "{}", profile.name);
 
-        let routing = RoutingHandshake::from(&response);
-        assert_eq!(routing.username, b"app_user", "{}", profile.name);
-        assert_eq!(routing.database, profile.database, "{}", profile.name);
-        assert_eq!(routing.zstd_level, profile.zstd_level, "{}", profile.name);
+        // The routing gate is only reachable through the successful
+        // negotiation and carries the endpoints unchanged.
+        let routing = negotiation.routing_handshake(&response, endpoints());
+        assert_eq!(routing.username(), b"app_user", "{}", profile.name);
+        assert_eq!(routing.database(), profile.database, "{}", profile.name);
+        assert_eq!(routing.zstd_level(), profile.zstd_level, "{}", profile.name);
         assert_eq!(
-            routing.has_attributes, profile.attributes,
+            routing.has_attributes(),
+            profile.attributes,
             "{}",
             profile.name
         );
-        assert_eq!(routing.collation, 0x21, "{}", profile.name);
+        assert_eq!(routing.collation(), 0x21, "{}", profile.name);
+        assert_eq!(
+            routing.negotiated(),
+            negotiation.negotiated(),
+            "{}",
+            profile.name
+        );
+        assert_eq!(routing.endpoints(), endpoints(), "{}", profile.name);
     }
 }
 
@@ -248,7 +273,7 @@ fn tls_driver_with_dropped_ssl_bit() {
             Ok(negotiation) => negotiation,
             Err(error) => unreachable!("negotiation failed: {error}"),
         };
-    assert!(negotiation.negotiated.contains(CapabilityFlags::SSL));
+    assert!(negotiation.negotiated().contains(CapabilityFlags::SSL));
 }
 
 /// Truncated packets never panic: every prefix of every profile (and of

@@ -110,19 +110,27 @@ pub const fn greeting_capability(
 
 /// Builds the greeting parameters exactly as Go `handshakeFirstTime` does:
 /// the caller's capability (see [`greeting_capability`]), a 20-byte salt,
-/// and the pinned `mysql_native_password` plugin.
+/// and the pinned `mysql_native_password` plugin. The connection identifier
+/// is the registry's `u64`; the greeting carries its **low 32 bits**, the
+/// exact bytes Go `MakeInitialHandshake` writes.
 #[must_use]
 pub fn build_greeting<'a>(
     capabilities: CapabilityFlags,
     salt: &'a [u8; 20],
     server_version: &'a [u8],
-    connection_id: u32,
+    connection_id: u64,
     collation: u8,
     status: StatusFlags,
 ) -> InitialHandshakeParams<'a> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Go MakeInitialHandshake writes exactly the low 32 bits \
+                  of the u64 connection id; the truncation is the contract"
+    )]
+    let wire_connection_id = connection_id as u32;
     InitialHandshakeParams {
         server_version,
-        connection_id,
+        connection_id: wire_connection_id,
         auth_plugin_data: salt,
         capabilities,
         collation,
@@ -132,17 +140,72 @@ pub fn build_greeting<'a>(
 }
 
 /// The successful outcome of frontend capability negotiation.
+///
+/// Opaque and unforgeable outside this module: the only constructor is
+/// [`negotiate_frontend`]'s success path, so holding one proves the
+/// required-capability check passed. It is also the only source of a
+/// [`RoutingHandshake`] (see [`FrontendNegotiation::routing_handshake`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrontendNegotiation {
+    negotiated: CapabilityFlags,
+    unsupported_by_proxy: CapabilityFlags,
+    plugin_auth_forced: bool,
+}
+
+impl FrontendNegotiation {
     /// The session capability: the frontend/proxy intersection, with
     /// `PLUGIN_AUTH` force-set when missing.
-    pub negotiated: CapabilityFlags,
+    #[must_use]
+    pub const fn negotiated(&self) -> CapabilityFlags {
+        self.negotiated
+    }
+
     /// Frontend capabilities the proxy does not support (Go debug-logs
     /// this set and ignores it).
-    pub unsupported_by_proxy: CapabilityFlags,
+    #[must_use]
+    pub const fn unsupported_by_proxy(&self) -> CapabilityFlags {
+        self.unsupported_by_proxy
+    }
+
     /// `PLUGIN_AUTH` was missing and force-set (Go warns: some clients,
     /// e.g. node/mysql, support it without setting the bit).
-    pub plugin_auth_forced: bool,
+    #[must_use]
+    pub const fn plugin_auth_forced(&self) -> bool {
+        self.plugin_auth_forced
+    }
+
+    /// Builds the routing gate from this successful negotiation, the
+    /// parsed handshake response, and the connection endpoints. This is
+    /// the **only** constructor of [`RoutingHandshake`]: routing cannot
+    /// run before capability negotiation succeeded and listener/client
+    /// metadata exist.
+    #[must_use]
+    pub fn routing_handshake<'a>(
+        &self,
+        response: &HandshakeResponse<'a>,
+        endpoints: ConnectionEndpoints,
+    ) -> RoutingHandshake<'a> {
+        RoutingHandshake {
+            username: response.username,
+            database: response.database,
+            collation: response.collation,
+            zstd_level: response.zstd_level,
+            has_attributes: response.attributes.is_some(),
+            negotiated: self.negotiated,
+            endpoints,
+        }
+    }
+}
+
+/// The endpoints routing may depend on: the proxy listener the client
+/// connected to and the real client address (post-PROXY-protocol when
+/// enabled), mirroring Go `ConnContext`'s `ServerAddr`/`ClientAddr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionEndpoints {
+    /// The proxy listener address that accepted the connection.
+    pub listener_addr: core::net::SocketAddr,
+    /// The real client address.
+    pub client_addr: core::net::SocketAddr,
 }
 
 /// The frontend lacks a required capability. Carries the missing set only;
@@ -352,33 +415,65 @@ pub const fn check_min_client_handshake(length: usize) -> Result<(), HandshakeTo
     }
 }
 
-/// The routing gate: everything routing may depend on, constructible only
-/// from a successfully parsed handshake response. The FSM's `DialBackend`
-/// effect must be given one of these, which encodes "route only after
-/// username, listener, and client metadata are available" in the types.
+/// The routing gate: everything routing may depend on. Opaque and
+/// unforgeable — the only constructor is
+/// [`FrontendNegotiation::routing_handshake`], so holding one proves
+/// capability negotiation succeeded **and** listener/client metadata
+/// exist. The FSM's `DialBackend` effect must be given one of these,
+/// which encodes "route only after username, listener, and client
+/// metadata are available" in the types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingHandshake<'a> {
-    /// The username the client sent.
-    pub username: &'a [u8],
-    /// The initial database, when negotiated.
-    pub database: Option<&'a [u8]>,
-    /// The client collation byte.
-    pub collation: u8,
-    /// The requested zstd level, when negotiated.
-    pub zstd_level: Option<u8>,
-    /// Whether the response carried connection attributes.
-    pub has_attributes: bool,
+    username: &'a [u8],
+    database: Option<&'a [u8]>,
+    collation: u8,
+    zstd_level: Option<u8>,
+    has_attributes: bool,
+    negotiated: CapabilityFlags,
+    endpoints: ConnectionEndpoints,
 }
 
-impl<'a> From<&HandshakeResponse<'a>> for RoutingHandshake<'a> {
-    fn from(response: &HandshakeResponse<'a>) -> Self {
-        Self {
-            username: response.username,
-            database: response.database,
-            collation: response.collation,
-            zstd_level: response.zstd_level,
-            has_attributes: response.attributes.is_some(),
-        }
+impl<'a> RoutingHandshake<'a> {
+    /// The username the client sent.
+    #[must_use]
+    pub const fn username(&self) -> &'a [u8] {
+        self.username
+    }
+
+    /// The initial database, when negotiated.
+    #[must_use]
+    pub const fn database(&self) -> Option<&'a [u8]> {
+        self.database
+    }
+
+    /// The client collation byte.
+    #[must_use]
+    pub const fn collation(&self) -> u8 {
+        self.collation
+    }
+
+    /// The requested zstd level, when negotiated.
+    #[must_use]
+    pub const fn zstd_level(&self) -> Option<u8> {
+        self.zstd_level
+    }
+
+    /// Whether the response carried connection attributes.
+    #[must_use]
+    pub const fn has_attributes(&self) -> bool {
+        self.has_attributes
+    }
+
+    /// The negotiated session capability this gate was built under.
+    #[must_use]
+    pub const fn negotiated(&self) -> CapabilityFlags {
+        self.negotiated
+    }
+
+    /// The listener and real client addresses.
+    #[must_use]
+    pub const fn endpoints(&self) -> ConnectionEndpoints {
+        self.endpoints
     }
 }
 
@@ -455,6 +550,40 @@ mod tests {
         );
     }
 
+    /// The greeting carries exactly the low 32 bits of the `u64`
+    /// connection id, matching Go `MakeInitialHandshake`.
+    #[test]
+    fn greeting_truncates_connection_id_like_go() {
+        let salt = [1_u8; 20];
+        let at_max = build_greeting(
+            SUPPORTED_SERVER_CAPABILITIES,
+            &salt,
+            b"v",
+            u64::from(u32::MAX),
+            0x21,
+            StatusFlags::from_bits_retain(0),
+        );
+        assert_eq!(at_max.connection_id, u32::MAX);
+        let wrapped = build_greeting(
+            SUPPORTED_SERVER_CAPABILITIES,
+            &salt,
+            b"v",
+            u64::from(u32::MAX) + 1,
+            0x21,
+            StatusFlags::from_bits_retain(0),
+        );
+        assert_eq!(wrapped.connection_id, 0);
+        let high_and_low = build_greeting(
+            SUPPORTED_SERVER_CAPABILITIES,
+            &salt,
+            b"v",
+            (7_u64 << 32) | 42,
+            0x21,
+            StatusFlags::from_bits_retain(0),
+        );
+        assert_eq!(high_and_low.connection_id, 42);
+    }
+
     /// Missing `PROTOCOL_41` produces the fixed Go error triple; nothing
     /// about the client's actual mask reaches the response.
     #[test]
@@ -489,15 +618,15 @@ mod tests {
             Ok(negotiation) => negotiation,
             Err(error) => unreachable!("negotiation failed: {error}"),
         };
-        assert!(negotiation.plugin_auth_forced);
+        assert!(negotiation.plugin_auth_forced());
         assert_eq!(
-            negotiation.negotiated,
+            negotiation.negotiated(),
             CapabilityFlags::PROTOCOL_41
                 .union(CapabilityFlags::SECURE_CONNECTION)
                 .union(CapabilityFlags::PLUGIN_AUTH)
         );
         assert_eq!(
-            negotiation.unsupported_by_proxy,
+            negotiation.unsupported_by_proxy(),
             CapabilityFlags::QUERY_ATTRIBUTES.union(CapabilityFlags::SESSION_TRACK)
         );
 
@@ -506,7 +635,7 @@ mod tests {
             Ok(negotiation) => negotiation,
             Err(error) => unreachable!("negotiation failed: {error}"),
         };
-        assert!(!negotiation.plugin_auth_forced);
+        assert!(!negotiation.plugin_auth_forced());
     }
 
     /// The `SSLRequest` mask wins over a differing response mask
