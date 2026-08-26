@@ -30,6 +30,7 @@ mod constants;
 mod error;
 mod handshake;
 mod packet;
+mod prepared;
 mod primitives;
 mod response;
 
@@ -50,6 +51,14 @@ pub use packet::{
     CommandPacket, LogicalPacketFragments, PHYSICAL_PACKET_HEADER_LEN, PacketHeader,
     PhysicalPacket, SequenceObservation, SequenceTracker, encode_command_packet,
     encode_physical_packet, physical_packet_count,
+};
+pub use prepared::{
+    ColumnType, ExecuteParameter, ParameterType, ParameterValue, PrepareOk, PrepareOkParams,
+    PreparedDecodeError, PreparedEncodeError, StatementCommand, StmtExecute, StmtExecuteParams,
+    StmtFetch, StmtSendLongData, decode_prepare_ok, decode_statement_command, decode_stmt_execute,
+    decode_stmt_fetch, decode_stmt_prepare, decode_stmt_send_long_data, encode_prepare_ok,
+    encode_statement_command, encode_stmt_execute, encode_stmt_fetch, encode_stmt_prepare,
+    encode_stmt_send_long_data,
 };
 pub use primitives::{
     Cursor, LengthEncodedInt, MAX_PAYLOAD_LEN, decode_length_encoded_bytes,

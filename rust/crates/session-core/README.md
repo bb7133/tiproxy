@@ -46,8 +46,9 @@ stateDiagram-v2
 ```
 
 Boundary rules (Go `backend_conn_mgr.go` parity): redirect and graceful
-close both wait for the transaction boundary; graceful close wins over a
-pending redirect; a failed migration keeps the current backend; migration
+close both wait until the transaction is closed **and** SES-05 reports no
+pending long-data/cursor guard; graceful close wins over a pending redirect;
+a failed migration keeps the current backend; migration
 is serialized with command execution (Go `processLock`), so client
 requests during it are illegal at the FSM level — Go's narrow
 hold-and-replay of an in-transaction `BEGIN` (`needHoldRequest`, MIG-005)
@@ -186,6 +187,42 @@ PROCESS_INFO, FIELD_LIST, cursor execute/fetch, multi-results, both EOF modes,
 and LOCAL INFILE. Unit tests pin the contextual marker matrix, typed malformed
 terminal rejection, and one million streamed rows with constant observer size
 and zero retained payload bytes.
+
+## Prepared statements (`prepared`, SES-05)
+
+`PreparedRegistry` owns independent state by backend statement ID. A completed
+prepare atomically registers its declared parameter/column counts; unknown-ID
+long data still creates a conservative guard, matching Go's status map. The
+registry retains only metadata, the latest parameter types, and one small guard
+enum per ID — never SQL, parameter values, long-data fragments, rows, or packet
+payloads.
+
+- `SEND_LONG_DATA` marks only its statement pending. Execute success clears
+  that guard unless `CURSOR_EXISTS` opens a cursor; execute ERR deliberately
+  preserves it. FETCH keeps the cursor until `LAST_ROW_SENT`; FETCH ERR also
+  preserves it. RESET/CLOSE affect one ID, while successful CHANGE_USER and
+  RESET_CONNECTION clear all IDs.
+- `PrepareObserver` consumes the declared metadata packet counts, supports both
+  classic and deprecated-EOF modes, and flushes exactly once on OK completion
+  or initial ERR. It validates the canonical prepare header and classic EOFs;
+  the deliberate strengthening over Go's unchecked/count-only path is recorded
+  as `SES-05-D1` in the parity ledger.
+- `mysql-wire::prepared` provides fixed-prefix codecs plus full EXECUTE
+  inspection/encoding: null bitmap, exact `0x80` unsigned flag, numeric,
+  temporal, string/blob/JSON/vector values, and retained type reuse when the
+  new-params flag is zero. Transparent forwarding extracts only the five-byte
+  command/ID prefix, so a multi-physical-packet EXECUTE remains streaming.
+- Adapter ordering is explicit: apply the registry mutation or terminal status,
+  send `PreparedRegistry::session_event`, then send the SES-00 response or
+  no-response completion event. Thus a queued redirect/drain cannot cross the
+  same boundary that clears or preserves a prepared guard.
+
+The generated Go corpus adds classic/deprecated prepare metadata, exact Go
+EXECUTE type/reuse bytes, and a two-ID lifecycle covering long data, execute
+ERR, partial/final fetch, reset, and close. Rust corpus/model tests link
+RSP-006 and PS-001..006. Live Connector/J, go-sql-driver, and Python driver
+acceptance requires the runnable Rust session/runtime and remains a later
+integration gate; no relay or fake driver result is substituted here.
 
 ## Special duplex flows (`special`, SES-06)
 

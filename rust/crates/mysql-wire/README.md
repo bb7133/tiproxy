@@ -4,7 +4,8 @@
 fixed-width and length-encoded integers, physical-packet headers, sequence
 tracking, capability/status/command constants, response headers, OK/ERR/EOF
 payloads, protocol-10 handshakes, connection attributes, and
-`COM_CHANGE_USER` fields.
+`COM_CHANGE_USER` fields. SES-05 adds prepared-statement fixed prefixes,
+prepare-OK metadata, and full `COM_STMT_EXECUTE` parameter codecs.
 
 It does not read sockets, join multi-packet logical messages, buffer or flush
 writes, negotiate TLS/compression, or choose session transitions. WIRE-01's
@@ -50,9 +51,14 @@ caller-owned `Vec` where the API makes that explicit.
 - Initial greetings require protocol version 10 and a zero filler, and every
   capability-selected handshake/change-user field must be complete. Go's
   unchecked or tolerant malformed-input paths are not copied.
+- Prepared codecs validate every fixed field before indexing and keep the
+  unsigned marker exact (`0x80`, not merely nonzero). Execute values borrow
+  packet bytes; temporal lengths and length-encoded string/blob/JSON/vector
+  values are checked before slicing. The five-byte command/statement prefix
+  remains separately decodable for transparent multi-packet streaming.
 - These intentional safety differences are recorded in the parity manifest's
-  WIRE-00 decision ledger. Canonical Go corpus vectors have no wire-level
-  difference.
+  WIRE-00 and SES-05 decision ledger rows. Canonical Go corpus vectors have no
+  wire-level difference.
 
 ## Tests
 
@@ -67,7 +73,8 @@ cargo clippy --locked --manifest-path rust/Cargo.toml \
 `tests/corpus.rs` reads the checked-in deterministic gzip traces emitted by the
 Go oracle. Its individually selectable tests name the linked parity IDs,
 including `PARITY-PKT-001/002/004/005/007`, `PARITY-HS-001/003/006/011`,
-`PARITY-RSP-001/002/003`, and `PARITY-CMD-017`. Property-style deterministic
+`PARITY-RSP-001/002/003/006`, `PARITY-CMD-017`, and `PARITY-PS-004`.
+Property-style deterministic
 tests cover 20,000 packet-header and length-encoded-integer values; adversarial
 tests exercise every prefix of valid messages plus pseudo-random hostile input.
 
