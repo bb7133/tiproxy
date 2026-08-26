@@ -44,7 +44,7 @@ func TestServerHandshakeLifecycleAndReconnect(t *testing.T) {
 	first := waitActive(t, server)
 	require.Equal(t, first.Epoch(), ack.GetControlEpoch())
 	require.True(t, first.HasCapability(1))
-	require.False(t, first.HasCapability(2))
+	require.True(t, first.HasCapability(2), "cap 3 requires cap 2 (closure)")
 	require.True(t, first.HasCapability(3))
 
 	peerHeartbeat := &controlpb.ControlEnvelope{
@@ -228,7 +228,7 @@ func rustHello(version uint32) *controlpb.Hello {
 		Role:              controlpb.Role_ROLE_RUST_DATAPLANE,
 		ProcessId:         "rust-test",
 		SupportedVersions: []uint32{version},
-		Capabilities:      []uint64{1, 3},
+		Capabilities:      []uint64{1, 2, 3},
 		MaxFrameBytes:     controlpb.DefaultMaxFrameBytes,
 	}
 }

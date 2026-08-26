@@ -98,11 +98,18 @@ func TestUnknownOptionalFieldAndRequiredCapability(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, decoded.ProtoReflect().GetUnknown())
 
-	local := &Hello{SupportedVersions: []uint32{ProtocolV1}, Capabilities: []uint64{1, 3}}
-	remote := &Hello{SupportedVersions: []uint32{ProtocolV1}, Capabilities: []uint64{3, 5}}
+	local := &Hello{SupportedVersions: []uint32{ProtocolV1}, Capabilities: []uint64{1, 2, 3}}
+	remote := &Hello{SupportedVersions: []uint32{ProtocolV1}, Capabilities: []uint64{2, 3, 5}}
 	ack, err := NegotiateHello(local, remote, []uint64{3}, 9)
 	require.NoError(t, err)
-	require.Equal(t, []uint64{3}, ack.GetNegotiatedCapabilities())
+	require.Equal(t, []uint64{2, 3}, ack.GetNegotiatedCapabilities())
+	// Capability closure: rehydration (3) without reconcile (2) is an
+	// illegal negotiation, rejected on the Go side too.
+	_, err = NegotiateHello(
+		&Hello{SupportedVersions: []uint32{ProtocolV1}, Capabilities: []uint64{1, 3}},
+		&Hello{SupportedVersions: []uint32{ProtocolV1}, Capabilities: []uint64{3, 5}},
+		nil, 9)
+	require.ErrorIs(t, err, ErrMissingCapability)
 	_, err = NegotiateHello(local, remote, []uint64{7}, 9)
 	require.ErrorIs(t, err, ErrMissingCapability)
 	_, err = NegotiateHello(local, &Hello{SupportedVersions: []uint32{2}}, nil, 9)

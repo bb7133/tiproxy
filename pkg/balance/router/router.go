@@ -28,6 +28,20 @@ type ConnEventReceiver interface {
 	OnConnClosed(backendID string, conn RedirectableConn) error
 }
 
+// AssignmentRehydrator restores accounting for an already-established
+// connection after a control-plane restart (CTL-06 reconciliation): the
+// connection attaches to the named backend exactly as if its original
+// assignment had succeeded, without running selection. The restored
+// BackendInst is returned so callers can rebind connection state; false
+// means the backend is unknown to this router.
+type AssignmentRehydrator interface {
+	RehydrateConn(backendID string, conn RedirectableConn) (BackendInst, bool)
+	// LookupBackend resolves a backend by ID without touching any
+	// accounting (used to rebind a rehydrated connection's state when a
+	// pending redirect's terminal result arrives).
+	LookupBackend(backendID string) (BackendInst, bool)
+}
+
 // Router routes client connections to backends.
 type Router interface {
 	GetBackendSelector(clientInfo ClientInfo) BackendSelector

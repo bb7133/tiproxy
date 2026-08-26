@@ -116,19 +116,37 @@ fn required_capability_and_version_negotiation_fail_closed()
 -> Result<(), Box<dyn std::error::Error>> {
     let local = Hello {
         supported_versions: vec![1],
-        capabilities: vec![1, 3],
+        capabilities: vec![1, 2, 3],
         max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
         ..Default::default()
     };
     let remote = Hello {
         supported_versions: vec![1],
-        capabilities: vec![3, 5],
+        capabilities: vec![2, 3, 5],
         max_frame_bytes: 64 * 1024,
         ..Default::default()
     };
     let ack = negotiate_hello(&local, &remote, &[3], 9)?;
-    assert_eq!(ack.negotiated_capabilities, vec![3]);
+    assert_eq!(ack.negotiated_capabilities, vec![2, 3]);
     assert_eq!(ack.max_frame_bytes, 64 * 1024);
+    // Capability closure: rehydration (3) without reconcile (2) is an
+    // illegal negotiation on this side too.
+    let rehydration_only = Hello {
+        supported_versions: vec![1],
+        capabilities: vec![1, 3],
+        max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+        ..Default::default()
+    };
+    let rehydration_peer = Hello {
+        supported_versions: vec![1],
+        capabilities: vec![3, 5],
+        max_frame_bytes: 64 * 1024,
+        ..Default::default()
+    };
+    assert!(matches!(
+        negotiate_hello(&rehydration_only, &rehydration_peer, &[], 9),
+        Err(FrameError::MissingCapability(2))
+    ));
     assert!(matches!(
         negotiate_hello(&local, &remote, &[7], 9),
         Err(FrameError::MissingCapability(7))

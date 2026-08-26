@@ -137,6 +137,32 @@ func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) Backen
 	}
 }
 
+// RehydrateConn implements AssignmentRehydrator by locating the group
+// that owns the backend. Group locks are taken outside the router lock.
+func (router *ScoreBasedRouter) RehydrateConn(backendID string, conn RedirectableConn) (BackendInst, bool) {
+	router.Lock()
+	groups := make([]*Group, len(router.groups))
+	copy(groups, router.groups)
+	router.Unlock()
+	for _, group := range groups {
+		if backend, ok := group.RehydrateConn(backendID, conn); ok {
+			return backend, true
+		}
+	}
+	return nil, false
+}
+
+// LookupBackend implements AssignmentRehydrator without accounting.
+func (router *ScoreBasedRouter) LookupBackend(backendID string) (BackendInst, bool) {
+	router.Lock()
+	defer router.Unlock()
+	backend, ok := router.backends[backendID]
+	if !ok {
+		return nil, false
+	}
+	return backend, true
+}
+
 func (router *ScoreBasedRouter) HealthyBackendCount() int {
 	router.Lock()
 	defer router.Unlock()

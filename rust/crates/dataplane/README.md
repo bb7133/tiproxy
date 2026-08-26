@@ -157,3 +157,44 @@ cancelled-acquire close accounting, cluster fail-closed/passthrough,
 jitter determinism and extreme-value delay bounds) and
 `tests/route_control.rs` (exact envelope bodies end to end, dispatch
 filtering, lifecycle fields, real-loopback TCP dialing) cover it.
+
+## Idempotent control commands (`control_commands`, CTL-06)
+
+Delayed, duplicate, or lost control messages must be harmless to
+router and connection state. `CommandGate` is the single-owner
+admission point on the control-handler task:
+
+- **Redirect** keyed `(connection_id, redirect_id)`: pending
+  duplicates absorb, terminal duplicates replay the cached result
+  verbatim (across control reconnects — the cache deliberately has no
+  epoch or request-id dimension), conflicting ids surface, late
+  completions are suppressed: at most one terminal result per id.
+- **Close** keyed `(connection_id, close_id)`: duplicates replay; a
+  different id on a closing connection reports the actual closing id
+  without a second schedule.
+- **Drain** is single-flight by `drain_id`: the active id reports
+  progress, a different concurrent id answers `DRAIN_IN_PROGRESS`, a
+  completed id replays its final result, and graceful/force phases
+  follow the command's absolute deadlines with never-negative,
+  never-overshooting counters.
+- **Reconciliation**: the request is built from the gate's
+  authoritative connection/backend/redirect-pending state plus
+  monotonic event sequences; applying the answering snapshot yields
+  the terminal redirect results the peer still believes pending
+  (replayed verbatim) and the ghost connections to close — both
+  restart directions (Go restart preserves Rust sessions; Rust
+  restart clears ghosts exactly once) are model-tested.
+- **Metering** (`MeteringLedger`): deduplicated cumulative producer —
+  open accumulation merges by `(keyspace, backend, public-endpoint)`,
+  sealed batches carry strictly monotonic sequences and are retained
+  verbatim (never coalesced) until the reconcile acknowledgement, and
+  the retention bound fails closed instead of dropping. The Go
+  consumer (`pkg/controlbridge::MeteringConsumer`) applies only
+  strictly advancing sequences, so at-least-once replay never
+  double-counts. Metrics stay best-effort end to end (transport-level
+  shed with a typed counter).
+
+The Go issuer half (`pkg/controlbridge::DrainIssuer`) mirrors the
+single-flight rule locally before anything reaches the wire. The
+operational picture lives in
+`docs/design/rust-dataplane-reconciliation-runbook.md`.

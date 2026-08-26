@@ -95,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             required_capabilities: vec![ControlCapability::ReconcileConnections as u64],
             body: Some(Body::ReconcileRequest(ReconcileRequest {
                 known_generation: 11,
+                last_drain_command_sequence: 0,
                 last_connection_event_sequence: 21,
                 last_metrics_sequence: 22,
                 last_metering_sequence: 23,
@@ -103,6 +104,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     backend_id: "backend-1".into(),
                     namespace: "default".into(),
                     redirect_pending: true,
+                    // Zero/empty/absent keeps the frozen golden bytes
+                    // identical across the additive fields.
+                    generation: 0,
+                    pending_redirect_id: String::new(),
+                    identity: None,
+                    last_redirect_command_sequence: 0,
                 }],
             })),
             ..Default::default()

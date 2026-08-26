@@ -66,6 +66,28 @@ func (r *StaticRouter) ServerVersion() string {
 func (r *StaticRouter) Close() {
 }
 
+// RehydrateConn implements AssignmentRehydrator: the connection counts
+// exactly as a successful assignment on the named backend.
+func (r *StaticRouter) RehydrateConn(backendID string, _ RedirectableConn) (BackendInst, bool) {
+	for _, backend := range r.backends {
+		if backend.ID() == backendID {
+			r.cnt++
+			return backend, true
+		}
+	}
+	return nil, false
+}
+
+// LookupBackend implements AssignmentRehydrator without accounting.
+func (r *StaticRouter) LookupBackend(backendID string) (BackendInst, bool) {
+	for _, backend := range r.backends {
+		if backend.ID() == backendID {
+			return backend, true
+		}
+	}
+	return nil, false
+}
+
 func (r *StaticRouter) OnRedirectSucceed(from, to string, conn RedirectableConn) error {
 	return nil
 }

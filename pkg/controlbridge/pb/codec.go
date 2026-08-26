@@ -128,6 +128,12 @@ func NegotiateHello(local, remote *Hello, requiredRemoteCapabilities []uint64, c
 		}
 	}
 	slices.Sort(negotiated)
+	// Capability closure: RECONCILE_SESSION_REHYDRATION (3) extends the
+	// reconcile exchange and must not be negotiated without
+	// RECONCILE_CONNECTIONS (2).
+	if slices.Contains(negotiated, uint64(3)) && !slices.Contains(negotiated, uint64(2)) {
+		return nil, fmt.Errorf("%w: capability 3 requires capability 2", ErrMissingCapability)
+	}
 	return &HelloAck{
 		SelectedVersion:        ProtocolV1,
 		NegotiatedCapabilities: negotiated,

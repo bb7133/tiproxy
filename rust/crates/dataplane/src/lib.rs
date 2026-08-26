@@ -21,6 +21,9 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod control_commands;
+pub mod control_dispatch;
+pub mod control_runtime;
 pub mod registry;
 pub mod route;
 pub mod route_control;
@@ -31,6 +34,13 @@ pub use admission::{
     AdmissionController, AdmissionMetricsSnapshot, AdmissionPolicy, AdmissionPolicyError,
     AdmissionRejection, MemoryProbe, MemoryProbeError, MemorySample, SystemMemoryProbe,
 };
+pub use control_commands::{
+    CloseAdmission, CommandGate, DrainAdmission, DrainPhase, MAX_COMPLETED_DRAINS,
+    MAX_DELTAS_PER_BATCH, MAX_METERING_KEY_BYTES, MAX_TERMINAL_REDIRECTS_PER_CONNECTION,
+    MAX_UNACKED_METERING_BATCHES, MeteringError, MeteringLedger, ReconcileRepairs,
+    RedirectAdmission,
+};
+pub use control_dispatch::{ControlCommandHandler, OutboundControl};
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,
 };

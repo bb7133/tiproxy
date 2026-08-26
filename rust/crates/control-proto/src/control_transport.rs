@@ -171,8 +171,16 @@ pub enum ConnectionState {
     Disconnected,
     /// A connection attempt or Hello exchange is in progress.
     Connecting,
-    /// The Go owner assigned this nonzero control epoch.
-    Connected(u64),
+    /// The Go owner assigned this nonzero control epoch with the
+    /// bit-masked negotiated capabilities (bit per capability id below
+    /// 64) — one atomic snapshot, so consumers never pair an epoch with
+    /// another session's capabilities.
+    Connected {
+        /// The negotiated control epoch.
+        epoch: u64,
+        /// Bitmask of negotiated capability ids.
+        capabilities: u64,
+    },
     /// The transport was explicitly shut down.
     Shutdown,
 }
@@ -190,6 +198,10 @@ pub enum TransportError {
     Protocol(String),
     /// A cancellation-aware operation exceeded its deadline.
     Timeout(&'static str),
+    /// A session-scoped envelope was bound to an epoch that is no
+    /// longer negotiated; the owner regenerates the work on the next
+    /// `Connected` transition.
+    StaleSessionEpoch,
     /// A non-droppable message cannot ever fit its configured lane.
     QueueFull,
     /// A metrics batch was deliberately shed under bulk-lane pressure.
@@ -211,6 +223,9 @@ impl fmt::Display for TransportError {
             Self::QueueFull => formatter.write_str("control transport queue is full"),
             Self::MetricsDropped => formatter.write_str("control metrics dropped under pressure"),
             Self::Closed => formatter.write_str("control transport is closed"),
+            Self::StaleSessionEpoch => {
+                formatter.write_str("session-scoped envelope outlived its negotiated epoch")
+            }
         }
     }
 }
@@ -224,6 +239,7 @@ impl std::error::Error for TransportError {
             | Self::Protocol(_)
             | Self::Timeout(_)
             | Self::QueueFull
+            | Self::StaleSessionEpoch
             | Self::MetricsDropped
             | Self::Closed => None,
         }
@@ -247,19 +263,56 @@ impl From<FrameError> for TransportError {
 /// Handlers must not block. Expensive work should enter a separately owned,
 /// bounded executor so the peer read deadline remains meaningful.
 pub trait Handler: Send + Sync {
-    /// Handles one post-Hello envelope.
+    /// Handles one post-Hello envelope. The read loop **awaits** this
+    /// call: a slow consumer applies real backpressure through TCP to
+    /// the Go sender's bounded lanes instead of accumulating an
+    /// unbounded queue or dropping a command the peer already
+    /// considers delivered.
     ///
     /// # Errors
     ///
     /// Returning an error closes the current stream and triggers reconnect.
-    fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError>;
+    fn handle(
+        &self,
+        envelope: ControlEnvelope,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+
+    /// Runs once per session, after the write path is live but
+    /// **before the first frame is read**: a handler that retained an
+    /// in-flight envelope from a previous session pumps it into its
+    /// downstream here, so at most one such frame can exist globally
+    /// (the next reader starts only after the slot is empty). The
+    /// default is a no-op for handlers without retention.
+    ///
+    /// # Cancellation
+    ///
+    /// The transport selects this future against session teardown and
+    /// shutdown: it may be **dropped at any await point** (for example
+    /// when the writer fails while this pump is backpressured).
+    /// Implementations must keep any retained state intact under
+    /// cancellation — the next session's call resumes the pump.
+    /// The transport serializes sessions, so at most one
+    /// `resume_session` runs at any time.
+    ///
+    /// # Errors
+    ///
+    /// Returning an error ends the session before any frame is read.
+    fn resume_session(
+        &self,
+        epoch: u64,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send {
+        async move {
+            let _ = epoch;
+            Ok(())
+        }
+    }
 }
 
 impl<F> Handler for F
 where
     F: Fn(ControlEnvelope) -> Result<(), TransportError> + Send + Sync,
 {
-    fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
+    async fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
         self(envelope)
     }
 }
@@ -272,8 +325,15 @@ pub struct ControlClient {
     state_tx: watch::Sender<ConnectionState>,
     epoch: AtomicU64,
     negotiated_frame_limit: AtomicU64,
+    /// Bitmask of negotiated control capabilities (bit per capability id
+    /// below 64), set on connect and cleared on disconnect.
+    negotiated_caps: AtomicU64,
     next_request_id: AtomicU64,
     metrics_dropped: AtomicU64,
+    /// Session-scoped envelopes discarded because their bound epoch was
+    /// no longer negotiated at write (or enqueue) time; the owner
+    /// regenerates that work on the next `Connected` transition.
+    session_scoped_dropped: AtomicU64,
     reconnect_attempts: AtomicU64,
     running: AtomicBool,
     last_received: StdMutex<Option<Instant>>,
@@ -300,8 +360,10 @@ impl ControlClient {
             state_tx,
             epoch: AtomicU64::new(0),
             negotiated_frame_limit: AtomicU64::new(u64::from(initial_frame_limit)),
+            negotiated_caps: AtomicU64::new(0),
             next_request_id: AtomicU64::new(0),
             metrics_dropped: AtomicU64::new(0),
+            session_scoped_dropped: AtomicU64::new(0),
             reconnect_attempts: AtomicU64::new(0),
             running: AtomicBool::new(false),
             last_received: StdMutex::new(None),
@@ -354,10 +416,18 @@ impl ControlClient {
                     self.epoch.store(negotiated.epoch, Ordering::Release);
                     self.negotiated_frame_limit
                         .store(u64::from(negotiated.max_frame_bytes), Ordering::Release);
+                    let mut caps_mask = 0_u64;
+                    for capability in &negotiated.capabilities {
+                        if *capability < 64 {
+                            caps_mask |= 1 << capability;
+                        }
+                    }
+                    self.negotiated_caps.store(caps_mask, Ordering::Release);
                     set_instant(&self.last_received, Some(Instant::now()));
-                    let _ = self
-                        .state_tx
-                        .send(ConnectionState::Connected(negotiated.epoch));
+                    let _ = self.state_tx.send(ConnectionState::Connected {
+                        epoch: negotiated.epoch,
+                        capabilities: caps_mask,
+                    });
                     let result = self.run_connected(negotiated, handler).await;
                     if !matches!(result, Err(TransportError::Closed)) {
                         set_string(&self.last_disconnect, Some(result_to_string(&result)));
@@ -368,6 +438,7 @@ impl ControlClient {
                 }
             }
             self.epoch.store(0, Ordering::Release);
+            self.negotiated_caps.store(0, Ordering::Release);
             self.negotiated_frame_limit
                 .store(u64::from(self.config.max_frame_bytes), Ordering::Release);
             let _ = self.state_tx.send(ConnectionState::Disconnected);
@@ -398,7 +469,15 @@ impl ControlClient {
     ///
     /// Returns when the lane is permanently too small, metrics are shed, or
     /// shutdown cancels the wait.
-    pub async fn send(&self, mut envelope: ControlEnvelope) -> Result<(), TransportError> {
+    pub async fn send(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
+        self.enqueue(envelope, None).await
+    }
+
+    async fn enqueue(
+        &self,
+        mut envelope: ControlEnvelope,
+        session_epoch: Option<u64>,
+    ) -> Result<(), TransportError> {
         if *self.shutdown_tx.borrow() {
             return Err(TransportError::Closed);
         }
@@ -421,7 +500,11 @@ impl ControlClient {
         };
         let result = lane
             .push(
-                QueuedEnvelope { envelope, size },
+                QueuedEnvelope {
+                    envelope,
+                    size,
+                    session_epoch,
+                },
                 drop_metrics,
                 self.shutdown_tx.subscribe(),
                 &self.queues.not_empty,
@@ -431,6 +514,36 @@ impl ControlClient {
             self.metrics_dropped.fetch_add(1, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Queues a **session-scoped** envelope bound to `epoch`: it is
+    /// written only while that exact epoch is negotiated and otherwise
+    /// dropped (counted in
+    /// [`ControlClient::session_scoped_dropped`]) — correct because the
+    /// owner regenerates such work on every `Connected` transition.
+    /// Durable cross-reconnect work (results, lifecycle events,
+    /// metering batches) must use [`ControlClient::send`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::StaleSessionEpoch`] when `epoch` is
+    /// no longer the negotiated epoch at enqueue time, plus every
+    /// [`ControlClient::send`] failure mode.
+    pub async fn send_session_scoped(
+        &self,
+        envelope: ControlEnvelope,
+        epoch: u64,
+    ) -> Result<(), TransportError> {
+        if epoch == 0 || self.epoch.load(Ordering::Acquire) != epoch {
+            return Err(TransportError::StaleSessionEpoch);
+        }
+        self.enqueue(envelope, Some(epoch)).await
+    }
+
+    /// Whether shutdown has been requested on this client.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        *self.shutdown_tx.borrow()
     }
 
     /// Requests cancellation of connect, queue, I/O, heartbeat, and backoff waits.
@@ -445,6 +558,36 @@ impl ControlClient {
         self.state_tx.subscribe()
     }
 
+    /// Whether the current control session negotiated the capability
+    /// (false when disconnected).
+    #[must_use]
+    pub fn has_negotiated_capability(&self, capability: u64) -> bool {
+        capability < 64 && (self.negotiated_caps.load(Ordering::Acquire) >> capability) & 1 == 1
+    }
+
+    /// Allocates the next request id for an application-originated
+    /// envelope on this sender. One checked allocator serves every
+    /// envelope (heartbeats included), so ids never repeat or regress
+    /// within a sender; `None` means the id space is exhausted (fail
+    /// closed — do not wrap).
+    #[must_use]
+    pub fn allocate_request_id(&self) -> Option<u64> {
+        // Compare-and-swap: at MAX the update closure refuses, so no
+        // concurrent caller can observe a transient wrap (a plain
+        // fetch_add would briefly publish 0 and hand a second caller a
+        // duplicate id 1).
+        self.next_request_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current == u64::MAX {
+                    None
+                } else {
+                    Some(current + 1)
+                }
+            })
+            .ok()
+            .map(|previous| previous + 1)
+    }
+
     /// Returns the currently negotiated epoch, or zero when disconnected.
     #[must_use]
     pub fn epoch(&self) -> u64 {
@@ -455,6 +598,14 @@ impl ControlClient {
     #[must_use]
     pub fn reconnect_attempts(&self) -> u64 {
         self.reconnect_attempts.load(Ordering::Relaxed)
+    }
+
+    /// Session-scoped envelopes dropped for an epoch that was no
+    /// longer negotiated (each is regenerated by its owner on the next
+    /// `Connected` transition).
+    #[must_use]
+    pub fn session_scoped_dropped(&self) -> u64 {
+        self.session_scoped_dropped.load(Ordering::Relaxed)
     }
 
     /// Returns the local count of intentionally shed metrics batches.
@@ -579,14 +730,38 @@ impl ControlClient {
         let last_sent = StdMutex::new(Instant::now());
         let mut shutdown = self.shutdown_tx.subscribe();
         let (session_stop_tx, _) = watch::channel(false);
-        let read_loop = self.read_loop(
-            &mut reader,
-            epoch,
-            max_frame_bytes,
-            &capabilities,
-            handler,
-            session_stop_tx.subscribe(),
-        );
+        // Two-phase session start: the write path (below) goes live
+        // immediately so a jammed dispatcher can unblock on draining
+        // lanes, but reading waits for `resume_session` — the handler
+        // first pumps any frame retained from the previous session, so
+        // a second retained frame can never come into existence.
+        let read_loop = async {
+            // The pump is selected against session teardown: if the
+            // writer dies while resume is backpressured, the stop
+            // signal cancels it (retention stays intact per the trait
+            // contract) so the join below always converges.
+            let mut resume_stop = session_stop_tx.subscribe();
+            tokio::select! {
+                result = handler.resume_session(epoch) => result?,
+                changed = resume_stop.changed() => {
+                    if changed.is_err() || *resume_stop.borrow() {
+                        return Err(TransportError::Closed);
+                    }
+                    return Err(TransportError::Protocol(
+                        "session stop state regressed".to_owned(),
+                    ));
+                }
+            }
+            self.read_loop(
+                &mut reader,
+                epoch,
+                max_frame_bytes,
+                &capabilities,
+                handler,
+                session_stop_tx.subscribe(),
+            )
+            .await
+        };
         let write_loop = self.write_loop(
             &mut writer,
             epoch,
@@ -610,6 +785,14 @@ impl ControlClient {
             }
         };
         session_stop_tx.send_replace(true);
+        // Publish the teardown BEFORE joining the loops: the inbound
+        // forwarder unblocks on this transition (retaining its one
+        // in-flight frame), so the read loop's `handler.await` cannot
+        // hold the join hostage while the dispatcher waits on outbound
+        // lanes only a future session can drain.
+        self.epoch.store(0, Ordering::Release);
+        self.negotiated_caps.store(0, Ordering::Release);
+        let _ = self.state_tx.send(ConnectionState::Disconnected);
         match first {
             CompletedLoop::Read(result) => {
                 let _ = tokio::join!(&mut write_loop, &mut heartbeat_loop);
@@ -654,7 +837,7 @@ impl ControlClient {
             };
             validate_session_envelope(&envelope, epoch, capabilities)?;
             set_instant(&self.last_received, Some(Instant::now()));
-            handler.handle(envelope)?;
+            handler.handle(envelope).await?;
         }
     }
 
@@ -667,7 +850,7 @@ impl ControlClient {
         mut session_stop: watch::Receiver<bool>,
     ) -> Result<(), TransportError> {
         loop {
-            let mut envelope = tokio::select! {
+            let (mut envelope, session_epoch) = tokio::select! {
                 result = self.queues.next(self.shutdown_tx.subscribe()) => result?,
                 changed = session_stop.changed() => {
                     if changed.is_err() || *session_stop.borrow() {
@@ -676,6 +859,17 @@ impl ControlClient {
                     continue;
                 }
             };
+            if let Some(bound) = session_epoch
+                && bound != epoch
+            {
+                // Session-scoped work bound to a dead epoch: consume it
+                // (freeing lane space for durable work) and count — the
+                // owner regenerated it on this session's `Connected`
+                // transition.
+                self.queues.commit(&envelope).await?;
+                self.session_scoped_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             envelope.protocol_version = u32::from(CONTROL_PROTOCOL_V1);
             envelope.control_epoch = epoch;
             envelope.sent_unix_millis = unix_millis();
@@ -724,8 +918,13 @@ impl ControlClient {
             if lock_std(last_sent).elapsed() < self.config.heartbeat_interval {
                 continue;
             }
+            let Some(heartbeat_id) = self.allocate_request_id() else {
+                return Err(TransportError::Protocol(
+                    "sender request-id space exhausted".to_owned(),
+                ));
+            };
             let heartbeat = ControlEnvelope {
-                request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1,
+                request_id: heartbeat_id,
                 priority: Priority::Critical as i32,
                 body: Some(Body::Heartbeat(Heartbeat {
                     monotonic_millis: 0,
@@ -737,9 +936,19 @@ impl ControlClient {
                 })),
                 ..Default::default()
             };
+            let session_epoch = self.epoch.load(Ordering::Acquire);
             tokio::select! {
-                result = timeout(self.config.peer_timeout, self.send(heartbeat)) => {
-                    result.map_err(|_| TransportError::Timeout("heartbeat queue"))??;
+                result = timeout(
+                    self.config.peer_timeout,
+                    self.send_session_scoped(heartbeat, session_epoch),
+                ) => {
+                    match result.map_err(|_| TransportError::Timeout("heartbeat queue"))? {
+                        // The session ended between the interval firing
+                        // and the enqueue: the next session heartbeats
+                        // for itself.
+                        Err(TransportError::StaleSessionEpoch) | Ok(()) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
                 changed = session_stop.changed() => {
                     if changed.is_err() || *session_stop.borrow() {
@@ -777,6 +986,13 @@ impl Drop for RunningGuard<'_> {
 struct QueuedEnvelope {
     envelope: ControlEnvelope,
     size: usize,
+    /// `Some(epoch)` marks a session-scoped envelope: it may only be
+    /// written under exactly this negotiated epoch and is dropped
+    /// (counted) otherwise — the owner regenerates it on the next
+    /// `Connected` transition. `None` marks durable-across-reconnect
+    /// work (results, lifecycle events, metering batches) that must
+    /// never be dropped; the peer dedups it by request id / sequence.
+    session_epoch: Option<u64>,
 }
 
 struct LaneState {
@@ -847,15 +1063,16 @@ impl LaneQueue {
         }
     }
 
-    async fn pop(&self) -> Option<ControlEnvelope> {
+    async fn pop(&self) -> Option<(ControlEnvelope, Option<u64>)> {
         let mut state = self.state.lock().await;
         if state.in_flight.is_some() {
             return None;
         }
         let item = state.items.pop_front()?;
         let envelope = item.envelope.clone();
+        let session_epoch = item.session_epoch;
         state.in_flight = Some(item);
-        Some(envelope)
+        Some((envelope, session_epoch))
     }
 
     async fn commit(&self) -> Result<(), TransportError> {
@@ -909,7 +1126,7 @@ impl OutboundQueues {
     async fn next(
         &self,
         mut shutdown: watch::Receiver<bool>,
-    ) -> Result<ControlEnvelope, TransportError> {
+    ) -> Result<(ControlEnvelope, Option<u64>), TransportError> {
         loop {
             if *shutdown.borrow() {
                 return Err(TransportError::Closed);
@@ -926,8 +1143,8 @@ impl OutboundQueues {
                 } else {
                     &self.bulk
                 };
-                if let Some(envelope) = queue.pop().await {
-                    return Ok(envelope);
+                if let Some(popped) = queue.pop().await {
+                    return Ok(popped);
                 }
             }
             drop(cursor);
@@ -1266,7 +1483,7 @@ mod tests {
             role: Role::RustDataplane as i32,
             process_id: "rust-fake-client".to_owned(),
             supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
-            capabilities: vec![3, 7],
+            capabilities: vec![2, 3, 7],
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             ..Default::default()
         }
@@ -1277,7 +1494,7 @@ mod tests {
             role: Role::GoControl as i32,
             process_id: "go-fake-server".to_owned(),
             supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
-            capabilities: vec![3, 5],
+            capabilities: vec![2, 3, 5],
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             ..Default::default()
         }
@@ -1358,7 +1575,8 @@ mod tests {
     ) -> Result<(), TransportError> {
         timeout(Duration::from_secs(1), async {
             loop {
-                if *state.borrow() == ConnectionState::Connected(epoch) {
+                if matches!(*state.borrow(), ConnectionState::Connected { epoch: seen, .. } if seen == epoch)
+                {
                     return Ok(());
                 }
                 state.changed().await.map_err(|_| TransportError::Closed)?;
@@ -1590,7 +1808,8 @@ mod tests {
             .await?;
 
         for index in 0..25 {
-            let envelope = client.queues.next(client.shutdown_tx.subscribe()).await?;
+            let (envelope, session_epoch) =
+                client.queues.next(client.shutdown_tx.subscribe()).await?;
             let expected = if index < 16 {
                 Priority::Critical
             } else if index < 24 {
@@ -1599,6 +1818,7 @@ mod tests {
                 Priority::Bulk
             };
             assert_eq!(Priority::try_from(envelope.priority)?, expected);
+            assert_eq!(session_epoch, None, "plain send() enqueues durable work");
             client.queues.commit(&envelope).await?;
         }
 
@@ -1693,6 +1913,137 @@ mod tests {
             assert_eq!(delay, second.duration(window));
             assert!(delay <= window);
         }
+        Ok(())
+    }
+
+    /// A handler whose `resume_session` blocks until released, counting
+    /// both hooks — the two-phase reconnect regressions drive it.
+    struct GatedHandler {
+        release: watch::Receiver<bool>,
+        resume_calls: Arc<AtomicU64>,
+        handled: Arc<AtomicU64>,
+    }
+
+    impl Handler for GatedHandler {
+        async fn handle(&self, _envelope: ControlEnvelope) -> Result<(), TransportError> {
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn resume_session(&self, _epoch: u64) -> Result<(), TransportError> {
+            self.resume_calls.fetch_add(1, Ordering::Relaxed);
+            let mut release = self.release.clone();
+            loop {
+                if *release.borrow() {
+                    return Ok(());
+                }
+                if release.changed().await.is_err() {
+                    return Err(TransportError::Closed);
+                }
+            }
+        }
+    }
+
+    /// Two-phase reconnect: no frame is read (the handler is not
+    /// invoked) until `resume_session` completes, even when the peer
+    /// already wrote one — and releasing the gate delivers it.
+    #[tokio::test]
+    async fn reader_waits_for_resume_session() -> Result<(), Box<dyn Error>> {
+        let (socket, listener) = TestSocket::bind()?;
+        let client = Arc::new(ControlClient::new(test_config(&socket))?);
+        let (release_tx, release_rx) = watch::channel(false);
+        let resume_calls = Arc::new(AtomicU64::new(0));
+        let frames = Arc::new(AtomicU64::new(0));
+        let handler = GatedHandler {
+            release: release_rx,
+            resume_calls: Arc::clone(&resume_calls),
+            handled: Arc::clone(&frames),
+        };
+        let run_client = Arc::clone(&client);
+        let client_task = tokio::spawn(async move { run_client.run(&handler).await });
+        let server_task = tokio::spawn(async move {
+            let mut stream = fake_go_handshake(&listener, 1, false).await?;
+            // A frame is on the wire immediately after the handshake.
+            write_frame_async(&mut stream, &heartbeat(1, 9), DEFAULT_MAX_FRAME_BYTES).await?;
+            sleep(Duration::from_millis(400)).await;
+            Ok::<(), TransportError>(())
+        });
+
+        timeout(Duration::from_secs(1), async {
+            while resume_calls.load(Ordering::Relaxed) == 0 {
+                yield_now().await;
+            }
+        })
+        .await?;
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            frames.load(Ordering::Relaxed),
+            0,
+            "no frame is read while resume_session is pending"
+        );
+        release_tx.send_replace(true);
+        timeout(Duration::from_secs(1), async {
+            while frames.load(Ordering::Relaxed) == 0 {
+                yield_now().await;
+            }
+        })
+        .await?;
+        client.shutdown();
+        timeout(Duration::from_secs(1), client_task).await???;
+        server_task.await??;
+        Ok(())
+    }
+
+    /// The writer failing while `resume_session` is still blocked must
+    /// not deadlock the teardown join: the stop signal cancels the
+    /// pump, the session converges, and the next session calls
+    /// `resume_session` again.
+    #[tokio::test]
+    async fn writer_failure_during_blocked_resume_converges() -> Result<(), Box<dyn Error>> {
+        let (socket, listener) = TestSocket::bind()?;
+        let mut config = test_config(&socket);
+        config.heartbeat_interval = Duration::from_millis(10);
+        let client = Arc::new(ControlClient::new(config)?);
+        let (release_tx, release_rx) = watch::channel(false);
+        let resume_calls = Arc::new(AtomicU64::new(0));
+        let frames = Arc::new(AtomicU64::new(0));
+        let handler = GatedHandler {
+            release: release_rx,
+            resume_calls: Arc::clone(&resume_calls),
+            handled: Arc::clone(&frames),
+        };
+        let run_client = Arc::clone(&client);
+        let client_task = tokio::spawn(async move { run_client.run(&handler).await });
+        let server_task = tokio::spawn(async move {
+            // Session 1: die while the resume gate is still closed —
+            // the client's heartbeat write fails against the dead
+            // socket while resume_session is blocked.
+            let first = fake_go_handshake(&listener, 1, false).await?;
+            sleep(Duration::from_millis(60)).await;
+            drop(first);
+            // Session 2 proves the teardown converged and re-invoked
+            // the pump.
+            let second = fake_go_handshake(&listener, 2, false).await?;
+            sleep(Duration::from_millis(200)).await;
+            drop(second);
+            Ok::<(), TransportError>(())
+        });
+
+        timeout(Duration::from_secs(2), async {
+            while resume_calls.load(Ordering::Relaxed) < 2 {
+                yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            frames.load(Ordering::Relaxed),
+            0,
+            "no frame was read across both gated sessions"
+        );
+        release_tx.send_replace(true);
+        client.shutdown();
+        timeout(Duration::from_secs(1), client_task).await???;
+        server_task.await??;
         Ok(())
     }
 }
