@@ -11,6 +11,9 @@ repository.workspace = true
 [dependencies]
 mysql-wire.workspace = true
 
+[dev-dependencies]
+flate2.workspace = true
+
 [features]
 default = []
 

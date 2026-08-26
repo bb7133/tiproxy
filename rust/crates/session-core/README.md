@@ -127,3 +127,32 @@ Pure backend-auth policy frozen from Go `authenticator.go`:
   classifications that carry no auth bytes; a test sweeps the whole
   `Debug` surface. Live-TiDB authentication tests belong to the runtime
   acceptance phases.
+
+## Command dispatch (`command`, SES-03)
+
+`command::dispatch` is the exhaustive pure switch for every real Go command
+byte `0x00..=0x1f`. Each `CommandPlan` fixes request forwarding, the backend
+response state machine, effects applied after forwarding, and effects applied
+only after a successful response. The response models deliberately stop at
+the command boundary: SES-04 owns streaming response classification, SES-05
+owns the prepared-statement map, and SES-06 owns `LOCAL INFILE` and
+change-user duplex execution.
+
+- `COM_QUIT`, `COM_STMT_SEND_LONG_DATA`, and `COM_STMT_CLOSE` have
+  `ExpectedResponse::None`; the runtime must never wait for backend data.
+- Every command on Go's generic one-packet path accepts the same terminal
+  OK/ERR/EOF header set. Corpus traces record the representative response for
+  each command without narrowing this shared runtime compatibility policy.
+- `COM_INIT_DB`, `COM_SET_OPTION`, and `COM_RESET_CONNECTION` update
+  `CommandSessionState` only after success. Reset preserves negotiated
+  capabilities, marks the locally tracked current database `Unknown`, and
+  emits `PreparedMutation::ClearAll` for SES-05. Command-level database
+  tracking must never replace the authoritative `SHOW SESSION_STATES` value
+  during migration.
+- Statement-ID and set-option prefixes are validated before forwarding.
+  `COM_END` (`0x20`) and every extension byte are rejected before metrics
+  indexing under the fixed `UnknownCommandPolicy::Reject`; these panic-path
+  safety choices are `SES-03-D1/D2` in the parity ledger.
+- The generated Go corpus carries every `CMD-000..032` ID. Rust command-corpus
+  tests consume the exact request bytes rather than maintaining a second
+  hand-written wire fixture.
