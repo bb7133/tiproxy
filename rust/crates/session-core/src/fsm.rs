@@ -33,7 +33,11 @@
 //!    owner atomically (session migration), and the exhaustive test proves
 //!    two simultaneous owners are unreachable.
 //!
-//! Go-parity notes (from `backend_conn_mgr.go`):
+//! Go-parity notes (from `backend_conn_mgr.go` and `authenticator.go`):
+//! - The proxy **synthesizes** the greeting itself (own salt and proxy
+//!   capability, Go `handshakeFirstTime`/`MakeInitialHandshake`); it does
+//!   not relay a backend greeting. The backend is dialed only after the
+//!   client's handshake response is accepted.
 //! - Redirect and graceful close both wait for the transaction boundary
 //!   (`finishedTxn`); graceful close wins over a pending redirect, and a
 //!   redirect completing during close reports failure (Go `ErrClosing`).
@@ -44,16 +48,16 @@
 //! State diagram (also in the crate README):
 //!
 //! ```text
-//! Accept -> Greeting -> FrontendHandshake <-> SslRequest
-//!                          |
-//!                          v
-//!                    BackendHandshake -> Ready <-> Command <-> Response
-//!                                          |          |           |
-//!                                          |          v           v
-//!                                          |     LocalInfile -> Response
-//!                                          v
-//!                （txn boundary）RedirectPending -> Ready
-//!                                Draining ----------> Closing -> Closed
+//! Accept -> Greeting <-> SslRequest
+//!             |  (client handshake response / dial backend)
+//!             v
+//!       FrontendHandshake -> BackendHandshake -> Ready <-> Command <-> Response
+//!                                                  |          |           |
+//!                                                  |          v           v
+//!                                                  |     LocalInfile -> Response
+//!                                                  v
+//!                        （txn boundary）RedirectPending -> Ready
+//!                                        Draining ----------> Closing -> Closed
 //! ```
 
 use core::fmt;
@@ -63,11 +67,14 @@ use core::fmt;
 pub enum SessionState {
     /// Transport accepted; PROXY/TLS sniffing not finished.
     Accept,
-    /// Initial backend dialed; waiting for its greeting.
+    /// The proxy-synthesized greeting was sent; waiting for the client's
+    /// `SSLRequest` or handshake response (Go `handshakeFirstTime`).
     Greeting,
-    /// Client sent `SSLRequest`; frontend TLS activation in progress.
+    /// Client sent `SSLRequest`; frontend TLS activation in progress
+    /// (returns to [`Self::Greeting`] for the real handshake response).
     SslRequest,
-    /// Greeting relayed; waiting for the client handshake response.
+    /// Client handshake response accepted; dialing the backend and waiting
+    /// for its greeting.
     FrontendHandshake,
     /// Client credentials forwarded; initial backend authentication runs.
     BackendHandshake,
@@ -155,10 +162,12 @@ pub enum SessionEvent {
 /// performs no I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEffect {
-    /// Dial the initial backend to obtain a greeting (candidate, not owner).
-    DialInitialBackend,
-    /// Relay the backend greeting to the client.
-    RelayGreetingToClient,
+    /// Send the proxy-synthesized greeting to the client (own salt and
+    /// proxy capability; Go `MakeInitialHandshake`).
+    SendProxyGreeting,
+    /// Dial the initial backend (candidate, not owner) after the client
+    /// handshake response is accepted.
+    DialBackend,
     /// Run the frontend TLS handshake.
     ActivateFrontendTls,
     /// Forward the client handshake response to the backend.
@@ -336,7 +345,7 @@ impl SessionFsm {
         match event {
             SessionEvent::ConnectionAccepted => Some((
                 SessionState::Greeting,
-                vec![SessionEffect::DialInitialBackend],
+                vec![SessionEffect::SendProxyGreeting],
             )),
             SessionEvent::ClientEof
             | SessionEvent::ClientIoError
@@ -346,16 +355,21 @@ impl SessionFsm {
         }
     }
 
+    // No backend exists before the client handshake response is accepted
+    // (Go dials in `handshakeFirstTime` only after `HandleHandshakeResp`),
+    // so backend events are illegal in `Greeting` and `SslRequest`.
     fn on_greeting(&mut self, event: SessionEvent) -> Option<(SessionState, Effects)> {
         match event {
-            SessionEvent::BackendGreetingReceived => Some((
+            SessionEvent::ClientSslRequest => Some((
+                SessionState::SslRequest,
+                vec![SessionEffect::ActivateFrontendTls],
+            )),
+            SessionEvent::ClientHandshakeResponse => Some((
                 SessionState::FrontendHandshake,
-                vec![SessionEffect::RelayGreetingToClient],
+                vec![SessionEffect::DialBackend],
             )),
             SessionEvent::ClientEof
             | SessionEvent::ClientIoError
-            | SessionEvent::BackendEof
-            | SessionEvent::BackendIoError
             | SessionEvent::ControlCloseImmediate
             | SessionEvent::HandshakeTimerExpired => Some((SessionState::Closing, self.teardown())),
             _ => None,
@@ -364,11 +378,9 @@ impl SessionFsm {
 
     fn on_ssl_request(&mut self, event: SessionEvent) -> Option<(SessionState, Effects)> {
         match event {
-            SessionEvent::TlsActivated => Some((SessionState::FrontendHandshake, Effects::new())),
+            SessionEvent::TlsActivated => Some((SessionState::Greeting, Effects::new())),
             SessionEvent::ClientEof
             | SessionEvent::ClientIoError
-            | SessionEvent::BackendEof
-            | SessionEvent::BackendIoError
             | SessionEvent::ControlCloseImmediate
             | SessionEvent::HandshakeTimerExpired => Some((SessionState::Closing, self.teardown())),
             _ => None,
@@ -377,11 +389,7 @@ impl SessionFsm {
 
     fn on_frontend_handshake(&mut self, event: SessionEvent) -> Option<(SessionState, Effects)> {
         match event {
-            SessionEvent::ClientSslRequest => Some((
-                SessionState::SslRequest,
-                vec![SessionEffect::ActivateFrontendTls],
-            )),
-            SessionEvent::ClientHandshakeResponse => Some((
+            SessionEvent::BackendGreetingReceived => Some((
                 SessionState::BackendHandshake,
                 vec![SessionEffect::ForwardHandshakeToBackend],
             )),
@@ -746,7 +754,12 @@ pub static TRANSITIONS: &[Transition] = &[
     // Greeting
     t(
         SessionState::Greeting,
-        SessionEvent::BackendGreetingReceived,
+        SessionEvent::ClientSslRequest,
+        SessionState::SslRequest,
+    ),
+    t(
+        SessionState::Greeting,
+        SessionEvent::ClientHandshakeResponse,
         SessionState::FrontendHandshake,
     ),
     t(
@@ -757,16 +770,6 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::Greeting,
         SessionEvent::ClientIoError,
-        SessionState::Closing,
-    ),
-    t(
-        SessionState::Greeting,
-        SessionEvent::BackendEof,
-        SessionState::Closing,
-    ),
-    t(
-        SessionState::Greeting,
-        SessionEvent::BackendIoError,
         SessionState::Closing,
     ),
     t(
@@ -783,7 +786,7 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::SslRequest,
         SessionEvent::TlsActivated,
-        SessionState::FrontendHandshake,
+        SessionState::Greeting,
     ),
     t(
         SessionState::SslRequest,
@@ -793,16 +796,6 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::SslRequest,
         SessionEvent::ClientIoError,
-        SessionState::Closing,
-    ),
-    t(
-        SessionState::SslRequest,
-        SessionEvent::BackendEof,
-        SessionState::Closing,
-    ),
-    t(
-        SessionState::SslRequest,
-        SessionEvent::BackendIoError,
         SessionState::Closing,
     ),
     t(
@@ -818,12 +811,7 @@ pub static TRANSITIONS: &[Transition] = &[
     // FrontendHandshake
     t(
         SessionState::FrontendHandshake,
-        SessionEvent::ClientSslRequest,
-        SessionState::SslRequest,
-    ),
-    t(
-        SessionState::FrontendHandshake,
-        SessionEvent::ClientHandshakeResponse,
+        SessionEvent::BackendGreetingReceived,
         SessionState::BackendHandshake,
     ),
     t(

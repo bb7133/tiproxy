@@ -23,11 +23,11 @@ no packet payloads (classification happens in the wire/transport layers).
 ```mermaid
 stateDiagram-v2
     [*] --> Accept
-    Accept --> Greeting: ConnectionAccepted / dial backend
-    Greeting --> FrontendHandshake: BackendGreetingReceived / relay
-    FrontendHandshake --> SslRequest: ClientSslRequest / activate TLS
-    SslRequest --> FrontendHandshake: TlsActivated
-    FrontendHandshake --> BackendHandshake: ClientHandshakeResponse / forward
+    Accept --> Greeting: ConnectionAccepted / send proxy greeting
+    Greeting --> SslRequest: ClientSslRequest / activate TLS
+    SslRequest --> Greeting: TlsActivated
+    Greeting --> FrontendHandshake: ClientHandshakeResponse / dial backend
+    FrontendHandshake --> BackendHandshake: BackendGreetingReceived / forward auth
     BackendHandshake --> Ready: BackendAuthOk / attach owner
     BackendHandshake --> Closing: BackendAuthFailed
     Ready --> Command: ClientCommand / forward

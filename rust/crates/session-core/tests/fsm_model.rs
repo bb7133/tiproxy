@@ -208,20 +208,20 @@ fn plain_lifecycle_walk() {
     run(
         &mut fsm,
         &[
-            (E::ConnectionAccepted, S::Greeting, &[F::DialInitialBackend]),
-            (
-                E::BackendGreetingReceived,
-                S::FrontendHandshake,
-                &[F::RelayGreetingToClient],
-            ),
+            (E::ConnectionAccepted, S::Greeting, &[F::SendProxyGreeting]),
             (
                 E::ClientSslRequest,
                 S::SslRequest,
                 &[F::ActivateFrontendTls],
             ),
-            (E::TlsActivated, S::FrontendHandshake, &[]),
+            (E::TlsActivated, S::Greeting, &[]),
             (
                 E::ClientHandshakeResponse,
+                S::FrontendHandshake,
+                &[F::DialBackend],
+            ),
+            (
+                E::BackendGreetingReceived,
                 S::BackendHandshake,
                 &[F::ForwardHandshakeToBackend],
             ),
@@ -263,8 +263,8 @@ fn authenticated_session() -> SessionFsm {
     let mut fsm = SessionFsm::new();
     for event in [
         E::ConnectionAccepted,
-        E::BackendGreetingReceived,
         E::ClientHandshakeResponse,
+        E::BackendGreetingReceived,
         E::BackendAuthOk,
     ] {
         match fsm.on_event(event) {
@@ -475,14 +475,14 @@ fn auth_failure_walk() {
     run(
         &mut fsm,
         &[
-            (E::ConnectionAccepted, S::Greeting, &[F::DialInitialBackend]),
-            (
-                E::BackendGreetingReceived,
-                S::FrontendHandshake,
-                &[F::RelayGreetingToClient],
-            ),
+            (E::ConnectionAccepted, S::Greeting, &[F::SendProxyGreeting]),
             (
                 E::ClientHandshakeResponse,
+                S::FrontendHandshake,
+                &[F::DialBackend],
+            ),
+            (
+                E::BackendGreetingReceived,
                 S::BackendHandshake,
                 &[F::ForwardHandshakeToBackend],
             ),
