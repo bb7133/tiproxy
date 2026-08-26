@@ -70,9 +70,13 @@ func TestDrainIssuerSingleFlightAndIdempotentResults(t *testing.T) {
 	}
 
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, command))
-	// Re-issuing the active id is a harmless duplicate command.
+	wireID := sender.sent()[0].GetDrainCommand().GetDrainId()
+	require.NotEqual(t, "d-1", wireID, "wire id is incarnation-qualified")
+	// Re-issuing the active id is a harmless duplicate command reusing
+	// the same wire identity.
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 2, 12, command))
 	require.Len(t, sender.sent(), 2)
+	require.Equal(t, wireID, sender.sent()[1].GetDrainCommand().GetDrainId())
 	// A different id while active never reaches the wire.
 	err := issuer.StartDrain(context.Background(), sender, 3, 12, &controlpb.DrainCommand{DrainId: "d-2"})
 	require.ErrorIs(t, err, ErrDrainInProgress)
@@ -80,7 +84,7 @@ func TestDrainIssuerSingleFlightAndIdempotentResults(t *testing.T) {
 
 	// Progress applies idempotently; an out-of-order older result is
 	// just replaced by the next observation (absolute counters).
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 2, 1, 0, false)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult(wireID, 2, 1, 0, false)))
 	progress, done := issuer.Progress("d-1")
 	require.False(t, done)
 	require.EqualValues(t, 1, progress.GetGracefullyClosed())
@@ -92,11 +96,11 @@ func TestDrainIssuerSingleFlightAndIdempotentResults(t *testing.T) {
 
 	// The terminal result completes the drain exactly once; duplicates
 	// of the terminal replay refresh the completed record harmlessly.
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 2, 1, 1, true)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult(wireID, 2, 1, 1, true)))
 	final, done := issuer.Progress("d-1")
 	require.True(t, done)
 	require.True(t, final.GetComplete())
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 2, 1, 1, true)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult(wireID, 2, 1, 1, true)))
 	final, done = issuer.Progress("d-1")
 	require.True(t, done)
 	require.EqualValues(t, 1, final.GetForceClosed())
@@ -106,11 +110,15 @@ func TestDrainIssuerSingleFlightAndIdempotentResults(t *testing.T) {
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 4, 12, command))
 	_, done = issuer.Progress("d-1")
 	require.True(t, done, "completed drain stays completed")
-	// With d-1 terminal, a new drain may start — and then the completed
-	// d-1 id conflicts like any different id (single-flight, matching
-	// the Rust gate).
+	// With d-1 terminal, a new drain may start; a completed id's replay
+	// re-send stays harmless even while another is active (it can never
+	// start anything — the Rust gate replays or proves it obsolete).
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 5, 12, &controlpb.DrainCommand{DrainId: "d-2"}))
-	require.ErrorIs(t, issuer.StartDrain(context.Background(), sender, 6, 12, command), ErrDrainInProgress)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 6, 12, command))
+	all := sender.sent()
+	replayed := all[len(all)-1].GetDrainCommand()
+	require.Equal(t, wireID, replayed.GetDrainId())
+	require.EqualValues(t, 1, replayed.GetCommandSequence(), "replay reuses the original binding")
 }
 
 // The consumer applies a batch only when its sequence advances:
@@ -180,14 +188,15 @@ func TestDrainCommandRoundTripContract(t *testing.T) {
 	require.Len(t, envelopes, 1)
 	sent := envelopes[0].GetDrainCommand()
 	require.NotNil(t, sent)
-	require.Equal(t, "d-rt", sent.GetDrainId())
+	rtWire := sent.GetDrainId()
+	require.NotEqual(t, "d-rt", rtWire, "wire id is incarnation-qualified")
 	require.Equal(t, []string{"tidb-a"}, sent.GetBackendIds())
 	require.Equal(t, controlpb.Priority_PRIORITY_CRITICAL, envelopes[0].GetPriority())
 
 	// The Rust gate's progress answer for a duplicate command applies
-	// idempotently on this side too.
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-rt", 3, 0, 0, false)))
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-rt", 3, 2, 1, true)))
+	// idempotently on this side too, correlated by the wire id.
+	require.NoError(t, issuer.HandleDrainResult(drainResult(rtWire, 3, 0, 0, false)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult(rtWire, 3, 2, 1, true)))
 	final, done := issuer.Progress("d-rt")
 	require.True(t, done)
 	require.EqualValues(t, 3, final.GetActiveConnections())
@@ -247,4 +256,46 @@ func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
 	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcile))
 	require.Equal(t, 0, handler.closeCalls)
 	require.Equal(t, 0, rt.ConnCount())
+}
+
+// Incarnation lineage: two fresh issuers (as after a Go restart, where
+// transport epochs can repeat) mint distinct wire ids for the same
+// operator label — old wire ids are never reissued — while ONE
+// incarnation keeps the same wire id and sequence for its label across
+// reconnects/epochs (an epoch change never turns one operation into a
+// new one). A previous incarnation's still-active drain is observable
+// through the DRAIN_IN_PROGRESS answer instead of being silently lost.
+func TestIncarnationLineageForDrainWireIds(t *testing.T) {
+	first := NewDrainIssuer()
+	second := NewDrainIssuer()
+	senderA := &recordingSender{}
+	senderB := &recordingSender{}
+
+	require.NoError(t, first.StartDrain(context.Background(), senderA, 1, 12, &controlpb.DrainCommand{DrainId: "ops-drain"}))
+	require.NoError(t, second.StartDrain(context.Background(), senderB, 1, 12, &controlpb.DrainCommand{DrainId: "ops-drain"}))
+	wireA := senderA.sent()[0].GetDrainCommand().GetDrainId()
+	wireB := senderB.sent()[0].GetDrainCommand().GetDrainId()
+	require.NotEqual(t, wireA, wireB,
+		"fresh incarnations mint distinct wire ids even at equal epochs")
+
+	// Same incarnation across a reconnect (epoch changes): the label
+	// keeps its original wire id and sequence.
+	reconnected := &recordingSender{}
+	require.NoError(t, first.StartDrain(context.Background(), reconnected, 2, 12, &controlpb.DrainCommand{DrainId: "ops-drain"}))
+	resent := reconnected.sent()[0].GetDrainCommand()
+	require.Equal(t, wireA, resent.GetDrainId(),
+		"one incarnation, one operation: epochs never re-mint the id")
+	require.EqualValues(t, 1, resent.GetCommandSequence())
+
+	// The old incarnation's drain still runs on the Rust side: the new
+	// incarnation's command is answered DRAIN_IN_PROGRESS naming the old
+	// wire id — recorded observably for a later retry.
+	require.NoError(t, second.HandleDrainResult(&controlpb.DrainResult{
+		DrainId:           wireA,
+		ActiveConnections: 3,
+		Code:              controlpb.ErrorCode_ERROR_CODE_DRAIN_IN_PROGRESS,
+	}))
+	foreign := second.ForeignActiveDrain()
+	require.NotNil(t, foreign, "the previous incarnation's operation is visible")
+	require.Equal(t, wireA, foreign.GetDrainId())
 }

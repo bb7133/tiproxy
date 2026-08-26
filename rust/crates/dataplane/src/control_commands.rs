@@ -370,6 +370,22 @@ impl CommandGate {
         );
     }
 
+    /// The connection's admission identity (for lifecycle events).
+    #[must_use]
+    pub fn connection_identity(&self, connection_id: u64) -> Option<ConnectionIdentity> {
+        self.connections
+            .get(&connection_id)
+            .map(|connection| connection.identity.clone())
+    }
+
+    /// The connection's recorded snapshot generation.
+    #[must_use]
+    pub fn connection_generation(&self, connection_id: u64) -> Option<u64> {
+        self.connections
+            .get(&connection_id)
+            .map(|connection| connection.snapshot_generation)
+    }
+
     /// The connection's currently recorded backend id.
     #[must_use]
     pub fn connection_backend(&self, connection_id: u64) -> Option<String> {

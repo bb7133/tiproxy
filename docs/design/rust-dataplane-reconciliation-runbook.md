@@ -16,7 +16,7 @@ Go↔Rust restart reconciliation. Protocol authority:
 | New redirect id while one is pending | Protocol violation surfaced; Go never issues one (it serializes on terminal results). |
 | Duplicate `CloseCommand` (same id) | Replays the cached `CloseResult`. |
 | Different close id while closing | Reports the actual closing id's state; never schedules a second close. |
-| Duplicate `DrainCommand` (active id) | Returns current progress; never a second drain. |
+| Duplicate `DrainCommand` (active id) | Returns current progress; never a second drain. Protocol `drain_id` is an **incarnation-unique wire operation id** (`<operator-label>@<128-bit boot nonce>`): one Go issuer incarnation binds each operator label to exactly one wire id/sequence, including across reconnects/epochs. A fresh Go restart re-requesting the same label is **a new operation by definition** (resuming would require persisting the label→wire mapping, which is deliberately not claimed); a previous incarnation's still-active drain surfaces through the `DRAIN_IN_PROGRESS` answer (`DrainIssuer::ForeignActiveDrain`) for the composition to wait on and retry. |
 | Different drain id while one is active | `DRAIN_IN_PROGRESS` (both sides reject — Go locally before sending, Rust at the gate). |
 | Re-issued completed drain id (idle) | Replays the final result. |
 | Duplicate/reordered `MeteringBatch` | Applies only the contiguous next sequence (`last+1`); duplicates and gaps are refused (the producer replays in order, so gaps converge), and totals never double-count or skip a batch. |
@@ -75,16 +75,25 @@ lifecycle).
 
 The gates are on the real message paths on both sides:
 
-- **Rust** — `dataplane::control_dispatch::ControlCommandHandler`, a
-  **process-long-lived** single owner (control reconnects update the
-  peer mode from the negotiated `RECONCILE_SESSION_REHYDRATION`
-  capability; the gate, its tombstones, unacked results, and watermarks
-  are never rebuilt — cross-epoch replay depends on them). Inbound
-  redirect/close/drain envelopes map to `SessionControl` signals on the
-  per-session registry, replays/progress to result envelopes, obsolete
-  duplicates to `DUPLICATE_REQUEST`-coded results, and violations to
-  typed protocol errors; drains ask graceful closes at admission and
-  `tick` closes the remainder at the force deadline.
+- **Rust** — `dataplane::control_dispatch`: `spawn_control_dispatch`
+  binds the **process-long-lived** `ControlCommandHandler` to the shared
+  control client — the returned `InboundForwarder` is the transport
+  `Handler` for `ControlClient::run` (full-queue backpressure errors the
+  stream into reconnect, never drops a command), and the
+  `ControlDispatchHandle` is the session-facing surface
+  (register/backend/closed/redirect-finished/close-finished/negotiated
+  notices). Control reconnects update the peer mode only; the gate, its
+  tombstones, unacked results, and watermarks are never rebuilt —
+  cross-epoch replay depends on them. `handle_envelope` consumes real
+  `ControlEnvelope`s (drain deadlines converted from the wire's
+  absolute unix-millis against an injected clock pair; a command
+  arriving past its force deadline force-closes immediately) and emits
+  complete outbound envelopes; each matched session receives
+  `CloseImmediate` exactly once however many force ticks land. Session
+  terminations and reconcile ghosts produce **sequenced** CLOSED event
+  envelopes (the event sequence rides the envelope request id, which
+  both Go's per-epoch dedup and the reconcile
+  `last_connection_event_sequence` key on).
 - **Go** — `pkg/controlbridge.CompositeControlHandler` (transport
   handler) composes the `RouterAdapter`, `DrainIssuer`, and
   `MeteringConsumer`: metering batches apply with contiguous-sequence

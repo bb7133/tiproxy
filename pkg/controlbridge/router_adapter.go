@@ -848,12 +848,11 @@ func (adapter *RouterAdapter) ResolveOrphans(ctx context.Context) error {
 	for _, orphan := range adapter.orphans {
 		pending = append(pending, orphan)
 	}
-	sender := adapter.sender
 	adapter.mu.Unlock()
 
 	var firstErr error
 	for _, orphan := range pending {
-		if err := adapter.resolveOneOrphan(ctx, sender, orphan); err != nil && firstErr == nil {
+		if err := adapter.resolveOneOrphan(ctx, orphan); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -867,7 +866,6 @@ func (adapter *RouterAdapter) ResolveOrphans(ctx context.Context) error {
 // close a session another path just recovered.
 func (adapter *RouterAdapter) resolveOneOrphan(
 	ctx context.Context,
-	sender EnvelopeSender,
 	orphan *orphanState,
 ) error {
 	id := orphan.remote.GetConnectionId()
@@ -889,9 +887,10 @@ func (adapter *RouterAdapter) resolveOneOrphan(
 	}
 	adapter.mu.Unlock()
 
+	current := adapter.currentSender()
 	epoch := uint64(0)
-	if sender != nil {
-		epoch = sender.Epoch()
+	if current != nil {
+		epoch = current.Epoch()
 	}
 	if state := adapter.rehydrateReconciled(orphan.remote, epoch); state != nil {
 		adapter.mu.Lock()
@@ -915,25 +914,33 @@ func (adapter *RouterAdapter) resolveOneOrphan(
 	// once the close reached the negotiated sender with both required
 	// capabilities: otherwise the orphan is retained and the next
 	// cadence retries.
-	if sender == nil ||
-		!sender.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE)) ||
-		!sender.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION)) {
+	// Responsibility transfers only once the close reached the
+	// **current** negotiated sender — re-read while holding the claim,
+	// so a concurrent reconnect cannot let a stale sender's send delete
+	// the obligation into the wrong lineage.
+	current = adapter.currentSender()
+	if current == nil ||
+		!current.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE)) ||
+		!current.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION)) {
 		return nil
 	}
 	envelope := &controlpb.ControlEnvelope{
-		RequestId:            adapter.nextID.Add(1),
-		Generation:           orphan.remote.GetGeneration(),
-		Priority:             controlpb.Priority_PRIORITY_CRITICAL,
-		RequiredCapabilities: []uint64{uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE)},
+		RequestId:  adapter.nextID.Add(1),
+		Generation: orphan.remote.GetGeneration(),
+		Priority:   controlpb.Priority_PRIORITY_CRITICAL,
+		RequiredCapabilities: []uint64{
+			uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE),
+			uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
+		},
 		Body: &controlpb.ControlEnvelope_CloseCommand{CloseCommand: &controlpb.CloseCommand{
 			ConnectionId: id,
-			CloseId:      adapter.newOperationID("orphan-close", sender.Epoch(), id),
+			CloseId:      adapter.newOperationID("orphan-close", current.Epoch(), id),
 			ErrorSource:  controlpb.ErrorSource_ERROR_SOURCE_PROXY,
 			Reason:       "unrehydratable after reconciliation",
 			Force:        false,
 		}},
 	}
-	if err := sender.Send(ctx, envelope); err != nil {
+	if err := current.Send(ctx, envelope); err != nil {
 		return err
 	}
 	adapter.mu.Lock()
@@ -1070,7 +1077,6 @@ func (adapter *RouterAdapter) forgetClosedState(state *connectionState) {
 		delete(adapter.connections, id)
 	}
 	if _, exists := adapter.closedIDs[id]; !exists {
-		adapter.closedIDs[id] = state.epoch
 		adapter.closedOrder = append(adapter.closedOrder, id)
 		if len(adapter.closedOrder) > maxClosedConnectionTombstones {
 			oldest := adapter.closedOrder[0]
@@ -1078,6 +1084,10 @@ func (adapter *RouterAdapter) forgetClosedState(state *connectionState) {
 			delete(adapter.closedIDs, oldest)
 		}
 	}
+	// Every close advances the tombstone to the incarnation that just
+	// closed: a stale epoch here would let the NEXT same-epoch reuse
+	// masquerade as a legitimate new lineage.
+	adapter.closedIDs[id] = state.epoch
 	adapter.mu.Unlock()
 }
 

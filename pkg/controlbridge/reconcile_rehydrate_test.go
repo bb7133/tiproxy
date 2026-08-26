@@ -408,12 +408,14 @@ func TestCompositeHandlerRestoresDrainWatermark(t *testing.T) {
 	command := lastEnvelope(t, peer).GetDrainCommand()
 	require.NotNil(t, command)
 	require.EqualValues(t, 10, command.GetCommandSequence(), "next = restored watermark + 1")
+	require.NotEqual(t, "d-after", command.GetDrainId(), "incarnation-qualified wire id")
 
-	// Drain results route through the composite to the issuer.
+	// Drain results (carrying the wire id) route through the composite
+	// to the issuer.
 	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
 		RequestId: 4,
 		Body: &controlpb.ControlEnvelope_DrainResult{DrainResult: &controlpb.DrainResult{
-			DrainId: "d-after", ActiveConnections: 0, Complete: true,
+			DrainId: command.GetDrainId(), ActiveConnections: 0, Complete: true,
 			Code: controlpb.ErrorCode_ERROR_CODE_OK,
 		}},
 	}))
@@ -429,15 +431,17 @@ func TestDrainIdBindingAndSequenceExhaustion(t *testing.T) {
 	issuer := NewDrainIssuer()
 	sender := &recordingSender{}
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, &controlpb.DrainCommand{DrainId: "d1"}))
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d1", 0, 0, 0, true)))
+	d1Wire := sender.sent()[0].GetDrainCommand().GetDrainId()
+	require.NoError(t, issuer.HandleDrainResult(drainResult(d1Wire, 0, 0, 0, true)))
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 2, 12, &controlpb.DrainCommand{DrainId: "d2"}))
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d2", 0, 0, 0, true)))
+	d2Wire := sender.sent()[1].GetDrainCommand().GetDrainId()
+	require.NoError(t, issuer.HandleDrainResult(drainResult(d2Wire, 0, 0, 0, true)))
 
-	// Re-issue long-completed d1: same sequence 1 on the wire.
+	// Re-issue long-completed d1: the same wire id and sequence 1.
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 3, 12, &controlpb.DrainCommand{DrainId: "d1"}))
 	sent := sender.sent()
 	last := sent[len(sent)-1].GetDrainCommand()
-	require.Equal(t, "d1", last.GetDrainId())
+	require.Equal(t, d1Wire, last.GetDrainId())
 	require.EqualValues(t, 1, last.GetCommandSequence(), "the original binding, never a new sequence")
 
 	// Sequence exhaustion fails closed.

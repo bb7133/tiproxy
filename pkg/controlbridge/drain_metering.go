@@ -16,7 +16,14 @@ package controlbridge
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
 	"sync"
+	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
@@ -30,35 +37,74 @@ import (
 // (the Rust side answers current progress), and a different id while
 // one is active is rejected locally before any envelope is sent.
 type DrainIssuer struct {
-	mu            sync.Mutex
-	active        *drainOperation
-	lastCompleted *drainOperation
+	mu sync.Mutex
+	// incarnation is a random 128-bit boot nonce minted at construction:
+	// the issuer-incarnation identity that makes wire ids unique across
+	// Go process restarts. Control epochs are NOT a restart identity
+	// (the transport's epoch counter is per-process and can repeat), so
+	// the nonce, not the epoch, qualifies the wire id.
+	incarnation string
+	// operations owns every drain this issuer ever put on the wire,
+	// keyed by the incarnation-qualified wire id. An id is bound to
+	// exactly one issuance (sequence) for the issuer's lifetime; a
+	// restarted lineage's re-request of the same operator label mints a
+	// NEW wire identity and sequence — by protocol definition that is a
+	// new operation, not a resumption (resuming would require
+	// persistence of the caller→wire mapping, which is deliberately not
+	// claimed). Drains are operator-initiated and low cardinality; the
+	// unbounded maps are a deliberate, documented trade for the
+	// provable binding.
+	operations map[string]*drainOperation
+	// callerIndex maps the operator-supplied label to its wire id
+	// within this incarnation: the same label across reconnects (new
+	// epochs) of ONE incarnation keeps its original wire id/sequence.
+	callerIndex map[string]string
+	activeID    string
 	// sequence is the issuer-wide monotonically increasing command
 	// sequence; restored from the reconcile watermark after a restart
 	// so new drains are never judged obsolete by the Rust gate.
 	sequence uint64
-	// issued binds every drain id ever issued by this issuer to its
-	// sequence for the issuer's lifetime: an id is bound to exactly one
-	// issuance, so any re-send reuses the original sequence (the Rust
-	// gate then replays its tombstone or proves it obsolete — it can
-	// never re-execute). Drains are operator-initiated and low
-	// cardinality, so the unbounded map is a deliberate, documented
-	// trade for the provable binding.
-	issued map[string]uint64
+	// foreignActive records the most recent DRAIN_IN_PROGRESS answer
+	// naming a wire id this incarnation never issued: a previous
+	// incarnation's drain is still running on the Rust side. The
+	// composition observes it and retries once that operation
+	// completes.
+	foreignActive *controlpb.DrainResult
 }
 
 type drainOperation struct {
-	drainID  string
-	sequence uint64
-	latest   *controlpb.DrainResult
+	wireID    string
+	sequence  uint64
+	latest    *controlpb.DrainResult
+	completed bool
+	everSent  bool
 }
 
 // ErrDrainInProgress rejects a second concurrent drain locally.
 var ErrDrainInProgress = errors.New("a different drain is already in progress")
 
-// NewDrainIssuer creates an idle issuer.
+// NewDrainIssuer creates an idle issuer with a fresh incarnation nonce.
 func NewDrainIssuer() *DrainIssuer {
-	return &DrainIssuer{issued: make(map[string]uint64)}
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		// crypto/rand failing is unrecoverable for lineage identity;
+		// fall back to a time-derived nonce rather than a constant.
+		binary.LittleEndian.PutUint64(nonce, uint64(time.Now().UnixNano()))
+	}
+	return &DrainIssuer{
+		incarnation: hex.EncodeToString(nonce),
+		operations:  make(map[string]*drainOperation),
+		callerIndex: make(map[string]string),
+	}
+}
+
+// ForeignActiveDrain reports a previous incarnation's drain the Rust
+// side answered DRAIN_IN_PROGRESS for (nil when none observed): the
+// composition retries its own drain after that operation completes.
+func (issuer *DrainIssuer) ForeignActiveDrain() *controlpb.DrainResult {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	return issuer.foreignActive
 }
 
 // ErrDrainSequenceExhausted fails closed when the monotonic sequence
@@ -156,7 +202,8 @@ func (handler *CompositeControlHandler) ResolveOrphans(ctx context.Context) erro
 // The generation stamps the command's provenance: the Rust gate rejects
 // drains minted before its applied config snapshot. Per-connection
 // generations are deliberately not involved (one drain spans
-// mixed-generation sessions).
+// mixed-generation sessions). The operator id in the command is
+// rewritten to the epoch-qualified wire id before sending.
 func (issuer *DrainIssuer) StartDrain(
 	ctx context.Context,
 	sender EnvelopeSender,
@@ -167,45 +214,70 @@ func (issuer *DrainIssuer) StartDrain(
 	if command == nil || command.GetDrainId() == "" {
 		return errors.New("drain command requires a drain id")
 	}
+	callerID := command.GetDrainId()
+
 	issuer.mu.Lock()
-	if issuer.active != nil && issuer.active.drainID != command.GetDrainId() {
-		issuer.mu.Unlock()
-		return ErrDrainInProgress
+	wireID, known := issuer.callerIndex[callerID]
+	var operation *drainOperation
+	if known {
+		operation = issuer.operations[wireID]
 	}
-	created := false
-	if bound, ever := issuer.issued[command.GetDrainId()]; ever {
-		// An id is bound to exactly one issuance for the issuer's
-		// lifetime: every re-send (active, completed, or long-evicted)
-		// reuses the original sequence.
-		command.CommandSequence = bound
-	} else {
+	if operation == nil {
+		// A new issuance for this operator id under the current control
+		// epoch: the wire id embeds the epoch, so a restarted lineage
+		// mints a fresh identity instead of colliding with a bound one.
+		if issuer.activeID != "" {
+			issuer.mu.Unlock()
+			return ErrDrainInProgress
+		}
 		if issuer.sequence == ^uint64(0) {
 			issuer.mu.Unlock()
 			return ErrDrainSequenceExhausted
 		}
 		issuer.sequence++
-		command.CommandSequence = issuer.sequence
-		issuer.issued[command.GetDrainId()] = issuer.sequence
-		issuer.active = &drainOperation{drainID: command.GetDrainId(), sequence: issuer.sequence}
-		created = true
+		wireID = fmt.Sprintf("%s@%s", callerID, issuer.incarnation)
+		operation = &drainOperation{wireID: wireID, sequence: issuer.sequence}
+		issuer.operations[wireID] = operation
+		issuer.callerIndex[callerID] = wireID
+		issuer.activeID = wireID
+	} else {
+		if !operation.completed {
+			if issuer.activeID != "" && issuer.activeID != wireID {
+				issuer.mu.Unlock()
+				return ErrDrainInProgress
+			}
+			// A retry of a not-yet-terminal drain (including one whose
+			// first send failed) restores it as the active operation so
+			// its eventual terminal result is owned, never a stray.
+			issuer.activeID = wireID
+		}
 	}
+	sequence := operation.sequence
 	issuer.mu.Unlock()
 
+	wire, ok := proto.Clone(command).(*controlpb.DrainCommand)
+	if !ok {
+		return errors.New("clone drain command")
+	}
+	wire.DrainId = wireID
+	wire.CommandSequence = sequence
 	err := sender.Send(ctx, &controlpb.ControlEnvelope{
 		RequestId:  requestID,
 		Generation: generation,
 		Priority:   controlpb.Priority_PRIORITY_CRITICAL,
-		Body:       &controlpb.ControlEnvelope_DrainCommand{DrainCommand: command},
+		Body:       &controlpb.ControlEnvelope_DrainCommand{DrainCommand: wire},
 	})
-	if err != nil && created {
-		// The command never reached the wire: roll the registration
-		// back so a later different drain is not rejected forever.
-		issuer.mu.Lock()
-		if issuer.active != nil && issuer.active.drainID == command.GetDrainId() && issuer.active.latest == nil {
-			issuer.active = nil
-		}
-		issuer.mu.Unlock()
+	issuer.mu.Lock()
+	if err == nil {
+		operation.everSent = true
+	} else if !operation.everSent && !operation.completed && issuer.activeID == wireID {
+		// Never reached the wire: release the single-flight slot so a
+		// different drain is not blocked forever; the binding itself is
+		// retained (the id stays bound to its one sequence for any
+		// retry).
+		issuer.activeID = ""
 	}
+	issuer.mu.Unlock()
 	return err
 }
 
@@ -219,16 +291,27 @@ func (issuer *DrainIssuer) HandleDrainResult(result *controlpb.DrainResult) erro
 	}
 	issuer.mu.Lock()
 	defer issuer.mu.Unlock()
-	if issuer.active == nil || issuer.active.drainID != result.GetDrainId() {
-		// A completed drain's record is terminal: late strays (including
-		// reordered non-terminal progress) never regress it.
+	operation := issuer.operations[result.GetDrainId()]
+	if operation == nil {
+		// A wire id this incarnation never bound. A DRAIN_IN_PROGRESS
+		// answer here names a previous incarnation's still-active
+		// drain: record it observably so the composition can wait and
+		// retry instead of never learning about the old operation.
+		if result.GetCode() == controlpb.ErrorCode_ERROR_CODE_DRAIN_IN_PROGRESS {
+			issuer.foreignActive = result
+		}
+		return nil
+	}
+	if operation.completed {
+		// Terminal is absolute: a replayed terminal refreshes nothing
+		// and a reordered non-terminal never regresses it.
 		return nil
 	}
 	// Counters are absolute and per-field monotonic: any single field
 	// moving backwards (or the matched population drifting) marks a
 	// reordered duplicate, which is ignored. Field-wise comparison also
 	// avoids the sum overflow a combined check would risk.
-	if latest := issuer.active.latest; latest != nil {
+	if latest := operation.latest; latest != nil {
 		if result.GetGracefullyClosed() < latest.GetGracefullyClosed() ||
 			result.GetForceClosed() < latest.GetForceClosed() ||
 			result.GetActiveConnections() != latest.GetActiveConnections() ||
@@ -241,26 +324,30 @@ func (issuer *DrainIssuer) HandleDrainResult(result *controlpb.DrainResult) erro
 		result.GetForceClosed() > result.GetActiveConnections()-result.GetGracefullyClosed() {
 		return nil
 	}
-	issuer.active.latest = result
+	operation.latest = result
 	if result.GetComplete() {
-		issuer.lastCompleted = issuer.active
-		issuer.active = nil
+		operation.completed = true
+		if issuer.activeID == operation.wireID {
+			issuer.activeID = ""
+		}
 	}
 	return nil
 }
 
-// Progress returns the latest observed result for drainID and whether
-// the drain is finished. Unknown IDs return (nil, false).
-func (issuer *DrainIssuer) Progress(drainID string) (*controlpb.DrainResult, bool) {
+// Progress returns the latest observed result for the operator's drain
+// id and whether that drain finished. Unknown ids return (nil, false).
+func (issuer *DrainIssuer) Progress(callerID string) (*controlpb.DrainResult, bool) {
 	issuer.mu.Lock()
 	defer issuer.mu.Unlock()
-	if issuer.active != nil && issuer.active.drainID == drainID {
-		return issuer.active.latest, false
+	wireID, known := issuer.callerIndex[callerID]
+	if !known {
+		return nil, false
 	}
-	if issuer.lastCompleted != nil && issuer.lastCompleted.drainID == drainID {
-		return issuer.lastCompleted.latest, true
+	operation := issuer.operations[wireID]
+	if operation == nil {
+		return nil, false
 	}
-	return nil, false
+	return operation.latest, operation.completed
 }
 
 // MeteringConsumer owns the Go side of deduplicated cumulative metering

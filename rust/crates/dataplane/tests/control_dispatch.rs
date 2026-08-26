@@ -22,9 +22,10 @@
 
 use std::time::Duration;
 
+use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
-    CloseCommand, ConnectionIdentity, DrainCommand, ErrorCode, ReconcileConnection,
-    ReconcileSnapshot, RedirectCommand,
+    CloseCommand, ConnectionIdentity, ControlEnvelope, DrainCommand, ErrorCode, ErrorSource,
+    ReconcileConnection, ReconcileSnapshot, RedirectCommand,
 };
 use dataplane::control_dispatch::{ControlCommandHandler, OutboundControl};
 use dataplane::session::SessionControl;
@@ -180,17 +181,16 @@ async fn drain_dispatch_runs_graceful_then_force() {
     let mut other = register(&mut handler, 3, "sql-b", "tidb-a");
 
     let now = Instant::now();
-    let graceful_by = now + Duration::from_secs(10);
-    let force_by = now + Duration::from_secs(20);
+    let now_ms: u64 = 1_000_000;
     let command = DrainCommand {
         drain_id: "d-1".to_owned(),
         listener_names: vec!["sql-a".to_owned()],
         backend_ids: Vec::new(),
-        graceful_deadline_unix_millis: 0,
-        force_deadline_unix_millis: 0,
+        graceful_deadline_unix_millis: now_ms + 10_000,
+        force_deadline_unix_millis: now_ms + 20_000,
         command_sequence: 1,
     };
-    let out = handler.handle_drain(30, 7, &command, now, graceful_by, force_by);
+    let out = handler.handle_drain(30, 7, &command, now, now_ms);
     let [OutboundControl::DrainResult(progress)] = out.as_slice() else {
         unreachable!("start answers progress")
     };
@@ -206,16 +206,25 @@ async fn drain_dispatch_runs_graceful_then_force() {
         "out-of-scope listener untouched"
     );
 
-    // One session drains gracefully.
-    handler.session_closed(1, false);
+    // One session drains gracefully; its CLOSED event is sequenced.
+    let closed = handler.session_closed(1, false, ErrorSource::ClientNetwork);
+    assert!(closed.is_some(), "sequenced CLOSED lifecycle event");
 
-    // Past the force deadline the remainder is closed immediately.
+    // Past the force deadline the remainder is closed immediately —
+    // exactly once, however many ticks land.
+    let force_by = now + Duration::from_secs(20);
     let _ = handler.tick(force_by + Duration::from_millis(1));
     assert_eq!(b.control.try_recv(), Ok(SessionControl::CloseImmediate));
-    handler.session_closed(2, true);
+    let _ = handler.tick(force_by + Duration::from_millis(2));
+    let _ = handler.tick(force_by + Duration::from_millis(3));
+    assert!(
+        b.control.try_recv().is_err(),
+        "repeated force ticks never duplicate CloseImmediate"
+    );
+    let _ = handler.session_closed(2, true, ErrorSource::Proxy);
 
     // Completed: the duplicate command replays the final result.
-    let out = handler.handle_drain(31, 7, &command, force_by, graceful_by, force_by);
+    let out = handler.handle_drain(31, 7, &command, force_by, now_ms + 20_001);
     let [OutboundControl::DrainResult(done)] = out.as_slice() else {
         unreachable!("completed drain replays")
     };
@@ -229,7 +238,7 @@ async fn drain_dispatch_runs_graceful_then_force() {
         command_sequence: 1,
         ..command.clone()
     };
-    let out = handler.handle_drain(32, 7, &obsolete, force_by, graceful_by, force_by);
+    let out = handler.handle_drain(32, 7, &obsolete, force_by, now_ms + 20_002);
     let [OutboundControl::DrainResult(answer)] = out.as_slice() else {
         unreachable!("obsolete answers a result")
     };
@@ -262,7 +271,7 @@ async fn handler_survives_reconnect_and_replays_lost_terminal() {
     assert_eq!(request.connections[0].pending_redirect_id, "r-1");
     assert_eq!(request.connections[0].last_redirect_command_sequence, 1);
 
-    let (outbound, ghosts) = handler.apply_reconcile_snapshot(&ReconcileSnapshot {
+    let (outbound, ghost_events) = handler.apply_reconcile_snapshot(&ReconcileSnapshot {
         applied_generation: 7,
         connection_event_sequence: 0,
         metrics_sequence: 0,
@@ -283,5 +292,123 @@ async fn handler_survives_reconnect_and_replays_lost_terminal() {
         vec![OutboundControl::RedirectResult(lost)],
         "the exact lost terminal replays across the epoch"
     );
-    assert!(ghosts.is_empty());
+    assert!(ghost_events.is_empty());
+}
+
+/// The full production entry: a real inbound `ControlEnvelope` drives
+/// `handle_envelope`, producing complete outbound envelopes (request
+/// ids, generation, critical priority); an already-force-expired drain
+/// command force-closes immediately without a graceful ask; and ghost
+/// connections in a reconcile snapshot come back as sequenced CLOSED
+/// event envelopes built from the peer's identity view.
+#[tokio::test(start_paused = true)]
+async fn handle_envelope_production_path() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7);
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+
+    // Redirect via a real envelope; the terminal result comes back as a
+    // complete envelope.
+    let now = Instant::now();
+    let now_ms: u64 = 5_000_000;
+    let inbound = ControlEnvelope {
+        request_id: 70,
+        generation: 7,
+        body: Some(Body::RedirectCommand(redirect(1, "r-env", 1))),
+        ..ControlEnvelope::default()
+    };
+    assert!(handler.handle_envelope(&inbound, now, now_ms).is_empty());
+    assert_eq!(session.control.try_recv(), Ok(SessionControl::Redirect));
+    let Some(OutboundControl::RedirectResult(_)) =
+        handler.redirect_completed(1, "r-env", true, "tidb-b", ErrorCode::Ok)
+    else {
+        unreachable!("terminal produced")
+    };
+    // The duplicate replay comes back as a full envelope.
+    let out = handler.handle_envelope(&inbound, now, now_ms);
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].body, Some(Body::RedirectResult(_))));
+    assert!(out[0].request_id > 0);
+    assert_eq!(out[0].generation, 7);
+
+    // An already-force-expired drain force-closes immediately.
+    let expired = ControlEnvelope {
+        request_id: 71,
+        generation: 7,
+        body: Some(Body::DrainCommand(DrainCommand {
+            drain_id: "d-exp".to_owned(),
+            listener_names: Vec::new(),
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: now_ms - 2_000,
+            force_deadline_unix_millis: now_ms - 1_000,
+            command_sequence: 1,
+        })),
+        ..ControlEnvelope::default()
+    };
+    let out = handler.handle_envelope(&expired, now, now_ms);
+    assert!(matches!(out[0].body, Some(Body::DrainResult(_))));
+    assert_eq!(
+        session.control.try_recv(),
+        Ok(SessionControl::CloseImmediate),
+        "expired force deadline skips the graceful ask entirely"
+    );
+
+    // Ghosts in a reconcile snapshot become sequenced CLOSED envelopes.
+    let mut fresh = ControlCommandHandler::new();
+    fresh.on_session_negotiated(true);
+    let snapshot = ControlEnvelope {
+        request_id: 72,
+        generation: 7,
+        body: Some(Body::ReconcileSnapshot(ReconcileSnapshot {
+            applied_generation: 7,
+            connection_event_sequence: 0,
+            metrics_sequence: 0,
+            metering_sequence: 0,
+            connections: vec![ReconcileConnection {
+                connection_id: 9,
+                backend_id: "tidb-a".to_owned(),
+                namespace: "ns-a".to_owned(),
+                redirect_pending: false,
+                generation: 7,
+                pending_redirect_id: String::new(),
+                identity: Some(identity(9)),
+                last_redirect_command_sequence: 0,
+            }],
+        })),
+        ..ControlEnvelope::default()
+    };
+    let out = fresh.handle_envelope(&snapshot, now, now_ms);
+    assert_eq!(out.len(), 1, "one ghost, one CLOSED event");
+    let Some(Body::ConnectionEvent(event)) = &out[0].body else {
+        unreachable!("ghost answered with a CLOSED event")
+    };
+    assert_eq!(event.connection.as_ref().map(|i| i.connection_id), Some(9));
+    assert!(out[0].request_id > 0, "the event sequence rides request_id");
+}
+
+/// A close whose session channel is gone terminates immediately instead
+/// of wedging the gate in Closing.
+#[tokio::test(start_paused = true)]
+async fn close_forward_failure_terminates() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    let session = register(&mut handler, 1, "sql-a", "tidb-a");
+    drop(session); // the control channel closes
+
+    let close = CloseCommand {
+        connection_id: 1,
+        close_id: "c-dead".to_owned(),
+        error_source: 0,
+        reason: String::new(),
+        force: false,
+    };
+    let out = handler.handle_close(80, 7, &close);
+    let [OutboundControl::CloseResult(result)] = out.as_slice() else {
+        unreachable!("dead session close terminates immediately")
+    };
+    assert!(result.accepted);
+    // The duplicate replays the terminal, proving the gate moved on.
+    let out = handler.handle_close(81, 7, &close);
+    assert!(matches!(out.as_slice(), [OutboundControl::CloseResult(_)]));
 }
