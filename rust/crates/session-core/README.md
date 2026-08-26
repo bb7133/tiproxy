@@ -61,3 +61,30 @@ relation is the
 reachability test over the full state × flag space (`tests/fsm_model.rs`),
 which also proves: no two backend owners, no authenticated state without
 authentication, no effects after `Closed`.
+
+## Handshake negotiation (`handshake`, SES-01)
+
+Pure first-handshake policy frozen from Go `authenticator.go` (the wire
+layouts live in `mysql-wire::handshake`):
+
+- `SUPPORTED_SERVER_CAPABILITIES` bit-pinned to Go's literal union;
+  `PROTOCOL_41` required from the frontend (fixed
+  `ER_NOT_SUPPORTED_AUTH_MODE` 1251/`08004` response when missing);
+  `DEPRECATE_EOF` required from the backend only when the session
+  negotiated it; `require-backend-tls` enforcement.
+- Go tolerances preserved: `PLUGIN_AUTH` force-set for clients that omit
+  the bit; the `SSLRequest` capability mask wins over a differing
+  handshake-response mask (trust-first); backend under-advertisement is
+  reported for logging and otherwise ignored (excluding `SSL`).
+- Size gates: 1-MiB pre-read cap (shared limits registry) and the
+  32-byte minimum for the first client packet.
+- `RoutingHandshake` is the routing gate: opaque, constructible only
+  via `FrontendNegotiation::routing_handshake` (itself only obtainable
+  from a successful negotiation), and carrying the listener and real
+  client addresses — `DialBackend` cannot run before negotiation
+  succeeded and username, listener, and client metadata exist.
+- `tests/handshake_matrix.rs` runs representative driver capability
+  profiles (mysql CLI 8.0, go-sql-driver, Connector/J, legacy
+  libmysqlclient, zstd, TLS-with-dropped-SSL-bit) end-to-end through
+  codec + policy, plus exhaustive truncation sweeps (no prefix panics or
+  decodes).
