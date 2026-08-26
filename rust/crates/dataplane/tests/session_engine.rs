@@ -176,6 +176,11 @@ async fn run_fake_backend(listener: TcpListener) {
             if packet.payload.first() == Some(&0x01) {
                 break; // COM_QUIT
             }
+            if packet.payload.windows(5).any(|window| window == b"SLEEP") {
+                // Simulates a long-running statement so a force
+                // deadline can preempt an in-flight command.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
             writer.reset_sequence(reader.expected_sequence());
             let Ok(ok) = encode_ok_packet(
                 ResponseHeader::OK,
@@ -700,5 +705,74 @@ async fn coordinated_shutdown_stops_accept_then_drains() {
     )
     .await;
     assert!(closed.is_some(), "the drained session closes and reports");
+    stack.dispatch_task.abort();
+}
+
+/// A drain whose force deadline lands while a command is in flight
+/// (never a safe boundary) force-closes the session: the terminal
+/// DrainResult counts it as force-closed and the CLOSED lifecycle
+/// event carries the proxy-shutdown attribution.
+#[tokio::test]
+async fn drain_force_deadline_preempts_in_flight_command() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("SELECT 1").await);
+
+    // Start a long statement: the backend stalls for seconds, so the
+    // session sits mid-command with no safe boundary.
+    let slow = tokio::spawn(async move { client.query_ok("SELECT SLEEP").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Force deadline ~now: graceful already passed, force imminent.
+    let now_ms = 1_000_000_u64;
+    let drain = command_envelope(
+        7000,
+        Body::DrainCommand(DrainCommand {
+            drain_id: "d-force".to_owned(),
+            listener_names: Vec::new(),
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: now_ms.saturating_sub(1_000),
+            force_deadline_unix_millis: now_ms.saturating_sub(500),
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(drain).await;
+
+    let terminal = wait_sent(&stack.sender, |e| {
+        matches!(&e.body, Some(Body::DrainResult(result))
+            if result.drain_id == "d-force" && result.complete)
+    })
+    .await;
+    let Some(terminal) = terminal else {
+        unreachable!("the force phase completes the drain")
+    };
+    let Some(Body::DrainResult(result)) = terminal.body else {
+        unreachable!()
+    };
+    assert_eq!(result.force_closed, 1, "the in-flight session was forced");
+
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(closed) = closed else {
+        unreachable!("the forced session reports CLOSED")
+    };
+    let Some(Body::ConnectionEvent(event)) = closed.body else {
+        unreachable!()
+    };
+    assert_eq!(
+        event.error_source, 6,
+        "timeout force-close uses the proxy-shutdown source: {event:?}"
+    );
+    let _ = slow.await;
     stack.dispatch_task.abort();
 }

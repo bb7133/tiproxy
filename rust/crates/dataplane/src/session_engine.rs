@@ -179,7 +179,6 @@ enum EngineReport {
 #[derive(Debug, Clone)]
 struct EngineExit {
     totals: TrafficTotals,
-    force_closed: bool,
     source: WireErrorSource,
     backend_id: String,
 }
@@ -420,7 +419,6 @@ pub async fn run_bound_session(
         cmd_state: None,
         in_transaction: false,
         pending_command: None,
-        force_closed: false,
         wire_end: None,
         closing: false,
         _seat: seat,
@@ -443,6 +441,7 @@ pub async fn run_bound_session(
     let mut redirect_token: Option<CommandToken> = None;
     let mut close_token: Option<CommandToken> = None;
     let mut directives_open = true;
+    let mut forced_by_control = false;
     let mut drain_signaled = *drain.borrow();
     if drain_signaled {
         // Admitted after stop-accept began: close at the first safe
@@ -482,6 +481,9 @@ pub async fn run_bound_session(
                     }
                     None => {}
                 }
+                if directive.control == SessionControl::CloseImmediate {
+                    forced_by_control = true;
+                }
                 let _ = control_tx.send(directive.control).await;
             }
             report = report_rx.recv() => {
@@ -495,7 +497,20 @@ pub async fn run_bound_session(
     // The loop returned: its handler (holding one cmd sender clone) is
     // gone; drop ours so the engine drains and exits, then join it.
     drop(cmd_tx);
-    let engine_exit = engine_task.await.ok();
+    // The engine may be blocked in a socket forward (a stalled backend
+    // mid-command); the force semantics bound that wait with the same
+    // absolute cleanup budget the loop uses, then hard-cancel — the
+    // sockets drop with the task, which IS the force close.
+    let mut engine_task = engine_task;
+    let engine_exit =
+        match tokio::time::timeout(loop_config.cleanup_deadline, &mut engine_task).await {
+            Ok(joined) => joined.ok(),
+            Err(_) => {
+                engine_task.abort();
+                let _ = engine_task.await;
+                None
+            }
+        };
     while let Ok(report) = report_rx.try_recv() {
         consume_report(report, &commander, &mut redirect_token).await;
     }
@@ -504,13 +519,19 @@ pub async fn run_bound_session(
         .as_ref()
         .map(|exit| exit.totals)
         .unwrap_or_default();
-    let forced = summary
+    let shutdown_end = summary
         .as_ref()
-        .is_some_and(|summary| summary.end == SessionEnd::ServerShutdown)
-        || engine_exit.as_ref().is_some_and(|exit| exit.force_closed);
-    let source = engine_exit
-        .as_ref()
-        .map_or(WireErrorSource::Proxy, |exit| exit.source);
+        .is_some_and(|summary| summary.end == SessionEnd::ServerShutdown);
+    let forced = shutdown_end || forced_by_control;
+    // Go parity: a timeout/immediate force-close reports the proxy
+    // shutdown source; everything else keeps the wire classification.
+    let source = if forced {
+        WireErrorSource::Shutdown
+    } else {
+        engine_exit
+            .as_ref()
+            .map_or(WireErrorSource::Proxy, |exit| exit.source)
+    };
     // Exactness: an unresolved redirect terminal fails closed so the
     // gate id never dangles; an accepted close that ran the session to
     // its end reports under its exact admitted id.
@@ -599,7 +620,6 @@ struct Engine {
     cmd_state: Option<CommandSessionState>,
     in_transaction: bool,
     pending_command: Option<PendingCommand>,
-    force_closed: bool,
     wire_end: Option<WireErrorSource>,
     closing: bool,
     _seat: SessionSeat,
@@ -629,7 +649,6 @@ impl Engine {
         self.shutdown_io().await;
         EngineExit {
             totals: self.totals(),
-            force_closed: self.force_closed,
             source: self.wire_end.unwrap_or(WireErrorSource::ClientNetwork),
             backend_id: self
                 .backend
@@ -1204,7 +1223,6 @@ impl Engine {
             }
             SessionEffect::CloseClient => {
                 self.closing = true;
-                self.force_closed = true;
                 let _ = self.client_w.flush().await;
                 Awaited::Closing
             }
