@@ -351,7 +351,7 @@ fn change_user_success_commits_identity() -> Result<(), Box<dyn std::error::Erro
         Some(PreparedMutation::ClearAll)
     );
 
-    let mut relay = ChangeUserRelay::new(false);
+    let mut relay = ChangeUserRelay::new();
     // Backend answers with a fresh auth switch (classified by SES-02).
     let mut switch = vec![0xfe];
     switch.extend_from_slice(b"mysql_native_password\0fresh-salt");
@@ -421,7 +421,7 @@ fn change_user_failure_keeps_previous_identity() -> Result<(), Box<dyn std::erro
     let payload = change_user_payload(capabilities);
     let plan = plan_change_user(&payload, capabilities)?;
 
-    let mut relay = ChangeUserRelay::new(false);
+    let mut relay = ChangeUserRelay::new();
     let step = relay.on_event(ChangeUserEvent::BackendError { code: 1045 })?;
     assert_eq!(
         step.effects,
@@ -430,17 +430,12 @@ fn change_user_failure_keeps_previous_identity() -> Result<(), Box<dyn std::erro
             ChangeUserEffect::DiscardPendingIdentity,
         ]
     );
-    // B2: the failure boundary is crossed with the retained pre-command
-    // transaction state so queued redirect/drain can proceed.
+    // SES-07: the failure boundary is the statusless ERR-completion
+    // event — the FSM decides on its retained state, and unknown-state
+    // knowledge is never restored by an ERR.
     assert_eq!(
         step.session_event,
-        Some(SessionEvent::BackendResponseTxnDone)
-    );
-    let mut in_txn_relay = ChangeUserRelay::new(true);
-    let step = in_txn_relay.on_event(ChangeUserEvent::BackendError { code: 1045 })?;
-    assert_eq!(
-        step.session_event,
-        Some(SessionEvent::BackendResponseTxnOpen)
+        Some(SessionEvent::BackendResponseErrorComplete)
     );
 
     // The failure path preserves the FULL previous identity, including
@@ -455,7 +450,7 @@ fn change_user_failure_keeps_previous_identity() -> Result<(), Box<dyn std::erro
     );
 
     // Client packets during the backend's turn are illegal.
-    let mut fresh = ChangeUserRelay::new(false);
+    let mut fresh = ChangeUserRelay::new();
     assert_eq!(
         fresh.on_event(ChangeUserEvent::ClientAuthResponse),
         Err(ChangeUserError::IllegalTurn {
@@ -538,7 +533,7 @@ fn change_user_failure_boundary_unblocks_queued_redirect_and_drain() {
         }
     }
     assert!(fsm.flags().redirect_pending);
-    let mut relay = ChangeUserRelay::new(false);
+    let mut relay = ChangeUserRelay::new();
     let step = match relay.on_event(ChangeUserEvent::BackendError { code: 1045 }) {
         Ok(step) => step,
         Err(error) => unreachable!("relay failed: {error}"),
@@ -566,7 +561,7 @@ fn change_user_failure_boundary_unblocks_queued_redirect_and_drain() {
             Err(error) => unreachable!("setup failed: {error}"),
         }
     }
-    let mut relay = ChangeUserRelay::new(false);
+    let mut relay = ChangeUserRelay::new();
     let step = match relay.on_event(ChangeUserEvent::BackendError { code: 1045 }) {
         Ok(step) => step,
         Err(error) => unreachable!("relay failed: {error}"),

@@ -289,9 +289,11 @@ impl ResponseEffect {
                 SessionEvent::BackendResponsePart
             }
             ResponseDisposition::LocalInfile => SessionEvent::BackendLocalInfileRequest,
-            ResponseDisposition::CompleteSuccess
-            | ResponseDisposition::CompleteError { .. }
-            | ResponseDisposition::CompleteRaw => {
+            // An ERR carries no server status: the FSM decides the
+            // boundary on its retained state and unknown-state knowledge
+            // is not restored (SES-07).
+            ResponseDisposition::CompleteError { .. } => SessionEvent::BackendResponseErrorComplete,
+            ResponseDisposition::CompleteSuccess | ResponseDisposition::CompleteRaw => {
                 if self.in_transaction {
                     SessionEvent::BackendResponseTxnOpen
                 } else {
@@ -1089,7 +1091,13 @@ mod tests {
             );
             assert!(effect.in_transaction);
             assert_eq!(effect.status, None);
-            assert_eq!(effect.session_event(), SessionEvent::BackendResponseTxnOpen);
+            // SES-07: statusless ERR maps to its own completion event so
+            // the FSM decides the boundary on retained state and never
+            // restores unknown-state knowledge from an ERR.
+            assert_eq!(
+                effect.session_event(),
+                SessionEvent::BackendResponseErrorComplete
+            );
         }
         Ok(())
     }

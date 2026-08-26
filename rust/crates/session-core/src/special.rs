@@ -508,20 +508,20 @@ pub struct ChangeUserStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeUserRelay {
     turn: ChangeUserTurn,
-    in_transaction_before: bool,
+}
+
+impl Default for ChangeUserRelay {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChangeUserRelay {
     /// Starts after the rewritten request was forwarded to the backend.
-    /// `in_transaction_before` is the transaction state retained from
-    /// before the command: Go's `handleErrorPacket` never touches
-    /// `serverStatus`, so a rejected change-user reaches its boundary
-    /// with exactly that retained state.
     #[must_use]
-    pub const fn new(in_transaction_before: bool) -> Self {
+    pub const fn new() -> Self {
         Self {
             turn: ChangeUserTurn::AwaitingBackend,
-            in_transaction_before,
         }
     }
 
@@ -561,14 +561,11 @@ impl ChangeUserRelay {
                         ChangeUserEffect::DiscardPendingIdentity,
                     ],
                     // Go's handleErrorPacket leaves the transaction flag
-                    // untouched, so the failure boundary is reached with
-                    // the retained pre-command state — the session must
-                    // still cross it (queued redirect/drain proceed).
-                    session_event: Some(if self.in_transaction_before {
-                        SessionEvent::BackendResponseTxnOpen
-                    } else {
-                        SessionEvent::BackendResponseTxnDone
-                    }),
+                    // untouched: the ERR-completion event lets the FSM
+                    // decide the boundary on its retained state without
+                    // restoring unknown-state knowledge, so queued
+                    // redirect/drain still proceed when genuinely safe.
+                    session_event: Some(SessionEvent::BackendResponseErrorComplete),
                 })
             }
             (ChangeUserTurn::AwaitingBackend, ChangeUserEvent::BackendAuthData) => {

@@ -398,9 +398,10 @@ mod tests {
         }
         assert!(fsm.is_safe_boundary(), "fresh authenticated session");
 
-        // Open transaction blocks; an authoritative done-status restores.
+        // In-flight command phases are never safe; an open transaction
+        // blocks at Ready; an authoritative done-status restores.
         for (event, safe) in [
-            (SessionEvent::ClientCommand, true),
+            (SessionEvent::ClientCommand, false),
             (SessionEvent::BackendResponseTxnOpen, false),
             (SessionEvent::ClientCommand, false),
             (SessionEvent::BackendResponseTxnDone, true),

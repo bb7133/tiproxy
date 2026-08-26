@@ -163,6 +163,16 @@ pub enum SessionEvent {
     /// and immediate graceful close are blocked until an authoritative
     /// response status refreshes the knowledge (SES-07 hardening).
     BackendStateUnknown,
+    /// The backend response completed with an ERR packet. An ERR carries
+    /// no server status (Go `handleErrorPacket` keeps `serverStatus`), so
+    /// the boundary is decided on the **retained** transaction state and
+    /// unknown-state knowledge is **not** restored.
+    BackendResponseErrorComplete,
+    /// An internal command completed with an ERR packet: no client
+    /// forwarding (the SES-07 hold machine owns the one-shot error
+    /// forward), retained transaction state, and no unknown-state
+    /// restoration.
+    InternalResponseError,
     /// Control plane: migrate this session to a new backend.
     ControlRedirect,
     /// Control plane: close gracefully at the next safe boundary.
@@ -555,13 +565,27 @@ impl SessionFsm {
     /// which redirect/drain queue instead of firing, so every migration and
     /// drain decision in this machine flows through this one predicate at
     /// state-completion points.
+    /// True only when the session is **between commands** (`Ready` or
+    /// `Draining`) with clear flags. Every in-flight phase — a command
+    /// awaiting its response, a `MORE_RESULTS` window, LOCAL INFILE,
+    /// change-user, an in-flight migration, teardown — returns false:
+    /// those phases queue redirect/drain instead of firing them.
     #[must_use]
     pub const fn is_safe_boundary(&self) -> bool {
+        matches!(self.state, SessionState::Ready | SessionState::Draining)
+            && self.flags_permit_boundary()
+    }
+
+    /// The flag half of the authority (Go `finishedTxn` + unknown-state
+    /// hardening). Command-completion handlers reuse exactly this while
+    /// the machine is still in the completing phase — completion *is* the
+    /// boundary point, so the phase term is supplied by construction.
+    const fn flags_permit_boundary(&self) -> bool {
         !self.flags.in_txn && !self.flags.prepared_pending && !self.flags.txn_unknown
     }
 
     const fn at_migration_boundary(&self) -> bool {
-        self.is_safe_boundary()
+        self.flags_permit_boundary()
     }
 
     /// Shared safe-boundary handling after prepared/transaction state is
@@ -602,6 +626,20 @@ impl SessionFsm {
         self.finish_command(Effects::new())
     }
 
+    /// ERR completion: the client sees the forwarded ERR, the command
+    /// ends, and the boundary is decided on the **retained** flags — an
+    /// ERR carries no status, so it can neither change the transaction
+    /// state nor restore unknown-state knowledge.
+    fn error_response_complete(&mut self) -> (SessionState, Effects) {
+        self.finish_command(vec![SessionEffect::ForwardResponseToClient])
+    }
+
+    /// Internal ERR completion: retained flags, no forwarding, no
+    /// unknown-state restoration.
+    fn internal_error_complete(&mut self) -> (SessionState, Effects) {
+        self.finish_command(Effects::new())
+    }
+
     fn on_command(&mut self, event: SessionEvent) -> Option<(SessionState, Effects)> {
         match event {
             SessionEvent::BackendResponsePart => Some((
@@ -613,6 +651,8 @@ impl SessionFsm {
             SessionEvent::NoResponseCommandComplete => Some(self.finish_command(Effects::new())),
             SessionEvent::InternalResponseTxnDone => Some(self.internal_response_complete(true)),
             SessionEvent::InternalResponseTxnOpen => Some(self.internal_response_complete(false)),
+            SessionEvent::BackendResponseErrorComplete => Some(self.error_response_complete()),
+            SessionEvent::InternalResponseError => Some(self.internal_error_complete()),
             SessionEvent::BackendLocalInfileRequest => Some((
                 SessionState::LocalInfile,
                 vec![SessionEffect::RequestLocalInfileFromClient],
@@ -663,6 +703,7 @@ impl SessionFsm {
             )),
             SessionEvent::BackendResponseTxnDone => Some(self.response_complete(true)),
             SessionEvent::BackendResponseTxnOpen => Some(self.response_complete(false)),
+            SessionEvent::BackendResponseErrorComplete => Some(self.error_response_complete()),
             SessionEvent::ControlRedirect => {
                 // Duplicate signals are illegal (one outstanding per session).
                 if self.flags.redirect_pending {
@@ -1146,6 +1187,66 @@ pub static TRANSITIONS: &[Transition] = &[
         SessionState::Command,
         SessionEvent::BackendResponseTxnOpen,
         SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::RedirectPending,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseError,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseError,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseError,
+        SessionState::RedirectPending,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::InternalResponseError,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::RedirectPending,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendResponseErrorComplete,
+        SessionState::Closing,
     ),
     t(
         SessionState::Command,

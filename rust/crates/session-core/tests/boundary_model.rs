@@ -123,6 +123,7 @@ fn redirect_never_starts_in_any_unsafe_state() -> Result<(), Box<dyn std::error:
     assert!(!observer.is_complete(), "MORE_RESULTS is not a completion");
     let _ = apply(&mut fsm, effect.session_event());
     assert_eq!(fsm.state(), SessionState::Response);
+    assert!(!fsm.is_safe_boundary(), "MORE_RESULTS window is unsafe");
     let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
     assert!(!effects.contains(&SessionEffect::StartRedirectHandshake));
 
@@ -133,6 +134,7 @@ fn redirect_never_starts_in_any_unsafe_state() -> Result<(), Box<dyn std::error:
     let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
     assert!(!effects.contains(&SessionEffect::StartRedirectHandshake));
     assert_eq!(fsm.state(), SessionState::LocalInfile);
+    assert!(!fsm.is_safe_boundary(), "LOCAL INFILE phase is unsafe");
 
     // 5. Cursor / long data through the real registry feed the same
     //    authority via PreparedStatePending.
@@ -228,7 +230,8 @@ fn held_begin_success_never_forwards_internal_commit() {
         "internal COMMIT OK must not forward to the client"
     );
     assert_eq!(fsm.state(), SessionState::RedirectPending);
-    assert!(fsm.is_safe_boundary());
+    // The in-flight migration is itself a non-boundary phase.
+    assert!(!fsm.is_safe_boundary());
 
     // Migration succeeds; the held BEGIN replays exactly once.
     let _ = apply(&mut fsm, SessionEvent::RedirectBackendReady);
@@ -299,4 +302,66 @@ fn held_begin_failure_and_close_paths() {
     }
     assert_eq!(hold.drop_for_close(), Ok(HoldEffect::DiscardHeldRequest));
     assert!(hold.take_for_replay().is_err(), "dropped is never replayed");
+}
+
+/// Unknown state survives every statusless ERR completion: a real
+/// observer ERR, a change-user ERR, and an internal COMMIT ERR all end
+/// their commands without restoring safety; only an authoritative OK/EOF
+/// status clears the flag.
+#[test]
+fn unknown_state_survives_every_err_variant() -> Result<(), Box<dyn std::error::Error>> {
+    use session_core::special::{ChangeUserEvent, ChangeUserRelay};
+
+    // 1. Real ResponseObserver ERR.
+    let mut fsm = authenticated_fsm();
+    let _ = apply(&mut fsm, SessionEvent::BackendStateUnknown);
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let query = [Command::Query.as_byte(), b'B'];
+    let plan = dispatch(CommandPacket::decode(&query)?)?;
+    let mut observer = ResponseObserver::new(plan.response, caps(), false, flush_threshold())?;
+    let mut err_packet = vec![0xff];
+    err_packet.extend_from_slice(&1064_u16.to_le_bytes());
+    err_packet.extend_from_slice(b"#42000syntax");
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&err_packet)?)?;
+    assert_eq!(effect.status, None, "ERR carries no status");
+    let _ = apply(&mut fsm, effect.session_event());
+    assert_eq!(fsm.state(), SessionState::Ready);
+    assert!(
+        fsm.flags().txn_unknown,
+        "observer ERR must not clear Unknown"
+    );
+    assert!(!fsm.is_safe_boundary());
+
+    // 2. Change-user ERR through the SES-06 relay.
+    let mut relay = ChangeUserRelay::new();
+    let step = match relay.on_event(ChangeUserEvent::BackendError { code: 1045 }) {
+        Ok(step) => step,
+        Err(error) => unreachable!("relay: {error}"),
+    };
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let Some(boundary) = step.session_event else {
+        unreachable!("change-user ERR must produce a boundary event")
+    };
+    let _ = apply(&mut fsm, boundary);
+    assert!(
+        fsm.flags().txn_unknown,
+        "change-user ERR must not clear Unknown"
+    );
+    assert!(!fsm.is_safe_boundary());
+
+    // 3. Internal COMMIT ERR.
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let _ = apply(&mut fsm, SessionEvent::InternalResponseError);
+    assert!(
+        fsm.flags().txn_unknown,
+        "internal ERR must not clear Unknown"
+    );
+    assert!(!fsm.is_safe_boundary());
+
+    // Only an authoritative status restores safety.
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let _ = apply(&mut fsm, SessionEvent::BackendResponseTxnDone);
+    assert!(!fsm.flags().txn_unknown);
+    assert!(fsm.is_safe_boundary());
+    Ok(())
 }
