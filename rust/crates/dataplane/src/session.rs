@@ -15,33 +15,52 @@
 //! Single-owner session event loop (DPL-01).
 //!
 //! One task owns all mutable session state — the SES-00 FSM, timers, and
-//! the child-operation set. There is no session mutex anywhere: event
-//! sources and effect handlers borrow `&mut` slices of the loop's state for
-//! the duration of one call, and child operations live in the session's
-//! [`JoinSet`], so nothing detaches and nothing is shared.
+//! the child-operation set. There is no session mutex anywhere: effect
+//! handlers borrow `&mut` slices of the loop's state for the duration of
+//! one call, and child operations live in the session's [`JoinSet`], so
+//! nothing detaches and nothing is shared.
+//!
+//! The transport classifier runs in its **own tracked pump task**: the
+//! loop moves the [`SessionEventSource`] into a dedicated task that polls
+//! `next_event` futures sequentially to completion and submits each
+//! classified event through a bounded channel. The loop side selects on
+//! that channel's `recv`, which is cancel-safe, so a classifier future is
+//! **never dropped mid-read** no matter which select arm wins — the
+//! cancel-safety of source implementations is structural, not documentary.
 //!
 //! The loop composes, in biased order: shutdown, control commands, the
-//! armed deadline timer, finished child operations, and transport events
-//! (already classified into [`SessionEvent`]s by the SES layers via
-//! [`SessionEventSource`]). Every accepted event drives
+//! armed deadline timer, the backend probe, finished child operations, and
+//! pumped transport events. Every accepted event drives
 //! [`SessionFsm::on_event`]; every returned effect goes to the injected
 //! [`EffectHandler`], which may spawn **tracked** children but cannot own
 //! session state.
 //!
-//! Cleanup is deadline-bounded on every exit path (client/backend/control
-//! EOF, cancel, error, or normal close): children are aborted and drained
-//! under [`SessionLoopConfig::cleanup_deadline`], and the transport is
-//! dropped (closing its file descriptors) before [`SessionSummary`] is
-//! returned. Go parity notes: the handshake deadline mirrors the frontend
-//! auth timeout, the periodic backend-active check mirrors
-//! `checkBackendActive`, and half-close follows Go — a client EOF tears the
-//! session down rather than lingering on a half-open pair.
+//! Control-plane loss follows the control-protocol v1 **last-good**
+//! semantics: the per-session control channel closing must not tear down
+//! an established SQL session. The loop disables the control arm and keeps
+//! forwarding traffic; redirects and graceful closes simply stop arriving
+//! until the control plane re-attaches through a new channel. Only the
+//! transport, the client, or the server shutdown signal end the session.
+//!
+//! Cleanup is deadline-bounded on every exit path (client/backend EOF,
+//! cancel, error, or normal close) and **drains before it aborts**:
+//! children get [`SessionLoopConfig::cleanup_deadline`] to finish
+//! normally — teardown effects spawned into the set complete exactly once
+//! — and only children still running after the deadline are aborted (and
+//! then awaited under the same bound again). The pump task is aborted at
+//! exit, and the transport drops with it. Go parity notes: the handshake
+//! deadline mirrors the frontend auth timeout and disarms on the
+//! transition into an authenticated state; the periodic backend-active
+//! check mirrors `checkBackendActive` and runs only in idle-safe states
+//! (KA-003: never concurrent with command I/O); half-close follows Go — a
+//! client EOF tears the session down rather than lingering on a half-open
+//! pair.
 
 use std::time::Duration;
 
 use session_core::fsm::{SessionEffect, SessionEvent, SessionFsm, SessionState, TransitionError};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep_until, timeout};
 
 /// Control-plane commands delivered to one session's loop.
@@ -67,7 +86,12 @@ impl SessionControl {
 
 /// Classified transport events for one session. The SES layers own the
 /// classification; the loop never sees packet bytes.
-pub trait SessionEventSource: Send {
+///
+/// The loop moves the source into a dedicated pump task that polls each
+/// `next_event` future to completion before requesting the next one, so
+/// implementations may hold partial read state across awaits without any
+/// cancellation hazard.
+pub trait SessionEventSource: Send + 'static {
     /// Waits for the next classified event. `None` means the transport is
     /// exhausted (both directions closed at the wire level).
     fn next_event(&mut self) -> impl Future<Output = Option<SessionEvent>> + Send;
@@ -84,8 +108,10 @@ pub trait EffectHandler: Send {
         children: &mut JoinSet<()>,
     ) -> impl Future<Output = ()> + Send;
 
-    /// Periodic backend-liveness probe (Go `checkBackendActive`). Returning
-    /// false injects [`SessionEvent::BackendIoError`].
+    /// Backend-liveness probe (Go `checkBackendActive`). Called only in
+    /// idle-safe states (KA-003) — never while a command, response, or
+    /// `LOCAL INFILE` exchange is in flight. Returning false injects
+    /// [`SessionEvent::BackendIoError`].
     fn backend_active(&mut self) -> impl Future<Output = bool> + Send {
         async { true }
     }
@@ -103,8 +129,8 @@ pub struct SessionLoopConfig {
     /// Interval for the backend-active probe once authenticated. Zero
     /// disables the probe.
     pub backend_check_interval: Duration,
-    /// Upper bound for aborting and draining children plus dropping the
-    /// transport on any exit path.
+    /// Per-phase upper bound at exit: first for letting children finish
+    /// normally, then (only if some remain) for joining aborted children.
     pub cleanup_deadline: Duration,
 }
 
@@ -128,17 +154,15 @@ pub enum SessionEnd {
     ServerShutdown,
     /// The transport was exhausted before the FSM closed.
     TransportExhausted,
-    /// The control channel closed and the FSM cannot make progress; the
-    /// session is torn down defensively.
-    ControlChannelLost,
 }
 
 /// Deadline-bounded cleanup accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupReport {
-    /// Children aborted at exit (they were still running).
+    /// Children aborted at exit because they outlived the drain deadline.
     pub aborted_children: usize,
-    /// Whether every child joined within the cleanup deadline.
+    /// Whether every child finished (or joined after abort) within the
+    /// configured bounds.
     pub within_deadline: bool,
 }
 
@@ -154,14 +178,23 @@ pub struct SessionSummary {
     /// Events rejected by the FSM (protocol violations surfaced by the
     /// transport ordering); each left the machine unchanged.
     pub rejected_events: u64,
+    /// Whether the control channel closed while the session kept running
+    /// (control-v1 last-good: never a teardown reason by itself).
+    pub control_detached: bool,
     /// Cleanup accounting.
     pub cleanup: CleanupReport,
 }
 
+/// Capacity of the pump channel between the classifier task and the loop.
+/// One slot keeps the classifier in lockstep with the loop: it classifies
+/// at most one event ahead, preserving the transport's natural
+/// backpressure.
+const EVENT_PUMP_CAPACITY: usize = 1;
+
 /// The single owner of one session's mutable state.
 pub struct SessionLoop<S, E> {
     fsm: SessionFsm,
-    source: S,
+    source: Option<S>,
     handler: E,
     control: mpsc::Receiver<SessionControl>,
     shutdown: watch::Receiver<bool>,
@@ -170,6 +203,7 @@ pub struct SessionLoop<S, E> {
     effects_executed: u64,
     rejected_events: u64,
     last_rejection: Option<TransitionError>,
+    control_detached: bool,
     aborted_children_total: usize,
     cleanup_within_deadline: bool,
 }
@@ -180,7 +214,7 @@ enum LoopAction {
     Deadline(SessionEvent),
     SourceExhausted,
     ServerShutdown,
-    ControlLost,
+    ControlDetached,
     ChildFinished,
     BackendProbe,
 }
@@ -197,7 +231,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
     ) -> Self {
         Self {
             fsm: SessionFsm::new(),
-            source,
+            source: Some(source),
             handler,
             control,
             shutdown,
@@ -206,6 +240,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
             effects_executed: 0,
             rejected_events: 0,
             last_rejection: None,
+            control_detached: false,
             aborted_children_total: 0,
             cleanup_within_deadline: true,
         }
@@ -218,9 +253,27 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
     }
 
     /// Runs the session to completion. All child tasks are joined or
-    /// aborted and the transport is dropped before this returns.
+    /// aborted, the pump task is stopped, and the transport is dropped
+    /// before this returns.
     pub async fn run(mut self) -> SessionSummary {
-        let end = self.event_loop().await;
+        // The classifier pump: owns the source, polls every `next_event`
+        // future to completion, and hands events over a bounded channel.
+        // `events.recv()` below is cancel-safe, so losing a select race
+        // can never drop a half-polled classifier future.
+        let (event_tx, mut events) = mpsc::channel::<SessionEvent>(EVENT_PUMP_CAPACITY);
+        // `new` always fills the slot; `run` consumes `self`.
+        let Some(mut source) = self.source.take() else {
+            unreachable!("session source taken twice")
+        };
+        let pump: JoinHandle<()> = tokio::spawn(async move {
+            while let Some(event) = source.next_event().await {
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let end = self.event_loop(&mut events).await;
         // Terminal accounting: reach Closed through the FSM when possible so
         // teardown effects execute exactly once.
         let end = match end {
@@ -234,23 +287,21 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 self.close_via_fsm(SessionEvent::ClientEof).await;
                 SessionEnd::TransportExhausted
             }
-            LoopEnd::ControlLost => {
-                self.close_via_fsm(SessionEvent::ControlCloseImmediate)
-                    .await;
-                SessionEnd::ControlChannelLost
-            }
         };
         let cleanup = self.cleanup().await;
+        pump.abort();
+        let _ = pump.await;
         SessionSummary {
             end,
             final_state: self.fsm.state(),
             effects_executed: self.effects_executed,
             rejected_events: self.rejected_events,
+            control_detached: self.control_detached,
             cleanup,
         }
     }
 
-    async fn event_loop(&mut self) -> LoopEnd {
+    async fn event_loop(&mut self, events: &mut mpsc::Receiver<SessionEvent>) -> LoopEnd {
         let handshake_deadline = Instant::now() + self.config.handshake_deadline;
         let mut armed_deadline: Option<(Instant, SessionEvent)> =
             Some((handshake_deadline, SessionEvent::HandshakeTimerExpired));
@@ -263,24 +314,29 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
             }
             if self.fsm.state() == SessionState::Closing {
                 // The loop is the runtime: teardown effects have executed,
-                // so drain children under the deadline and seal the FSM.
+                // so let their children drain (aborting only past the
+                // deadline) and seal the FSM.
                 let _ = self.cleanup().await;
                 self.apply(SessionEvent::TeardownComplete, &mut armed_deadline)
                     .await;
                 continue;
             }
-            let action = self.next_action(armed_deadline, next_probe).await;
+            let action = self.next_action(events, armed_deadline, next_probe).await;
             match action {
                 LoopAction::ServerShutdown => return LoopEnd::Shutdown,
                 LoopAction::SourceExhausted => return LoopEnd::SourceExhausted,
-                LoopAction::ControlLost => return LoopEnd::ControlLost,
+                LoopAction::ControlDetached => {
+                    // Control-v1 last-good: losing the control channel never
+                    // tears down an established session. Redirect/drain
+                    // commands stop arriving; traffic continues.
+                    self.control_detached = true;
+                }
                 LoopAction::ChildFinished => {}
                 LoopAction::BackendProbe => {
                     if let Some(probe) = next_probe.as_mut() {
                         *probe = Instant::now() + self.config.backend_check_interval;
                     }
-                    if authenticated_phase(self.fsm.state()) && !self.handler.backend_active().await
-                    {
+                    if probe_safe(self.fsm.state()) && !self.handler.backend_active().await {
                         self.apply(SessionEvent::BackendIoError, &mut armed_deadline)
                             .await;
                     }
@@ -290,14 +346,6 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     self.apply(event, &mut armed_deadline).await;
                 }
                 LoopAction::Event(event) => {
-                    if let Some((_, pending)) = armed_deadline
-                        && pending == SessionEvent::HandshakeTimerExpired
-                        && authenticated_phase(self.fsm.state())
-                    {
-                        // Authentication finished: the handshake deadline
-                        // disarms and only a drain deadline can re-arm.
-                        armed_deadline = None;
-                    }
                     self.apply(event, &mut armed_deadline).await;
                 }
             }
@@ -306,9 +354,15 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
 
     async fn next_action(
         &mut self,
+        events: &mut mpsc::Receiver<SessionEvent>,
         armed_deadline: Option<(Instant, SessionEvent)>,
         next_probe: Option<Instant>,
     ) -> LoopAction {
+        // A shutdown that predates this call (including one set before the
+        // loop started) must not be lost to `changed()`'s edge semantics.
+        if *self.shutdown.borrow() {
+            return LoopAction::ServerShutdown;
+        }
         let far_future = Instant::now() + Duration::from_secs(86_400);
         let deadline_at = armed_deadline.map_or(far_future, |(at, _)| at);
         let probe_at = next_probe.unwrap_or(far_future);
@@ -321,9 +375,9 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     LoopAction::ChildFinished
                 }
             }
-            command = self.control.recv() => match command {
+            command = self.control.recv(), if !self.control_detached => match command {
                 Some(command) => LoopAction::Event(command.session_event()),
-                None => LoopAction::ControlLost,
+                None => LoopAction::ControlDetached,
             },
             () = sleep_until(deadline_at), if armed_deadline.is_some() => {
                 match armed_deadline {
@@ -336,7 +390,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 let _ = joined;
                 LoopAction::ChildFinished
             }
-            event = self.source.next_event() => match event {
+            event = events.recv() => match event {
                 Some(event) => LoopAction::Event(event),
                 None => LoopAction::SourceExhausted,
             },
@@ -359,6 +413,16 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     }
                     self.handler.execute(effect, &mut self.children).await;
                     self.effects_executed += 1;
+                }
+                // The handshake deadline is judged on the post-transition
+                // state: the very transition into an authenticated state
+                // (`BackendAuthOk`) disarms it, with no dependency on any
+                // later event arriving.
+                if let Some((_, pending)) = *armed_deadline
+                    && pending == SessionEvent::HandshakeTimerExpired
+                    && authenticated_phase(self.fsm.state())
+                {
+                    *armed_deadline = None;
                 }
             }
             Err(rejection) => {
@@ -383,15 +447,25 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         }
     }
 
+    /// Drains children: first a normal-completion window of
+    /// `cleanup_deadline` — teardown work spawned by `Close*` effects runs
+    /// to completion here — then, only for children that outlived it,
+    /// abort plus a second bounded join.
     async fn cleanup(&mut self) -> CleanupReport {
-        let aborted_children = self.children.len();
-        self.children.abort_all();
         let drained = timeout(self.config.cleanup_deadline, async {
             while self.children.join_next().await.is_some() {}
         })
         .await;
+        let aborted_children = self.children.len();
+        if drained.is_err() && aborted_children > 0 {
+            self.children.abort_all();
+            let joined = timeout(self.config.cleanup_deadline, async {
+                while self.children.join_next().await.is_some() {}
+            })
+            .await;
+            self.cleanup_within_deadline &= joined.is_ok();
+        }
         self.aborted_children_total += aborted_children;
-        self.cleanup_within_deadline &= drained.is_ok();
         CleanupReport {
             aborted_children: self.aborted_children_total,
             within_deadline: self.cleanup_within_deadline,
@@ -411,9 +485,18 @@ const fn authenticated_phase(state: SessionState) -> bool {
     )
 }
 
+/// KA-003: the backend probe may only run while no command, response, or
+/// `LOCAL INFILE` exchange is in flight — it must never race command I/O
+/// on the backend connection. `Ready` and `Draining` are the idle states
+/// (`Draining` waits at a boundary; a drained command re-enters
+/// `Command`). `RedirectPending` is excluded conservatively: the owner is
+/// mid-swap.
+const fn probe_safe(state: SessionState) -> bool {
+    matches!(state, SessionState::Ready | SessionState::Draining)
+}
+
 enum LoopEnd {
     FsmClosed,
     Shutdown,
     SourceExhausted,
-    ControlLost,
 }

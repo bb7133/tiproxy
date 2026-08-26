@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! DPL-01 model tests: the single-owner loop with a fake transport and a
+//! DPL-01 model tests: the single-owner loop with fake transports and a
 //! recording effect handler, under Tokio's paused-time deterministic
-//! scheduler. Critical interleavings (redirect × command × shutdown) are
-//! enumerated explicitly instead of sampled.
+//! scheduler. Critical interleavings (redirect × command boundary ×
+//! shutdown) are enumerated explicitly with quiesced hand-offs, plus one
+//! all-arms-ready race; the pump architecture is exercised with a
+//! multi-await classifier under select-arm noise.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dataplane::session::{
@@ -61,18 +64,71 @@ impl SessionEventSource for FakeSource {
     }
 }
 
-/// Records effects; optionally spawns a stuck child per effect and answers
-/// backend probes from a script.
+/// A live transport the test feeds while the loop runs; `None` (channel
+/// closed) is transport exhaustion.
+struct ChannelSource {
+    rx: mpsc::Receiver<SessionEvent>,
+}
+
+impl ChannelSource {
+    fn new() -> (mpsc::Sender<SessionEvent>, Self) {
+        let (tx, rx) = mpsc::channel(32);
+        (tx, Self { rx })
+    }
+}
+
+impl SessionEventSource for ChannelSource {
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        self.rx.recv().await
+    }
+}
+
+/// A classifier whose `next_event` awaits **twice** per event (two
+/// "half-packets"), holding partial state across the await — the shape
+/// that a select-cancelled future would corrupt. The pump must poll it to
+/// completion, so no half may ever be lost or re-read.
+struct MultiAwaitSource {
+    halves: mpsc::Receiver<SessionEvent>,
+    completed: Arc<AtomicU64>,
+}
+
+impl SessionEventSource for MultiAwaitSource {
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        // First half: the event kind arrives.
+        let first = self.halves.recv().await?;
+        // Partial state (`first`) is live across this second await; a
+        // dropped future here would lose it.
+        let second = self.halves.recv().await?;
+        assert_eq!(first, second, "half-packets torn apart by cancellation");
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Some(first)
+    }
+}
+
+/// Records effects; optionally spawns children per effect and answers
+/// backend probes from a script while counting probe calls.
 #[derive(Default)]
 struct Recorder {
     effects: Arc<Mutex<Vec<SessionEffect>>>,
     spawn_stuck_child_on_forward: bool,
+    /// On `CloseBackend`, spawn a teardown child that finishes only after
+    /// a paused-time delay and then flips the flag: proves cleanup drains
+    /// instead of aborting.
+    spawn_slow_teardown_child: Option<(Duration, Arc<AtomicBool>)>,
     backend_alive: Arc<Mutex<VecDeque<bool>>>,
+    probe_calls: Arc<AtomicU64>,
 }
 
 impl Recorder {
     fn effects(&self) -> Arc<Mutex<Vec<SessionEffect>>> {
         Arc::clone(&self.effects)
+    }
+}
+
+fn locked<T: Clone>(cell: &Arc<Mutex<T>>) -> T {
+    match cell.lock() {
+        Ok(inner) => inner.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
@@ -83,6 +139,16 @@ impl EffectHandler for Recorder {
                 std::future::pending::<()>().await;
             });
         }
+        if effect == SessionEffect::CloseBackend
+            && let Some((delay, flag)) = &self.spawn_slow_teardown_child
+        {
+            let delay = *delay;
+            let flag = Arc::clone(flag);
+            children.spawn(async move {
+                tokio::time::sleep(delay).await;
+                flag.store(true, Ordering::SeqCst);
+            });
+        }
         match self.effects.lock() {
             Ok(mut effects) => effects.push(effect),
             Err(poisoned) => poisoned.into_inner().push(effect),
@@ -90,6 +156,7 @@ impl EffectHandler for Recorder {
     }
 
     async fn backend_active(&mut self) -> bool {
+        self.probe_calls.fetch_add(1, Ordering::SeqCst);
         match self.backend_alive.lock() {
             Ok(mut alive) => alive.pop_front().unwrap_or(true),
             Err(poisoned) => poisoned.into_inner().pop_front().unwrap_or(true),
@@ -114,6 +181,20 @@ const HANDSHAKE: [SessionEvent; 4] = [
     SessionEvent::BackendGreetingReceived,
     SessionEvent::BackendAuthOk,
 ];
+
+/// Runs every ready task to quiescence under the paused-time
+/// current-thread scheduler without advancing the clock: all hand-offs in
+/// these tests are ready-driven, so a bounded yield burst is a
+/// deterministic barrier.
+async fn quiesce() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn count(effects: &[SessionEffect], wanted: SessionEffect) -> usize {
+    effects.iter().filter(|effect| **effect == wanted).count()
+}
 
 /// The scripted lifecycle runs to `Closed` through the FSM with effects in
 /// order and nothing left running.
@@ -142,14 +223,11 @@ async fn scripted_lifecycle_completes_cleanly() {
     assert_eq!(summary.end, SessionEnd::Closed);
     assert_eq!(summary.final_state, SessionState::Closed);
     assert_eq!(summary.rejected_events, 0);
+    assert!(!summary.control_detached);
     assert_eq!(summary.cleanup.aborted_children, 0);
     assert!(summary.cleanup.within_deadline);
-    let recorded = match effects.lock() {
-        Ok(effects) => effects.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
     assert_eq!(
-        recorded,
+        locked(&effects),
         vec![
             SessionEffect::SendProxyGreeting,
             SessionEffect::DialBackend,
@@ -166,10 +244,11 @@ async fn scripted_lifecycle_completes_cleanly() {
     );
 }
 
-/// A client EOF with a stuck child releases everything within the cleanup
-/// deadline: the child is aborted, joined, and reported.
+/// A client EOF with a stuck child still releases everything: the child
+/// gets the drain window, is aborted only after it, and joins within the
+/// second bound.
 #[tokio::test(start_paused = true)]
-async fn eof_releases_stuck_children_within_deadline() {
+async fn eof_aborts_stuck_children_after_drain_window() {
     let mut events = HANDSHAKE.to_vec();
     events.push(SessionEvent::ClientCommand);
     // Transport ends abruptly afterwards (client vanished).
@@ -191,12 +270,54 @@ async fn eof_releases_stuck_children_within_deadline() {
     assert_eq!(summary.end, SessionEnd::TransportExhausted);
     assert_eq!(summary.final_state, SessionState::Closed);
     assert_eq!(summary.cleanup.aborted_children, 1, "stuck child aborted");
+    assert!(
+        summary.cleanup.within_deadline,
+        "abort joined within the bound"
+    );
+}
+
+/// Cleanup **drains before aborting**: a teardown child spawned by
+/// `CloseBackend` that needs (paused) time to finish is allowed to
+/// complete — it is not aborted, and its completion is observable.
+#[tokio::test(start_paused = true)]
+async fn teardown_children_drain_to_completion() {
+    let mut events = HANDSHAKE.to_vec();
+    events.push(SessionEvent::ClientCommandQuit);
+    events.push(SessionEvent::TeardownComplete);
+    let finished = Arc::new(AtomicBool::new(false));
+    let (_control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let handler = Recorder {
+        // Inside the 5s cleanup deadline, but requires real draining.
+        spawn_slow_teardown_child: Some((Duration::from_secs(2), Arc::clone(&finished))),
+        ..Recorder::default()
+    };
+    let summary = SessionLoop::new(
+        FakeSource::scripted(&events),
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    )
+    .run()
+    .await;
+
+    assert_eq!(summary.end, SessionEnd::Closed);
+    assert_eq!(summary.final_state, SessionState::Closed);
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "teardown child ran to completion"
+    );
+    assert_eq!(
+        summary.cleanup.aborted_children, 0,
+        "draining, not aborting"
+    );
     assert!(summary.cleanup.within_deadline);
 }
 
-/// Every arrival order of redirect, a command boundary, and server shutdown
-/// completes without deadlock (explicit interleaving enumeration under the
-/// deterministic paused-time scheduler).
+/// Every arrival order of a redirect command, a real transport command
+/// boundary (`BackendResponseTxnDone`), and server shutdown completes
+/// without deadlock, with teardown effects exactly once. Stimuli are
+/// quiesced between steps, so each order is actually exercised.
 #[tokio::test(start_paused = true)]
 async fn redirect_command_shutdown_interleavings_never_deadlock() {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -214,46 +335,100 @@ async fn redirect_command_shutdown_interleavings_never_deadlock() {
         [Signal::Shutdown, Signal::CommandBoundary, Signal::Redirect],
     ];
     for permutation in permutations {
-        let mut events = HANDSHAKE.to_vec();
-        events.push(SessionEvent::ClientCommand);
+        let (event_tx, source) = ChannelSource::new();
         let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
         let handler = Recorder::default();
+        let effects = handler.effects();
         let looped = SessionLoop::new(
-            FakeSource::parking(&events),
+            source,
             handler,
             control_rx,
             shutdown_rx,
             SessionLoopConfig::default(),
         );
         let run = tokio::spawn(looped.run());
-        // Let the loop absorb the scripted prefix deterministically.
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        for event in HANDSHAKE {
+            let _ = event_tx.send(event).await;
+        }
+        // A command is in flight when the stimuli start.
+        let _ = event_tx.send(SessionEvent::ClientCommand).await;
+        quiesce().await;
         for signal in permutation {
             match signal {
                 Signal::Redirect => {
                     let _ = control_tx.send(SessionControl::Redirect).await;
                 }
                 Signal::CommandBoundary => {
-                    // The backend completes the in-flight command; delivered
-                    // through control-independent shutdown of the fake by
-                    // dropping precision: we emulate by a graceful close
-                    // which also exercises the drain path.
-                    let _ = control_tx.send(SessionControl::GracefulClose).await;
+                    // The real transport boundary: the backend finishes the
+                    // in-flight command out of transaction.
+                    let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
                 }
                 Signal::Shutdown => {
                     let _ = shutdown_tx.send(true);
                 }
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            quiesce().await;
         }
+        // Whatever the order, the session must have been shut down.
         let summary = match tokio::time::timeout(Duration::from_secs(120), run).await {
             Ok(Ok(summary)) => summary,
             Ok(Err(join_error)) => unreachable!("loop panicked: {join_error}"),
             Err(_) => unreachable!("deadlock: {permutation:?}"),
         };
+        assert_eq!(summary.end, SessionEnd::ServerShutdown, "{permutation:?}");
         assert_eq!(summary.final_state, SessionState::Closed, "{permutation:?}");
         assert!(summary.cleanup.within_deadline, "{permutation:?}");
+        let recorded = locked(&effects);
+        assert_eq!(
+            count(&recorded, SessionEffect::ClassifySessionEnd),
+            1,
+            "teardown exactly once: {permutation:?}"
+        );
+        assert_eq!(
+            count(&recorded, SessionEffect::CloseClient),
+            1,
+            "client closed exactly once: {permutation:?}"
+        );
     }
+}
+
+/// All three stimulus arms ready **simultaneously** (no quiescing): the
+/// biased select must still produce one clean shutdown with exactly-once
+/// teardown.
+#[tokio::test(start_paused = true)]
+async fn concurrent_ready_arms_race_cleanly() {
+    let (event_tx, source) = ChannelSource::new();
+    let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let handler = Recorder::default();
+    let effects = handler.effects();
+    let looped = SessionLoop::new(
+        source,
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    );
+    let run = tokio::spawn(looped.run());
+    for event in HANDSHAKE {
+        let _ = event_tx.send(event).await;
+    }
+    let _ = event_tx.send(SessionEvent::ClientCommand).await;
+    quiesce().await;
+    // Make every arm ready at once; the loop has not observed any of them
+    // when they are all sent back-to-back without yielding.
+    let _ = control_tx.send(SessionControl::Redirect).await;
+    let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
+    let _ = shutdown_tx.send(true);
+    let summary = match tokio::time::timeout(Duration::from_secs(120), run).await {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(join_error)) => unreachable!("loop panicked: {join_error}"),
+        Err(_) => unreachable!("deadlock under concurrent-ready race"),
+    };
+    assert_eq!(summary.end, SessionEnd::ServerShutdown);
+    assert_eq!(summary.final_state, SessionState::Closed);
+    let recorded = locked(&effects);
+    assert_eq!(count(&recorded, SessionEffect::ClassifySessionEnd), 1);
+    assert_eq!(count(&recorded, SessionEffect::CloseClient), 1);
 }
 
 /// Server shutdown closes an idle authenticated session immediately and
@@ -271,7 +446,7 @@ async fn server_shutdown_closes_idle_session() {
         SessionLoopConfig::default(),
     );
     let run = tokio::spawn(looped.run());
-    tokio::time::sleep(Duration::from_millis(1)).await;
+    quiesce().await;
     let _ = shutdown_tx.send(true);
     let summary = match run.await {
         Ok(summary) => summary,
@@ -279,16 +454,41 @@ async fn server_shutdown_closes_idle_session() {
     };
     assert_eq!(summary.end, SessionEnd::ServerShutdown);
     assert_eq!(summary.final_state, SessionState::Closed);
-    let recorded = match effects.lock() {
-        Ok(effects) => effects.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
+    let recorded = locked(&effects);
     assert!(recorded.contains(&SessionEffect::ReleaseBackend));
     assert!(recorded.contains(&SessionEffect::CloseClient));
 }
 
-/// The handshake deadline fires for a stalled pre-auth session and tears it
-/// down; after authentication the deadline is disarmed.
+/// A shutdown signal that predates the loop (`watch` already true at
+/// start) is observed: the session closes as `ServerShutdown` with
+/// teardown exactly once instead of waiting for a change that never
+/// comes.
+#[tokio::test(start_paused = true)]
+async fn preexisting_shutdown_is_not_missed() {
+    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let _ = shutdown_tx.send(true);
+    let handler = Recorder::default();
+    let effects = handler.effects();
+    let summary = SessionLoop::new(
+        FakeSource::parking(&[]),
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    )
+    .run()
+    .await;
+    assert_eq!(summary.end, SessionEnd::ServerShutdown);
+    assert_eq!(summary.final_state, SessionState::Closed);
+    let recorded = locked(&effects);
+    assert_eq!(count(&recorded, SessionEffect::CloseClient), 1);
+    assert_eq!(count(&recorded, SessionEffect::ClassifySessionEnd), 1);
+}
+
+/// The handshake deadline fires for a stalled pre-auth session; after the
+/// `BackendAuthOk` **transition itself** it is disarmed — an authenticated
+/// session that then goes fully idle (probe disabled, no further events)
+/// survives far past the deadline.
 #[tokio::test(start_paused = true)]
 async fn handshake_deadline_only_before_authentication() {
     // Stalled pre-auth session: the deadline closes it.
@@ -305,18 +505,27 @@ async fn handshake_deadline_only_before_authentication() {
     assert_eq!(summary.end, SessionEnd::Closed, "deadline sealed the FSM");
     assert_eq!(summary.final_state, SessionState::Closed);
 
-    // Authenticated session: advancing past the handshake deadline does
-    // nothing; the probe keeps it alive until shutdown.
+    // Authenticated then **completely idle**: no probe, no transport
+    // event, no control traffic. Only the post-transition disarm keeps
+    // this session alive past the handshake deadline.
+    let config = SessionLoopConfig {
+        backend_check_interval: Duration::ZERO,
+        ..SessionLoopConfig::default()
+    };
     let (_control_tx2, control_rx, shutdown_tx, shutdown_rx) = channels();
     let looped = SessionLoop::new(
         FakeSource::parking(&HANDSHAKE),
         Recorder::default(),
         control_rx,
         shutdown_rx,
-        SessionLoopConfig::default(),
+        config,
     );
     let run = tokio::spawn(looped.run());
-    tokio::time::sleep(Duration::from_secs(120)).await;
+    quiesce().await;
+    // Far past the 30s handshake deadline; a still-armed timer would fire
+    // here and close the session as `Closed`.
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert!(!run.is_finished(), "idle authenticated session survives");
     let _ = shutdown_tx.send(true);
     let summary = match run.await {
         Ok(summary) => summary,
@@ -358,37 +567,177 @@ async fn dead_backend_probe_closes_session() {
         "probe failure sealed the FSM"
     );
     assert_eq!(summary.final_state, SessionState::Closed);
-    let recorded = match effects.lock() {
-        Ok(effects) => effects.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
+    let recorded = locked(&effects);
     assert!(recorded.contains(&SessionEffect::ReleaseBackend));
 }
 
-/// A lost control channel defensively tears the session down, and FSM
-/// rejections are counted without changing the machine.
+/// KA-003: the probe never runs while a command is in flight. Probe ticks
+/// spanning an in-flight command do not call `backend_active`; returning
+/// to `Ready` resumes probing.
 #[tokio::test(start_paused = true)]
-async fn control_loss_and_rejections_are_accounted() {
-    let mut events = HANDSHAKE.to_vec();
-    // An illegal event at Ready: a backend auth result out of phase.
-    events.push(SessionEvent::BackendAuthOk);
+async fn probe_skips_in_flight_commands() {
+    let (event_tx, source) = ChannelSource::new();
+    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let handler = Recorder::default();
+    let probes = Arc::clone(&handler.probe_calls);
+    let config = SessionLoopConfig {
+        backend_check_interval: Duration::from_secs(1),
+        ..SessionLoopConfig::default()
+    };
+    let looped = SessionLoop::new(source, handler, control_rx, shutdown_rx, config);
+    let run = tokio::spawn(looped.run());
+    for event in HANDSHAKE {
+        let _ = event_tx.send(event).await;
+    }
+    quiesce().await;
+    // Idle at Ready: ticks probe. Quiesce after the clock advance so
+    // every due tick is fully processed before the count is read.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    quiesce().await;
+    let idle_probes = probes.load(Ordering::SeqCst);
+    assert!(idle_probes >= 2, "idle probes ticked: {idle_probes}");
+
+    // In-flight command: ticks continue but must not probe.
+    let _ = event_tx.send(SessionEvent::ClientCommand).await;
+    quiesce().await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        idle_probes,
+        "no probe while a command is in flight"
+    );
+
+    // Response completes; probing resumes.
+    let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
+    quiesce().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        probes.load(Ordering::SeqCst) > idle_probes,
+        "probing resumes at the boundary"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let summary = match run.await {
+        Ok(summary) => summary,
+        Err(join_error) => unreachable!("loop panicked: {join_error}"),
+    };
+    assert_eq!(summary.end, SessionEnd::ServerShutdown);
+}
+
+/// Control-v1 last-good semantics: the per-session control channel
+/// closing does **not** tear down the session. Traffic continues to full
+/// command completion afterwards; only transport exhaustion ends it, and
+/// the detachment is reported. FSM rejections are counted without
+/// changing the machine.
+#[tokio::test(start_paused = true)]
+async fn control_detach_keeps_session_serving() {
+    let (event_tx, source) = ChannelSource::new();
     let (control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let handler = Recorder::default();
+    let effects = handler.effects();
     let looped = SessionLoop::new(
-        FakeSource::parking(&events),
-        Recorder::default(),
+        source,
+        handler,
         control_rx,
         shutdown_rx,
         SessionLoopConfig::default(),
     );
     let run = tokio::spawn(looped.run());
-    // Let the scripted events (including the rejection) be absorbed first.
-    tokio::time::sleep(Duration::from_millis(1)).await;
+    for event in HANDSHAKE {
+        let _ = event_tx.send(event).await;
+    }
+    // An illegal event at Ready: a backend auth result out of phase.
+    let _ = event_tx.send(SessionEvent::BackendAuthOk).await;
+    quiesce().await;
+
+    // The control plane detaches mid-session.
     drop(control_tx);
+    quiesce().await;
+    assert!(!run.is_finished(), "control loss must not end the session");
+
+    // The session still serves a complete command afterwards.
+    let _ = event_tx.send(SessionEvent::ClientCommand).await;
+    let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
+    quiesce().await;
+    let recorded = locked(&effects);
+    assert_eq!(count(&recorded, SessionEffect::ForwardCommandToBackend), 1);
+    assert_eq!(count(&recorded, SessionEffect::ForwardResponseToClient), 1);
+
+    // Only the transport ends it.
+    drop(event_tx);
     let summary = match run.await {
         Ok(summary) => summary,
         Err(join_error) => unreachable!("loop panicked: {join_error}"),
     };
-    assert_eq!(summary.end, SessionEnd::ControlChannelLost);
+    assert_eq!(summary.end, SessionEnd::TransportExhausted);
     assert_eq!(summary.final_state, SessionState::Closed);
+    assert!(summary.control_detached, "detachment reported");
     assert_eq!(summary.rejected_events, 1);
+}
+
+/// The pump owns classifier polling: a source that awaits twice per event
+/// (partial state across the await) survives heavy select-arm noise —
+/// every event arrives exactly once, in order, with no torn halves.
+#[tokio::test(start_paused = true)]
+async fn multi_await_classifier_survives_select_noise() {
+    const COMMANDS: u64 = 10;
+    let (half_tx, halves) = mpsc::channel::<SessionEvent>(4);
+    let completed = Arc::new(AtomicU64::new(0));
+    let source = MultiAwaitSource {
+        halves,
+        completed: Arc::clone(&completed),
+    };
+    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let handler = Recorder::default();
+    let effects = handler.effects();
+    let looped = SessionLoop::new(
+        source,
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    );
+    let run = tokio::spawn(looped.run());
+
+    let mut script: Vec<SessionEvent> = HANDSHAKE.to_vec();
+    for _ in 0..COMMANDS {
+        script.push(SessionEvent::ClientCommand);
+        script.push(SessionEvent::BackendResponseTxnDone);
+    }
+    for event in script {
+        // First half, then select-arm noise (a watch write that keeps the
+        // shutdown arm winning races without shutting down), then the
+        // second half. Under the old in-select polling this interleaving
+        // cancels the classifier future between the halves.
+        let _ = half_tx.send(event).await;
+        let _ = shutdown_tx.send(false);
+        tokio::task::yield_now().await;
+        let _ = shutdown_tx.send(false);
+        let _ = half_tx.send(event).await;
+        let _ = shutdown_tx.send(false);
+        quiesce().await;
+    }
+    let expected = 4 + COMMANDS * 2;
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        expected,
+        "every classified event completed exactly once"
+    );
+    let recorded = locked(&effects);
+    assert_eq!(
+        count(&recorded, SessionEffect::ForwardCommandToBackend),
+        usize::try_from(COMMANDS).unwrap_or(usize::MAX),
+    );
+    assert_eq!(
+        count(&recorded, SessionEffect::ForwardResponseToClient),
+        usize::try_from(COMMANDS).unwrap_or(usize::MAX),
+    );
+
+    let _ = shutdown_tx.send(true);
+    let summary = match run.await {
+        Ok(summary) => summary,
+        Err(join_error) => unreachable!("loop panicked: {join_error}"),
+    };
+    assert_eq!(summary.end, SessionEnd::ServerShutdown);
+    assert_eq!(summary.rejected_events, 0, "no torn or duplicated events");
 }

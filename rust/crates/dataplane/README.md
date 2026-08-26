@@ -60,26 +60,45 @@ cargo clippy --locked --manifest-path rust/Cargo.toml \
 ## Session event loop (`session`, DPL-01)
 
 `SessionLoop` is the single owner of one session's mutable state: the
-SES-00 FSM, the armed one-shot deadline (handshake until authentication,
-drain when `BeginDrainTimer` fires), the backend-active probe cadence
-(Go `checkBackendActive`), and the child-operation `JoinSet`. There is no
-session mutex: the `SessionEventSource` (SES-layer classification; the
-loop never sees packet bytes) and the `EffectHandler` (which may spawn
-**tracked** children but cannot own session state) borrow `&mut` for one
-call at a time.
+SES-00 FSM, the armed one-shot deadline (handshake until the
+authenticating transition itself disarms it, drain when
+`BeginDrainTimer` fires), the backend-active probe cadence (Go
+`checkBackendActive`, gated to idle-safe states — `Ready`/`Draining` —
+per KA-003 so it never races command I/O), and the child-operation
+`JoinSet`. There is no session mutex: the `EffectHandler` (which may
+spawn **tracked** children but cannot own session state) borrows `&mut`
+for one call at a time, and the `SessionEventSource` (SES-layer
+classification; the loop never sees packet bytes) is moved into a
+dedicated **pump task** that polls each `next_event` future to
+completion and submits events over a one-slot bounded channel — the
+loop selects on the channel's cancel-safe `recv`, so classifier futures
+holding partial read state are never dropped by a lost select race.
 
-Biased select order: server shutdown, control commands, the armed
-deadline, the probe, finished children, transport events. When the FSM
-enters `Closing` the loop itself drains children under the cleanup
-deadline and seals the machine with `TeardownComplete`. Every exit path
-(client/backend/control EOF, server shutdown, control-channel loss,
-normal close) drives the FSM's teardown effects exactly once and
-reports deadline-bounded cleanup accounting in `SessionSummary`.
+Biased select order: server shutdown (with the current value checked
+first, so a shutdown that predates the loop is never missed), control
+commands, the armed deadline, the probe, finished children, pumped
+transport events. Control-channel closure follows control-protocol v1
+last-good semantics: it never tears down an established session — the
+arm is disabled, traffic continues, and the detachment is reported in
+`SessionSummary`. When the FSM enters `Closing` the loop itself drains
+children and seals the machine with `TeardownComplete`. Cleanup drains
+before it aborts: children get the full `cleanup_deadline` to finish
+normally (teardown effects complete exactly once), and only those that
+outlive it are aborted and joined under a second bound. Every exit path
+(client/backend EOF, server shutdown, normal close) drives the FSM's
+teardown effects exactly once.
 
 `tests/session_loop.rs` runs under Tokio's paused-time deterministic
-scheduler: scripted lifecycle with exact effect order, stuck-child
-release within the cleanup deadline, an explicit enumeration of all six
-redirect × graceful-close × shutdown arrival orders (no deadlock), the
-handshake deadline firing only before authentication, dead-probe
-teardown, and control-loss/rejection accounting. The no-detached-task
-property is structural: handlers only ever receive `&mut JoinSet`.
+scheduler: scripted lifecycle with exact effect order; stuck children
+aborted only after the drain window while a slow teardown child runs to
+observable completion; all six redirect × transport command boundary ×
+shutdown arrival orders with quiesced hand-offs plus one
+all-arms-ready race (exactly-once teardown asserted in each); the
+handshake deadline firing pre-auth but an authenticated fully idle
+session (probe disabled, no events) surviving far past it; a
+pre-existing shutdown observed at start; probe ticks skipping in-flight
+commands and resuming at the boundary; control detachment with the
+session still serving complete commands afterwards; and a multi-await
+classifier under select-arm noise delivering every event exactly once.
+The no-detached-task property is structural: handlers only ever receive
+`&mut JoinSet`, and the pump task is owned and stopped by the loop.
