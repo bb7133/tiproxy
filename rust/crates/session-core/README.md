@@ -188,6 +188,32 @@ and LOCAL INFILE. Unit tests pin the contextual marker matrix, typed malformed
 terminal rejection, and one million streamed rows with constant observer size
 and zero retained payload bytes.
 
+## Restricted internal client (`internal_client`, SES-08)
+
+Only proxy-generated migration queries use the full text-result parser. The
+type-level allowlist has exactly three members: `SHOW SESSION_STATES`, escaped
+`SET SESSION_STATES`, and the held-request `COMMIT`. There is no raw-SQL
+constructor. The parser consumes complete logical payloads and bounds aggregate
+result bytes, rows, columns, column names, and individual cells. It supports
+classic EOF and `CLIENT_DEPRECATE_EOF`, extracts `Session_states` and the
+required nonempty `Session_token` by exact column name, and rejects duplicate or
+missing columns, NULL/invalid UTF-8 values, LOCAL INFILE, multiple results,
+malformed metadata/rows, and oversized responses. Backend ERR text is parsed
+but never retained or exposed through `Debug`.
+
+The module dependency graph preserves the hot-path boundary:
+
+```text
+ordinary user response ──> response::ResponseObserver ──> 23-byte prefix codecs
+internal allowlisted SQL ─> internal_client             ──> full bounded payload
+```
+
+`response` neither imports nor calls `internal_client`; its existing
+million-row test proves constant observer size and zero retained payload bytes.
+The `migration-session-state` Go corpus trace is consumed only by the SES-08
+test, which pins `PARITY-RSP-007`/`PARITY-MIG-002` without changing ordinary
+forwarding.
+
 ## Prepared statements (`prepared`, SES-05)
 
 `PreparedRegistry` owns independent state by backend statement ID. A completed
