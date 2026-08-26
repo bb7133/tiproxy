@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SES-07 differential/integration model: the safety authority driven by
-//! the real SES-04 observer statuses and SES-05 registry, and the held
-//! `BEGIN` composed with the SES-00 FSM across a full migration.
+//! SES-07 integration model: the FSM as the **single** safety authority,
+//! driven by real SES-04 observer statuses and the SES-05 registry, and
+//! the held `BEGIN` composed across full SES-00 migrations with exact
+//! effect assertions (an internal `COMMIT` never forwards to the client).
 
 use std::num::NonZeroU64;
 
 use mysql_wire::{CapabilityFlags, CommandPacket, StatusFlags};
-use session_core::boundary::{
-    HeldBegin, HeldBeginPhase, HoldEffect, SessionSafety, need_hold_request,
-};
+use session_core::boundary::{HeldBegin, HeldBeginPhase, HoldEffect, need_hold_request};
 use session_core::command::{Command, PreparedMutation, dispatch};
-use session_core::fsm::{SessionEvent, SessionFsm, SessionState};
+use session_core::fsm::{SessionEffect, SessionEvent, SessionFsm, SessionState};
 use session_core::prepared::{PrepareMetadata, PreparedRegistry};
 use session_core::response::{ResponseObserver, ResponsePacket};
 
@@ -63,54 +62,82 @@ fn authenticated_fsm() -> SessionFsm {
     fsm
 }
 
-/// Migration never occurs during a transaction, multi-result, LOCAL INFILE,
-/// cursor, or long-data state: the authority is driven by real observer
-/// statuses and registry guards through each blocking condition.
-#[test]
-fn authority_blocks_every_unsafe_state() -> Result<(), Box<dyn std::error::Error>> {
-    let mut safety = SessionSafety::new();
-    let mut registry = PreparedRegistry::new();
-    assert!(safety.is_safe_boundary());
+fn apply(fsm: &mut SessionFsm, event: SessionEvent) -> Vec<SessionEffect> {
+    match fsm.on_event(event) {
+        Ok(effects) => effects,
+        Err(error) => unreachable!("{event:?} failed: {error}"),
+    }
+}
 
-    // 1. Open transaction via a real OK status from the observer.
+/// Migration never starts during a transaction, an unknown state, a
+/// multi-result window, LOCAL INFILE, a cursor, or long data — proven by
+/// issuing `ControlRedirect` in each condition and asserting no
+/// `StartRedirectHandshake` is produced by the single FSM authority.
+#[test]
+fn redirect_never_starts_in_any_unsafe_state() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Open transaction (real observer status drives the FSM event).
+    let mut fsm = authenticated_fsm();
     let query = [Command::Query.as_byte(), b'B'];
     let plan = dispatch(CommandPacket::decode(&query)?)?;
     let mut observer = ResponseObserver::new(plan.response, caps(), false, flush_threshold())?;
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
     let effect = observer.observe_backend(ResponsePacket::from_payload(&ok_packet(
         StatusFlags::IN_TRANS,
     ))?)?;
-    let Some(status) = effect.status else {
-        unreachable!("OK carries a status")
-    };
-    safety.observe_status(status.contains(StatusFlags::IN_TRANS));
-    assert!(!safety.is_safe_boundary(), "transaction blocks migration");
+    let _ = apply(&mut fsm, effect.session_event());
+    assert!(!fsm.is_safe_boundary());
+    let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
+    assert!(
+        !effects.contains(&SessionEffect::StartRedirectHandshake),
+        "in-transaction redirect must queue"
+    );
+    assert_eq!(fsm.state(), SessionState::Ready);
 
-    // 2. Multi-result: the command has not completed, so the runtime never
-    //    consults the authority mid-stream; the status that ends the first
-    //    result still says MORE_RESULTS and the txn state persists.
-    let mut observer = ResponseObserver::new(
-        dispatch(CommandPacket::decode(&query)?)?.response,
-        caps(),
-        true,
-        flush_threshold(),
-    )?;
+    // 2. Unknown state after a disruption: still no migration, even at an
+    //    otherwise idle boundary.
+    let mut fsm = authenticated_fsm();
+    let _ = apply(&mut fsm, SessionEvent::BackendStateUnknown);
+    assert!(!fsm.is_safe_boundary());
+    let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
+    assert!(
+        !effects.contains(&SessionEffect::StartRedirectHandshake),
+        "unknown-state redirect must queue"
+    );
+    // An authoritative status then releases the queued redirect.
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let effects = apply(&mut fsm, SessionEvent::BackendResponseTxnDone);
+    assert!(
+        effects.contains(&SessionEffect::StartRedirectHandshake),
+        "authoritative status releases the queued redirect"
+    );
+
+    // 3. MORE_RESULTS window: the observer stays incomplete, the FSM stays
+    //    in Response, and a redirect only queues.
+    let mut fsm = authenticated_fsm();
+    let plan = dispatch(CommandPacket::decode(&query)?)?;
+    let mut observer = ResponseObserver::new(plan.response, caps(), false, flush_threshold())?;
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
     let effect = observer.observe_backend(ResponsePacket::from_payload(&ok_packet(
-        StatusFlags::IN_TRANS.union(StatusFlags::MORE_RESULTS_EXISTS),
+        StatusFlags::MORE_RESULTS_EXISTS,
     ))?)?;
     assert!(!observer.is_complete(), "MORE_RESULTS is not a completion");
-    let Some(status) = effect.status else {
-        unreachable!("OK carries a status")
-    };
-    safety.observe_status(status.contains(StatusFlags::IN_TRANS));
-    assert!(!safety.is_safe_boundary());
+    let _ = apply(&mut fsm, effect.session_event());
+    assert_eq!(fsm.state(), SessionState::Response);
+    let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
+    assert!(!effects.contains(&SessionEffect::StartRedirectHandshake));
 
-    // 3. LOCAL INFILE in flight: no completion, no authority consult; a
-    //    disruption (client abort) must leave the state unsafe.
-    safety.observe_disruption();
-    assert!(!safety.is_safe_boundary(), "unknown after abort is unsafe");
-    safety.observe_status(false);
+    // 4. LOCAL INFILE in flight.
+    let mut fsm = authenticated_fsm();
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let _ = apply(&mut fsm, SessionEvent::BackendLocalInfileRequest);
+    let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
+    assert!(!effects.contains(&SessionEffect::StartRedirectHandshake));
+    assert_eq!(fsm.state(), SessionState::LocalInfile);
 
-    // 4. Cursor open via the registry (real execute status path).
+    // 5. Cursor / long data through the real registry feed the same
+    //    authority via PreparedStatePending.
+    let mut fsm = authenticated_fsm();
+    let mut registry = PreparedRegistry::new();
     registry.register(PrepareMetadata {
         statement_id: 7,
         parameter_count: 0,
@@ -128,90 +155,128 @@ fn authority_blocks_every_unsafe_state() -> Result<(), Box<dyn std::error::Error
         StatusFlags::CURSOR_EXISTS,
     ))?)?;
     registry.observe_response(Command::StmtExecute, 7, effect);
-    safety.set_prepared_pending(registry.has_pending());
-    assert!(!safety.is_safe_boundary(), "open cursor blocks migration");
-
-    // 5. Long data pending blocks too; clearing everything restores safety.
-    registry.apply_mutation(PreparedMutation::LongData(9));
-    safety.set_prepared_pending(registry.has_pending());
-    assert!(!safety.is_safe_boundary(), "long data blocks migration");
+    let _ = apply(&mut fsm, registry.session_event());
+    assert!(!fsm.is_safe_boundary(), "open cursor blocks");
+    let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
+    assert!(!effects.contains(&SessionEffect::StartRedirectHandshake));
     registry.apply_mutation(PreparedMutation::ClearAll);
-    safety.set_prepared_pending(registry.has_pending());
-    assert!(safety.is_safe_boundary(), "cleared state is safe again");
+    let _ = apply(&mut fsm, registry.session_event());
+    // The queued redirect fires only once the guard clears and the next
+    // command completes.
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let effects = apply(&mut fsm, SessionEvent::BackendResponseTxnDone);
+    assert!(effects.contains(&SessionEffect::StartRedirectHandshake));
     Ok(())
 }
 
-/// The full held-BEGIN walk across the SES-00 FSM: a pending redirect inside
-/// a transaction, `BEGIN` arrives, the internal COMMIT closes the
-/// transaction, migration fires at the boundary, and the held request is
-/// replayed exactly once on the new backend.
+/// Graceful close honors the same single authority: under Unknown it
+/// drains rather than closing immediately, and only an authoritative
+/// status closes it.
 #[test]
-fn held_begin_walk_across_migration() {
+fn drain_waits_for_unknown_state() {
     let mut fsm = authenticated_fsm();
-    // Open a transaction, then queue a redirect (it must wait).
+    let _ = apply(&mut fsm, SessionEvent::BackendStateUnknown);
+    let effects = apply(&mut fsm, SessionEvent::ControlGracefulClose);
+    assert!(
+        !effects.contains(&SessionEffect::CloseClient),
+        "unknown state must not close immediately"
+    );
+    assert_eq!(fsm.state(), SessionState::Draining);
+    // The next command's authoritative done-status reaches the boundary
+    // and the drain completes.
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let effects = apply(&mut fsm, SessionEvent::BackendResponseTxnDone);
+    assert!(effects.contains(&SessionEffect::CloseClient));
+    assert_eq!(fsm.state(), SessionState::Closing);
+}
+
+/// The full held-BEGIN walk with exact effect assertions: the internal
+/// COMMIT's OK produces **no client forwarding**, the boundary fires the
+/// queued redirect, and the held request replays exactly once.
+#[test]
+fn held_begin_success_never_forwards_internal_commit() {
+    let mut fsm = authenticated_fsm();
     for event in [
         SessionEvent::ClientCommand,
         SessionEvent::BackendResponseTxnOpen,
         SessionEvent::ControlRedirect,
     ] {
-        match fsm.on_event(event) {
-            Ok(_) => {}
-            Err(error) => unreachable!("setup failed: {error}"),
-        }
+        let _ = apply(&mut fsm, event);
     }
     assert_eq!(fsm.state(), SessionState::Ready);
     assert!(fsm.flags().redirect_pending);
+    assert!(!fsm.is_safe_boundary());
 
-    let mut safety = SessionSafety::new();
-    safety.observe_status(true);
-    assert!(!safety.is_safe_boundary());
-
-    // The client sends BEGIN: the hold decision fires.
+    // BEGIN arrives; the hold decision fires; the runtime substitutes the
+    // internal COMMIT for the held request.
     assert!(need_hold_request(Command::Query, b"BEGIN", true, false));
     let (mut hold, effect) = HeldBegin::start();
     assert_eq!(effect, HoldEffect::SendInternalCommit);
+    let effects = apply(&mut fsm, SessionEvent::ClientCommand);
+    assert_eq!(effects, vec![SessionEffect::ForwardCommandToBackend]);
 
-    // The FSM still enters Command for the in-flight (internal) exchange;
-    // the runtime substitutes the COMMIT for the held BEGIN.
-    match fsm.on_event(SessionEvent::ClientCommand) {
-        Ok(_) => assert_eq!(fsm.state(), SessionState::Command),
-        Err(error) => unreachable!("command failed: {error}"),
-    }
-
-    // The internal COMMIT succeeds: transaction closed, boundary safe.
+    // Internal COMMIT OK: the boundary logic runs with NO forwarding —
+    // the redirect starts and nothing reaches the client.
     match hold.on_commit_ok() {
         Ok(()) => {}
-        Err(error) => unreachable!("commit ok failed: {error}"),
+        Err(error) => unreachable!("commit ok: {error}"),
     }
-    safety.observe_status(false);
-    assert!(safety.is_safe_boundary());
+    let effects = apply(&mut fsm, SessionEvent::InternalResponseTxnDone);
+    assert_eq!(
+        effects,
+        vec![SessionEffect::StartRedirectHandshake],
+        "internal COMMIT OK must not forward to the client"
+    );
+    assert_eq!(fsm.state(), SessionState::RedirectPending);
+    assert!(fsm.is_safe_boundary());
 
-    // The commit's TxnDone boundary lets the queued redirect fire.
-    match fsm.on_event(SessionEvent::BackendResponseTxnDone) {
-        Ok(_) => assert_eq!(fsm.state(), SessionState::RedirectPending),
-        Err(error) => unreachable!("boundary failed: {error}"),
-    }
-    match fsm.on_event(SessionEvent::RedirectBackendReady) {
-        Ok(_) => assert_eq!(fsm.state(), SessionState::Ready),
-        Err(error) => unreachable!("migration failed: {error}"),
-    }
-
-    // The held BEGIN replays exactly once on the new backend.
+    // Migration succeeds; the held BEGIN replays exactly once.
+    let _ = apply(&mut fsm, SessionEvent::RedirectBackendReady);
     assert_eq!(hold.take_for_replay(), Ok(HoldEffect::ReplayHeldRequest));
-    match fsm.on_event(SessionEvent::ClientCommand) {
-        Ok(_) => assert_eq!(fsm.state(), SessionState::Command),
-        Err(error) => unreachable!("replay failed: {error}"),
-    }
+    let effects = apply(&mut fsm, SessionEvent::ClientCommand);
+    assert_eq!(effects, vec![SessionEffect::ForwardCommandToBackend]);
     assert_eq!(hold.phase(), HeldBeginPhase::Replayed);
     assert!(hold.take_for_replay().is_err(), "never duplicated");
 }
 
-/// A failed migration still replays the held BEGIN on the old backend
-/// (Go executes it regardless of the redirect result), and a graceful
-/// close instead drops it.
+/// The internal COMMIT error path: the runtime forwards the error exactly
+/// once via the hold effect, and the FSM leaves `Command` with the
+/// retained open-transaction state and no duplicate forwarding.
+#[test]
+fn held_begin_commit_error_forwards_exactly_once() {
+    let mut fsm = authenticated_fsm();
+    for event in [
+        SessionEvent::ClientCommand,
+        SessionEvent::BackendResponseTxnOpen,
+        SessionEvent::ControlRedirect,
+        SessionEvent::ClientCommand, // the held BEGIN's internal cycle
+    ] {
+        let _ = apply(&mut fsm, event);
+    }
+    let (mut hold, _) = HeldBegin::start();
+    // COMMIT fails: the hold machine owns the single client forward.
+    assert_eq!(
+        hold.on_commit_error(),
+        Ok(HoldEffect::ForwardCommitErrorToClient)
+    );
+    // The FSM exits Command through the internal path with NO forwarding
+    // effect (Go handleErrorPacket keeps serverStatus: still in txn).
+    let effects = apply(&mut fsm, SessionEvent::InternalResponseTxnOpen);
+    assert_eq!(effects, Vec::new(), "no duplicate forwarding");
+    assert_eq!(fsm.state(), SessionState::Ready);
+    assert!(fsm.flags().in_txn, "commit failed: txn retained");
+    assert!(fsm.flags().redirect_pending, "redirect stays queued");
+    assert!(!fsm.is_safe_boundary());
+    assert!(
+        hold.take_for_replay().is_err(),
+        "aborted hold never replays"
+    );
+}
+
+/// A failed migration still replays the held BEGIN on the old backend,
+/// and a graceful close instead drops it.
 #[test]
 fn held_begin_failure_and_close_paths() {
-    // Failed migration: replay happens on the retained backend.
     let (mut hold, _) = HeldBegin::start();
     match hold.on_commit_ok() {
         Ok(()) => {}
@@ -222,15 +287,11 @@ fn held_begin_failure_and_close_paths() {
         SessionEvent::ControlRedirect,
         SessionEvent::RedirectBackendFailed,
     ] {
-        match fsm.on_event(event) {
-            Ok(_) => {}
-            Err(error) => unreachable!("setup failed: {error}"),
-        }
+        let _ = apply(&mut fsm, event);
     }
     assert_eq!(fsm.state(), SessionState::Ready);
     assert_eq!(hold.take_for_replay(), Ok(HoldEffect::ReplayHeldRequest));
 
-    // Graceful close before replay: the held request is dropped.
     let (mut hold, _) = HeldBegin::start();
     match hold.on_commit_ok() {
         Ok(()) => {}

@@ -17,30 +17,34 @@
 //! (`cmd_processor_exec.go`), the held-request execution in
 //! `backend_conn_mgr.go`, and the keyword lexer in `pkg/util/lex`.
 //!
-//! Three pieces:
+//! Two pieces live here; the safety **authority itself lives in the FSM**:
 //!
-//! 1. [`SessionSafety`] — the single `is_safe_boundary` decision. Go:
-//!    `finishedTxn` is false while `StatusInTrans` or `StatusQuit` is set or
-//!    any prepared statement has pending long-data/cursor state. The Rust
-//!    authority adds one hardening dimension: transaction knowledge is a
-//!    tri-state, and a disruption (cancel, unclassifiable failure) makes it
-//!    [`TxnKnowledge::Unknown`], which is **never** safe until an
-//!    authoritative backend status refreshes it. A `MySQL` ERR keeps the
-//!    previous known state (Go `handleErrorPacket` never touches
-//!    `serverStatus`) — errors that still updated status mid-multi-statement
-//!    are already reflected because every applied status went through
-//!    [`SessionSafety::observe_status`].
+//! 1. The single `is_safe_boundary` decision is
+//!    [`crate::fsm::SessionFsm::is_safe_boundary`] — Go `finishedTxn`
+//!    (no open transaction, no pending prepared guard) plus the SES-07
+//!    hardening flag set by [`crate::fsm::SessionEvent::BackendStateUnknown`]
+//!    after a disruption: unknown backend state is **never** safe until an
+//!    authoritative response status clears it. There is deliberately no
+//!    second safety predicate anywhere: phase gating (command in flight,
+//!    `MORE_RESULTS`, LOCAL INFILE, change-user, migration, closing) is the
+//!    machine's own state structure, and every redirect/drain decision the
+//!    machine makes flows through that one predicate. A `MySQL` ERR keeps
+//!    the previous known state (Go `handleErrorPacket` never touches
+//!    `serverStatus`).
 //! 2. [`need_hold_request`] — the exact Go predicate: only a `COM_QUERY`
 //!    that lexes as `BEGIN`/`START TRANSACTION`, only inside a transaction,
 //!    and only with no pending prepared state. The SQL text is borrowed
 //!    transiently; nothing here retains or logs query bytes.
 //! 3. [`HeldBegin`] — the hold lifecycle: the proxy sends an **internal**
-//!    `COMMIT` (never forwarded to the client), reaches the safe boundary,
-//!    lets redirect/drain fire, and then replays the held `BEGIN` exactly
-//!    once — or provably never: a `COMMIT` error forwards that error to the
-//!    client as the answer to its `BEGIN` (Go's `IsMySQLError` path), and a
-//!    graceful close drops the held request (Go executes it only while
-//!    `closeStatus < statusNotifyClose`).
+//!    `COMMIT` whose completion enters the FSM as
+//!    [`crate::fsm::SessionEvent::InternalResponseTxnDone`]/`TxnOpen`, so
+//!    the boundary logic runs **without any client forwarding** (an
+//!    internal `COMMIT`'s OK never leaks); on a commit `MySQL` error the
+//!    runtime forwards that error to the client exactly once via
+//!    [`HoldEffect::ForwardCommitErrorToClient`] as the answer to the
+//!    `BEGIN` (Go's `IsMySQLError` path). The held request replays exactly
+//!    once after redirect resolves, or provably never (commit error /
+//!    graceful-close drop, Go `closeStatus < statusNotifyClose`).
 //!
 //! The lexer is a byte-faithful port of Go `pkg/util/lex` `Lexer.NextToken`:
 //! uppercased `[a-z]`, kept `[A-Z_]`, single/double quotes with backslash
@@ -170,93 +174,6 @@ pub fn need_hold_request(
     is_start_txn(data)
 }
 
-/// What the session knows about the backend transaction state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TxnKnowledge {
-    /// The last applied backend status said whether a transaction is open.
-    Known {
-        /// `SERVER_STATUS_IN_TRANS` from that status.
-        in_transaction: bool,
-    },
-    /// A disruption (cancel, abort, unclassifiable failure) invalidated the
-    /// knowledge. Never a safe boundary until refreshed.
-    Unknown,
-}
-
-/// The single authoritative redirect/drain boundary decision
-/// (Go `finishedTxn` plus the unknown-state hardening).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionSafety {
-    txn: TxnKnowledge,
-    quit: bool,
-    prepared_pending: bool,
-}
-
-impl Default for SessionSafety {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SessionSafety {
-    /// A fresh session: no transaction, no quit, no prepared state.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            txn: TxnKnowledge::Known {
-                in_transaction: false,
-            },
-            quit: false,
-            prepared_pending: false,
-        }
-    }
-
-    /// Current transaction knowledge.
-    #[must_use]
-    pub const fn txn(&self) -> TxnKnowledge {
-        self.txn
-    }
-
-    /// Applies an authoritative backend status (every OK/EOF the observers
-    /// apply, including mid-multi-statement statuses before an error).
-    pub const fn observe_status(&mut self, in_transaction: bool) {
-        self.txn = TxnKnowledge::Known { in_transaction };
-    }
-
-    /// Marks a disruption: the backend state can no longer be inferred.
-    /// A `MySQL` ERR is **not** a disruption (Go keeps `serverStatus`);
-    /// use this for cancellation, upload aborts, and unclassified failures.
-    pub const fn observe_disruption(&mut self) {
-        self.txn = TxnKnowledge::Unknown;
-    }
-
-    /// Marks `COM_QUIT` (Go `StatusQuit`): the session never reaches a safe
-    /// boundary again.
-    pub const fn mark_quit(&mut self) {
-        self.quit = true;
-    }
-
-    /// Mirrors the SES-05 registry's pending long-data/cursor guard.
-    pub const fn set_prepared_pending(&mut self, pending: bool) {
-        self.prepared_pending = pending;
-    }
-
-    /// The one authoritative decision: redirect and graceful close may
-    /// proceed only when this returns true. Callers ask only at command
-    /// completion — a `MORE_RESULTS` continuation or an in-flight
-    /// LOCAL INFILE/change-user is not a completion.
-    #[must_use]
-    pub const fn is_safe_boundary(&self) -> bool {
-        matches!(
-            self.txn,
-            TxnKnowledge::Known {
-                in_transaction: false
-            }
-        ) && !self.quit
-            && !self.prepared_pending
-    }
-}
-
 /// Lifecycle phase of one held `BEGIN`/`START TRANSACTION`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeldBeginPhase {
@@ -335,8 +252,9 @@ impl HeldBegin {
     }
 
     /// The internal commit succeeded: the transaction is closed and the
-    /// request is held for replay. The caller applies the commit's status
-    /// to [`SessionSafety`] (which makes the boundary safe).
+    /// request is held for replay. The caller feeds
+    /// [`crate::fsm::SessionEvent::InternalResponseTxnDone`] into the FSM,
+    /// which makes the boundary safe without forwarding anything.
     ///
     /// # Errors
     ///
@@ -459,37 +377,68 @@ mod tests {
         assert!(!need_hold_request(Command::Query, b"SELECT 1", true, false));
     }
 
-    /// The authority matrix: only known-out-of-txn, no-quit, no-prepared is
-    /// safe; ERR keeps knowledge; disruption is never safe until refreshed.
+    /// The FSM is the single authority: unknown state, prepared guards,
+    /// and open transactions all block, and only an authoritative status
+    /// restores safety. (Full redirect/drain gating is integration-tested
+    /// in `tests/boundary_model.rs`.)
     #[test]
-    fn safety_matrix_matches_finished_txn_plus_unknown_hardening() {
-        let mut safety = SessionSafety::new();
-        assert!(safety.is_safe_boundary(), "fresh session is at a boundary");
+    fn fsm_authority_matrix() {
+        use crate::fsm::{SessionEvent, SessionFsm};
+        let mut fsm = SessionFsm::new();
+        for event in [
+            SessionEvent::ConnectionAccepted,
+            SessionEvent::ClientHandshakeResponse,
+            SessionEvent::BackendGreetingReceived,
+            SessionEvent::BackendAuthOk,
+        ] {
+            match fsm.on_event(event) {
+                Ok(_) => {}
+                Err(error) => unreachable!("setup failed: {error}"),
+            }
+        }
+        assert!(fsm.is_safe_boundary(), "fresh authenticated session");
 
-        safety.observe_status(true);
-        assert!(!safety.is_safe_boundary(), "open transaction blocks");
-        // A MySQL ERR is not a disruption: the caller simply does not call
-        // observe_status (Go keeps serverStatus), so the state persists.
-        assert!(!safety.is_safe_boundary());
-        safety.observe_status(false);
-        assert!(safety.is_safe_boundary());
+        // Open transaction blocks; an authoritative done-status restores.
+        for (event, safe) in [
+            (SessionEvent::ClientCommand, true),
+            (SessionEvent::BackendResponseTxnOpen, false),
+            (SessionEvent::ClientCommand, false),
+            (SessionEvent::BackendResponseTxnDone, true),
+        ] {
+            match fsm.on_event(event) {
+                Ok(_) => assert_eq!(fsm.is_safe_boundary(), safe, "{event:?}"),
+                Err(error) => unreachable!("{event:?}: {error}"),
+            }
+        }
 
-        safety.set_prepared_pending(true);
-        assert!(!safety.is_safe_boundary(), "prepared guard blocks");
-        safety.set_prepared_pending(false);
-        assert!(safety.is_safe_boundary());
+        // Disruption: unknown is never safe until a status clears it.
+        match fsm.on_event(SessionEvent::BackendStateUnknown) {
+            Ok(effects) => assert!(effects.is_empty()),
+            Err(error) => unreachable!("unknown: {error}"),
+        }
+        assert!(!fsm.is_safe_boundary(), "unknown state is never safe");
+        for event in [
+            SessionEvent::ClientCommand,
+            SessionEvent::BackendResponseTxnDone,
+        ] {
+            match fsm.on_event(event) {
+                Ok(_) => {}
+                Err(error) => unreachable!("{event:?}: {error}"),
+            }
+        }
+        assert!(fsm.is_safe_boundary(), "authoritative status restores");
 
-        safety.observe_disruption();
-        assert!(!safety.is_safe_boundary(), "unknown state is never safe");
-        assert_eq!(safety.txn(), TxnKnowledge::Unknown);
-        // Only an authoritative status refresh restores safety.
-        safety.observe_status(false);
-        assert!(safety.is_safe_boundary());
-
-        safety.mark_quit();
-        assert!(!safety.is_safe_boundary(), "quit never returns to safety");
-        safety.observe_status(false);
-        assert!(!safety.is_safe_boundary());
+        // Prepared guards block through the same predicate.
+        match fsm.on_event(SessionEvent::PreparedStatePending) {
+            Ok(_) => {}
+            Err(error) => unreachable!("pending: {error}"),
+        }
+        assert!(!fsm.is_safe_boundary(), "prepared guard blocks");
+        match fsm.on_event(SessionEvent::PreparedStateClear) {
+            Ok(_) => {}
+            Err(error) => unreachable!("clear: {error}"),
+        }
+        assert!(fsm.is_safe_boundary());
     }
 
     /// The held BEGIN is neither lost nor duplicated: exactly-once replay,

@@ -263,17 +263,19 @@ Direction-reversing flows frozen from Go `forwardLoadInFile` /
 The single authoritative redirect/drain decision plus MIG-005, frozen
 from Go `finishedTxn`/`needHoldRequest` and `pkg/util/lex`:
 
-- `SessionSafety::is_safe_boundary()` = known-out-of-transaction ∧ no
-  quit ∧ no prepared long-data/cursor guard (Go `finishedTxn` incl.
-  `StatusQuit`). Hardening beyond Go: transaction knowledge is
-  tri-state — a disruption (cancel/abort/unclassified failure) makes it
-  `Unknown`, which is **never** safe until an authoritative status
-  refreshes it. A `MySQL` ERR is not a disruption (Go keeps
-  `serverStatus`); statuses applied mid-multi-statement before an error
-  are reflected because every applied status flows through
-  `observe_status`. Callers consult the authority only at command
-  completion (`MORE_RESULTS`, LOCAL INFILE, change-user in flight are
-  not completions).
+- **The authority lives in the FSM**: `SessionFsm::is_safe_boundary()`
+  = no open transaction ∧ no prepared guard ∧ no unknown state (Go
+  `finishedTxn`; quit/phase gating is the machine's own structure —
+  redirect/drain queue in every in-flight state and fire only through
+  this one predicate at completion points). The SES-07 hardening flag
+  is set by the `BackendStateUnknown` event after a disruption and
+  cleared only by an authoritative response status; a `MySQL` ERR is
+  not a disruption (Go keeps `serverStatus`). There is deliberately no
+  second safety predicate anywhere. Internal commands
+  (`InternalResponseTxnDone`/`TxnOpen`) run the same boundary logic
+  **without client forwarding**, so the held `BEGIN`'s internal
+  `COMMIT` OK never leaks and its error is forwarded exactly once by
+  the hold machine.
 - `need_hold_request` is Go's predicate byte-for-byte (only an
   in-transaction `COM_QUERY` lexing as `BEGIN`/`START TRANSACTION` with
   no pending prepared state; trailing NUL stripped), on top of a
