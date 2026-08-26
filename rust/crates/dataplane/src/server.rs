@@ -573,7 +573,9 @@ fn snapshot_config(snapshot: &ValidatedSnapshot) -> Result<&ConfigSnapshot, Serv
         .ok_or(ServerError::MissingConfig)
 }
 
-fn snapshot_keepalive(policy: &SnapshotKeepalive) -> KeepalivePolicy {
+/// Converts a snapshot keepalive policy into the socket layer's.
+#[must_use]
+pub fn snapshot_keepalive(policy: &SnapshotKeepalive) -> KeepalivePolicy {
     KeepalivePolicy {
         enabled: policy.enabled,
         idle: Duration::from_millis(policy.idle_millis),

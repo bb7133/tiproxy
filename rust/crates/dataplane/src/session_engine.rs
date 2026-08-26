@@ -421,7 +421,7 @@ pub async fn run_bound_session(
         pending_command: None,
         wire_end: None,
         closing: false,
-        _seat: seat,
+        seat,
     };
 
     let session_loop = SessionLoop::new(
@@ -622,7 +622,7 @@ struct Engine {
     pending_command: Option<PendingCommand>,
     wire_end: Option<WireErrorSource>,
     closing: bool,
-    _seat: SessionSeat,
+    seat: SessionSeat,
 }
 
 /// Outcome of waiting for one specific FSM effect.
@@ -761,6 +761,24 @@ impl Engine {
             return Some(WireErrorSource::Proxy);
         };
         let backend_id = acquired.backend.backend_id.clone();
+        // Health-appropriate keepalive at dial time (KA-003 family):
+        // the snapshot's healthy/unhealthy backend policy follows the
+        // router-reported health of this assignment. Mid-session
+        // health transitions re-apply with DPL-07's topology feed.
+        {
+            let config = self.seat.snapshot().raw().config.as_ref();
+            let policy = if acquired.backend.healthy {
+                config.and_then(|config| config.healthy_backend_keepalive)
+            } else {
+                config.and_then(|config| config.unhealthy_backend_keepalive)
+            };
+            if let Some(policy) = policy {
+                let _ = proxy_io::socket::apply_keepalive(
+                    &acquired.conn,
+                    crate::server::snapshot_keepalive(&policy),
+                );
+            }
+        }
         let (backend_read, backend_write) = acquired.conn.into_split();
         let mut backend = BackendIo {
             reader: PacketReader::new(backend_read),

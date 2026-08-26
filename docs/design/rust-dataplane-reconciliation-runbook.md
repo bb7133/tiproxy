@@ -213,6 +213,28 @@ The gates are on the real message paths on both sides:
   result arrives and arms the consume-once `ForeignDrainResolved`
   retry signal.
 
+**DPL-04 session ownership and drain**: `tiproxy-rs` now runs the
+production session owner: one engine task owns all four socket halves
+of a session, the DPL-01 FSM drives it through the one-slot pump
+contract, and the CTL-06 terminal notices are produced at the real
+effect completion points under the exact gate-admitted ids carried by
+the session directives' command tokens. Coordinated local shutdown
+follows stop-accept (`DataplaneHandle::stop_accepting`; listeners
+close, sessions continue) → safe-boundary graceful drain (the owner
+injects a token-free graceful close; the loop's drain deadline is the
+per-session force) → the absolute grace deadline
+(`--drain-grace-seconds`) forces and joins everything — a session
+stalled mid-command by an unresponsive backend is hard-cancelled at
+the cleanup budget, reported force-closed with the proxy-shutdown
+source. The Go operator entry is `Bridge.StartDrain` (HTTP:
+`POST /api/dataplane/drain`, progress at
+`GET /api/dataplane/drain/:id`): one absolute deadline budget per
+drain id, idempotent re-issue under the incarnation-scoped wire
+binding, foreign-drain rejection until its terminal resolves, epoch
+re-sync replaying the active drain to a restarted lineage, and the
+issuer's send-failure semantics keeping responsibility with the next
+retry.
+
 **Scope honesty**: DPL-03 starts both composition entries behind the
 Go `rust-dataplane.enabled` gate. Go owns the bridge and monotonic
 snapshot publisher; `tiproxy-rs` owns the control runtime, first SQL
