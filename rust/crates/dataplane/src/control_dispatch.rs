@@ -146,11 +146,59 @@ pub enum ResponseKind {
     HandshakeDecision,
 }
 
+/// The exact gate-admitted command identity a control directive
+/// carries. The token enters the session channel **together with** the
+/// command — before the session can observe it — so the terminal the
+/// session later reports is bound to precisely the effect it executed:
+/// there is no shared slot to write after the send and no state to
+/// infer from, and an instantly completing session cannot outrun the
+/// binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandToken {
+    /// Which command family admitted this id.
+    pub kind: CommandKind,
+    /// The gate-admitted exact id (redirect id or close id).
+    pub id: Arc<str>,
+}
+
+/// The command family a [`CommandToken`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    /// A per-session redirect (`redirect_id`).
+    Redirect,
+    /// A per-session close (`close_id`).
+    Close,
+}
+
+/// One unit on a session's control channel: the control signal plus —
+/// for gate-admitted per-session commands — the token whose id the
+/// completion notice must return. Drain-driven closes carry no token:
+/// their terminal is the drain's own `DrainResult`, produced through
+/// the close accounting path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDirective {
+    /// The control signal for the session loop.
+    pub control: SessionControl,
+    /// The admitted command identity, when one exists.
+    pub command: Option<CommandToken>,
+}
+
+impl SessionDirective {
+    /// A drain- or shutdown-driven directive with no per-command id.
+    #[must_use]
+    pub const fn bare(control: SessionControl) -> Self {
+        Self {
+            control,
+            command: None,
+        }
+    }
+}
+
 /// One registered live session: its control channel, its correlated
 /// Go-response channel, the currently armed response expectation, and
 /// the drain-scoping metadata.
 struct SessionEntry {
-    control: mpsc::Sender<SessionControl>,
+    control: mpsc::Sender<SessionDirective>,
     responses: Option<mpsc::Sender<ControlEnvelope>>,
     /// Fail-closed correlation: only a response matching the armed
     /// `(initiating request id, body kind)` is delivered; everything
@@ -298,7 +346,7 @@ impl ControlCommandHandler {
         namespace: &str,
         snapshot_generation: u64,
         listener_name: &str,
-        control: mpsc::Sender<SessionControl>,
+        control: mpsc::Sender<SessionDirective>,
         responses: Option<mpsc::Sender<ControlEnvelope>>,
     ) {
         let connection_id = identity.connection_id;
@@ -667,7 +715,14 @@ impl ControlCommandHandler {
                     (command.connection_id, command.redirect_id.clone()),
                     request_id,
                 );
-                match self.forward(command.connection_id, SessionControl::Redirect) {
+                let directive = SessionDirective {
+                    control: SessionControl::Redirect,
+                    command: Some(CommandToken {
+                        kind: CommandKind::Redirect,
+                        id: Arc::from(command.redirect_id.as_str()),
+                    }),
+                };
+                match self.forward(command.connection_id, directive) {
                     ForwardOutcome::Sent => Vec::new(),
                     // The session vanished (or its channel is jammed)
                     // between registration and dispatch: retire the
@@ -753,12 +808,18 @@ impl ControlCommandHandler {
                     (command.connection_id, command.close_id.clone()),
                     request_id,
                 );
-                let control = if force {
-                    SessionControl::CloseImmediate
-                } else {
-                    SessionControl::GracefulClose
+                let directive = SessionDirective {
+                    control: if force {
+                        SessionControl::CloseImmediate
+                    } else {
+                        SessionControl::GracefulClose
+                    },
+                    command: Some(CommandToken {
+                        kind: CommandKind::Close,
+                        id: Arc::from(command.close_id.as_str()),
+                    }),
                 };
-                match self.forward(command.connection_id, control) {
+                match self.forward(command.connection_id, directive) {
                     ForwardOutcome::Sent => Vec::new(),
                     // Retire the accepted close with its terminal
                     // immediately so the gate never sticks in Closing.
@@ -869,7 +930,8 @@ impl ControlCommandHandler {
                     outbound.extend(self.force_close_remaining());
                 } else {
                     for id in &matched {
-                        let _ = self.forward(*id, SessionControl::GracefulClose);
+                        let _ = self
+                            .forward(*id, SessionDirective::bare(SessionControl::GracefulClose));
                     }
                 }
                 // A zero-match admission completes on arrival: its very
@@ -935,7 +997,7 @@ impl ControlCommandHandler {
             if self.force_notified.contains(&id) {
                 continue;
             }
-            match self.forward(id, SessionControl::CloseImmediate) {
+            match self.forward(id, SessionDirective::bare(SessionControl::CloseImmediate)) {
                 ForwardOutcome::Sent => {
                     self.force_notified.insert(id);
                 }
@@ -1086,9 +1148,9 @@ impl ControlCommandHandler {
         self.metering.seal()
     }
 
-    fn forward(&mut self, connection_id: u64, control: SessionControl) -> ForwardOutcome {
+    fn forward(&mut self, connection_id: u64, directive: SessionDirective) -> ForwardOutcome {
         match self.sessions.get(&connection_id) {
-            Some(entry) => match entry.control.try_send(control) {
+            Some(entry) => match entry.control.try_send(directive) {
                 Ok(()) => ForwardOutcome::Sent,
                 Err(mpsc::error::TrySendError::Full(_)) => ForwardOutcome::Full,
                 Err(mpsc::error::TrySendError::Closed(_)) => ForwardOutcome::Gone,
@@ -1195,7 +1257,7 @@ pub enum DispatchNotice {
         /// Configured listener name (drain scoping).
         listener_name: String,
         /// The session loop's control channel.
-        control: mpsc::Sender<SessionControl>,
+        control: mpsc::Sender<SessionDirective>,
         /// Correlated Go answers (route assignments, handshake
         /// decisions/results) for this session, when it routes.
         responses: Option<mpsc::Sender<ControlEnvelope>>,
@@ -1351,7 +1413,7 @@ impl ControlDispatchHandle {
         namespace: String,
         snapshot_generation: u64,
         listener_name: String,
-        control: mpsc::Sender<SessionControl>,
+        control: mpsc::Sender<SessionDirective>,
         responses: Option<mpsc::Sender<ControlEnvelope>>,
     ) -> bool {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();

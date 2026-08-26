@@ -42,6 +42,7 @@ pub use control_commands::{
     MAX_UNACKED_METERING_BATCHES, MeteringError, MeteringLedger, ReconcileRepairs,
     RedirectAdmission,
 };
+pub use control_dispatch::{CommandKind, CommandToken, SessionDirective};
 pub use control_dispatch::{ControlCommandHandler, OutboundControl};
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,

@@ -35,8 +35,8 @@ use control_proto::v1::{
     RouteAssignment,
 };
 use dataplane::control_dispatch::{
-    ControlCommandHandler, DispatchFatal, DispatchNotice, DispatchSender, InboundForwarder,
-    ResponseKind, run_control_dispatch,
+    CommandKind, CommandToken, ControlCommandHandler, DispatchFatal, DispatchNotice,
+    DispatchSender, InboundForwarder, ResponseKind, SessionDirective, run_control_dispatch,
 };
 use dataplane::session::SessionControl;
 use tokio::sync::{mpsc, watch};
@@ -81,7 +81,7 @@ fn error_code(envelope: &ControlEnvelope) -> Option<ErrorCode> {
 }
 
 struct Session {
-    control: mpsc::Receiver<SessionControl>,
+    control: mpsc::Receiver<SessionDirective>,
 }
 
 fn register(
@@ -110,7 +110,10 @@ async fn redirect_dispatch_end_to_end() {
     // Start: the session receives the control signal; nothing outbound.
     let inbound = envelope(10, 7, Body::RedirectCommand(redirect(1, "r-1", 1)));
     assert!(handler.handle_envelope(&inbound, now, 1_000).is_empty());
-    assert_eq!(session.control.try_recv(), Ok(SessionControl::Redirect));
+    assert_eq!(
+        session.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::Redirect)
+    );
 
     // The session finishes: exactly one terminal goes out, carrying the
     // initiating request id (the asynchronous answer to request 10).
@@ -177,7 +180,7 @@ async fn close_dispatch_end_to_end() {
     let inbound = envelope(20, 7, Body::CloseCommand(close.clone()));
     assert!(handler.handle_envelope(&inbound, now, 2_000).is_empty());
     assert_eq!(
-        session.control.try_recv(),
+        session.control.try_recv().map(|d| d.control),
         Ok(SessionControl::GracefulClose)
     );
 
@@ -186,7 +189,10 @@ async fn close_dispatch_end_to_end() {
     let out = handler.handle_envelope(&dup, now, 2_001);
     assert!(matches!(out[0].body, Some(Body::CloseResult(_))));
     assert_eq!(out[0].request_id, 21);
-    assert!(session.control.try_recv().is_err(), "no second close");
+    assert!(
+        session.control.try_recv().map(|d| d.control).is_err(),
+        "no second close"
+    );
 
     let Some(terminal) = handler.close_completed(1, "c-1") else {
         unreachable!("close completes once")
@@ -237,13 +243,16 @@ async fn drain_dispatch_runs_graceful_then_force() {
     };
     assert_eq!(progress.active_connections, 2, "scoped to sql-a only");
     assert_eq!(
-        a.control.try_recv(),
+        a.control.try_recv().map(|d| d.control),
         Ok(SessionControl::GracefulClose),
         "matched session asked to close at a safe point"
     );
-    assert_eq!(b.control.try_recv(), Ok(SessionControl::GracefulClose));
+    assert_eq!(
+        b.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
     assert!(
-        other.control.try_recv().is_err(),
+        other.control.try_recv().map(|d| d.control).is_err(),
         "out-of-scope listener untouched"
     );
 
@@ -257,11 +266,14 @@ async fn drain_dispatch_runs_graceful_then_force() {
     // exactly once, however many ticks land.
     let force_by = now + Duration::from_secs(20);
     assert!(handler.tick(force_by + Duration::from_millis(1)).is_empty());
-    assert_eq!(b.control.try_recv(), Ok(SessionControl::CloseImmediate));
+    assert_eq!(
+        b.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::CloseImmediate)
+    );
     let _ = handler.tick(force_by + Duration::from_millis(2));
     let _ = handler.tick(force_by + Duration::from_millis(3));
     assert!(
-        b.control.try_recv().is_err(),
+        b.control.try_recv().map(|d| d.control).is_err(),
         "repeated force ticks never duplicate CloseImmediate"
     );
 
@@ -392,7 +404,10 @@ async fn handler_survives_reconnect_and_replays_lost_terminal() {
     // Epoch N: a redirect completes but its result is lost in transit.
     let inbound = envelope(40, 7, Body::RedirectCommand(redirect(1, "r-1", 1)));
     let _ = handler.handle_envelope(&inbound, now, 4_000);
-    assert_eq!(session.control.try_recv(), Ok(SessionControl::Redirect));
+    assert_eq!(
+        session.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::Redirect)
+    );
     let Some(lost) = handler.redirect_completed(1, "r-1", true, "tidb-b", ErrorCode::Ok) else {
         unreachable!("terminal produced")
     };
@@ -472,7 +487,7 @@ async fn handle_envelope_production_path() {
     let out = handler.handle_envelope(&expired, now, now_ms);
     assert!(matches!(out[0].body, Some(Body::DrainResult(_))));
     assert_eq!(
-        session.control.try_recv(),
+        session.control.try_recv().map(|d| d.control),
         Ok(SessionControl::CloseImmediate),
         "expired force deadline skips the graceful ask entirely"
     );
@@ -667,7 +682,8 @@ async fn force_close_marks_only_on_delivery() {
     handler.register_session(identity(1), "ns-a", 7, "sql-a", tx.clone(), None);
     handler.set_backend(1, "tidb-a");
     assert!(
-        tx.try_send(SessionControl::GracefulClose).is_ok(),
+        tx.try_send(SessionDirective::bare(SessionControl::GracefulClose))
+            .is_ok(),
         "pre-fill the slot"
     );
 
@@ -685,7 +701,7 @@ async fn force_close_marks_only_on_delivery() {
     // once, but the jammed channel must NOT count as notified.
     let _ = handler.handle_envelope(&envelope(96, 7, Body::DrainCommand(command)), now, now_ms);
     assert_eq!(
-        rx.try_recv(),
+        rx.try_recv().map(|d| d.control),
         Ok(SessionControl::GracefulClose),
         "only the pre-filled message is in the slot"
     );
@@ -693,7 +709,10 @@ async fn force_close_marks_only_on_delivery() {
 
     // The slot is free now: the next tick delivers exactly once.
     assert!(handler.tick(now + Duration::from_millis(1)).is_empty());
-    assert_eq!(rx.try_recv(), Ok(SessionControl::CloseImmediate));
+    assert_eq!(
+        rx.try_recv().map(|d| d.control),
+        Ok(SessionControl::CloseImmediate)
+    );
     let _ = handler.tick(now + Duration::from_millis(2));
     assert!(rx.try_recv().is_err(), "delivered exactly once");
 }
@@ -1149,7 +1168,10 @@ async fn reconcile_snapshot_epoch_and_capability_policy() {
     let mut command = envelope(51, 7, Body::RedirectCommand(redirect(1, "r-old", 1)));
     command.control_epoch = 4;
     assert!(handler.handle_envelope(&command, now, 3).is_empty());
-    assert_eq!(session.control.try_recv(), Ok(SessionControl::Redirect));
+    assert_eq!(
+        session.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::Redirect)
+    );
 
     // Without cap 2 an inbound snapshot is unsolicited.
     let mut legacy = ControlCommandHandler::new();
@@ -1794,5 +1816,171 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
         Some(ErrorCode::StaleGeneration),
         "post-ack commands are judged against the new generation"
     );
+    harness.task.abort();
+}
+
+/// Directives carry the gate-admitted exact command identity WITH the
+/// signal — before the session can observe it — and drain-driven
+/// closes carry no token (their terminal is the drain's own result).
+#[tokio::test(start_paused = true)]
+async fn directives_carry_exact_command_tokens() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7);
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+
+    let _ = handler.handle_envelope(
+        &envelope(10, 7, Body::RedirectCommand(redirect(1, "r-tok", 1))),
+        now,
+        1_000,
+    );
+    let Ok(directive) = session.control.try_recv() else {
+        unreachable!("redirect directive delivered")
+    };
+    assert_eq!(directive.control, SessionControl::Redirect);
+    assert_eq!(
+        directive.command,
+        Some(CommandToken {
+            kind: CommandKind::Redirect,
+            id: Arc::from("r-tok"),
+        }),
+        "the exact admitted id travels with the command"
+    );
+
+    let close = CloseCommand {
+        connection_id: 1,
+        close_id: "c-tok".to_owned(),
+        error_source: 0,
+        reason: String::new(),
+        force: false,
+    };
+    let _ = handler.handle_envelope(&envelope(11, 7, Body::CloseCommand(close)), now, 1_001);
+    let Ok(directive) = session.control.try_recv() else {
+        unreachable!("close directive delivered")
+    };
+    assert_eq!(
+        directive
+            .command
+            .as_ref()
+            .map(|token| (&*token.id, token.kind)),
+        Some(("c-tok", CommandKind::Close))
+    );
+
+    // Drain-driven graceful close: no per-command token.
+    let drain = DrainCommand {
+        drain_id: "d-tok".to_owned(),
+        listener_names: Vec::new(),
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: 11_000,
+        force_deadline_unix_millis: 21_000,
+        command_sequence: 1,
+    };
+    let _ = handler.handle_envelope(&envelope(12, 7, Body::DrainCommand(drain)), now, 1_002);
+    let Ok(directive) = session.control.try_recv() else {
+        unreachable!("drain directive delivered")
+    };
+    assert_eq!(directive.control, SessionControl::GracefulClose);
+    assert_eq!(directive.command, None, "drain closes carry no token");
+}
+
+/// The pinned instant-completion regression: a session that completes
+/// the effect the moment the directive becomes visible — strictly
+/// before any dispatcher code after the channel send could run — still
+/// produces the terminal under the exact admitted id, because the id
+/// arrived WITH the command and the completion notice returns the
+/// token's own id. No post-send bookkeeping exists to race.
+#[tokio::test(start_paused = true)]
+async fn instant_completion_binds_exact_terminal_id() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+
+    // The instant session: every directive is answered with its
+    // completion notice immediately, using only the carried token.
+    let (control_tx, mut control_rx) = mpsc::channel::<SessionDirective>(8);
+    let notices = harness.notice_tx.clone();
+    let instant_session = tokio::spawn(async move {
+        while let Some(directive) = control_rx.recv().await {
+            let Some(token) = directive.command else {
+                continue;
+            };
+            let notice = match token.kind {
+                CommandKind::Redirect => DispatchNotice::RedirectFinished {
+                    connection_id: 1,
+                    redirect_id: token.id.to_string(),
+                    succeeded: true,
+                    backend_id: "tidb-b".to_owned(),
+                    code: ErrorCode::Ok,
+                },
+                CommandKind::Close => DispatchNotice::CloseFinished {
+                    connection_id: 1,
+                    close_id: token.id.to_string(),
+                },
+            };
+            let _ = notices.send(notice).await;
+        }
+    });
+
+    let (register_ack_tx, register_ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::RegisterSession {
+            identity: identity(1),
+            namespace: "ns-a".to_owned(),
+            snapshot_generation: 7,
+            listener_name: "sql-a".to_owned(),
+            control: control_tx,
+            responses: None,
+            applied: register_ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = register_ack_rx.await else {
+        unreachable!("registration applied")
+    };
+
+    // Redirect admitted under request 40: the instant terminal must
+    // carry redirect id "r-fast" AND answer request 40.
+    harness
+        .inbound_tx
+        .send(envelope(
+            40,
+            7,
+            Body::RedirectCommand(redirect(1, "r-fast", 1)),
+        ))
+        .await
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    let Some(Body::RedirectResult(result)) = &sent[0].body else {
+        unreachable!("instant completion produced the redirect terminal")
+    };
+    assert_eq!(result.redirect_id, "r-fast", "exact admitted id");
+    assert!(result.succeeded);
+    assert_eq!(
+        sent[0].request_id, 40,
+        "the terminal answers the initiating request"
+    );
+
+    // Close admitted under request 41: same exactness.
+    let close = CloseCommand {
+        connection_id: 1,
+        close_id: "c-fast".to_owned(),
+        error_source: 0,
+        reason: String::new(),
+        force: false,
+    };
+    harness
+        .inbound_tx
+        .send(envelope(41, 7, Body::CloseCommand(close)))
+        .await
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    let Some(Body::CloseResult(result)) = &sent[1].body else {
+        unreachable!("instant completion produced the close terminal")
+    };
+    assert_eq!(result.close_id, "c-fast");
+    assert_eq!(sent[1].request_id, 41);
+
+    instant_session.abort();
     harness.task.abort();
 }

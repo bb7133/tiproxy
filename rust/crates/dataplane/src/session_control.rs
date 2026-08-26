@@ -27,9 +27,10 @@ use std::sync::{Arc, OnceLock};
 use control_proto::v1::{ConnectionIdentity, ControlEnvelope};
 use tokio::sync::{mpsc, watch};
 
-use crate::control_dispatch::{ControlDispatchHandle, ExpectResponseError, ResponseKind};
+use crate::control_dispatch::{
+    ControlDispatchHandle, ExpectResponseError, ResponseKind, SessionDirective,
+};
 use crate::server::{AcceptedConnection, ConnectionFuture, ConnectionHandler};
-use crate::session::SessionControl;
 
 const SESSION_CONTROL_CAPACITY: usize = 8;
 const SESSION_RESPONSE_CAPACITY: usize = 1;
@@ -38,7 +39,7 @@ const SESSION_RESPONSE_CAPACITY: usize = 1;
 pub struct SessionControlBinding {
     dispatch: ControlDispatchHandle,
     connection_id: u64,
-    control: mpsc::Receiver<SessionControl>,
+    control: mpsc::Receiver<SessionDirective>,
     responses: mpsc::Receiver<ControlEnvelope>,
 }
 
@@ -109,9 +110,13 @@ impl SessionControlBinding {
             .await
     }
 
-    /// Receives the next redirect/close command for the single-owner session
-    /// loop. `None` means the dispatcher detached.
-    pub async fn recv_control(&mut self) -> Option<SessionControl> {
+    /// Receives the next control directive for the single-owner session
+    /// loop: the signal plus — for gate-admitted per-session commands —
+    /// the exact [`CommandToken`](crate::control_dispatch::CommandToken)
+    /// whose id the completion notice must return. `None` means the
+    /// dispatcher detached (control-v1 last-good: never a teardown
+    /// reason by itself).
+    pub async fn recv_control(&mut self) -> Option<SessionDirective> {
         self.control.recv().await
     }
 
