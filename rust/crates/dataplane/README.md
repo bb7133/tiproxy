@@ -49,6 +49,15 @@ This implements the Rust targets behind `PARITY-ADM-001`, `PARITY-ADM-002`,
 `PARITY-KA-001`, the new-session subset of `PARITY-CFG-001`, and the
 capture/replay preflight in `PARITY-EXCL-001`.
 
+DPL-03 composes this server with CTL-05 in `runtime_config`: the first valid
+snapshot binds all SQL listeners before it is acknowledged, later snapshots
+atomically replace the complete generation for new admissions, and any bind,
+validation, or restart-required listener rejection preserves the last-good
+generation. `session_control` registers each admitted connection with CTL-06
+before handing it to an injected session owner, and exposes typed
+`SetBackend`/`ExpectResponse` plumbing. Terminal close/redirect effects and
+metering production remain owned by DPL-04 and DPL-06 respectively.
+
 From the repository root:
 
 ```sh

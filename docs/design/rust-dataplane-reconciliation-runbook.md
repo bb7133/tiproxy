@@ -213,13 +213,16 @@ The gates are on the real message paths on both sides:
   result arrives and arms the consume-once `ForeignDrainResolved`
   retry signal.
 
-**Scope honesty**: the application `main`s do not start these
-composition entries yet — `tiproxy-rs` is still a version-only stub
-and the Go proxy bootstrap has no dataplane branch. That wiring, and
-live listener sessions feeding the runtime, land with the DPL-03/05
-integrations (tracked as acceptance checklist items on those issues);
-issue #16's end-to-end lost Assigned/Closed and restart acceptance
-stays **open** until then.
+**Scope honesty**: DPL-03 starts both composition entries behind the
+Go `rust-dataplane.enabled` gate. Go owns the bridge and monotonic
+snapshot publisher; `tiproxy-rs` owns the control runtime, first SQL
+listener bind, atomic serving-generation updates, and the typed
+`RegisterSession` / `SetBackend` / `ExpectResponse` session seam. The
+concrete session effects that emit `SessionClosed`, `RedirectFinished`,
+and `CloseFinished` land in DPL-04, metering producers in DPL-06, and
+namespace/topology projection in DPL-07. Issue #16's end-to-end lost
+Assigned/Closed and restart acceptance therefore stays **open** until
+those dependent integrations land.
 
 **Lineage is the control epoch, not the config generation**: a Rust
 restart can keep the same snapshot generation, so closed-connection
@@ -286,10 +289,9 @@ after a reconnect rotation does not transfer the obligation into the
 dead lineage — and no rotation-plus-reconcile can land between a
 separate compare and delete, because there is no window between them.
 The orphan is retained and the next cadence re-sends on the live
-sender. `AttachRouterLookup`/`ResolveOrphans` are seams:
-the composition wiring (namespace manager, maintenance cadence) lands
-with the DPL-03/05 integrations, and the no-leak property holds *given
-that cadence* — it is not claimed for an unwired binary. A reused
+sender. `AttachRouterLookup`/`ResolveOrphans` are wired by DPL-03 to the
+namespace manager and the bridge's managed maintenance cadence; the
+no-leak property holds while that cadence is running. A reused
 connection id arriving under a new generation/identity retires the
 stale incarnation's accounting exactly once before the rebuild.
 

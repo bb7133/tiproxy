@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex as StdMutex, RwLock};
 
 use rustls::client::danger::HandshakeSignatureValid;
 pub use rustls::pki_types::UnixTime;
@@ -79,7 +79,8 @@ impl SnapshotError {
         }
     }
 
-    fn unsupported(detail: impl Into<String>) -> Self {
+    /// A valid setting that the Rust dataplane cannot apply.
+    pub fn unsupported(detail: impl Into<String>) -> Self {
         Self {
             kind: SnapshotErrorKind::Unsupported,
             detail: detail.into(),
@@ -264,8 +265,8 @@ impl ValidatedSnapshot {
 /// store while it is held — so a downstream success between the phases
 /// can never be invalidated by a racing commit.
 #[derive(Debug)]
-pub struct Staged<'store> {
-    _writer: StdMutexGuard<'store, ()>,
+pub struct Staged {
+    writer: WriterGuard,
     state: StagedState,
 }
 
@@ -279,7 +280,7 @@ enum StagedState {
     Validated(Arc<ValidatedSnapshot>),
 }
 
-impl Staged<'_> {
+impl Staged {
     /// The staged snapshot's validated view.
     #[must_use]
     pub fn snapshot(&self) -> &Arc<ValidatedSnapshot> {
@@ -292,6 +293,51 @@ impl Staged<'_> {
     #[must_use]
     pub const fn is_changed(&self) -> bool {
         matches!(self.state, StagedState::Validated(_))
+    }
+}
+
+/// An owned reservation used instead of `std::sync::MutexGuard`: the
+/// staged token crosses the serving consumer's async boundary, while a
+/// standard mutex guard is not `Send`.
+#[derive(Debug, Default)]
+struct WriterReservation {
+    held: StdMutex<bool>,
+    available: Condvar,
+}
+
+impl WriterReservation {
+    fn acquire(self: &Arc<Self>) -> Result<WriterGuard, SnapshotError> {
+        let mut held = self
+            .held
+            .lock()
+            .map_err(|_| SnapshotError::internal("snapshot writer reservation poisoned"))?;
+        while *held {
+            held = self
+                .available
+                .wait(held)
+                .map_err(|_| SnapshotError::internal("snapshot writer reservation poisoned"))?;
+        }
+        *held = true;
+        Ok(WriterGuard {
+            reservation: Arc::clone(self),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct WriterGuard {
+    reservation: Arc<WriterReservation>,
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        let mut held = self
+            .reservation
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *held = false;
+        self.reservation.available.notify_one();
     }
 }
 
@@ -329,7 +375,7 @@ pub struct SnapshotStore {
     /// the committed state between `stage` and `commit`. A downstream
     /// consumer success can therefore never be followed by a
     /// stale/conflict commit failure.
-    writer: StdMutex<()>,
+    writer: Arc<WriterReservation>,
 }
 
 impl SnapshotStore {
@@ -364,7 +410,7 @@ impl SnapshotStore {
         Ok(Self {
             allowed_tls_roots: roots,
             current: RwLock::new(None),
-            writer: StdMutex::new(()),
+            writer: Arc::new(WriterReservation::default()),
         })
     }
 
@@ -417,11 +463,8 @@ impl SnapshotStore {
         generation: u64,
         snapshot: StateSnapshot,
         now: UnixTime,
-    ) -> Result<Staged<'_>, SnapshotError> {
-        let writer = self
-            .writer
-            .lock()
-            .map_err(|_| SnapshotError::internal("snapshot writer reservation poisoned"))?;
+    ) -> Result<Staged, SnapshotError> {
+        let writer = self.writer.acquire()?;
         if generation == 0 {
             return Err(SnapshotError::invalid(
                 "snapshot generation must be nonzero",
@@ -445,7 +488,7 @@ impl SnapshotStore {
                         // two-phase apply (downstream included)
                         // succeeded when it was committed.
                         return Ok(Staged {
-                            _writer: writer,
+                            writer,
                             state: StagedState::Unchanged(Arc::clone(current)),
                         });
                     }
@@ -457,7 +500,7 @@ impl SnapshotStore {
         }
         let candidate = Arc::new(self.validate(generation, snapshot, now)?);
         Ok(Staged {
-            _writer: writer,
+            writer,
             state: StagedState::Validated(candidate),
         })
     }
@@ -470,8 +513,16 @@ impl SnapshotStore {
     /// # Errors
     ///
     /// Returns an internal error when the store lock is poisoned.
-    pub fn commit(&self, staged: Staged<'_>) -> Result<ApplyOutcome, SnapshotError> {
-        let Staged { _writer, state } = staged;
+    pub fn commit(&self, staged: Staged) -> Result<ApplyOutcome, SnapshotError> {
+        if !Arc::ptr_eq(&self.writer, &staged.writer.reservation) {
+            return Err(SnapshotError::internal(
+                "staged snapshot belongs to another store",
+            ));
+        }
+        let Staged {
+            writer: _writer,
+            state,
+        } = staged;
         let candidate = match state {
             StagedState::Unchanged(current) => {
                 return Ok(ApplyOutcome {

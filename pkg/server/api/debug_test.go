@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/pingcap/tiproxy/pkg/controlbridge"
 	"github.com/stretchr/testify/require"
 )
 
@@ -92,6 +93,24 @@ func TestDebugHealthManualOverride(t *testing.T) {
 		require.Equal(t, http.StatusOK, r.StatusCode)
 	})
 	assertHealth(http.StatusBadGateway, "server is not ready")
+}
+
+func TestDebugHealthWaitsForRustDataplaneApply(t *testing.T) {
+	server, doHTTP := createServer(t)
+	server.mgr.DataplaneStatus = staticDataplaneStatus{}
+	doHTTP(t, http.MethodGet, "/api/debug/health", httpOpts{}, func(t *testing.T, r *http.Response) {
+		require.Equal(t, http.StatusBadGateway, r.StatusCode)
+		var health map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&health))
+		require.Equal(t, "Rust dataplane has no applied configuration", health["unhealthy_reason"])
+	})
+
+	server.mgr.DataplaneStatus = staticDataplaneStatus{status: controlbridge.SnapshotStatus{
+		AppliedGeneration: 1,
+	}}
+	doHTTP(t, http.MethodGet, "/api/debug/health", httpOpts{}, func(t *testing.T, r *http.Response) {
+		require.Equal(t, http.StatusOK, r.StatusCode)
+	})
 }
 
 func TestDebugHealthAllowsHTTPWithHTTPTLS(t *testing.T) {

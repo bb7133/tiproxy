@@ -33,6 +33,9 @@ func (h *Server) DebugHealth(c *gin.Context) {
 	} else if !h.mgr.NsMgr.Ready() {
 		status = http.StatusBadGateway
 		health.UnhealthyReason = "server is not ready"
+	} else if h.mgr.DataplaneStatus != nil && h.mgr.DataplaneStatus.Status().AppliedGeneration == 0 {
+		status = http.StatusBadGateway
+		health.UnhealthyReason = "Rust dataplane has no applied configuration"
 	}
 	c.JSON(status, health)
 }

@@ -200,8 +200,12 @@ func (session *Session) heartbeatLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			requestID, err := session.AllocateRequestID()
+			if err != nil {
+				return err
+			}
 			heartbeat := &controlpb.ControlEnvelope{
-				RequestId: session.nextID.Add(1),
+				RequestId: requestID,
 				Priority:  controlpb.Priority_PRIORITY_CRITICAL,
 				Body: &controlpb.ControlEnvelope_Heartbeat{Heartbeat: &controlpb.Heartbeat{
 					MonotonicMillis: uint64(time.Since(processStartedAt).Milliseconds()),
@@ -215,3 +219,24 @@ func (session *Session) heartbeatLoop(ctx context.Context) error {
 }
 
 var processStartedAt = time.Now()
+
+// ErrRequestIDExhausted fails closed when an epoch's request-id lineage
+// reaches uint64 max. Wrapping would let a live control epoch reuse an
+// application request id and break response correlation.
+var ErrRequestIDExhausted = errors.New("control request id space is exhausted")
+
+// AllocateRequestID returns the next request id from this session's single
+// checked allocator. Heartbeats and every application-originated envelope use
+// this same lineage; responses continue to reuse the initiating request id.
+func (session *Session) AllocateRequestID() (uint64, error) {
+	for {
+		current := session.nextID.Load()
+		if current == ^uint64(0) {
+			return 0, ErrRequestIDExhausted
+		}
+		next := current + 1
+		if session.nextID.CompareAndSwap(current, next) {
+			return next, nil
+		}
+	}
+}

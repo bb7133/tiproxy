@@ -16,6 +16,7 @@
 //! transport, dispatch, and snapshot tasks, and shutdown propagates
 //! through the whole chain to a clean join.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -66,8 +67,9 @@ async fn runtime_shutdown_cascades_to_clean_join() {
     let Ok(store) = SnapshotStore::new(Vec::new()) else {
         unreachable!("empty allowlist store constructs")
     };
-    let Ok(runtime) = spawn_control_runtime(runtime_config(socket), store, |_snapshot: &_| Ok(()))
-    else {
+    let Ok(runtime) = spawn_control_runtime(runtime_config(socket), store, |_snapshot: &_| {
+        std::future::ready(Ok(()))
+    }) else {
         unreachable!("valid configuration spawns")
     };
     let handle = runtime.handle();
@@ -137,12 +139,12 @@ impl dataplane::control_runtime::SnapshotConsumer for CountingConsumer {
     fn apply(
         &mut self,
         _snapshot: &Arc<control_proto::snapshot::ValidatedSnapshot>,
-    ) -> Result<(), SnapshotError> {
+    ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if call <= self.reject_first {
-            return Err(SnapshotError::invalid("serving side rejected"));
+            return std::future::ready(Err(SnapshotError::invalid("serving side rejected")));
         }
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
@@ -163,7 +165,7 @@ async fn consumer_rejection_never_advances_the_store() {
 
     // First delivery: the consumer rejects generation 1.
     let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(10, 1), test_now());
+        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(10, 1), test_now()).await;
     assert_eq!(applied, None, "no applied generation on rejection");
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("the owner answers a snapshot result")
@@ -189,7 +191,7 @@ async fn consumer_rejection_never_advances_the_store() {
     // Replay of the SAME generation: the consumer runs again — no
     // false acknowledgement off an advanced store — and now succeeds.
     let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(11, 1), test_now());
+        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(11, 1), test_now()).await;
     assert_eq!(applied, Some(1), "committed after consumer success");
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("result body")
@@ -205,7 +207,7 @@ async fn consumer_rejection_never_advances_the_store() {
     // Post-commit replay: committed implies the consumer succeeded —
     // answered OK without re-running it.
     let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(12, 1), test_now());
+        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(12, 1), test_now()).await;
     assert_eq!(applied, Some(1));
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("result body")
@@ -253,6 +255,49 @@ async fn staged_token_serializes_concurrent_writers() {
         unreachable!("store readable")
     };
     assert_eq!(current.generation(), 2, "the racer applied strictly after");
+}
+
+/// Abandoning the downstream phase releases the owned reservation without
+/// committing the candidate, so a waiting synchronous writer can continue.
+#[tokio::test]
+async fn dropped_staged_token_releases_concurrent_writer() {
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let store = Arc::new(store);
+    let Ok(staged) = store.stage(1, valid_snapshot(), test_now()) else {
+        unreachable!("generation 1 stages")
+    };
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(0);
+    let racer = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let applied = store.apply(2, valid_snapshot(), test_now()).is_ok();
+            let _ = finished_tx.send(applied);
+        })
+    };
+    let Ok(()) = started_rx.recv() else {
+        unreachable!("racer started")
+    };
+    assert_eq!(
+        finished_rx.recv_timeout(Duration::from_millis(20)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "the writer waits while the staged token is alive"
+    );
+
+    drop(staged);
+    let Ok(true) = finished_rx.recv() else {
+        unreachable!("the writer proceeds after the token is dropped")
+    };
+    let Ok(()) = racer.join() else {
+        unreachable!("writer thread joined")
+    };
+    let Ok(Some(current)) = store.current() else {
+        unreachable!("store readable")
+    };
+    assert_eq!(current.generation(), 2);
 }
 
 fn supervised_client() -> Arc<ControlClient> {
@@ -596,6 +641,10 @@ async fn snapshot_owner_shutdown_boundary() {
     let Ok(SnapshotStep::CleanExit) = step else {
         unreachable!("requested shutdown normalizes to a clean exit: {step:?}")
     };
+    let Some((generation, _)) = client.last_good_snapshot_age() else {
+        unreachable!("committed snapshot updates transport diagnostics")
+    };
+    assert_eq!(generation, 1);
     dispatch.abort();
 
     // Fatal side: dispatch died unexpectedly (no shutdown), the

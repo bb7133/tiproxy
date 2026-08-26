@@ -102,10 +102,10 @@ fi
 
 if [[ $mode == rust ]]; then
 	cat >"$run_dir/rust-launch-blocker.log" <<'EOF'
-Rust capabilities were reported, but FND-04 does not yet have a truthful Go
-control-bridge launch contract. Refusing to substitute the Go proxy or a raw
-TCP relay. Add that wiring only with the real control bridge and Rust runtime
-implemented by #10-#15 and #34-#37.
+Rust capabilities were reported, but DPL-03 intentionally does not claim a
+truthful SELECT-1 topology yet: DPL-04 must install the concrete session owner
+and DPL-07 must project namespace/backend topology. Refusing to substitute the
+Go proxy or a raw TCP relay for either missing owner.
 EOF
 	cat "$run_dir/rust-launch-blocker.log" >&2
 	exit 78

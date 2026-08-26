@@ -117,6 +117,28 @@ func TestProxyConfig(t *testing.T) {
 	require.Equal(t, data1, data2)
 }
 
+func TestRustDataplaneConfigGateAndClone(t *testing.T) {
+	cfg := NewConfig()
+	require.Equal(t, int64(-1), cfg.RustDataplane.AllowedUID)
+	cfg.RustDataplane.TLSAllowedRoots = []string{"/tls-a"}
+	cloned := cfg.Clone()
+	cloned.RustDataplane.TLSAllowedRoots[0] = "/tls-b"
+	require.Equal(t, []string{"/tls-a"}, cfg.RustDataplane.TLSAllowedRoots)
+
+	cfg.RustDataplane.Enabled = true
+	require.ErrorContains(t, cfg.Check(), "enable-traffic-replay must be false")
+	cfg.EnableTrafficReplay = false
+	cfg.RustDataplane.ControlSocket = "relative.sock"
+	require.ErrorContains(t, cfg.Check(), "control-socket must be absolute")
+	cfg.RustDataplane.ControlSocket = filepath.Join(t.TempDir(), "control.sock")
+	require.NoError(t, cfg.Check())
+
+	cfg.RustDataplane.AllowedUID = -2
+	require.ErrorContains(t, cfg.Check(), "allowed-uid")
+	cfg.RustDataplane.AllowedUID = int64(^uint32(0)) + 1
+	require.ErrorContains(t, cfg.Check(), "allowed-uid")
+}
+
 func TestProxyConfigCOS(t *testing.T) {
 	data := []byte(`
 [metering]

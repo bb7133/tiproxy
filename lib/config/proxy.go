@@ -37,6 +37,17 @@ type Config struct {
 	HA                  HA                    `yaml:"ha,omitempty" toml:"ha,omitempty" json:"ha,omitempty"`
 	Metering            config.MeteringConfig `yaml:"metering,omitempty" toml:"metering,omitempty" json:"metering,omitempty" reloadable:"false"`
 	EnableTrafficReplay bool                  `yaml:"enable-traffic-replay,omitempty" toml:"enable-traffic-replay,omitempty" json:"enable-traffic-replay,omitempty" reloadable:"true"`
+	RustDataplane       RustDataplane         `yaml:"rust-dataplane,omitempty" toml:"rust-dataplane,omitempty" json:"rust-dataplane,omitempty" reloadable:"false"`
+}
+
+// RustDataplane gates the out-of-process Rust SQL listener and its local
+// control channel. Every field is restart-required; dynamic SQL policy is
+// delivered through StateSnapshot instead.
+type RustDataplane struct {
+	Enabled         bool     `yaml:"enabled,omitempty" toml:"enabled,omitempty" json:"enabled,omitempty" reloadable:"false"`
+	ControlSocket   string   `yaml:"control-socket,omitempty" toml:"control-socket,omitempty" json:"control-socket,omitempty" reloadable:"false"`
+	AllowedUID      int64    `yaml:"allowed-uid,omitempty" toml:"allowed-uid,omitempty" json:"allowed-uid,omitempty" reloadable:"false"`
+	TLSAllowedRoots []string `yaml:"tls-allowed-roots,omitempty" toml:"tls-allowed-roots,omitempty" json:"tls-allowed-roots,omitempty" reloadable:"false"`
 }
 
 type KeepAlive struct {
@@ -181,6 +192,7 @@ func NewConfig() *Config {
 	cfg.HA.GARPRefreshCount = 30
 
 	cfg.EnableTrafficReplay = true
+	cfg.RustDataplane.AllowedUID = -1
 
 	return &cfg
 }
@@ -191,6 +203,7 @@ func (cfg *Config) Clone() *Config {
 	newCfg.Proxy.PublicEndpoints = slices.Clone(cfg.Proxy.PublicEndpoints)
 	newCfg.Proxy.BackendClusters = slices.Clone(cfg.Proxy.BackendClusters)
 	newCfg.Proxy.FailBackendList = slices.Clone(cfg.Proxy.FailBackendList)
+	newCfg.RustDataplane.TLSAllowedRoots = slices.Clone(cfg.RustDataplane.TLSAllowedRoots)
 	for i := range newCfg.Proxy.BackendClusters {
 		newCfg.Proxy.BackendClusters[i].NSServers = slices.Clone(newCfg.Proxy.BackendClusters[i].NSServers)
 	}
@@ -231,6 +244,16 @@ func (cfg *Config) Check() error {
 	}
 	if cfg.HA.GARPRefreshCount < 0 {
 		return errors.Wrapf(ErrInvalidConfigValue, "ha.garp-refresh-count must be greater than or equal to 0")
+	}
+	if cfg.RustDataplane.AllowedUID < -1 || cfg.RustDataplane.AllowedUID > int64(^uint32(0)) {
+		return errors.Wrapf(ErrInvalidConfigValue, "rust-dataplane.allowed-uid must be -1 or a uint32")
+	}
+	if cfg.RustDataplane.ControlSocket != "" && !filepath.IsAbs(cfg.RustDataplane.ControlSocket) {
+		return errors.Wrapf(ErrInvalidConfigValue, "rust-dataplane.control-socket must be absolute")
+	}
+	if cfg.RustDataplane.Enabled && cfg.EnableTrafficReplay {
+		return errors.Wrapf(ErrInvalidConfigValue,
+			"enable-traffic-replay must be false when rust-dataplane.enabled is true")
 	}
 
 	return nil
