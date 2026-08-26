@@ -42,13 +42,15 @@
 //! until the control plane re-attaches through a new channel. Only the
 //! transport, the client, or the server shutdown signal end the session.
 //!
-//! Cleanup is deadline-bounded on every exit path (client/backend EOF,
-//! cancel, error, or normal close) and **drains before it aborts**:
-//! children get [`SessionLoopConfig::cleanup_deadline`] to finish
-//! normally — teardown effects spawned into the set complete exactly once
-//! — and only children still running after the deadline are aborted (and
-//! then awaited under the same bound again). The pump task is aborted at
-//! exit, and the transport drops with it. Go parity notes: the handshake
+//! Cleanup on every exit path (client/backend EOF, cancel, error, or
+//! normal close) runs under **one absolute budget**:
+//! [`SessionLoopConfig::cleanup_deadline`] covers the whole terminal
+//! sequence. The pump is stopped and joined **first** — the source (and
+//! the transport it owns) releases before any teardown child is waited
+//! on — then children get the remaining budget to finish normally
+//! (teardown effects spawned into the set complete exactly once), and
+//! only children still running at the deadline are aborted and joined
+//! within the same absolute bound. Go parity notes: the handshake
 //! deadline mirrors the frontend auth timeout and disarms on the
 //! transition into an authenticated state; the periodic backend-active
 //! check mirrors `checkBackendActive` and runs only in idle-safe states
@@ -61,7 +63,7 @@ use std::time::Duration;
 use session_core::fsm::{SessionEffect, SessionEvent, SessionFsm, SessionState, TransitionError};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 /// Control-plane commands delivered to one session's loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,8 +131,10 @@ pub struct SessionLoopConfig {
     /// Interval for the backend-active probe once authenticated. Zero
     /// disables the probe.
     pub backend_check_interval: Duration,
-    /// Per-phase upper bound at exit: first for letting children finish
-    /// normally, then (only if some remain) for joining aborted children.
+    /// Absolute budget for the whole terminal cleanup: stopping the pump
+    /// (releasing the source/transport), letting children finish
+    /// normally, and joining any aborted stragglers all share this one
+    /// window.
     pub cleanup_deadline: Duration,
 }
 
@@ -266,14 +270,31 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
             unreachable!("session source taken twice")
         };
         let pump: JoinHandle<()> = tokio::spawn(async move {
-            while let Some(event) = source.next_event().await {
-                if event_tx.send(event).await.is_err() {
+            loop {
+                // Reserve the slot **before** touching the transport: the
+                // classifier reads at most one event ahead of the loop,
+                // so transport backpressure is real (an unconsumed event
+                // never triggers speculative classification of the next).
+                let Ok(permit) = event_tx.reserve().await else {
                     break;
+                };
+                match source.next_event().await {
+                    Some(event) => permit.send(event),
+                    None => break,
                 }
             }
         });
 
         let end = self.event_loop(&mut events).await;
+        // One absolute budget for the whole terminal sequence.
+        let cleanup_by = Instant::now() + self.config.cleanup_deadline;
+        // Stop the pump first: the source — and the transport it owns —
+        // must release before any teardown child is waited on, so
+        // teardown work that needs the transport's file descriptors or
+        // locks cannot deadlock against the pump.
+        drop(events);
+        pump.abort();
+        self.cleanup_within_deadline &= timeout_at(cleanup_by, pump).await.is_ok();
         // Terminal accounting: reach Closed through the FSM when possible so
         // teardown effects execute exactly once.
         let end = match end {
@@ -288,9 +309,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 SessionEnd::TransportExhausted
             }
         };
-        let cleanup = self.cleanup().await;
-        pump.abort();
-        let _ = pump.await;
+        let cleanup = self.cleanup_within(cleanup_by).await;
         SessionSummary {
             end,
             final_state: self.fsm.state(),
@@ -313,10 +332,11 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 return LoopEnd::FsmClosed;
             }
             if self.fsm.state() == SessionState::Closing {
-                // The loop is the runtime: teardown effects have executed,
-                // so let their children drain (aborting only past the
-                // deadline) and seal the FSM.
-                let _ = self.cleanup().await;
+                // The loop is the runtime: teardown effects have executed
+                // and their children are tracked, so seal the FSM now;
+                // the children drain in the terminal cleanup, under the
+                // single absolute budget, after the pump releases the
+                // transport.
                 self.apply(SessionEvent::TeardownComplete, &mut armed_deadline)
                     .await;
                 continue;
@@ -447,19 +467,27 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         }
     }
 
-    /// Drains children: first a normal-completion window of
-    /// `cleanup_deadline` — teardown work spawned by `Close*` effects runs
-    /// to completion here — then, only for children that outlived it,
-    /// abort plus a second bounded join.
-    async fn cleanup(&mut self) -> CleanupReport {
-        let drained = timeout(self.config.cleanup_deadline, async {
+    /// Drains children against the terminal cleanup's **absolute**
+    /// deadline: a normal-completion window first — teardown work spawned
+    /// by `Close*` effects runs to completion here — then, only for
+    /// children that outlived it, abort plus a join. A tenth of the
+    /// budget is reserved for that abort join so a stuck child cannot
+    /// starve it; both phases share the same absolute deadline, keeping
+    /// the whole sequence at one `cleanup_deadline`. Anything beyond the
+    /// bound is reported and force-aborted when the set drops.
+    async fn cleanup_within(&mut self, deadline: Instant) -> CleanupReport {
+        let abort_grace = self.config.cleanup_deadline / 10;
+        let drain_by = deadline
+            .checked_sub(abort_grace)
+            .unwrap_or_else(Instant::now);
+        let drained = timeout_at(drain_by, async {
             while self.children.join_next().await.is_some() {}
         })
         .await;
         let aborted_children = self.children.len();
         if drained.is_err() && aborted_children > 0 {
             self.children.abort_all();
-            let joined = timeout(self.config.cleanup_deadline, async {
+            let joined = timeout_at(deadline, async {
                 while self.children.join_next().await.is_some() {}
             })
             .await;

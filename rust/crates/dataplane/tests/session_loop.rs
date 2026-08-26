@@ -16,8 +16,10 @@
 //! recording effect handler, under Tokio's paused-time deterministic
 //! scheduler. Critical interleavings (redirect × command boundary ×
 //! shutdown) are enumerated explicitly with quiesced hand-offs, plus one
-//! all-arms-ready race; the pump architecture is exercised with a
-//! multi-await classifier under select-arm noise.
+//! all-arms-ready race (with a handler gate proving all arms were
+//! loaded); the pump architecture is exercised with a multi-await
+//! classifier under select-arm noise, a read-ahead bound proof, and a
+//! terminal-cleanup budget/ordering proof.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -105,6 +107,56 @@ impl SessionEventSource for MultiAwaitSource {
     }
 }
 
+/// Counts completed transport reads: the counter increments only after
+/// an event is fully consumed from the inner channel, so it measures how
+/// far ahead of the loop the classifier has actually read.
+struct CountingSource {
+    rx: mpsc::Receiver<SessionEvent>,
+    completed_reads: Arc<AtomicU64>,
+}
+
+impl CountingSource {
+    fn new() -> (mpsc::Sender<SessionEvent>, Arc<AtomicU64>, Self) {
+        let (tx, rx) = mpsc::channel(32);
+        let completed_reads = Arc::new(AtomicU64::new(0));
+        (
+            tx,
+            Arc::clone(&completed_reads),
+            Self {
+                rx,
+                completed_reads,
+            },
+        )
+    }
+}
+
+impl SessionEventSource for CountingSource {
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        let event = self.rx.recv().await?;
+        self.completed_reads.fetch_add(1, Ordering::SeqCst);
+        Some(event)
+    }
+}
+
+/// Flags its own drop: the source stands in for the transport, so the
+/// flag marks the instant the transport's resources release.
+struct DropFlagSource {
+    inner: FakeSource,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for DropFlagSource {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl SessionEventSource for DropFlagSource {
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        self.inner.next_event().await
+    }
+}
+
 /// Records effects; optionally spawns children per effect and answers
 /// backend probes from a script while counting probe calls.
 #[derive(Default)]
@@ -117,6 +169,10 @@ struct Recorder {
     spawn_slow_teardown_child: Option<(Duration, Arc<AtomicBool>)>,
     backend_alive: Arc<Mutex<VecDeque<bool>>>,
     probe_calls: Arc<AtomicU64>,
+    /// When set, the first `ForwardCommandToBackend` blocks the loop
+    /// mid-apply until the test releases the gate — a real barrier for
+    /// loading select arms while the loop is provably not selecting.
+    forward_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Recorder {
@@ -134,6 +190,13 @@ fn locked<T: Clone>(cell: &Arc<Mutex<T>>) -> T {
 
 impl EffectHandler for Recorder {
     async fn execute(&mut self, effect: SessionEffect, children: &mut JoinSet<()>) {
+        if effect == SessionEffect::ForwardCommandToBackend
+            && let Some(gate) = self.forward_gate.take()
+        {
+            // Hold the loop here until the test opens the gate.
+            let permit = gate.acquire().await;
+            drop(permit);
+        }
         if self.spawn_stuck_child_on_forward && effect == SessionEffect::ForwardCommandToBackend {
             children.spawn(async {
                 std::future::pending::<()>().await;
@@ -161,6 +224,40 @@ impl EffectHandler for Recorder {
             Ok(mut alive) => alive.pop_front().unwrap_or(true),
             Err(poisoned) => poisoned.into_inner().pop_front().unwrap_or(true),
         }
+    }
+}
+
+/// Wraps a `Recorder` and, on `CloseBackend`, spawns a teardown child
+/// that spins (paused-time sleeps) until the source-drop flag is
+/// observed, then records that it saw the drop.
+struct SpinUntilDropHandler {
+    inner: Recorder,
+    source_dropped: Arc<AtomicBool>,
+    seen_drop: Arc<AtomicBool>,
+}
+
+impl EffectHandler for SpinUntilDropHandler {
+    async fn execute(&mut self, effect: SessionEffect, children: &mut JoinSet<()>) {
+        if effect == SessionEffect::CloseBackend {
+            let dropped = Arc::clone(&self.source_dropped);
+            let seen = Arc::clone(&self.seen_drop);
+            children.spawn(async move {
+                while !dropped.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                seen.store(true, Ordering::SeqCst);
+            });
+            // Also record the effect itself.
+            self.inner
+                .execute(SessionEffect::CloseBackend, children)
+                .await;
+            return;
+        }
+        self.inner.execute(effect, children).await;
+    }
+
+    async fn backend_active(&mut self) -> bool {
+        self.inner.backend_active().await
     }
 }
 
@@ -392,14 +489,76 @@ async fn redirect_command_shutdown_interleavings_never_deadlock() {
     }
 }
 
-/// All three stimulus arms ready **simultaneously** (no quiescing): the
-/// biased select must still produce one clean shutdown with exactly-once
+/// All three stimulus arms **provably loaded** while the loop is blocked
+/// inside a gated handler call (not selecting): the control command is
+/// queued, the pump has demonstrably relayed the transport boundary into
+/// the loop-facing channel (completed-read counter), and shutdown is
+/// set. Releasing the gate lets the biased select race all three at
+/// once; the outcome must be one clean shutdown with exactly-once
 /// teardown.
 #[tokio::test(start_paused = true)]
 async fn concurrent_ready_arms_race_cleanly() {
-    let (event_tx, source) = ChannelSource::new();
+    let (event_tx, reads, source) = CountingSource::new();
     let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
-    let handler = Recorder::default();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler = Recorder {
+        forward_gate: Some(Arc::clone(&gate)),
+        ..Recorder::default()
+    };
+    let effects = handler.effects();
+    let looped = SessionLoop::new(
+        source,
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    );
+    let run = tokio::spawn(looped.run());
+    for event in HANDSHAKE {
+        let _ = event_tx.send(event).await;
+    }
+    // The command's ForwardCommandToBackend blocks on the gate: the loop
+    // is now provably inside apply, not inside select.
+    let _ = event_tx.send(SessionEvent::ClientCommand).await;
+    quiesce().await;
+    assert_eq!(reads.load(Ordering::SeqCst), 5, "loop is gated mid-apply");
+
+    // Load every arm while the loop cannot observe any of them.
+    let _ = control_tx.send(SessionControl::Redirect).await;
+    let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
+    quiesce().await;
+    // The pump has finished relaying the boundary event into the
+    // loop-facing one-slot channel: the transport arm is genuinely ready.
+    assert_eq!(reads.load(Ordering::SeqCst), 6, "boundary relayed by pump");
+    let _ = shutdown_tx.send(true);
+
+    // Open the gate: the loop returns to next_action with all three arms
+    // ready simultaneously.
+    gate.add_permits(1);
+    let summary = match tokio::time::timeout(Duration::from_secs(120), run).await {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(join_error)) => unreachable!("loop panicked: {join_error}"),
+        Err(_) => unreachable!("deadlock under concurrent-ready race"),
+    };
+    assert_eq!(summary.end, SessionEnd::ServerShutdown);
+    assert_eq!(summary.final_state, SessionState::Closed);
+    let recorded = locked(&effects);
+    assert_eq!(count(&recorded, SessionEffect::ClassifySessionEnd), 1);
+    assert_eq!(count(&recorded, SessionEffect::CloseClient), 1);
+}
+
+/// The pump classifies at most one event ahead of the loop: while the
+/// loop is blocked mid-apply and the one-slot channel is full, the
+/// classifier does not consume further transport events.
+#[tokio::test(start_paused = true)]
+async fn classifier_reads_at_most_one_ahead() {
+    let (event_tx, reads, source) = CountingSource::new();
+    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler = Recorder {
+        forward_gate: Some(Arc::clone(&gate)),
+        ..Recorder::default()
+    };
     let effects = handler.effects();
     let looped = SessionLoop::new(
         source,
@@ -414,21 +573,118 @@ async fn concurrent_ready_arms_race_cleanly() {
     }
     let _ = event_tx.send(SessionEvent::ClientCommand).await;
     quiesce().await;
-    // Make every arm ready at once; the loop has not observed any of them
-    // when they are all sent back-to-back without yielding.
-    let _ = control_tx.send(SessionControl::Redirect).await;
+    // 5 events consumed; the loop is gated inside the command's effect.
+    assert_eq!(reads.load(Ordering::SeqCst), 5);
+
+    // Three more transport events are available. The pump may take
+    // exactly one (into the free slot); the reserve-before-read contract
+    // forbids classifying the second while the slot is occupied.
+    let _ = event_tx.send(SessionEvent::BackendResponsePart).await;
+    let _ = event_tx.send(SessionEvent::BackendResponsePart).await;
     let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
+    quiesce().await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        6,
+        "one event ahead at most; no speculative classification"
+    );
+
+    // Release the gate: everything flows and the command completes.
+    gate.add_permits(1);
+    quiesce().await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        8,
+        "backlog drains after release"
+    );
+    let recorded = locked(&effects);
+    assert_eq!(count(&recorded, SessionEffect::ForwardResponseToClient), 3);
+
     let _ = shutdown_tx.send(true);
-    let summary = match tokio::time::timeout(Duration::from_secs(120), run).await {
-        Ok(Ok(summary)) => summary,
-        Ok(Err(join_error)) => unreachable!("loop panicked: {join_error}"),
-        Err(_) => unreachable!("deadlock under concurrent-ready race"),
+    let summary = match run.await {
+        Ok(summary) => summary,
+        Err(join_error) => unreachable!("loop panicked: {join_error}"),
     };
     assert_eq!(summary.end, SessionEnd::ServerShutdown);
-    assert_eq!(summary.final_state, SessionState::Closed);
-    let recorded = locked(&effects);
-    assert_eq!(count(&recorded, SessionEffect::ClassifySessionEnd), 1);
-    assert_eq!(count(&recorded, SessionEffect::CloseClient), 1);
+    assert_eq!(summary.rejected_events, 0);
+}
+
+/// Terminal cleanup honors **one absolute budget** and stops the pump
+/// first: with a stuck child, the whole terminal sequence (pump stop +
+/// drain window + abort join) elapses at most `cleanup_deadline`, and
+/// the source (transport stand-in) is dropped before a teardown child —
+/// which spins until it observes that drop — completes.
+#[tokio::test(start_paused = true)]
+async fn terminal_cleanup_budget_and_source_release_order() {
+    // Case 1: source released before the teardown child finishes.
+    let source_dropped = Arc::new(AtomicBool::new(false));
+    let teardown_seen_drop = Arc::new(AtomicBool::new(false));
+    let mut events = HANDSHAKE.to_vec();
+    events.push(SessionEvent::ClientCommandQuit);
+    // Parking: the pump stays blocked inside `next_event`, holding the
+    // source (transport stand-in), until terminal cleanup stops it. If
+    // the pump were stopped after the child drain, the spinner below
+    // could never finish and would be aborted instead.
+    let source = DropFlagSource {
+        inner: FakeSource::parking(&events),
+        dropped: Arc::clone(&source_dropped),
+    };
+    let (_control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let handler = SpinUntilDropHandler {
+        inner: Recorder::default(),
+        source_dropped: Arc::clone(&source_dropped),
+        seen_drop: Arc::clone(&teardown_seen_drop),
+    };
+    let start = tokio::time::Instant::now();
+    let summary = SessionLoop::new(
+        source,
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    )
+    .run()
+    .await;
+    assert_eq!(summary.end, SessionEnd::Closed);
+    assert!(source_dropped.load(Ordering::SeqCst));
+    assert!(
+        teardown_seen_drop.load(Ordering::SeqCst),
+        "teardown child observed the source drop before completing"
+    );
+    assert_eq!(summary.cleanup.aborted_children, 0);
+    assert!(summary.cleanup.within_deadline);
+    assert!(
+        start.elapsed() <= Duration::from_secs(5),
+        "well inside the budget: {:?}",
+        start.elapsed()
+    );
+
+    // Case 2: a stuck child bounds the whole terminal sequence to one
+    // cleanup_deadline.
+    let mut events = HANDSHAKE.to_vec();
+    events.push(SessionEvent::ClientCommand);
+    let (_control_tx2, control_rx, _shutdown_tx2, shutdown_rx) = channels();
+    let handler = Recorder {
+        spawn_stuck_child_on_forward: true,
+        ..Recorder::default()
+    };
+    let start = tokio::time::Instant::now();
+    let summary = SessionLoop::new(
+        FakeSource::scripted(&events),
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    )
+    .run()
+    .await;
+    assert_eq!(summary.end, SessionEnd::TransportExhausted);
+    assert_eq!(summary.cleanup.aborted_children, 1);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed <= Duration::from_secs(5) + Duration::from_millis(50),
+        "terminal sequence bounded by one cleanup_deadline: {elapsed:?}"
+    );
 }
 
 /// Server shutdown closes an idle authenticated session immediately and

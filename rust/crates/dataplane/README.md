@@ -69,10 +69,12 @@ per KA-003 so it never races command I/O), and the child-operation
 spawn **tracked** children but cannot own session state) borrows `&mut`
 for one call at a time, and the `SessionEventSource` (SES-layer
 classification; the loop never sees packet bytes) is moved into a
-dedicated **pump task** that polls each `next_event` future to
-completion and submits events over a one-slot bounded channel — the
-loop selects on the channel's cancel-safe `recv`, so classifier futures
-holding partial read state are never dropped by a lost select race.
+dedicated **pump task** that reserves the one-slot channel's permit
+**before** reading the transport, polls each `next_event` future to
+completion, and submits through the permit — the loop selects on the
+channel's cancel-safe `recv`, so classifier futures holding partial
+read state are never dropped by a lost select race, and the classifier
+is never more than one event ahead of the loop (real backpressure).
 
 Biased select order: server shutdown (with the current value checked
 first, so a shutdown that predates the loop is never missed), control
@@ -80,20 +82,27 @@ commands, the armed deadline, the probe, finished children, pumped
 transport events. Control-channel closure follows control-protocol v1
 last-good semantics: it never tears down an established session — the
 arm is disabled, traffic continues, and the detachment is reported in
-`SessionSummary`. When the FSM enters `Closing` the loop itself drains
-children and seals the machine with `TeardownComplete`. Cleanup drains
-before it aborts: children get the full `cleanup_deadline` to finish
-normally (teardown effects complete exactly once), and only those that
-outlive it are aborted and joined under a second bound. Every exit path
-(client/backend EOF, server shutdown, normal close) drives the FSM's
-teardown effects exactly once.
+`SessionSummary`. When the FSM enters `Closing` the loop seals the
+machine with `TeardownComplete`; the tracked teardown children drain in
+the terminal cleanup. That cleanup runs exactly once, owned by `run`,
+under **one absolute budget** (`cleanup_deadline`): the pump stops
+first — the source, standing for the transport, releases before any
+child is waited on — then children drain normally (teardown effects
+complete exactly once), and only stragglers are aborted and joined in a
+reserved slice of the same window. Every exit path (client/backend EOF,
+server shutdown, normal close) drives the FSM's teardown effects
+exactly once.
 
 `tests/session_loop.rs` runs under Tokio's paused-time deterministic
 scheduler: scripted lifecycle with exact effect order; stuck children
 aborted only after the drain window while a slow teardown child runs to
-observable completion; all six redirect × transport command boundary ×
+observable completion; the terminal sequence bounded by one
+`cleanup_deadline` with the source provably dropped before a teardown
+child completes; the classifier held to at most one event of
+read-ahead; all six redirect × transport command boundary ×
 shutdown arrival orders with quiesced hand-offs plus one
-all-arms-ready race (exactly-once teardown asserted in each); the
+all-arms-ready race with a handler gate proving every arm was loaded
+(exactly-once teardown asserted in each); the
 handshake deadline firing pre-auth but an authenticated fully idle
 session (probe disabled, no events) surviving far past it; a
 pre-existing shutdown observed at start; probe ticks skipping in-flight
