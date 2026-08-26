@@ -24,6 +24,7 @@ pub mod command;
 pub mod error_source;
 pub mod fsm;
 pub mod handshake;
+pub mod response;
 
 /// Stable description used by workspace-level topology checks.
 pub const CRATE_ROLE: &str = "session lifecycle and migration state";

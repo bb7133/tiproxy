@@ -487,6 +487,35 @@ fn local_infile_walk() {
             ),
         ],
     );
+
+    // A later statement in a multi-result query can request LOCAL INFILE
+    // after the first result already transitioned Command -> Response.
+    run(
+        &mut fsm,
+        &[
+            (E::ClientCommand, S::Command, &[F::ForwardCommandToBackend]),
+            (
+                E::BackendResponsePart,
+                S::Response,
+                &[F::ForwardResponseToClient],
+            ),
+            (
+                E::BackendLocalInfileRequest,
+                S::LocalInfile,
+                &[F::RequestLocalInfileFromClient],
+            ),
+            (
+                E::ClientInfileEnd,
+                S::Response,
+                &[F::ForwardInfileEndToBackend],
+            ),
+            (
+                E::BackendResponseTxnDone,
+                S::Ready,
+                &[F::ForwardResponseToClient],
+            ),
+        ],
+    );
 }
 
 /// Graceful close before authentication closes immediately

@@ -156,3 +156,33 @@ change-user duplex execution.
 - The generated Go corpus carries every `CMD-000..032` ID. Rust command-corpus
   tests consume the exact request bytes rather than maintaining a second
   hand-written wire fixture.
+
+## Streaming response observer (`response`, SES-04)
+
+`ResponseObserver` consumes a completed logical packet's bounded 23-byte
+prefix and framing counters after the runtime has streamed the packet. It
+retains no response payload and distinguishes contextual meanings instead of
+classifying by the first byte alone:
+
+- query start accepts OK, ERR, LOCAL INFILE, or a resultset header; classic
+  metadata and row states recognize only short EOF, while deprecated-EOF data
+  recognizes only protocol-length `0xfe` OK terminators;
+- `0x00`, `0x01`, and `0xfb` remain opaque column/row bytes inside resultsets,
+  and `0xfe` with length 6 or a maximum-size first physical packet remains
+  data;
+- classic metadata EOF updates status only when it opens a cursor, matching
+  Go; final OK/EOF status tracks transaction, cursor, last-row, and
+  `MORE_RESULTS_EXISTS` boundaries, while ERR preserves prior transaction
+  state;
+- FIELD_LIST, FETCH, raw STATISTICS, and the generic one-packet OK/ERR/EOF
+  contract have dedicated states. Prepare metadata remains SES-05; the LOCAL
+  INFILE request/final-response boundary is recognized here, while its client
+  upload loop remains SES-06;
+- flush effects occur only at a command/result/LOCAL-INFILE protocol boundary
+  or when pending wire bytes reach the nonzero configured threshold.
+
+The exact generated Go corpus covers RSP-001..005 and RSP-008 cases, including
+PROCESS_INFO, FIELD_LIST, cursor execute/fetch, multi-results, both EOF modes,
+and LOCAL INFILE. Unit tests pin the contextual marker matrix, typed malformed
+terminal rejection, and one million streamed rows with constant observer size
+and zero retained payload bytes.
