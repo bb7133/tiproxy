@@ -187,6 +187,910 @@
       }
     },
     {
+      "id": "command-binlog-dump",
+      "description": "COM_BINLOG_DUMP follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-018"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-binlog-dump.trace.gz",
+      "trace_sha256": "b9a5f1ffb2d5b945ad728f41204f326452b8315ec6c2563bb38b43cf0702da72",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-binlog-dump-gtid",
+      "description": "COM_BINLOG_DUMP_GTID follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-030"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-binlog-dump-gtid.trace.gz",
+      "trace_sha256": "9b7d70e1a699642f23ff8586a93834e2fa273bb50a7acf2bf5c721db82aed650",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-connect",
+      "description": "COM_CONNECT follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-011"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-connect.trace.gz",
+      "trace_sha256": "56f7207a9be76f026f5ffc0d678e9d431ebcdf532a7109b52725c2913cf89fe4",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-connect-out",
+      "description": "COM_CONNECT_OUT follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-020"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-connect-out.trace.gz",
+      "trace_sha256": "e326551fa3c669409594be4f29ddbcf3733443394c08d45b7de35175495d22f0",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-create-db",
+      "description": "COM_CREATE_DB follows the generic one-packet OK path.",
+      "parity_ids": [
+        "CMD-005"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-create-db.trace.gz",
+      "trace_sha256": "49fce0c556ca3eef34ed388764813fc6b7ba73c30e4aea4ce131e325f44c243e",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "generic OK response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-daemon",
+      "description": "COM_DAEMON follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-029"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-daemon.trace.gz",
+      "trace_sha256": "d8c9ba9f3c6beffc058919eb6a92e48a2b9dac83fa0bb733a35dcd6187a19ebc",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-debug",
+      "description": "COM_DEBUG follows the generic one-packet EOF path.",
+      "parity_ids": [
+        "CMD-013"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-debug.trace.gz",
+      "trace_sha256": "df45db64c984a62e34c851eeee189e965577da445c9a0df2aeebddd2403349f9",
+      "uncompressed_bytes": 44,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 5,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "generic EOF response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-delayed-insert",
+      "description": "COM_DELAYED_INSERT follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-016"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-delayed-insert.trace.gz",
+      "trace_sha256": "9f659e01c2058b49ab13f50b2ed2c62a04dcbcf45fe4563fbc28a0f1014556ff",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-deprecated-shutdown",
+      "description": "The deprecated COM_SHUTDOWN slot remains a generic one-packet command.",
+      "parity_ids": [
+        "CMD-008"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-deprecated-shutdown.trace.gz",
+      "trace_sha256": "f3d0f93d738e16a9f66c0ec8311404ad6df40cd0b7f7ee39c865a768f6c14030",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "generic OK response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-drop-db",
+      "description": "COM_DROP_DB follows the generic one-packet OK path.",
+      "parity_ids": [
+        "CMD-006"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-drop-db.trace.gz",
+      "trace_sha256": "fe5a1e2e91fb81c78c32edf8fb14ac1b2600acc35b7d9949b453567499abd344",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "generic OK response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-end-sentinel",
+      "description": "Go's COM_END array sentinel is rejected as a non-command before metrics indexing.",
+      "parity_ids": [
+        "CMD-032"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/command.go",
+        "pkg/proxy/backend/metrics.go:addCmdMetrics"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-end-sentinel.trace.gz",
+      "trace_sha256": "08fc8e1d1627844d68b54b110dfe836494e7a0413162238d8c625ad41381d1d5",
+      "uncompressed_bytes": 26,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "reject",
+        "terminal_state": "closed",
+        "error_code": 1835,
+        "effects": [
+          "sentinel is not forwarded",
+          "command metrics are not indexed"
+        ]
+      }
+    },
+    {
+      "id": "command-process-kill",
+      "description": "COM_PROCESS_KILL follows the generic one-packet OK path.",
+      "parity_ids": [
+        "CMD-012"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-process-kill.trace.gz",
+      "trace_sha256": "57968daa7bcedfed92669f8e58ee2624d96ca4024ce331cbf7c635e40898e1ac",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "generic OK response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-refresh",
+      "description": "COM_REFRESH follows the generic one-packet OK path.",
+      "parity_ids": [
+        "CMD-007"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-refresh.trace.gz",
+      "trace_sha256": "45ba9b36d5356762465fb763dedd86bf1a96b0a5e88d033df87dd4765df2afdf",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "generic OK response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-register-slave",
+      "description": "COM_REGISTER_SLAVE follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-021"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-register-slave.trace.gz",
+      "trace_sha256": "7a27a4e1e64c3a1edaa6cd9c2ae57fb8205e4d4c409cbcc3ec26d1f84bbc27d4",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-sleep",
+      "description": "COM_SLEEP follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-000"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-sleep.trace.gz",
+      "trace_sha256": "c0d43ae7b189cdae49315e1bff3f5df6fe38649400bd280c49d28db34d07c787",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-table-dump",
+      "description": "COM_TABLE_DUMP follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-019"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-table-dump.trace.gz",
+      "trace_sha256": "afdc283f21111dcf8fdf4de6cf3ec31282d085e3a83aca3c00c81373f4aa417b",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-time",
+      "description": "COM_TIME follows the generic one-packet error path.",
+      "parity_ids": [
+        "CMD-015"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-time.trace.gz",
+      "trace_sha256": "2f00229554dd2d551b34c1cc3f4f3bad2284545a988417acbf861837a020df04",
+      "uncompressed_bytes": 69,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "mysql_error",
+        "terminal_state": "ready",
+        "error_code": 1064,
+        "effects": [
+          "generic ERR response is forwarded"
+        ]
+      }
+    },
+    {
+      "id": "command-unknown",
+      "description": "An unassigned command byte is rejected by the fixed unknown-command policy.",
+      "parity_ids": [
+        "CMD-032"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/command.go",
+        "pkg/proxy/backend/metrics.go:addCmdMetrics"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/command-unknown.trace.gz",
+      "trace_sha256": "4b41bb15f1aefbfc9a64b6bc2f1a8c0c762716fd389b9fbc1de9d3e45ee5b2c8",
+      "uncompressed_bytes": 26,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 1,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "reject",
+        "terminal_state": "closed",
+        "error_code": 1835,
+        "effects": [
+          "unknown command is not forwarded",
+          "command metrics are not indexed"
+        ]
+      }
+    },
+    {
       "id": "field-list",
       "description": "COM_FIELD_LIST ends with a legacy EOF packet.",
       "parity_ids": [
@@ -1398,6 +2302,102 @@
         ],
         "effects": [
           "multi-statement capability is enabled"
+        ]
+      }
+    },
+    {
+      "id": "set-option-disable",
+      "description": "COM_SET_OPTION value 1 disables multi-statements after EOF success.",
+      "parity_ids": [
+        "CMD-027"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/backend_conn_mgr_test.go:TestSpecialCmds"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "multi_statements_enabled"
+      },
+      "trace_file": "cases/set-option-disable.trace.gz",
+      "trace_sha256": "db49dd1b8c5aaec699b5d86a1b8e0b24a77580da0307d3caf0ec0533bd064183",
+      "uncompressed_bytes": 46,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 3,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 5,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "multi-statement capability is disabled"
+        ]
+      }
+    },
+    {
+      "id": "set-option-malformed",
+      "description": "COM_SET_OPTION rejects values other than 0 and 1 before forwarding.",
+      "parity_ids": [
+        "CMD-027"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/backend_conn_mgr.go:ExecuteCmd"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/set-option-malformed.trace.gz",
+      "trace_sha256": "1cf110619665b3e99a9b289c607b0937f8443d9c99e02af62e8dea43fe796271",
+      "uncompressed_bytes": 28,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 3,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "reject",
+        "terminal_state": "closed",
+        "error_code": 1835,
+        "effects": [
+          "malformed option is not forwarded"
         ]
       }
     },

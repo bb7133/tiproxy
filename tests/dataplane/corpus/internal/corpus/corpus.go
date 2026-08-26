@@ -156,9 +156,71 @@ func Build() Manifest {
 		makeCase("migration-session-state", "Internal SHOW SESSION_STATES result contains sanitized state and a session token.", []string{"MIG-002", "MIG-004", "RSP-007"}, refs("pkg/proxy/backend/backend_conn_mgr_test.go:TestNormalRedirect", "pkg/proxy/backend/backend_conn_mgr.go:querySessionStates"), modernCapNames, state("migration", "querying_session_state"), []recordSpec{{"proxy_to_backend", 0, [][]byte{commandPayload(pnet.ComQuery, []byte("SHOW SESSION_STATES"))}, nil}, {"backend_to_proxy", 1, migrationResult(), nil}}, expect("capture_internal_result", "ready_to_reconnect", []string{"SERVER_STATUS_AUTOCOMMIT"}, 0, "session state JSON is retained", "session token is retained", "ordinary result payloads remain opaque")),
 		makeRawCase("change-user-malformed", "Truncated COM_CHANGE_USER authentication data.", []string{"CMD-017", "HS-008"}, refs("pkg/proxy/backend/cmd_processor_test.go:TestNetworkError"), legacyCaps, state("command", "ready"), "client_to_proxy", framePayloads(0, []byte{pnet.ComChangeUser.Byte(), 'u', 0, 8, 1}), expect("reject", "closed", nil, gomysql.ER_MALFORMED_PACKET, "malformed command is not forwarded")),
 	}
+	cases = append(cases, commandDispatchCases(legacyCaps, ok, errPacket)...)
 
 	sort.Slice(cases, func(i, j int) bool { return cases[i].ID < cases[j].ID })
 	return Manifest{SchemaVersion: SchemaVersion, GeneratedBy: GeneratorVersion, Cases: cases}
+}
+
+// commandDispatchCases fills the command IDs whose only existing Go coverage
+// is the exhaustive cmdResponseTypes table. Special response state machines
+// keep their richer cases above; these vectors freeze the generic one-packet
+// branch and the explicit Rust rejection boundary for ComEnd/unknown bytes.
+func commandDispatchCases(capabilities []string, ok, errPacket []byte) []Case {
+	type commandCase struct {
+		id          string
+		description string
+		command     pnet.Command
+		response    []byte
+		expected    Expected
+	}
+	okExpected := expect("forward", "ready", []string{"SERVER_STATUS_AUTOCOMMIT"}, 0, "generic OK response is forwarded")
+	errExpected := expect("mysql_error", "ready", nil, gomysql.ER_PARSE_ERROR, "generic ERR response is forwarded")
+	eofExpected := expect("forward", "ready", []string{"SERVER_STATUS_AUTOCOMMIT"}, 0, "generic EOF response is forwarded")
+	eof := pnet.MakeEOFPacket(pnet.ServerStatusAutocommit)
+	specs := []commandCase{
+		{"command-sleep", "COM_SLEEP follows the generic one-packet error path.", pnet.ComSleep, errPacket, errExpected},
+		{"command-create-db", "COM_CREATE_DB follows the generic one-packet OK path.", pnet.ComCreateDB, ok, okExpected},
+		{"command-drop-db", "COM_DROP_DB follows the generic one-packet OK path.", pnet.ComDropDB, ok, okExpected},
+		{"command-refresh", "COM_REFRESH follows the generic one-packet OK path.", pnet.ComRefresh, ok, okExpected},
+		{"command-deprecated-shutdown", "The deprecated COM_SHUTDOWN slot remains a generic one-packet command.", pnet.ComDeprecated1, ok, okExpected},
+		{"command-connect", "COM_CONNECT follows the generic one-packet error path.", pnet.ComConnect, errPacket, errExpected},
+		{"command-process-kill", "COM_PROCESS_KILL follows the generic one-packet OK path.", pnet.ComProcessKill, ok, okExpected},
+		{"command-debug", "COM_DEBUG follows the generic one-packet EOF path.", pnet.ComDebug, eof, eofExpected},
+		{"command-time", "COM_TIME follows the generic one-packet error path.", pnet.ComTime, errPacket, errExpected},
+		{"command-delayed-insert", "COM_DELAYED_INSERT follows the generic one-packet error path.", pnet.ComDelayedInsert, errPacket, errExpected},
+		{"command-binlog-dump", "COM_BINLOG_DUMP follows the generic one-packet error path.", pnet.ComBinlogDump, errPacket, errExpected},
+		{"command-table-dump", "COM_TABLE_DUMP follows the generic one-packet error path.", pnet.ComTableDump, errPacket, errExpected},
+		{"command-connect-out", "COM_CONNECT_OUT follows the generic one-packet error path.", pnet.ComConnectOut, errPacket, errExpected},
+		{"command-register-slave", "COM_REGISTER_SLAVE follows the generic one-packet error path.", pnet.ComRegisterSlave, errPacket, errExpected},
+		{"command-daemon", "COM_DAEMON follows the generic one-packet error path.", pnet.ComDaemon, errPacket, errExpected},
+		{"command-binlog-dump-gtid", "COM_BINLOG_DUMP_GTID follows the generic one-packet error path.", pnet.ComBinlogDumpGtid, errPacket, errExpected},
+	}
+
+	cases := make([]Case, 0, len(specs)+4)
+	for _, spec := range specs {
+		cases = append(cases, makeCase(
+			spec.id,
+			spec.description,
+			[]string{fmt.Sprintf("CMD-%03d", spec.command.Byte())},
+			refs("pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"),
+			capabilities,
+			state("command", "ready"),
+			[]recordSpec{
+				{"client_to_proxy", 0, [][]byte{{spec.command.Byte()}}, nil},
+				{"backend_to_proxy", 1, [][]byte{spec.response}, nil},
+			},
+			spec.expected,
+		))
+	}
+
+	cases = append(cases,
+		makeCase("set-option-disable", "COM_SET_OPTION value 1 disables multi-statements after EOF success.", []string{"CMD-027"}, refs("pkg/proxy/backend/backend_conn_mgr_test.go:TestSpecialCmds"), capabilities, state("command", "multi_statements_enabled"), []recordSpec{{"client_to_proxy", 0, [][]byte{{pnet.ComSetOption.Byte(), 1, 0}}, nil}, {"backend_to_proxy", 1, [][]byte{eof}, nil}}, expect("forward", "ready", []string{"SERVER_STATUS_AUTOCOMMIT"}, 0, "multi-statement capability is disabled")),
+		makeCase("set-option-malformed", "COM_SET_OPTION rejects values other than 0 and 1 before forwarding.", []string{"CMD-027"}, refs("pkg/proxy/backend/backend_conn_mgr.go:ExecuteCmd"), capabilities, state("command", "ready"), []recordSpec{{"client_to_proxy", 0, [][]byte{{pnet.ComSetOption.Byte(), 2, 0}}, nil}}, expect("reject", "closed", nil, gomysql.ER_MALFORMED_PACKET, "malformed option is not forwarded")),
+		makeCase("command-end-sentinel", "Go's COM_END array sentinel is rejected as a non-command before metrics indexing.", []string{"CMD-032"}, refs("pkg/proxy/net/command.go", "pkg/proxy/backend/metrics.go:addCmdMetrics"), capabilities, state("command", "ready"), []recordSpec{{"client_to_proxy", 0, [][]byte{{pnet.ComEnd.Byte()}}, nil}}, expect("reject", "closed", nil, gomysql.ER_MALFORMED_PACKET, "sentinel is not forwarded", "command metrics are not indexed")),
+		makeRawCase("command-unknown", "An unassigned command byte is rejected by the fixed unknown-command policy.", []string{"CMD-032"}, refs("pkg/proxy/net/command.go", "pkg/proxy/backend/metrics.go:addCmdMetrics"), capabilities, state("command", "ready"), "client_to_proxy", framePayloads(0, []byte{0xff}), expect("reject", "closed", nil, gomysql.ER_MALFORMED_PACKET, "unknown command is not forwarded", "command metrics are not indexed")),
+	)
+	return cases
 }
 
 type recordSpec struct {
