@@ -462,14 +462,14 @@ impl SnapshotStore {
         })
     }
 
-    /// Phase two: commits a staged snapshot, re-checking monotonicity
-    /// under the write lock (a concurrent writer may have advanced the
-    /// store between the phases).
+    /// Phase two: publishes a staged snapshot. The staged token still
+    /// holds the store's writer reservation, so **no concurrent writer
+    /// can have advanced the store between the phases** — the commit
+    /// is a plain publication, not a re-negotiation.
     ///
     /// # Errors
     ///
-    /// Returns stale/invalid/internal errors exactly like
-    /// [`SnapshotStore::apply`].
+    /// Returns an internal error when the store lock is poisoned.
     pub fn commit(&self, staged: Staged<'_>) -> Result<ApplyOutcome, SnapshotError> {
         let Staged { _writer, state } = staged;
         let candidate = match state {

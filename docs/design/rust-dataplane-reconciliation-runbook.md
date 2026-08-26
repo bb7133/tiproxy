@@ -76,12 +76,29 @@ lifecycle).
 The gates are on the real message paths on both sides:
 
 - **Rust** — `dataplane::control_runtime::spawn_control_runtime` is
-  the **single composition entry**: it constructs the `ControlClient`,
-  runs it with the dispatch `InboundForwarder`, owns the CTL-05
-  snapshot task (validate → apply through the monotonic
-  `SnapshotStore` → serving-side consumer → `SnapshotResult` with the
-  initiating request id → `AppliedGeneration` into drain provenance),
-  and owns shutdown/join/error propagation. The **process-long-lived**
+  the **single composition entry**: it constructs the `ControlClient`
+  and places every task under one **supervisor** — as soon as any
+  task terminates the supervisor cancels the siblings via transport
+  shutdown, joins everything, and only then arbitrates: a real error
+  (dispatch fatal, transport failure, snapshot-owner failure, panic)
+  always wins over the clean cascade exits it triggers, whichever exit
+  the select observed first; and with no real error and no requested
+  shutdown, the FIRST clean exit of **any** task is itself reported as
+  an unexpected termination. The CTL-05 snapshot owner applies each
+  `StateSnapshot` as a **transaction**: `SnapshotStore::stage`
+  validates without committing (the staged token holds the store's
+  writer reservation, so no concurrent writer can advance the store
+  between the phases), the serving-side consumer applies, and only
+  then `commit` publishes — a consumer rejection leaves the store on
+  the previous generation, so a replay of the same generation re-runs
+  the consumer instead of being falsely acknowledged. After a
+  successful commit the owner passes the **applied-generation
+  barrier** (the dispatcher acknowledges recording the generation
+  before the `SnapshotResult` OK goes to Go, so commands minted
+  against the new generation can never race an older applied view),
+  and its failure semantics are explicit: barrier/send failures under
+  a requested shutdown are the clean cascade, the same failures
+  without one propagate to the supervisor. The **process-long-lived**
   `ControlCommandHandler` lives on the dispatch task. The
   `InboundForwarder`'s `handle` **awaits** a bounded queue
   reservation, so a slow dispatcher stalls the read loop and the
@@ -110,8 +127,14 @@ The gates are on the real message paths on both sides:
   `RECONCILE_CONNECTIONS` is an unsolicited protocol violation;
   `RouteAssignment` / `HandshakeDecision` deliver to the owning
   session in every epoch under **fail-closed correlation** — the
-  session arms `(initiating request id, body kind)` via
-  `ExpectResponse`, and an unsolicited, wrong-id, or wrong-kind answer
+  session arms `(initiating request id, body kind)` through the typed
+  `ControlDispatchHandle::expect_response`, which awaits the
+  dispatcher's **typed verdict**: only a live session WITH a response
+  channel is armed (`UnknownConnection` / `NoResponseChannel` refuse,
+  so a caller is never told to start an exchange whose answer could
+  not be delivered), the request goes to Go only after `Ok(())`
+  (registration carries the same applied-ack contract), and an
+  unsolicited, wrong-id, or wrong-kind answer
   is refused as a violation instead of occupying the one-slot channel
   or being mis-consumed by a newer exchange (a closed response channel
   is answered `RECONCILIATION_REQUIRED`, not treated as delivered);
@@ -124,7 +147,17 @@ The gates are on the real message paths on both sides:
 
   Reconnect is automatic, atomic, and **capability-gated**: the
   `Connected { epoch, capabilities }` watch snapshot carries both
-  values in one read; the peer mode updates from the mask, and — only
+  values in one read, and the handler models the **active session as
+  an `Option`** — every non-`Connected` observation clears it, so a
+  watch-coalesced `Connected → Disconnected` can never leave a stale
+  epoch behind, and a dead session's `ReconcileSnapshot` is refused
+  (it must match the currently active epoch exactly); a deterministic
+  barrier drains pending state observations **before** each inbound
+  envelope, so a frame from a previous session is always judged
+  against the newest session snapshot regardless of select order. The
+  handshake **rejects cap-3-without-cap-2 on both sides** and the peer
+  mode derives rehydration only from `cap2 && cap3`. The peer mode
+  updates from the mask, and — only
   when `RECONCILE_CONNECTIONS` was negotiated — the reconcile request
   (declaring `[RECONCILE_CONNECTIONS, RECONCILE_SESSION_REHYDRATION]`
   as negotiated) is sent **session-scoped**: the transport queue entry
@@ -137,12 +170,12 @@ The gates are on the real message paths on both sides:
   the ledger's bounded unacked retention (fail-closed seal at the
   bound) is then the explicit backpressure. Metering has its full
   production lifecycle with **producer-owned failure**: sessions call
-  `ControlDispatchHandle::record_metering` and await the ledger's own
-  fail-closed verdict (recorded and acknowledged in one await-free
-  step) — on error the delta was **not** absorbed and stays with the
-  producer, which retries (`BacklogFull` clears on a reconcile ack) or
-  declares its stream unhealthy; sequence exhaustion is a dispatch
-  fatal. The tick seals batches onto the wire, reconnects replay
+  `ControlDispatchHandle::record_metering`, which keeps the original
+  delta at the producer and sends a copy — every failure (ledger
+  rejection, dispatch gone, ack closed) **returns the original delta**
+  to its owner, which retries (`BacklogFull` clears on a reconcile
+  ack) or declares its stream unhealthy; sequence exhaustion — from a
+  record or from the periodic seal — is a dispatch fatal. The tick seals batches onto the wire, reconnects replay
   everything unacknowledged, and every counted path is exported
   through the shared `DispatchStats`.
 

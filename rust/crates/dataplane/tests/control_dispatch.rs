@@ -1613,8 +1613,8 @@ async fn applied_acks_order_arming_before_responses() {
         })
         .await
         .ok();
-    let Ok(()) = expect_ack_rx.await else {
-        unreachable!("the expectation is acknowledged when armed")
+    let Ok(dataplane::control_dispatch::ExpectArmVerdict::Armed) = expect_ack_rx.await else {
+        unreachable!("the expectation is acknowledged as armed")
     };
 
     // Only now would the session send its request — so the answer
@@ -1724,5 +1724,75 @@ async fn metering_saturation_rejects_producer_instead_of_dropping() {
     let Ok(Err(_)) = ack_rx.await else {
         unreachable!("oversized keys are rejected to the producer")
     };
+    harness.task.abort();
+}
+
+/// The applied-generation barrier semantics observable end to end:
+/// once the typed ack fires (the snapshot owner sends its OK only
+/// after this), every subsequently processed inbound command is
+/// judged against the NEW applied generation — a drain minted under
+/// the superseded generation is rejected stale, never admitted off an
+/// older applied view.
+#[tokio::test(start_paused = true)]
+async fn applied_generation_ack_orders_before_inbound_commands() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+
+    // Before any applied generation, old-provenance drains are legal.
+    let early = envelope(
+        30,
+        3,
+        Body::DrainCommand(DrainCommand {
+            drain_id: "d-early".to_owned(),
+            listener_names: Vec::new(),
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: 1_010_000,
+            force_deadline_unix_millis: 1_020_000,
+            command_sequence: 1,
+        }),
+    );
+    harness.inbound_tx.send(early).await.ok();
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    assert!(
+        matches!(sent[0].body, Some(Body::DrainResult(_))),
+        "pre-barrier provenance is admitted"
+    );
+
+    // The snapshot owner's barrier: notice + ack, awaited before the
+    // OK would go to Go.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::AppliedGeneration {
+            generation: 7,
+            applied: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = ack_rx.await else {
+        unreachable!("the dispatcher acknowledges the applied generation")
+    };
+
+    // After the ack, a drain minted under the superseded generation is
+    // stale — the new applied view is guaranteed visible.
+    let stale = envelope(
+        31,
+        3,
+        Body::DrainCommand(DrainCommand {
+            drain_id: "d-stale".to_owned(),
+            listener_names: Vec::new(),
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: 1_010_000,
+            force_deadline_unix_millis: 1_020_000,
+            command_sequence: 2,
+        }),
+    );
+    harness.inbound_tx.send(stale).await.ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    assert_eq!(
+        error_code(&sent[1]),
+        Some(ErrorCode::StaleGeneration),
+        "post-ack commands are judged against the new generation"
+    );
     harness.task.abort();
 }

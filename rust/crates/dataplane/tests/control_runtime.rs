@@ -28,8 +28,12 @@ use control_proto::v1::{
     StateSnapshot, TlsPolicy,
 };
 use dataplane::control_dispatch::DispatchFatal;
+use dataplane::control_dispatch::{
+    ExpectResponseError, MeteringRecordError, ResponseKind, spawn_control_dispatch_with_handler,
+};
 use dataplane::control_runtime::{
-    ControlRuntime, ControlRuntimeConfig, process_state_snapshot, spawn_control_runtime,
+    ControlRuntime, ControlRuntimeConfig, SnapshotStep, process_state_snapshot,
+    snapshot_owner_step, spawn_control_runtime,
 };
 
 fn runtime_config(socket: std::path::PathBuf) -> ControlRuntimeConfig {
@@ -303,7 +307,10 @@ fn supervise_with(
         })
     };
     let snapshots = if snapshot_panics {
-        let task = tokio::spawn(std::future::pending::<()>());
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
         task.abort();
         task
     } else {
@@ -312,6 +319,7 @@ fn supervise_with(
             while !client.is_shutdown() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            Ok(())
         })
     };
     (
@@ -382,6 +390,7 @@ async fn unrequested_transport_exit_is_an_error() {
             while !client.is_shutdown() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            Ok(())
         })
     };
     let runtime = ControlRuntime::supervise(client, handle, transport, dispatch, snapshots);
@@ -390,4 +399,309 @@ async fn unrequested_transport_exit_is_an_error() {
         unreachable!("unrequested transport exit must err: {joined:?}")
     };
     assert!(error.to_string().contains("without a requested shutdown"));
+}
+
+/// Public-API metering ownership: every failure hands the ORIGINAL
+/// delta back to the producer — ledger rejection under saturation and
+/// dispatch unavailability alike — so a failed handoff never consumes
+/// the value.
+#[tokio::test]
+async fn record_metering_returns_the_delta_on_every_failure() {
+    // Saturate a handler exactly to the fail-closed bound…
+    let mut handler = dataplane::control_dispatch::ControlCommandHandler::new();
+    for index in 0..1024_u32 {
+        assert!(
+            handler
+                .metering()
+                .record(control_proto::v1::MeteringDelta {
+                    keyspace: format!("ks-{index}"),
+                    backend_id: "tidb-a".to_owned(),
+                    public_endpoint: false,
+                    response_bytes: 1,
+                    cross_location_bytes: 0,
+                })
+                .is_ok()
+        );
+        assert!(handler.seal_metering().is_ok());
+    }
+    for index in 0..1024_u32 {
+        assert!(
+            handler
+                .metering()
+                .record(control_proto::v1::MeteringDelta {
+                    keyspace: format!("open-{index}"),
+                    backend_id: "tidb-a".to_owned(),
+                    public_endpoint: false,
+                    response_bytes: 1,
+                    cross_location_bytes: 0,
+                })
+                .is_ok()
+        );
+    }
+    // …and put it behind the PUBLIC handle.
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel(1);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        handler,
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+
+    let original = control_proto::v1::MeteringDelta {
+        keyspace: "one-too-many".to_owned(),
+        backend_id: "tidb-a".to_owned(),
+        public_endpoint: false,
+        response_bytes: 7,
+        cross_location_bytes: 3,
+    };
+    let Err(MeteringRecordError::Rejected { delta, error: _ }) =
+        handle.record_metering(original.clone()).await
+    else {
+        unreachable!("saturation rejects through the public API")
+    };
+    assert_eq!(delta, original, "the exact delta comes back to its owner");
+
+    // Dispatch gone: same ownership contract.
+    dispatch.abort();
+    let _ = dispatch.await;
+    let Err(MeteringRecordError::DispatchUnavailable { delta }) =
+        handle.record_metering(original.clone()).await
+    else {
+        unreachable!("a dead dispatcher rejects, never consumes")
+    };
+    assert_eq!(delta, original);
+    client.shutdown();
+}
+
+/// Public-API expectation arming is fail-closed: only a live session
+/// WITH a response channel is armed; unknown sessions and channel-less
+/// registrations refuse — the caller is never told to start an
+/// exchange whose answer could not be delivered.
+#[tokio::test]
+async fn expect_response_verdicts_are_fail_closed() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel(1);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+
+    // Unknown connection.
+    assert_eq!(
+        handle
+            .expect_response(9, 1, ResponseKind::RouteAssignment)
+            .await,
+        Err(ExpectResponseError::UnknownConnection)
+    );
+
+    // Registered WITHOUT a response channel.
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(4);
+    let identity = control_proto::v1::ConnectionIdentity {
+        connection_id: 1,
+        listener_address: "0.0.0.0:6000".to_owned(),
+        client_address: "10.9.8.7:1".to_owned(),
+        proxy_address: "10.0.0.9:6000".to_owned(),
+        public_endpoint: false,
+    };
+    assert!(
+        handle
+            .register_session(
+                identity.clone(),
+                "ns-a".to_owned(),
+                7,
+                "sql-a".to_owned(),
+                control_tx.clone(),
+                None,
+            )
+            .await
+    );
+    assert_eq!(
+        handle
+            .expect_response(1, 1, ResponseKind::RouteAssignment)
+            .await,
+        Err(ExpectResponseError::NoResponseChannel)
+    );
+
+    // Registered WITH a channel: armed.
+    let (resp_tx, _resp_rx) = tokio::sync::mpsc::channel(1);
+    let identity2 = control_proto::v1::ConnectionIdentity {
+        connection_id: 2,
+        ..identity
+    };
+    assert!(
+        handle
+            .register_session(
+                identity2,
+                "ns-a".to_owned(),
+                7,
+                "sql-a".to_owned(),
+                control_tx,
+                Some(resp_tx),
+            )
+            .await
+    );
+    assert_eq!(
+        handle
+            .expect_response(2, 5, ResponseKind::RouteAssignment)
+            .await,
+        Ok(())
+    );
+
+    dispatch.abort();
+    assert_eq!(
+        handle
+            .expect_response(2, 6, ResponseKind::RouteAssignment)
+            .await,
+        Err(ExpectResponseError::DispatchUnavailable)
+    );
+    client.shutdown();
+}
+
+/// The snapshot owner's shutdown boundary: a requested shutdown
+/// interrupting the applied-generation/answer path is the normal
+/// cascade (clean exit), while a dispatcher that died UNEXPECTEDLY
+/// under an in-flight snapshot is the owner's error.
+#[tokio::test]
+async fn snapshot_owner_shutdown_boundary() {
+    // Clean side: shutdown already requested, dispatch alive — the
+    // barrier passes and the answer send normalizes Closed to a clean
+    // exit.
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel(1);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    client.shutdown();
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
+    };
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &snapshot_envelope(20, 1),
+    )
+    .await;
+    let Ok(SnapshotStep::CleanExit) = step else {
+        unreachable!("requested shutdown normalizes to a clean exit: {step:?}")
+    };
+    dispatch.abort();
+
+    // Fatal side: dispatch died unexpectedly (no shutdown), the
+    // barrier cannot be passed — the owner errs for the supervisor.
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel(1);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    dispatch.abort();
+    let _ = dispatch.await;
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &snapshot_envelope(21, 1),
+    )
+    .await;
+    let Err(error) = step else {
+        unreachable!("an unexpectedly dead dispatcher must err: {step:?}")
+    };
+    assert!(error.to_string().contains("applied-generation barrier"));
+    client.shutdown();
+}
+
+/// Arbitration is select-order independent: transport AND dispatch
+/// exit cleanly at the same instant with no shutdown requested —
+/// whichever the supervisor observes first, the join must report an
+/// unexpected termination, never Ok.
+#[tokio::test]
+async fn simultaneous_clean_exits_are_still_unexpected() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel(1);
+    let (handle, _forwarder, real_dispatch) = dataplane::control_dispatch::spawn_control_dispatch(
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    real_dispatch.abort();
+    // Both immediately ready and clean.
+    let transport = tokio::spawn(async { Ok::<(), TransportError>(()) });
+    let dispatch = tokio::spawn(async { Ok(()) });
+    let snapshots = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            while !client.is_shutdown() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    };
+    let runtime = ControlRuntime::supervise(client, handle, transport, dispatch, snapshots);
+    let joined = tokio::time::timeout(Duration::from_secs(2), runtime.join()).await;
+    let Ok(Err(error)) = joined else {
+        unreachable!("simultaneous clean exits must still err: {joined:?}")
+    };
+    assert!(error.to_string().contains("without a requested shutdown"));
+}
+
+/// A snapshot owner that exits cleanly FIRST without a requested
+/// shutdown is an unexpected termination too.
+#[tokio::test]
+async fn snapshot_clean_first_exit_is_unexpected() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel(1);
+    let (handle, _forwarder, real_dispatch) = dataplane::control_dispatch::spawn_control_dispatch(
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    real_dispatch.abort();
+    let transport = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            while !client.is_shutdown() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok::<(), TransportError>(())
+        })
+    };
+    let dispatch = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            while !client.is_shutdown() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    };
+    let snapshots = tokio::spawn(async { Ok(()) });
+    let runtime = ControlRuntime::supervise(client, handle, transport, dispatch, snapshots);
+    let joined = tokio::time::timeout(Duration::from_secs(2), runtime.join()).await;
+    let Ok(Err(error)) = joined else {
+        unreachable!("snapshot clean-first exit must err: {joined:?}")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("snapshot owner exited without a requested shutdown"),
+        "the first-exit task is named: {error}"
+    );
 }

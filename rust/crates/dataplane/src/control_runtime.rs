@@ -160,7 +160,7 @@ impl ControlRuntime {
         handle: ControlDispatchHandle,
         transport: JoinHandle<Result<(), TransportError>>,
         dispatch: JoinHandle<Result<(), DispatchFatal>>,
-        snapshots: JoinHandle<()>,
+        snapshots: JoinHandle<Result<(), TransportError>>,
     ) -> Self {
         let supervisor = tokio::spawn(supervise_tasks(
             Arc::clone(&client),
@@ -180,7 +180,7 @@ impl ControlRuntime {
 enum FirstExit {
     Transport(Result<Result<(), TransportError>, JoinError>),
     Dispatch(Result<Result<(), DispatchFatal>, JoinError>),
-    Snapshots(Result<(), JoinError>),
+    Snapshots(Result<Result<(), TransportError>, JoinError>),
 }
 
 /// Waits for the first task to terminate, shuts the transport down
@@ -191,7 +191,7 @@ async fn supervise_tasks(
     client: Arc<ControlClient>,
     mut transport: JoinHandle<Result<(), TransportError>>,
     mut dispatch: JoinHandle<Result<(), DispatchFatal>>,
-    mut snapshots: JoinHandle<()>,
+    mut snapshots: JoinHandle<Result<(), TransportError>>,
 ) -> Result<(), TransportError> {
     let first = tokio::select! {
         result = &mut transport => FirstExit::Transport(result),
@@ -203,7 +203,11 @@ async fn supervise_tasks(
     let shutdown_requested = client.is_shutdown();
     client.shutdown();
 
-    let transport_first = matches!(first, FirstExit::Transport(_));
+    let first_task = match &first {
+        FirstExit::Transport(_) => "control transport",
+        FirstExit::Dispatch(_) => "control dispatch",
+        FirstExit::Snapshots(_) => "control snapshot owner",
+    };
     let (transport_result, dispatch_result, snapshot_result) = match first {
         FirstExit::Transport(result) => (result, dispatch.await, snapshots.await),
         FirstExit::Dispatch(result) => (transport.await, result, snapshots.await),
@@ -215,14 +219,6 @@ async fn supervise_tasks(
             "control transport task panicked".to_owned(),
         )),
         Ok(Err(error)) => Some(error),
-        // A clean transport exit is unexpected only when the transport
-        // itself terminated first without a requested shutdown; after
-        // the supervisor's own cascade it is the expected outcome.
-        Ok(Ok(())) if transport_first && !shutdown_requested => {
-            Some(TransportError::Configuration(
-                "control transport exited without a requested shutdown".to_owned(),
-            ))
-        }
         Ok(Ok(())) => None,
     };
     let dispatch_error = match dispatch_result {
@@ -232,26 +228,36 @@ async fn supervise_tasks(
         Ok(Err(fatal)) => Some(TransportError::Configuration(format!(
             "control dispatch terminated: {fatal}"
         ))),
-        // A clean dispatch exit is the shutdown cascade (its channels
-        // closed); never an error by itself.
         Ok(Ok(())) => None,
     };
-    let snapshot_error = snapshot_result
-        .err()
-        .map(|_| TransportError::Configuration("control snapshot owner panicked".to_owned()));
+    let snapshot_error = match snapshot_result {
+        Err(_) => Some(TransportError::Configuration(
+            "control snapshot owner panicked".to_owned(),
+        )),
+        Ok(Err(error)) => Some(error),
+        Ok(Ok(())) => None,
+    };
 
-    // Arbitration: dispatch fatals describe the root cause most
-    // precisely, then transport failures, then panics of the snapshot
-    // owner. Clean exits contribute nothing, so a fatal can never be
-    // masked by the cascade it triggered.
-    match [dispatch_error, transport_error, snapshot_error]
+    // Arbitration: real errors first — dispatch fatals describe the
+    // root cause most precisely, then transport failures, then the
+    // snapshot owner's. Clean exits contribute nothing, so a fatal can
+    // never be masked by the cascade it triggered. When there is no
+    // real error anywhere and no shutdown was requested, the FIRST
+    // exit — whichever task it was, however the select observed it —
+    // was an unexpected clean termination and is reported as such.
+    if let Some(error) = [dispatch_error, transport_error, snapshot_error]
         .into_iter()
         .flatten()
         .next()
     {
-        Some(error) => Err(error),
-        None => Ok(()),
+        return Err(error);
     }
+    if !shutdown_requested {
+        return Err(TransportError::Configuration(format!(
+            "{first_task} exited without a requested shutdown"
+        )));
+    }
+    Ok(())
 }
 
 /// Constructs the control client and spawns the transport, dispatch,
@@ -348,22 +354,74 @@ pub fn process_state_snapshot<C: SnapshotConsumer>(
 }
 
 /// The CTL-05 snapshot owner task: drives [`process_state_snapshot`]
-/// for every inbound snapshot, answers the peer, and feeds successful
-/// applications into drain provenance.
+/// for every inbound snapshot, passes the **applied-generation
+/// barrier** (the dispatcher must have recorded the generation before
+/// the OK goes to Go — commands minted against the new generation can
+/// then never race an older applied view), and answers the peer.
+/// Failure semantics are explicit: a barrier or send failure during a
+/// requested shutdown is the normal cascade (clean exit), while the
+/// same failure without one — the dispatcher or transport died
+/// unexpectedly under this in-flight snapshot — propagates as the
+/// owner's error for the supervisor to surface.
 async fn run_snapshot_owner<C: SnapshotConsumer>(
     client: Arc<ControlClient>,
     handle: ControlDispatchHandle,
     store: SnapshotStore,
     mut consumer: C,
     mut snapshots: mpsc::Receiver<ControlEnvelope>,
-) {
+) -> Result<(), TransportError> {
     while let Some(envelope) = snapshots.recv().await {
-        let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
-        let (answer, applied) = process_state_snapshot(&store, &mut consumer, &envelope, now);
-        if let Some(generation) = applied {
-            let _ = handle.applied_generation(generation).await;
+        match snapshot_owner_step(&client, &handle, &store, &mut consumer, &envelope).await? {
+            SnapshotStep::Continue => {}
+            SnapshotStep::CleanExit => return Ok(()),
         }
-        let _ = client.send(answer).await;
+    }
+    Ok(())
+}
+
+/// Outcome of one snapshot-owner step.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SnapshotStep {
+    /// The envelope was processed and answered; keep serving.
+    Continue,
+    /// A requested shutdown interrupted the barrier or the answer:
+    /// the normal cascade, exit cleanly.
+    CleanExit,
+}
+
+/// One snapshot-owner iteration: transaction, applied-generation
+/// barrier, answer. Public so the shutdown-boundary semantics are
+/// directly testable: barrier/send failures under a requested
+/// shutdown normalize to [`SnapshotStep::CleanExit`], while the same
+/// failures without one propagate as the owner's error.
+///
+/// # Errors
+///
+/// The dispatch task disappearing before the barrier, or a
+/// non-cascade transport send failure.
+pub async fn snapshot_owner_step<C: SnapshotConsumer>(
+    client: &Arc<ControlClient>,
+    handle: &ControlDispatchHandle,
+    store: &SnapshotStore,
+    consumer: &mut C,
+    envelope: &ControlEnvelope,
+) -> Result<SnapshotStep, TransportError> {
+    let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
+    let (answer, applied) = process_state_snapshot(store, consumer, envelope, now);
+    if let Some(generation) = applied
+        && !handle.applied_generation(generation).await
+    {
+        if client.is_shutdown() {
+            return Ok(SnapshotStep::CleanExit);
+        }
+        return Err(TransportError::Configuration(
+            "dispatch task gone before the applied-generation barrier".to_owned(),
+        ));
+    }
+    match client.send(answer).await {
+        Ok(()) => Ok(SnapshotStep::Continue),
+        Err(TransportError::Closed) if client.is_shutdown() => Ok(SnapshotStep::CleanExit),
+        Err(error) => Err(error),
     }
 }
 

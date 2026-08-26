@@ -123,6 +123,20 @@ pub enum OutboundControl {
     },
 }
 
+/// The dispatcher's verdict on arming a response expectation: only a
+/// live session WITH a response channel can be armed — acknowledging
+/// anything else would tell the caller to send a request whose answer
+/// could never be delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectArmVerdict {
+    /// The expectation is armed; the caller may send its request.
+    Armed,
+    /// No session is registered under this connection id.
+    UnknownConnection,
+    /// The session registered without a response channel.
+    NoResponseChannel,
+}
+
 /// The body kind a session's outstanding request expects back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseKind {
@@ -312,9 +326,19 @@ impl ControlCommandHandler {
     /// The expectation stays armed after a match — Go may push an
     /// updated `RouteAssignment` under the same initiating id — until
     /// the next arm or the session closes.
-    pub fn expect_response(&mut self, connection_id: u64, request_id: u64, kind: ResponseKind) {
-        if let Some(entry) = self.sessions.get_mut(&connection_id) {
-            entry.expected = Some((request_id, kind));
+    pub fn expect_response(
+        &mut self,
+        connection_id: u64,
+        request_id: u64,
+        kind: ResponseKind,
+    ) -> ExpectArmVerdict {
+        match self.sessions.get_mut(&connection_id) {
+            Some(entry) if entry.responses.is_some() => {
+                entry.expected = Some((request_id, kind));
+                ExpectArmVerdict::Armed
+            }
+            Some(_) => ExpectArmVerdict::NoResponseChannel,
+            None => ExpectArmVerdict::UnknownConnection,
         }
     }
 
@@ -1147,8 +1171,17 @@ fn closed_event_envelope(
 /// Session-side notifications into the dispatch task.
 #[derive(Debug)]
 pub enum DispatchNotice {
-    /// A config snapshot generation was applied (CTL-05).
-    AppliedGeneration(u64),
+    /// A config snapshot generation was applied (CTL-05). The ack is
+    /// the barrier between committing a snapshot and acknowledging it
+    /// to Go: only after the dispatcher recorded the generation may
+    /// the `SnapshotResult` OK go out, so commands minted against the
+    /// new generation can never race an older applied view.
+    AppliedGeneration {
+        /// The committed generation.
+        generation: u64,
+        /// Completed when the dispatcher recorded it.
+        applied: tokio::sync::oneshot::Sender<()>,
+    },
     /// An admitted session registers its channels. `applied` is the
     /// causal barrier: interact with the session's registration (send
     /// requests, expect commands to find it) only after it fires.
@@ -1184,10 +1217,11 @@ pub enum DispatchNotice {
         request_id: u64,
         /// The body kind the answer must have.
         kind: ResponseKind,
-        /// Completed when the expectation is armed — the causal
-        /// barrier: the session sends its request to Go only after
-        /// this fires, so the answer cannot exist before the arm.
-        applied: tokio::sync::oneshot::Sender<()>,
+        /// Completed with the dispatcher's arm verdict — the causal
+        /// barrier: the session sends its request to Go only after an
+        /// `Armed` verdict, so the answer cannot exist before the arm
+        /// and a dead/channel-less session is never told to proceed.
+        applied: tokio::sync::oneshot::Sender<ExpectArmVerdict>,
     },
     /// One metering delta from a session's accounting. The ack carries
     /// the ledger's fail-closed verdict; on `Err` the delta was NOT
@@ -1243,14 +1277,35 @@ pub struct ControlDispatchHandle {
     stats: Arc<DispatchStats>,
 }
 
-/// A metering delta could not be handed to the ledger; ownership stays
-/// with the producer in every case.
+/// A metering delta could not be handed to the ledger. Every variant
+/// **returns the original delta**: ownership stays with the producer,
+/// which retries or declares its stream unhealthy — the value is never
+/// silently consumed by a failed handoff.
 #[derive(Debug)]
 pub enum MeteringRecordError {
     /// The ledger rejected the delta (fail-closed verdict).
-    Rejected(MeteringError),
+    Rejected {
+        /// The delta, returned to its owner.
+        delta: control_proto::v1::MeteringDelta,
+        /// The ledger's verdict.
+        error: MeteringError,
+    },
     /// The dispatch task is gone (or its ack channel closed before
     /// answering); the delta was not absorbed.
+    DispatchUnavailable {
+        /// The delta, returned to its owner.
+        delta: control_proto::v1::MeteringDelta,
+    },
+}
+
+/// Arming a response expectation failed; no request may be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectResponseError {
+    /// No session is registered under this connection id.
+    UnknownConnection,
+    /// The session registered without a response channel.
+    NoResponseChannel,
+    /// The dispatch task is gone.
     DispatchUnavailable,
 }
 
@@ -1268,10 +1323,22 @@ impl ControlDispatchHandle {
         Arc::clone(&self.stats)
     }
 
-    /// Records the applied config snapshot generation.
+    /// Records the applied config snapshot generation and **waits
+    /// until the dispatcher recorded it** — the barrier callers (the
+    /// snapshot owner) must pass before acknowledging the generation
+    /// to Go. Returns false when the dispatch task is gone.
     pub async fn applied_generation(&self, generation: u64) -> bool {
-        self.notify(DispatchNotice::AppliedGeneration(generation))
+        let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::AppliedGeneration {
+                generation,
+                applied: applied_tx,
+            })
             .await
+        {
+            return false;
+        }
+        applied_rx.await.is_ok()
     }
 
     /// Registers an admitted session and **waits until the dispatcher
@@ -1314,16 +1381,23 @@ impl ControlDispatchHandle {
         .await
     }
 
-    /// Arms the session's response expectation and **waits until the
-    /// dispatcher applied it**: the caller must send the corresponding
-    /// request to Go only after this returns true, which is what makes
-    /// the fail-closed correlation race-free.
+    /// Arms the session's response expectation and **waits for the
+    /// dispatcher's verdict**: the caller may send the corresponding
+    /// request to Go only after `Ok(())` — which is issued only for a
+    /// live session with a response channel, so the caller is never
+    /// told to start an exchange whose answer could not be delivered.
+    ///
+    /// # Errors
+    ///
+    /// The dispatcher's arm rejection, or
+    /// [`ExpectResponseError::DispatchUnavailable`] when the dispatch
+    /// task is gone.
     pub async fn expect_response(
         &self,
         connection_id: u64,
         request_id: u64,
         kind: ResponseKind,
-    ) -> bool {
+    ) -> Result<(), ExpectResponseError> {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
         if !self
             .notify(DispatchNotice::ExpectResponse {
@@ -1334,9 +1408,14 @@ impl ControlDispatchHandle {
             })
             .await
         {
-            return false;
+            return Err(ExpectResponseError::DispatchUnavailable);
         }
-        applied_rx.await.is_ok()
+        match applied_rx.await {
+            Ok(ExpectArmVerdict::Armed) => Ok(()),
+            Ok(ExpectArmVerdict::UnknownConnection) => Err(ExpectResponseError::UnknownConnection),
+            Ok(ExpectArmVerdict::NoResponseChannel) => Err(ExpectResponseError::NoResponseChannel),
+            Err(_) => Err(ExpectResponseError::DispatchUnavailable),
+        }
     }
 
     /// Hands one metering delta to the ledger and returns the ledger's
@@ -1355,20 +1434,23 @@ impl ControlDispatchHandle {
         &self,
         delta: control_proto::v1::MeteringDelta,
     ) -> Result<(), MeteringRecordError> {
+        // The producer keeps the original for the whole handoff: the
+        // notice carries a copy, so every failure path — send failure,
+        // ack closed, ledger rejection — can hand the value back.
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         if !self
             .notify(DispatchNotice::Metering {
-                delta: Box::new(delta),
+                delta: Box::new(delta.clone()),
                 ack: ack_tx,
             })
             .await
         {
-            return Err(MeteringRecordError::DispatchUnavailable);
+            return Err(MeteringRecordError::DispatchUnavailable { delta });
         }
         match ack_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(MeteringRecordError::Rejected(error)),
-            Err(_) => Err(MeteringRecordError::DispatchUnavailable),
+            Ok(Err(error)) => Err(MeteringRecordError::Rejected { delta, error }),
+            Err(_) => Err(MeteringRecordError::DispatchUnavailable { delta }),
         }
     }
 
@@ -1832,8 +1914,12 @@ async fn apply_notice<S: DispatchSender>(
     notice: DispatchNotice,
 ) -> Result<(), DispatchFatal> {
     match notice {
-        DispatchNotice::AppliedGeneration(generation) => {
+        DispatchNotice::AppliedGeneration {
+            generation,
+            applied,
+        } => {
             handler.set_applied_generation(generation);
+            let _ = applied.send(());
         }
         DispatchNotice::RegisterSession {
             identity,
@@ -1866,8 +1952,8 @@ async fn apply_notice<S: DispatchSender>(
             kind,
             applied,
         } => {
-            handler.expect_response(connection_id, request_id, kind);
-            let _ = applied.send(());
+            let verdict = handler.expect_response(connection_id, request_id, kind);
+            let _ = applied.send(verdict);
         }
         DispatchNotice::Metering { delta, ack } => {
             // Record and ack in one await-free step: the verdict the
@@ -1962,9 +2048,16 @@ async fn run_tick<S: DispatchSender>(
             dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
         }
         Ok(None) => {}
+        Err(MeteringError::SequenceExhausted) => {
+            // The strictly monotonic sequence space is gone: every
+            // future seal would fail identically, so the loop stops
+            // fail-closed instead of living forever unable to seal.
+            handler.count_metering_seal_failure();
+            return Err(DispatchFatal::MeteringSequenceExhausted);
+        }
         Err(_) => {
-            // Fail-closed bound reached (for example: no reconcile ack
-            // path): counted, and nothing is lost — a failed seal
+            // Recoverable fail-closed bound (for example: no reconcile
+            // ack path): counted, and nothing is lost — a failed seal
             // leaves the open accumulation intact and sealed batches
             // stay retained until acknowledged.
             handler.count_metering_seal_failure();
@@ -1993,6 +2086,28 @@ pub fn spawn_control_dispatch(
     InboundForwarder,
     tokio::task::JoinHandle<Result<(), DispatchFatal>>,
 ) {
+    spawn_control_dispatch_with_handler(
+        ControlCommandHandler::new(),
+        client,
+        snapshot_tx,
+        tick_interval,
+    )
+}
+
+/// [`spawn_control_dispatch`] with a caller-provided handler — the
+/// assembly seam for alternate compositions and for regressions that
+/// need to pre-populate gate or ledger state behind the public handle.
+#[must_use]
+pub fn spawn_control_dispatch_with_handler(
+    handler: ControlCommandHandler,
+    client: Arc<ControlClient>,
+    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    tick_interval: Duration,
+) -> (
+    ControlDispatchHandle,
+    InboundForwarder,
+    tokio::task::JoinHandle<Result<(), DispatchFatal>>,
+) {
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let (notice_tx, notice_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let state = client.subscribe_state();
@@ -2001,7 +2116,6 @@ pub fn spawn_control_dispatch(
         state: client.subscribe_state(),
         retained: Arc::new(StdMutex::new(None)),
     };
-    let handler = ControlCommandHandler::new();
     let handler_stats = handler.stats();
     let task = tokio::spawn(run_control_dispatch(
         handler,
