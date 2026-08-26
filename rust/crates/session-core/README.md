@@ -88,3 +88,42 @@ layouts live in `mysql-wire::handshake`):
   libmysqlclient, zstd, TLS-with-dropped-SSL-bit) end-to-end through
   codec + policy, plus exhaustive truncation sweeps (no prefix panics or
   decodes).
+
+## Authentication relay (`auth`, SES-02)
+
+Pure backend-auth policy frozen from Go `authenticator.go`:
+
+- `plan_backend_handshake` (Go `writeAuthHandshake`): backend mask =
+  negotiated∩backend (+`CONNECT_ATTRS` when attrs exist, ±`SSL` by TLS
+  mode); `require-backend-tls` without a config → `ProxyNoTls` route;
+  otherwise TLS is opportunistic (client `SSL` && backend `SSL` &&
+  config). Backend TLS always activates between the 32-byte `SSLRequest`
+  prefix and the credentials; TLS failure routes as
+  `BackendProxyProtocol` (Go quirk), write failures as
+  `BackendHandshake`. The plan takes the `RoutingHandshake` gate, so it
+  cannot run before negotiation succeeded.
+- `AuthRelay` (Go's auth-forward loop): pure turn machine relaying
+  backend↔client auth exchanges without interpreting them. Plugin switch
+  round-trips, `caching_sha2_password` fast path (plugin-gated — sm3 and
+  everything else is plain pass-through), handler-approved backend
+  reconnect (state reset), first-packet PROXY-protocol error routing
+  (`1156`/`8052` by code, or the "PROXY Protocol" message substring under
+  any code, → `BackendProxyProtocol`, later
+  errors → `AuthenticationFailed`), and per-side compression activation
+  only on the final OK (client = negotiated mask, backend =
+  negotiated∩backend, zlib-wins order).
+- `classify_backend_auth_packet`: the no-panic entry point from a
+  transiently borrowed backend auth payload to a secret-free `AuthEvent`
+  (OK / error with the `1156`/`8052`/"PROXY Protocol"-substring suspect
+  rule — Go's sniff has **no code guard** — / auth switch with
+  NUL-terminated plugin classification / two-byte fast-auth marker /
+  extra data). An unterminated auth-switch name is a typed
+  `MalformedAuthPacket` where Go would panic (ledger SES-02-D1).
+- Reconnect is a hard gate: after a handler-approved reconnect the relay
+  accepts only `BackendReconnected` carrying the **new** backend
+  capability, which later compression activation uses (Go re-reads the
+  greeting after `RECONNECT`).
+- Secrets cannot leak by construction: events/effects/errors are
+  classifications that carry no auth bytes; a test sweeps the whole
+  `Debug` surface. Live-TiDB authentication tests belong to the runtime
+  acceptance phases.
