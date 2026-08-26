@@ -118,18 +118,24 @@ async fn run(options: Options) -> Result<(), String> {
     let shared_client = Arc::new(ControlClient::new(client).map_err(|error| error.to_string())?);
     let (drain_tx, drain_rx) = watch::channel(false);
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+    let loop_config = SessionLoopConfig::default();
     let owner: Arc<dyn BoundSessionHandler> = Arc::new(EngineSessionOwner::new(
         Arc::clone(&shared_client),
         "default",
         session_shutdown_rx,
         drain_rx,
-        SessionLoopConfig::default(),
+        loop_config,
     ));
     let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
     let (consumer, serving) = DataplaneSnapshotConsumer::new(
         Arc::new(SystemMemoryProbe::new()),
         Arc::new(connection_handler),
     );
+    // Forced shutdown lets each session owner finish its bounded
+    // terminal work (close notice + engine join) before the abort
+    // backstop fires.
+    let consumer =
+        consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
     let runtime = spawn_control_runtime_with_client(
         Arc::clone(&shared_client),
         Duration::from_millis(100),

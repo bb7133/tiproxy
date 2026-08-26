@@ -43,6 +43,10 @@ use crate::registry::{ConnectionLease, ConnectionMetadata, ConnectionRegistry, R
 const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(5);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
+/// How much longer the listener-task join waits than the session-task
+/// join it contains, so the inner grace can elapse first.
+const FORCE_JOIN_MARGIN: Duration = Duration::from_secs(1);
+
 /// Immutable configured SQL listener.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ListenerSpec {
@@ -357,6 +361,7 @@ where
 pub struct DataplaneServer {
     listeners: Vec<NamedListener>,
     handle: DataplaneHandle,
+    force_join_grace: Duration,
 }
 
 impl DataplaneServer {
@@ -419,7 +424,22 @@ impl DataplaneServer {
             registry,
             counters,
         };
-        Ok(Self { listeners, handle })
+        Ok(Self {
+            listeners,
+            handle,
+            force_join_grace: Duration::ZERO,
+        })
+    }
+
+    /// Bounds how long forced shutdown waits for session tasks to finish
+    /// their own terminal work (close notices, bounded engine joins)
+    /// before the abort backstop. Zero — the default — aborts
+    /// immediately; compositions whose sessions self-bound their force
+    /// path should pass that bound plus margin.
+    #[must_use]
+    pub fn with_force_join_grace(mut self, grace: Duration) -> Self {
+        self.force_join_grace = grace;
+        self
     }
 
     /// Returns a cloneable control/reload/diagnostic handle before `run`
@@ -451,6 +471,7 @@ impl DataplaneServer {
                 self.handle.admission.clone(),
                 self.handle.registry.clone(),
                 Arc::clone(&self.handle.counters),
+                self.force_join_grace,
             ));
         }
         let mut shutdown = self.handle.shutdown_tx.subscribe();
@@ -479,6 +500,24 @@ impl DataplaneServer {
             }
         };
         self.handle.shutdown();
+        if outcome.is_ok() && !self.force_join_grace.is_zero() {
+            // Ordered force: the listener owners are themselves waiting
+            // out the same grace for their sessions' terminal work, so
+            // hold the abort backstop a margin longer than they do.
+            let deadline = sleep(self.force_join_grace + FORCE_JOIN_MARGIN);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut deadline => break,
+                    joined = listener_tasks.join_next() => {
+                        if joined.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         listener_tasks.abort_all();
         while listener_tasks.join_next().await.is_some() {}
         outcome
@@ -655,6 +694,7 @@ async fn run_listener(
     admission: AdmissionController,
     registry: ConnectionRegistry,
     counters: Arc<ServerCounters>,
+    force_join_grace: Duration,
 ) {
     let NamedListener {
         name,
@@ -751,10 +791,45 @@ async fn run_listener(
             }
         }
     }
+    join_sessions_bounded(&mut sessions, force_join_grace, &counters).await;
     sessions.abort_all();
     while let Some(joined) = sessions.join_next().await {
         if joined.is_err_and(|error| error.is_panic()) {
             counters.handler_panics.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Force phase: session owners still emit their close notices and join
+/// their engines under the per-session cleanup bound; hold the abort
+/// backstop until they finish or the grace ends.
+async fn join_sessions_bounded(
+    sessions: &mut JoinSet<()>,
+    grace: Duration,
+    counters: &ServerCounters,
+) {
+    if grace.is_zero() || sessions.is_empty() {
+        return;
+    }
+    let deadline = sleep(grace);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut deadline => break,
+            joined = sessions.join_next() => {
+                match joined {
+                    Some(result) => {
+                        if result.is_err_and(|error| error.is_panic()) {
+                            counters.handler_panics.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        if sessions.is_empty() {
+            break;
         }
     }
 }

@@ -695,6 +695,8 @@ impl Engine {
             Ok(negotiation) => negotiation,
             Err(missing) => {
                 let (code, state, message) = missing.client_response();
+                self.client_w
+                    .reset_sequence(self.client_r.expected_sequence());
                 let _ = self.write_client_error(code, state, message).await;
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::ClientNetwork);
@@ -941,8 +943,16 @@ impl Engine {
             if self.closing {
                 return None;
             }
+            // Every client command starts a fresh wire exchange at
+            // sequence zero, and its response lineage answers at one.
+            self.client_r.reset_sequence(0);
             // Between commands: serve control effects and probes while
-            // waiting for the next client command.
+            // waiting for the next client command. Only the peek is
+            // raced — it retains consumed bytes inside the reader, so a
+            // losing arm never drops partial-frame progress. Once a
+            // header is visible the logical read runs uncontended; a
+            // client stalling mid-frame is bounded by the owner's force
+            // deadline, like any other mid-command stall.
             let payload = tokio::select! {
                 cmd = self.cmds.recv() => {
                     let cmd = cmd?;
@@ -951,8 +961,12 @@ impl Engine {
                         Awaited::Got => continue,
                     }
                 }
-                read = self.client_r.read_logical(COMMAND_PAYLOAD_LIMIT) => {
-                    match read {
+                peeked = self.client_r.peek_packet() => {
+                    if let Err(error) = peeked {
+                        let source = self.client_read_end(&error).await;
+                        return Some(source);
+                    }
+                    match self.client_r.read_logical(COMMAND_PAYLOAD_LIMIT).await {
                         Ok(packet) => packet.payload,
                         Err(error) => {
                             let source = self.client_read_end(&error).await;
@@ -961,6 +975,7 @@ impl Engine {
                     }
                 }
             };
+            self.client_w.reset_sequence(1);
             // Extract the plan's owned facts before the payload moves:
             // CommandPlan borrows the packet bytes.
             let planned = {
@@ -1010,18 +1025,8 @@ impl Engine {
             let Some(pending) = self.pending_command.take() else {
                 return Some(WireErrorSource::Proxy);
             };
-            if let Some(backend) = self.backend.as_mut() {
-                if backend
-                    .writer
-                    .write_logical(&pending.payload, true)
-                    .await
-                    .is_err()
-                {
-                    let _ = self.events.send(SessionEvent::BackendIoError).await;
-                    return Some(WireErrorSource::BackendNetwork);
-                }
-            } else {
-                return Some(WireErrorSource::Proxy);
+            if let Some(source) = self.forward_command_to_backend(&pending).await {
+                return Some(source);
             }
             self.apply_command_mutations(&pending, false);
 
@@ -1043,6 +1048,30 @@ impl Engine {
                 return None;
             }
         }
+    }
+
+    /// Forwards one accepted command to the backend on a fresh exchange:
+    /// the request restarts at sequence zero and its response lineage
+    /// answers from one.
+    async fn forward_command_to_backend(
+        &mut self,
+        pending: &PendingCommand,
+    ) -> Option<WireErrorSource> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Some(WireErrorSource::Proxy);
+        };
+        backend.writer.reset_sequence(0);
+        backend.reader.reset_sequence(1);
+        if backend
+            .writer
+            .write_logical(&pending.payload, true)
+            .await
+            .is_err()
+        {
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(WireErrorSource::BackendNetwork);
+        }
+        None
     }
 
     /// Streams one command's backend response(s) to the client.
@@ -1122,6 +1151,15 @@ impl Engine {
 
     /// The client LOCAL INFILE upload until the empty terminator.
     async fn infile_rounds(&mut self) -> Option<WireErrorSource> {
+        // The upload continues each side's exchange in lockstep: the
+        // client's next chunk follows the forwarded infile request, and
+        // the chunks forwarded to the backend follow its request packet.
+        self.client_r.reset_sequence(self.client_w.next_sequence());
+        if let Some(backend) = self.backend.as_mut() {
+            backend
+                .writer
+                .reset_sequence(backend.reader.expected_sequence());
+        }
         loop {
             let payload = match self.client_r.read_logical(COMMAND_PAYLOAD_LIMIT).await {
                 Ok(packet) => packet.payload,
@@ -1155,6 +1193,13 @@ impl Engine {
                 return Some(WireErrorSource::BackendNetwork);
             }
             if done {
+                // The final backend response continues after the last
+                // uploaded chunk on both sides of the relay.
+                backend
+                    .reader
+                    .reset_sequence(backend.writer.next_sequence());
+                self.client_w
+                    .reset_sequence(self.client_r.expected_sequence());
                 return None;
             }
         }
@@ -1304,6 +1349,10 @@ impl Engine {
                     let Some(payload) = self.relay_hold.take() else {
                         return Err(WireErrorSource::Proxy);
                     };
+                    // Connection-phase relay: both directions continue
+                    // the one counter per channel in lockstep.
+                    self.client_w
+                        .reset_sequence(self.client_r.expected_sequence());
                     if self.client_w.write_logical(&payload, true).await.is_err() {
                         let _ = self.events.send(SessionEvent::ClientIoError).await;
                         return Err(WireErrorSource::ClientNetwork);
@@ -1316,6 +1365,9 @@ impl Engine {
                     let Some(backend) = self.backend.as_mut() else {
                         return Err(WireErrorSource::Proxy);
                     };
+                    backend
+                        .writer
+                        .reset_sequence(backend.reader.expected_sequence());
                     if backend.writer.write_logical(&payload, true).await.is_err() {
                         let _ = self.events.send(SessionEvent::BackendIoError).await;
                         return Err(WireErrorSource::BackendNetwork);

@@ -45,6 +45,7 @@ use mysql_wire::{
 };
 use proxy_io::{PacketReader, PacketWriter};
 use session_core::handshake::build_greeting;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
@@ -148,7 +149,12 @@ async fn run_fake_backend(listener: TcpListener) {
         if writer.write_logical(&greeting, true).await.is_err() {
             continue;
         }
-        // Handshake response.
+        // Handshake response: strict wire sequence — it must continue
+        // the greeting exchange at one, no silent resync.
+        match reader.peek_packet().await {
+            Ok(preview) if preview.sequence_id == 1 => {}
+            _ => continue,
+        }
         if reader.read_logical(64 * 1024).await.is_err() {
             continue;
         }
@@ -170,6 +176,12 @@ async fn run_fake_backend(listener: TcpListener) {
         // Command loop: OK for everything until quit/EOF.
         loop {
             reader.reset_sequence(0);
+            // Strict wire sequence: every proxied command must restart
+            // its exchange at zero, exactly like the Go oracle.
+            match reader.peek_packet().await {
+                Ok(preview) if preview.sequence_id == 0 => {}
+                _ => break,
+            }
             let Ok(packet) = reader.read_logical(1024 * 1024).await else {
                 break;
             };
@@ -205,7 +217,7 @@ struct Stack {
     server_handle: dataplane::DataplaneHandle,
     sender: Arc<FakeSender>,
     _state_tx: watch::Sender<ConnectionState>,
-    _shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: watch::Sender<bool>,
     drain_tx: watch::Sender<bool>,
     forwarder: Arc<dataplane::control_dispatch::InboundForwarder>,
     sql_port: u16,
@@ -268,6 +280,9 @@ async fn spawn_stack() -> Stack {
     else {
         unreachable!("dataplane bind")
     };
+    // Mirror the executable's composition: forced shutdown holds the
+    // abort backstop past the session owners' cleanup bound.
+    let server = server.with_force_join_grace(Duration::from_secs(3));
     let server_handle = server.handle();
     let server_task = tokio::spawn(async move {
         let _ = server.run(connection_handler).await;
@@ -277,7 +292,7 @@ async fn spawn_stack() -> Stack {
         server_handle,
         sender,
         _state_tx: state_tx,
-        _shutdown_tx: shutdown_tx,
+        shutdown_tx,
         drain_tx,
         forwarder: Arc::new(forwarder),
         sql_port: sql_addr.port(),
@@ -345,6 +360,10 @@ impl MysqlClient {
         let (read, write) = stream.into_split();
         let mut reader = PacketReader::new(read);
         let mut writer = PacketWriter::new(write);
+        // Strict wire sequences throughout the connection phase: the
+        // greeting opens at zero and the auth result continues the
+        // exchange right after the handshake response.
+        assert_eq!(reader.peek_packet().await.ok()?.sequence_id, 0);
         let greeting = reader.read_logical(64 * 1024).await.ok()?;
         let parsed = parse_initial_handshake(&greeting.payload).ok()?;
         let capabilities = CapabilityFlags::PROTOCOL_41
@@ -367,8 +386,13 @@ impl MysqlClient {
         .ok()?;
         writer.reset_sequence(reader.expected_sequence());
         writer.write_logical(&response, true).await.ok()?;
-        reader.reset_sequence(writer.next_sequence());
+        let expected_auth_sequence = writer.next_sequence();
+        reader.reset_sequence(expected_auth_sequence);
         // Auth result.
+        assert_eq!(
+            reader.peek_packet().await.ok()?.sequence_id,
+            expected_auth_sequence
+        );
         let auth = reader.read_logical(64 * 1024).await.ok()?;
         if auth.payload.first() != Some(&0x00) {
             return None;
@@ -388,6 +412,12 @@ impl MysqlClient {
             return false;
         }
         self.reader.reset_sequence(1);
+        // Strict wire sequence: the response to a fresh command must
+        // answer at one, whatever earlier exchanges left behind.
+        match self.reader.peek_packet().await {
+            Ok(preview) => assert_eq!(preview.sequence_id, 1),
+            Err(_) => return false,
+        }
         let Ok(response) = self.reader.read_logical(64 * 1024).await else {
             return false;
         };
@@ -446,7 +476,7 @@ async fn wait_sent<F: Fn(&ControlEnvelope) -> bool>(
     sender: &Arc<FakeSender>,
     predicate: F,
 ) -> Option<ControlEnvelope> {
-    for _ in 0..300 {
+    for _ in 0..500 {
         if let Some(envelope) = sender.sent().into_iter().find(|e| predicate(e)) {
             return Some(envelope);
         }
@@ -641,6 +671,71 @@ async fn redirect_refusal_is_exact_and_session_survives() {
     stack.dispatch_task.abort();
 }
 
+/// Contract #1 cancel-safety: control activity racing a fragmented
+/// client command must not drop bytes the engine already consumed from
+/// the wire — the exchange completes intact once the frame arrives.
+#[tokio::test]
+async fn control_activity_during_fragmented_command_keeps_wire_intact() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("SELECT 1").await);
+
+    // Send only part of the next command's header, then let control
+    // traffic win the engine's idle race while the frame is pending.
+    let payload = b"\x03SELECT 6";
+    let mut frame = vec![u8::try_from(payload.len()).unwrap_or(0), 0, 0, 0];
+    frame.extend_from_slice(payload);
+    assert!(client.writer.get_mut().write_all(&frame[..2]).await.is_ok());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let redirect = command_envelope(
+        6001,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-frag".to_owned(),
+            backend_id: "tidb-other".to_owned(),
+            backend_address: "127.0.0.1:1".to_owned(),
+            cluster_name: String::new(),
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let refused = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-frag"),
+    )
+    .await;
+    assert!(refused.is_some(), "control served while the frame is open");
+
+    // Complete the frame: nothing consumed earlier may be lost. A
+    // desynced engine never answers, so the read is deadline-bounded.
+    assert!(client.writer.get_mut().write_all(&frame[2..]).await.is_ok());
+    client.reader.reset_sequence(1);
+    match timeout(Duration::from_secs(5), client.reader.peek_packet()).await {
+        Ok(Ok(preview)) => assert_eq!(preview.sequence_id, 1),
+        other => unreachable!("the response survives the race: {other:?}"),
+    }
+    let Ok(Ok(response)) = timeout(
+        Duration::from_secs(5),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await
+    else {
+        unreachable!("the fragmented command still round-trips")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
 /// Control-plane loss must not tear down a healthy session (control-v1
 /// last-good): with the dispatcher gone, established traffic continues.
 #[tokio::test]
@@ -772,6 +867,49 @@ async fn drain_force_deadline_preempts_in_flight_command() {
     assert_eq!(
         event.error_source, 6,
         "timeout force-close uses the proxy-shutdown source: {event:?}"
+    );
+    let _ = slow.await;
+    stack.dispatch_task.abort();
+}
+
+/// The force phase of a full server shutdown (session shutdown and
+/// server shutdown back-to-back, exactly the executable's signal path)
+/// must not abort a session owner before its terminal work: the CLOSED
+/// notice with shutdown attribution still goes out mid-command.
+#[tokio::test]
+async fn forced_shutdown_still_emits_session_closed() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("SELECT 1").await);
+
+    // Mid-command, no safe boundary: the backend stalls for seconds.
+    let slow = tokio::spawn(async move { client.query_ok("SELECT SLEEP").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    stack.shutdown_tx.send_replace(true);
+    stack.server_handle.shutdown();
+
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(closed) = closed else {
+        unreachable!("the forced session still reports CLOSED")
+    };
+    let Some(Body::ConnectionEvent(event)) = closed.body else {
+        unreachable!()
+    };
+    assert_eq!(
+        event.error_source, 6,
+        "forced shutdown uses the proxy-shutdown source: {event:?}"
     );
     let _ = slow.await;
     stack.dispatch_task.abort();
