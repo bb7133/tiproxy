@@ -434,10 +434,21 @@ impl CommandGate {
         self.applied_generation = generation;
     }
 
-    /// The next monotonic sequence for an outgoing connection event.
-    pub fn next_event_sequence(&mut self) -> u64 {
-        self.event_sequence = self.event_sequence.saturating_add(1);
-        self.event_sequence
+    /// The applied config snapshot generation (the reconcile request's
+    /// known generation).
+    #[must_use]
+    pub const fn applied_generation(&self) -> u64 {
+        self.applied_generation
+    }
+
+    /// Records the request id an outgoing connection event was sent
+    /// under: the ids come from the sender's single checked allocator
+    /// (so they are monotonic), and the recorded maximum is the
+    /// `last_connection_event_sequence` the reconcile request reports.
+    pub fn record_event_sequence(&mut self, request_id: u64) {
+        if request_id > self.event_sequence {
+            self.event_sequence = request_id;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -806,12 +817,13 @@ impl CommandGate {
     /// session counts at most once (duplicate closes are no-ops) and an
     /// id outside the matched set never counts. Counters are monotonic
     /// and can never go negative or overshoot by construction.
-    pub fn record_drain_close(&mut self, connection_id: u64, forced: bool) {
-        let Some(drain) = self.drain.as_mut() else {
-            return;
-        };
+    /// Returns the **terminal** `DrainResult` when this close completes
+    /// the active drain (the completion transition must proactively
+    /// reach the issuer — it never re-asks).
+    pub fn record_drain_close(&mut self, connection_id: u64, forced: bool) -> Option<DrainResult> {
+        let drain = self.drain.as_mut()?;
         if !drain.remaining.remove(&connection_id) {
-            return;
+            return None;
         }
         if forced {
             drain.force_closed += 1;
@@ -820,7 +832,23 @@ impl CommandGate {
         }
         if drain.remaining.is_empty() {
             self.finish_drain();
+            return self
+                .completed_drains
+                .back()
+                .map(|done| done.result(ErrorCode::Ok));
         }
+        None
+    }
+
+    /// The terminal result of a completed drain by id (a zero-match
+    /// admission completes immediately, so its very first answer is the
+    /// terminal).
+    #[must_use]
+    pub fn completed_drain_result(&self, drain_id: &str) -> Option<DrainResult> {
+        self.completed_drains
+            .iter()
+            .find(|done| done.drain_id == drain_id)
+            .map(|done| done.result(ErrorCode::Ok))
     }
 
     /// Current progress of the active drain (for the periodic report),

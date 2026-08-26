@@ -17,11 +17,9 @@ package controlbridge
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"sync"
-	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -70,6 +68,10 @@ type DrainIssuer struct {
 	// composition observes it and retries once that operation
 	// completes.
 	foreignActive *controlpb.DrainResult
+	// foreignResolved holds the terminal result that ended the
+	// observed foreign drain — the consumable retry signal for the
+	// composition's own pending drain.
+	foreignResolved *controlpb.DrainResult
 }
 
 type drainOperation struct {
@@ -83,28 +85,44 @@ type drainOperation struct {
 // ErrDrainInProgress rejects a second concurrent drain locally.
 var ErrDrainInProgress = errors.New("a different drain is already in progress")
 
-// NewDrainIssuer creates an idle issuer with a fresh incarnation nonce.
-func NewDrainIssuer() *DrainIssuer {
+// NewDrainIssuer creates an idle issuer with a fresh incarnation
+// nonce. It fails when crypto/rand does: lineage identity is the
+// safety anchor for drain wire ids, and a weaker (guessable or
+// collision-prone) nonce could silently alias two incarnations, so the
+// constructor refuses to start rather than degrade.
+func NewDrainIssuer() (*DrainIssuer, error) {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
-		// crypto/rand failing is unrecoverable for lineage identity;
-		// fall back to a time-derived nonce rather than a constant.
-		binary.LittleEndian.PutUint64(nonce, uint64(time.Now().UnixNano()))
+		return nil, fmt.Errorf("drain issuer incarnation nonce: %w", err)
 	}
 	return &DrainIssuer{
 		incarnation: hex.EncodeToString(nonce),
 		operations:  make(map[string]*drainOperation),
 		callerIndex: make(map[string]string),
-	}
+	}, nil
 }
 
 // ForeignActiveDrain reports a previous incarnation's drain the Rust
 // side answered DRAIN_IN_PROGRESS for (nil when none observed): the
 // composition retries its own drain after that operation completes.
+// The record clears when a terminal result for that wire id arrives —
+// [DrainIssuer.ForeignDrainResolved] is the retry signal.
 func (issuer *DrainIssuer) ForeignActiveDrain() *controlpb.DrainResult {
 	issuer.mu.Lock()
 	defer issuer.mu.Unlock()
 	return issuer.foreignActive
+}
+
+// ForeignDrainResolved consumes the retry signal: it returns the
+// terminal result that ended the previously observed foreign drain
+// (nil when none has completed since the last call) and clears it, so
+// the composition retries its own drain exactly once per resolution.
+func (issuer *DrainIssuer) ForeignDrainResolved() *controlpb.DrainResult {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	resolved := issuer.foreignResolved
+	issuer.foreignResolved = nil
+	return resolved
 }
 
 // ErrDrainSequenceExhausted fails closed when the monotonic sequence
@@ -296,7 +314,17 @@ func (issuer *DrainIssuer) HandleDrainResult(result *controlpb.DrainResult) erro
 		// A wire id this incarnation never bound. A DRAIN_IN_PROGRESS
 		// answer here names a previous incarnation's still-active
 		// drain: record it observably so the composition can wait and
-		// retry instead of never learning about the old operation.
+		// retry instead of never learning about the old operation. Its
+		// terminal (the Rust side answers the completion transition
+		// proactively) clears the record and arms the retry signal.
+		if result.GetComplete() {
+			if issuer.foreignActive != nil &&
+				issuer.foreignActive.GetDrainId() == result.GetDrainId() {
+				issuer.foreignActive = nil
+				issuer.foreignResolved = result
+			}
+			return nil
+		}
 		if result.GetCode() == controlpb.ErrorCode_ERROR_CODE_DRAIN_IN_PROGRESS {
 			issuer.foreignActive = result
 		}

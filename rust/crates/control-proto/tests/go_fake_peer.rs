@@ -142,7 +142,10 @@ async fn rust_client_exchanges_messages_with_go_codec_peer() -> Result<(), Box<d
 
     timeout(Duration::from_secs(2), async {
         loop {
-            if *state.borrow() == ConnectionState::Connected(101) {
+            if matches!(
+                *state.borrow(),
+                ConnectionState::Connected { epoch: 101, .. }
+            ) {
                 return Ok::<(), TransportError>(());
             }
             state.changed().await.map_err(|_| TransportError::Closed)?;

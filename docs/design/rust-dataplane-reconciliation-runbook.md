@@ -77,29 +77,61 @@ The gates are on the real message paths on both sides:
 
 - **Rust** — `dataplane::control_dispatch`: `spawn_control_dispatch`
   binds the **process-long-lived** `ControlCommandHandler` to the shared
-  control client — the returned `InboundForwarder` is the transport
-  `Handler` for `ControlClient::run` (full-queue backpressure errors the
-  stream into reconnect, never drops a command), and the
-  `ControlDispatchHandle` is the session-facing surface
-  (register/backend/closed/redirect-finished/close-finished/negotiated
-  notices). Control reconnects update the peer mode only; the gate, its
-  tombstones, unacked results, and watermarks are never rebuilt —
-  cross-epoch replay depends on them. `handle_envelope` consumes real
-  `ControlEnvelope`s (drain deadlines converted from the wire's
-  absolute unix-millis against an injected clock pair; a command
-  arriving past its force deadline force-closes immediately) and emits
-  complete outbound envelopes; each matched session receives
-  `CloseImmediate` exactly once however many force ticks land. Session
-  terminations and reconcile ghosts produce **sequenced** CLOSED event
-  envelopes (the event sequence rides the envelope request id, which
-  both Go's per-epoch dedup and the reconcile
-  `last_connection_event_sequence` key on).
+  control client. The returned `InboundForwarder` is the transport
+  `Handler` for `ControlClient::run`: its `handle` **awaits** a bounded
+  channel send, so a slow dispatcher stalls the read loop and the
+  backpressure is real — through TCP to the Go sender's bounded lanes —
+  instead of an unbounded Rust-side queue (Go frees lane quota once a
+  frame is written, so only await-backpressure actually bounds memory)
+  or a dropped command the peer considers delivered. The dispatch loop
+  is the explicit multiplexer for **every** inbound body: commands and
+  reconcile snapshots consult the gate; `RouteAssignment` /
+  `HandshakeDecision` / `HandshakeResult` forward to the owning
+  session's registered response channel (slot overflow is answered as a
+  protocol violation, a closed channel defers to close accounting);
+  snapshot bodies forward — awaited — to the CTL-05 owner; transport
+  bodies terminate; anything else is answered with a typed protocol
+  error and counted. Nothing is silently dropped. Reconnect is
+  automatic and atomic: the loop watches the client's connection
+  state, whose `Connected { epoch, capabilities }` snapshot carries
+  both values in one atomic read — on every new session it updates the
+  peer mode from the negotiated capability mask, sends the reconcile
+  request built from the gate, and replays unacknowledged metering,
+  all bound to exactly that session. Control reconnects update the
+  peer mode only; the gate, its tombstones, unacked results, and
+  watermarks are never rebuilt — cross-epoch replay depends on them.
+  `handle_envelope` consumes real `ControlEnvelope`s (wire deadlines
+  validated — force before graceful or absurdly far ahead is a
+  protocol violation — then converted against an injected clock pair;
+  a command arriving past its force deadline force-closes immediately)
+  and emits complete outbound envelopes. **Request-id lineage**: every
+  application-originated envelope takes its id from the sender's
+  single checked allocator (heartbeats included; fail-closed at
+  exhaustion, never wrapping), while **responses reuse the initiating
+  request id** — inline answers carry the inbound command's id and
+  asynchronous terminals carry the id saved at admission. CLOSED
+  lifecycle events (session terminations and reconcile ghosts) take
+  allocator ids, and the recorded maximum is the reconcile
+  `last_connection_event_sequence` both Go's per-epoch dedup and
+  rehydration key on. **Terminal `DrainResult`s are produced
+  proactively on the completion transition** — the last matched
+  session closing (or a zero-match admission) answers the issuer with
+  the initiating id, never waiting for a command replay — and
+  force-phase `CloseImmediate` is marked delivered only when the send
+  succeeds: a full session channel retries on the next tick, a closed
+  one converges through the close path.
 - **Go** — `pkg/controlbridge.CompositeControlHandler` (transport
   handler) composes the `RouterAdapter`, `DrainIssuer`, and
   `MeteringConsumer`: metering batches apply with contiguous-sequence
   dedup, drain results route to the issuer, and every
   `ReconcileRequest` restores the issuer's drain watermark before the
-  adapter answers.
+  adapter answers. `NewDrainIssuer` is **fallible**: the incarnation
+  nonce is the safety anchor for drain wire-id lineage, so a
+  crypto/rand failure refuses to construct rather than degrade to a
+  guessable nonce. An observed foreign drain (a previous incarnation's
+  wire id answered `DRAIN_IN_PROGRESS`) clears when its terminal
+  result arrives and arms the consume-once `ForeignDrainResolved`
+  retry signal.
 
 **Lineage is the control epoch, not the config generation**: a Rust
 restart can keep the same snapshot generation, so closed-connection
@@ -156,9 +188,13 @@ by construction (no connection object exists), and retried by
 `ResolveOrphans`. After `MaxOrphanResolveAttempts` failed rehydrations
 the adapter closes the session with a generation-stamped
 per-connection `CloseCommand` — and responsibility transfers only when
-that close actually reached the negotiated sender with the
-`PER_CONNECTION_CLOSE` capability; failed sends keep the orphan for
-the next attempt. `AttachRouterLookup`/`ResolveOrphans` are seams:
+that close actually reached the **current** negotiated sender with the
+`PER_CONNECTION_CLOSE` capability. Failed sends keep the orphan for
+the next attempt, and a **compare-and-delete** re-reads the current
+sender after a successful send: a stale sender's in-flight `Send`
+returning nil after a reconnect rotation does not transfer the
+obligation into the dead lineage — the orphan is retained and the next
+cadence re-sends on the live sender. `AttachRouterLookup`/`ResolveOrphans` are seams:
 the composition wiring (namespace manager, maintenance cadence) lands
 with the DPL-03/05 integrations, and the no-leak property holds *given
 that cadence* — it is not claimed for an unwired binary. A reused

@@ -171,8 +171,16 @@ pub enum ConnectionState {
     Disconnected,
     /// A connection attempt or Hello exchange is in progress.
     Connecting,
-    /// The Go owner assigned this nonzero control epoch.
-    Connected(u64),
+    /// The Go owner assigned this nonzero control epoch with the
+    /// bit-masked negotiated capabilities (bit per capability id below
+    /// 64) — one atomic snapshot, so consumers never pair an epoch with
+    /// another session's capabilities.
+    Connected {
+        /// The negotiated control epoch.
+        epoch: u64,
+        /// Bitmask of negotiated capability ids.
+        capabilities: u64,
+    },
     /// The transport was explicitly shut down.
     Shutdown,
 }
@@ -247,19 +255,26 @@ impl From<FrameError> for TransportError {
 /// Handlers must not block. Expensive work should enter a separately owned,
 /// bounded executor so the peer read deadline remains meaningful.
 pub trait Handler: Send + Sync {
-    /// Handles one post-Hello envelope.
+    /// Handles one post-Hello envelope. The read loop **awaits** this
+    /// call: a slow consumer applies real backpressure through TCP to
+    /// the Go sender's bounded lanes instead of accumulating an
+    /// unbounded queue or dropping a command the peer already
+    /// considers delivered.
     ///
     /// # Errors
     ///
     /// Returning an error closes the current stream and triggers reconnect.
-    fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError>;
+    fn handle(
+        &self,
+        envelope: ControlEnvelope,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
 }
 
 impl<F> Handler for F
 where
     F: Fn(ControlEnvelope) -> Result<(), TransportError> + Send + Sync,
 {
-    fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
+    async fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
         self(envelope)
     }
 }
@@ -272,6 +287,9 @@ pub struct ControlClient {
     state_tx: watch::Sender<ConnectionState>,
     epoch: AtomicU64,
     negotiated_frame_limit: AtomicU64,
+    /// Bitmask of negotiated control capabilities (bit per capability id
+    /// below 64), set on connect and cleared on disconnect.
+    negotiated_caps: AtomicU64,
     next_request_id: AtomicU64,
     metrics_dropped: AtomicU64,
     reconnect_attempts: AtomicU64,
@@ -300,6 +318,7 @@ impl ControlClient {
             state_tx,
             epoch: AtomicU64::new(0),
             negotiated_frame_limit: AtomicU64::new(u64::from(initial_frame_limit)),
+            negotiated_caps: AtomicU64::new(0),
             next_request_id: AtomicU64::new(0),
             metrics_dropped: AtomicU64::new(0),
             reconnect_attempts: AtomicU64::new(0),
@@ -354,10 +373,18 @@ impl ControlClient {
                     self.epoch.store(negotiated.epoch, Ordering::Release);
                     self.negotiated_frame_limit
                         .store(u64::from(negotiated.max_frame_bytes), Ordering::Release);
+                    let mut caps_mask = 0_u64;
+                    for capability in &negotiated.capabilities {
+                        if *capability < 64 {
+                            caps_mask |= 1 << capability;
+                        }
+                    }
+                    self.negotiated_caps.store(caps_mask, Ordering::Release);
                     set_instant(&self.last_received, Some(Instant::now()));
-                    let _ = self
-                        .state_tx
-                        .send(ConnectionState::Connected(negotiated.epoch));
+                    let _ = self.state_tx.send(ConnectionState::Connected {
+                        epoch: negotiated.epoch,
+                        capabilities: caps_mask,
+                    });
                     let result = self.run_connected(negotiated, handler).await;
                     if !matches!(result, Err(TransportError::Closed)) {
                         set_string(&self.last_disconnect, Some(result_to_string(&result)));
@@ -368,6 +395,7 @@ impl ControlClient {
                 }
             }
             self.epoch.store(0, Ordering::Release);
+            self.negotiated_caps.store(0, Ordering::Release);
             self.negotiated_frame_limit
                 .store(u64::from(self.config.max_frame_bytes), Ordering::Release);
             let _ = self.state_tx.send(ConnectionState::Disconnected);
@@ -443,6 +471,29 @@ impl ControlClient {
     #[must_use]
     pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
         self.state_tx.subscribe()
+    }
+
+    /// Whether the current control session negotiated the capability
+    /// (false when disconnected).
+    #[must_use]
+    pub fn has_negotiated_capability(&self, capability: u64) -> bool {
+        capability < 64 && (self.negotiated_caps.load(Ordering::Acquire) >> capability) & 1 == 1
+    }
+
+    /// Allocates the next request id for an application-originated
+    /// envelope on this sender. One checked allocator serves every
+    /// envelope (heartbeats included), so ids never repeat or regress
+    /// within a sender; `None` means the id space is exhausted (fail
+    /// closed — do not wrap).
+    #[must_use]
+    pub fn allocate_request_id(&self) -> Option<u64> {
+        let previous = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        if previous == u64::MAX {
+            // Restore the terminal value so every later call also fails.
+            self.next_request_id.store(u64::MAX, Ordering::Relaxed);
+            return None;
+        }
+        Some(previous + 1)
     }
 
     /// Returns the currently negotiated epoch, or zero when disconnected.
@@ -654,7 +705,7 @@ impl ControlClient {
             };
             validate_session_envelope(&envelope, epoch, capabilities)?;
             set_instant(&self.last_received, Some(Instant::now()));
-            handler.handle(envelope)?;
+            handler.handle(envelope).await?;
         }
     }
 
@@ -724,8 +775,13 @@ impl ControlClient {
             if lock_std(last_sent).elapsed() < self.config.heartbeat_interval {
                 continue;
             }
+            let Some(heartbeat_id) = self.allocate_request_id() else {
+                return Err(TransportError::Protocol(
+                    "sender request-id space exhausted".to_owned(),
+                ));
+            };
             let heartbeat = ControlEnvelope {
-                request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1,
+                request_id: heartbeat_id,
                 priority: Priority::Critical as i32,
                 body: Some(Body::Heartbeat(Heartbeat {
                     monotonic_millis: 0,
@@ -1358,7 +1414,8 @@ mod tests {
     ) -> Result<(), TransportError> {
         timeout(Duration::from_secs(1), async {
             loop {
-                if *state.borrow() == ConnectionState::Connected(epoch) {
+                if matches!(*state.borrow(), ConnectionState::Connected { epoch: seen, .. } if seen == epoch)
+                {
                     return Ok(());
                 }
                 state.changed().await.map_err(|_| TransportError::Closed)?;

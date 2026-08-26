@@ -385,9 +385,11 @@ fn go_restart_preserves_rust_sessions() {
     gate.register_connection(identity(2), "ns-b", 7);
     gate.set_backend(2, "tidb-b");
     let _ = gate.admit_redirect(&redirect(2, "r-1", 1), 7);
-    let seq_a = gate.next_event_sequence();
-    let seq_b = gate.next_event_sequence();
-    assert!(seq_b > seq_a, "event sequences are monotonic");
+    // Outgoing events carry allocator-issued ids; the gate records the
+    // maximum as the reconcile watermark.
+    gate.record_event_sequence(1);
+    gate.record_event_sequence(2);
+    gate.record_event_sequence(1);
 
     let request = gate.build_reconcile_request(9, 3, 4);
     assert_eq!(request.known_generation, 9);

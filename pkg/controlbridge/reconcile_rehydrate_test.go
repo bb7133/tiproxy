@@ -16,6 +16,7 @@ package controlbridge
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -273,7 +274,7 @@ func TestRehydratedWatermarkResumesSequences(t *testing.T) {
 	require.EqualValues(t, 7, lastEnvelope(t, peer).GetGeneration(), "stamped with the session generation")
 
 	// The drain issuer's watermark restores the same way.
-	issuer := NewDrainIssuer()
+	issuer := mustDrainIssuer(t)
 	issuer.RestoreSequence(9)
 	sender := &recordingSender{}
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, &controlpb.DrainCommand{DrainId: "d-next"}))
@@ -373,7 +374,7 @@ func TestCompositeHandlerRestoresDrainWatermark(t *testing.T) {
 	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
 	handler := &recordingHandler{rt: rt}
 	adapter := newTestAdapter(t, handler)
-	issuer := NewDrainIssuer()
+	issuer := mustDrainIssuer(t)
 	consumer := NewMeteringConsumer()
 	composite, err := NewCompositeControlHandler(adapter, issuer, consumer)
 	require.NoError(t, err)
@@ -428,7 +429,7 @@ func TestCompositeHandlerRestoresDrainWatermark(t *testing.T) {
 // sequence (never a new one), and the sequence space fails closed at
 // exhaustion.
 func TestDrainIdBindingAndSequenceExhaustion(t *testing.T) {
-	issuer := NewDrainIssuer()
+	issuer := mustDrainIssuer(t)
 	sender := &recordingSender{}
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, &controlpb.DrainCommand{DrainId: "d1"}))
 	d1Wire := sender.sent()[0].GetDrainCommand().GetDrainId()
@@ -445,7 +446,7 @@ func TestDrainIdBindingAndSequenceExhaustion(t *testing.T) {
 	require.EqualValues(t, 1, last.GetCommandSequence(), "the original binding, never a new sequence")
 
 	// Sequence exhaustion fails closed.
-	exhausted := NewDrainIssuer()
+	exhausted := mustDrainIssuer(t)
 	exhausted.RestoreSequence(^uint64(0))
 	err := exhausted.StartDrain(context.Background(), sender, 4, 12, &controlpb.DrainCommand{DrainId: "d-max"})
 	require.ErrorIs(t, err, ErrDrainSequenceExhausted)
@@ -492,4 +493,66 @@ func TestConcurrentOrphanResolutionAndReconcile(t *testing.T) {
 		require.Nil(t, envelope.GetCloseCommand(), "no close raced the recovery")
 	}
 	peer.mu.Unlock()
+}
+
+// rotatingSender rotates the adapter's current sender to next while its
+// own close Send is still in flight, then returns success — modeling a
+// stale lineage whose write completes just as a reconnect lands.
+type rotatingSender struct {
+	*fakeSender
+	adapter *RouterAdapter
+	next    EnvelopeSender
+	once    sync.Once
+}
+
+func (peer *rotatingSender) Send(ctx context.Context, envelope *controlpb.ControlEnvelope) error {
+	if err := peer.fakeSender.Send(ctx, envelope); err != nil {
+		return err
+	}
+	if envelope.GetCloseCommand() != nil {
+		peer.once.Do(func() { peer.adapter.rememberSender(peer.next) })
+	}
+	return nil
+}
+
+// A stale sender's in-flight Send returning nil after a rotation must
+// NOT transfer the orphan-close obligation into the dead lineage: the
+// compare-and-delete retains the orphan, and the next cadence carries
+// the close on the live sender before deleting.
+func TestOrphanCloseRetainedWhenSenderRotatesInFlight(t *testing.T) {
+	handler := &recordingHandler{rt: router.NewStaticRouter([]string{"tidb-a:4000"})}
+	adapter := newTestAdapter(t, handler)
+	capabilities := []uint64{
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE),
+	}
+	replacement := newFakeSender(24, capabilities...)
+	stale := &rotatingSender{
+		fakeSender: newFakeSender(23, capabilities...),
+		adapter:    adapter,
+		next:       replacement,
+	}
+
+	// No RouterLookup attached: the orphan cannot rehydrate and must
+	// converge to a bounded close.
+	remote := reconciledConnection(84, "tidb-gone:4000", "")
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), stale, reconcileRequestEnvelope(98, remote)))
+	require.Equal(t, 1, adapter.OrphanCount())
+
+	// On the bounded attempt the stale sender's Send succeeds, but the
+	// reconnect rotated the current sender mid-flight.
+	for attempt := 0; attempt < MaxOrphanResolveAttempts; attempt++ {
+		require.NoError(t, adapter.ResolveOrphans(context.Background()))
+	}
+	require.NotNil(t, lastEnvelope(t, stale.fakeSender).GetCloseCommand(),
+		"the stale lineage did carry a close")
+	require.Equal(t, 1, adapter.OrphanCount(),
+		"nil Send error alone must not delete: the sender is no longer current")
+
+	// The next cadence re-sends on the live lineage and only then
+	// transfers responsibility.
+	require.NoError(t, adapter.ResolveOrphans(context.Background()))
+	require.NotNil(t, lastEnvelope(t, replacement).GetCloseCommand())
+	require.Equal(t, 0, adapter.OrphanCount())
 }

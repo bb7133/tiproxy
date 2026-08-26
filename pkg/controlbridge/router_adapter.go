@@ -943,6 +943,15 @@ func (adapter *RouterAdapter) resolveOneOrphan(
 	if err := current.Send(ctx, envelope); err != nil {
 		return err
 	}
+	// Compare-and-delete: Send may race a sender rotation — a stale
+	// sender's in-flight Send can still return nil while its stream is
+	// being torn down, so a nil error alone does not prove the close
+	// reached the live lineage. The obligation transfers only if the
+	// sender that carried the close is still current; otherwise the
+	// orphan is retained and the next cadence retries.
+	if adapter.currentSender() != current {
+		return nil
+	}
 	adapter.mu.Lock()
 	delete(adapter.orphans, id)
 	adapter.mu.Unlock()

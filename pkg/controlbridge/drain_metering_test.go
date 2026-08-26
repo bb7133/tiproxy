@@ -25,6 +25,17 @@ import (
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 )
 
+// mustDrainIssuer builds an issuer or fails the test: crypto/rand is
+// healthy in the test environment, so an error is a real defect.
+func mustDrainIssuer(t *testing.T) *DrainIssuer {
+	t.Helper()
+	issuer, err := NewDrainIssuer()
+	if err != nil {
+		t.Fatalf("NewDrainIssuer: %v", err)
+	}
+	return issuer
+}
+
 type recordingSender struct {
 	mu        sync.Mutex
 	envelopes []*controlpb.ControlEnvelope
@@ -62,7 +73,7 @@ func drainResult(id string, active, graceful, forced uint64, complete bool) *con
 // rejected locally, and duplicate/out-of-order results apply
 // idempotently with the terminal result completing exactly once.
 func TestDrainIssuerSingleFlightAndIdempotentResults(t *testing.T) {
-	issuer := NewDrainIssuer()
+	issuer := mustDrainIssuer(t)
 	sender := &recordingSender{}
 	command := &controlpb.DrainCommand{
 		DrainId:       "d-1",
@@ -175,7 +186,7 @@ func TestMeteringConsumerDeduplicatesBySequence(t *testing.T) {
 // through its lifecycle. The byte-level codec equivalence is pinned by
 // the CTL-02/03 golden corpus; this test fixes the semantic contract.
 func TestDrainCommandRoundTripContract(t *testing.T) {
-	issuer := NewDrainIssuer()
+	issuer := mustDrainIssuer(t)
 	sender := &recordingSender{}
 	command := &controlpb.DrainCommand{
 		DrainId:                    "d-rt",
@@ -266,8 +277,8 @@ func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
 // new one). A previous incarnation's still-active drain is observable
 // through the DRAIN_IN_PROGRESS answer instead of being silently lost.
 func TestIncarnationLineageForDrainWireIds(t *testing.T) {
-	first := NewDrainIssuer()
-	second := NewDrainIssuer()
+	first := mustDrainIssuer(t)
+	second := mustDrainIssuer(t)
 	senderA := &recordingSender{}
 	senderB := &recordingSender{}
 
@@ -298,4 +309,43 @@ func TestIncarnationLineageForDrainWireIds(t *testing.T) {
 	foreign := second.ForeignActiveDrain()
 	require.NotNil(t, foreign, "the previous incarnation's operation is visible")
 	require.Equal(t, wireA, foreign.GetDrainId())
+}
+
+// A foreign drain (a previous incarnation's wire id) clears on its
+// terminal result and arms the consume-once retry signal — the Rust
+// side answers the completion transition proactively, so the observing
+// incarnation never has to re-ask.
+func TestForeignDrainClearsOnTerminalAndSignalsRetry(t *testing.T) {
+	issuer := mustDrainIssuer(t)
+	foreign := &controlpb.DrainResult{
+		DrainId:           "old@deadbeef",
+		ActiveConnections: 3,
+		Code:              controlpb.ErrorCode_ERROR_CODE_DRAIN_IN_PROGRESS,
+	}
+	require.NoError(t, issuer.HandleDrainResult(foreign))
+	require.NotNil(t, issuer.ForeignActiveDrain())
+	require.Nil(t, issuer.ForeignDrainResolved(), "no terminal observed yet")
+
+	// A terminal for a DIFFERENT unknown wire id clears nothing.
+	require.NoError(t, issuer.HandleDrainResult(&controlpb.DrainResult{
+		DrainId:  "other@cafe",
+		Complete: true,
+	}))
+	require.NotNil(t, issuer.ForeignActiveDrain())
+	require.Nil(t, issuer.ForeignDrainResolved())
+
+	// The foreign drain's own terminal clears the record and arms the
+	// retry signal exactly once.
+	require.NoError(t, issuer.HandleDrainResult(&controlpb.DrainResult{
+		DrainId:           "old@deadbeef",
+		ActiveConnections: 3,
+		GracefullyClosed:  2,
+		ForceClosed:       1,
+		Complete:          true,
+	}))
+	require.Nil(t, issuer.ForeignActiveDrain(), "terminal clears the foreign record")
+	resolved := issuer.ForeignDrainResolved()
+	require.NotNil(t, resolved, "the retry signal is armed")
+	require.Equal(t, "old@deadbeef", resolved.GetDrainId())
+	require.Nil(t, issuer.ForeignDrainResolved(), "the retry signal consumes once")
 }
