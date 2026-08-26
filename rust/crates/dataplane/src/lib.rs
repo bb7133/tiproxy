@@ -34,8 +34,9 @@ pub use admission::{
 };
 pub use control_commands::{
     CloseAdmission, CommandGate, DrainAdmission, DrainPhase, MAX_COMPLETED_DRAINS,
-    MAX_DELTAS_PER_BATCH, MAX_TERMINAL_REDIRECTS_PER_CONNECTION, MAX_UNACKED_METERING_BATCHES,
-    MeteringError, MeteringLedger, ReconcileRepairs, RedirectAdmission,
+    MAX_DELTAS_PER_BATCH, MAX_METERING_KEY_BYTES, MAX_TERMINAL_REDIRECTS_PER_CONNECTION,
+    MAX_UNACKED_METERING_BATCHES, MeteringError, MeteringLedger, ReconcileRepairs,
+    RedirectAdmission,
 };
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,

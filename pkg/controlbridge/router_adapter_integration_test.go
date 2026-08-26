@@ -87,8 +87,9 @@ func TestRouterAdapterWithFakeRustUDSPeer(t *testing.T) {
 	}, ack.GetMaxFrameBytes()))
 
 	writePeerEnvelope(t, peer, ack.GetControlEpoch(), &controlpb.ControlEnvelope{
-		RequestId: 1,
-		Priority:  controlpb.Priority_PRIORITY_CONTROL,
+		RequestId:  1,
+		Generation: 7,
+		Priority:   controlpb.Priority_PRIORITY_CONTROL,
 		Body: &controlpb.ControlEnvelope_HandshakeResponse{HandshakeResponse: &controlpb.HandshakeResponseEvent{
 			Connection: testIdentity(100, "0.0.0.0:6000"),
 			Handshake:  testHandshake("root"),
@@ -100,8 +101,9 @@ func TestRouterAdapterWithFakeRustUDSPeer(t *testing.T) {
 	require.True(t, decision.GetAccept())
 
 	writePeerEnvelope(t, peer, ack.GetControlEpoch(), &controlpb.ControlEnvelope{
-		RequestId: 2,
-		Priority:  controlpb.Priority_PRIORITY_CONTROL,
+		RequestId:  2,
+		Generation: 7,
+		Priority:   controlpb.Priority_PRIORITY_CONTROL,
 		Body: &controlpb.ControlEnvelope_RouteRequest{RouteRequest: &controlpb.RouteRequest{
 			Connection: testIdentity(100, "0.0.0.0:6000"),
 			Handshake:  testHandshake("root"),

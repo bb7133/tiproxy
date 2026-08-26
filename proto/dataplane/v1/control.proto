@@ -64,6 +64,12 @@ enum ControlCapability {
   CONTROL_CAPABILITY_UNSPECIFIED = 0;
   CONTROL_CAPABILITY_PER_CONNECTION_CLOSE = 1;
   CONTROL_CAPABILITY_RECONCILE_CONNECTIONS = 2;
+  // CTL-06: both sides carry ReconcileConnection
+  // generation/pending_redirect_id/identity, nonzero command sequences,
+  // and the rehydration/orphan lifecycle. Without it the legacy
+  // RECONCILE_CONNECTIONS behavior applies (identification by omission,
+  // no orphan closes).
+  CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION = 3;
 }
 
 message Hello {
@@ -271,6 +277,12 @@ message RedirectCommand {
   string backend_address = 4;
   string cluster_name = 5;
   uint64 deadline_unix_millis = 6;
+  // Per-connection monotonically increasing issue number (CTL-06):
+  // proves a delayed duplicate of an evicted tombstone obsolete
+  // (sequence at or below the watermark without a cache hit never
+  // acts). Additive; zero only for peers predating
+  // RECONCILE_SESSION_REHYDRATION.
+  uint64 command_sequence = 7;
 }
 
 message RedirectResult {
@@ -305,6 +317,9 @@ message DrainCommand {
   repeated string backend_ids = 3;
   uint64 graceful_deadline_unix_millis = 4;
   uint64 force_deadline_unix_millis = 5;
+  // Issuer-wide monotonically increasing issue number (CTL-06); same
+  // obsolescence watermark role as RedirectCommand.command_sequence.
+  uint64 command_sequence = 6;
 }
 
 message DrainResult {
@@ -349,6 +364,9 @@ message ReconcileRequest {
   uint64 last_metrics_sequence = 3;
   uint64 last_metering_sequence = 4;
   repeated ReconcileConnection connections = 5;
+  // Issuer-wide drain command_sequence watermark (CTL-06): a restarted
+  // Go lineage resumes issuing drains from watermark + 1.
+  uint64 last_drain_command_sequence = 6;
 }
 
 message ReconcileConnection {
@@ -373,6 +391,10 @@ message ReconcileConnection {
   // must equal the outer connection_id. Additive; absent means the
   // peer predates the field.
   ConnectionIdentity identity = 7;
+  // Highest redirect command_sequence observed for this connection
+  // (CTL-06): a restarted Go lineage resumes issuing from
+  // watermark + 1 so its new commands are never judged obsolete.
+  uint64 last_redirect_command_sequence = 8;
 }
 
 message ReconcileSnapshot {

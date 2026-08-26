@@ -64,7 +64,8 @@ func TestGoRestartRehydratesAccountingAndClosesExactlyOnce(t *testing.T) {
 	adapter := newTestAdapter(t, handler)
 	adapter.AttachRouterLookup(func(string) (router.Router, error) { return rt, nil })
 	peer := newFakeSender(21,
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS))
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
 
 	baseline := rt.ConnCount()
 	remote := reconciledConnection(80, "tidb-a:4000", "")
@@ -120,7 +121,8 @@ func TestGoRestartRestoresPendingRedirectExactlyOnce(t *testing.T) {
 	adapter := newTestAdapter(t, handler)
 	adapter.AttachRouterLookup(func(string) (router.Router, error) { return rt, nil })
 	peer := newFakeSender(22,
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS))
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
 
 	remote := reconciledConnection(81, "tidb-a:4000", "r-pending")
 	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(94, remote)))
@@ -167,6 +169,7 @@ func TestOrphanResolutionIsBoundedAndConverges(t *testing.T) {
 	adapter := newTestAdapter(t, handler)
 	peer := newFakeSender(23,
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE))
 
 	// No RouterLookup attached: rehydration cannot succeed.
@@ -201,4 +204,104 @@ func TestOrphanResolutionIsBoundedAndConverges(t *testing.T) {
 	require.Equal(t, baseline+1, rt.ConnCount(), "recovered orphan joins real accounting")
 	require.NotNil(t, adapter.get(83))
 	_ = backend.SrcNone
+}
+
+// A Rust restart reuses connection id 1 under a newer generation: the
+// reconcile must retire the stale same-id Go state exactly once and
+// rebuild the new incarnation — never leave both sides on different
+// generations forever.
+func TestReconcileConvergesReusedIdAcrossGenerations(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler := &recordingHandler{rt: rt}
+	adapter := newTestAdapter(t, handler)
+	adapter.AttachRouterLookup(func(string) (router.Router, error) { return rt, nil })
+	peer := newFakeSender(24,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
+
+	// The old incarnation lives through the normal path (generation 7).
+	establishConnection(t, adapter, peer, 1, "0.0.0.0:6000", "root")
+	require.Equal(t, 1, rt.ConnCount())
+	baselineCloses := handler.closeCalls
+
+	// Rust restarted: id 1 returns under generation 9 with a different
+	// client address.
+	fresh := reconciledConnection(1, "tidb-a:4000", "")
+	fresh.Generation = 9
+	fresh.Identity.ClientAddress = "10.9.8.7:60000"
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(98, fresh)))
+
+	// The stale incarnation was retired exactly once and the new one
+	// rebuilt: counts stay convergent, the snapshot reports gen 9.
+	require.Equal(t, 1, rt.ConnCount(), "old retired, new rehydrated: no drift")
+	require.Equal(t, baselineCloses+1, handler.closeCalls, "stale accounting retired exactly once")
+	snapshot := lastEnvelope(t, peer).GetReconcileSnapshot()
+	require.Len(t, snapshot.GetConnections(), 1)
+	require.EqualValues(t, 9, snapshot.GetConnections()[0].GetGeneration())
+	require.Equal(t, "10.9.8.7:60000", snapshot.GetConnections()[0].GetIdentity().GetClientAddress())
+
+	// Idempotent re-apply converges with no further retires.
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(99, fresh)))
+	require.Equal(t, 1, rt.ConnCount())
+	require.Equal(t, baselineCloses+1, handler.closeCalls)
+}
+
+// The redirect watermark survives a Go restart: a rehydrated connection
+// reporting watermark 37 issues its next redirect with sequence 38 —
+// its own new commands are never judged obsolete.
+func TestRehydratedWatermarkResumesSequences(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000", "tidb-b:4000"})
+	handler := &recordingHandler{rt: rt}
+	adapter := newTestAdapter(t, handler)
+	adapter.AttachRouterLookup(func(string) (router.Router, error) { return rt, nil })
+	peer := newFakeSender(25,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
+
+	remote := reconciledConnection(84, "tidb-a:4000", "")
+	remote.LastRedirectCommandSequence = 37
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(100, remote)))
+	snapshot := lastEnvelope(t, peer).GetReconcileSnapshot()
+	require.EqualValues(t, 37, snapshot.GetConnections()[0].GetLastRedirectCommandSequence())
+
+	state := adapter.get(84)
+	require.NotNil(t, state)
+	require.True(t, state.conn.Redirect(router.NewStaticBackend("tidb-b:4000")))
+	command := lastEnvelope(t, peer).GetRedirectCommand()
+	require.NotNil(t, command)
+	require.EqualValues(t, 38, command.GetCommandSequence(), "next = watermark + 1")
+	require.EqualValues(t, 7, lastEnvelope(t, peer).GetGeneration(), "stamped with the session generation")
+
+	// The drain issuer's watermark restores the same way.
+	issuer := NewDrainIssuer()
+	issuer.RestoreSequence(9)
+	sender := &recordingSender{}
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, &controlpb.DrainCommand{DrainId: "d-next"}))
+	sent := sender.sent()
+	require.EqualValues(t, 10, sent[len(sent)-1].GetDrainCommand().GetCommandSequence())
+}
+
+// A legacy peer (no REHYDRATION capability) keeps the original
+// behavior: identification by omission with no orphan tracking and no
+// orphan closes — a healthy old-peer session is never killed by the new
+// lifecycle.
+func TestLegacyPeerKeepsOmissionSemantics(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler := &recordingHandler{rt: rt}
+	adapter := newTestAdapter(t, handler)
+	adapter.AttachRouterLookup(func(string) (router.Router, error) { return rt, nil })
+	peer := newFakeSender(26,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS))
+
+	remote := reconciledConnection(85, "tidb-a:4000", "")
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(101, remote)))
+	require.Empty(t, lastEnvelope(t, peer).GetReconcileSnapshot().GetConnections())
+	require.Equal(t, 0, adapter.OrphanCount(), "legacy peers are never orphan-tracked")
+	require.Equal(t, 0, rt.ConnCount(), "and never blindly adopted")
+	require.NoError(t, adapter.ResolveOrphans(context.Background()))
+	peer.mu.Lock()
+	for _, envelope := range peer.messages {
+		require.Nil(t, envelope.GetCloseCommand(), "no orphan close for legacy peers")
+	}
+	peer.mu.Unlock()
 }

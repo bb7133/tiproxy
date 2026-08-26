@@ -32,11 +32,16 @@ type DrainIssuer struct {
 	mu            sync.Mutex
 	active        *drainOperation
 	lastCompleted *drainOperation
+	// sequence is the issuer-wide monotonically increasing command
+	// sequence; restored from the reconcile watermark after a restart
+	// so new drains are never judged obsolete by the Rust gate.
+	sequence uint64
 }
 
 type drainOperation struct {
-	drainID string
-	latest  *controlpb.DrainResult
+	drainID  string
+	sequence uint64
+	latest   *controlpb.DrainResult
 }
 
 // ErrDrainInProgress rejects a second concurrent drain locally.
@@ -45,6 +50,16 @@ var ErrDrainInProgress = errors.New("a different drain is already in progress")
 // NewDrainIssuer creates an idle issuer.
 func NewDrainIssuer() *DrainIssuer {
 	return &DrainIssuer{}
+}
+
+// RestoreSequence adopts the reconcile-reported drain watermark: the
+// next issued drain uses watermark + 1.
+func (issuer *DrainIssuer) RestoreSequence(watermark uint64) {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	if watermark > issuer.sequence {
+		issuer.sequence = watermark
+	}
 }
 
 // StartDrain sends the DrainCommand for drainID over the negotiated
@@ -73,11 +88,18 @@ func (issuer *DrainIssuer) StartDrain(
 		return ErrDrainInProgress
 	}
 	created := false
-	if issuer.active == nil {
-		if issuer.lastCompleted == nil || issuer.lastCompleted.drainID != command.GetDrainId() {
-			issuer.active = &drainOperation{drainID: command.GetDrainId()}
-			created = true
-		}
+	switch {
+	case issuer.active != nil:
+		// Re-sending the active drain reuses its bound sequence: an id
+		// is bound to exactly one issuance.
+		command.CommandSequence = issuer.active.sequence
+	case issuer.lastCompleted != nil && issuer.lastCompleted.drainID == command.GetDrainId():
+		command.CommandSequence = issuer.lastCompleted.sequence
+	default:
+		issuer.sequence++
+		command.CommandSequence = issuer.sequence
+		issuer.active = &drainOperation{drainID: command.GetDrainId(), sequence: issuer.sequence}
+		created = true
 	}
 	issuer.mu.Unlock()
 
@@ -114,14 +136,22 @@ func (issuer *DrainIssuer) HandleDrainResult(result *controlpb.DrainResult) erro
 		// reordered non-terminal progress) never regress it.
 		return nil
 	}
-	// Counters are absolute and monotonic: an observation that moves
-	// backwards is a reordered duplicate and is ignored.
+	// Counters are absolute and per-field monotonic: any single field
+	// moving backwards (or the matched population drifting) marks a
+	// reordered duplicate, which is ignored. Field-wise comparison also
+	// avoids the sum overflow a combined check would risk.
 	if latest := issuer.active.latest; latest != nil {
-		observed := result.GetGracefullyClosed() + result.GetForceClosed()
-		known := latest.GetGracefullyClosed() + latest.GetForceClosed()
-		if observed < known || (latest.GetComplete() && !result.GetComplete()) {
+		if result.GetGracefullyClosed() < latest.GetGracefullyClosed() ||
+			result.GetForceClosed() < latest.GetForceClosed() ||
+			result.GetActiveConnections() != latest.GetActiveConnections() ||
+			(latest.GetComplete() && !result.GetComplete()) {
 			return nil
 		}
+	}
+	// Closed totals can never exceed the stable matched population.
+	if result.GetGracefullyClosed() > result.GetActiveConnections() ||
+		result.GetForceClosed() > result.GetActiveConnections()-result.GetGracefullyClosed() {
+		return nil
 	}
 	issuer.active.latest = result
 	if result.GetComplete() {
@@ -182,27 +212,57 @@ func (consumer *MeteringConsumer) Apply(batch *controlpb.MeteringBatch) bool {
 	}
 	consumer.mu.Lock()
 	defer consumer.mu.Unlock()
+	// The sequence space is exhausted: +1 would wrap and accept
+	// sequence 0. Fail closed on everything.
+	if consumer.lastApplied == ^uint64(0) {
+		return false
+	}
 	// Only the contiguous next sequence applies: a gap means an earlier
 	// batch is still in flight (the producer replays in order), and
 	// applying past it would lose that batch forever.
 	if batch.GetSequence() != consumer.lastApplied+1 {
 		return false
 	}
-	consumer.lastApplied = batch.GetSequence()
+	// Transactional: validate every checked addition first; only a
+	// fully valid batch advances the sequence or touches a counter, so
+	// an overflow can neither wrap totals nor acknowledge the batch.
+	type pendingAdd struct {
+		key      meteringKey
+		response uint64
+		cross    uint64
+	}
+	adds := make([]pendingAdd, 0, len(batch.GetDeltas()))
+	staged := make(map[meteringKey]meteringTotals, len(batch.GetDeltas()))
 	for _, delta := range batch.GetDeltas() {
 		key := meteringKey{
 			keyspace:       delta.GetKeyspace(),
 			backendID:      delta.GetBackendId(),
 			publicEndpoint: delta.GetPublicEndpoint(),
 		}
-		totals, ok := consumer.totals[key]
+		current, ok := staged[key]
+		if !ok {
+			if existing, present := consumer.totals[key]; present {
+				current = *existing
+			}
+		}
+		response := current.responseBytes + delta.GetResponseBytes()
+		cross := current.crossLocationBytes + delta.GetCrossLocationBytes()
+		if response < current.responseBytes || cross < current.crossLocationBytes {
+			return false
+		}
+		staged[key] = meteringTotals{responseBytes: response, crossLocationBytes: cross}
+		adds = append(adds, pendingAdd{key: key, response: response, cross: cross})
+	}
+	for _, add := range adds {
+		totals, ok := consumer.totals[add.key]
 		if !ok {
 			totals = &meteringTotals{}
-			consumer.totals[key] = totals
+			consumer.totals[add.key] = totals
 		}
-		totals.responseBytes += delta.GetResponseBytes()
-		totals.crossLocationBytes += delta.GetCrossLocationBytes()
+		totals.responseBytes = add.response
+		totals.crossLocationBytes = add.cross
 	}
+	consumer.lastApplied = batch.GetSequence()
 	return true
 }
 

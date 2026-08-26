@@ -96,6 +96,26 @@ pub enum RedirectAdmission {
         /// Generation this connection was admitted under.
         connection_generation: u64,
     },
+    /// The same command id arrived with a different sequence than it
+    /// was first observed with: `PROTOCOL_VIOLATION`, never act (an id
+    /// is bound to exactly one issuance).
+    SequenceMismatch {
+        /// The sequence the id is bound to.
+        bound_sequence: u64,
+        /// The mismatched sequence on this duplicate.
+        command_sequence: u64,
+    },
+    /// The command's sequence is at or below the watermark and no cache
+    /// holds its id: a delayed duplicate of an evicted terminal. Go's
+    /// serialization proves its result was already consumed — the
+    /// runtime answers with a `DUPLICATE_REQUEST`-coded result the
+    /// issuer ignores by id; never act.
+    Obsolete {
+        /// The duplicate's sequence.
+        command_sequence: u64,
+        /// The connection's watermark.
+        watermark: u64,
+    },
     /// The connection is unknown to this gate: answer
     /// `RECONCILIATION_REQUIRED`, never act.
     UnknownConnection,
@@ -151,6 +171,25 @@ pub enum DrainAdmission {
         /// The gate's applied snapshot generation.
         applied_generation: u64,
     },
+    /// The same drain id arrived with a different sequence than it was
+    /// first observed with: `PROTOCOL_VIOLATION`, never act.
+    SequenceMismatch {
+        /// The sequence the id is bound to.
+        bound_sequence: u64,
+        /// The mismatched sequence on this duplicate.
+        command_sequence: u64,
+    },
+    /// The command's sequence is at or below the issuer watermark and
+    /// no tombstone holds its id: a delayed duplicate of an evicted
+    /// completed drain — the runtime answers with a
+    /// `DUPLICATE_REQUEST`-coded result the issuer ignores. Never
+    /// restarts a drain.
+    Obsolete {
+        /// The duplicate's sequence.
+        command_sequence: u64,
+        /// The gate's drain watermark.
+        watermark: u64,
+    },
 }
 
 /// Which drain phase applies at an instant.
@@ -170,7 +209,10 @@ pub enum DrainPhase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RedirectState {
     Idle,
-    Pending { redirect_id: String },
+    Pending {
+        redirect_id: String,
+        command_sequence: u64,
+    },
 }
 
 /// Bounded per-connection terminal-result tombstones: delayed duplicates
@@ -193,6 +235,16 @@ enum CloseState {
 /// Per-connection control-plane state: the gate's authority for
 /// idempotency and reconciliation. Session/data state stays in the
 /// session loop; only identifiers live here.
+/// One finished redirect: the cached result plus whether its delivery
+/// has been proven by a reconcile snapshot (unacked results are the
+/// exact ids a fresh Go lineage must learn about).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalRecord {
+    result: RedirectResult,
+    command_sequence: u64,
+    unacked: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConnectionControl {
     identity: ConnectionIdentity,
@@ -200,8 +252,15 @@ struct ConnectionControl {
     namespace: String,
     snapshot_generation: u64,
     redirect: RedirectState,
-    /// Terminal results in completion order (front = oldest); bounded.
-    redirect_terminals: VecDeque<RedirectResult>,
+    /// Highest command sequence observed for this connection: a
+    /// sequence at or below it that misses every cache is provably
+    /// obsolete (Go serializes redirects, so issuing n+1 implies n's
+    /// terminal was consumed) and never acts.
+    redirect_watermark: u64,
+    /// Terminal records in completion order (front = oldest); bounded —
+    /// eviction is safe because obsolescence is proven by the
+    /// watermark, not by cache residency.
+    redirect_terminals: VecDeque<TerminalRecord>,
     close: CloseState,
 }
 
@@ -209,17 +268,23 @@ impl ConnectionControl {
     fn terminal_result(&self, redirect_id: &str) -> Option<&RedirectResult> {
         self.redirect_terminals
             .iter()
+            .map(|record| &record.result)
             .find(|result| result.redirect_id == redirect_id)
     }
 
-    fn latest_terminal(&self) -> Option<&RedirectResult> {
-        self.redirect_terminals.back()
+    fn latest_unacked(&self) -> Option<&RedirectResult> {
+        self.redirect_terminals
+            .iter()
+            .rev()
+            .find(|record| record.unacked)
+            .map(|record| &record.result)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DrainState {
     drain_id: String,
+    command_sequence: u64,
     listener_names: Vec<String>,
     backend_ids: Vec<String>,
     graceful_deadline: Instant,
@@ -261,6 +326,14 @@ pub struct CommandGate {
     /// The last applied config snapshot generation (CTL-05): drain
     /// provenance is checked against it.
     applied_generation: u64,
+    /// Issuer-wide drain sequence watermark (same obsolescence role as
+    /// the per-connection redirect watermark).
+    drain_watermark: u64,
+    /// True only when the negotiated peer predates
+    /// `RECONCILE_SESSION_REHYDRATION`: zero generations/sequences are
+    /// then tolerated with the legacy tombstone-only behavior. The
+    /// default is strict fail-closed.
+    legacy_peer: bool,
 }
 
 impl CommandGate {
@@ -290,6 +363,7 @@ impl CommandGate {
                 namespace: namespace.to_owned(),
                 snapshot_generation,
                 redirect: RedirectState::Idle,
+                redirect_watermark: 0,
                 redirect_terminals: VecDeque::new(),
                 close: CloseState::Open,
             },
@@ -323,6 +397,13 @@ impl CommandGate {
         self.connections.is_empty()
     }
 
+    /// Declares the negotiated peer legacy (predating
+    /// `RECONCILE_SESSION_REHYDRATION`): zero generations and sequences
+    /// are tolerated with tombstone-only dedup. Strict is the default.
+    pub fn set_legacy_peer(&mut self, legacy: bool) {
+        self.legacy_peer = legacy;
+    }
+
     /// Records the applied config snapshot generation (from CTL-05
     /// snapshot application) for drain provenance checks.
     pub fn set_applied_generation(&mut self, generation: u64) {
@@ -352,37 +433,83 @@ impl CommandGate {
         command: &RedirectCommand,
         command_generation: u64,
     ) -> RedirectAdmission {
+        let legacy = self.legacy_peer;
         let Some(connection) = self.connections.get_mut(&command.connection_id) else {
             return RedirectAdmission::UnknownConnection;
         };
-        if command_generation != 0 && command_generation != connection.snapshot_generation {
+        // State-bearing envelopes carry a nonzero generation (frozen
+        // ADR); zero is tolerated only from a declared legacy peer.
+        if command_generation != connection.snapshot_generation
+            && !(legacy && command_generation == 0)
+        {
             return RedirectAdmission::StaleGeneration {
                 command_generation,
                 connection_generation: connection.snapshot_generation,
             };
         }
-        // A delayed duplicate of ANY finished id replays its tombstone —
-        // an old id must never re-execute after newer ones finished.
-        if let Some(result) = connection.terminal_result(&command.redirect_id) {
-            return RedirectAdmission::Replay(result.clone());
-        }
-        match &connection.redirect {
-            RedirectState::Pending { redirect_id } => {
-                if *redirect_id == command.redirect_id {
-                    RedirectAdmission::DuplicatePending
-                } else {
-                    RedirectAdmission::Conflict {
-                        pending_redirect_id: redirect_id.clone(),
-                    }
-                }
-            }
-            RedirectState::Idle => {
-                connection.redirect = RedirectState::Pending {
-                    redirect_id: command.redirect_id.clone(),
+        // A delayed duplicate of a cached finished id replays its
+        // tombstone — after verifying the id is bound to the sequence
+        // it was first issued with.
+        if let Some(record) = connection
+            .redirect_terminals
+            .iter()
+            .find(|record| record.result.redirect_id == command.redirect_id)
+        {
+            if command.command_sequence != record.command_sequence
+                && !(legacy && command.command_sequence == 0)
+            {
+                return RedirectAdmission::SequenceMismatch {
+                    bound_sequence: record.command_sequence,
+                    command_sequence: command.command_sequence,
                 };
-                RedirectAdmission::Start
             }
+            return RedirectAdmission::Replay(record.result.clone());
         }
+        if let RedirectState::Pending {
+            redirect_id,
+            command_sequence,
+        } = &connection.redirect
+        {
+            if *redirect_id == command.redirect_id {
+                if command.command_sequence != *command_sequence
+                    && !(legacy && command.command_sequence == 0)
+                {
+                    return RedirectAdmission::SequenceMismatch {
+                        bound_sequence: *command_sequence,
+                        command_sequence: command.command_sequence,
+                    };
+                }
+                return RedirectAdmission::DuplicatePending;
+            }
+            return RedirectAdmission::Conflict {
+                pending_redirect_id: redirect_id.clone(),
+            };
+        }
+        // Cache miss at Idle: the watermark decides new-vs-evicted. Go
+        // issues n+1 only after consuming n's terminal, so a sequence at
+        // or below the watermark whose id misses every cache is a
+        // duplicate of an evicted, already-consumed terminal.
+        let sequence = command.command_sequence;
+        if sequence == 0 {
+            if !legacy {
+                return RedirectAdmission::Obsolete {
+                    command_sequence: 0,
+                    watermark: connection.redirect_watermark,
+                };
+            }
+        } else if sequence <= connection.redirect_watermark {
+            return RedirectAdmission::Obsolete {
+                command_sequence: sequence,
+                watermark: connection.redirect_watermark,
+            };
+        } else {
+            connection.redirect_watermark = sequence;
+        }
+        connection.redirect = RedirectState::Pending {
+            redirect_id: command.redirect_id.clone(),
+            command_sequence: sequence,
+        };
+        RedirectAdmission::Start
     }
 
     /// Completes the pending redirect with its **single** terminal
@@ -399,12 +526,13 @@ impl CommandGate {
         code: ErrorCode,
     ) -> Option<RedirectResult> {
         let connection = self.connections.get_mut(&connection_id)?;
-        match &connection.redirect {
+        let bound_sequence = match &connection.redirect {
             RedirectState::Pending {
                 redirect_id: pending,
-            } if pending == redirect_id => {}
+                command_sequence,
+            } if pending == redirect_id => *command_sequence,
             _ => return None,
-        }
+        };
         let previous_backend_id = connection.backend_id.clone();
         if succeeded {
             new_backend_id.clone_into(&mut connection.backend_id);
@@ -423,7 +551,11 @@ impl CommandGate {
             detail: String::new(),
         };
         connection.redirect = RedirectState::Idle;
-        connection.redirect_terminals.push_back(result.clone());
+        connection.redirect_terminals.push_back(TerminalRecord {
+            result: result.clone(),
+            command_sequence: bound_sequence,
+            unacked: true,
+        });
         while connection.redirect_terminals.len() > MAX_TERMINAL_REDIRECTS_PER_CONNECTION {
             let _ = connection.redirect_terminals.pop_front();
         }
@@ -443,10 +575,13 @@ impl CommandGate {
         force: bool,
         command_generation: u64,
     ) -> CloseAdmission {
+        let self_legacy = self.legacy_peer;
         let Some(connection) = self.connections.get_mut(&connection_id) else {
             return CloseAdmission::UnknownConnection;
         };
-        if command_generation != 0 && command_generation != connection.snapshot_generation {
+        if command_generation != connection.snapshot_generation
+            && !(self_legacy && command_generation == 0)
+        {
             return CloseAdmission::StaleGeneration {
                 command_generation,
                 connection_generation: connection.snapshot_generation,
@@ -529,7 +664,10 @@ impl CommandGate {
         // references configuration (listeners, backends) that may no
         // longer exist. Per-connection generations are deliberately not
         // matched here — one command spans mixed-generation sessions.
-        if command_generation != 0 && command_generation < self.applied_generation {
+        // Zero provenance is tolerated only from a declared legacy peer.
+        if (command_generation == 0 && !self.legacy_peer)
+            || (command_generation != 0 && command_generation < self.applied_generation)
+        {
             return DrainAdmission::StaleGeneration {
                 command_generation,
                 applied_generation: self.applied_generation,
@@ -537,6 +675,14 @@ impl CommandGate {
         }
         if let Some(active) = &self.drain {
             if active.drain_id == command.drain_id {
+                if command.command_sequence != active.command_sequence
+                    && !(self.legacy_peer && command.command_sequence == 0)
+                {
+                    return DrainAdmission::SequenceMismatch {
+                        bound_sequence: active.command_sequence,
+                        command_sequence: command.command_sequence,
+                    };
+                }
                 return DrainAdmission::Progress(active.result(ErrorCode::Ok));
             }
             return DrainAdmission::Conflict(active.result(ErrorCode::DrainInProgress));
@@ -546,11 +692,39 @@ impl CommandGate {
             .iter()
             .find(|done| done.drain_id == command.drain_id)
         {
+            if command.command_sequence != done.command_sequence
+                && !(self.legacy_peer && command.command_sequence == 0)
+            {
+                return DrainAdmission::SequenceMismatch {
+                    bound_sequence: done.command_sequence,
+                    command_sequence: command.command_sequence,
+                };
+            }
             return DrainAdmission::Replay(done.result(ErrorCode::Ok));
+        }
+        // Cache miss: the issuer-wide watermark proves evicted-completed
+        // duplicates obsolete (the issuer is single-flight, so issuing a
+        // later drain implies the earlier one completed).
+        let sequence = command.command_sequence;
+        if sequence == 0 {
+            if !self.legacy_peer {
+                return DrainAdmission::Obsolete {
+                    command_sequence: 0,
+                    watermark: self.drain_watermark,
+                };
+            }
+        } else if sequence <= self.drain_watermark {
+            return DrainAdmission::Obsolete {
+                command_sequence: sequence,
+                watermark: self.drain_watermark,
+            };
+        } else {
+            self.drain_watermark = sequence;
         }
         let matched_total = u64::try_from(matched_connections.len()).unwrap_or(u64::MAX);
         self.drain = Some(DrainState {
             drain_id: command.drain_id.clone(),
+            command_sequence: sequence,
             listener_names: command.listener_names.clone(),
             backend_ids: command.backend_ids.clone(),
             graceful_deadline,
@@ -663,13 +837,24 @@ impl CommandGate {
                 connection_id: *connection_id,
                 backend_id: connection.backend_id.clone(),
                 namespace: connection.namespace.clone(),
-                redirect_pending: matches!(connection.redirect, RedirectState::Pending { .. }),
+                // "Pending" to the peer means: a redirect id whose
+                // terminal result the peer may not have seen — either
+                // truly in flight or finished with an unacknowledged
+                // (possibly lost) result. The exact id lets a fresh
+                // lineage restore it and lets the snapshot answer prove
+                // which tombstone to replay.
+                redirect_pending: matches!(connection.redirect, RedirectState::Pending { .. })
+                    || connection.latest_unacked().is_some(),
                 generation: connection.snapshot_generation,
                 pending_redirect_id: match &connection.redirect {
-                    RedirectState::Pending { redirect_id } => redirect_id.clone(),
-                    RedirectState::Idle => String::new(),
+                    RedirectState::Pending { redirect_id, .. } => redirect_id.clone(),
+                    RedirectState::Idle => connection
+                        .latest_unacked()
+                        .map(|result| result.redirect_id.clone())
+                        .unwrap_or_default(),
                 },
                 identity: Some(connection.identity.clone()),
+                last_redirect_command_sequence: connection.redirect_watermark,
             })
             .collect();
         connections.sort_by_key(|connection| connection.connection_id);
@@ -679,6 +864,7 @@ impl CommandGate {
             last_metrics_sequence,
             last_metering_sequence,
             connections,
+            last_drain_command_sequence: self.drain_watermark,
         }
     }
 
@@ -695,18 +881,36 @@ impl CommandGate {
         let mut replay_redirect_results = Vec::new();
         let mut ghost_connections = Vec::new();
         for remote in &snapshot.connections {
-            match self.connections.get(&remote.connection_id) {
+            match self.connections.get_mut(&remote.connection_id) {
                 None => ghost_connections.push(remote.connection_id),
                 Some(local) => {
-                    // Go believes a redirect is still pending: the
-                    // latest terminal is the one whose result it lost
-                    // (Go serializes redirects, so at most one can be
-                    // outstanding).
-                    if remote.redirect_pending
-                        && !matches!(local.redirect, RedirectState::Pending { .. })
-                        && let Some(result) = local.latest_terminal()
-                    {
-                        replay_redirect_results.push(result.clone());
+                    if remote.redirect_pending {
+                        if matches!(local.redirect, RedirectState::Pending { .. }) {
+                            // Truly still in flight: the session will
+                            // produce the one terminal result itself.
+                        } else if !remote.pending_redirect_id.is_empty() {
+                            // The peer names the exact id it still
+                            // believes outstanding: replay that
+                            // tombstone and only that tombstone.
+                            if let Some(result) = local.terminal_result(&remote.pending_redirect_id)
+                            {
+                                replay_redirect_results.push(result.clone());
+                            }
+                        } else if let Some(result) = local.latest_unacked() {
+                            // Legacy peer without the id field: Go
+                            // serialization bounds the outstanding set
+                            // to one, and only an unacked terminal can
+                            // be it.
+                            replay_redirect_results.push(result.clone());
+                        }
+                    } else {
+                        // The peer's authoritative view has nothing
+                        // outstanding: every terminal produced so far
+                        // was seen or is obsolete — acknowledge them so
+                        // later requests stop re-reporting.
+                        for record in &mut local.redirect_terminals {
+                            record.unacked = false;
+                        }
                     }
                 }
             }
@@ -769,13 +973,27 @@ pub enum MeteringError {
     SequenceExhausted,
     /// A single delta's counters would overflow the cumulative entry.
     CounterOverflow,
+    /// A metering key exceeds its byte bound; unbounded keys would let
+    /// one delta alone exceed the control frame bound.
+    OversizedKey {
+        /// The offending field.
+        field: &'static str,
+        /// Observed bytes.
+        actual: usize,
+        /// The bound.
+        limit: usize,
+    },
 }
 
 /// Hard bound on retained sealed batches awaiting acknowledgement.
 pub const MAX_UNACKED_METERING_BATCHES: usize = 1024;
-/// Hard bound on deltas in one sealed batch (well under the 1 MiB
-/// control frame bound: each delta is a few hundred bytes at most under
-/// the key-size caps).
+/// Hard bound on one metering key field (`keyspace` / `backend_id`).
+pub const MAX_METERING_KEY_BYTES: usize = 256;
+/// Hard bound on deltas in one sealed batch. Worst-case encoded size is
+/// provably inside the 1 MiB control frame bound:
+/// `1024 deltas × (2 × (256 key bytes + 3 tag/len) + 2 × 11 varint
+/// counters + 1 bool + ~6 framing) ≈ 1024 × 547 ≈ 548 KiB`, plus the
+/// batch header — under 60% of the frame bound.
 pub const MAX_DELTAS_PER_BATCH: usize = 1024;
 
 impl MeteringLedger {
@@ -797,6 +1015,18 @@ impl MeteringLedger {
     /// is lost — when a counter would overflow, or when an implied seal
     /// hits the retention or sequence bound.
     pub fn record(&mut self, delta: MeteringDelta) -> Result<(), MeteringError> {
+        for (field, len) in [
+            ("keyspace", delta.keyspace.len()),
+            ("backend_id", delta.backend_id.len()),
+        ] {
+            if len > MAX_METERING_KEY_BYTES {
+                return Err(MeteringError::OversizedKey {
+                    field,
+                    actual: len,
+                    limit: MAX_METERING_KEY_BYTES,
+                });
+            }
+        }
         if let Some(existing) = self.open.iter_mut().find(|entry| {
             entry.keyspace == delta.keyspace
                 && entry.backend_id == delta.backend_id

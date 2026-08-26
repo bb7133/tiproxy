@@ -439,7 +439,8 @@ func sendHandshake(
 ) {
 	t.Helper()
 	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
-		RequestId: connectionID*10 + 1,
+		RequestId:  connectionID*10 + 1,
+		Generation: 7,
 		Body: &controlpb.ControlEnvelope_HandshakeResponse{HandshakeResponse: &controlpb.HandshakeResponseEvent{
 			Connection: testIdentity(connectionID, listener),
 			Handshake:  testHandshake(user),
@@ -456,7 +457,8 @@ func sendRoute(
 ) {
 	t.Helper()
 	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
-		RequestId: connectionID*10 + 2,
+		RequestId:  connectionID*10 + 2,
+		Generation: 7,
 		Body: &controlpb.ControlEnvelope_RouteRequest{RouteRequest: &controlpb.RouteRequest{
 			Connection:    testIdentity(connectionID, listener),
 			Handshake:     testHandshake(user),
@@ -544,7 +546,8 @@ func testHandshake(user string) *controlpb.HandshakeMetadata {
 
 func connectionEvent(connectionID uint64, kind controlpb.ConnectionEventKind) *controlpb.ControlEnvelope {
 	return &controlpb.ControlEnvelope{
-		RequestId: connectionID*100 + uint64(kind),
+		RequestId:  connectionID*100 + uint64(kind),
+		Generation: 7,
 		Body: &controlpb.ControlEnvelope_ConnectionEvent{ConnectionEvent: &controlpb.ConnectionEvent{
 			Kind:       kind,
 			Connection: testIdentity(connectionID, "0.0.0.0:6000"),

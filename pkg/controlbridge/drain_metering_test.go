@@ -46,10 +46,10 @@ func (sender *recordingSender) sent() []*controlpb.ControlEnvelope {
 	return append([]*controlpb.ControlEnvelope(nil), sender.envelopes...)
 }
 
-func drainResult(id string, graceful, forced uint64, complete bool) *controlpb.DrainResult {
+func drainResult(id string, active, graceful, forced uint64, complete bool) *controlpb.DrainResult {
 	return &controlpb.DrainResult{
 		DrainId:           id,
-		ActiveConnections: graceful + forced,
+		ActiveConnections: active,
 		GracefullyClosed:  graceful,
 		ForceClosed:       forced,
 		Complete:          complete,
@@ -80,23 +80,23 @@ func TestDrainIssuerSingleFlightAndIdempotentResults(t *testing.T) {
 
 	// Progress applies idempotently; an out-of-order older result is
 	// just replaced by the next observation (absolute counters).
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 1, 0, false)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 2, 1, 0, false)))
 	progress, done := issuer.Progress("d-1")
 	require.False(t, done)
 	require.EqualValues(t, 1, progress.GetGracefullyClosed())
 
 	// A stray result for an unknown id is dropped without effect.
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-9", 5, 5, true)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult("d-9", 10, 5, 5, true)))
 	_, known := issuer.Progress("d-9")
 	require.False(t, known)
 
 	// The terminal result completes the drain exactly once; duplicates
 	// of the terminal replay refresh the completed record harmlessly.
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 1, 1, true)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 2, 1, 1, true)))
 	final, done := issuer.Progress("d-1")
 	require.True(t, done)
 	require.True(t, final.GetComplete())
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 1, 1, true)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult("d-1", 2, 1, 1, true)))
 	final, done = issuer.Progress("d-1")
 	require.True(t, done)
 	require.EqualValues(t, 1, final.GetForceClosed())
@@ -186,8 +186,8 @@ func TestDrainCommandRoundTripContract(t *testing.T) {
 
 	// The Rust gate's progress answer for a duplicate command applies
 	// idempotently on this side too.
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-rt", 0, 0, false)))
-	require.NoError(t, issuer.HandleDrainResult(drainResult("d-rt", 2, 1, true)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult("d-rt", 3, 0, 0, false)))
+	require.NoError(t, issuer.HandleDrainResult(drainResult("d-rt", 3, 2, 1, true)))
 	final, done := issuer.Progress("d-rt")
 	require.True(t, done)
 	require.EqualValues(t, 3, final.GetActiveConnections())
@@ -216,7 +216,8 @@ func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
 	adapter.AttachMetering(consumer)
 
 	peer := newFakeSender(11,
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS))
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
 	// Rust survived a Go restart and reports two live sessions plus a
 	// producer metering sequence beyond what this consumer ever saw.
 	reconcile := &controlpb.ControlEnvelope{

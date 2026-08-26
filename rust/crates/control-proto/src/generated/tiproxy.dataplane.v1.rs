@@ -398,6 +398,13 @@ pub struct RedirectCommand {
     pub cluster_name: ::prost::alloc::string::String,
     #[prost(uint64, tag="6")]
     pub deadline_unix_millis: u64,
+    /// Per-connection monotonically increasing issue number (CTL-06):
+    /// proves a delayed duplicate of an evicted tombstone obsolete
+    /// (sequence at or below the watermark without a cache hit never
+    /// acts). Additive; zero only for peers predating
+    /// RECONCILE_SESSION_REHYDRATION.
+    #[prost(uint64, tag="7")]
+    pub command_sequence: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RedirectResult {
@@ -454,6 +461,10 @@ pub struct DrainCommand {
     pub graceful_deadline_unix_millis: u64,
     #[prost(uint64, tag="5")]
     pub force_deadline_unix_millis: u64,
+    /// Issuer-wide monotonically increasing issue number (CTL-06); same
+    /// obsolescence watermark role as RedirectCommand.command_sequence.
+    #[prost(uint64, tag="6")]
+    pub command_sequence: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DrainResult {
@@ -524,6 +535,10 @@ pub struct ReconcileRequest {
     pub last_metering_sequence: u64,
     #[prost(message, repeated, tag="5")]
     pub connections: ::prost::alloc::vec::Vec<ReconcileConnection>,
+    /// Issuer-wide drain command_sequence watermark (CTL-06): a restarted
+    /// Go lineage resumes issuing drains from watermark + 1.
+    #[prost(uint64, tag="6")]
+    pub last_drain_command_sequence: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReconcileConnection {
@@ -555,6 +570,11 @@ pub struct ReconcileConnection {
     /// peer predates the field.
     #[prost(message, optional, tag="7")]
     pub identity: ::core::option::Option<ConnectionIdentity>,
+    /// Highest redirect command_sequence observed for this connection
+    /// (CTL-06): a restarted Go lineage resumes issuing from
+    /// watermark + 1 so its new commands are never judged obsolete.
+    #[prost(uint64, tag="8")]
+    pub last_redirect_command_sequence: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReconcileSnapshot {
@@ -660,6 +680,12 @@ pub enum ControlCapability {
     Unspecified = 0,
     PerConnectionClose = 1,
     ReconcileConnections = 2,
+    /// CTL-06: both sides carry ReconcileConnection
+    /// generation/pending_redirect_id/identity, nonzero command sequences,
+    /// and the rehydration/orphan lifecycle. Without it the legacy
+    /// RECONCILE_CONNECTIONS behavior applies (identification by omission,
+    /// no orphan closes).
+    ReconcileSessionRehydration = 3,
 }
 impl ControlCapability {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -671,6 +697,7 @@ impl ControlCapability {
             Self::Unspecified => "CONTROL_CAPABILITY_UNSPECIFIED",
             Self::PerConnectionClose => "CONTROL_CAPABILITY_PER_CONNECTION_CLOSE",
             Self::ReconcileConnections => "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS",
+            Self::ReconcileSessionRehydration => "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -679,6 +706,7 @@ impl ControlCapability {
             "CONTROL_CAPABILITY_UNSPECIFIED" => Some(Self::Unspecified),
             "CONTROL_CAPABILITY_PER_CONNECTION_CLOSE" => Some(Self::PerConnectionClose),
             "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS" => Some(Self::ReconcileConnections),
+            "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION" => Some(Self::ReconcileSessionRehydration),
             _ => None,
         }
     }

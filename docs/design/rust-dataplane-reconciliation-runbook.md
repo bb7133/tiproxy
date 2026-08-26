@@ -46,6 +46,31 @@ from transport epochs and request ids:
   `(connection_id, id)` alone: replay works **across** control
   reconnects and Go epochs by design.
 
+## Command sequences and provable obsolescence
+
+Every `RedirectCommand` carries a per-connection monotonically
+increasing `command_sequence` and every `DrainCommand` an issuer-wide
+one. An id is bound to exactly one issuance: the same id with a
+different sequence is a `PROTOCOL_VIOLATION`. Tombstone caches are
+bounded, and eviction is **provably safe**: Go issues command *n+1*
+only after consuming *n*'s terminal, so a sequence at or below the
+watermark whose id misses every cache is a duplicate of an evicted,
+already-consumed terminal — the gate answers `Obsolete`, and the
+runtime replies with a `DUPLICATE_REQUEST`-coded result that the
+issuer ignores by id (never a new failure, never a re-execution).
+Watermarks survive restarts through reconciliation
+(`ReconcileConnection.last_redirect_command_sequence`,
+`ReconcileRequest.last_drain_command_sequence`): a restarted issuer
+resumes from watermark + 1.
+
+All of this — the additive reconcile fields, nonzero sequences, and
+the rehydration/orphan lifecycle — is gated by the
+`RECONCILE_SESSION_REHYDRATION` capability. A legacy peer keeps the
+original `RECONCILE_CONNECTIONS` behavior: identification by omission,
+tombstone-only dedup, zero generations/sequences tolerated, and no
+orphan closes (a healthy old-peer session is never killed by the new
+lifecycle).
+
 ## Restart matrix
 
 ### Go restarts (Rust and its SQL sessions survive)
@@ -87,13 +112,20 @@ identity equality, plus the connection's `generation` and
 redirects until its (replayed) terminal result retires it exactly once.
 
 A pair that cannot be rehydrated (unknown namespace/backend, missing
-identity from an old peer) becomes an **orphan**: identified by
-omission from the snapshot (Rust keeps the session alive), excluded
-from redirect/drain by construction (no connection object exists), and
-retried by `ResolveOrphans` on the composition's maintenance cadence.
-After `MaxOrphanResolveAttempts` failures the adapter closes the
-session with a generation-stamped per-connection `CloseCommand` rather
-than leaking it forever.
+identity) becomes an **orphan**: identified by omission from the
+snapshot (Rust keeps the session alive), excluded from redirect/drain
+by construction (no connection object exists), and retried by
+`ResolveOrphans`. After `MaxOrphanResolveAttempts` failed rehydrations
+the adapter closes the session with a generation-stamped
+per-connection `CloseCommand` — and responsibility transfers only when
+that close actually reached the negotiated sender with the
+`PER_CONNECTION_CLOSE` capability; failed sends keep the orphan for
+the next attempt. `AttachRouterLookup`/`ResolveOrphans` are seams:
+the composition wiring (namespace manager, maintenance cadence) lands
+with the DPL-03/05 integrations, and the no-leak property holds *given
+that cadence* — it is not claimed for an unwired binary. A reused
+connection id arriving under a new generation/identity retires the
+stale incarnation's accounting exactly once before the rebuild.
 
 ### Rust restarts (Go and its router survive)
 
@@ -113,11 +145,14 @@ than leaking it forever.
   current absolute counters (`gracefully_closed`, `force_closed`,
   `complete`); a differing id answers `DRAIN_IN_PROGRESS` and
   identifies the active drain.
-- **Metering backpressure**: `MeteringLedger` retains at most
-  `MAX_UNACKED_METERING_BATCHES` sealed batches; hitting the bound is a
-  typed fail-closed signal (`MeteringBacklogFull`) meaning reconciles
-  have not acknowledged for too long — treat the control stream as
-  unhealthy rather than expecting dropped metering.
+- **Metering backpressure and durability**: `MeteringLedger` retains at
+  most `MAX_UNACKED_METERING_BATCHES` sealed batches with hard key and
+  per-batch bounds; every bound is a typed fail-closed signal
+  (`MeteringError`) — backpressure, never a drop. This satisfies the
+  protocol's retain-**or**-backpressure branch; retention is
+  **in-memory only**: unacknowledged batches do not survive a Rust
+  process crash (crash durability is an explicit non-goal here and a
+  candidate follow-up enhancement).
 - **Stuck redirect**: if a redirect never terminates, Go will not issue
   another for that connection; force the session closed
   (`CloseCommand`, `force=true`) — close accounting retires the

@@ -133,6 +133,12 @@ const (
 	ControlCapability_CONTROL_CAPABILITY_UNSPECIFIED           ControlCapability = 0
 	ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE  ControlCapability = 1
 	ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS ControlCapability = 2
+	// CTL-06: both sides carry ReconcileConnection
+	// generation/pending_redirect_id/identity, nonzero command sequences,
+	// and the rehydration/orphan lifecycle. Without it the legacy
+	// RECONCILE_CONNECTIONS behavior applies (identification by omission,
+	// no orphan closes).
+	ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION ControlCapability = 3
 )
 
 // Enum value maps for ControlCapability.
@@ -141,11 +147,13 @@ var (
 		0: "CONTROL_CAPABILITY_UNSPECIFIED",
 		1: "CONTROL_CAPABILITY_PER_CONNECTION_CLOSE",
 		2: "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS",
+		3: "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION",
 	}
 	ControlCapability_value = map[string]int32{
-		"CONTROL_CAPABILITY_UNSPECIFIED":           0,
-		"CONTROL_CAPABILITY_PER_CONNECTION_CLOSE":  1,
-		"CONTROL_CAPABILITY_RECONCILE_CONNECTIONS": 2,
+		"CONTROL_CAPABILITY_UNSPECIFIED":                   0,
+		"CONTROL_CAPABILITY_PER_CONNECTION_CLOSE":          1,
+		"CONTROL_CAPABILITY_RECONCILE_CONNECTIONS":         2,
+		"CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION": 3,
 	}
 )
 
@@ -2637,8 +2645,14 @@ type RedirectCommand struct {
 	BackendAddress     string                 `protobuf:"bytes,4,opt,name=backend_address,json=backendAddress,proto3" json:"backend_address,omitempty"`
 	ClusterName        string                 `protobuf:"bytes,5,opt,name=cluster_name,json=clusterName,proto3" json:"cluster_name,omitempty"`
 	DeadlineUnixMillis uint64                 `protobuf:"varint,6,opt,name=deadline_unix_millis,json=deadlineUnixMillis,proto3" json:"deadline_unix_millis,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Per-connection monotonically increasing issue number (CTL-06):
+	// proves a delayed duplicate of an evicted tombstone obsolete
+	// (sequence at or below the watermark without a cache hit never
+	// acts). Additive; zero only for peers predating
+	// RECONCILE_SESSION_REHYDRATION.
+	CommandSequence uint64 `protobuf:"varint,7,opt,name=command_sequence,json=commandSequence,proto3" json:"command_sequence,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RedirectCommand) Reset() {
@@ -2709,6 +2723,13 @@ func (x *RedirectCommand) GetClusterName() string {
 func (x *RedirectCommand) GetDeadlineUnixMillis() uint64 {
 	if x != nil {
 		return x.DeadlineUnixMillis
+	}
+	return 0
+}
+
+func (x *RedirectCommand) GetCommandSequence() uint64 {
+	if x != nil {
+		return x.CommandSequence
 	}
 	return 0
 }
@@ -2964,8 +2985,11 @@ type DrainCommand struct {
 	BackendIds                 []string               `protobuf:"bytes,3,rep,name=backend_ids,json=backendIds,proto3" json:"backend_ids,omitempty"`
 	GracefulDeadlineUnixMillis uint64                 `protobuf:"varint,4,opt,name=graceful_deadline_unix_millis,json=gracefulDeadlineUnixMillis,proto3" json:"graceful_deadline_unix_millis,omitempty"`
 	ForceDeadlineUnixMillis    uint64                 `protobuf:"varint,5,opt,name=force_deadline_unix_millis,json=forceDeadlineUnixMillis,proto3" json:"force_deadline_unix_millis,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	// Issuer-wide monotonically increasing issue number (CTL-06); same
+	// obsolescence watermark role as RedirectCommand.command_sequence.
+	CommandSequence uint64 `protobuf:"varint,6,opt,name=command_sequence,json=commandSequence,proto3" json:"command_sequence,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *DrainCommand) Reset() {
@@ -3029,6 +3053,13 @@ func (x *DrainCommand) GetGracefulDeadlineUnixMillis() uint64 {
 func (x *DrainCommand) GetForceDeadlineUnixMillis() uint64 {
 	if x != nil {
 		return x.ForceDeadlineUnixMillis
+	}
+	return 0
+}
+
+func (x *DrainCommand) GetCommandSequence() uint64 {
+	if x != nil {
+		return x.CommandSequence
 	}
 	return 0
 }
@@ -3388,8 +3419,11 @@ type ReconcileRequest struct {
 	LastMetricsSequence         uint64                 `protobuf:"varint,3,opt,name=last_metrics_sequence,json=lastMetricsSequence,proto3" json:"last_metrics_sequence,omitempty"`
 	LastMeteringSequence        uint64                 `protobuf:"varint,4,opt,name=last_metering_sequence,json=lastMeteringSequence,proto3" json:"last_metering_sequence,omitempty"`
 	Connections                 []*ReconcileConnection `protobuf:"bytes,5,rep,name=connections,proto3" json:"connections,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// Issuer-wide drain command_sequence watermark (CTL-06): a restarted
+	// Go lineage resumes issuing drains from watermark + 1.
+	LastDrainCommandSequence uint64 `protobuf:"varint,6,opt,name=last_drain_command_sequence,json=lastDrainCommandSequence,proto3" json:"last_drain_command_sequence,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *ReconcileRequest) Reset() {
@@ -3457,6 +3491,13 @@ func (x *ReconcileRequest) GetConnections() []*ReconcileConnection {
 	return nil
 }
 
+func (x *ReconcileRequest) GetLastDrainCommandSequence() uint64 {
+	if x != nil {
+		return x.LastDrainCommandSequence
+	}
+	return 0
+}
+
 type ReconcileConnection struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ConnectionId    uint64                 `protobuf:"varint,1,opt,name=connection_id,json=connectionId,proto3" json:"connection_id,omitempty"`
@@ -3479,9 +3520,13 @@ type ReconcileConnection struct {
 	// listener/client/proxy addresses to routing. connection_id inside
 	// must equal the outer connection_id. Additive; absent means the
 	// peer predates the field.
-	Identity      *ConnectionIdentity `protobuf:"bytes,7,opt,name=identity,proto3" json:"identity,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Identity *ConnectionIdentity `protobuf:"bytes,7,opt,name=identity,proto3" json:"identity,omitempty"`
+	// Highest redirect command_sequence observed for this connection
+	// (CTL-06): a restarted Go lineage resumes issuing from
+	// watermark + 1 so its new commands are never judged obsolete.
+	LastRedirectCommandSequence uint64 `protobuf:"varint,8,opt,name=last_redirect_command_sequence,json=lastRedirectCommandSequence,proto3" json:"last_redirect_command_sequence,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *ReconcileConnection) Reset() {
@@ -3561,6 +3606,13 @@ func (x *ReconcileConnection) GetIdentity() *ConnectionIdentity {
 		return x.Identity
 	}
 	return nil
+}
+
+func (x *ReconcileConnection) GetLastRedirectCommandSequence() uint64 {
+	if x != nil {
+		return x.LastRedirectCommandSequence
+	}
+	return 0
 }
 
 type ReconcileSnapshot struct {
@@ -3987,7 +4039,7 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x0fclient_in_bytes\x18\x06 \x01(\x04R\rclientInBytes\x12(\n" +
 	"\x10client_out_bytes\x18\a \x01(\x04R\x0eclientOutBytes\x12(\n" +
 	"\x10backend_in_bytes\x18\b \x01(\x04R\x0ebackendInBytes\x12*\n" +
-	"\x11backend_out_bytes\x18\t \x01(\x04R\x0fbackendOutBytes\"\xf4\x01\n" +
+	"\x11backend_out_bytes\x18\t \x01(\x04R\x0fbackendOutBytes\"\x9f\x02\n" +
 	"\x0fRedirectCommand\x12#\n" +
 	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x1f\n" +
 	"\vredirect_id\x18\x02 \x01(\tR\n" +
@@ -3996,7 +4048,8 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"backend_id\x18\x03 \x01(\tR\tbackendId\x12'\n" +
 	"\x0fbackend_address\x18\x04 \x01(\tR\x0ebackendAddress\x12!\n" +
 	"\fcluster_name\x18\x05 \x01(\tR\vclusterName\x120\n" +
-	"\x14deadline_unix_millis\x18\x06 \x01(\x04R\x12deadlineUnixMillis\"\x90\x02\n" +
+	"\x14deadline_unix_millis\x18\x06 \x01(\x04R\x12deadlineUnixMillis\x12)\n" +
+	"\x10command_sequence\x18\a \x01(\x04R\x0fcommandSequence\"\x90\x02\n" +
 	"\x0eRedirectResult\x12#\n" +
 	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x1f\n" +
 	"\vredirect_id\x18\x02 \x01(\tR\n" +
@@ -4018,14 +4071,15 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\bclose_id\x18\x02 \x01(\tR\acloseId\x12\x1a\n" +
 	"\baccepted\x18\x03 \x01(\bR\baccepted\x123\n" +
 	"\x04code\x18\x04 \x01(\x0e2\x1f.tiproxy.dataplane.v1.ErrorCodeR\x04code\x12\x16\n" +
-	"\x06detail\x18\x05 \x01(\tR\x06detail\"\xf1\x01\n" +
+	"\x06detail\x18\x05 \x01(\tR\x06detail\"\x9c\x02\n" +
 	"\fDrainCommand\x12\x19\n" +
 	"\bdrain_id\x18\x01 \x01(\tR\adrainId\x12%\n" +
 	"\x0elistener_names\x18\x02 \x03(\tR\rlistenerNames\x12\x1f\n" +
 	"\vbackend_ids\x18\x03 \x03(\tR\n" +
 	"backendIds\x12A\n" +
 	"\x1dgraceful_deadline_unix_millis\x18\x04 \x01(\x04R\x1agracefulDeadlineUnixMillis\x12;\n" +
-	"\x1aforce_deadline_unix_millis\x18\x05 \x01(\x04R\x17forceDeadlineUnixMillis\"\x90\x02\n" +
+	"\x1aforce_deadline_unix_millis\x18\x05 \x01(\x04R\x17forceDeadlineUnixMillis\x12)\n" +
+	"\x10command_sequence\x18\x06 \x01(\x04R\x0fcommandSequence\"\x90\x02\n" +
 	"\vDrainResult\x12\x19\n" +
 	"\bdrain_id\x18\x01 \x01(\tR\adrainId\x12-\n" +
 	"\x12active_connections\x18\x02 \x01(\x04R\x11activeConnections\x12+\n" +
@@ -4055,13 +4109,14 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x14cross_location_bytes\x18\x05 \x01(\x04R\x12crossLocationBytes\"h\n" +
 	"\rMeteringBatch\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12;\n" +
-	"\x06deltas\x18\x02 \x03(\v2#.tiproxy.dataplane.v1.MeteringDeltaR\x06deltas\"\xb9\x02\n" +
+	"\x06deltas\x18\x02 \x03(\v2#.tiproxy.dataplane.v1.MeteringDeltaR\x06deltas\"\xf8\x02\n" +
 	"\x10ReconcileRequest\x12)\n" +
 	"\x10known_generation\x18\x01 \x01(\x04R\x0fknownGeneration\x12C\n" +
 	"\x1elast_connection_event_sequence\x18\x02 \x01(\x04R\x1blastConnectionEventSequence\x122\n" +
 	"\x15last_metrics_sequence\x18\x03 \x01(\x04R\x13lastMetricsSequence\x124\n" +
 	"\x16last_metering_sequence\x18\x04 \x01(\x04R\x14lastMeteringSequence\x12K\n" +
-	"\vconnections\x18\x05 \x03(\v2).tiproxy.dataplane.v1.ReconcileConnectionR\vconnections\"\xb8\x02\n" +
+	"\vconnections\x18\x05 \x03(\v2).tiproxy.dataplane.v1.ReconcileConnectionR\vconnections\x12=\n" +
+	"\x1blast_drain_command_sequence\x18\x06 \x01(\x04R\x18lastDrainCommandSequence\"\xfd\x02\n" +
 	"\x13ReconcileConnection\x12#\n" +
 	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x1d\n" +
 	"\n" +
@@ -4072,7 +4127,8 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"generation\x18\x05 \x01(\x04R\n" +
 	"generation\x12.\n" +
 	"\x13pending_redirect_id\x18\x06 \x01(\tR\x11pendingRedirectId\x12D\n" +
-	"\bidentity\x18\a \x01(\v2(.tiproxy.dataplane.v1.ConnectionIdentityR\bidentity\"\xa3\x02\n" +
+	"\bidentity\x18\a \x01(\v2(.tiproxy.dataplane.v1.ConnectionIdentityR\bidentity\x12C\n" +
+	"\x1elast_redirect_command_sequence\x18\b \x01(\x04R\x1blastRedirectCommandSequence\"\xa3\x02\n" +
 	"\x11ReconcileSnapshot\x12-\n" +
 	"\x12applied_generation\x18\x01 \x01(\x04R\x11appliedGeneration\x12:\n" +
 	"\x19connection_event_sequence\x18\x02 \x01(\x04R\x17connectionEventSequence\x12)\n" +
@@ -4097,11 +4153,12 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fROLE_GO_CONTROL\x10\x01\x12\x17\n" +
-	"\x13ROLE_RUST_DATAPLANE\x10\x02*\x92\x01\n" +
+	"\x13ROLE_RUST_DATAPLANE\x10\x02*\xc8\x01\n" +
 	"\x11ControlCapability\x12\"\n" +
 	"\x1eCONTROL_CAPABILITY_UNSPECIFIED\x10\x00\x12+\n" +
 	"'CONTROL_CAPABILITY_PER_CONNECTION_CLOSE\x10\x01\x12,\n" +
-	"(CONTROL_CAPABILITY_RECONCILE_CONNECTIONS\x10\x02*v\n" +
+	"(CONTROL_CAPABILITY_RECONCILE_CONNECTIONS\x10\x02\x124\n" +
+	"0CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION\x10\x03*v\n" +
 	"\x11ProxyProtocolMode\x12#\n" +
 	"\x1fPROXY_PROTOCOL_MODE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cPROXY_PROTOCOL_MODE_DISABLED\x10\x01\x12\x1a\n" +
