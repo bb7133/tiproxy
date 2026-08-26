@@ -129,6 +129,9 @@ pub enum SessionEvent {
     ClientCommand,
     /// The client sent `COM_QUIT`.
     ClientCommandQuit,
+    /// A no-response command (`COM_STMT_SEND_LONG_DATA` or
+    /// `COM_STMT_CLOSE`) finished after successful backend forwarding.
+    NoResponseCommandComplete,
     /// A non-final backend response chunk arrived.
     BackendResponsePart,
     /// The backend response completed with the transaction finished.
@@ -141,6 +144,12 @@ pub enum SessionEvent {
     ClientInfileChunk,
     /// The client finished the `LOCAL INFILE` stream (empty packet).
     ClientInfileEnd,
+    /// SES-05 reports that at least one prepared statement now has pending
+    /// long data or an unread cursor.
+    PreparedStatePending,
+    /// SES-05 reports that no prepared statement has pending long data or an
+    /// unread cursor.
+    PreparedStateClear,
     /// Control plane: migrate this session to a new backend.
     ControlRedirect,
     /// Control plane: close gracefully at the next safe boundary.
@@ -240,7 +249,7 @@ impl std::error::Error for TransitionError {}
 /// Extended-state flags; exposed read-only for observability and tests.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "these are six independent extended-state dimensions of the \
+    reason = "these are seven independent extended-state dimensions of the \
               model; folding them into nested enums would obscure the \
               reachable-space enumeration the model test performs"
 )]
@@ -252,6 +261,8 @@ pub struct SessionFlags {
     pub backend_owner: bool,
     /// The last completed response left a transaction open.
     pub in_txn: bool,
+    /// SES-05 has at least one pending long-data/cursor guard.
+    pub prepared_pending: bool,
     /// A control-plane redirect awaits the next transaction boundary.
     pub redirect_pending: bool,
     /// A graceful close awaits the next transaction boundary.
@@ -306,6 +317,26 @@ impl SessionFsm {
     /// Returns [`TransitionError`] for an illegal `(state, event)` pair; the
     /// machine is unchanged and no effects are produced.
     pub fn on_event(&mut self, event: SessionEvent) -> Result<Effects, TransitionError> {
+        if matches!(
+            self.state,
+            SessionState::Ready
+                | SessionState::Command
+                | SessionState::Response
+                | SessionState::LocalInfile
+                | SessionState::Draining
+        ) {
+            match event {
+                SessionEvent::PreparedStatePending => {
+                    self.flags.prepared_pending = true;
+                    return Ok(Effects::new());
+                }
+                SessionEvent::PreparedStateClear => {
+                    self.flags.prepared_pending = false;
+                    return Ok(Effects::new());
+                }
+                _ => {}
+            }
+        }
         let outcome = match self.state {
             SessionState::Accept => self.on_accept(event),
             SessionState::Greeting => self.on_greeting(event),
@@ -467,22 +498,23 @@ impl SessionFsm {
                     return None;
                 }
                 self.flags.redirect_pending = true;
-                if self.flags.in_txn {
-                    // Go parity: wait for the transaction boundary.
-                    Some((SessionState::Ready, Effects::new()))
-                } else {
+                if self.at_migration_boundary() {
                     Some((
                         SessionState::RedirectPending,
                         vec![SessionEffect::StartRedirectHandshake],
                     ))
+                } else {
+                    // Go parity: wait for both the transaction boundary and
+                    // every prepared long-data/cursor guard to clear.
+                    Some((SessionState::Ready, Effects::new()))
                 }
             }
             SessionEvent::ControlGracefulClose => {
-                if self.flags.in_txn {
+                if self.at_migration_boundary() {
+                    Some((SessionState::Closing, self.teardown()))
+                } else {
                     self.flags.draining = true;
                     Some((SessionState::Draining, vec![SessionEffect::BeginDrainTimer]))
-                } else {
-                    Some((SessionState::Closing, self.teardown()))
                 }
             }
             SessionEvent::ClientCommandQuit
@@ -495,25 +527,35 @@ impl SessionFsm {
         }
     }
 
-    /// Shared response-boundary handling for `Command` and `Response`.
-    fn response_complete(&mut self, txn_done: bool) -> (SessionState, Effects) {
-        self.flags.in_txn = !txn_done;
-        let mut effects = vec![SessionEffect::ForwardResponseToClient];
-        if txn_done && self.flags.draining {
+    /// Go `finishedTxn`: no open transaction and no pending prepared guard.
+    const fn at_migration_boundary(&self) -> bool {
+        !self.flags.in_txn && !self.flags.prepared_pending
+    }
+
+    /// Shared safe-boundary handling after prepared/transaction state is
+    /// already current for the completed command.
+    fn finish_command(&mut self, mut effects: Effects) -> (SessionState, Effects) {
+        if self.at_migration_boundary() && self.flags.draining {
             // Go parity: graceful close wins over a pending redirect;
             // `teardown` reports the refused redirect as failed.
             effects.extend(self.teardown());
             return (SessionState::Closing, effects);
         }
-        if txn_done && self.flags.redirect_pending {
+        if self.at_migration_boundary() && self.flags.redirect_pending {
             effects.push(SessionEffect::StartRedirectHandshake);
             return (SessionState::RedirectPending, effects);
         }
         if self.flags.draining {
-            // Transaction still open: keep waiting at the drain deadline.
+            // Transaction or prepared guard remains open.
             return (SessionState::Draining, effects);
         }
         (SessionState::Ready, effects)
+    }
+
+    /// Shared response-boundary handling for `Command` and `Response`.
+    fn response_complete(&mut self, txn_done: bool) -> (SessionState, Effects) {
+        self.flags.in_txn = !txn_done;
+        self.finish_command(vec![SessionEffect::ForwardResponseToClient])
     }
 
     fn on_command(&mut self, event: SessionEvent) -> Option<(SessionState, Effects)> {
@@ -524,6 +566,7 @@ impl SessionFsm {
             )),
             SessionEvent::BackendResponseTxnDone => Some(self.response_complete(true)),
             SessionEvent::BackendResponseTxnOpen => Some(self.response_complete(false)),
+            SessionEvent::NoResponseCommandComplete => Some(self.finish_command(Effects::new())),
             SessionEvent::BackendLocalInfileRequest => Some((
                 SessionState::LocalInfile,
                 vec![SessionEffect::RequestLocalInfileFromClient],
@@ -723,12 +766,15 @@ impl SessionFsm {
             // without effects while tearing down.
             SessionEvent::ClientCommand
             | SessionEvent::ClientCommandQuit
+            | SessionEvent::NoResponseCommandComplete
             | SessionEvent::BackendResponsePart
             | SessionEvent::BackendResponseTxnDone
             | SessionEvent::BackendResponseTxnOpen
             | SessionEvent::BackendLocalInfileRequest
             | SessionEvent::ClientInfileChunk
             | SessionEvent::ClientInfileEnd
+            | SessionEvent::PreparedStatePending
+            | SessionEvent::PreparedStateClear
             | SessionEvent::ControlGracefulClose
             | SessionEvent::ControlCloseImmediate
             | SessionEvent::ClientEof
@@ -961,6 +1007,16 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Ready,
+        SessionEvent::PreparedStatePending,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Ready,
+        SessionEvent::PreparedStateClear,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Ready,
         SessionEvent::ControlRedirect,
         SessionState::RedirectPending,
     ),
@@ -1027,6 +1083,11 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Command,
+        SessionEvent::BackendResponseTxnDone,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
         SessionEvent::BackendResponseTxnOpen,
         SessionState::Ready,
     ),
@@ -1034,6 +1095,36 @@ pub static TRANSITIONS: &[Transition] = &[
         SessionState::Command,
         SessionEvent::BackendResponseTxnOpen,
         SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::NoResponseCommandComplete,
+        SessionState::Ready,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::NoResponseCommandComplete,
+        SessionState::RedirectPending,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::NoResponseCommandComplete,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::NoResponseCommandComplete,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::PreparedStatePending,
+        SessionState::Command,
+    ),
+    t(
+        SessionState::Command,
+        SessionEvent::PreparedStateClear,
+        SessionState::Command,
     ),
     t(
         SessionState::Command,
@@ -1108,6 +1199,11 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Response,
+        SessionEvent::BackendResponseTxnDone,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Response,
         SessionEvent::BackendResponseTxnOpen,
         SessionState::Ready,
     ),
@@ -1115,6 +1211,16 @@ pub static TRANSITIONS: &[Transition] = &[
         SessionState::Response,
         SessionEvent::BackendResponseTxnOpen,
         SessionState::Draining,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::PreparedStatePending,
+        SessionState::Response,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::PreparedStateClear,
+        SessionState::Response,
     ),
     t(
         SessionState::Response,
@@ -1166,6 +1272,16 @@ pub static TRANSITIONS: &[Transition] = &[
         SessionState::LocalInfile,
         SessionEvent::ClientInfileEnd,
         SessionState::Response,
+    ),
+    t(
+        SessionState::LocalInfile,
+        SessionEvent::PreparedStatePending,
+        SessionState::LocalInfile,
+    ),
+    t(
+        SessionState::LocalInfile,
+        SessionEvent::PreparedStateClear,
+        SessionState::LocalInfile,
     ),
     t(
         SessionState::LocalInfile,
@@ -1261,6 +1377,16 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Draining,
+        SessionEvent::PreparedStatePending,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Draining,
+        SessionEvent::PreparedStateClear,
+        SessionState::Draining,
+    ),
+    t(
+        SessionState::Draining,
         SessionEvent::ControlRedirect,
         SessionState::Draining,
     ),
@@ -1327,6 +1453,11 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Closing,
+        SessionEvent::NoResponseCommandComplete,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
         SessionEvent::BackendResponsePart,
         SessionState::Closing,
     ),
@@ -1353,6 +1484,16 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::Closing,
         SessionEvent::ClientInfileEnd,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::PreparedStatePending,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Closing,
+        SessionEvent::PreparedStateClear,
         SessionState::Closing,
     ),
     t(

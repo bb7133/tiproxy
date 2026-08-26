@@ -24,7 +24,7 @@ use session_core::fsm::{
 
 /// Every event, so exploration and illegal-pair checks cover the whole
 /// alphabet. A new variant that is not added here fails the count pin.
-const ALL_EVENTS: [SessionEvent; 27] = [
+const ALL_EVENTS: [SessionEvent; 30] = [
     SessionEvent::ConnectionAccepted,
     SessionEvent::BackendGreetingReceived,
     SessionEvent::ClientSslRequest,
@@ -34,12 +34,15 @@ const ALL_EVENTS: [SessionEvent; 27] = [
     SessionEvent::BackendAuthFailed,
     SessionEvent::ClientCommand,
     SessionEvent::ClientCommandQuit,
+    SessionEvent::NoResponseCommandComplete,
     SessionEvent::BackendResponsePart,
     SessionEvent::BackendResponseTxnDone,
     SessionEvent::BackendResponseTxnOpen,
     SessionEvent::BackendLocalInfileRequest,
     SessionEvent::ClientInfileChunk,
     SessionEvent::ClientInfileEnd,
+    SessionEvent::PreparedStatePending,
+    SessionEvent::PreparedStateClear,
     SessionEvent::ControlRedirect,
     SessionEvent::ControlGracefulClose,
     SessionEvent::ControlCloseImmediate,
@@ -410,6 +413,68 @@ fn boundary_priority_walk() {
             ),
         ],
     );
+}
+
+/// Pending prepared long data/cursors are part of Go's `finishedTxn`
+/// predicate even outside a SQL transaction. Redirect and graceful close
+/// wait until the guard is cleared at a command boundary; a no-response
+/// close command can provide that boundary without inventing a backend
+/// response packet.
+#[test]
+fn prepared_guard_blocks_redirect_and_drain() {
+    use SessionEffect as F;
+    use SessionEvent as E;
+    use SessionState as S;
+
+    let mut redirect = authenticated_session();
+    run(
+        &mut redirect,
+        &[
+            (E::PreparedStatePending, S::Ready, &[]),
+            (E::ControlRedirect, S::Ready, &[]),
+            (E::ClientCommand, S::Command, &[F::ForwardCommandToBackend]),
+            (E::PreparedStateClear, S::Command, &[]),
+            (
+                E::NoResponseCommandComplete,
+                S::RedirectPending,
+                &[F::StartRedirectHandshake],
+            ),
+        ],
+    );
+
+    let mut drain = authenticated_session();
+    run(
+        &mut drain,
+        &[
+            (E::PreparedStatePending, S::Ready, &[]),
+            (E::ControlGracefulClose, S::Draining, &[F::BeginDrainTimer]),
+            (E::ClientCommand, S::Command, &[F::ForwardCommandToBackend]),
+            (E::PreparedStateClear, S::Command, &[]),
+            (
+                E::NoResponseCommandComplete,
+                S::Closing,
+                &[
+                    F::ReleaseBackend,
+                    F::CloseBackend,
+                    F::CloseClient,
+                    F::ClassifySessionEnd,
+                ],
+            ),
+        ],
+    );
+
+    let mut still_pending = authenticated_session();
+    run(
+        &mut still_pending,
+        &[
+            (E::PreparedStatePending, S::Ready, &[]),
+            (E::ControlRedirect, S::Ready, &[]),
+            (E::ClientCommand, S::Command, &[F::ForwardCommandToBackend]),
+            (E::NoResponseCommandComplete, S::Ready, &[]),
+        ],
+    );
+    assert!(still_pending.flags().prepared_pending);
+    assert!(still_pending.flags().redirect_pending);
 }
 
 /// Graceful close on an idle session inside a transaction: `Draining`

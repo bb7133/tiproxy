@@ -24,6 +24,7 @@ pub mod command;
 pub mod error_source;
 pub mod fsm;
 pub mod handshake;
+pub mod prepared;
 pub mod response;
 pub mod special;
 

@@ -2559,6 +2559,74 @@
       }
     },
     {
+      "id": "stmt-execute-types-reuse",
+      "description": "Two COM_STMT_EXECUTE requests freeze Go's null bitmap, signed/unsigned types, and new-params-bound reuse bytes.",
+      "parity_ids": [
+        "CMD-023",
+        "PS-004"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/net/mysql.go:MakeExecuteStmtRequest",
+        "pkg/proxy/net/mysql_test.go:TestPrepareStmts"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "statement_42_prepared_with_4_params"
+      },
+      "trace_file": "cases/stmt-execute-types-reuse.trace.gz",
+      "trace_sha256": "ad4c3e7823aa885b2b7f8e02ddc4ac3b4b069d1be2db99fd81cc96f88f1f52b2",
+      "uncompressed_bytes": 152,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 41,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 33,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT"
+        ],
+        "effects": [
+          "first execute supplies four parameter types",
+          "second execute reuses the retained types",
+          "null and unsigned markers stay exact"
+        ]
+      }
+    },
+    {
       "id": "stmt-fetch",
       "description": "COM_STMT_FETCH returns cursor rows and closes the cursor.",
       "parity_ids": [
@@ -2611,6 +2679,136 @@
         ],
         "effects": [
           "cursor-open status is cleared"
+        ]
+      }
+    },
+    {
+      "id": "stmt-lifecycle-independent",
+      "description": "Two statement IDs independently retain long-data and cursor guards across ERR, partial fetch, reset, final fetch, and close.",
+      "parity_ids": [
+        "CMD-023",
+        "CMD-024",
+        "CMD-025",
+        "CMD-026",
+        "CMD-028",
+        "PS-001",
+        "PS-002",
+        "PS-003",
+        "PS-005",
+        "PS-006",
+        "RSP-008"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor.go:updatePrepStmtStatus",
+        "pkg/proxy/backend/cmd_processor.go:finishedTxn",
+        "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts",
+        "pkg/proxy/backend/cmd_processor_test.go:TestMixPrepAndTxnStatus"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "statements_7_and_8_prepared"
+      },
+      "trace_file": "cases/stmt-lifecycle-independent.trace.gz",
+      "trace_sha256": "6f7c4e3afb36d76a6de35be06e0492b17a87e9e267bd78157082d261dd0d979f",
+      "uncompressed_bytes": 335,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 10,
+          "physical_packets": 1
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 10,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 42,
+          "physical_packets": 3
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 10,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 30,
+          "physical_packets": 1
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 9,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 2
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 5,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 1
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 9,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 7,
+          "physical_packets": 2
+        },
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 5,
+          "physical_packets": 1
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "server_status": [
+          "SERVER_STATUS_AUTOCOMMIT",
+          "SERVER_STATUS_LAST_ROW_SENT"
+        ],
+        "effects": [
+          "statement 7 long data survives execute ERR",
+          "statement 8 cursor survives a fetch without LAST_ROW_SENT",
+          "reset clears only statement 7",
+          "final fetch and close clear statement 8",
+          "migration is blocked until both independent guards clear"
         ]
       }
     },
@@ -2708,6 +2906,62 @@
         "effects": [
           "statement ID 7 becomes pending",
           "parameter and column metadata are forwarded"
+        ]
+      }
+    },
+    {
+      "id": "stmt-prepare-metadata-deprecate-eof",
+      "description": "COM_STMT_PREPARE omits metadata EOF packets when CLIENT_DEPRECATE_EOF is negotiated.",
+      "parity_ids": [
+        "CMD-022",
+        "PS-004",
+        "RSP-006"
+      ],
+      "go_source_refs": [
+        "pkg/proxy/backend/cmd_processor_exec.go:forwardPrepareCmd",
+        "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
+      ],
+      "capabilities": [
+        "CLIENT_CONNECT_ATTS",
+        "CLIENT_CONNECT_WITH_DB",
+        "CLIENT_DEPRECATE_EOF",
+        "CLIENT_LOCAL_FILES",
+        "CLIENT_MULTI_RESULTS",
+        "CLIENT_MULTI_STATEMENTS",
+        "CLIENT_PLUGIN_AUTH",
+        "CLIENT_PROTOCOL_41",
+        "CLIENT_PS_MULTI_RESULTS",
+        "CLIENT_SECURE_CONNECTION",
+        "CLIENT_ZSTD_COMPRESSION_ALGORITHM"
+      ],
+      "initial_state": {
+        "phase": "command",
+        "state": "ready"
+      },
+      "trace_file": "cases/stmt-prepare-metadata-deprecate-eof.trace.gz",
+      "trace_sha256": "f689c2fdcf51b3a8e3de97a7c7b88159ee3ab3738ed19fa7f4a2d04dc1832b57",
+      "uncompressed_bytes": 135,
+      "records": [
+        {
+          "direction": "client_to_proxy",
+          "sequence_start": 0,
+          "logical_payload_bytes": 9,
+          "physical_packets": 1
+        },
+        {
+          "direction": "backend_to_proxy",
+          "sequence_start": 1,
+          "logical_payload_bytes": 80,
+          "physical_packets": 3
+        }
+      ],
+      "expected": {
+        "outcome": "forward",
+        "terminal_state": "ready",
+        "effects": [
+          "statement ID 9 becomes pending",
+          "metadata groups omit classic EOF packets",
+          "the response flushes once after the last declared column"
         ]
       }
     },
