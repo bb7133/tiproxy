@@ -365,3 +365,153 @@ fn unknown_state_survives_every_err_variant() -> Result<(), Box<dyn std::error::
     assert!(fsm.is_safe_boundary());
     Ok(())
 }
+
+/// Mid-command `MORE_RESULTS` terminators carry authoritative statuses
+/// that must reach the FSM (Go updates `serverStatus` at **every** result
+/// terminator), so a statusless final ERR decides the boundary on the
+/// **latest** status, not the pre-command one.
+#[test]
+fn mid_multi_result_status_reaches_the_fsm() -> Result<(), Box<dyn std::error::Error>> {
+    let query = [Command::Query.as_byte(), b'B'];
+    let mut err_packet = vec![0xff];
+    err_packet.extend_from_slice(&1064_u16.to_le_bytes());
+    err_packet.extend_from_slice(b"#42000syntax");
+
+    // A. txn open -> mid-result "done" -> final ERR: the retained state is
+    //    "out of transaction", so the queued redirect is released.
+    let mut fsm = authenticated_fsm();
+    let plan = dispatch(CommandPacket::decode(&query)?)?;
+    let mut observer = ResponseObserver::new(plan.response, caps(), false, flush_threshold())?;
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&ok_packet(
+        StatusFlags::IN_TRANS,
+    ))?)?;
+    let _ = apply(&mut fsm, effect.session_event());
+    let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
+    assert!(!effects.contains(&SessionEffect::StartRedirectHandshake));
+    let plan = dispatch(CommandPacket::decode(&query)?)?;
+    let mut observer = ResponseObserver::new(plan.response, caps(), true, flush_threshold())?;
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&ok_packet(
+        StatusFlags::MORE_RESULTS_EXISTS,
+    ))?)?;
+    assert_eq!(
+        effect.session_event(),
+        SessionEvent::BackendResponsePartTxnDone,
+        "a MORE_RESULTS terminator must expose its authoritative status"
+    );
+    let _ = apply(&mut fsm, effect.session_event());
+    assert_eq!(fsm.state(), SessionState::Response);
+    assert!(!fsm.flags().in_txn, "mid-result status must be applied");
+    assert!(
+        !fsm.is_safe_boundary(),
+        "the command is still in flight: no boundary yet"
+    );
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&err_packet)?)?;
+    assert_eq!(effect.status, None, "ERR carries no status");
+    let effects = apply(&mut fsm, effect.session_event());
+    assert!(
+        effects.contains(&SessionEffect::StartRedirectHandshake),
+        "final ERR after a mid-result COMMIT must release the redirect"
+    );
+
+    // B. out of txn -> mid-result "open" -> final ERR: the retained state
+    //    is "in transaction", so the queued redirect stays blocked.
+    let mut fsm = authenticated_fsm();
+    let plan = dispatch(CommandPacket::decode(&query)?)?;
+    let mut observer = ResponseObserver::new(plan.response, caps(), false, flush_threshold())?;
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
+    assert!(!effects.contains(&SessionEffect::StartRedirectHandshake));
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&ok_packet(
+        StatusFlags::MORE_RESULTS_EXISTS.union(StatusFlags::IN_TRANS),
+    ))?)?;
+    assert_eq!(
+        effect.session_event(),
+        SessionEvent::BackendResponsePartTxnOpen
+    );
+    let _ = apply(&mut fsm, effect.session_event());
+    assert!(fsm.flags().in_txn, "mid-result BEGIN must be applied");
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&err_packet)?)?;
+    let effects = apply(&mut fsm, effect.session_event());
+    assert!(
+        !effects.contains(&SessionEffect::StartRedirectHandshake),
+        "final ERR after a mid-result BEGIN must keep the redirect queued"
+    );
+    assert!(!fsm.is_safe_boundary());
+
+    // C. Unknown -> mid-result authoritative status -> final ERR: the
+    //    part status restores knowledge, and the ERR retains it.
+    let mut fsm = authenticated_fsm();
+    let _ = apply(&mut fsm, SessionEvent::BackendStateUnknown);
+    let effects = apply(&mut fsm, SessionEvent::ControlRedirect);
+    assert!(!effects.contains(&SessionEffect::StartRedirectHandshake));
+    let plan = dispatch(CommandPacket::decode(&query)?)?;
+    let mut observer = ResponseObserver::new(plan.response, caps(), false, flush_threshold())?;
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&ok_packet(
+        StatusFlags::MORE_RESULTS_EXISTS,
+    ))?)?;
+    let _ = apply(&mut fsm, effect.session_event());
+    assert!(
+        !fsm.flags().txn_unknown,
+        "a mid-result authoritative status restores knowledge"
+    );
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&err_packet)?)?;
+    let effects = apply(&mut fsm, effect.session_event());
+    assert!(
+        !fsm.flags().txn_unknown,
+        "the ERR retains the restored knowledge"
+    );
+    assert!(
+        effects.contains(&SessionEffect::StartRedirectHandshake),
+        "known + out-of-txn at the ERR boundary releases the redirect"
+    );
+    Ok(())
+}
+
+/// A late backend/internal ERR (or a late mid-result status) arriving
+/// after an immediate close is tolerated in `Closing` and teardown still
+/// completes — the in-flight-traffic race never becomes a
+/// `TransitionError`.
+#[test]
+fn late_err_after_immediate_close_is_tolerated() -> Result<(), Box<dyn std::error::Error>> {
+    let query = [Command::Query.as_byte(), b'B'];
+    for late in [
+        SessionEvent::BackendResponseErrorComplete,
+        SessionEvent::InternalResponseError,
+        SessionEvent::BackendResponsePartTxnDone,
+        SessionEvent::BackendResponsePartTxnOpen,
+        SessionEvent::InternalResponseTxnDone,
+        SessionEvent::InternalResponseTxnOpen,
+        SessionEvent::BackendStateUnknown,
+    ] {
+        let mut fsm = authenticated_fsm();
+        let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+        let _ = apply(&mut fsm, SessionEvent::ControlCloseImmediate);
+        assert_eq!(fsm.state(), SessionState::Closing);
+        let effects = apply(&mut fsm, late);
+        assert!(effects.is_empty(), "late {late:?} must be a silent no-op");
+        assert_eq!(fsm.state(), SessionState::Closing);
+        let _ = apply(&mut fsm, SessionEvent::TeardownComplete);
+        assert_eq!(fsm.state(), SessionState::Closed);
+    }
+
+    // The real observer path: the command is mid-flight when the close
+    // lands, and its final ERR arrives only afterwards.
+    let mut fsm = authenticated_fsm();
+    let plan = dispatch(CommandPacket::decode(&query)?)?;
+    let mut observer = ResponseObserver::new(plan.response, caps(), false, flush_threshold())?;
+    let _ = apply(&mut fsm, SessionEvent::ClientCommand);
+    let _ = apply(&mut fsm, SessionEvent::ControlCloseImmediate);
+    let mut err_packet = vec![0xff];
+    err_packet.extend_from_slice(&1064_u16.to_le_bytes());
+    err_packet.extend_from_slice(b"#42000syntax");
+    let effect = observer.observe_backend(ResponsePacket::from_payload(&err_packet)?)?;
+    let effects = apply(&mut fsm, effect.session_event());
+    assert!(effects.is_empty());
+    assert_eq!(fsm.state(), SessionState::Closing);
+    let _ = apply(&mut fsm, SessionEvent::TeardownComplete);
+    assert_eq!(fsm.state(), SessionState::Closed);
+    Ok(())
+}

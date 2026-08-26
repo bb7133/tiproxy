@@ -285,8 +285,17 @@ impl ResponseEffect {
     #[must_use]
     pub const fn session_event(self) -> SessionEvent {
         match self.disposition {
-            ResponseDisposition::Continue | ResponseDisposition::MoreResults => {
-                SessionEvent::BackendResponsePart
+            ResponseDisposition::Continue => SessionEvent::BackendResponsePart,
+            // A MORE_RESULTS terminator carries an authoritative status that
+            // Go applies immediately (`handleOKPacket`/`handleEOFPacket` run
+            // per result, not per command), so the FSM must see it mid-flight
+            // (SES-07).
+            ResponseDisposition::MoreResults => {
+                if self.in_transaction {
+                    SessionEvent::BackendResponsePartTxnOpen
+                } else {
+                    SessionEvent::BackendResponsePartTxnDone
+                }
             }
             ResponseDisposition::LocalInfile => SessionEvent::BackendLocalInfileRequest,
             // An ERR carries no server status: the FSM decides the
