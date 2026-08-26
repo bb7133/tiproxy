@@ -14,3 +14,50 @@ Go-compatible failure taxonomy (`error_source`):
   for the listed failures, silence for everything else, so internal detail
   (paths, certificates, control payloads) cannot reach a client by
   construction.
+
+## Session FSM (`fsm`, SES-00)
+
+Pure state machine: classified events in, effects out. No I/O, no timers,
+no packet payloads (classification happens in the wire/transport layers).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Accept
+    Accept --> Greeting: ConnectionAccepted / send proxy greeting
+    Greeting --> SslRequest: ClientSslRequest / activate TLS
+    SslRequest --> Greeting: TlsActivated
+    Greeting --> FrontendHandshake: ClientHandshakeResponse / dial backend
+    FrontendHandshake --> BackendHandshake: BackendGreetingReceived / forward auth
+    BackendHandshake --> Ready: BackendAuthOk / attach owner
+    BackendHandshake --> Closing: BackendAuthFailed
+    Ready --> Command: ClientCommand / forward
+    Command --> Response: BackendResponsePart / stream
+    Command --> LocalInfile: BackendLocalInfileRequest
+    LocalInfile --> Response: ClientInfileEnd
+    Response --> Ready: response complete (boundary rules below)
+    Ready --> RedirectPending: ControlRedirect at txn boundary
+    RedirectPending --> Ready: RedirectBackendReady / swap owner
+    RedirectPending --> Ready: RedirectBackendFailed / keep owner
+    Ready --> Draining: ControlGracefulClose inside a txn
+    Draining --> Command: ClientCommand
+    Draining --> Closing: boundary or drain deadline
+    Ready --> Closing: quit, EOF, error, immediate close
+    Closing --> Closed: TeardownComplete
+```
+
+Boundary rules (Go `backend_conn_mgr.go` parity): redirect and graceful
+close both wait for the transaction boundary; graceful close wins over a
+pending redirect; a failed migration keeps the current backend; migration
+is serialized with command execution (Go `processLock`), so client
+requests during it are illegal at the FSM level — Go's narrow
+hold-and-replay of an in-transaction `BEGIN` (`needHoldRequest`, MIG-005)
+is deferred to SES-07; every accepted redirect signal is retired with
+exactly one result, including across close and teardown (synchronous
+failure at close, one-shot suppression of the late in-flight result);
+graceful close before authentication closes immediately
+(`TestGracefulCloseBeforeHandshake`). The complete legal transition
+relation is the
+`TRANSITIONS` table, proven exactly equal to the machine by an exhaustive
+reachability test over the full state × flag space (`tests/fsm_model.rs`),
+which also proves: no two backend owners, no authenticated state without
+authentication, no effects after `Closed`.
