@@ -186,3 +186,34 @@ PROCESS_INFO, FIELD_LIST, cursor execute/fetch, multi-results, both EOF modes,
 and LOCAL INFILE. Unit tests pin the contextual marker matrix, typed malformed
 terminal rejection, and one million streamed rows with constant observer size
 and zero retained payload bytes.
+
+## Special duplex flows (`special`, SES-06)
+
+Direction-reversing flows frozen from Go `forwardLoadInFile` /
+`forwardChangeUserCmd`:
+
+- `LocalInfileUpload`: the client-owned upload turn machine after the
+  observer's `0xfb` — chunks forwarded unflushed, the empty terminator
+  forwarded with a backend flush (Go's batching), then the SES-04
+  observer consumes the final OK/ERR (and `MORE_RESULTS`). Counters only
+  (u64, checked): file bytes never enter the type; overflow and
+  wrong-turn events (including any backend packet mid-upload, which Go
+  never reads) are typed and inert. Go forwards the flow regardless of
+  the `LOCAL_FILES` capability (`TiDB` enforces it);
+  `local_infile_negotiated` exists for logging only.
+- `plan_change_user`: parse (hard errors → typed `Malformed`, Go
+  `ErrMalformPacket`), then rewrite with `UNKNOWN_AUTH_PLUGIN` and **no
+  auth data** (tiproxy#127 — the backend re-issues an auth switch with
+  its own salt). The pending identity (user/database/attribute pairs) is
+  committed only on the final OK; `Debug` output is redacted and the
+  client's scramble provably survives nowhere.
+- `ChangeUserRelay`: the backend↔client auth loop as turns (classified
+  via SES-02's `classify_backend_auth_packet`); OK → commit + the
+  SES-00 boundary event (txn bit via a bounded-prefix parse), ERR →
+  forward + discard (previous identity untouched, like Go applying
+  `changeUser` only on `err == nil`); SES-03's `ClearAll` fires on the
+  same success.
+- Redirect/drain during either flow stays pending until the safe
+  boundary (integration-tested against the SES-00 FSM).
+- `COM_STATISTICS` deliberately has no sub-machine: the SES-04
+  observer's raw one-packet state is Go's `forwardStatisticsCmd`.
