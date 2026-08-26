@@ -175,9 +175,10 @@ struct Recorder {
     /// loading select arms while the loop is provably not selecting.
     forward_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Spawn an instantly-completing child on `ForwardCommandToBackend`
-    /// (before any gate), so the finished-child select arm is ready
-    /// while the loop is gated.
-    spawn_instant_child_on_forward: bool,
+    /// (before any gate) that flips the flag when it finishes, so the
+    /// finished-child select arm is **provably** ready while the loop is
+    /// gated.
+    spawn_instant_child_on_forward: Option<Arc<AtomicBool>>,
 }
 
 impl Recorder {
@@ -195,8 +196,13 @@ fn locked<T: Clone>(cell: &Arc<Mutex<T>>) -> T {
 
 impl EffectHandler for Recorder {
     async fn execute(&mut self, effect: SessionEffect, children: &mut JoinSet<()>) {
-        if self.spawn_instant_child_on_forward && effect == SessionEffect::ForwardCommandToBackend {
-            children.spawn(async {});
+        if effect == SessionEffect::ForwardCommandToBackend
+            && let Some(done) = &self.spawn_instant_child_on_forward
+        {
+            let done = Arc::clone(done);
+            children.spawn(async move {
+                done.store(true, Ordering::SeqCst);
+            });
         }
         if effect == SessionEffect::ForwardCommandToBackend
             && let Some(gate) = self.forward_gate.take()
@@ -570,9 +576,10 @@ async fn three_select_arms_race_cleanly() {
     let (event_tx, reads, source) = CountingSource::new();
     let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let child_done = Arc::new(AtomicBool::new(false));
     let handler = Recorder {
         forward_gate: Some(Arc::clone(&gate)),
-        spawn_instant_child_on_forward: true,
+        spawn_instant_child_on_forward: Some(Arc::clone(&child_done)),
         ..Recorder::default()
     };
     let effects = handler.effects();
@@ -602,6 +609,13 @@ async fn three_select_arms_race_cleanly() {
     let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
     quiesce().await;
     assert_eq!(reads.load(Ordering::SeqCst), 6, "boundary relayed by pump");
+    // The loop is still gated inside the handler, so the JoinSet cannot
+    // have been reaped: a completed child here proves the join_next arm
+    // is ready.
+    assert!(
+        child_done.load(Ordering::SeqCst),
+        "child finished while the loop was gated"
+    );
 
     // Release: the next select polls all three ready arms at once (no
     // precheck applies to any of them).
