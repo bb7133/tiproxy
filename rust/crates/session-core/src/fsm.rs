@@ -565,6 +565,13 @@ impl SessionFsm {
                 SessionState::Response,
                 vec![SessionEffect::ForwardResponseToClient],
             )),
+            // A later statement in a multi-result COM_QUERY may request
+            // LOCAL INFILE after an earlier result already moved the session
+            // from Command to Response.
+            SessionEvent::BackendLocalInfileRequest => Some((
+                SessionState::LocalInfile,
+                vec![SessionEffect::RequestLocalInfileFromClient],
+            )),
             SessionEvent::BackendResponseTxnDone => Some(self.response_complete(true)),
             SessionEvent::BackendResponseTxnOpen => Some(self.response_complete(false)),
             SessionEvent::ControlRedirect => {
@@ -1078,6 +1085,11 @@ pub static TRANSITIONS: &[Transition] = &[
         SessionState::Response,
         SessionEvent::BackendResponsePart,
         SessionState::Response,
+    ),
+    t(
+        SessionState::Response,
+        SessionEvent::BackendLocalInfileRequest,
+        SessionState::LocalInfile,
     ),
     t(
         SessionState::Response,

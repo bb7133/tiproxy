@@ -1094,7 +1094,9 @@
       "id": "field-list",
       "description": "COM_FIELD_LIST ends with a legacy EOF packet.",
       "parity_ids": [
-        "CMD-004"
+        "CMD-004",
+        "RSP-002",
+        "RSP-008"
       ],
       "go_source_refs": [
         "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
@@ -1847,7 +1849,9 @@
       "id": "process-info",
       "description": "COM_PROCESS_INFO uses result-set forwarding.",
       "parity_ids": [
-        "CMD-010"
+        "CMD-010",
+        "RSP-002",
+        "RSP-008"
       ],
       "go_source_refs": [
         "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
@@ -2405,7 +2409,8 @@
       "id": "statistics",
       "description": "COM_STATISTICS returns a raw human-readable payload.",
       "parity_ids": [
-        "CMD-009"
+        "CMD-009",
+        "RSP-001"
       ],
       "go_source_refs": [
         "pkg/proxy/backend/cmd_processor_test.go:TestForwardCommands"
@@ -2501,7 +2506,9 @@
       "parity_ids": [
         "CMD-023",
         "PS-002",
-        "PS-004"
+        "PS-004",
+        "RSP-002",
+        "RSP-008"
       ],
       "go_source_refs": [
         "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
@@ -2556,7 +2563,9 @@
       "description": "COM_STMT_FETCH returns cursor rows and closes the cursor.",
       "parity_ids": [
         "CMD-028",
-        "PS-002"
+        "PS-002",
+        "RSP-002",
+        "RSP-008"
       ],
       "go_source_refs": [
         "pkg/proxy/backend/cmd_processor_test.go:TestPreparedStmts"
