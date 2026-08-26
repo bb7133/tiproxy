@@ -34,20 +34,41 @@
 //!   terminal answer (`NO_BACKEND` after enumerating candidates, or an
 //!   internal error); it carries no backend and needs no result.
 //!
+//! **Retirement discipline** (ADR: one terminal `RouteResult` **or**
+//! connection close): a failed `RouteResult` is sent only for a real
+//! candidate failure that the session will keep re-selecting past —
+//! the adapter answers it by pushing the next assignment. Locally
+//! terminal outcomes (budget exhaustion, unsupported cluster, session
+//! teardown mid-dial via cancelling the `acquire` future) send **no**
+//! result: the runtime emits `ConnectionEvent(CLOSED)` and Go
+//! `closeStateLocked` finishes the unfinished assignment exactly once
+//! (reconcile is the backstop). [`RouteEngine::unretired_assignment`]
+//! exposes what close accounting must cover. Sending a failed result on
+//! a dying session would make the adapter reserve yet another backend
+//! for it — deliberately avoided.
+//!
 //! Dial parity with Go `BackendConnManager.getBackendIO`:
 //! - a **per-dial** timeout bounds each attempt (`DialTimeout`, 1s);
 //! - a **total** budget bounds the whole acquisition
 //!   (`ConnectTimeout` via `backoff.MaxElapsedTime`);
 //! - failed attempts back off exponentially: initial 100ms, multiplier
-//!   2, randomization factor 0.5, capped at the max interval. The jitter
-//!   source is **injected** ([`DialSchedule::jitter`]) so production can
-//!   seed it per connection while tests fix it — the crate has no
-//!   global randomness.
+//!   2, randomization factor 0.5, capped at the max interval. The
+//!   jitter comes from an injected, session-owned [`JitterSource`]
+//!   (production: [`SplitMixJitter`] driven by
+//!   `connection seed + assignment_id + attempt`, so schedules
+//!   desynchronize across assignments with no global randomness; tests
+//!   pin constants). Outputs are clamped to `[0, 1]` with a non-finite
+//!   guard before Go's `RandomizationFactor` mapping.
 //!
 //! Cluster-aware dialing stays a seam: [`BackendDialer::dial`] receives
 //! the assignment's `cluster_name` (Go `BackendDialer.DialContext`
-//! carries it for serverless multi-cluster DNS); resolver logic belongs
-//! to the namespace/multi-cluster integration (DPL-07), not here.
+//! carries it for serverless multi-cluster DNS). A dialer declares
+//! [`BackendDialer::CLUSTER_AWARE`]; the engine **fails closed** with a
+//! typed [`AcquireError::ClusterUnsupported`] when a non-empty cluster
+//! reaches a cluster-unaware dialer — direct TCP never silently
+//! ignores a cluster scope. Resolver logic (Go `NetworkRouter`'s
+//! cluster-scoped DNS) belongs to the namespace/multi-cluster
+//! integration (DPL-07), not here.
 //!
 //! No `MySQL` payload bytes appear anywhere in this module: route
 //! messages carry identifiers and addresses only.
@@ -113,6 +134,13 @@ pub enum AcquireError {
         /// The failure that consumed the final attempt, if any dial ran.
         last_failure: Option<DialFailure>,
     },
+    /// A non-empty `cluster_name` reached a dialer that is not
+    /// cluster-aware: fail closed instead of silently dialing outside
+    /// the cluster scope (resolver integration is DPL-07).
+    ClusterUnsupported {
+        /// The assignment's cluster scope.
+        cluster_name: String,
+    },
     /// The control conversation broke mid-acquisition.
     Channel(RouteChannelError),
 }
@@ -146,6 +174,11 @@ pub trait RouteChannel: Send {
 /// plain TCP semantics. Resolver logic is deliberately out of scope
 /// (DPL-07).
 pub trait BackendDialer: Send {
+    /// Whether this dialer honors the assignment's cluster scope
+    /// (cluster DNS). Cluster-unaware dialers (plain TCP) keep the
+    /// default; the engine then rejects non-empty cluster names.
+    const CLUSTER_AWARE: bool = false;
+
     /// The established, not-yet-authenticated backend connection.
     type Conn: Send;
 
@@ -156,6 +189,64 @@ pub trait BackendDialer: Send {
         address: &str,
         cluster_name: &str,
     ) -> impl Future<Output = Result<Self::Conn, DialFailure>> + Send;
+}
+
+/// Session-owned jitter for the backoff schedule. Implementations
+/// return a value in `[0, 1]`; the engine clamps and guards non-finite
+/// values before applying Go's `RandomizationFactor` mapping.
+pub trait JitterSource: Send {
+    /// The jitter for `attempt` of the assignment `assignment_id`.
+    fn jitter(&mut self, assignment_id: &str, attempt: u32) -> f64;
+}
+
+/// Deterministic centered jitter: every delay is exactly nominal.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CenteredJitter;
+
+impl JitterSource for CenteredJitter {
+    fn jitter(&mut self, _assignment_id: &str, _attempt: u32) -> f64 {
+        0.5
+    }
+}
+
+/// SplitMix64-based jitter driven by
+/// `connection seed + assignment_id + attempt`: deterministic per
+/// input, desynchronized across assignments and connections, no global
+/// randomness.
+#[derive(Debug, Clone, Copy)]
+pub struct SplitMixJitter {
+    seed: u64,
+}
+
+impl SplitMixJitter {
+    /// Seeds the source for one connection.
+    #[must_use]
+    pub const fn for_connection(connection_id: u64) -> Self {
+        Self {
+            seed: connection_id ^ 0x9e37_79b9_7f4a_7c15,
+        }
+    }
+
+    fn splitmix(state: u64) -> u64 {
+        let mut z = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+impl JitterSource for SplitMixJitter {
+    fn jitter(&mut self, assignment_id: &str, attempt: u32) -> f64 {
+        let mut state = self.seed ^ u64::from(attempt).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        for byte in assignment_id.as_bytes() {
+            state = Self::splitmix(state ^ u64::from(*byte));
+        }
+        let value = Self::splitmix(state);
+        // 53 mantissa bits: uniform in [0, 1); exact in f64.
+        #[allow(clippy::cast_precision_loss)]
+        let unit = (value >> 11) as f64 / (1u64 << 53) as f64;
+        unit
+    }
 }
 
 /// Dial budgets and backoff shape (Go `getBackendIO` /
@@ -176,15 +267,6 @@ pub struct DialSchedule {
     pub randomization: f64,
     /// Interval cap (Go `MaxInterval`).
     pub max_interval: Duration,
-    /// Injected jitter source returning values in `[0, 1]`; the attempt
-    /// index makes deterministic schedules expressible. Production seeds
-    /// this per connection; tests pin it.
-    pub jitter: fn(attempt: u32) -> f64,
-}
-
-/// Centered jitter: every delay uses exactly the nominal interval.
-const fn centered_jitter(_attempt: u32) -> f64 {
-    0.5
 }
 
 impl Default for DialSchedule {
@@ -196,15 +278,15 @@ impl Default for DialSchedule {
             multiplier: 2.0,
             randomization: 0.5,
             max_interval: Duration::from_secs(2),
-            jitter: centered_jitter,
         }
     }
 }
 
 impl DialSchedule {
     /// The backoff delay before attempt `attempt` (attempt 0 dials
-    /// immediately).
-    fn delay_before(&self, attempt: u32) -> Duration {
+    /// immediately) with the given raw jitter (clamped; non-finite
+    /// values fall back to centered).
+    fn delay_before(&self, attempt: u32, jitter: f64) -> Duration {
         if attempt == 0 {
             return Duration::ZERO;
         }
@@ -215,7 +297,11 @@ impl DialSchedule {
             0.0,
         );
         let nominal = nominal.min(self.max_interval.as_secs_f64());
-        let jitter = (self.jitter)(attempt).clamp(0.0, 1.0);
+        let jitter = if jitter.is_finite() {
+            jitter.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
         let factor = self.randomization.mul_add(2.0 * jitter - 1.0, 1.0);
         Duration::from_secs_f64((nominal * factor).max(0.0))
     }
@@ -280,28 +366,50 @@ pub struct AcquireStats {
 /// The route/dial engine for one connection: drives request →
 /// assignment → dial → result cycles under the budgets, reporting every
 /// assignment's outcome exactly once.
-pub struct RouteEngine<Ch, D> {
+pub struct RouteEngine<Ch, D, J = CenteredJitter> {
     channel: Ch,
     dialer: D,
     schedule: DialSchedule,
+    jitter: J,
     connection_id: u64,
     stats: AcquireStats,
+    /// The OK assignment currently consumed but not yet retired by a
+    /// result. On local terminal outcomes (budget exhaustion,
+    /// unsupported cluster) and on a cancelled `acquire` future this
+    /// stays set: close accounting (`ConnectionEvent(CLOSED)` → Go
+    /// `closeStateLocked`) must cover it.
+    unretired: Option<String>,
 }
 
-impl<Ch: RouteChannel, D: BackendDialer> RouteEngine<Ch, D> {
+impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> {
     /// Builds the engine for one connection.
-    pub const fn new(channel: Ch, dialer: D, schedule: DialSchedule, connection_id: u64) -> Self {
+    pub const fn new(
+        channel: Ch,
+        dialer: D,
+        schedule: DialSchedule,
+        jitter: J,
+        connection_id: u64,
+    ) -> Self {
         Self {
             channel,
             dialer,
             schedule,
+            jitter,
             connection_id,
             stats: AcquireStats {
                 assignments: 0,
                 dials: 0,
                 results_reported: 0,
             },
+            unretired: None,
         }
+    }
+
+    /// The assignment id that close accounting must retire (none when
+    /// every consumed assignment already got its result).
+    #[must_use]
+    pub fn unretired_assignment(&self) -> Option<&str> {
+        self.unretired.as_deref()
     }
 
     /// Acquisition accounting so far.
@@ -383,13 +491,28 @@ impl<Ch: RouteChannel, D: BackendDialer> RouteEngine<Ch, D> {
                     });
                 }
             }
+            // From here until this assignment's result is sent, close
+            // accounting owns it.
+            self.unretired = Some(assignment.assignment_id.clone());
+
+            // Fail closed on a cluster scope the dialer cannot honor
+            // (locally terminal: no result; CLOSED accounting covers it).
+            if !assignment.cluster_name.is_empty() && !D::CLUSTER_AWARE {
+                return Err(AcquireError::ClusterUnsupported {
+                    cluster_name: assignment.cluster_name,
+                });
+            }
 
             // Backoff before this attempt (the first dials immediately).
-            let delay = self.schedule.delay_before(attempt);
+            let raw = self
+                .jitter
+                .jitter(&assignment.assignment_id, attempt.saturating_add(1));
+            let delay = self.schedule.delay_before(attempt, raw);
             if Instant::now() + delay >= total_deadline {
-                // The budget cannot fit another attempt: retire this
-                // assignment and stop.
-                self.report(&assignment, None).await?;
+                // The budget cannot fit another attempt. Locally
+                // terminal: no failed result (it would make the adapter
+                // reserve yet another backend); CLOSED accounting
+                // retires the pending assignment.
                 return Err(AcquireError::BudgetExhausted { last_failure: None });
             }
             if !delay.is_zero() {
@@ -412,7 +535,7 @@ impl<Ch: RouteChannel, D: BackendDialer> RouteEngine<Ch, D> {
 
             match outcome {
                 Ok(conn) => {
-                    self.report(&assignment, Some(Ok(()))).await?;
+                    self.report(&assignment, Ok(())).await?;
                     return Ok(AcquiredBackend {
                         conn,
                         backend: BackendInfo::from_assignment(&assignment),
@@ -421,30 +544,33 @@ impl<Ch: RouteChannel, D: BackendDialer> RouteEngine<Ch, D> {
                     });
                 }
                 Err(failure) => {
-                    self.report(&assignment, Some(Err(failure))).await?;
                     if Instant::now() >= total_deadline {
+                        // Locally terminal: the session stops
+                        // re-selecting, so a failed result would only
+                        // spawn an unconsumed assignment. CLOSED
+                        // accounting retires this one.
                         return Err(AcquireError::BudgetExhausted {
                             last_failure: Some(failure),
                         });
                     }
-                    // The adapter pushes the next assignment after a
-                    // failed result; loop to await it.
+                    // A real candidate failure with the session still
+                    // re-selecting: the failed result retires it and the
+                    // adapter pushes the next assignment.
+                    self.report(&assignment, Err(failure)).await?;
                 }
             }
         }
     }
 
-    /// Retires one assignment with exactly one `RouteResult`.
-    ///
-    /// `outcome`: `Some(Ok(()))` connected; `Some(Err(f))` dial failure;
-    /// `None` not attempted (budget exhausted before dialing).
+    /// Retires one assignment with exactly one `RouteResult` and hands
+    /// its close-accounting obligation back.
     async fn report(
         &mut self,
         assignment: &RouteAssignment,
-        outcome: Option<Result<(), DialFailure>>,
+        outcome: Result<(), DialFailure>,
     ) -> Result<(), AcquireError> {
         let result = match outcome {
-            Some(Ok(())) => RouteResult {
+            Ok(()) => RouteResult {
                 connection_id: self.connection_id,
                 assignment_id: assignment.assignment_id.clone(),
                 connected: true,
@@ -452,7 +578,7 @@ impl<Ch: RouteChannel, D: BackendDialer> RouteEngine<Ch, D> {
                 code: ErrorCode::Ok.into(),
                 detail: String::new(),
             },
-            Some(Err(failure)) => RouteResult {
+            Err(failure) => RouteResult {
                 connection_id: self.connection_id,
                 assignment_id: assignment.assignment_id.clone(),
                 connected: false,
@@ -460,16 +586,9 @@ impl<Ch: RouteChannel, D: BackendDialer> RouteEngine<Ch, D> {
                 code: ErrorCode::BackendDialFailed.into(),
                 detail: String::new(),
             },
-            None => RouteResult {
-                connection_id: self.connection_id,
-                assignment_id: assignment.assignment_id.clone(),
-                connected: false,
-                error_source: ErrorSource::Proxy.into(),
-                code: ErrorCode::BackendDialFailed.into(),
-                detail: String::new(),
-            },
         };
         self.stats.results_reported = self.stats.results_reported.saturating_add(1);
+        self.unretired = None;
         self.channel
             .report_result(result)
             .await

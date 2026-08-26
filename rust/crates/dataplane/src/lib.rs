@@ -34,8 +34,9 @@ pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,
 };
 pub use route::{
-    AcquireError, AcquireStats, AcquiredBackend, BackendDialer, BackendInfo, DialFailure,
-    DialSchedule, RouteChannel, RouteChannelError, RouteEngine,
+    AcquireError, AcquireStats, AcquiredBackend, BackendDialer, BackendInfo, CenteredJitter,
+    DialFailure, DialSchedule, JitterSource, RouteChannel, RouteChannelError, RouteEngine,
+    SplitMixJitter,
 };
 pub use server::{
     AcceptedConnection, BoundListenerInfo, ConnectionHandler, DataplaneHandle, DataplaneServer,

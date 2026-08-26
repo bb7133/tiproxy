@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use control_proto::v1::{ErrorCode, ErrorSource, RouteAssignment, RouteResult};
 use dataplane::route::{
-    AcquireError, BackendDialer, DialFailure, DialSchedule, RouteChannel, RouteChannelError,
-    RouteEngine,
+    AcquireError, BackendDialer, CenteredJitter, DialFailure, DialSchedule, JitterSource,
+    RouteChannel, RouteChannelError, RouteEngine, SplitMixJitter,
 };
 use tokio::time::Instant;
 
@@ -120,6 +120,8 @@ impl FakeDialer {
 }
 
 impl BackendDialer for FakeDialer {
+    const CLUSTER_AWARE: bool = true;
+
     type Conn = String;
 
     async fn dial(&mut self, address: &str, cluster_name: &str) -> Result<String, DialFailure> {
@@ -143,7 +145,7 @@ fn engine(
     dialer: FakeDialer,
     schedule: DialSchedule,
 ) -> RouteEngine<FakeAdapter, FakeDialer> {
-    RouteEngine::new(adapter, dialer, schedule, CONN_ID)
+    RouteEngine::new(adapter, dialer, schedule, CenteredJitter, CONN_ID)
 }
 
 fn results_for<'r>(results: &'r [RouteResult], id: &str) -> Vec<&'r RouteResult> {
@@ -294,11 +296,15 @@ async fn total_budget_bounds_acquisition() {
         start.elapsed()
     );
     let stats = engine.stats();
+    assert!(
+        engine.unretired_assignment().is_some(),
+        "the final assignment is handed to close accounting"
+    );
     let (channel, _) = engine.into_parts();
     assert_eq!(
         u32::try_from(channel.results.len()).unwrap_or(u32::MAX),
-        stats.assignments,
-        "every consumed assignment retired exactly once"
+        stats.assignments - 1,
+        "every re-selected assignment retired; the terminal one is not"
     );
     for result in &channel.results {
         assert!(!result.connected);
@@ -461,14 +467,191 @@ async fn pre_dial_exhaustion_still_retires_the_assignment() {
         unreachable!("budget cannot fit the retry")
     };
     assert!(matches!(error, AcquireError::BudgetExhausted { .. }));
+    assert_eq!(
+        engine.unretired_assignment(),
+        Some("a-2"),
+        "the unattempted assignment goes to close accounting, not a failed result"
+    );
     let (channel, _) = engine.into_parts();
     assert_eq!(
         results_for(&channel.results, "a-1").len(),
         1,
         "failed dial retired"
     );
-    let unattempted = results_for(&channel.results, "a-2");
-    assert_eq!(unattempted.len(), 1, "unattempted assignment retired too");
-    assert!(!unattempted[0].connected);
-    assert_eq!(unattempted[0].error_source(), ErrorSource::Proxy);
+    assert!(
+        results_for(&channel.results, "a-2").is_empty(),
+        "no failed result for a locally-terminal outcome"
+    );
+}
+
+/// Session teardown mid-dial: cancelling the `acquire` future sends no
+/// failed result (which would make the adapter reserve another backend
+/// for a dying session); the consumed assignment surfaces through
+/// `unretired_assignment` for `ConnectionEvent(CLOSED)` accounting.
+#[tokio::test(start_paused = true)]
+async fn cancelled_acquire_leaves_assignment_to_close_accounting() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    let dialer = FakeDialer::new(&[("10.0.0.1:4000", Outcome::Hang)]);
+    let mut engine = engine(adapter, dialer, schedule());
+    {
+        let acquire = engine.acquire(Vec::new());
+        tokio::pin!(acquire);
+        let raced = tokio::time::timeout(Duration::from_millis(500), &mut acquire).await;
+        assert!(
+            raced.is_err(),
+            "the dial is mid-flight when the close lands"
+        );
+        // The future drops here: teardown mid-dial.
+    }
+    assert_eq!(
+        engine.unretired_assignment(),
+        Some("a-1"),
+        "close accounting owns the in-flight assignment"
+    );
+    let (channel, _) = engine.into_parts();
+    assert!(
+        channel.results.is_empty(),
+        "no failed result on teardown: CLOSED retires it Go-side"
+    );
+}
+
+/// A cluster-unaware dialer must not silently ignore a non-empty
+/// cluster scope: the engine fails closed with the typed error and the
+/// assignment goes to close accounting.
+#[tokio::test(start_paused = true)]
+async fn cluster_scope_fails_closed_on_unaware_dialer() {
+    struct DirectOnly;
+    impl BackendDialer for DirectOnly {
+        // CLUSTER_AWARE stays the default: false.
+        type Conn = ();
+
+        async fn dial(&mut self, _address: &str, _cluster_name: &str) -> Result<(), DialFailure> {
+            Ok(())
+        }
+    }
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    let mut engine = RouteEngine::new(
+        adapter,
+        DirectOnly,
+        DialSchedule::default(),
+        CenteredJitter,
+        CONN_ID,
+    );
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!("must fail closed")
+    };
+    assert_eq!(
+        error,
+        AcquireError::ClusterUnsupported {
+            cluster_name: "cluster-a".to_owned()
+        }
+    );
+    assert_eq!(engine.unretired_assignment(), Some("a-1"));
+
+    // An empty cluster scope dials fine on the same dialer.
+    let mut adapter = FakeAdapter::default();
+    adapter.assignments.push_back(RouteAssignment {
+        cluster_name: String::new(),
+        ..assignment("a-2", "tidb-b", "10.0.0.2:4000")
+    });
+    let mut engine = RouteEngine::new(
+        adapter,
+        DirectOnly,
+        DialSchedule::default(),
+        CenteredJitter,
+        CONN_ID,
+    );
+    assert!(engine.acquire(Vec::new()).await.is_ok());
+}
+
+/// The assignment's exact `cluster_name` reaches every dial attempt
+/// (Go `BackendDialer.DialContext` passthrough).
+#[tokio::test(start_paused = true)]
+async fn cluster_name_passes_through_to_every_dial() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    adapter
+        .assignments
+        .push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
+    let dialer = FakeDialer::new(&[
+        ("10.0.0.1:4000", Outcome::Refuse),
+        ("10.0.0.2:4000", Outcome::Connect),
+    ]);
+    let mut engine = engine(adapter, dialer, schedule());
+    assert!(engine.acquire(Vec::new()).await.is_ok());
+    let (_, dialer) = engine.into_parts();
+    assert_eq!(dialer.attempts.len(), 2);
+    for (_, cluster, _) in &dialer.attempts {
+        assert_eq!(cluster, "cluster-a", "exact passthrough on every dial");
+    }
+}
+
+/// `SplitMixJitter` is deterministic per input, in-range, and
+/// desynchronized across assignments and connections; extreme and
+/// non-finite injected jitter maps to the documented delay bounds.
+#[tokio::test(start_paused = true)]
+async fn jitter_semantics_are_deterministic_and_bounded() {
+    struct Fixed(f64);
+    impl JitterSource for Fixed {
+        fn jitter(&mut self, _assignment_id: &str, _attempt: u32) -> f64 {
+            self.0
+        }
+    }
+
+    let mut a = SplitMixJitter::for_connection(7);
+    let mut b = SplitMixJitter::for_connection(7);
+    let mut c = SplitMixJitter::for_connection(8);
+    let same = a.jitter("assign-1", 1);
+    assert!((0.0..=1.0).contains(&same));
+    assert!(
+        (same - b.jitter("assign-1", 1)).abs() < f64::EPSILON,
+        "deterministic"
+    );
+    assert!(
+        (same - c.jitter("assign-1", 1)).abs() > f64::EPSILON,
+        "connections desynchronize"
+    );
+    assert!(
+        (same - a.jitter("assign-2", 1)).abs() > f64::EPSILON,
+        "assignments desynchronize"
+    );
+
+    // Extreme jitter: with RandomizationFactor 0.5 the first delay is
+    // nominal 100ms scaled into [50ms, 150ms]; non-finite jitter falls
+    // back to centered (100ms). Observed through real waits.
+    for (raw, expected_ms) in [(0.0, 50), (1.0, 150), (f64::NAN, 100)] {
+        let mut adapter = FakeAdapter::default();
+        adapter
+            .assignments
+            .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+        adapter
+            .assignments
+            .push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
+        let dialer = FakeDialer::new(&[
+            ("10.0.0.1:4000", Outcome::Refuse),
+            ("10.0.0.2:4000", Outcome::Connect),
+        ]);
+        let start = Instant::now();
+        let mut engine = RouteEngine::new(
+            adapter,
+            dialer,
+            DialSchedule::default(),
+            Fixed(raw),
+            CONN_ID,
+        );
+        assert!(engine.acquire(Vec::new()).await.is_ok());
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(expected_ms),
+            "raw jitter {raw} maps to {expected_ms}ms"
+        );
+    }
 }
