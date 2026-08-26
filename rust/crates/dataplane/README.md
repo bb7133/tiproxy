@@ -100,8 +100,11 @@ observable completion; the terminal sequence bounded by one
 `cleanup_deadline` with the source provably dropped before a teardown
 child completes; the classifier held to at most one event of
 read-ahead; all six redirect × transport command boundary ×
-shutdown arrival orders with quiesced hand-offs plus one
-all-arms-ready race with a handler gate proving every arm was loaded
+shutdown arrival orders with quiesced hand-offs; a
+shutdown-precheck domination case (three stimuli provably pending,
+shutdown observed before the select) and a genuine three-select-arm
+race — control, finished child, and pumped boundary event, none with a
+precheck — polled simultaneously with the biased order observable
 (exactly-once teardown asserted in each); the
 handshake deadline firing pre-auth but an authenticated fully idle
 session (probe disabled, no events) surviving far past it; a

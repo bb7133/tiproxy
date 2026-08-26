@@ -15,9 +15,10 @@
 //! DPL-01 model tests: the single-owner loop with fake transports and a
 //! recording effect handler, under Tokio's paused-time deterministic
 //! scheduler. Critical interleavings (redirect × command boundary ×
-//! shutdown) are enumerated explicitly with quiesced hand-offs, plus one
-//! all-arms-ready race (with a handler gate proving all arms were
-//! loaded); the pump architecture is exercised with a multi-await
+//! shutdown) are enumerated explicitly with quiesced hand-offs, plus a
+//! shutdown-precheck domination case and a genuine three-select-arm
+//! race (handler gate + pump relay proof, arms without any precheck);
+//! the pump architecture is exercised with a multi-await
 //! classifier under select-arm noise, a read-ahead bound proof, and a
 //! terminal-cleanup budget/ordering proof.
 
@@ -173,6 +174,10 @@ struct Recorder {
     /// mid-apply until the test releases the gate — a real barrier for
     /// loading select arms while the loop is provably not selecting.
     forward_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Spawn an instantly-completing child on `ForwardCommandToBackend`
+    /// (before any gate), so the finished-child select arm is ready
+    /// while the loop is gated.
+    spawn_instant_child_on_forward: bool,
 }
 
 impl Recorder {
@@ -190,6 +195,9 @@ fn locked<T: Clone>(cell: &Arc<Mutex<T>>) -> T {
 
 impl EffectHandler for Recorder {
     async fn execute(&mut self, effect: SessionEffect, children: &mut JoinSet<()>) {
+        if self.spawn_instant_child_on_forward && effect == SessionEffect::ForwardCommandToBackend {
+            children.spawn(async {});
+        }
         if effect == SessionEffect::ForwardCommandToBackend
             && let Some(gate) = self.forward_gate.take()
         {
@@ -489,15 +497,17 @@ async fn redirect_command_shutdown_interleavings_never_deadlock() {
     }
 }
 
-/// All three stimulus arms **provably loaded** while the loop is blocked
-/// inside a gated handler call (not selecting): the control command is
-/// queued, the pump has demonstrably relayed the transport boundary into
-/// the loop-facing channel (completed-read counter), and shutdown is
-/// set. Releasing the gate lets the biased select race all three at
-/// once; the outcome must be one clean shutdown with exactly-once
-/// teardown.
+/// Three stimuli **provably pending** while the loop is blocked inside a
+/// gated handler call: a control command queued, the transport boundary
+/// demonstrably relayed by the pump into the loop-facing channel
+/// (completed-read counter), and shutdown set. On release the
+/// `next_action` precheck observes the pre-existing shutdown **before
+/// entering the select**, so shutdown dominates the pending work — the
+/// outcome must be one clean shutdown with exactly-once teardown. (The
+/// genuine three-select-arm race, with no precheck involved, is
+/// `three_select_arms_race_cleanly` below.)
 #[tokio::test(start_paused = true)]
-async fn concurrent_ready_arms_race_cleanly() {
+async fn pending_stimuli_shutdown_precheck_dominates() {
     let (event_tx, reads, source) = CountingSource::new();
     let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -523,25 +533,101 @@ async fn concurrent_ready_arms_race_cleanly() {
     quiesce().await;
     assert_eq!(reads.load(Ordering::SeqCst), 5, "loop is gated mid-apply");
 
-    // Load every arm while the loop cannot observe any of them.
+    // Load every stimulus while the loop cannot observe any of them.
     let _ = control_tx.send(SessionControl::Redirect).await;
     let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
     quiesce().await;
     // The pump has finished relaying the boundary event into the
-    // loop-facing one-slot channel: the transport arm is genuinely ready.
+    // loop-facing one-slot channel: the transport stimulus is pending at
+    // the loop's own channel, not upstream.
     assert_eq!(reads.load(Ordering::SeqCst), 6, "boundary relayed by pump");
     let _ = shutdown_tx.send(true);
 
-    // Open the gate: the loop returns to next_action with all three arms
-    // ready simultaneously.
+    // Open the gate: the precheck sees shutdown before any select poll.
     gate.add_permits(1);
     let summary = match tokio::time::timeout(Duration::from_secs(120), run).await {
         Ok(Ok(summary)) => summary,
         Ok(Err(join_error)) => unreachable!("loop panicked: {join_error}"),
-        Err(_) => unreachable!("deadlock under concurrent-ready race"),
+        Err(_) => unreachable!("deadlock with pending stimuli"),
     };
     assert_eq!(summary.end, SessionEnd::ServerShutdown);
     assert_eq!(summary.final_state, SessionState::Closed);
+    let recorded = locked(&effects);
+    assert_eq!(count(&recorded, SessionEffect::ClassifySessionEnd), 1);
+    assert_eq!(count(&recorded, SessionEffect::CloseClient), 1);
+}
+
+/// A **genuine** three-select-arm race: none of these arms has a
+/// precheck, so on gate release the loop's very next `tokio::select!`
+/// polls three simultaneously ready arms — a queued control command, a
+/// finished child, and a pumped transport boundary event. The biased
+/// order must hold observably: the redirect is queued first (control
+/// beats the boundary event, so the redirect is already pending when
+/// the boundary lands and fires `StartRedirectHandshake` exactly once),
+/// the finished child is a no-op, and nothing is lost or rejected.
+#[tokio::test(start_paused = true)]
+async fn three_select_arms_race_cleanly() {
+    let (event_tx, reads, source) = CountingSource::new();
+    let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler = Recorder {
+        forward_gate: Some(Arc::clone(&gate)),
+        spawn_instant_child_on_forward: true,
+        ..Recorder::default()
+    };
+    let effects = handler.effects();
+    let looped = SessionLoop::new(
+        source,
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    );
+    let run = tokio::spawn(looped.run());
+    for event in HANDSHAKE {
+        let _ = event_tx.send(event).await;
+    }
+    // The command's effect spawns an instantly-completing child, then
+    // blocks on the gate: the loop is inside apply, not selecting.
+    let _ = event_tx.send(SessionEvent::ClientCommand).await;
+    quiesce().await;
+    assert_eq!(reads.load(Ordering::SeqCst), 5, "loop is gated mid-apply");
+
+    // Arm 1: control (queued redirect).
+    let _ = control_tx.send(SessionControl::Redirect).await;
+    // Arm 2: the child has already finished during the quiesce; its
+    // join_next result is waiting.
+    // Arm 3: the transport boundary, provably relayed into the
+    // loop-facing channel by the pump.
+    let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
+    quiesce().await;
+    assert_eq!(reads.load(Ordering::SeqCst), 6, "boundary relayed by pump");
+
+    // Release: the next select polls all three ready arms at once (no
+    // precheck applies to any of them).
+    gate.add_permits(1);
+    quiesce().await;
+    let recorded = locked(&effects);
+    assert_eq!(
+        count(&recorded, SessionEffect::ForwardResponseToClient),
+        1,
+        "boundary event survived the race"
+    );
+    assert_eq!(
+        count(&recorded, SessionEffect::StartRedirectHandshake),
+        1,
+        "control won the biased race: the redirect was already queued at the boundary"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let summary = match tokio::time::timeout(Duration::from_secs(120), run).await {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(join_error)) => unreachable!("loop panicked: {join_error}"),
+        Err(_) => unreachable!("deadlock after the select race"),
+    };
+    assert_eq!(summary.end, SessionEnd::ServerShutdown);
+    assert_eq!(summary.final_state, SessionState::Closed);
+    assert_eq!(summary.rejected_events, 0, "nothing lost or duplicated");
     let recorded = locked(&effects);
     assert_eq!(count(&recorded, SessionEffect::ClassifySessionEnd), 1);
     assert_eq!(count(&recorded, SessionEffect::CloseClient), 1);
