@@ -111,6 +111,17 @@ Pure backend-auth policy frozen from Go `authenticator.go`:
   errors → `AuthenticationFailed`), and per-side compression activation
   only on the final OK (client = negotiated mask, backend =
   negotiated∩backend, zlib-wins order).
+- `classify_backend_auth_packet`: the no-panic entry point from a
+  transiently borrowed backend auth payload to a secret-free `AuthEvent`
+  (OK / error with the `1156`/`8052`/"PROXY Protocol"-substring suspect
+  rule — Go's sniff has **no code guard** — / auth switch with
+  NUL-terminated plugin classification / two-byte fast-auth marker /
+  extra data). An unterminated auth-switch name is a typed
+  `MalformedAuthPacket` where Go would panic (ledger SES-02-D1).
+- Reconnect is a hard gate: after a handler-approved reconnect the relay
+  accepts only `BackendReconnected` carrying the **new** backend
+  capability, which later compression activation uses (Go re-reads the
+  greeting after `RECONNECT`).
 - Secrets cannot leak by construction: events/effects/errors are
   classifications that carry no auth bytes; a test sweeps the whole
   `Debug` surface. Live-TiDB authentication tests belong to the runtime

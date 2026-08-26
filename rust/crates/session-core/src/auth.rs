@@ -41,13 +41,18 @@
 //!   plugin (including `tidb_sm3_password`, clear, socket, LDAP) is a
 //!   plain pass-through.
 //! - First-packet backend errors `1156` (packets out of order), `8052`
-//!   (`TiDB` invalid sequence), and a `1105` whose message mentions
-//!   "PROXY Protocol" classify as `BackendProxyProtocol`; later errors
-//!   classify as `AuthenticationFailed` (Go `handleHandshakeError`).
-//!   Message sniffing happens in the wire layer; the event carries only
-//!   the resulting class, never the message.
+//!   (`TiDB` invalid sequence), and **any** error whose message contains
+//!   "PROXY Protocol" (Go's substring check has no code guard) classify
+//!   as `BackendProxyProtocol`; later errors classify as
+//!   `AuthenticationFailed` (Go `handleHandshakeError`).
+//!   [`classify_backend_auth_packet`] performs the classification over a
+//!   transiently borrowed payload; the event carries only the resulting
+//!   class, never the message or any auth bytes.
 //! - A handler-approved error triggers a backend reconnect
-//!   (Go `HandleHandshakeErr` → `RECONNECT`).
+//!   (Go `HandleHandshakeErr` → `RECONNECT`). The reconnect is an explicit
+//!   gate: the relay accepts nothing until [`AuthEvent::BackendReconnected`]
+//!   delivers the **new** backend capability (Go re-reads the greeting and
+//!   compression later uses the new mask).
 
 use core::fmt;
 
@@ -223,6 +228,117 @@ pub fn plan_backend_handshake(
     })
 }
 
+/// Go `mysql.ER_NET_PACKETS_OUT_OF_ORDER`: a PROXY-protocol suspect in
+/// the first backend packet.
+pub const ER_NET_PACKETS_OUT_OF_ORDER: u16 = 1156;
+/// Go/`TiDB` `ER_INVALID_SEQUENCE` (`authenticator.go` local constant).
+pub const ER_INVALID_SEQUENCE: u16 = 8052;
+/// The message marker Go sniffs for (`strings.Contains`, **no code
+/// guard** — any error code qualifies).
+pub const PROXY_PROTOCOL_MESSAGE_MARKER: &[u8] = b"PROXY Protocol";
+
+/// A backend authentication packet that cannot be classified safely.
+/// Carries only the observed length and a static reason — never payload
+/// bytes. (Go's loop would panic slicing an auth-switch without a NUL
+/// terminator; returning this typed error instead is a recorded
+/// divergence, SES-02-D1.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedAuthPacket {
+    /// The payload length observed.
+    pub length: usize,
+    /// A static description of the violated shape.
+    pub reason: &'static str,
+}
+
+impl fmt::Display for MalformedAuthPacket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "malformed backend auth packet ({} bytes): {}",
+            self.length, self.reason
+        )
+    }
+}
+
+impl std::error::Error for MalformedAuthPacket {}
+
+fn contains_marker(haystack: &[u8]) -> bool {
+    haystack
+        .windows(PROXY_PROTOCOL_MESSAGE_MARKER.len())
+        .any(|window| window == PROXY_PROTOCOL_MESSAGE_MARKER)
+}
+
+/// Classifies one backend authentication packet into a secret-free
+/// [`AuthEvent`] without panicking on any input. The payload is borrowed
+/// transiently: nothing from it (message bytes, plugin names, auth data)
+/// enters the returned event or any `Debug` output.
+///
+/// Rules, mirroring Go's auth-forward loop and `handleHandshakeError`:
+/// - `0x00` → [`AuthEvent::BackendOk`].
+/// - `0xff` → [`AuthEvent::BackendError`] with
+///   [`AuthErrorClass::ProxyProtocolSuspect`] when the code is `1156` or
+///   `8052`, **or** the message contains "PROXY Protocol" (no code
+///   guard, exactly like Go); `handler_reconnect` is always `false` —
+///   the handshake-handler decision belongs to the runtime.
+/// - `0xfe` → [`AuthEvent::AuthSwitchRequest`] with the plugin name
+///   classified up to the NUL terminator. A missing NUL is
+///   [`MalformedAuthPacket`] (Go would panic here; SES-02-D1).
+/// - `0x01` with exactly two bytes and `0x03` →
+///   [`AuthEvent::FastAuthSuccess`] (the plugin gate stays in the relay).
+/// - Anything else non-empty → [`AuthEvent::ExtraAuthData`].
+///
+/// # Errors
+///
+/// Returns [`MalformedAuthPacket`] for an empty payload, an unparsable
+/// error packet, or an unterminated auth-switch plugin name.
+pub fn classify_backend_auth_packet(
+    payload: &[u8],
+    capabilities: CapabilityFlags,
+) -> Result<AuthEvent, MalformedAuthPacket> {
+    let Some(&header) = payload.first() else {
+        return Err(MalformedAuthPacket {
+            length: 0,
+            reason: "empty payload",
+        });
+    };
+    match header {
+        0x00 => Ok(AuthEvent::BackendOk),
+        0xff => {
+            let Ok(error) = mysql_wire::parse_error_packet(payload, capabilities) else {
+                return Err(MalformedAuthPacket {
+                    length: payload.len(),
+                    reason: "unparsable error packet",
+                });
+            };
+            let suspect = error.code == ER_NET_PACKETS_OUT_OF_ORDER
+                || error.code == ER_INVALID_SEQUENCE
+                || contains_marker(error.message);
+            Ok(AuthEvent::BackendError {
+                class: if suspect {
+                    AuthErrorClass::ProxyProtocolSuspect
+                } else {
+                    AuthErrorClass::Other
+                },
+                handler_reconnect: false,
+            })
+        }
+        0xfe => {
+            let name_and_rest = &payload[1..];
+            let Some(nul) = name_and_rest.iter().position(|&b| b == 0) else {
+                return Err(MalformedAuthPacket {
+                    length: payload.len(),
+                    reason: "auth switch without a NUL-terminated plugin name",
+                });
+            };
+            Ok(AuthEvent::AuthSwitchRequest {
+                plugin: AuthPluginName::classify(&name_and_rest[..nul]),
+            })
+        }
+        0x01 if payload.len() == 2 && payload[1] == 0x03 => Ok(AuthEvent::FastAuthSuccess),
+        _ => Ok(AuthEvent::ExtraAuthData),
+    }
+}
+
 /// Classified backend error during authentication. The wire layer performs
 /// the classification (codes `1156`/`8052`; the `1105` "PROXY Protocol"
 /// message sniff); the event carries only the class.
@@ -263,6 +379,13 @@ pub enum AuthEvent {
     ExtraAuthData,
     /// The client's next authentication packet arrived.
     ClientAuthResponse,
+    /// After a handler-approved reconnect: the new backend's greeting was
+    /// read and verified; carries the new capability mask (Go re-reads
+    /// `backendCapability` after `RECONNECT`).
+    BackendReconnected {
+        /// The new backend's capability mask.
+        backend: CapabilityFlags,
+    },
 }
 
 /// Relay effects. No effect carries authentication bytes: forwarding
@@ -320,6 +443,9 @@ pub enum AuthTurn {
     AwaitingBackend,
     /// Waiting for the client's response to relayed auth data.
     AwaitingClient,
+    /// A handler-approved reconnect is in flight: nothing is legal until
+    /// [`AuthEvent::BackendReconnected`] delivers the new capability.
+    AwaitingReconnect,
     /// The relay reached a terminal outcome.
     Finished,
 }
@@ -414,9 +540,11 @@ impl AuthRelay {
             ) => {
                 if handler_reconnect {
                     // Go: close the backend and redo the handshake without
-                    // forwarding the error to the client.
+                    // forwarding the error to the client. The relay then
+                    // waits for the new backend's verified greeting.
                     self.packet_index = 0;
                     self.plugin = None;
+                    self.turn = AuthTurn::AwaitingReconnect;
                     Ok(AuthStep {
                         effects: vec![AuthEffect::ReconnectBackend],
                         outcome: None,
@@ -469,6 +597,16 @@ impl AuthRelay {
                 self.turn = AuthTurn::AwaitingClient;
                 Ok(AuthStep {
                     effects: vec![AuthEffect::ForwardBackendToClient],
+                    outcome: None,
+                })
+            }
+            (AuthTurn::AwaitingReconnect, AuthEvent::BackendReconnected { backend }) => {
+                // The new backend's capability replaces the old one; later
+                // compression activation uses the new mask.
+                self.backend = backend;
+                self.turn = AuthTurn::AwaitingBackend;
+                Ok(AuthStep {
+                    effects: Vec::new(),
                     outcome: None,
                 })
             }
@@ -700,8 +838,26 @@ mod tests {
         );
         assert_eq!(step_result.effects, vec![AuthEffect::ReconnectBackend]);
         assert_eq!(step_result.outcome, None);
-        assert_eq!(relay.turn(), AuthTurn::AwaitingBackend);
+        assert_eq!(relay.turn(), AuthTurn::AwaitingReconnect);
         assert_eq!(relay.plugin(), None);
+        // The reconnect is a hard gate: nothing is legal until the new
+        // backend's verified greeting arrives.
+        for event in [
+            AuthEvent::BackendOk,
+            AuthEvent::ClientAuthResponse,
+            AuthEvent::ExtraAuthData,
+            AuthEvent::FastAuthSuccess,
+        ] {
+            assert!(relay.on_event(event).is_err(), "{event:?} before greeting");
+        }
+        let step_result = step(
+            &mut relay,
+            AuthEvent::BackendReconnected {
+                backend: caps(CapabilityFlags::PROTOCOL_41.bits()),
+            },
+        );
+        assert_eq!(step_result.effects, Vec::new());
+        assert_eq!(relay.turn(), AuthTurn::AwaitingBackend);
         // After reconnect, a first-packet PROXY-protocol suspect routes
         // as such again (the packet index reset).
         let step_result = step(
@@ -715,6 +871,156 @@ mod tests {
             step_result.outcome,
             Some(AuthOutcome::Failed(FailureKind::BackendProxyProtocol))
         );
+    }
+
+    /// Compression after a reconnect uses the **new** backend capability
+    /// (Go re-reads the greeting and `setCompress` sees the new mask).
+    #[test]
+    fn reconnect_swaps_backend_capability_for_compression() {
+        // Old backend: zstd. New backend: no compression bits at all.
+        let mut relay = new_relay();
+        let _ = step(
+            &mut relay,
+            AuthEvent::BackendError {
+                class: AuthErrorClass::Other,
+                handler_reconnect: true,
+            },
+        );
+        let _ = step(
+            &mut relay,
+            AuthEvent::BackendReconnected {
+                backend: caps(CapabilityFlags::PROTOCOL_41.bits()),
+            },
+        );
+        let done = step(&mut relay, AuthEvent::BackendOk);
+        assert_eq!(
+            done.effects,
+            vec![
+                AuthEffect::ForwardBackendToClient,
+                // Client side still uses the negotiated mask (zlib wins).
+                AuthEffect::ActivateClientCompression(CompressionSelection::Zlib),
+                // Backend side reflects the NEW backend: no compression.
+                AuthEffect::ActivateBackendCompression(CompressionSelection::None),
+            ]
+        );
+        // BackendReconnected outside the reconnect gate is illegal.
+        let mut relay = new_relay();
+        assert!(
+            relay
+                .on_event(AuthEvent::BackendReconnected { backend: caps(0) })
+                .is_err()
+        );
+    }
+
+    /// The classifier maps every packet shape without panicking and never
+    /// retains payload bytes.
+    #[test]
+    fn classifier_matches_go_rules() {
+        let caps41 = caps(CapabilityFlags::PROTOCOL_41.bits());
+        assert_eq!(
+            classify_backend_auth_packet(&[0x00, 0x00, 0x00], caps41),
+            Ok(AuthEvent::BackendOk)
+        );
+        // Auth switch with a NUL-terminated plugin name.
+        let mut switch = vec![0xfe];
+        switch.extend_from_slice(b"caching_sha2_password\0salt-bytes");
+        assert_eq!(
+            classify_backend_auth_packet(&switch, caps41),
+            Ok(AuthEvent::AuthSwitchRequest {
+                plugin: AuthPluginName::CachingSha2Password
+            })
+        );
+        // Fast-auth success is exactly two bytes.
+        assert_eq!(
+            classify_backend_auth_packet(&[0x01, 0x03], caps41),
+            Ok(AuthEvent::FastAuthSuccess)
+        );
+        assert_eq!(
+            classify_backend_auth_packet(&[0x01, 0x03, 0x00], caps41),
+            Ok(AuthEvent::ExtraAuthData)
+        );
+        assert_eq!(
+            classify_backend_auth_packet(&[0x01, 0x04], caps41),
+            Ok(AuthEvent::ExtraAuthData)
+        );
+
+        // Error classification: 1156 and 8052 by code.
+        for code in [ER_NET_PACKETS_OUT_OF_ORDER, ER_INVALID_SEQUENCE] {
+            let mut packet = vec![0xff];
+            packet.extend_from_slice(&code.to_le_bytes());
+            packet.extend_from_slice(b"#HY000ordinary text");
+            assert_eq!(
+                classify_backend_auth_packet(&packet, caps41),
+                Ok(AuthEvent::BackendError {
+                    class: AuthErrorClass::ProxyProtocolSuspect,
+                    handler_reconnect: false,
+                }),
+                "code {code}"
+            );
+        }
+        // The message sniff has NO code guard (Go strings.Contains): a
+        // non-1105 code with the marker is still a suspect.
+        let mut packet = vec![0xff];
+        packet.extend_from_slice(&9999_u16.to_le_bytes());
+        packet.extend_from_slice(b"#HY000invalid PROXY Protocol header");
+        assert_eq!(
+            classify_backend_auth_packet(&packet, caps41),
+            Ok(AuthEvent::BackendError {
+                class: AuthErrorClass::ProxyProtocolSuspect,
+                handler_reconnect: false,
+            })
+        );
+        // An ordinary auth error is not a suspect.
+        let mut packet = vec![0xff];
+        packet.extend_from_slice(&1045_u16.to_le_bytes());
+        packet.extend_from_slice(b"#28000Access denied for user");
+        assert_eq!(
+            classify_backend_auth_packet(&packet, caps41),
+            Ok(AuthEvent::BackendError {
+                class: AuthErrorClass::Other,
+                handler_reconnect: false,
+            })
+        );
+    }
+
+    /// Malformed and truncated packets return typed errors — never a
+    /// panic, and never payload bytes in the error (Go would panic on the
+    /// unterminated auth switch; SES-02-D1).
+    #[test]
+    fn classifier_rejects_malformed_without_panic() {
+        let caps41 = caps(CapabilityFlags::PROTOCOL_41.bits());
+        let empty = classify_backend_auth_packet(&[], caps41);
+        assert_eq!(
+            empty,
+            Err(MalformedAuthPacket {
+                length: 0,
+                reason: "empty payload",
+            })
+        );
+        // Auth switch without a NUL terminator.
+        let mut switch = vec![0xfe];
+        switch.extend_from_slice(b"secret-plugin-no-nul");
+        let error = match classify_backend_auth_packet(&switch, caps41) {
+            Err(error) => error,
+            Ok(event) => unreachable!("accepted: {event:?}"),
+        };
+        assert!(!format!("{error:?}").contains("secret-plugin"));
+        assert!(!error.to_string().contains("secret-plugin"));
+        // Truncated error packets (header only, partial code).
+        for truncated in [&[0xff][..], &[0xff, 0x12][..]] {
+            assert!(
+                classify_backend_auth_packet(truncated, caps41).is_err(),
+                "{truncated:?}"
+            );
+        }
+        // Every prefix of a full error packet classifies or rejects —
+        // no panic on any cut.
+        let mut full = vec![0xff];
+        full.extend_from_slice(&1045_u16.to_le_bytes());
+        full.extend_from_slice(b"#28000Access denied");
+        for cut in 0..=full.len() {
+            let _ = classify_backend_auth_packet(&full[..cut], caps41);
+        }
     }
 
     /// Malformed/unexpected sequences are typed errors and change nothing:
