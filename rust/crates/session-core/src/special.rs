@@ -297,15 +297,23 @@ impl fmt::Debug for SessionIdentity {
 }
 
 impl SessionIdentity {
-    /// Creates the identity from the initial handshake outcome.
+    /// Creates the identity from the initial handshake outcome. Go keeps
+    /// the first `HandshakeResponse`'s attributes on the authenticator
+    /// (`auth.attrs = clientResp.Attrs`), so they belong here from the
+    /// start — a later change-user replaces them entirely (including
+    /// clearing them when the new request carries none).
     #[must_use]
-    pub fn new(username: &[u8], database: Option<&[u8]>) -> Self {
+    pub fn new(
+        username: &[u8],
+        database: Option<&[u8]>,
+        attributes: Option<&[(Vec<u8>, Vec<u8>)]>,
+    ) -> Self {
         Self {
             username: username.to_vec(),
             database: database.map_or(CurrentDatabaseState::None, |database| {
                 CurrentDatabaseState::Selected(database.to_vec())
             }),
-            attributes: None,
+            attributes: attributes.map(<[(Vec<u8>, Vec<u8>)]>::to_vec),
         }
     }
 

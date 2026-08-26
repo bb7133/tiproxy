@@ -382,8 +382,12 @@ fn change_user_success_commits_identity() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(relay.turn(), ChangeUserTurn::Finished);
 
     // Committing updates the SES-06 identity.
-    let mut identity = SessionIdentity::new(b"old_user", Some(b"old_db"));
-    assert_eq!(identity.attributes(), None);
+    let old_attrs = vec![(b"_client_name".to_vec(), b"legacy".to_vec())];
+    let mut identity = SessionIdentity::new(b"old_user", Some(b"old_db"), Some(&old_attrs));
+    assert_eq!(
+        identity.attributes().map(<[(Vec<u8>, Vec<u8>)]>::to_vec),
+        Some(old_attrs.clone())
+    );
     identity.apply_change_user(&plan.pending);
     assert_eq!(identity.username(), b"new_user");
     assert_eq!(
@@ -439,10 +443,16 @@ fn change_user_failure_keeps_previous_identity() -> Result<(), Box<dyn std::erro
         Some(SessionEvent::BackendResponseTxnOpen)
     );
 
-    let identity = SessionIdentity::new(b"old_user", Some(b"old_db"));
-    // The pending identity is discarded: nothing applies it.
+    // The failure path preserves the FULL previous identity, including
+    // non-empty initial-handshake attributes (nothing applies pending).
+    let old_attrs = vec![(b"_client_name".to_vec(), b"legacy".to_vec())];
+    let identity = SessionIdentity::new(b"old_user", Some(b"old_db"), Some(&old_attrs));
     let _ = plan;
     assert_eq!(identity.username(), b"old_user");
+    assert_eq!(
+        identity.attributes().map(<[(Vec<u8>, Vec<u8>)]>::to_vec),
+        Some(old_attrs)
+    );
 
     // Client packets during the backend's turn are illegal.
     let mut fresh = ChangeUserRelay::new(false);
@@ -494,4 +504,82 @@ fn statistics_is_owned_by_the_observer() -> Result<(), Box<dyn std::error::Error
     let effect = observer.observe_backend(ResponsePacket::from_payload(&raw)?)?;
     assert_eq!(effect.disposition, ResponseDisposition::CompleteRaw);
     Ok(())
+}
+
+/// A successful change-user whose request carries NO attributes clears the
+/// previously stored ones (Go `changeUser` assigns `req.Attrs`
+/// unconditionally, nil included).
+#[test]
+fn change_user_success_without_attrs_clears_old_attrs() -> Result<(), Box<dyn std::error::Error>> {
+    let capabilities = caps(0); // no CONNECT_ATTRS: request has none
+    let payload = change_user_payload(capabilities);
+    let plan = plan_change_user(&payload, capabilities)?;
+    assert_eq!(plan.pending.attributes(), None);
+
+    let old_attrs = vec![(b"_client_name".to_vec(), b"legacy".to_vec())];
+    let mut identity = SessionIdentity::new(b"old_user", Some(b"old_db"), Some(&old_attrs));
+    identity.apply_change_user(&plan.pending);
+    assert_eq!(identity.username(), b"new_user");
+    assert_eq!(identity.attributes(), None, "old attrs must be cleared");
+    Ok(())
+}
+
+/// Regression for the stuck-Command bug: the ERR boundary event actually
+/// drives a SES-00 FSM with a queued redirect (and, separately, a queued
+/// drain) across the failure boundary.
+#[test]
+fn change_user_failure_boundary_unblocks_queued_redirect_and_drain() {
+    // Queued redirect: Command + redirect_pending, then the relay fails.
+    let mut fsm = authenticated_fsm();
+    for event in [SessionEvent::ClientCommand, SessionEvent::ControlRedirect] {
+        match fsm.on_event(event) {
+            Ok(_) => {}
+            Err(error) => unreachable!("setup failed: {error}"),
+        }
+    }
+    assert!(fsm.flags().redirect_pending);
+    let mut relay = ChangeUserRelay::new(false);
+    let step = match relay.on_event(ChangeUserEvent::BackendError { code: 1045 }) {
+        Ok(step) => step,
+        Err(error) => unreachable!("relay failed: {error}"),
+    };
+    let Some(boundary) = step.session_event else {
+        unreachable!("failure must produce a boundary event")
+    };
+    match fsm.on_event(boundary) {
+        Ok(_) => assert_eq!(
+            fsm.state(),
+            SessionState::RedirectPending,
+            "queued redirect proceeds across the failed change-user"
+        ),
+        Err(error) => unreachable!("boundary rejected: {error}"),
+    }
+
+    // Queued drain: graceful close during the relay, boundary closes.
+    let mut fsm = authenticated_fsm();
+    for event in [
+        SessionEvent::ClientCommand,
+        SessionEvent::ControlGracefulClose,
+    ] {
+        match fsm.on_event(event) {
+            Ok(_) => {}
+            Err(error) => unreachable!("setup failed: {error}"),
+        }
+    }
+    let mut relay = ChangeUserRelay::new(false);
+    let step = match relay.on_event(ChangeUserEvent::BackendError { code: 1045 }) {
+        Ok(step) => step,
+        Err(error) => unreachable!("relay failed: {error}"),
+    };
+    let Some(boundary) = step.session_event else {
+        unreachable!("failure must produce a boundary event")
+    };
+    match fsm.on_event(boundary) {
+        Ok(_) => assert_eq!(
+            fsm.state(),
+            SessionState::Closing,
+            "queued drain closes at the failed change-user boundary"
+        ),
+        Err(error) => unreachable!("boundary rejected: {error}"),
+    }
 }
