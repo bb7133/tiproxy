@@ -39,11 +39,20 @@
 //!   not relay a backend greeting. The backend is dialed only after the
 //!   client's handshake response is accepted.
 //! - Redirect and graceful close both wait for the transaction boundary
-//!   (`finishedTxn`); graceful close wins over a pending redirect, and a
-//!   redirect completing during close reports failure (Go `ErrClosing`).
-//! - Client requests that arrive during migration are held and replayed
-//!   after the migration finishes, success or not (Go `holdRequest`).
+//!   (`finishedTxn`); graceful close wins over a pending redirect, and every
+//!   accepted redirect signal is retired with **exactly one** result — a
+//!   close from any pending state reports the failure synchronously, and a
+//!   late target-handshake result is suppressed once (Go `ErrClosing` /
+//!   `OnConnClosed` accounting).
+//! - Migration is serialized with command execution (Go `processLock`), so
+//!   client requests are illegal in [`SessionState::RedirectPending`]; the
+//!   runtime queues them outside the machine. Go's narrow hold-and-replay
+//!   (`needHoldRequest`: only an in-transaction `COM_QUERY`
+//!   `BEGIN`/`START TRANSACTION` with no pending prepared statements,
+//!   MIG-005) is deferred to SES-07 as a classified event refinement.
 //! - A failed migration keeps the current backend attached.
+//! - Graceful close before authentication closes immediately
+//!   (Go `TestGracefulCloseBeforeHandshake`).
 //!
 //! State diagram (also in the crate README):
 //!
@@ -196,10 +205,6 @@ pub enum SessionEffect {
     NotifyRedirectSucceeded,
     /// Report a failed or refused migration to the control plane.
     NotifyRedirectFailed,
-    /// Buffer the client request that arrived during migration.
-    HoldClientCommand,
-    /// Re-inject the held client request after migration completes.
-    ReplayHeldCommand,
     /// Arm the drain deadline for a graceful close in progress.
     BeginDrainTimer,
     /// Close the client connection.
@@ -251,8 +256,9 @@ pub struct SessionFlags {
     pub redirect_pending: bool,
     /// A graceful close awaits the next transaction boundary.
     pub draining: bool,
-    /// A client request is held until the in-flight migration completes.
-    pub held_command: bool,
+    /// The session closed while a target handshake was in flight: its
+    /// failure was already reported, so the one late result is suppressed.
+    pub late_redirect_result: bool,
 }
 
 /// The pure session machine: the single owner of mutable session state.
@@ -312,7 +318,7 @@ impl SessionFsm {
             SessionState::LocalInfile => self.on_local_infile(event),
             SessionState::RedirectPending => self.on_redirect_pending(event),
             SessionState::Draining => self.on_draining(event),
-            SessionState::Closing => Self::on_closing(event),
+            SessionState::Closing => self.on_closing(event),
             SessionState::Closed => None,
         };
         match outcome {
@@ -327,10 +333,15 @@ impl SessionFsm {
         }
     }
 
-    /// Teardown effect sequence: release the owner if attached, close both
-    /// sides, and classify the session end.
+    /// Teardown effect sequence: retire a pending redirect with its one
+    /// failure result, release the owner if attached, close both sides, and
+    /// classify the session end.
     fn teardown(&mut self) -> Effects {
         let mut effects = Effects::new();
+        if self.flags.redirect_pending {
+            self.flags.redirect_pending = false;
+            effects.push(SessionEffect::NotifyRedirectFailed);
+        }
         if self.flags.backend_owner {
             self.flags.backend_owner = false;
             effects.push(SessionEffect::ReleaseBackend);
@@ -347,8 +358,11 @@ impl SessionFsm {
                 SessionState::Greeting,
                 vec![SessionEffect::SendProxyGreeting],
             )),
+            // Go parity: graceful close before the handshake finishes
+            // closes immediately (`TestGracefulCloseBeforeHandshake`).
             SessionEvent::ClientEof
             | SessionEvent::ClientIoError
+            | SessionEvent::ControlGracefulClose
             | SessionEvent::ControlCloseImmediate
             | SessionEvent::HandshakeTimerExpired => Some((SessionState::Closing, self.teardown())),
             _ => None,
@@ -368,8 +382,11 @@ impl SessionFsm {
                 SessionState::FrontendHandshake,
                 vec![SessionEffect::DialBackend],
             )),
+            // Go parity: graceful close before the handshake finishes
+            // closes immediately (`TestGracefulCloseBeforeHandshake`).
             SessionEvent::ClientEof
             | SessionEvent::ClientIoError
+            | SessionEvent::ControlGracefulClose
             | SessionEvent::ControlCloseImmediate
             | SessionEvent::HandshakeTimerExpired => Some((SessionState::Closing, self.teardown())),
             _ => None,
@@ -379,8 +396,11 @@ impl SessionFsm {
     fn on_ssl_request(&mut self, event: SessionEvent) -> Option<(SessionState, Effects)> {
         match event {
             SessionEvent::TlsActivated => Some((SessionState::Greeting, Effects::new())),
+            // Go parity: graceful close before the handshake finishes
+            // closes immediately (`TestGracefulCloseBeforeHandshake`).
             SessionEvent::ClientEof
             | SessionEvent::ClientIoError
+            | SessionEvent::ControlGracefulClose
             | SessionEvent::ControlCloseImmediate
             | SessionEvent::HandshakeTimerExpired => Some((SessionState::Closing, self.teardown())),
             _ => None,
@@ -397,6 +417,7 @@ impl SessionFsm {
             | SessionEvent::ClientIoError
             | SessionEvent::BackendEof
             | SessionEvent::BackendIoError
+            | SessionEvent::ControlGracefulClose
             | SessionEvent::ControlCloseImmediate
             | SessionEvent::HandshakeTimerExpired => Some((SessionState::Closing, self.teardown())),
             _ => None,
@@ -425,6 +446,7 @@ impl SessionFsm {
             | SessionEvent::ClientIoError
             | SessionEvent::BackendEof
             | SessionEvent::BackendIoError
+            | SessionEvent::ControlGracefulClose
             | SessionEvent::ControlCloseImmediate
             | SessionEvent::HandshakeTimerExpired => Some((SessionState::Closing, self.teardown())),
             _ => None,
@@ -438,6 +460,12 @@ impl SessionFsm {
                 vec![SessionEffect::ForwardCommandToBackend],
             )),
             SessionEvent::ControlRedirect => {
+                // Go parity: the control plane keeps one outstanding signal
+                // per session ("won't be notified again before
+                // OnRedirectSucceed"), so a duplicate is illegal.
+                if self.flags.redirect_pending {
+                    return None;
+                }
                 self.flags.redirect_pending = true;
                 if self.flags.in_txn {
                     // Go parity: wait for the transaction boundary.
@@ -472,12 +500,8 @@ impl SessionFsm {
         self.flags.in_txn = !txn_done;
         let mut effects = vec![SessionEffect::ForwardResponseToClient];
         if txn_done && self.flags.draining {
-            // Go parity: graceful close wins over a pending redirect; the
-            // refused redirect is reported as failed.
-            if self.flags.redirect_pending {
-                self.flags.redirect_pending = false;
-                effects.push(SessionEffect::NotifyRedirectFailed);
-            }
+            // Go parity: graceful close wins over a pending redirect;
+            // `teardown` reports the refused redirect as failed.
             effects.extend(self.teardown());
             return (SessionState::Closing, effects);
         }
@@ -505,6 +529,10 @@ impl SessionFsm {
                 vec![SessionEffect::RequestLocalInfileFromClient],
             )),
             SessionEvent::ControlRedirect => {
+                // Duplicate signals are illegal (one outstanding per session).
+                if self.flags.redirect_pending {
+                    return None;
+                }
                 self.flags.redirect_pending = true;
                 Some((SessionState::Command, Effects::new()))
             }
@@ -540,6 +568,10 @@ impl SessionFsm {
             SessionEvent::BackendResponseTxnDone => Some(self.response_complete(true)),
             SessionEvent::BackendResponseTxnOpen => Some(self.response_complete(false)),
             SessionEvent::ControlRedirect => {
+                // Duplicate signals are illegal (one outstanding per session).
+                if self.flags.redirect_pending {
+                    return None;
+                }
                 self.flags.redirect_pending = true;
                 Some((SessionState::Response, Effects::new()))
             }
@@ -568,6 +600,10 @@ impl SessionFsm {
                 vec![SessionEffect::ForwardInfileEndToBackend],
             )),
             SessionEvent::ControlRedirect => {
+                // Duplicate signals are illegal (one outstanding per session).
+                if self.flags.redirect_pending {
+                    return None;
+                }
                 self.flags.redirect_pending = true;
                 Some((SessionState::LocalInfile, Effects::new()))
             }
@@ -592,52 +628,37 @@ impl SessionFsm {
         match event {
             SessionEvent::RedirectBackendReady => {
                 self.flags.redirect_pending = false;
-                let mut effects = vec![
-                    SessionEffect::SwapBackend,
-                    SessionEffect::NotifyRedirectSucceeded,
-                ];
-                if self.flags.held_command {
-                    self.flags.held_command = false;
-                    effects.push(SessionEffect::ReplayHeldCommand);
-                }
-                Some((SessionState::Ready, effects))
+                Some((
+                    SessionState::Ready,
+                    vec![
+                        SessionEffect::SwapBackend,
+                        SessionEffect::NotifyRedirectSucceeded,
+                    ],
+                ))
             }
             SessionEvent::RedirectBackendFailed => {
                 // Go parity: keep the current backend attached.
                 self.flags.redirect_pending = false;
-                let mut effects = vec![SessionEffect::NotifyRedirectFailed];
-                if self.flags.held_command {
-                    self.flags.held_command = false;
-                    effects.push(SessionEffect::ReplayHeldCommand);
-                }
-                Some((SessionState::Ready, effects))
+                Some((
+                    SessionState::Ready,
+                    vec![SessionEffect::NotifyRedirectFailed],
+                ))
             }
-            SessionEvent::ClientCommand | SessionEvent::ClientCommandQuit => {
-                if self.flags.held_command {
-                    // A second request during migration violates the
-                    // one-command-in-flight protocol.
-                    None
-                } else {
-                    self.flags.held_command = true;
-                    Some((
-                        SessionState::RedirectPending,
-                        vec![SessionEffect::HoldClientCommand],
-                    ))
-                }
-            }
-            SessionEvent::ControlGracefulClose => {
-                // Go parity: at the boundary, graceful close proceeds even
-                // with a migration in flight; its late result is refused in
-                // `Closing`.
-                self.flags.redirect_pending = false;
-                Some((SessionState::Closing, self.teardown()))
-            }
-            SessionEvent::ControlCloseImmediate
+            // Migration is serialized with command execution (Go
+            // `processLock`), so client requests here are illegal; the
+            // runtime queues them outside the machine. Go's narrow
+            // hold-and-replay of an in-transaction BEGIN (MIG-005,
+            // `needHoldRequest`) is a SES-07 refinement.
+            SessionEvent::ControlGracefulClose
+            | SessionEvent::ControlCloseImmediate
             | SessionEvent::ClientEof
             | SessionEvent::ClientIoError
             | SessionEvent::BackendEof
             | SessionEvent::BackendIoError => {
-                self.flags.redirect_pending = false;
+                // The target handshake is in flight: `teardown` reports the
+                // failure now (exactly once) and the one late result is
+                // suppressed in `Closing`.
+                self.flags.late_redirect_result = true;
                 Some((SessionState::Closing, self.teardown()))
             }
             // The drain deadline is never armed here: entering
@@ -670,14 +691,24 @@ impl SessionFsm {
         }
     }
 
-    fn on_closing(event: SessionEvent) -> Option<(SessionState, Effects)> {
+    fn on_closing(&mut self, event: SessionEvent) -> Option<(SessionState, Effects)> {
         match event {
             SessionEvent::TeardownComplete => Some((SessionState::Closed, Effects::new())),
-            // Go parity: a migration completing during close reports failure
-            // (`ErrClosing`) so the control plane can recover its scores.
-            SessionEvent::RedirectBackendReady
-            | SessionEvent::RedirectBackendFailed
-            | SessionEvent::ControlRedirect => Some((
+            // The in-flight migration's failure was already reported when
+            // the close began, so the one late target-handshake result is
+            // suppressed; a second result (or one without an in-flight
+            // handshake) is illegal.
+            SessionEvent::RedirectBackendReady | SessionEvent::RedirectBackendFailed => {
+                if self.flags.late_redirect_result {
+                    self.flags.late_redirect_result = false;
+                    Some((SessionState::Closing, Effects::new()))
+                } else {
+                    None
+                }
+            }
+            // A fresh redirect signal while closing is refused with its own
+            // result (Go `ErrClosing`).
+            SessionEvent::ControlRedirect => Some((
                 SessionState::Closing,
                 vec![SessionEffect::NotifyRedirectFailed],
             )),
@@ -748,6 +779,11 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Accept,
+        SessionEvent::ControlGracefulClose,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Accept,
         SessionEvent::HandshakeTimerExpired,
         SessionState::Closing,
     ),
@@ -779,6 +815,11 @@ pub static TRANSITIONS: &[Transition] = &[
     ),
     t(
         SessionState::Greeting,
+        SessionEvent::ControlGracefulClose,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::Greeting,
         SessionEvent::HandshakeTimerExpired,
         SessionState::Closing,
     ),
@@ -801,6 +842,11 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::SslRequest,
         SessionEvent::ControlCloseImmediate,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::SslRequest,
+        SessionEvent::ControlGracefulClose,
         SessionState::Closing,
     ),
     t(
@@ -837,6 +883,11 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::FrontendHandshake,
         SessionEvent::ControlCloseImmediate,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::FrontendHandshake,
+        SessionEvent::ControlGracefulClose,
         SessionState::Closing,
     ),
     t(
@@ -878,6 +929,11 @@ pub static TRANSITIONS: &[Transition] = &[
     t(
         SessionState::BackendHandshake,
         SessionEvent::ControlCloseImmediate,
+        SessionState::Closing,
+    ),
+    t(
+        SessionState::BackendHandshake,
+        SessionEvent::ControlGracefulClose,
         SessionState::Closing,
     ),
     t(
@@ -1149,16 +1205,6 @@ pub static TRANSITIONS: &[Transition] = &[
         SessionState::RedirectPending,
         SessionEvent::RedirectBackendFailed,
         SessionState::Ready,
-    ),
-    t(
-        SessionState::RedirectPending,
-        SessionEvent::ClientCommand,
-        SessionState::RedirectPending,
-    ),
-    t(
-        SessionState::RedirectPending,
-        SessionEvent::ClientCommandQuit,
-        SessionState::RedirectPending,
     ),
     t(
         SessionState::RedirectPending,

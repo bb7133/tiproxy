@@ -141,6 +141,30 @@ fn exhaustive_model_check() {
                         "no effects may follow Closed"
                     );
                     check_ownership(fsm.flags(), next.flags(), &effects);
+                    // Exactly-one redirect result: never two results in one
+                    // transition, and every close from a pending state
+                    // retires the pending redirect with its one failure.
+                    let notifies = effects
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e,
+                                SessionEffect::NotifyRedirectFailed
+                                    | SessionEffect::NotifyRedirectSucceeded
+                            )
+                        })
+                        .count();
+                    assert!(notifies <= 1, "at most one redirect result per transition");
+                    if fsm.flags().redirect_pending
+                        && fsm.state() != SessionState::Closing
+                        && next.state() == SessionState::Closing
+                    {
+                        assert_eq!(
+                            notifies, 1,
+                            "a close from a redirect-pending state must \
+                             report the failure"
+                        );
+                    }
                     if AUTHENTICATED_STATES.contains(&next.state()) {
                         assert!(
                             next.flags().authenticated && next.flags().backend_owner,
@@ -276,51 +300,51 @@ fn authenticated_session() -> SessionFsm {
     fsm
 }
 
-/// Redirect at an idle boundary: migration succeeds, the held command is
-/// replayed, ownership swaps exactly once.
+/// Redirect at an idle boundary: migration succeeds and ownership swaps
+/// exactly once. Migration is serialized with command execution (Go
+/// `processLock`), so client requests during it are illegal, as is a
+/// duplicate redirect signal while one is outstanding.
 #[test]
-fn redirect_success_with_held_command_walk() {
+fn redirect_success_walk() {
     use SessionEffect as F;
     use SessionEvent as E;
     use SessionState as S;
     let mut fsm = authenticated_session();
     run(
         &mut fsm,
-        &[
-            (
-                E::ControlRedirect,
-                S::RedirectPending,
-                &[F::StartRedirectHandshake],
-            ),
-            (
-                E::ClientCommand,
-                S::RedirectPending,
-                &[F::HoldClientCommand],
-            ),
-            (
-                E::RedirectBackendReady,
-                S::Ready,
-                &[
-                    F::SwapBackend,
-                    F::NotifyRedirectSucceeded,
-                    F::ReplayHeldCommand,
-                ],
-            ),
-        ],
+        &[(
+            E::ControlRedirect,
+            S::RedirectPending,
+            &[F::StartRedirectHandshake],
+        )],
+    );
+    assert!(fsm.on_event(E::ClientCommand).is_err());
+    assert!(fsm.on_event(E::ClientCommandQuit).is_err());
+    assert!(fsm.on_event(E::ControlRedirect).is_err());
+    run(
+        &mut fsm,
+        &[(
+            E::RedirectBackendReady,
+            S::Ready,
+            &[F::SwapBackend, F::NotifyRedirectSucceeded],
+        )],
     );
     assert!(fsm.flags().backend_owner);
     assert!(!fsm.flags().redirect_pending);
-    assert!(!fsm.flags().held_command);
 
-    // A second in-flight request during migration is a protocol violation.
-    let mut migrating = authenticated_session();
-    for event in [E::ControlRedirect, E::ClientCommand] {
-        match migrating.on_event(event) {
+    // A duplicate signal is also illegal while waiting inside a txn.
+    let mut in_txn = authenticated_session();
+    for event in [
+        E::ClientCommand,
+        E::BackendResponseTxnOpen,
+        E::ControlRedirect,
+    ] {
+        match in_txn.on_event(event) {
             Ok(_) => {}
             Err(error) => unreachable!("setup failed: {error}"),
         }
     }
-    assert!(migrating.on_event(E::ClientCommand).is_err());
+    assert!(in_txn.on_event(E::ControlRedirect).is_err());
 }
 
 /// A failed migration keeps the current backend attached (Go parity).
@@ -465,6 +489,29 @@ fn local_infile_walk() {
     );
 }
 
+/// Graceful close before authentication closes immediately
+/// (Go `TestGracefulCloseBeforeHandshake`).
+#[test]
+fn graceful_close_before_handshake_walk() {
+    use SessionEffect as F;
+    use SessionEvent as E;
+    use SessionState as S;
+    let mut fsm = SessionFsm::new();
+    run(
+        &mut fsm,
+        &[
+            (E::ConnectionAccepted, S::Greeting, &[F::SendProxyGreeting]),
+            (
+                E::ControlGracefulClose,
+                S::Closing,
+                &[F::CloseBackend, F::CloseClient, F::ClassifySessionEnd],
+            ),
+            (E::TeardownComplete, S::Closed, &[]),
+        ],
+    );
+    assert!(!fsm.flags().authenticated);
+}
+
 /// Authentication failure relays the result and tears down.
 #[test]
 fn auth_failure_walk() {
@@ -508,6 +555,9 @@ fn closing_tolerance_and_closed_rejection() {
     use SessionEffect as F;
     use SessionEvent as E;
     use SessionState as S;
+    // Ordering A: close → late result → teardown. The close itself reports
+    // the failure exactly once; the late result is suppressed, and a
+    // duplicate result is illegal.
     let mut fsm = authenticated_session();
     run(
         &mut fsm,
@@ -521,18 +571,26 @@ fn closing_tolerance_and_closed_rejection() {
                 E::ClientEof,
                 S::Closing,
                 &[
+                    F::NotifyRedirectFailed,
                     F::ReleaseBackend,
                     F::CloseBackend,
                     F::CloseClient,
                     F::ClassifySessionEnd,
                 ],
             ),
-            // The in-flight migration result arrives late.
-            (
-                E::RedirectBackendReady,
-                S::Closing,
-                &[F::NotifyRedirectFailed],
-            ),
+            // The one in-flight result arrives late: suppressed, no second
+            // notification.
+            (E::RedirectBackendReady, S::Closing, &[]),
+        ],
+    );
+    // A duplicate result is a protocol violation.
+    assert!(fsm.on_event(E::RedirectBackendFailed).is_err());
+    run(
+        &mut fsm,
+        &[
+            // A fresh redirect signal while closing is refused with its own
+            // result (Go ErrClosing).
+            (E::ControlRedirect, S::Closing, &[F::NotifyRedirectFailed]),
             // Stray traffic is tolerated without effects.
             (E::BackendResponsePart, S::Closing, &[]),
             (E::TeardownComplete, S::Closed, &[]),
@@ -548,4 +606,30 @@ fn closing_tolerance_and_closed_rejection() {
             Ok(effects) => unreachable!("Closed accepted {event:?} with {effects:?}"),
         }
     }
+
+    // Ordering B: close → teardown → late result. The failure was already
+    // reported at close time, so exactly one notification exists on the
+    // whole path and the post-teardown result is rejected at Closed.
+    let mut fsm = authenticated_session();
+    let mut notifications = 0_usize;
+    for event in [E::ControlRedirect, E::ClientEof, E::TeardownComplete] {
+        match fsm.on_event(event) {
+            Ok(effects) => {
+                notifications += effects
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            SessionEffect::NotifyRedirectFailed
+                                | SessionEffect::NotifyRedirectSucceeded
+                        )
+                    })
+                    .count();
+            }
+            Err(error) => unreachable!("setup failed: {error}"),
+        }
+    }
+    assert_eq!(fsm.state(), SessionState::Closed);
+    assert_eq!(notifications, 1, "exactly one result for the one signal");
+    assert!(fsm.on_event(E::RedirectBackendReady).is_err());
 }
