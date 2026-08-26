@@ -19,9 +19,32 @@ Go↔Rust restart reconciliation. Protocol authority:
 | Duplicate `DrainCommand` (active id) | Returns current progress; never a second drain. |
 | Different drain id while one is active | `DRAIN_IN_PROGRESS` (both sides reject — Go locally before sending, Rust at the gate). |
 | Re-issued completed drain id (idle) | Replays the final result. |
-| Duplicate/reordered `MeteringBatch` | Applies only when the sequence strictly advances; totals never double-count. |
+| Duplicate/reordered `MeteringBatch` | Applies only the contiguous next sequence (`last+1`); duplicates and gaps are refused (the producer replays in order, so gaps converge), and totals never double-count or skip a batch. |
 | Shed `MetricsBatch` | Best effort by design: dropped under bulk-lane pressure with a local counter; nothing depends on a metrics sequence. |
 | Command for an unknown connection id | `RECONCILIATION_REQUIRED`; never acts on another incarnation. |
+
+## Generation layering
+
+Two dimensions guard against stale state and are deliberately separate
+from transport epochs and request ids:
+
+- **Per-session commands** (`RedirectCommand`, `CloseCommand`): the Go
+  side stamps the envelope with the generation the target session was
+  admitted under; the Rust gate **exact-matches** it against the
+  connection's recorded generation and answers `STALE_GENERATION` on a
+  mismatch — a Rust restart restarts connection ids from 1, so id
+  reuse across incarnations is real and the generation is the guard.
+- **Drain** (`DrainCommand`): one command spans sessions captured under
+  different generations, so the envelope carries the issuing lineage's
+  **config generation** and the Rust gate checks provenance only
+  (reject `< applied_generation`), never per-connection equality.
+- The same connection's later envelopes (`RouteRequest`,
+  `ConnectionEvent`) must not drift from the generation its handshake
+  established; drift is a `PROTOCOL_VIOLATION`, never silently
+  rewritten.
+- Redirect/close terminal-result tombstones are keyed by
+  `(connection_id, id)` alone: replay works **across** control
+  reconnects and Go epochs by design.
 
 ## Restart matrix
 
@@ -46,6 +69,31 @@ Go↔Rust restart reconciliation. Protocol authority:
    the old lineage had applied. The snapshot's `metering_sequence` is
    the consumer's **applied** sequence, which lets the ledger drop its
    acknowledged retention.
+
+#### Rehydration and orphans (Go restart)
+
+For each live pair in `ReconcileRequest` unknown to the fresh lineage,
+the adapter rebuilds real state through two production seams:
+`AttachRouterLookup` (namespace → router, wired to the namespace
+manager) and the router's `AssignmentRehydrator` (`RehydrateConn`
+attaches the connection to its backend exactly as a successful
+assignment — score, connection list, event receiver — and returns the
+`BackendInst` so `ServerAddr`/close accounting work; `LookupBackend`
+rebinds a restored pending redirect's target when its terminal result
+arrives). The reconcile entry carries the full admission
+`ConnectionIdentity` (additive field), so later `ConnectionEvent`s pass
+identity equality, plus the connection's `generation` and
+`pending_redirect_id` — a restored pending redirect blocks new
+redirects until its (replayed) terminal result retires it exactly once.
+
+A pair that cannot be rehydrated (unknown namespace/backend, missing
+identity from an old peer) becomes an **orphan**: identified by
+omission from the snapshot (Rust keeps the session alive), excluded
+from redirect/drain by construction (no connection object exists), and
+retried by `ResolveOrphans` on the composition's maintenance cadence.
+After `MaxOrphanResolveAttempts` failures the adapter closes the
+session with a generation-stamped per-connection `CloseCommand` rather
+than leaking it forever.
 
 ### Rust restarts (Go and its router survive)
 

@@ -59,9 +59,31 @@ type RouterAdapter struct {
 	// metering, when attached, owns deduplicated cumulative metering;
 	// its highest applied sequence is the reconcile acknowledgement the
 	// Rust producer uses to drop retained batches (CTL-06). Without a
-	// consumer the snapshot echoes the request's claimed sequence.
+	// consumer the acknowledgement is zero: nothing was applied, so
+	// nothing may be dropped.
 	metering *MeteringConsumer
+
+	// routerLookup, when attached, resolves a namespace to its router so
+	// a restarted lineage can rehydrate accounting for Rust sessions
+	// reported through reconciliation (CTL-06). The composition wires it
+	// to the namespace manager.
+	routerLookup func(namespace string) (router.Router, error)
+
+	// orphans tracks reconcile-reported live sessions this lineage could
+	// not rehydrate yet (unknown namespace/backend). They are excluded
+	// from redirect/drain by construction (no projectedConn exists) and
+	// resolved by bounded retries; past the bound they are closed.
+	orphans map[uint64]*orphanState
 }
+
+type orphanState struct {
+	remote   *controlpb.ReconcileConnection
+	attempts int
+}
+
+// MaxOrphanResolveAttempts bounds rehydration retries for one orphan
+// before the adapter closes the session instead of leaking it forever.
+const MaxOrphanResolveAttempts = 3
 
 type connectionState struct {
 	mu sync.Mutex
@@ -72,6 +94,12 @@ type connectionState struct {
 	router    router.Router
 	selector  *router.BackendSelector
 	namespace string
+
+	// generation is the snapshot generation the connection was admitted
+	// under (established by the handshake envelope, restored by
+	// reconciliation): per-session commands are stamped with it and the
+	// same connection's later envelopes must not drift from it.
+	generation uint64
 
 	decision       *controlpb.HandshakeDecision
 	assignment     *routeAssignment
@@ -103,6 +131,7 @@ func NewRouterAdapter(handler backend.HandshakeHandler) (*RouterAdapter, error) 
 		handler:     handler,
 		connections: make(map[uint64]*connectionState),
 		closedIDs:   make(map[uint64]struct{}),
+		orphans:     make(map[uint64]*orphanState),
 	}, nil
 }
 
@@ -134,15 +163,15 @@ func (adapter *RouterAdapter) HandleEnvelope(
 
 	switch body := envelope.GetBody().(type) {
 	case *controlpb.ControlEnvelope_HandshakeResponse:
-		return adapter.handleHandshakeResponse(ctx, sender, envelope.GetRequestId(), body.HandshakeResponse)
+		return adapter.handleHandshakeResponse(ctx, sender, envelope.GetRequestId(), envelope.GetGeneration(), body.HandshakeResponse)
 	case *controlpb.ControlEnvelope_RouteRequest:
-		return adapter.handleRouteRequest(ctx, sender, envelope.GetRequestId(), body.RouteRequest)
+		return adapter.handleRouteRequest(ctx, sender, envelope.GetRequestId(), envelope.GetGeneration(), body.RouteRequest)
 	case *controlpb.ControlEnvelope_RouteResult:
 		return adapter.handleRouteResult(ctx, sender, envelope.GetRequestId(), body.RouteResult)
 	case *controlpb.ControlEnvelope_HandshakeResult:
 		return adapter.handleHandshakeResult(ctx, sender, envelope.GetRequestId(), body.HandshakeResult)
 	case *controlpb.ControlEnvelope_ConnectionEvent:
-		return adapter.handleConnectionEvent(sender.Epoch(), envelope.GetRequestId(), body.ConnectionEvent)
+		return adapter.handleConnectionEvent(sender.Epoch(), envelope.GetRequestId(), envelope.GetGeneration(), body.ConnectionEvent)
 	case *controlpb.ControlEnvelope_RedirectResult:
 		return adapter.handleRedirectResult(body.RedirectResult)
 	case *controlpb.ControlEnvelope_CloseResult:
@@ -162,6 +191,7 @@ func (adapter *RouterAdapter) handleHandshakeResponse(
 	ctx context.Context,
 	sender EnvelopeSender,
 	requestID uint64,
+	generation uint64,
 	event *controlpb.HandshakeResponseEvent,
 ) error {
 	if event == nil || event.GetConnection() == nil || event.GetHandshake() == nil {
@@ -188,6 +218,13 @@ func (adapter *RouterAdapter) handleHandshakeResponse(
 			errors.New("handshake collation exceeds one byte"))
 	}
 
+	if state.generation == 0 {
+		state.generation = generation
+		state.conn.generation = generation
+	} else if generation != 0 && generation != state.generation {
+		return adapter.rejectHandshakeLocked(ctx, sender, requestID, state,
+			errors.New("handshake generation drifted for an established connection"))
+	}
 	state.handshake = cloneHandshake(event.GetHandshake())
 	response := projectHandshake(state.handshake)
 	if err := adapter.handler.HandleHandshakeResp(state.conn, response); err != nil {
@@ -236,6 +273,7 @@ func (adapter *RouterAdapter) handleRouteRequest(
 	ctx context.Context,
 	sender EnvelopeSender,
 	requestID uint64,
+	generation uint64,
 	request *controlpb.RouteRequest,
 ) error {
 	if request == nil || request.GetConnection() == nil || request.GetHandshake() == nil {
@@ -252,6 +290,10 @@ func (adapter *RouterAdapter) handleRouteRequest(
 	if !sameIdentity(state.identity, request.GetConnection()) || !proto.Equal(state.handshake, request.GetHandshake()) {
 		return adapter.sendProtocolError(ctx, sender, requestID,
 			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "route identity differs from handshake event")
+	}
+	if generation != 0 && state.generation != 0 && generation != state.generation {
+		return adapter.sendProtocolError(ctx, sender, requestID,
+			controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, "route generation drifted for an established connection")
 	}
 	if state.closed || state.decision == nil || !state.decision.GetAccept() || state.router == nil {
 		return adapter.sendProtocolError(ctx, sender, requestID,
@@ -432,7 +474,7 @@ func (adapter *RouterAdapter) handleHandshakeResult(
 }
 
 func (adapter *RouterAdapter) handleConnectionEvent(
-	epoch, requestID uint64,
+	epoch, requestID, generation uint64,
 	event *controlpb.ConnectionEvent,
 ) error {
 	if event == nil || event.GetConnection() == nil {
@@ -451,6 +493,9 @@ func (adapter *RouterAdapter) handleConnectionEvent(
 	defer state.mu.Unlock()
 	if !sameIdentity(state.identity, event.GetConnection()) {
 		return errors.New("connection event identity differs from handshake event")
+	}
+	if generation != 0 && state.generation != 0 && generation != state.generation {
+		return errors.New("connection event generation drifted for an established connection")
 	}
 	if state.seenConnectionEvent(epoch, requestID) {
 		return nil
@@ -483,6 +528,9 @@ func (adapter *RouterAdapter) handleRedirectResult(result *controlpb.RedirectRes
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if handled, err := adapter.finishRehydratedRedirectLocked(state, result); handled {
+		return err
+	}
 	pending, receiver := state.conn.takeRedirect(result.GetRedirectId())
 	if pending == nil || receiver == nil || state.closed {
 		return nil
@@ -531,6 +579,32 @@ func (adapter *RouterAdapter) handleReconcile(
 		rust[connection.GetConnectionId()] = connection
 	}
 
+	// Rebuild state for live Rust sessions unknown to this lineage (a
+	// Go restart) before answering: rehydrated sessions join router and
+	// selector accounting exactly as if their original assignments had
+	// succeeded; the rest become bounded-retry orphans excluded from
+	// redirect/drain by construction.
+	for id, remote := range rust {
+		adapter.mu.Lock()
+		_, known := adapter.connections[id]
+		adapter.mu.Unlock()
+		if known {
+			continue
+		}
+		if state := adapter.rehydrateReconciled(remote); state != nil {
+			adapter.mu.Lock()
+			adapter.connections[id] = state
+			delete(adapter.orphans, id)
+			adapter.mu.Unlock()
+			continue
+		}
+		adapter.mu.Lock()
+		if _, tracked := adapter.orphans[id]; !tracked {
+			adapter.orphans[id] = &orphanState{remote: proto.Clone(remote).(*controlpb.ReconcileConnection)}
+		}
+		adapter.mu.Unlock()
+	}
+
 	adapter.mu.Lock()
 	states := make([]*connectionState, 0, len(adapter.connections))
 	for _, state := range adapter.connections {
@@ -546,10 +620,13 @@ func (adapter *RouterAdapter) handleReconcile(
 				adapter.closeStateLocked(state, backend.SrcProxyQuit)
 			} else {
 				snapshot = append(snapshot, &controlpb.ReconcileConnection{
-					ConnectionId:    id,
-					BackendId:       state.conn.backendID(),
-					Namespace:       state.namespace,
-					RedirectPending: state.conn.redirectPending(),
+					ConnectionId:      id,
+					BackendId:         state.conn.backendID(),
+					Namespace:         state.namespace,
+					RedirectPending:   state.conn.redirectPending(),
+					Generation:        state.generation,
+					PendingRedirectId: state.conn.pendingRedirectID(),
+					Identity:          proto.Clone(state.identity).(*controlpb.ConnectionIdentity),
 				})
 			}
 		}
@@ -577,14 +654,176 @@ func (adapter *RouterAdapter) AttachMetering(consumer *MeteringConsumer) {
 	adapter.metering = consumer
 }
 
-func (adapter *RouterAdapter) meteringAcknowledgement(claimed uint64) uint64 {
+// AttachRouterLookup installs the namespace-to-router resolver used to
+// rehydrate reconcile-reported sessions after a Go restart. The
+// composition wires it to the namespace manager.
+func (adapter *RouterAdapter) AttachRouterLookup(lookup func(namespace string) (router.Router, error)) {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	adapter.routerLookup = lookup
+}
+
+func (adapter *RouterAdapter) meteringAcknowledgement(uint64) uint64 {
 	adapter.mu.Lock()
 	consumer := adapter.metering
 	adapter.mu.Unlock()
 	if consumer == nil {
-		return claimed
+		// Nothing was applied, so nothing may be acknowledged: an echo
+		// of the producer's claim would let it drop unconsumed batches.
+		return 0
 	}
 	return consumer.LastApplied()
+}
+
+// finishRehydratedRedirectLocked retires a reconciliation-restored
+// pending redirect exactly once. The target backend inst was unknown at
+// rehydration time; the terminal result names it, so the rebind
+// resolves it through the router's lookup.
+func (adapter *RouterAdapter) finishRehydratedRedirectLocked(
+	state *connectionState,
+	result *controlpb.RedirectResult,
+) (bool, error) {
+	conn := state.conn
+	conn.mu.Lock()
+	pendingID := conn.rehydratedRedirectID
+	receiver := conn.receiver
+	if pendingID == "" || pendingID != result.GetRedirectId() {
+		conn.mu.Unlock()
+		return false, nil
+	}
+	conn.rehydratedRedirectID = ""
+	conn.mu.Unlock()
+	if state.closed || receiver == nil {
+		return true, nil
+	}
+	if !result.GetSucceeded() {
+		return true, receiver.OnRedirectFail(result.GetPreviousBackendId(), result.GetBackendId(), conn)
+	}
+	if rehydrator, ok := state.router.(router.AssignmentRehydrator); ok {
+		if inst, found := rehydrator.LookupBackend(result.GetBackendId()); found {
+			state.currentBackend = inst
+			conn.setBackend(inst)
+		}
+	}
+	return true, receiver.OnRedirectSucceed(result.GetPreviousBackendId(), result.GetBackendId(), conn)
+}
+
+// rehydrateReconciledLocked rebuilds full adapter/router state for one
+// reconcile-reported live session unknown to this lineage. Returns the
+// new state, or nil when rehydration is not currently possible (the
+// caller tracks it as a bounded-retry orphan).
+func (adapter *RouterAdapter) rehydrateReconciled(remote *controlpb.ReconcileConnection) *connectionState {
+	identity := remote.GetIdentity()
+	if identity == nil || identity.GetConnectionId() != remote.GetConnectionId() {
+		return nil
+	}
+	adapter.mu.Lock()
+	lookup := adapter.routerLookup
+	adapter.mu.Unlock()
+	if lookup == nil {
+		return nil
+	}
+	rt, err := lookup(remote.GetNamespace())
+	if err != nil || rt == nil {
+		return nil
+	}
+	rehydrator, ok := rt.(router.AssignmentRehydrator)
+	if !ok {
+		return nil
+	}
+	conn := newProjectedConn(adapter, identity)
+	conn.generation = remote.GetGeneration()
+	inst, ok := rehydrator.RehydrateConn(remote.GetBackendId(), conn)
+	if !ok {
+		return nil
+	}
+	conn.mu.Lock()
+	conn.server = inst.Addr()
+	conn.backend = inst
+	conn.rehydratedRedirectID = remote.GetPendingRedirectId()
+	if conn.receiver == nil {
+		if receiver, ok := rt.(router.ConnEventReceiver); ok {
+			conn.receiver = receiver
+		}
+	}
+	conn.mu.Unlock()
+	return &connectionState{
+		identity:       proto.Clone(identity).(*controlpb.ConnectionIdentity),
+		conn:           conn,
+		router:         rt,
+		namespace:      bounded(remote.GetNamespace()),
+		generation:     remote.GetGeneration(),
+		currentBackend: inst,
+		handshakeDone:  true,
+		opened:         true,
+		eventKeys:      make(map[connectionEventKey]struct{}),
+	}
+}
+
+// ResolveOrphans retries rehydration for reconcile-reported sessions
+// this lineage could not rebuild, bounded by MaxOrphanResolveAttempts;
+// past the bound the session is closed through the ordinary
+// per-connection close path instead of leaking forever. The composition
+// calls this on its reconcile/maintenance cadence.
+func (adapter *RouterAdapter) ResolveOrphans(ctx context.Context) error {
+	adapter.mu.Lock()
+	pending := make([]*orphanState, 0, len(adapter.orphans))
+	for _, orphan := range adapter.orphans {
+		pending = append(pending, orphan)
+	}
+	sender := adapter.sender
+	adapter.mu.Unlock()
+
+	var firstErr error
+	for _, orphan := range pending {
+		id := orphan.remote.GetConnectionId()
+		if state := adapter.rehydrateReconciled(orphan.remote); state != nil {
+			adapter.mu.Lock()
+			if _, exists := adapter.connections[id]; !exists {
+				adapter.connections[id] = state
+			}
+			delete(adapter.orphans, id)
+			adapter.mu.Unlock()
+			continue
+		}
+		orphan.attempts++
+		if orphan.attempts < MaxOrphanResolveAttempts {
+			continue
+		}
+		// Bounded: close the session rather than leaking an orphan the
+		// control plane can never manage. CLOSED for an unknown id is
+		// tolerated, so this converges even without local state.
+		adapter.mu.Lock()
+		delete(adapter.orphans, id)
+		adapter.mu.Unlock()
+		if sender == nil {
+			continue
+		}
+		envelope := &controlpb.ControlEnvelope{
+			RequestId:            adapter.nextID.Add(1),
+			Generation:           orphan.remote.GetGeneration(),
+			Priority:             controlpb.Priority_PRIORITY_CRITICAL,
+			RequiredCapabilities: []uint64{uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE)},
+			Body: &controlpb.ControlEnvelope_CloseCommand{CloseCommand: &controlpb.CloseCommand{
+				ConnectionId: id,
+				CloseId:      adapter.newOperationID("orphan-close", 0, id),
+				ErrorSource:  controlpb.ErrorSource_ERROR_SOURCE_PROXY,
+				Reason:       "unrehydratable after reconciliation",
+				Force:        false,
+			}},
+		}
+		if err := sender.Send(ctx, envelope); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// OrphanCount reports currently tracked unrehydrated sessions.
+func (adapter *RouterAdapter) OrphanCount() int {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	return len(adapter.orphans)
 }
 
 func (adapter *RouterAdapter) closeStateLocked(state *connectionState, source backend.ErrorSource) {
@@ -754,6 +993,10 @@ type projectedConn struct {
 	adapter *RouterAdapter
 	id      uint64
 	client  string
+	// generation stamps outgoing per-session commands (redirect/close)
+	// so the Rust gate can reject commands minted for a different
+	// connection incarnation. Written once under state.mu.
+	generation uint64
 
 	mu sync.Mutex
 
@@ -766,9 +1009,14 @@ type projectedConn struct {
 	receiver   router.ConnEventReceiver
 	redirect   router.BackendInst
 	redirectID string
-	closeID    string
-	closing    bool
-	closed     bool
+	// rehydratedRedirectID is a pending redirect restored from
+	// reconciliation whose target backend inst is unknown to this
+	// lineage; its terminal result is handled specially and no new
+	// redirect may be issued until it retires.
+	rehydratedRedirectID string
+	closeID              string
+	closing              bool
+	closed               bool
 }
 
 func newProjectedConn(adapter *RouterAdapter, identity *controlpb.ConnectionIdentity) *projectedConn {
@@ -832,7 +1080,7 @@ func (conn *projectedConn) Redirect(target router.BackendInst) bool {
 		return false
 	}
 	conn.mu.Lock()
-	if conn.closed || conn.closing || conn.redirect != nil {
+	if conn.closed || conn.closing || conn.redirect != nil || conn.rehydratedRedirectID != "" {
 		conn.mu.Unlock()
 		return false
 	}
@@ -843,8 +1091,9 @@ func (conn *projectedConn) Redirect(target router.BackendInst) bool {
 	}
 	redirectID := conn.adapter.newOperationID("redirect", sender.Epoch(), conn.id)
 	envelope := &controlpb.ControlEnvelope{
-		RequestId: conn.adapter.nextID.Add(1),
-		Priority:  controlpb.Priority_PRIORITY_CRITICAL,
+		RequestId:  conn.adapter.nextID.Add(1),
+		Generation: conn.generation,
+		Priority:   controlpb.Priority_PRIORITY_CRITICAL,
 		Body: &controlpb.ControlEnvelope_RedirectCommand{RedirectCommand: &controlpb.RedirectCommand{
 			ConnectionId:   conn.id,
 			RedirectId:     redirectID,
@@ -878,6 +1127,7 @@ func (conn *projectedConn) ForceClose() bool {
 	closeID := conn.adapter.newOperationID("close", sender.Epoch(), conn.id)
 	envelope := &controlpb.ControlEnvelope{
 		RequestId:            conn.adapter.nextID.Add(1),
+		Generation:           conn.generation,
 		Priority:             controlpb.Priority_PRIORITY_CRITICAL,
 		RequiredCapabilities: []uint64{capability},
 		Body: &controlpb.ControlEnvelope_CloseCommand{CloseCommand: &controlpb.CloseCommand{
@@ -969,7 +1219,16 @@ func (conn *projectedConn) takeRedirect(id string) (router.BackendInst, router.C
 func (conn *projectedConn) redirectPending() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	return conn.redirect != nil
+	return conn.redirect != nil || conn.rehydratedRedirectID != ""
+}
+
+func (conn *projectedConn) pendingRedirectID() string {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.redirect != nil {
+		return conn.redirectID
+	}
+	return conn.rehydratedRedirectID
 }
 
 func (conn *projectedConn) finishClose(id string, accepted bool) {

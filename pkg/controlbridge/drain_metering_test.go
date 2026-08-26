@@ -69,12 +69,12 @@ func TestDrainIssuerSingleFlightAndIdempotentResults(t *testing.T) {
 		ListenerNames: []string{"sql-a"},
 	}
 
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, command))
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, command))
 	// Re-issuing the active id is a harmless duplicate command.
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 2, command))
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 2, 12, command))
 	require.Len(t, sender.sent(), 2)
 	// A different id while active never reaches the wire.
-	err := issuer.StartDrain(context.Background(), sender, 3, &controlpb.DrainCommand{DrainId: "d-2"})
+	err := issuer.StartDrain(context.Background(), sender, 3, 12, &controlpb.DrainCommand{DrainId: "d-2"})
 	require.ErrorIs(t, err, ErrDrainInProgress)
 	require.Len(t, sender.sent(), 2)
 
@@ -103,14 +103,14 @@ func TestDrainIssuerSingleFlightAndIdempotentResults(t *testing.T) {
 
 	// While idle, re-issuing the completed d-1 id re-sends for a
 	// replayed final result instead of restarting a drain.
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 4, command))
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 4, 12, command))
 	_, done = issuer.Progress("d-1")
 	require.True(t, done, "completed drain stays completed")
 	// With d-1 terminal, a new drain may start — and then the completed
 	// d-1 id conflicts like any different id (single-flight, matching
 	// the Rust gate).
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 5, &controlpb.DrainCommand{DrainId: "d-2"}))
-	require.ErrorIs(t, issuer.StartDrain(context.Background(), sender, 6, command), ErrDrainInProgress)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 5, 12, &controlpb.DrainCommand{DrainId: "d-2"}))
+	require.ErrorIs(t, issuer.StartDrain(context.Background(), sender, 6, 12, command), ErrDrainInProgress)
 }
 
 // The consumer applies a batch only when its sequence advances:
@@ -144,16 +144,21 @@ func TestMeteringConsumerDeduplicatesBySequence(t *testing.T) {
 	response, _ = consumer.Totals("ks-a", "tidb-a", false)
 	require.EqualValues(t, 150, response)
 
-	// Out-of-order old sequences are ignored even if never seen: the
-	// producer replays in order, so a lower sequence after a higher one
-	// is by contract already-applied content.
+	// Out-of-order old sequences are ignored: the producer replays in
+	// order, so a lower sequence after a higher one is already-applied
+	// content.
 	require.False(t, consumer.Apply(batch(1, 999)))
 	require.EqualValues(t, 2, consumer.LastApplied())
 
+	// A gap is refused too — applying 4 before 3 would lose 3 forever.
+	// The producer's in-order replay then converges.
+	require.False(t, consumer.Apply(batch(4, 7)), "gap refused")
+	require.EqualValues(t, 2, consumer.LastApplied())
 	require.True(t, consumer.Apply(batch(3, 1)))
-	require.EqualValues(t, 3, consumer.LastApplied())
+	require.True(t, consumer.Apply(batch(4, 7)))
+	require.EqualValues(t, 4, consumer.LastApplied())
 	response, _ = consumer.Totals("ks-a", "tidb-a", false)
-	require.EqualValues(t, 151, response)
+	require.EqualValues(t, 158, response)
 }
 
 // Go↔Rust drain roundtrip at the wire-type level: the command the
@@ -170,7 +175,7 @@ func TestDrainCommandRoundTripContract(t *testing.T) {
 		GracefulDeadlineUnixMillis: 1_000,
 		ForceDeadlineUnixMillis:    2_000,
 	}
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 7, command))
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 7, 12, command))
 	envelopes := sender.sent()
 	require.Len(t, envelopes, 1)
 	sent := envelopes[0].GetDrainCommand()
@@ -200,12 +205,14 @@ func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
 	handler := &recordingHandler{rt: rt}
 	adapter := newTestAdapter(t, handler)
 	consumer := NewMeteringConsumer()
-	require.True(t, consumer.Apply(&controlpb.MeteringBatch{
-		Sequence: 4,
-		Deltas: []*controlpb.MeteringDelta{{
-			Keyspace: "ks-a", BackendId: "tidb-a", ResponseBytes: 10,
-		}},
-	}))
+	for sequence := uint64(1); sequence <= 4; sequence++ {
+		require.True(t, consumer.Apply(&controlpb.MeteringBatch{
+			Sequence: sequence,
+			Deltas: []*controlpb.MeteringDelta{{
+				Keyspace: "ks-a", BackendId: "tidb-a", ResponseBytes: 10,
+			}},
+		}))
+	}
 	adapter.AttachMetering(consumer)
 
 	peer := newFakeSender(11,

@@ -103,6 +103,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     backend_id: "backend-1".into(),
                     namespace: "default".into(),
                     redirect_pending: true,
+                    // Zero/empty/absent keeps the frozen golden bytes
+                    // identical across the additive fields.
+                    generation: 0,
+                    pending_redirect_id: String::new(),
+                    identity: None,
                 }],
             })),
             ..Default::default()

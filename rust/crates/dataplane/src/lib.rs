@@ -33,8 +33,9 @@ pub use admission::{
     AdmissionRejection, MemoryProbe, MemoryProbeError, MemorySample, SystemMemoryProbe,
 };
 pub use control_commands::{
-    CloseAdmission, CommandGate, DrainAdmission, DrainPhase, MAX_UNACKED_METERING_BATCHES,
-    MeteringBacklogFull, MeteringLedger, ReconcileRepairs, RedirectAdmission,
+    CloseAdmission, CommandGate, DrainAdmission, DrainPhase, MAX_COMPLETED_DRAINS,
+    MAX_DELTAS_PER_BATCH, MAX_TERMINAL_REDIRECTS_PER_CONNECTION, MAX_UNACKED_METERING_BATCHES,
+    MeteringError, MeteringLedger, ReconcileRepairs, RedirectAdmission,
 };
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,

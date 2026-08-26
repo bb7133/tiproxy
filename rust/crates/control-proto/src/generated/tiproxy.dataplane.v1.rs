@@ -535,6 +535,26 @@ pub struct ReconcileConnection {
     pub namespace: ::prost::alloc::string::String,
     #[prost(bool, tag="4")]
     pub redirect_pending: bool,
+    /// Snapshot generation the connection was admitted under (CTL-06):
+    /// lets a restarted Go lineage restore the expected-generation guard.
+    /// Additive; absent (zero) means the peer predates the field.
+    #[prost(uint64, tag="5")]
+    pub generation: u64,
+    /// The redirect id still awaiting its terminal result, when
+    /// redirect_pending is true (CTL-06): lets a restarted Go lineage
+    /// correlate the eventual RedirectResult and know when the next
+    /// redirect may be issued. Additive; empty with redirect_pending set
+    /// means the peer predates the field.
+    #[prost(string, tag="6")]
+    pub pending_redirect_id: ::prost::alloc::string::String,
+    /// The admission identity exactly as the handshake event carried it
+    /// (CTL-06): a restarted Go lineage rebuilds connection state that
+    /// passes later identity-equality checks and supplies real
+    /// listener/client/proxy addresses to routing. connection_id inside
+    /// must equal the outer connection_id. Additive; absent means the
+    /// peer predates the field.
+    #[prost(message, optional, tag="7")]
+    pub identity: ::core::option::Option<ConnectionIdentity>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReconcileSnapshot {

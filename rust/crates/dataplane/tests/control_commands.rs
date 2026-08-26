@@ -20,7 +20,8 @@
 //! lost results and ghost connections in both restart directions.
 
 use control_proto::v1::{
-    DrainCommand, ErrorCode, ReconcileConnection, ReconcileSnapshot, RedirectCommand,
+    ConnectionIdentity, DrainCommand, ErrorCode, ReconcileConnection, ReconcileSnapshot,
+    RedirectCommand,
 };
 use dataplane::control_commands::{
     CloseAdmission, CommandGate, DrainAdmission, DrainPhase, RedirectAdmission,
@@ -49,9 +50,19 @@ fn drain(drain_id: &str, listeners: &[&str], backends: &[&str]) -> DrainCommand 
     }
 }
 
+fn identity(connection_id: u64) -> ConnectionIdentity {
+    ConnectionIdentity {
+        connection_id,
+        listener_address: "0.0.0.0:6000".to_owned(),
+        client_address: "10.9.8.7:55555".to_owned(),
+        proxy_address: "10.0.0.9:6000".to_owned(),
+        public_endpoint: false,
+    }
+}
+
 fn gate_with_connection(connection_id: u64, backend: &str) -> CommandGate {
     let mut gate = CommandGate::new();
-    gate.register_connection(connection_id, "ns-a", 7);
+    gate.register_connection(identity(connection_id), "ns-a", 7);
     gate.set_backend(connection_id, backend);
     gate
 }
@@ -65,16 +76,16 @@ fn redirect_duplicates_act_at_most_once() {
     let mut gate = gate_with_connection(1, "tidb-a");
 
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-1")),
+        gate.admit_redirect(&redirect(1, "r-1"), 7),
         RedirectAdmission::Start
     );
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-1")),
+        gate.admit_redirect(&redirect(1, "r-1"), 7),
         RedirectAdmission::DuplicatePending,
         "duplicate of the pending id is absorbed"
     );
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-2")),
+        gate.admit_redirect(&redirect(1, "r-2"), 7),
         RedirectAdmission::Conflict {
             pending_redirect_id: "r-1".to_owned()
         },
@@ -102,14 +113,14 @@ fn redirect_duplicates_act_at_most_once() {
 
     // The delayed duplicate command replays the cached result verbatim.
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-1")),
+        gate.admit_redirect(&redirect(1, "r-1"), 7),
         RedirectAdmission::Replay(result.clone())
     );
 
     // A new id after the terminal starts a fresh redirect from the new
     // backend.
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-2")),
+        gate.admit_redirect(&redirect(1, "r-2"), 7),
         RedirectAdmission::Start
     );
     let Some(second) = gate.complete_redirect(1, "r-2", false, "", ErrorCode::RedirectFailed)
@@ -128,7 +139,7 @@ fn redirect_duplicates_act_at_most_once() {
 
     // Unknown connections are never acted on.
     assert_eq!(
-        gate.admit_redirect(&redirect(99, "r-1")),
+        gate.admit_redirect(&redirect(99, "r-1"), 7),
         RedirectAdmission::UnknownConnection
     );
 }
@@ -142,7 +153,7 @@ fn duplicate_storm_is_idempotent() {
     let mut effects = Vec::new();
     for _ in 0..3 {
         for _ in 0..2 {
-            if gate.admit_redirect(&redirect(1, "r-1")) == RedirectAdmission::Start {
+            if gate.admit_redirect(&redirect(1, "r-1"), 7) == RedirectAdmission::Start {
                 effects.push("start");
             }
             if let Some(result) = gate.complete_redirect(1, "r-1", true, "tidb-b", ErrorCode::Ok) {
@@ -162,17 +173,17 @@ fn close_commands_schedule_at_most_once() {
     let mut gate = gate_with_connection(1, "tidb-a");
 
     assert_eq!(
-        gate.admit_close(1, "c-1", false),
+        gate.admit_close(1, "c-1", false, 7),
         CloseAdmission::Start { force: false }
     );
     // Duplicate while closing: replay the accepted state.
-    let CloseAdmission::Replay(state) = gate.admit_close(1, "c-1", false) else {
+    let CloseAdmission::Replay(state) = gate.admit_close(1, "c-1", false, 7) else {
         unreachable!("duplicate close id must replay")
     };
     assert_eq!(state.close_id, "c-1");
     assert!(state.accepted);
     // A different id while closing: current state, no second schedule.
-    let CloseAdmission::AlreadyClosing(state) = gate.admit_close(1, "c-2", true) else {
+    let CloseAdmission::AlreadyClosing(state) = gate.admit_close(1, "c-2", true, 7) else {
         unreachable!("different close id must not schedule a second close")
     };
     assert_eq!(state.close_id, "c-1", "reports the actual closing id");
@@ -196,22 +207,22 @@ fn close_commands_schedule_at_most_once() {
     // Post-terminal: duplicate replays the terminal result; different
     // ids still report it.
     assert_eq!(
-        gate.admit_close(1, "c-1", false),
+        gate.admit_close(1, "c-1", false, 7),
         CloseAdmission::Replay(result.clone())
     );
     assert_eq!(
-        gate.admit_close(1, "c-3", false),
+        gate.admit_close(1, "c-3", false, 7),
         CloseAdmission::AlreadyClosing(result)
     );
     assert_eq!(
-        gate.admit_close(42, "c-1", false),
+        gate.admit_close(42, "c-1", false, 7),
         CloseAdmission::UnknownConnection
     );
 
     // Force close maps through.
     let mut gate = gate_with_connection(2, "tidb-a");
     assert_eq!(
-        gate.admit_close(2, "c-f", true),
+        gate.admit_close(2, "c-f", true, 7),
         CloseAdmission::Start { force: true }
     );
 }
@@ -221,14 +232,22 @@ fn close_commands_schedule_at_most_once() {
 /// `DRAIN_IN_PROGRESS`, accounting can never overshoot or go negative,
 /// and a completed drain id replays its final result.
 #[tokio::test(start_paused = true)]
+#[allow(clippy::too_many_lines)]
 async fn drain_is_single_flight_with_replayable_progress() {
     let mut gate = CommandGate::new();
     let now = Instant::now();
     let graceful_by = now + Duration::from_secs(10);
     let force_by = now + Duration::from_secs(20);
 
+    let matched = std::collections::BTreeSet::from([101_u64, 102]);
     assert_eq!(
-        gate.admit_drain(&drain("d-1", &["sql-a"], &[]), graceful_by, force_by, 2),
+        gate.admit_drain(
+            &drain("d-1", &["sql-a"], &[]),
+            0,
+            graceful_by,
+            force_by,
+            matched.clone()
+        ),
         DrainAdmission::Start
     );
     // Scope selection: listener match with empty backend list matches
@@ -237,9 +256,13 @@ async fn drain_is_single_flight_with_replayable_progress() {
     assert!(!gate.drain_selects("sql-b", "tidb-x"));
 
     // Repeating the active id: progress, not a second drain.
-    let DrainAdmission::Progress(progress) =
-        gate.admit_drain(&drain("d-1", &["sql-a"], &[]), graceful_by, force_by, 2)
-    else {
+    let DrainAdmission::Progress(progress) = gate.admit_drain(
+        &drain("d-1", &["sql-a"], &[]),
+        0,
+        graceful_by,
+        force_by,
+        matched.clone(),
+    ) else {
         unreachable!("active id must report progress")
     };
     assert_eq!(progress.active_connections, 2);
@@ -247,30 +270,44 @@ async fn drain_is_single_flight_with_replayable_progress() {
     assert!(!progress.complete);
 
     // A different concurrent drain is rejected.
-    let DrainAdmission::Conflict(conflict) =
-        gate.admit_drain(&drain("d-2", &[], &[]), graceful_by, force_by, 5)
-    else {
+    let DrainAdmission::Conflict(conflict) = gate.admit_drain(
+        &drain("d-2", &[], &[]),
+        0,
+        graceful_by,
+        force_by,
+        std::collections::BTreeSet::from([1_u64]),
+    ) else {
         unreachable!("concurrent drain must conflict")
     };
     assert_eq!(conflict.drain_id, "d-1", "reports the active drain");
     assert_eq!(conflict.code(), ErrorCode::DrainInProgress);
 
-    // Phases follow the absolute deadlines.
+    // Phases follow the absolute deadlines, including the window
+    // between graceful expiry and force.
     assert_eq!(gate.drain_phase(now), Some(DrainPhase::Graceful));
+    assert_eq!(
+        gate.drain_phase(now + Duration::from_secs(15)),
+        Some(DrainPhase::GraceExpired)
+    );
     assert_eq!(
         gate.drain_phase(now + Duration::from_secs(25)),
         Some(DrainPhase::Force)
     );
 
-    // Accounting: one graceful, one forced completes the drain; extra
-    // closes are ignored (a session closes once — never negative, never
-    // overshooting).
-    gate.record_drain_close(false);
-    gate.record_drain_close(true);
-    gate.record_drain_close(true);
-    let DrainAdmission::Replay(done) =
-        gate.admit_drain(&drain("d-1", &["sql-a"], &[]), graceful_by, force_by, 2)
-    else {
+    // Per-id accounting: each matched session counts once (duplicate
+    // closes are no-ops), out-of-scope ids never count — never
+    // negative, never overshooting, by construction.
+    gate.record_drain_close(101, false);
+    gate.record_drain_close(101, true);
+    gate.record_drain_close(999, true);
+    gate.record_drain_close(102, true);
+    let DrainAdmission::Replay(done) = gate.admit_drain(
+        &drain("d-1", &["sql-a"], &[]),
+        0,
+        graceful_by,
+        force_by,
+        matched,
+    ) else {
         unreachable!("completed drain id must replay its final result")
     };
     assert!(done.complete);
@@ -280,16 +317,58 @@ async fn drain_is_single_flight_with_replayable_progress() {
 
     // With the drain complete, a new drain may start.
     assert_eq!(
-        gate.admit_drain(&drain("d-2", &[], &["tidb-a"]), graceful_by, force_by, 0),
+        gate.admit_drain(
+            &drain("d-2", &[], &["tidb-a"]),
+            0,
+            graceful_by,
+            force_by,
+            std::collections::BTreeSet::new()
+        ),
         DrainAdmission::Start
     );
     // Zero matched connections completes immediately.
-    let DrainAdmission::Replay(empty) =
-        gate.admit_drain(&drain("d-2", &[], &["tidb-a"]), graceful_by, force_by, 0)
-    else {
+    let DrainAdmission::Replay(empty) = gate.admit_drain(
+        &drain("d-2", &[], &["tidb-a"]),
+        0,
+        graceful_by,
+        force_by,
+        std::collections::BTreeSet::new(),
+    ) else {
         unreachable!("empty drain is complete immediately")
     };
     assert!(empty.complete);
+
+    // Out-of-order duplicate of the FIRST completed drain replays its
+    // final result even after a later drain completed (tombstones, not
+    // just last-completed).
+    let DrainAdmission::Replay(old_replay) = gate.admit_drain(
+        &drain("d-1", &["sql-a"], &[]),
+        0,
+        graceful_by,
+        force_by,
+        std::collections::BTreeSet::from([7_u64]),
+    ) else {
+        unreachable!("delayed d-1 must replay, never restart")
+    };
+    assert!(old_replay.complete);
+    assert_eq!(old_replay.gracefully_closed, 1);
+
+    // Drain provenance: a command minted before the applied snapshot is
+    // stale; equal or newer generations pass.
+    gate.set_applied_generation(9);
+    assert_eq!(
+        gate.admit_drain(
+            &drain("d-3", &[], &[]),
+            8,
+            graceful_by,
+            force_by,
+            std::collections::BTreeSet::new()
+        ),
+        DrainAdmission::StaleGeneration {
+            command_generation: 8,
+            applied_generation: 9
+        }
+    );
 }
 
 /// Reconciliation, Rust-alive direction (Go restarted): the request
@@ -299,11 +378,11 @@ async fn drain_is_single_flight_with_replayable_progress() {
 #[test]
 fn go_restart_preserves_rust_sessions() {
     let mut gate = CommandGate::new();
-    gate.register_connection(1, "ns-a", 7);
+    gate.register_connection(identity(1), "ns-a", 7);
     gate.set_backend(1, "tidb-a");
-    gate.register_connection(2, "ns-b", 7);
+    gate.register_connection(identity(2), "ns-b", 7);
     gate.set_backend(2, "tidb-b");
-    let _ = gate.admit_redirect(&redirect(2, "r-1"));
+    let _ = gate.admit_redirect(&redirect(2, "r-1"), 7);
     let seq_a = gate.next_event_sequence();
     let seq_b = gate.next_event_sequence();
     assert!(seq_b > seq_a, "event sequences are monotonic");
@@ -343,7 +422,7 @@ fn rust_restart_clears_ghosts_and_replays_lost_results() {
     // A fresh gate knows one live connection with a cached terminal
     // redirect result whose delivery was lost.
     let mut gate = gate_with_connection(5, "tidb-a");
-    let _ = gate.admit_redirect(&redirect(5, "r-5"));
+    let _ = gate.admit_redirect(&redirect(5, "r-5"), 7);
     let Some(lost) = gate.complete_redirect(5, "r-5", true, "tidb-b", ErrorCode::Ok) else {
         unreachable!("completion produces the result")
     };
@@ -361,6 +440,9 @@ fn rust_restart_clears_ghosts_and_replays_lost_results() {
                 backend_id: "tidb-a".to_owned(),
                 namespace: "ns-a".to_owned(),
                 redirect_pending: true,
+                generation: 7,
+                pending_redirect_id: String::new(),
+                identity: None,
             },
             // Ghosts: connections that died with the Rust restart.
             ReconcileConnection {
@@ -368,12 +450,18 @@ fn rust_restart_clears_ghosts_and_replays_lost_results() {
                 backend_id: "tidb-a".to_owned(),
                 namespace: "ns-a".to_owned(),
                 redirect_pending: false,
+                generation: 7,
+                pending_redirect_id: String::new(),
+                identity: None,
             },
             ReconcileConnection {
                 connection_id: 3,
                 backend_id: "tidb-b".to_owned(),
                 namespace: "ns-b".to_owned(),
                 redirect_pending: true,
+                generation: 7,
+                pending_redirect_id: String::new(),
+                identity: None,
             },
         ],
     });
@@ -397,6 +485,9 @@ fn rust_restart_clears_ghosts_and_replays_lost_results() {
             backend_id: "tidb-a".to_owned(),
             namespace: "ns-a".to_owned(),
             redirect_pending: true,
+            generation: 7,
+            pending_redirect_id: String::new(),
+            identity: None,
         }],
     });
     assert_eq!(again.replay_redirect_results.len(), 1);
@@ -413,6 +504,9 @@ fn rust_restart_clears_ghosts_and_replays_lost_results() {
             backend_id: "tidb-a".to_owned(),
             namespace: "ns-a".to_owned(),
             redirect_pending: false,
+            generation: 7,
+            pending_redirect_id: String::new(),
+            identity: None,
         }],
     });
     assert_eq!(repairs.ghost_connections, vec![1]);
@@ -427,17 +521,17 @@ fn rust_restart_clears_ghosts_and_replays_lost_results() {
 #[test]
 fn stale_generations_never_affect_new_connections() {
     let mut gate = CommandGate::new();
-    gate.register_connection(1, "ns-a", 7);
+    gate.register_connection(identity(1), "ns-a", 7);
     gate.set_backend(1, "tidb-a");
     // The connection closes; a new one is admitted under generation 9
     // reusing nothing from the old id.
     gate.unregister_connection(1);
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-old")),
+        gate.admit_redirect(&redirect(1, "r-old"), 7),
         RedirectAdmission::UnknownConnection,
         "commands for the retired incarnation never act"
     );
-    gate.register_connection(2, "ns-a", 9);
+    gate.register_connection(identity(2), "ns-a", 9);
     gate.set_backend(2, "tidb-b");
     let request = gate.build_reconcile_request(9, 0, 0);
     assert_eq!(request.connections.len(), 1);
@@ -472,9 +566,9 @@ fn metering_is_deduplicated_cumulative_and_replayable() {
     );
 
     // Same key merges cumulatively; different key stays separate.
-    ledger.record(delta("ks-a", 100));
-    ledger.record(delta("ks-a", 50));
-    ledger.record(delta("ks-b", 10));
+    let _ = ledger.record(delta("ks-a", 100));
+    let _ = ledger.record(delta("ks-a", 50));
+    let _ = ledger.record(delta("ks-b", 10));
     let Ok(Some(first)) = ledger.seal() else {
         unreachable!("first seal")
     };
@@ -491,7 +585,7 @@ fn metering_is_deduplicated_cumulative_and_replayable() {
         "same-key deltas merge cumulatively"
     );
 
-    ledger.record(delta("ks-a", 7));
+    let _ = ledger.record(delta("ks-a", 7));
     let Ok(Some(second)) = ledger.seal() else {
         unreachable!("second seal")
     };
@@ -515,10 +609,10 @@ fn metering_is_deduplicated_cumulative_and_replayable() {
     // and no batch is dropped.
     let mut full = MeteringLedger::new();
     for index in 0..MAX_UNACKED_METERING_BATCHES {
-        full.record(delta("ks", u64::try_from(index).unwrap_or(u64::MAX) + 1));
+        let _ = full.record(delta("ks", u64::try_from(index).unwrap_or(u64::MAX) + 1));
         assert!(full.seal().is_ok());
     }
-    full.record(delta("ks", 5));
+    let _ = full.record(delta("ks", 5));
     let backlog = full.seal();
     assert!(backlog.is_err(), "backlog full fails closed, never drops");
     // The accumulation survives for a later seal after acks arrive.
@@ -540,7 +634,7 @@ fn metering_is_deduplicated_cumulative_and_replayable() {
 #[test]
 fn redirect_replay_survives_epochs_and_generations_stay_separate() {
     let mut gate = gate_with_connection(1, "tidb-a");
-    let _ = gate.admit_redirect(&redirect(1, "r-1"));
+    let _ = gate.admit_redirect(&redirect(1, "r-1"), 7);
     let Some(result) = gate.complete_redirect(1, "r-1", true, "tidb-b", ErrorCode::Ok) else {
         unreachable!("completion produces the result")
     };
@@ -550,7 +644,7 @@ fn redirect_replay_survives_epochs_and_generations_stay_separate() {
     // replays verbatim — no epoch or request-id dimension exists in the
     // key, by design.
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-1")),
+        gate.admit_redirect(&redirect(1, "r-1"), 7),
         RedirectAdmission::Replay(result.clone())
     );
 
@@ -566,6 +660,9 @@ fn redirect_replay_survives_epochs_and_generations_stay_separate() {
             backend_id: "tidb-a".to_owned(),
             namespace: "ns-a".to_owned(),
             redirect_pending: true,
+            generation: 7,
+            pending_redirect_id: String::new(),
+            identity: None,
         }],
     });
     assert_eq!(repairs.replay_redirect_results, vec![result]);
@@ -574,13 +671,83 @@ fn redirect_replay_survives_epochs_and_generations_stay_separate() {
     // under generation 11 shares nothing with the closed generation-7
     // incarnation, and the old incarnation's commands never touch it.
     gate.unregister_connection(1);
-    gate.register_connection(2, "ns-a", 11);
+    gate.register_connection(identity(2), "ns-a", 11);
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-2")),
+        gate.admit_redirect(&redirect(1, "r-2"), 7),
         RedirectAdmission::UnknownConnection,
         "the retired incarnation's id space is dead"
     );
     let request = gate.build_reconcile_request(11, 0, 0);
     assert_eq!(request.connections.len(), 1);
     assert_eq!(request.connections[0].connection_id, 2);
+}
+
+/// True out-of-order regression: after r1 AND r2 both finished, a
+/// delayed duplicate of r1 replays r1's tombstone — an old id never
+/// re-executes just because newer ids finished after it.
+#[test]
+fn delayed_old_redirect_id_replays_after_newer_terminals() {
+    let mut gate = gate_with_connection(1, "tidb-a");
+    let _ = gate.admit_redirect(&redirect(1, "r-1"), 7);
+    let Some(first) = gate.complete_redirect(1, "r-1", true, "tidb-b", ErrorCode::Ok) else {
+        unreachable!("r-1 completes")
+    };
+    let _ = gate.admit_redirect(&redirect(1, "r-2"), 7);
+    let Some(second) = gate.complete_redirect(1, "r-2", true, "tidb-c", ErrorCode::Ok) else {
+        unreachable!("r-2 completes")
+    };
+
+    assert_eq!(
+        gate.admit_redirect(&redirect(1, "r-1"), 7),
+        RedirectAdmission::Replay(first),
+        "delayed r-1 replays its own tombstone, never re-executes"
+    );
+    assert_eq!(
+        gate.admit_redirect(&redirect(1, "r-2"), 7),
+        RedirectAdmission::Replay(second),
+    );
+    assert_eq!(
+        gate.complete_redirect(1, "r-1", false, "", ErrorCode::RedirectFailed),
+        None,
+        "a delayed completion for a tombstoned id is suppressed"
+    );
+}
+
+/// Connection-id reuse across a Rust restart: the same numeric id
+/// admitted under a newer generation rejects commands stamped with the
+/// old incarnation's generation — the guard is the generation, not the
+/// id space.
+#[test]
+fn id_reuse_across_generations_rejects_stale_commands() {
+    let mut gate = CommandGate::new();
+    gate.register_connection(identity(1), "ns-a", 7);
+    gate.unregister_connection(1);
+    // Rust restarted: ids start from 1 again, new snapshot generation.
+    gate.register_connection(identity(1), "ns-a", 9);
+    gate.set_backend(1, "tidb-a");
+
+    assert_eq!(
+        gate.admit_redirect(&redirect(1, "r-old"), 7),
+        RedirectAdmission::StaleGeneration {
+            command_generation: 7,
+            connection_generation: 9
+        },
+        "a command minted for the old incarnation never acts on the new one"
+    );
+    assert_eq!(
+        gate.admit_close(1, "c-old", false, 7),
+        CloseAdmission::StaleGeneration {
+            command_generation: 7,
+            connection_generation: 9
+        }
+    );
+    // The correct generation acts normally; zero is legacy-tolerated.
+    assert_eq!(
+        gate.admit_redirect(&redirect(1, "r-new"), 9),
+        RedirectAdmission::Start
+    );
+    let request = gate.build_reconcile_request(9, 0, 0);
+    assert_eq!(request.connections[0].generation, 9);
+    assert_eq!(request.connections[0].pending_redirect_id, "r-new");
+    assert!(request.connections[0].redirect_pending);
 }

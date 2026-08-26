@@ -3463,8 +3463,25 @@ type ReconcileConnection struct {
 	BackendId       string                 `protobuf:"bytes,2,opt,name=backend_id,json=backendId,proto3" json:"backend_id,omitempty"`
 	Namespace       string                 `protobuf:"bytes,3,opt,name=namespace,proto3" json:"namespace,omitempty"`
 	RedirectPending bool                   `protobuf:"varint,4,opt,name=redirect_pending,json=redirectPending,proto3" json:"redirect_pending,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Snapshot generation the connection was admitted under (CTL-06):
+	// lets a restarted Go lineage restore the expected-generation guard.
+	// Additive; absent (zero) means the peer predates the field.
+	Generation uint64 `protobuf:"varint,5,opt,name=generation,proto3" json:"generation,omitempty"`
+	// The redirect id still awaiting its terminal result, when
+	// redirect_pending is true (CTL-06): lets a restarted Go lineage
+	// correlate the eventual RedirectResult and know when the next
+	// redirect may be issued. Additive; empty with redirect_pending set
+	// means the peer predates the field.
+	PendingRedirectId string `protobuf:"bytes,6,opt,name=pending_redirect_id,json=pendingRedirectId,proto3" json:"pending_redirect_id,omitempty"`
+	// The admission identity exactly as the handshake event carried it
+	// (CTL-06): a restarted Go lineage rebuilds connection state that
+	// passes later identity-equality checks and supplies real
+	// listener/client/proxy addresses to routing. connection_id inside
+	// must equal the outer connection_id. Additive; absent means the
+	// peer predates the field.
+	Identity      *ConnectionIdentity `protobuf:"bytes,7,opt,name=identity,proto3" json:"identity,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReconcileConnection) Reset() {
@@ -3523,6 +3540,27 @@ func (x *ReconcileConnection) GetRedirectPending() bool {
 		return x.RedirectPending
 	}
 	return false
+}
+
+func (x *ReconcileConnection) GetGeneration() uint64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *ReconcileConnection) GetPendingRedirectId() string {
+	if x != nil {
+		return x.PendingRedirectId
+	}
+	return ""
+}
+
+func (x *ReconcileConnection) GetIdentity() *ConnectionIdentity {
+	if x != nil {
+		return x.Identity
+	}
+	return nil
 }
 
 type ReconcileSnapshot struct {
@@ -4023,13 +4061,18 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x1elast_connection_event_sequence\x18\x02 \x01(\x04R\x1blastConnectionEventSequence\x122\n" +
 	"\x15last_metrics_sequence\x18\x03 \x01(\x04R\x13lastMetricsSequence\x124\n" +
 	"\x16last_metering_sequence\x18\x04 \x01(\x04R\x14lastMeteringSequence\x12K\n" +
-	"\vconnections\x18\x05 \x03(\v2).tiproxy.dataplane.v1.ReconcileConnectionR\vconnections\"\xa2\x01\n" +
+	"\vconnections\x18\x05 \x03(\v2).tiproxy.dataplane.v1.ReconcileConnectionR\vconnections\"\xb8\x02\n" +
 	"\x13ReconcileConnection\x12#\n" +
 	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x1d\n" +
 	"\n" +
 	"backend_id\x18\x02 \x01(\tR\tbackendId\x12\x1c\n" +
 	"\tnamespace\x18\x03 \x01(\tR\tnamespace\x12)\n" +
-	"\x10redirect_pending\x18\x04 \x01(\bR\x0fredirectPending\"\xa3\x02\n" +
+	"\x10redirect_pending\x18\x04 \x01(\bR\x0fredirectPending\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x05 \x01(\x04R\n" +
+	"generation\x12.\n" +
+	"\x13pending_redirect_id\x18\x06 \x01(\tR\x11pendingRedirectId\x12D\n" +
+	"\bidentity\x18\a \x01(\v2(.tiproxy.dataplane.v1.ConnectionIdentityR\bidentity\"\xa3\x02\n" +
 	"\x11ReconcileSnapshot\x12-\n" +
 	"\x12applied_generation\x18\x01 \x01(\x04R\x11appliedGeneration\x12:\n" +
 	"\x19connection_event_sequence\x18\x02 \x01(\x04R\x17connectionEventSequence\x12)\n" +
@@ -4226,13 +4269,14 @@ var file_dataplane_v1_control_proto_depIdxs = []int32{
 	34, // 58: tiproxy.dataplane.v1.MetricsBatch.metrics:type_name -> tiproxy.dataplane.v1.MetricDelta
 	36, // 59: tiproxy.dataplane.v1.MeteringBatch.deltas:type_name -> tiproxy.dataplane.v1.MeteringDelta
 	39, // 60: tiproxy.dataplane.v1.ReconcileRequest.connections:type_name -> tiproxy.dataplane.v1.ReconcileConnection
-	39, // 61: tiproxy.dataplane.v1.ReconcileSnapshot.connections:type_name -> tiproxy.dataplane.v1.ReconcileConnection
-	6,  // 62: tiproxy.dataplane.v1.ProtocolError.code:type_name -> tiproxy.dataplane.v1.ErrorCode
-	63, // [63:63] is the sub-list for method output_type
-	63, // [63:63] is the sub-list for method input_type
-	63, // [63:63] is the sub-list for extension type_name
-	63, // [63:63] is the sub-list for extension extendee
-	0,  // [0:63] is the sub-list for field type_name
+	18, // 61: tiproxy.dataplane.v1.ReconcileConnection.identity:type_name -> tiproxy.dataplane.v1.ConnectionIdentity
+	39, // 62: tiproxy.dataplane.v1.ReconcileSnapshot.connections:type_name -> tiproxy.dataplane.v1.ReconcileConnection
+	6,  // 63: tiproxy.dataplane.v1.ProtocolError.code:type_name -> tiproxy.dataplane.v1.ErrorCode
+	64, // [64:64] is the sub-list for method output_type
+	64, // [64:64] is the sub-list for method input_type
+	64, // [64:64] is the sub-list for extension type_name
+	64, // [64:64] is the sub-list for extension extendee
+	0,  // [0:64] is the sub-list for field type_name
 }
 
 func init() { file_dataplane_v1_control_proto_init() }

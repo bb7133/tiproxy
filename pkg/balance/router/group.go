@@ -407,6 +407,33 @@ func (g *Group) onCreateConn(backendInst BackendInst, conn RedirectableConn, suc
 	}
 }
 
+// RehydrateConn implements the group half of AssignmentRehydrator: the
+// connection attaches to the named backend exactly as if its original
+// assignment had succeeded (score, connection list, event receiver),
+// without running selection. False means this group does not own the
+// backend.
+func (g *Group) RehydrateConn(backendID string, conn RedirectableConn) (BackendInst, bool) {
+	g.Lock()
+	defer g.Unlock()
+	backend, ok := g.backends[backendID]
+	if !ok {
+		return nil, false
+	}
+	// Selection would have incremented connScore before onCreateConn;
+	// mirror the successful-assignment total effect here.
+	backend.connScore++
+	connWrapper := &connWrapper{
+		RedirectableConn: conn,
+		scoreOwner:       backend,
+		createTime:       time.Now(),
+		phase:            phaseNotRedirected,
+		forceClosing:     false,
+	}
+	g.addConn(backend, connWrapper)
+	conn.SetEventReceiver(g)
+	return backend, true
+}
+
 func (g *Group) CloseTimedOutFailoverConnections(now time.Time) {
 	g.Lock()
 	defer g.Unlock()

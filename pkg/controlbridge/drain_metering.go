@@ -53,10 +53,15 @@ func NewDrainIssuer() *DrainIssuer {
 // Re-issuing a completed drain ID also re-sends (the Rust gate replays
 // the final result). A different ID while one drain is active returns
 // ErrDrainInProgress without sending anything.
+// The generation stamps the command's provenance: the Rust gate rejects
+// drains minted before its applied config snapshot. Per-connection
+// generations are deliberately not involved (one drain spans
+// mixed-generation sessions).
 func (issuer *DrainIssuer) StartDrain(
 	ctx context.Context,
 	sender EnvelopeSender,
 	requestID uint64,
+	generation uint64,
 	command *controlpb.DrainCommand,
 ) error {
 	if command == nil || command.GetDrainId() == "" {
@@ -67,18 +72,31 @@ func (issuer *DrainIssuer) StartDrain(
 		issuer.mu.Unlock()
 		return ErrDrainInProgress
 	}
+	created := false
 	if issuer.active == nil {
 		if issuer.lastCompleted == nil || issuer.lastCompleted.drainID != command.GetDrainId() {
 			issuer.active = &drainOperation{drainID: command.GetDrainId()}
+			created = true
 		}
 	}
 	issuer.mu.Unlock()
 
-	return sender.Send(ctx, &controlpb.ControlEnvelope{
-		RequestId: requestID,
-		Priority:  controlpb.Priority_PRIORITY_CRITICAL,
-		Body:      &controlpb.ControlEnvelope_DrainCommand{DrainCommand: command},
+	err := sender.Send(ctx, &controlpb.ControlEnvelope{
+		RequestId:  requestID,
+		Generation: generation,
+		Priority:   controlpb.Priority_PRIORITY_CRITICAL,
+		Body:       &controlpb.ControlEnvelope_DrainCommand{DrainCommand: command},
 	})
+	if err != nil && created {
+		// The command never reached the wire: roll the registration
+		// back so a later different drain is not rejected forever.
+		issuer.mu.Lock()
+		if issuer.active != nil && issuer.active.drainID == command.GetDrainId() && issuer.active.latest == nil {
+			issuer.active = nil
+		}
+		issuer.mu.Unlock()
+	}
+	return err
 }
 
 // HandleDrainResult applies one progress or terminal result. Duplicate
@@ -92,12 +110,18 @@ func (issuer *DrainIssuer) HandleDrainResult(result *controlpb.DrainResult) erro
 	issuer.mu.Lock()
 	defer issuer.mu.Unlock()
 	if issuer.active == nil || issuer.active.drainID != result.GetDrainId() {
-		// A late replay for an already-completed drain refreshes the
-		// completed record; anything else is a stale stray and drops.
-		if issuer.lastCompleted != nil && issuer.lastCompleted.drainID == result.GetDrainId() {
-			issuer.lastCompleted.latest = result
-		}
+		// A completed drain's record is terminal: late strays (including
+		// reordered non-terminal progress) never regress it.
 		return nil
+	}
+	// Counters are absolute and monotonic: an observation that moves
+	// backwards is a reordered duplicate and is ignored.
+	if latest := issuer.active.latest; latest != nil {
+		observed := result.GetGracefullyClosed() + result.GetForceClosed()
+		known := latest.GetGracefullyClosed() + latest.GetForceClosed()
+		if observed < known || (latest.GetComplete() && !result.GetComplete()) {
+			return nil
+		}
 	}
 	issuer.active.latest = result
 	if result.GetComplete() {
@@ -158,7 +182,10 @@ func (consumer *MeteringConsumer) Apply(batch *controlpb.MeteringBatch) bool {
 	}
 	consumer.mu.Lock()
 	defer consumer.mu.Unlock()
-	if batch.GetSequence() <= consumer.lastApplied {
+	// Only the contiguous next sequence applies: a gap means an earlier
+	// batch is still in flight (the producer replays in order), and
+	// applying past it would lose that batch forever.
+	if batch.GetSequence() != consumer.lastApplied+1 {
 		return false
 	}
 	consumer.lastApplied = batch.GetSequence()
