@@ -25,11 +25,12 @@
 //!   `nextAssignmentLocked` on `connected=false`). The engine therefore
 //!   never re-sends `RouteRequest` for retries — it reports and awaits.
 //! - Every assignment the adapter hands out reserves router score until
-//!   exactly one terminal `RouteResult` (or close/reconcile) retires it.
-//!   The engine enforces **exactly one report per assignment id**
-//!   structurally: an assignment is consumed by the one report the
-//!   engine makes for it, including on budget exhaustion, terminal
-//!   channel failure, and handshake-driven re-selection.
+//!   exactly one terminal `RouteResult` **or** connection-close
+//!   accounting retires it. The engine sends **at most one** result per
+//!   assignment (never two), and every consumed assignment that does
+//!   not get its result — locally terminal paths — stays exposed via
+//!   [`RouteEngine::unretired_assignment`] for the close path (see the
+//!   retirement discipline below).
 //! - A `RouteAssignment` whose `code` is not OK is the adapter's
 //!   terminal answer (`NO_BACKEND` after enumerating candidates, or an
 //!   internal error); it carries no backend and needs no result.
@@ -448,17 +449,24 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
         excluded_backend_ids: Vec<String>,
     ) -> Result<AcquiredBackend<D::Conn>, AcquireError> {
         let total_deadline = Instant::now() + self.schedule.total;
-        self.channel
-            .request_route(excluded_backend_ids)
-            .await
-            .map_err(AcquireError::Channel)?;
+        match timeout_at(
+            total_deadline,
+            self.channel.request_route(excluded_backend_ids),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(AcquireError::Channel(error)),
+            Err(_) => return Err(AcquireError::BudgetExhausted { last_failure: None }),
+        }
         self.assignment_loop(total_deadline).await
     }
 
     /// Continues acquisition after a backend-handshake failure that the
     /// Go handler decided to retry: the adapter (having processed the
-    /// handshake result) pushes the next assignment; the same budgets
-    /// apply to the continuation.
+    /// handshake result) pushes the next assignment; a fresh total
+    /// budget covers the continuation (assignments, dials, and result
+    /// sends alike).
     ///
     /// # Errors
     ///
@@ -503,6 +511,13 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
                     });
                 }
             }
+            // The adapter recorded `state.assignment` before sending an
+            // explicit OK: the close-accounting obligation exists from
+            // this moment, even for an assignment that fails validation
+            // below (an empty id is represented as an empty marker —
+            // Go's close path keys on connection state, not the id).
+            self.unretired = Some(assignment.assignment_id.clone());
+
             // An OK assignment must actually name a backend.
             let missing = if assignment.assignment_id.is_empty() {
                 Some("assignment_id")
@@ -516,9 +531,6 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
             if let Some(field) = missing {
                 return Err(AcquireError::MalformedAssignment { field });
             }
-            // From here until this assignment's result is sent, close
-            // accounting owns it.
-            self.unretired = Some(assignment.assignment_id.clone());
 
             // Fail closed on a cluster scope the dialer cannot honor
             // (locally terminal: no result; CLOSED accounting covers it).
@@ -564,7 +576,7 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
 
             match outcome {
                 Ok(conn) => {
-                    self.report(&assignment, Ok(())).await?;
+                    self.report(&assignment, Ok(()), total_deadline).await?;
                     return Ok(AcquiredBackend {
                         conn,
                         backend: BackendInfo::from_assignment(&assignment),
@@ -585,7 +597,8 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
                     // A real candidate failure with the session still
                     // re-selecting: the failed result retires it and the
                     // adapter pushes the next assignment.
-                    self.report(&assignment, Err(failure)).await?;
+                    self.report(&assignment, Err(failure), total_deadline)
+                        .await?;
                 }
             }
         }
@@ -597,6 +610,7 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
         &mut self,
         assignment: &RouteAssignment,
         outcome: Result<(), DialFailure>,
+        total_deadline: Instant,
     ) -> Result<(), AcquireError> {
         let result = match outcome {
             Ok(()) => RouteResult {
@@ -617,13 +631,21 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
             },
         };
         // The retirement obligation transfers only once the send
-        // succeeded: a failed or cancelled send leaves `unretired` set
-        // (and stats untouched) so `ConnectionEvent(CLOSED)` accounting
-        // still covers the assignment the adapter may consider open.
-        self.channel
-            .report_result(result)
-            .await
-            .map_err(AcquireError::Channel)?;
+        // succeeded: a failed, cancelled, or budget-timed-out send
+        // leaves `unretired` set (and stats untouched) so
+        // `ConnectionEvent(CLOSED)` accounting still covers the
+        // assignment the adapter may consider open. The send shares the
+        // acquisition's absolute deadline — the total budget covers the
+        // whole exchange, not just the dials.
+        match timeout_at(total_deadline, self.channel.report_result(result)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(AcquireError::Channel(error)),
+            Err(_) => {
+                return Err(AcquireError::BudgetExhausted {
+                    last_failure: outcome.err(),
+                });
+            }
+        }
         self.stats.results_reported = self.stats.results_reported.saturating_add(1);
         self.unretired = None;
         Ok(())

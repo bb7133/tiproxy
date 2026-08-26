@@ -832,6 +832,130 @@ async fn unspecified_and_malformed_assignments_are_terminal() {
             field: "backend_address"
         }
     );
+    assert_eq!(
+        malformed_engine.unretired_assignment(),
+        Some("a-1"),
+        "the adapter recorded the assignment before sending OK: close accounting owns it"
+    );
     let (_, dialer) = malformed_engine.into_parts();
     assert!(dialer.attempts.is_empty(), "never dialed");
+
+    // Even a missing assignment_id keeps a (empty) close marker: the
+    // adapter's state.assignment exists regardless of the id.
+    let mut adapter = FakeAdapter::default();
+    adapter.assignments.push_back(RouteAssignment {
+        assignment_id: String::new(),
+        ..assignment("ignored", "tidb-a", "10.0.0.1:4000")
+    });
+    let dialer = FakeDialer::new(&[]);
+    let mut empty_id_engine = engine(adapter, dialer, schedule());
+    let Err(error) = empty_id_engine.acquire(Vec::new()).await else {
+        unreachable!("empty id must be terminal")
+    };
+    assert_eq!(
+        error,
+        AcquireError::MalformedAssignment {
+            field: "assignment_id"
+        }
+    );
+    assert_eq!(
+        empty_id_engine.unretired_assignment(),
+        Some(""),
+        "empty marker still signals an open adapter-side assignment"
+    );
+}
+
+/// The total budget covers the **whole** exchange: a hanging initial
+/// `request_route` and a hanging `report_result` are both cut exactly
+/// at the total deadline, and a timed-out report keeps the retirement
+/// obligation.
+#[tokio::test(start_paused = true)]
+async fn total_budget_bounds_request_and_report_sends() {
+    struct HangingRequest;
+    impl RouteChannel for HangingRequest {
+        async fn request_route(
+            &mut self,
+            _excluded_backend_ids: Vec<String>,
+        ) -> Result<(), RouteChannelError> {
+            std::future::pending().await
+        }
+        async fn next_assignment(&mut self) -> Result<RouteAssignment, RouteChannelError> {
+            Err(RouteChannelError::ControlLost)
+        }
+        async fn report_result(&mut self, _result: RouteResult) -> Result<(), RouteChannelError> {
+            Ok(())
+        }
+    }
+    struct HangingReportChannel {
+        assignments: VecDeque<RouteAssignment>,
+    }
+    impl RouteChannel for HangingReportChannel {
+        async fn request_route(
+            &mut self,
+            _excluded_backend_ids: Vec<String>,
+        ) -> Result<(), RouteChannelError> {
+            Ok(())
+        }
+        async fn next_assignment(&mut self) -> Result<RouteAssignment, RouteChannelError> {
+            self.assignments
+                .pop_front()
+                .ok_or(RouteChannelError::ControlLost)
+        }
+        async fn report_result(&mut self, _result: RouteResult) -> Result<(), RouteChannelError> {
+            std::future::pending().await
+        }
+    }
+
+    // Hanging initial request: cut exactly at total.
+    let config = DialSchedule {
+        total: Duration::from_millis(400),
+        ..DialSchedule::default()
+    };
+    let start = Instant::now();
+    let mut request_engine = RouteEngine::new(
+        HangingRequest,
+        FakeDialer::new(&[]),
+        config,
+        CenteredJitter,
+        CONN_ID,
+    );
+    let Err(error) = request_engine.acquire(Vec::new()).await else {
+        unreachable!("hanging request must not acquire")
+    };
+    assert_eq!(error, AcquireError::BudgetExhausted { last_failure: None });
+    assert_eq!(start.elapsed(), Duration::from_millis(400));
+
+    // Hanging failed-result send: cut at total, obligation retained.
+    let mut assignments = VecDeque::new();
+    assignments.push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    assignments.push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
+    let dialer = FakeDialer::new(&[("10.0.0.1:4000", Outcome::Refuse)]);
+    let config = DialSchedule {
+        total: Duration::from_millis(400),
+        ..DialSchedule::default()
+    };
+    let start = Instant::now();
+    let mut report_engine = RouteEngine::new(
+        HangingReportChannel { assignments },
+        dialer,
+        config,
+        CenteredJitter,
+        CONN_ID,
+    );
+    let Err(error) = report_engine.acquire(Vec::new()).await else {
+        unreachable!("hanging report must not acquire")
+    };
+    assert_eq!(
+        error,
+        AcquireError::BudgetExhausted {
+            last_failure: Some(DialFailure::Connect)
+        }
+    );
+    assert_eq!(start.elapsed(), Duration::from_millis(400), "cut at total");
+    assert_eq!(
+        report_engine.unretired_assignment(),
+        Some("a-1"),
+        "the timed-out report keeps the retirement obligation"
+    );
+    assert_eq!(report_engine.stats().results_reported, 0);
 }
