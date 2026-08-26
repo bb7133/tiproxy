@@ -114,3 +114,46 @@ session still serving complete commands afterwards; and a multi-await
 classifier under select-arm noise delivering every event exactly once.
 The no-detached-task property is structural: handlers only ever receive
 `&mut JoinSet`, and the pump task is owned and stopped by the loop.
+
+## Route client and dial retry (`route` / `route_control`, DPL-02)
+
+Rust never duplicates balance policy: backend choice stays on the Go
+side behind the control protocol. `RouteEngine` implements the consumer
+half of `pkg/controlbridge`'s `RouterAdapter` exactly — one
+`RouteRequest` opens the exchange, the adapter pushes an assignment
+immediately and another after every **failed** `RouteResult`, and a
+non-OK assignment (`NO_BACKEND`, internal) is the terminal answer.
+
+Retirement follows the ADR (one terminal `RouteResult` **or**
+connection close): a failed result is sent only for a candidate
+failure the session keeps re-selecting past. Locally terminal outcomes
+— budget exhaustion, an unsupported cluster scope, or teardown
+mid-dial (cancelling the `acquire` future) — send no result, because
+`handleRouteResult(false)` would make the adapter reserve yet another
+backend for a dying session; `unretired_assignment()` exposes what the
+`ConnectionEvent(CLOSED)` accounting (Go `closeStateLocked`, reconcile
+as backstop) must retire.
+
+Dial parity with `getBackendIO`: a per-dial timeout (1s) bounds each
+attempt, a total budget (`ConnectTimeout`) bounds the acquisition, and
+failures back off 100ms ×2 ±50% capped — with the jitter from a
+session-owned `JitterSource` (`SplitMixJitter` hashes connection seed +
+assignment id + attempt; no global randomness; clamped with a
+non-finite guard). `BackendDialer` carries the assignment's
+`cluster_name` on every dial; a dialer declares `CLUSTER_AWARE`, and
+the engine **fails closed** (`ClusterUnsupported`) when a cluster scope
+reaches a cluster-unaware dialer — the direct `TcpDialer` never
+silently ignores it. Cluster DNS resolution itself is DPL-07.
+
+`route_control` binds the engine to the real envelopes:
+`ControlRouteChannel` builds `RouteRequest`/`RouteResult` bodies (the
+identity must equal the handshake event's — the adapter rejects
+mismatches), `AssignmentRouter` is the control-handler task's
+single-owner dispatch table, and `connection_opened`/`connection_closed`
+build the lifecycle events. `tests/route_engine.rs` (13 paused-time
+tests: two-backend failover with exact backoff timing, all-down
+`NO_BACKEND`, both budget bounds, the exact Go nominal backoff series,
+cancelled-acquire close accounting, cluster fail-closed/passthrough,
+jitter determinism and extreme-value delay bounds) and
+`tests/route_control.rs` (exact envelope bodies end to end, dispatch
+filtering, lifecycle fields, real-loopback TCP dialing) cover it.
