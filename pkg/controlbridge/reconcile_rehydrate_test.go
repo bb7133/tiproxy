@@ -305,3 +305,187 @@ func TestLegacyPeerKeepsOmissionSemantics(t *testing.T) {
 	}
 	peer.mu.Unlock()
 }
+
+// Lineage is the control epoch, not the config generation: a Rust
+// restart may keep the same generation, and only the new epoch plus a
+// new identity mark the new incarnation. Both arrival orders converge
+// with the stale same-id state retired exactly once.
+func TestSameGenerationNewEpochLineage(t *testing.T) {
+	// Order A: the new incarnation's handshake arrives before any
+	// reconcile.
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler := &recordingHandler{rt: rt}
+	adapter := newTestAdapter(t, handler)
+	oldPeer := newFakeSender(30)
+	establishConnection(t, adapter, oldPeer, 1, "0.0.0.0:6000", "root")
+	require.Equal(t, 1, rt.ConnCount())
+	baselineCloses := handler.closeCalls
+
+	// Same id, same generation (7), NEW epoch and a different client
+	// address: the old state is retired exactly once and the handshake
+	// succeeds instead of tripping the closed-id tombstone.
+	newPeer := newFakeSender(31)
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), newPeer, &controlpb.ControlEnvelope{
+		RequestId:  900,
+		Generation: 7,
+		Body: &controlpb.ControlEnvelope_HandshakeResponse{HandshakeResponse: &controlpb.HandshakeResponseEvent{
+			Connection: &controlpb.ConnectionIdentity{
+				ConnectionId:    1,
+				ListenerAddress: "0.0.0.0:6000",
+				ClientAddress:   "10.0.0.2:23456",
+				ProxyAddress:    "192.0.2.10:4000",
+			},
+			Handshake: testHandshake("root"),
+		}},
+	}))
+	require.Equal(t, baselineCloses+1, handler.closeCalls, "stale lineage retired exactly once")
+	state := adapter.get(1)
+	require.NotNil(t, state)
+	require.Equal(t, "10.0.0.2:23456", state.identity.GetClientAddress())
+
+	// Order B: the reconcile arrives before any handshake.
+	rt2 := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler2 := &recordingHandler{rt: rt2}
+	adapter2 := newTestAdapter(t, handler2)
+	adapter2.AttachRouterLookup(func(string) (router.Router, error) { return rt2, nil })
+	oldPeer2 := newFakeSender(40)
+	establishConnection(t, adapter2, oldPeer2, 1, "0.0.0.0:6000", "root")
+	require.Equal(t, 1, rt2.ConnCount())
+	closesBefore := handler2.closeCalls
+
+	newPeer2 := newFakeSender(41,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
+	fresh := reconciledConnection(1, "tidb-a:4000", "")
+	fresh.Generation = 7 // deliberately the SAME generation
+	fresh.Identity.ClientAddress = "10.0.0.3:34567"
+	require.NoError(t, adapter2.HandleEnvelope(context.Background(), newPeer2, reconcileRequestEnvelope(902, fresh)))
+	require.Equal(t, closesBefore+1, handler2.closeCalls, "stale lineage retired exactly once via reconcile")
+	require.Equal(t, 1, rt2.ConnCount(), "no drift: retired plus rehydrated")
+	snapshot := lastEnvelope(t, newPeer2).GetReconcileSnapshot()
+	require.Len(t, snapshot.GetConnections(), 1)
+	require.Equal(t, "10.0.0.3:34567", snapshot.GetConnections()[0].GetIdentity().GetClientAddress())
+}
+
+// The composite production handler restores the drain watermark from a
+// real reconcile request: the next StartDrain issues watermark + 1.
+func TestCompositeHandlerRestoresDrainWatermark(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler := &recordingHandler{rt: rt}
+	adapter := newTestAdapter(t, handler)
+	issuer := NewDrainIssuer()
+	consumer := NewMeteringConsumer()
+	composite, err := NewCompositeControlHandler(adapter, issuer, consumer)
+	require.NoError(t, err)
+	peer := newFakeSender(50,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
+
+	// Metering flows through the composite too.
+	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
+		RequestId: 1,
+		Body: &controlpb.ControlEnvelope_MeteringBatch{MeteringBatch: &controlpb.MeteringBatch{
+			Sequence: 1,
+			Deltas:   []*controlpb.MeteringDelta{{Keyspace: "ks", BackendId: "tidb-a", ResponseBytes: 5}},
+		}},
+	}))
+	require.EqualValues(t, 1, consumer.LastApplied())
+
+	// The real reconcile request carries the drain watermark.
+	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
+		RequestId:  2,
+		Generation: 7,
+		Body: &controlpb.ControlEnvelope_ReconcileRequest{ReconcileRequest: &controlpb.ReconcileRequest{
+			KnownGeneration:          7,
+			LastDrainCommandSequence: 9,
+		}},
+	}))
+	snapshot := lastEnvelope(t, peer).GetReconcileSnapshot()
+	require.NotNil(t, snapshot)
+	require.EqualValues(t, 1, snapshot.GetMeteringSequence(), "composite wires the consumer's ack")
+
+	require.NoError(t, issuer.StartDrain(context.Background(), peer, 3, 12, &controlpb.DrainCommand{DrainId: "d-after"}))
+	command := lastEnvelope(t, peer).GetDrainCommand()
+	require.NotNil(t, command)
+	require.EqualValues(t, 10, command.GetCommandSequence(), "next = restored watermark + 1")
+
+	// Drain results route through the composite to the issuer.
+	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
+		RequestId: 4,
+		Body: &controlpb.ControlEnvelope_DrainResult{DrainResult: &controlpb.DrainResult{
+			DrainId: "d-after", ActiveConnections: 0, Complete: true,
+			Code: controlpb.ErrorCode_ERROR_CODE_OK,
+		}},
+	}))
+	_, done := issuer.Progress("d-after")
+	require.True(t, done)
+}
+
+// A drain id is bound to one issuance for the issuer's lifetime: after
+// d1 and d2 both completed, re-issuing d1 re-sends its ORIGINAL
+// sequence (never a new one), and the sequence space fails closed at
+// exhaustion.
+func TestDrainIdBindingAndSequenceExhaustion(t *testing.T) {
+	issuer := NewDrainIssuer()
+	sender := &recordingSender{}
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, &controlpb.DrainCommand{DrainId: "d1"}))
+	require.NoError(t, issuer.HandleDrainResult(drainResult("d1", 0, 0, 0, true)))
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 2, 12, &controlpb.DrainCommand{DrainId: "d2"}))
+	require.NoError(t, issuer.HandleDrainResult(drainResult("d2", 0, 0, 0, true)))
+
+	// Re-issue long-completed d1: same sequence 1 on the wire.
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, 3, 12, &controlpb.DrainCommand{DrainId: "d1"}))
+	sent := sender.sent()
+	last := sent[len(sent)-1].GetDrainCommand()
+	require.Equal(t, "d1", last.GetDrainId())
+	require.EqualValues(t, 1, last.GetCommandSequence(), "the original binding, never a new sequence")
+
+	// Sequence exhaustion fails closed.
+	exhausted := NewDrainIssuer()
+	exhausted.RestoreSequence(^uint64(0))
+	err := exhausted.StartDrain(context.Background(), sender, 4, 12, &controlpb.DrainCommand{DrainId: "d-max"})
+	require.ErrorIs(t, err, ErrDrainSequenceExhausted)
+}
+
+// Concurrent ResolveOrphans and reconcile cannot double-attach or kill
+// a freshly recovered session: the rehydration claim spans the whole
+// resolution lifecycle.
+func TestConcurrentOrphanResolutionAndReconcile(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler := &recordingHandler{rt: rt}
+	adapter := newTestAdapter(t, handler)
+	peer := newFakeSender(60,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE))
+
+	// Seed an orphan (no lookup attached yet).
+	remote := reconciledConnection(86, "tidb-a:4000", "")
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(903, remote)))
+	require.Equal(t, 1, adapter.OrphanCount())
+
+	// The lookup comes online; a reconcile and the maintenance cadence
+	// race to resolve the same orphan.
+	adapter.AttachRouterLookup(func(string) (router.Router, error) { return rt, nil })
+	done := make(chan struct{}, 2)
+	go func() {
+		_ = adapter.ResolveOrphans(context.Background())
+		done <- struct{}{}
+	}()
+	go func() {
+		_ = adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(904, remote))
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
+
+	require.Equal(t, 0, adapter.OrphanCount())
+	require.Equal(t, 1, rt.ConnCount(), "attached exactly once, never double-counted")
+	require.NotNil(t, adapter.get(86))
+	// Nothing closed the recovered session.
+	peer.mu.Lock()
+	for _, envelope := range peer.messages {
+		require.Nil(t, envelope.GetCloseCommand(), "no close raced the recovery")
+	}
+	peer.mu.Unlock()
+}

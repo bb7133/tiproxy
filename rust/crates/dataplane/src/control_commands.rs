@@ -370,6 +370,14 @@ impl CommandGate {
         );
     }
 
+    /// The connection's currently recorded backend id.
+    #[must_use]
+    pub fn connection_backend(&self, connection_id: u64) -> Option<String> {
+        self.connections
+            .get(&connection_id)
+            .map(|connection| connection.backend_id.clone())
+    }
+
     /// Records the connection's current backend (after a successful
     /// route/redirect).
     pub fn set_backend(&mut self, connection_id: u64, backend_id: &str) {
@@ -804,6 +812,15 @@ impl CommandGate {
     #[must_use]
     pub fn drain_progress(&self) -> Option<DrainResult> {
         self.drain.as_ref().map(|drain| drain.result(ErrorCode::Ok))
+    }
+
+    /// The matched sessions still open under the active drain.
+    #[must_use]
+    pub fn drain_remaining(&self) -> Vec<u64> {
+        self.drain
+            .as_ref()
+            .map(|drain| drain.remaining.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     fn finish_drain(&mut self) {

@@ -71,6 +71,35 @@ tombstone-only dedup, zero generations/sequences tolerated, and no
 orphan closes (a healthy old-peer session is never killed by the new
 lifecycle).
 
+## Production ownership
+
+The gates are on the real message paths on both sides:
+
+- **Rust** — `dataplane::control_dispatch::ControlCommandHandler`, a
+  **process-long-lived** single owner (control reconnects update the
+  peer mode from the negotiated `RECONCILE_SESSION_REHYDRATION`
+  capability; the gate, its tombstones, unacked results, and watermarks
+  are never rebuilt — cross-epoch replay depends on them). Inbound
+  redirect/close/drain envelopes map to `SessionControl` signals on the
+  per-session registry, replays/progress to result envelopes, obsolete
+  duplicates to `DUPLICATE_REQUEST`-coded results, and violations to
+  typed protocol errors; drains ask graceful closes at admission and
+  `tick` closes the remainder at the force deadline.
+- **Go** — `pkg/controlbridge.CompositeControlHandler` (transport
+  handler) composes the `RouterAdapter`, `DrainIssuer`, and
+  `MeteringConsumer`: metering batches apply with contiguous-sequence
+  dedup, drain results route to the issuer, and every
+  `ReconcileRequest` restores the issuer's drain watermark before the
+  adapter answers.
+
+**Lineage is the control epoch, not the config generation**: a Rust
+restart can keep the same snapshot generation, so closed-connection
+tombstones and same-id replacement are scoped by the control-session
+epoch (a restart forces a reconnect and a new epoch; a same-process
+lineage never reuses ids). Both arrival orders — handshake before
+reconcile and reconcile before handshake — retire a stale same-id
+incarnation exactly once.
+
 ## Restart matrix
 
 ### Go restarts (Rust and its SQL sessions survive)

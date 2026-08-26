@@ -20,6 +20,7 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
+	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
 )
 
 // DrainIssuer owns the Go side of scoped drain (CTL-06): it issues
@@ -36,6 +37,14 @@ type DrainIssuer struct {
 	// sequence; restored from the reconcile watermark after a restart
 	// so new drains are never judged obsolete by the Rust gate.
 	sequence uint64
+	// issued binds every drain id ever issued by this issuer to its
+	// sequence for the issuer's lifetime: an id is bound to exactly one
+	// issuance, so any re-send reuses the original sequence (the Rust
+	// gate then replays its tombstone or proves it obsolete — it can
+	// never re-execute). Drains are operator-initiated and low
+	// cardinality, so the unbounded map is a deliberate, documented
+	// trade for the provable binding.
+	issued map[string]uint64
 }
 
 type drainOperation struct {
@@ -49,8 +58,13 @@ var ErrDrainInProgress = errors.New("a different drain is already in progress")
 
 // NewDrainIssuer creates an idle issuer.
 func NewDrainIssuer() *DrainIssuer {
-	return &DrainIssuer{}
+	return &DrainIssuer{issued: make(map[string]uint64)}
 }
+
+// ErrDrainSequenceExhausted fails closed when the monotonic sequence
+// space is exhausted: wrapping to zero would violate the nonzero
+// contract and break the obsolescence proof.
+var ErrDrainSequenceExhausted = errors.New("drain command sequence space is exhausted")
 
 // RestoreSequence adopts the reconcile-reported drain watermark: the
 // next issued drain uses watermark + 1.
@@ -60,6 +74,77 @@ func (issuer *DrainIssuer) RestoreSequence(watermark uint64) {
 	if watermark > issuer.sequence {
 		issuer.sequence = watermark
 	}
+}
+
+// CompositeControlHandler is the production transport handler for the
+// Go control plane: it owns the drain issuer and metering consumer
+// alongside the router adapter, restores the drain sequence watermark
+// from every reconcile request before delegating, applies metering
+// batches, and routes drain results to the issuer. Everything else goes
+// to the RouterAdapter.
+type CompositeControlHandler struct {
+	adapter  *RouterAdapter
+	issuer   *DrainIssuer
+	consumer *MeteringConsumer
+}
+
+// NewCompositeControlHandler wires the three owners together; the
+// consumer's applied sequence becomes the adapter's reconcile
+// acknowledgement.
+func NewCompositeControlHandler(
+	adapter *RouterAdapter,
+	issuer *DrainIssuer,
+	consumer *MeteringConsumer,
+) (*CompositeControlHandler, error) {
+	if adapter == nil || issuer == nil || consumer == nil {
+		return nil, errors.New("composite control handler requires adapter, issuer, and consumer")
+	}
+	adapter.AttachMetering(consumer)
+	return &CompositeControlHandler{adapter: adapter, issuer: issuer, consumer: consumer}, nil
+}
+
+// HandleControlMessage implements transport.Handler.
+func (handler *CompositeControlHandler) HandleControlMessage(
+	ctx context.Context,
+	session *transport.Session,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	return handler.HandleEnvelope(ctx, session, envelope)
+}
+
+// HandleEnvelope dispatches one control message across the three
+// production owners.
+func (handler *CompositeControlHandler) HandleEnvelope(
+	ctx context.Context,
+	sender EnvelopeSender,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	if envelope == nil {
+		return errors.New("control envelope is required")
+	}
+	switch body := envelope.GetBody().(type) {
+	case *controlpb.ControlEnvelope_MeteringBatch:
+		// Dedup by contiguous sequence; the acknowledgement flows back
+		// through the reconcile snapshot. Refused batches are the
+		// producer's replay concern, not an error.
+		_ = handler.consumer.Apply(body.MeteringBatch)
+		return nil
+	case *controlpb.ControlEnvelope_DrainResult:
+		return handler.issuer.HandleDrainResult(body.DrainResult)
+	case *controlpb.ControlEnvelope_ReconcileRequest:
+		// Restore the issuer-wide drain watermark before the adapter
+		// answers, so drains issued after the reconcile resume from
+		// watermark + 1.
+		handler.issuer.RestoreSequence(body.ReconcileRequest.GetLastDrainCommandSequence())
+		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
+	default:
+		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
+	}
+}
+
+// ResolveOrphans delegates the maintenance cadence to the adapter.
+func (handler *CompositeControlHandler) ResolveOrphans(ctx context.Context) error {
+	return handler.adapter.ResolveOrphans(ctx)
 }
 
 // StartDrain sends the DrainCommand for drainID over the negotiated
@@ -88,16 +173,19 @@ func (issuer *DrainIssuer) StartDrain(
 		return ErrDrainInProgress
 	}
 	created := false
-	switch {
-	case issuer.active != nil:
-		// Re-sending the active drain reuses its bound sequence: an id
-		// is bound to exactly one issuance.
-		command.CommandSequence = issuer.active.sequence
-	case issuer.lastCompleted != nil && issuer.lastCompleted.drainID == command.GetDrainId():
-		command.CommandSequence = issuer.lastCompleted.sequence
-	default:
+	if bound, ever := issuer.issued[command.GetDrainId()]; ever {
+		// An id is bound to exactly one issuance for the issuer's
+		// lifetime: every re-send (active, completed, or long-evicted)
+		// reuses the original sequence.
+		command.CommandSequence = bound
+	} else {
+		if issuer.sequence == ^uint64(0) {
+			issuer.mu.Unlock()
+			return ErrDrainSequenceExhausted
+		}
 		issuer.sequence++
 		command.CommandSequence = issuer.sequence
+		issuer.issued[command.GetDrainId()] = issuer.sequence
 		issuer.active = &drainOperation{drainID: command.GetDrainId(), sequence: issuer.sequence}
 		created = true
 	}

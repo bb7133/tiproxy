@@ -227,8 +227,8 @@ func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
 			KnownGeneration:      12,
 			LastMeteringSequence: 9,
 			Connections: []*controlpb.ReconcileConnection{
-				{ConnectionId: 70, BackendId: "tidb-a:4000", Namespace: "ns-a", RedirectPending: true},
-				{ConnectionId: 71, BackendId: "tidb-a:4000", Namespace: "ns-a"},
+				reconciledConnection(70, "tidb-a:4000", "r-70"),
+				reconciledConnection(71, "tidb-a:4000", ""),
 			},
 		}},
 	}
@@ -236,7 +236,7 @@ func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
 	snapshot := lastEnvelope(t, peer).GetReconcileSnapshot()
 	require.NotNil(t, snapshot)
 	require.Empty(t, snapshot.GetConnections(),
-		"unknown-to-lineage connections are identified by omission, never adopted blindly")
+		"unrehydratable connections (no router lookup attached) are identified by omission")
 	require.EqualValues(t, 4, snapshot.GetMeteringSequence(),
 		"the acknowledgement is the consumer's applied sequence, not the producer's claim")
 	require.Equal(t, 0, handler.closeCalls, "no phantom accounting, no negative counts")

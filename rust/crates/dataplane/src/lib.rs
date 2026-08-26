@@ -22,6 +22,7 @@
 
 pub mod admission;
 pub mod control_commands;
+pub mod control_dispatch;
 pub mod registry;
 pub mod route;
 pub mod route_control;
@@ -38,6 +39,7 @@ pub use control_commands::{
     MAX_UNACKED_METERING_BATCHES, MeteringError, MeteringLedger, ReconcileRepairs,
     RedirectAdmission,
 };
+pub use control_dispatch::{ControlCommandHandler, OutboundControl};
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,
 };
