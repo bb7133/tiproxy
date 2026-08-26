@@ -313,13 +313,26 @@ fn change_user_rejects_malformed_and_oversized() {
         plan_change_user(&[0x11], capabilities),
         Err(ChangeUserError::Malformed)
     ));
-    let oversized = vec![0_u8; (1 << 20) + 1];
-    assert!(matches!(
-        plan_change_user(&oversized, capabilities),
-        Err(ChangeUserError::TooLarge {
-            declared
-        }) if declared == (1 << 20) + 1
-    ));
+    // No size cap: COM_CHANGE_USER is an ordinary command packet in Go —
+    // an oversized-but-parsable payload is not rejected here (B3).
+    let big_db = vec![b'd'; 512 * 1024];
+    let attributes: &[Attribute<'_>] = &[];
+    let _ = attributes;
+    let big = match encode_change_user(
+        ChangeUserParams {
+            username: b"u",
+            auth_response: b"",
+            database: &big_db,
+            character_set: Some(0x21),
+            auth_plugin_name: Some(b"mysql_native_password"),
+            attributes: None,
+        },
+        capabilities,
+    ) {
+        Ok(payload) => payload,
+        Err(error) => unreachable!("encode big change-user: {error}"),
+    };
+    assert!(plan_change_user(&big, capabilities).is_ok());
 }
 
 /// The relay round-trips the backend's fresh auth switch, commits on OK
@@ -338,7 +351,7 @@ fn change_user_success_commits_identity() -> Result<(), Box<dyn std::error::Erro
         Some(PreparedMutation::ClearAll)
     );
 
-    let mut relay = ChangeUserRelay::new();
+    let mut relay = ChangeUserRelay::new(false);
     // Backend answers with a fresh auth switch (classified by SES-02).
     let mut switch = vec![0xfe];
     switch.extend_from_slice(b"mysql_native_password\0fresh-salt");
@@ -370,12 +383,19 @@ fn change_user_success_commits_identity() -> Result<(), Box<dyn std::error::Erro
 
     // Committing updates the SES-06 identity.
     let mut identity = SessionIdentity::new(b"old_user", Some(b"old_db"));
+    assert_eq!(identity.attributes(), None);
     identity.apply_change_user(&plan.pending);
     assert_eq!(identity.username(), b"new_user");
     assert_eq!(
         identity.database(),
         &session_core::command::CurrentDatabaseState::Selected(b"new_db".to_vec())
     );
+    // B1: attributes commit with the identity (Go changeUser sets attrs).
+    assert_eq!(
+        identity.attributes().map(<[(Vec<u8>, Vec<u8>)]>::to_vec),
+        Some(vec![(b"program_name".to_vec(), b"ses06".to_vec())])
+    );
+    assert!(!format!("{identity:?}").contains("ses06"), "Debug redacts");
 
     // Nothing further is legal after the terminal step.
     assert!(
@@ -397,7 +417,7 @@ fn change_user_failure_keeps_previous_identity() -> Result<(), Box<dyn std::erro
     let payload = change_user_payload(capabilities);
     let plan = plan_change_user(&payload, capabilities)?;
 
-    let mut relay = ChangeUserRelay::new();
+    let mut relay = ChangeUserRelay::new(false);
     let step = relay.on_event(ChangeUserEvent::BackendError { code: 1045 })?;
     assert_eq!(
         step.effects,
@@ -406,7 +426,18 @@ fn change_user_failure_keeps_previous_identity() -> Result<(), Box<dyn std::erro
             ChangeUserEffect::DiscardPendingIdentity,
         ]
     );
-    assert_eq!(step.session_event, None);
+    // B2: the failure boundary is crossed with the retained pre-command
+    // transaction state so queued redirect/drain can proceed.
+    assert_eq!(
+        step.session_event,
+        Some(SessionEvent::BackendResponseTxnDone)
+    );
+    let mut in_txn_relay = ChangeUserRelay::new(true);
+    let step = in_txn_relay.on_event(ChangeUserEvent::BackendError { code: 1045 })?;
+    assert_eq!(
+        step.session_event,
+        Some(SessionEvent::BackendResponseTxnOpen)
+    );
 
     let identity = SessionIdentity::new(b"old_user", Some(b"old_db"));
     // The pending identity is discarded: nothing applies it.
@@ -414,7 +445,7 @@ fn change_user_failure_keeps_previous_identity() -> Result<(), Box<dyn std::erro
     assert_eq!(identity.username(), b"old_user");
 
     // Client packets during the backend's turn are illegal.
-    let mut fresh = ChangeUserRelay::new();
+    let mut fresh = ChangeUserRelay::new(false);
     assert_eq!(
         fresh.on_event(ChangeUserEvent::ClientAuthResponse),
         Err(ChangeUserError::IllegalTurn {

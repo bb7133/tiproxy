@@ -208,11 +208,14 @@ Direction-reversing flows frozen from Go `forwardLoadInFile` /
   committed only on the final OK; `Debug` output is redacted and the
   client's scramble provably survives nowhere.
 - `ChangeUserRelay`: the backend↔client auth loop as turns (classified
-  via SES-02's `classify_backend_auth_packet`); OK → commit + the
-  SES-00 boundary event (txn bit via a bounded-prefix parse), ERR →
-  forward + discard (previous identity untouched, like Go applying
-  `changeUser` only on `err == nil`); SES-03's `ClearAll` fires on the
-  same success.
+  via SES-02's `classify_backend_auth_packet`); OK → commit
+  (user/database/**attributes**, Go `changeUser`) + the SES-00 boundary
+  event (txn bit via a bounded-prefix parse), ERR → forward + discard
+  with the boundary crossed on the **retained pre-command transaction
+  state** (Go's `handleErrorPacket` never touches `serverStatus`), so
+  queued redirect/drain proceed; SES-03's `ClearAll` fires only on
+  success. No size cap: `COM_CHANGE_USER` is an ordinary command packet
+  in Go — the 1-MiB cap belongs to the pre-auth handshake only.
 - Redirect/drain during either flow stays pending until the safe
   boundary (integration-tested against the SES-00 FSM).
 - `COM_STATISTICS` deliberately has no sub-machine: the SES-04

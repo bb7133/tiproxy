@@ -51,7 +51,6 @@
 
 use core::fmt;
 
-use mysql_wire::limits::check_pre_handshake_packet;
 use mysql_wire::{
     Attribute, CapabilityFlags, ChangeUser, ChangeUserParams, DecodeError, encode_change_user,
     parse_change_user, parse_ok_packet,
@@ -276,10 +275,25 @@ impl fmt::Debug for PendingIdentity {
 }
 
 /// The session identity SES-06 owns across reauthentication.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Attribute bytes are redacted from `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionIdentity {
     username: Vec<u8>,
     database: CurrentDatabaseState,
+    attributes: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
+impl fmt::Debug for SessionIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionIdentity")
+            .field("username_bytes", &self.username.len())
+            .field("database", &self.database)
+            .field(
+                "attribute_pairs",
+                &self.attributes.as_ref().map_or(0, Vec::len),
+            )
+            .finish()
+    }
 }
 
 impl SessionIdentity {
@@ -291,7 +305,14 @@ impl SessionIdentity {
             database: database.map_or(CurrentDatabaseState::None, |database| {
                 CurrentDatabaseState::Selected(database.to_vec())
             }),
+            attributes: None,
         }
+    }
+
+    /// Current connection-attribute pairs, when any were committed.
+    #[must_use]
+    pub fn attributes(&self) -> Option<&[(Vec<u8>, Vec<u8>)]> {
+        self.attributes.as_deref()
     }
 
     /// Current username bytes.
@@ -307,7 +328,8 @@ impl SessionIdentity {
         &self.database
     }
 
-    /// Commits a successful change-user: Go `authenticator.changeUser`.
+    /// Commits a successful change-user: Go `authenticator.changeUser`
+    /// replaces user, dbname, **and attrs** (`authenticator.go:483-487`).
     pub fn apply_change_user(&mut self, pending: &PendingIdentity) {
         self.username.clone_from(&pending.username);
         self.database = if pending.database.is_empty() {
@@ -315,6 +337,7 @@ impl SessionIdentity {
         } else {
             CurrentDatabaseState::Selected(pending.database.clone())
         };
+        self.attributes.clone_from(&pending.attributes);
     }
 }
 
@@ -342,11 +365,6 @@ pub enum ChangeUserError {
     /// The request payload does not parse as `COM_CHANGE_USER`
     /// (Go returns `ErrMalformPacket`).
     Malformed,
-    /// The request exceeds the pre-read handshake-packet cap.
-    TooLarge {
-        /// Declared payload length.
-        declared: usize,
-    },
     /// Re-encoding the rewritten request failed.
     RewriteFailed,
     /// An event arrived on the wrong relay turn.
@@ -360,10 +378,6 @@ impl fmt::Display for ChangeUserError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Malformed => f.write_str("malformed COM_CHANGE_USER request"),
-            Self::TooLarge { declared } => write!(
-                f,
-                "COM_CHANGE_USER request of {declared} bytes exceeds the handshake cap"
-            ),
             Self::RewriteFailed => f.write_str("COM_CHANGE_USER rewrite failed"),
             Self::IllegalTurn { turn } => {
                 write!(f, "illegal change-user event while {turn:?}")
@@ -386,9 +400,10 @@ pub fn plan_change_user(
     payload: &[u8],
     capabilities: CapabilityFlags,
 ) -> Result<ChangeUserPlan, ChangeUserError> {
-    check_pre_handshake_packet(payload.len()).map_err(|_| ChangeUserError::TooLarge {
-        declared: payload.len(),
-    })?;
+    // No size gate here: COM_CHANGE_USER is an ordinary command packet in
+    // Go (the 1-MiB `maxHandshakePacketSize` cap applies only to the
+    // pre-authentication handshake reads), so adding one would be an
+    // undocumented divergence.
     let parsed: ChangeUser<'_> =
         parse_change_user(payload, capabilities).map_err(|_| ChangeUserError::Malformed)?;
     let attributes_entries: Option<Vec<Attribute<'_>>> = match parsed.attributes {
@@ -485,20 +500,20 @@ pub struct ChangeUserStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeUserRelay {
     turn: ChangeUserTurn,
-}
-
-impl Default for ChangeUserRelay {
-    fn default() -> Self {
-        Self::new()
-    }
+    in_transaction_before: bool,
 }
 
 impl ChangeUserRelay {
     /// Starts after the rewritten request was forwarded to the backend.
+    /// `in_transaction_before` is the transaction state retained from
+    /// before the command: Go's `handleErrorPacket` never touches
+    /// `serverStatus`, so a rejected change-user reaches its boundary
+    /// with exactly that retained state.
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn new(in_transaction_before: bool) -> Self {
         Self {
             turn: ChangeUserTurn::AwaitingBackend,
+            in_transaction_before,
         }
     }
 
@@ -538,9 +553,14 @@ impl ChangeUserRelay {
                         ChangeUserEffect::DiscardPendingIdentity,
                     ],
                     // Go's handleErrorPacket leaves the transaction flag
-                    // untouched; the runtime maps the boundary through the
-                    // retained pre-command transaction state.
-                    session_event: None,
+                    // untouched, so the failure boundary is reached with
+                    // the retained pre-command state — the session must
+                    // still cross it (queued redirect/drain proceed).
+                    session_event: Some(if self.in_transaction_before {
+                        SessionEvent::BackendResponseTxnOpen
+                    } else {
+                        SessionEvent::BackendResponseTxnDone
+                    }),
                 })
             }
             (ChangeUserTurn::AwaitingBackend, ChangeUserEvent::BackendAuthData) => {
