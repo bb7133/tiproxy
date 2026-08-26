@@ -18,7 +18,8 @@ boundaries and build policy remain stable.
 - `control-proto` owns the versioned control-plane contract between Go and Rust.
   MySQL packet payloads are forbidden at this boundary.
 - `dataplane` composes the four libraries without moving hot-path traffic into
-  the control plane.
+  the control plane. Its listener, admission, and registry contracts are
+  documented in [`crates/dataplane/README.md`](crates/dataplane/README.md).
 - `tiproxy-rs` is the deployable executable.
 
 Every crate has empty default features. New optional behavior must be additive,

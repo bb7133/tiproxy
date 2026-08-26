@@ -1,0 +1,1144 @@
+// Copyright 2026 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Multi-listener SQL accept lifecycle and the session-runtime composition
+//! hook. This module stops at an admitted, registered `TcpStream`; DPL-01 owns
+//! `MySQL` session execution.
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use control_proto::snapshot::ValidatedSnapshot;
+use control_proto::v1::{ConfigSnapshot, KeepalivePolicy as SnapshotKeepalive, StateSnapshot};
+use proxy_io::socket::{
+    BoundListener, KeepalivePolicy, SocketError, apply_keepalive, bind_listeners, configure_stream,
+};
+use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tokio::time::sleep;
+
+use crate::admission::{
+    AdmissionController, AdmissionPolicy, AdmissionPolicyError, AdmissionRejection, MemoryProbe,
+};
+use crate::registry::{ConnectionLease, ConnectionMetadata, ConnectionRegistry, RegistryError};
+
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(5);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Immutable configured SQL listener.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ListenerSpec {
+    /// Stable listener name projected by the Go control plane.
+    pub name: String,
+    /// Host or IP without brackets. Empty means IPv4 unspecified.
+    pub address: String,
+    /// TCP port. Zero is supported by the topology test hook.
+    pub port: u16,
+}
+
+impl ListenerSpec {
+    /// Creates a listener specification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-listener error for an empty name or malformed host.
+    pub fn new(
+        name: impl Into<String>,
+        address: impl Into<String>,
+        port: u16,
+    ) -> Result<Self, ServerError> {
+        let name = name.into();
+        let address = address.into();
+        if name.is_empty() {
+            return Err(ServerError::InvalidListener("listener name is empty"));
+        }
+        if address.contains(['[', ']', '/']) || address.chars().any(char::is_whitespace) {
+            return Err(ServerError::InvalidListener(
+                "listener address is malformed",
+            ));
+        }
+        Ok(Self {
+            name,
+            address,
+            port,
+        })
+    }
+}
+
+/// Configured and actual address for one successfully bound listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundListenerInfo {
+    /// Stable configured listener name.
+    pub name: Arc<str>,
+    /// Host/IP and requested port from the initial snapshot.
+    pub configured_address: String,
+    /// OS-reported address, including the real ephemeral port.
+    pub actual_address: SocketAddr,
+}
+
+struct NamedListener {
+    name: Arc<str>,
+    listener: TcpListener,
+    actual_address: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListenerSignature(Vec<(String, String, u32)>);
+
+impl ListenerSignature {
+    fn from_snapshot(snapshot: &ValidatedSnapshot) -> Result<Self, ServerError> {
+        let config = snapshot_config(snapshot)?;
+        Ok(Self(
+            config
+                .listeners
+                .iter()
+                .map(|listener| {
+                    (
+                        listener.name.clone(),
+                        listener.address.clone(),
+                        listener.port,
+                    )
+                })
+                .collect(),
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ServerCounters {
+    accept_errors: AtomicU64,
+    socket_policy_failures: AtomicU64,
+    registration_failures: AtomicU64,
+    handler_panics: AtomicU64,
+}
+
+/// Connection and listener lifecycle metrics without a Prometheus dependency.
+/// DPL-06 exports these atomics through the control-plane metrics batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerMetricsSnapshot {
+    /// Current admitted connections.
+    pub active_connections: u64,
+    /// Current connection-buffer reservation.
+    pub connection_buffer_bytes: u64,
+    /// Connections successfully inserted into the registry.
+    pub registered_total: u64,
+    /// Connections rejected for memory pressure.
+    pub rejected_memory_total: u64,
+    /// Connections rejected at the configured maximum.
+    pub rejected_max_connections_total: u64,
+    /// Memory samples that failed open.
+    pub memory_probe_failures_total: u64,
+    /// Listener accept errors that entered bounded backoff.
+    pub accept_errors_total: u64,
+    /// Accepted sockets on which a best-effort policy could not be applied.
+    pub socket_policy_failures_total: u64,
+    /// Stable-ID/registry failures after admission.
+    pub registration_failures_total: u64,
+    /// Panics contained to one injected connection handler.
+    pub handler_panics_total: u64,
+}
+
+/// Cloneable control surface for snapshot reload, shutdown, diagnostics, and
+/// the registry consumed by later control-command handlers.
+#[derive(Clone)]
+pub struct DataplaneHandle {
+    snapshot_tx: watch::Sender<Arc<ValidatedSnapshot>>,
+    shutdown_tx: watch::Sender<bool>,
+    listener_signature: ListenerSignature,
+    listeners: Arc<[BoundListenerInfo]>,
+    admission: AdmissionController,
+    registry: ConnectionRegistry,
+    counters: Arc<ServerCounters>,
+}
+
+impl DataplaneHandle {
+    /// Atomically publishes a complete validated generation for new
+    /// admissions/sessions. Existing sessions retain their captured `Arc`.
+    /// Listener changes fail because listeners are restart-required in v1.
+    ///
+    /// # Errors
+    ///
+    /// Returns a preflight, policy, or restart-required error without changing
+    /// the last-good generation.
+    pub fn update_snapshot(&self, snapshot: Arc<ValidatedSnapshot>) -> Result<(), ServerError> {
+        preflight_snapshot(snapshot.raw())?;
+        if ListenerSignature::from_snapshot(&snapshot)? != self.listener_signature {
+            return Err(ServerError::ListenerReloadRequiresRestart);
+        }
+        let _ = policy_from_snapshot(&snapshot)?;
+        self.snapshot_tx.send_replace(snapshot);
+        Ok(())
+    }
+
+    /// Requests idempotent listener and session-task shutdown.
+    pub fn shutdown(&self) {
+        self.shutdown_tx.send_replace(true);
+    }
+
+    /// Returns whether shutdown has been requested.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
+
+    /// Returns all actual bound addresses in configured order.
+    #[must_use]
+    pub fn listeners(&self) -> Arc<[BoundListenerInfo]> {
+        Arc::clone(&self.listeners)
+    }
+
+    /// Returns the shared, payload-free live registry.
+    #[must_use]
+    pub fn registry(&self) -> ConnectionRegistry {
+        self.registry.clone()
+    }
+
+    /// Returns a consistent-enough atomic metrics observation. Live gauge and
+    /// registry count converge exactly after every lifecycle transition.
+    #[must_use]
+    pub fn metrics(&self) -> ServerMetricsSnapshot {
+        let admission = self.admission.metrics();
+        let registry = self.registry.snapshot();
+        ServerMetricsSnapshot {
+            active_connections: admission.active_connections,
+            connection_buffer_bytes: admission.connection_buffer_bytes,
+            registered_total: registry.registered_total,
+            rejected_memory_total: admission.rejected_memory_total,
+            rejected_max_connections_total: admission.rejected_max_connections_total,
+            memory_probe_failures_total: admission.memory_probe_failures_total,
+            accept_errors_total: self.counters.accept_errors.load(Ordering::Relaxed),
+            socket_policy_failures_total: self
+                .counters
+                .socket_policy_failures
+                .load(Ordering::Relaxed),
+            registration_failures_total: self
+                .counters
+                .registration_failures
+                .load(Ordering::Relaxed),
+            handler_panics_total: self.counters.handler_panics.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Admitted client socket passed to the DPL-01 session-runtime hook. The
+/// private lease keeps registry membership and admission gauges alive for
+/// exactly as long as this value.
+pub struct AcceptedConnection {
+    stream: TcpStream,
+    snapshot: Arc<ValidatedSnapshot>,
+    lease: ConnectionLease,
+}
+
+impl AcceptedConnection {
+    /// Returns payload-free identity and accounting metadata.
+    #[must_use]
+    pub const fn metadata(&self) -> &ConnectionMetadata {
+        self.lease.metadata()
+    }
+
+    /// Returns the immutable generation captured at admission.
+    #[must_use]
+    pub fn snapshot(&self) -> &Arc<ValidatedSnapshot> {
+        &self.snapshot
+    }
+
+    /// Borrows the owned client stream.
+    #[must_use]
+    pub const fn stream(&self) -> &TcpStream {
+        &self.stream
+    }
+
+    /// Mutably borrows the owned client stream for session I/O.
+    pub const fn stream_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+}
+
+impl fmt::Debug for AcceptedConnection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcceptedConnection")
+            .field("metadata", self.metadata())
+            .field("snapshot_generation", &self.snapshot.generation())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Boxed, owned connection future used by the DPL-01 composition boundary.
+pub type ConnectionFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Injected owner of one admitted connection. A panic is contained to that
+/// task; returning or cancellation drops the socket and registry lease.
+pub trait ConnectionHandler: Send + Sync + 'static {
+    /// Runs one connection until it closes.
+    fn handle(&self, connection: AcceptedConnection) -> ConnectionFuture;
+}
+
+impl<F, Fut> ConnectionHandler for F
+where
+    F: Fn(AcceptedConnection) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    fn handle(&self, connection: AcceptedConnection) -> ConnectionFuture {
+        Box::pin(self(connection))
+    }
+}
+
+/// Bound SQL listeners and their one accept-lifecycle owner.
+pub struct DataplaneServer {
+    listeners: Vec<NamedListener>,
+    handle: DataplaneHandle,
+}
+
+impl DataplaneServer {
+    /// Preflights and binds every listener from the initial validated snapshot.
+    /// Any bind failure drops all sockets already opened in this attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a preflight, resolution, policy, or socket bind error.
+    pub async fn bind(
+        snapshot: Arc<ValidatedSnapshot>,
+        memory: Arc<dyn MemoryProbe>,
+    ) -> Result<Self, ServerError> {
+        let specs = listener_specs(&snapshot)?;
+        Self::bind_specs(snapshot, specs, memory).await
+    }
+
+    async fn bind_specs(
+        snapshot: Arc<ValidatedSnapshot>,
+        specs: Vec<ListenerSpec>,
+        memory: Arc<dyn MemoryProbe>,
+    ) -> Result<Self, ServerError> {
+        preflight_snapshot(snapshot.raw())?;
+        let _ = policy_from_snapshot(&snapshot)?;
+        validate_specs(&specs)?;
+        let addresses = resolve_specs(&specs).await?;
+        let bound = bind_listeners(&addresses).await?;
+        let mut listeners = Vec::with_capacity(bound.len());
+        let mut listener_info = Vec::with_capacity(bound.len());
+        for (spec, bound) in specs.iter().zip(bound) {
+            let BoundListener {
+                listener,
+                actual_address,
+            } = bound;
+            let name: Arc<str> = Arc::from(spec.name.as_str());
+            listener_info.push(BoundListenerInfo {
+                name: Arc::clone(&name),
+                configured_address: format_listener_address(&spec.address, spec.port),
+                actual_address,
+            });
+            listeners.push(NamedListener {
+                name,
+                listener,
+                actual_address,
+            });
+        }
+        let (snapshot_tx, _) = watch::channel(Arc::clone(&snapshot));
+        let (shutdown_tx, _) = watch::channel(false);
+        let admission = AdmissionController::new(memory);
+        let registry = ConnectionRegistry::new();
+        let counters = Arc::new(ServerCounters::default());
+        let handle = DataplaneHandle {
+            snapshot_tx,
+            shutdown_tx,
+            listener_signature: ListenerSignature::from_snapshot(&snapshot)?,
+            listeners: listener_info.into(),
+            admission,
+            registry,
+            counters,
+        };
+        Ok(Self { listeners, handle })
+    }
+
+    /// Returns a cloneable control/reload/diagnostic handle before `run`
+    /// consumes the listener owner.
+    #[must_use]
+    pub fn handle(&self) -> DataplaneHandle {
+        self.handle.clone()
+    }
+
+    /// Runs all listeners independently until handle shutdown. Listener and
+    /// connection tasks are always joined or aborted before this returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns if a listener owner panics or exits before shutdown.
+    pub async fn run<H>(self, handler: H) -> Result<(), ServerError>
+    where
+        H: ConnectionHandler,
+    {
+        let handler: Arc<dyn ConnectionHandler> = Arc::new(handler);
+        let mut listener_tasks = JoinSet::new();
+        for listener in self.listeners {
+            listener_tasks.spawn(run_listener(
+                listener,
+                Arc::clone(&handler),
+                self.handle.snapshot_tx.subscribe(),
+                self.handle.shutdown_tx.subscribe(),
+                self.handle.admission.clone(),
+                self.handle.registry.clone(),
+                Arc::clone(&self.handle.counters),
+            ));
+        }
+        let mut shutdown = self.handle.shutdown_tx.subscribe();
+        let outcome = loop {
+            if *shutdown.borrow() {
+                break Ok(());
+            }
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break Ok(());
+                    }
+                }
+                joined = listener_tasks.join_next() => {
+                    match joined {
+                        Some(Ok(())) if self.handle.is_shutdown() => break Ok(()),
+                        Some(Err(error)) if error.is_panic() => {
+                            break Err(ServerError::ListenerTaskPanicked);
+                        }
+                        Some(Ok(()) | Err(_)) | None => {
+                            break Err(ServerError::ListenerTaskStopped);
+                        }
+                    }
+                }
+            }
+        };
+        self.handle.shutdown();
+        listener_tasks.abort_all();
+        while listener_tasks.join_next().await.is_some() {}
+        outcome
+    }
+}
+
+/// Preflights raw control state before any SQL listener is provisioned.
+///
+/// # Errors
+///
+/// Returns an explicit unsupported error for traffic capture/replay and a
+/// configuration error when the complete config is absent.
+pub fn preflight_snapshot(snapshot: &StateSnapshot) -> Result<(), ServerError> {
+    let config = snapshot.config.as_ref().ok_or(ServerError::MissingConfig)?;
+    if config.traffic_replay_enabled {
+        return Err(ServerError::TrafficReplayUnsupported);
+    }
+    Ok(())
+}
+
+/// Typed SQL-server startup, reload, registry, and owner failures.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    /// The complete snapshot lacks its required config.
+    #[error("dataplane snapshot config is required")]
+    MissingConfig,
+    /// Traffic capture/replay is explicitly outside the Rust dataplane.
+    #[error("traffic capture/replay is unsupported by the Rust dataplane")]
+    TrafficReplayUnsupported,
+    /// Listener syntax or uniqueness is invalid.
+    #[error("invalid listener configuration: {0}")]
+    InvalidListener(&'static str),
+    /// A configured hostname had no usable socket address.
+    #[error("listener {listener_name} cannot be resolved")]
+    ListenerResolution {
+        /// Stable listener name; host input is omitted from diagnostics.
+        listener_name: String,
+    },
+    /// A reload attempted to change restart-required listeners.
+    #[error("listener configuration changed; restart is required")]
+    ListenerReloadRequiresRestart,
+    /// The validated snapshot could not produce a new-session policy.
+    #[error(transparent)]
+    AdmissionPolicy(#[from] AdmissionPolicyError),
+    /// A required frontend keepalive policy is absent.
+    #[error("frontend keepalive policy is required")]
+    MissingFrontendKeepalive,
+    /// Binding or configuring the transport failed.
+    #[error(transparent)]
+    Socket(#[from] SocketError),
+    /// Stable registry allocation failed.
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+    /// A listener owner exited without shutdown.
+    #[error("SQL listener task stopped before shutdown")]
+    ListenerTaskStopped,
+    /// A listener owner panicked; all peers were stopped and joined.
+    #[error("SQL listener task panicked")]
+    ListenerTaskPanicked,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NewSessionPolicy {
+    admission: AdmissionPolicy,
+    frontend_keepalive: KeepalivePolicy,
+}
+
+fn policy_from_snapshot(snapshot: &ValidatedSnapshot) -> Result<NewSessionPolicy, ServerError> {
+    let config = snapshot_config(snapshot)?;
+    let admission = AdmissionPolicy::new(
+        config.max_connections,
+        config.high_memory_reject_threshold,
+        config.connection_buffer_bytes,
+    )?;
+    let frontend_keepalive = snapshot_keepalive(
+        config
+            .frontend_keepalive
+            .as_ref()
+            .ok_or(ServerError::MissingFrontendKeepalive)?,
+    );
+    Ok(NewSessionPolicy {
+        admission,
+        frontend_keepalive,
+    })
+}
+
+fn snapshot_config(snapshot: &ValidatedSnapshot) -> Result<&ConfigSnapshot, ServerError> {
+    snapshot
+        .raw()
+        .config
+        .as_ref()
+        .ok_or(ServerError::MissingConfig)
+}
+
+fn snapshot_keepalive(policy: &SnapshotKeepalive) -> KeepalivePolicy {
+    KeepalivePolicy {
+        enabled: policy.enabled,
+        idle: Duration::from_millis(policy.idle_millis),
+        probes: policy.probe_count,
+        interval: Duration::from_millis(policy.interval_millis),
+        user_timeout: Duration::from_millis(policy.user_timeout_millis),
+    }
+}
+
+fn listener_specs(snapshot: &ValidatedSnapshot) -> Result<Vec<ListenerSpec>, ServerError> {
+    snapshot_config(snapshot)?
+        .listeners
+        .iter()
+        .map(|listener| {
+            let port = u16::try_from(listener.port)
+                .map_err(|_| ServerError::InvalidListener("listener port exceeds u16"))?;
+            ListenerSpec::new(&listener.name, &listener.address, port)
+        })
+        .collect()
+}
+
+fn validate_specs(specs: &[ListenerSpec]) -> Result<(), ServerError> {
+    if specs.is_empty() {
+        return Err(ServerError::InvalidListener("no SQL listeners configured"));
+    }
+    let mut names = BTreeSet::new();
+    let mut addresses = BTreeSet::new();
+    for spec in specs {
+        if !names.insert(spec.name.as_str()) {
+            return Err(ServerError::InvalidListener("duplicate listener name"));
+        }
+        if !addresses.insert((spec.address.as_str(), spec.port)) {
+            return Err(ServerError::InvalidListener("duplicate listener address"));
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_specs(specs: &[ListenerSpec]) -> Result<Vec<SocketAddr>, ServerError> {
+    let mut addresses = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let address = if spec.address.is_empty() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), spec.port)
+        } else if let Ok(ip) = spec.address.parse::<IpAddr>() {
+            SocketAddr::new(ip, spec.port)
+        } else {
+            lookup_host((spec.address.as_str(), spec.port))
+                .await
+                .map_err(|_| ServerError::ListenerResolution {
+                    listener_name: spec.name.clone(),
+                })?
+                .next()
+                .ok_or_else(|| ServerError::ListenerResolution {
+                    listener_name: spec.name.clone(),
+                })?
+        };
+        addresses.push(address);
+    }
+    Ok(addresses)
+}
+
+fn format_listener_address(host: &str, port: u16) -> String {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        SocketAddr::new(ip, port).to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+async fn run_listener(
+    named: NamedListener,
+    handler: Arc<dyn ConnectionHandler>,
+    snapshot_rx: watch::Receiver<Arc<ValidatedSnapshot>>,
+    mut shutdown: watch::Receiver<bool>,
+    admission: AdmissionController,
+    registry: ConnectionRegistry,
+    counters: Arc<ServerCounters>,
+) {
+    let NamedListener {
+        name,
+        listener,
+        actual_address,
+    } = named;
+    let mut sessions = JoinSet::new();
+    let mut backoff = AcceptBackoff::new();
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            joined = sessions.join_next(), if !sessions.is_empty() => {
+                if joined.is_some_and(|result| result.is_err_and(|error| error.is_panic())) {
+                    counters.handler_panics.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            accepted = listener.accept() => {
+                if let Ok((stream, peer_address)) = accepted {
+                    backoff.reset();
+                    let snapshot = Arc::clone(&snapshot_rx.borrow());
+                    if let Some(connection) = prepare_connection(
+                        stream,
+                        peer_address,
+                        Arc::clone(&name),
+                        actual_address,
+                        snapshot,
+                        &admission,
+                        &registry,
+                        &counters,
+                    ) {
+                        let handler = Arc::clone(&handler);
+                        sessions.spawn(async move {
+                            handler.handle(connection).await;
+                        });
+                    }
+                } else {
+                    counters.accept_errors.fetch_add(1, Ordering::Relaxed);
+                    let delay = backoff.fail();
+                    tokio::select! {
+                        biased;
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        () = sleep(delay) => {}
+                    }
+                }
+            }
+        }
+    }
+    drop(listener);
+    sessions.abort_all();
+    while let Some(joined) = sessions.join_next().await {
+        if joined.is_err_and(|error| error.is_panic()) {
+            counters.handler_panics.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the accept boundary intentionally makes every owned resource and address explicit"
+)]
+fn prepare_connection(
+    stream: TcpStream,
+    peer_address: SocketAddr,
+    listener_name: Arc<str>,
+    listener_address: SocketAddr,
+    snapshot: Arc<ValidatedSnapshot>,
+    admission: &AdmissionController,
+    registry: &ConnectionRegistry,
+    counters: &ServerCounters,
+) -> Option<AcceptedConnection> {
+    let Ok(policy) = policy_from_snapshot(&snapshot) else {
+        return None;
+    };
+    // Preserve Go's admission order: memory, then max-connections, before
+    // allocating an ID or any session-owned state.
+    let permit = match admission.try_acquire(policy.admission) {
+        Ok(permit) => permit,
+        Err(AdmissionRejection::Memory { .. } | AdmissionRejection::MaxConnections { .. }) => {
+            return None;
+        }
+    };
+    if configure_stream(&stream).is_err() {
+        counters
+            .socket_policy_failures
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Ok(lease) = registry.register(
+        permit,
+        snapshot.generation(),
+        listener_name,
+        listener_address,
+        peer_address,
+    ) else {
+        counters
+            .registration_failures
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    // Go applies frontend keepalive after registration, logs failures, and
+    // continues serving the socket.
+    if apply_keepalive(&stream, policy.frontend_keepalive).is_err() {
+        counters
+            .socket_policy_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    Some(AcceptedConnection {
+        stream,
+        snapshot,
+        lease,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AcceptBackoff {
+    next: Duration,
+}
+
+impl AcceptBackoff {
+    const fn new() -> Self {
+        Self {
+            next: ACCEPT_BACKOFF_INITIAL,
+        }
+    }
+
+    fn fail(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(ACCEPT_BACKOFF_MAX);
+        delay
+    }
+
+    const fn reset(&mut self) {
+        self.next = ACCEPT_BACKOFF_INITIAL;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+    use std::sync::Mutex;
+
+    use control_proto::snapshot::SnapshotStore;
+    use control_proto::v1::{
+        ConfigSnapshot, KeepalivePolicy as SnapshotKeepalive, Listener, ProxyProtocolMode,
+        TlsPolicy,
+    };
+    use rustls::pki_types::UnixTime;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration as TokioDuration, timeout};
+
+    use crate::{MemoryProbeError, MemorySample};
+
+    #[derive(Debug)]
+    struct MutableMemory(Mutex<Result<MemorySample, MemoryProbeError>>);
+
+    impl MutableMemory {
+        fn new(used_bytes: u64, limit_bytes: u64) -> Self {
+            Self(Mutex::new(Ok(MemorySample::now(used_bytes, limit_bytes))))
+        }
+
+        fn set(&self, used_bytes: u64, limit_bytes: u64) {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Ok(MemorySample::now(used_bytes, limit_bytes));
+        }
+    }
+
+    impl MemoryProbe for MutableMemory {
+        fn sample(&self) -> Result<MemorySample, MemoryProbeError> {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+    }
+
+    fn snapshot(
+        generation: u64,
+        max_connections: u64,
+        threshold: f64,
+        listeners: Vec<Listener>,
+    ) -> Result<Arc<ValidatedSnapshot>, Box<dyn Error>> {
+        let keepalive = SnapshotKeepalive {
+            enabled: true,
+            idle_millis: 0,
+            probe_count: 0,
+            interval_millis: 0,
+            user_timeout_millis: 0,
+        };
+        let raw = StateSnapshot {
+            config: Some(ConfigSnapshot {
+                max_connections,
+                high_memory_reject_threshold: threshold,
+                connection_buffer_bytes: 4096,
+                frontend_keepalive: Some(keepalive),
+                healthy_backend_keepalive: Some(keepalive),
+                unhealthy_backend_keepalive: Some(keepalive),
+                proxy_protocol: ProxyProtocolMode::Disabled as i32,
+                listeners,
+                server_version: "TiProxy-test".to_owned(),
+                frontend_tls: Some(TlsPolicy::default()),
+                backend_tls: Some(TlsPolicy::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let store = SnapshotStore::new([])?;
+        Ok(store
+            .apply(
+                generation,
+                raw,
+                UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+            )?
+            .snapshot)
+    }
+
+    fn one_listener() -> Vec<Listener> {
+        vec![Listener {
+            address: "127.0.0.1".to_owned(),
+            port: 6000,
+            name: "sql-0".to_owned(),
+        }]
+    }
+
+    async fn ephemeral_server(
+        snapshot: Arc<ValidatedSnapshot>,
+        memory: Arc<MutableMemory>,
+    ) -> Result<DataplaneServer, ServerError> {
+        DataplaneServer::bind_specs(
+            snapshot,
+            vec![ListenerSpec::new("sql-0", "127.0.0.1", 0)?],
+            memory,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn actual_address_keepalive_and_shutdown_cleanup() -> Result<(), Box<dyn Error>> {
+        let snap = snapshot(1, 0, 0.0, one_listener())?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        assert_ne!(actual.port(), 0);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let keepalive = proxy_io::socket::read_keepalive(connection.stream())
+                    .map(|state| state.enabled)
+                    .unwrap_or(false);
+                let _ = tx.send((connection.metadata().clone(), keepalive));
+                std::future::pending::<()>().await;
+            }
+        }));
+        let mut client = TcpStream::connect(actual).await?;
+        let (metadata, keepalive) = timeout(TokioDuration::from_secs(2), rx.recv())
+            .await?
+            .ok_or("handler did not report")?;
+        assert_eq!(metadata.listener_address, actual);
+        assert_eq!(metadata.connection_id.get(), 1);
+        assert!(keepalive);
+        assert_eq!(handle.registry().len(), 1);
+
+        handle.shutdown();
+        owner.await??;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            timeout(TokioDuration::from_secs(2), client.read(&mut byte)).await??,
+            0
+        );
+        assert!(TcpStream::connect(actual).await.is_err());
+        assert!(handle.registry().is_empty());
+        let metrics = handle.metrics();
+        assert_eq!(metrics.active_connections, 0);
+        assert_eq!(metrics.connection_buffer_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_cancellation_aborts_children_and_releases_every_resource()
+    -> Result<(), Box<dyn Error>> {
+        let snap = snapshot(1, 0, 0.0, one_listener())?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(connection.metadata().connection_id);
+                std::future::pending::<()>().await;
+            }
+        }));
+        let mut client = TcpStream::connect(actual).await?;
+        let _ = timeout(TokioDuration::from_secs(2), rx.recv())
+            .await?
+            .ok_or("handler did not start")?;
+        assert_eq!(handle.registry().len(), 1);
+
+        owner.abort();
+        let cancellation = owner.await;
+        assert!(cancellation.is_err_and(|error| error.is_cancelled()));
+        timeout(TokioDuration::from_secs(2), async {
+            while !handle.registry().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            timeout(TokioDuration::from_secs(2), client.read(&mut byte)).await??,
+            0
+        );
+        assert!(TcpStream::connect(actual).await.is_err());
+        let metrics = handle.metrics();
+        assert_eq!(metrics.active_connections, 0);
+        assert_eq!(metrics.connection_buffer_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_rejection_precedes_id_and_reload_applies_to_new_connection()
+    -> Result<(), Box<dyn Error>> {
+        let memory = Arc::new(MutableMemory::new(900, 1000));
+        let snap = snapshot(1, 0, 0.9, one_listener())?;
+        let server = ephemeral_server(snap, Arc::clone(&memory)).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(connection.metadata().connection_id);
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        let mut rejected = TcpStream::connect(actual).await?;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            timeout(TokioDuration::from_secs(2), rejected.read(&mut byte)).await??,
+            0
+        );
+        assert_eq!(handle.metrics().rejected_memory_total, 1);
+        assert_eq!(handle.metrics().registered_total, 0);
+        assert!(handle.registry().is_empty());
+
+        memory.set(1, 1000);
+        handle.update_snapshot(snapshot(2, 0, 0.0, one_listener())?)?;
+        let _accepted = TcpStream::connect(actual).await?;
+        let first_id = timeout(TokioDuration::from_secs(2), rx.recv())
+            .await?
+            .ok_or("accepted connection not reported")?;
+        assert_eq!(first_id.get(), 1, "memory reject must not consume an ID");
+        handle.shutdown();
+        owner.await??;
+        assert!(handle.registry().is_empty());
+        assert_eq!(handle.metrics().active_connections, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_connections_reject_at_boundary_without_gauge_drift()
+    -> Result<(), Box<dyn Error>> {
+        let snap = snapshot(1, 2, 0.0, one_listener())?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(connection.metadata().connection_id);
+                std::future::pending::<()>().await;
+            }
+        }));
+        let _first = TcpStream::connect(actual).await?;
+        let _second = TcpStream::connect(actual).await?;
+        let _ = timeout(TokioDuration::from_secs(2), rx.recv()).await?;
+        let _ = timeout(TokioDuration::from_secs(2), rx.recv()).await?;
+        let mut third = TcpStream::connect(actual).await?;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            timeout(TokioDuration::from_secs(2), third.read(&mut byte)).await??,
+            0
+        );
+        assert_eq!(handle.registry().len(), 2);
+        let metrics = handle.metrics();
+        assert_eq!(metrics.active_connections, 2);
+        assert_eq!(metrics.rejected_max_connections_total, 1);
+        handle.shutdown();
+        owner.await??;
+        assert!(handle.registry().is_empty());
+        assert_eq!(handle.metrics().active_connections, 0);
+        assert_eq!(handle.metrics().connection_buffer_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handler_panic_is_contained_and_raii_cleanup_runs() -> Result<(), Box<dyn Error>> {
+        let snap = snapshot(1, 0, 0.0, one_listener())?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let calls = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run({
+            let calls = Arc::clone(&calls);
+            move |connection: AcceptedConnection| {
+                let call = calls.fetch_add(1, Ordering::Relaxed);
+                let tx = tx.clone();
+                async move {
+                    assert_ne!(call, 0, "injected handler panic");
+                    let _ = tx.send(connection.metadata().connection_id);
+                    std::future::pending::<()>().await;
+                }
+            }
+        }));
+        let mut first = TcpStream::connect(actual).await?;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            timeout(TokioDuration::from_secs(2), first.read(&mut byte)).await??,
+            0
+        );
+        let _second = TcpStream::connect(actual).await?;
+        let second_id = timeout(TokioDuration::from_secs(2), rx.recv())
+            .await?
+            .ok_or("second handler did not run")?;
+        assert_eq!(second_id.get(), 2);
+        assert_eq!(handle.registry().len(), 1);
+        assert_eq!(handle.metrics().handler_panics_total, 1);
+        handle.shutdown();
+        owner.await??;
+        assert!(handle.registry().is_empty());
+        assert_eq!(handle.metrics().active_connections, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expanded_port_range_binds_all_and_releases_together() -> Result<(), Box<dyn Error>> {
+        let mut bound = None;
+        for _ in 0..128 {
+            let (start, end) = reserve_contiguous_ports(3).await?;
+            let listeners: Vec<Listener> = (start..=end)
+                .enumerate()
+                .map(|(index, port)| Listener {
+                    address: "127.0.0.1".to_owned(),
+                    port: u32::from(port),
+                    name: format!("sql-{index}"),
+                })
+                .collect();
+            let snap = snapshot(1, 0, 0.0, listeners)?;
+            if let Ok(server) =
+                DataplaneServer::bind(snap, Arc::new(MutableMemory::new(1, 100))).await
+            {
+                bound = Some((server, start, end));
+                break;
+            }
+        }
+        let (server, start, end) = bound.ok_or("could not bind a contiguous port range")?;
+        let handle = server.handle();
+        let actual: Vec<u16> = handle
+            .listeners()
+            .iter()
+            .map(|listener| listener.actual_address.port())
+            .collect();
+        assert_eq!(actual, (start..=end).collect::<Vec<_>>());
+        let owner = tokio::spawn(server.run(|_connection: AcceptedConnection| async {}));
+        handle.shutdown();
+        owner.await??;
+        for address in handle
+            .listeners()
+            .iter()
+            .map(|listener| listener.actual_address)
+        {
+            assert!(TcpStream::connect(address).await.is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capture_preflight_and_accept_backoff_are_explicit() {
+        let raw = StateSnapshot {
+            config: Some(ConfigSnapshot {
+                traffic_replay_enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            preflight_snapshot(&raw),
+            Err(ServerError::TrafficReplayUnsupported)
+        ));
+        let mut backoff = AcceptBackoff::new();
+        assert_eq!(backoff.fail(), ACCEPT_BACKOFF_INITIAL);
+        for _ in 0..16 {
+            let _ = backoff.fail();
+        }
+        assert_eq!(backoff.fail(), ACCEPT_BACKOFF_MAX);
+        backoff.reset();
+        assert_eq!(backoff.fail(), ACCEPT_BACKOFF_INITIAL);
+    }
+
+    async fn reserve_contiguous_ports(size: u16) -> Result<(u16, u16), Box<dyn Error>> {
+        for _ in 0..128 {
+            let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            let start = probe.local_addr()?.port();
+            drop(probe);
+            let Some(end) = start.checked_add(size.saturating_sub(1)) else {
+                continue;
+            };
+            let mut reservations = Vec::new();
+            let mut complete = true;
+            for port in start..=end {
+                if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+                    reservations.push(listener);
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            drop(reservations);
+            if complete {
+                return Ok((start, end));
+            }
+        }
+        Err("no free contiguous port range found".into())
+    }
+}
