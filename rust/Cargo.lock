@@ -290,7 +290,10 @@ dependencies = [
  "control-proto",
  "mysql-wire",
  "proxy-io",
+ "rustls",
  "session-core",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

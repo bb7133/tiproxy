@@ -14,11 +14,27 @@
 
 //! Composition root for the `TiProxy` Rust dataplane.
 //!
-//! No protocol behavior is implemented in the foundation workspace. Keeping
-//! this crate as the only composition layer preserves the library boundaries
-//! while later parity work lands independently.
+//! This crate owns SQL listener and connection admission lifecycle. `MySQL`
+//! packet processing remains in `mysql-wire`, transport mechanics remain in
+//! `proxy-io`, and session policy remains in `session-core`.
 
 #![forbid(unsafe_code)]
+
+pub mod admission;
+pub mod registry;
+pub mod server;
+
+pub use admission::{
+    AdmissionController, AdmissionMetricsSnapshot, AdmissionPolicy, AdmissionPolicyError,
+    AdmissionRejection, MemoryProbe, MemoryProbeError, MemorySample, SystemMemoryProbe,
+};
+pub use registry::{
+    ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,
+};
+pub use server::{
+    AcceptedConnection, BoundListenerInfo, ConnectionHandler, DataplaneHandle, DataplaneServer,
+    ListenerSpec, ServerError, ServerMetricsSnapshot, preflight_snapshot,
+};
 
 /// Names and stable roles of the library crates composed by the dataplane.
 #[must_use]

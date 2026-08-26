@@ -15,6 +15,11 @@ control-proto.workspace = true
 mysql-wire.workspace = true
 proxy-io.workspace = true
 session-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
 
 [lints]
 workspace = true
