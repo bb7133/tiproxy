@@ -154,9 +154,10 @@ pub enum SessionEvent {
     /// finished (SES-07 held-`BEGIN` `COMMIT`): boundary logic runs but
     /// nothing is forwarded to the client.
     InternalResponseTxnDone,
-    /// An internal command's response completed with the transaction still
-    /// open (for example the internal `COMMIT` failed); nothing is
-    /// forwarded — the runtime owns any one-shot error forwarding.
+    /// An internal command's response completed with an authoritative
+    /// status still showing an open transaction; nothing is forwarded.
+    /// An internal ERR is **not** this event — it carries no status and
+    /// must enter as [`SessionEvent::InternalResponseError`].
     InternalResponseTxnOpen,
     /// A disruption (cancellation, aborted exchange, unclassifiable
     /// failure) made the backend transaction state unknowable. Migration

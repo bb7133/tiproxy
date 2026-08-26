@@ -272,10 +272,11 @@ from Go `finishedTxn`/`needHoldRequest` and `pkg/util/lex`:
   cleared only by an authoritative response status; a `MySQL` ERR is
   not a disruption (Go keeps `serverStatus`). There is deliberately no
   second safety predicate anywhere. Internal commands
-  (`InternalResponseTxnDone`/`TxnOpen`) run the same boundary logic
-  **without client forwarding**, so the held `BEGIN`'s internal
-  `COMMIT` OK never leaks and its error is forwarded exactly once by
-  the hold machine.
+  (`InternalResponseTxnDone`/`TxnOpen` on an authoritative status,
+  `InternalResponseError` for a statusless ERR deciding on the
+  retained flags) run the same boundary logic **without client
+  forwarding**, so the held `BEGIN`'s internal `COMMIT` OK never
+  leaks and its error is forwarded exactly once by the hold machine.
 - `need_hold_request` is Go's predicate byte-for-byte (only an
   in-transaction `COM_QUERY` lexing as `BEGIN`/`START TRANSACTION` with
   no pending prepared state; trailing NUL stripped), on top of a

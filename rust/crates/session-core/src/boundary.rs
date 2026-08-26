@@ -37,9 +37,12 @@
 //!    transiently; nothing here retains or logs query bytes.
 //! 3. [`HeldBegin`] — the hold lifecycle: the proxy sends an **internal**
 //!    `COMMIT` whose completion enters the FSM as
-//!    [`crate::fsm::SessionEvent::InternalResponseTxnDone`]/`TxnOpen`, so
-//!    the boundary logic runs **without any client forwarding** (an
-//!    internal `COMMIT`'s OK never leaks); on a commit `MySQL` error the
+//!    [`crate::fsm::SessionEvent::InternalResponseTxnDone`]/`TxnOpen` on
+//!    an authoritative status, or as
+//!    [`crate::fsm::SessionEvent::InternalResponseError`] on a statusless
+//!    ERR (boundary decided on the retained flags), so the boundary logic
+//!    runs **without any client forwarding** (an internal `COMMIT`'s OK
+//!    never leaks); on a commit `MySQL` error the
 //!    runtime forwards that error to the client exactly once via
 //!    [`HoldEffect::ForwardCommitErrorToClient`] as the answer to the
 //!    `BEGIN` (Go's `IsMySQLError` path). The held request replays exactly
