@@ -76,7 +76,7 @@
 use std::time::Duration;
 
 use control_proto::v1::{ErrorCode, ErrorSource, RouteAssignment, RouteResult};
-use tokio::time::{Instant, sleep, timeout, timeout_at};
+use tokio::time::{Instant, sleep, timeout_at};
 
 /// How one dial attempt failed. Payload-free by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +133,12 @@ pub enum AcquireError {
     BudgetExhausted {
         /// The failure that consumed the final attempt, if any dial ran.
         last_failure: Option<DialFailure>,
+    },
+    /// An OK assignment missing a required backend field (the Go
+    /// adapter always fills these on success): protocol-level terminal.
+    MalformedAssignment {
+        /// The first missing required field.
+        field: &'static str,
     },
     /// A non-empty `cluster_name` reached a dialer that is not
     /// cluster-aware: fail closed instead of silently dialing outside
@@ -426,8 +432,10 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
 
     /// Acquires a backend: sends the route request and runs the
     /// assignment/dial/result loop under the per-dial and total budgets.
-    /// Every OK assignment received is retired with exactly one result,
-    /// including on the failure paths.
+    /// A re-selected candidate failure is retired with exactly one
+    /// failed result; locally terminal outcomes leave the pending
+    /// assignment in [`Self::unretired_assignment`] for
+    /// `ConnectionEvent(CLOSED)` accounting.
     ///
     /// # Errors
     ///
@@ -478,7 +486,11 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
             };
             self.stats.assignments = self.stats.assignments.saturating_add(1);
             match assignment.code() {
-                ErrorCode::Ok | ErrorCode::Unspecified => {}
+                // Only an explicit OK is a backend-carrying assignment.
+                // UNSPECIFIED (the proto default) is a protocol-level
+                // terminal, not a success — the Go adapter always sets
+                // OK on real assignments.
+                ErrorCode::Ok => {}
                 ErrorCode::NoBackend => {
                     return Err(AcquireError::NoBackend {
                         detail: assignment.detail,
@@ -490,6 +502,19 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
                         detail: assignment.detail,
                     });
                 }
+            }
+            // An OK assignment must actually name a backend.
+            let missing = if assignment.assignment_id.is_empty() {
+                Some("assignment_id")
+            } else if assignment.backend_id.is_empty() {
+                Some("backend_id")
+            } else if assignment.backend_address.is_empty() {
+                Some("backend_address")
+            } else {
+                None
+            };
+            if let Some(field) = missing {
+                return Err(AcquireError::MalformedAssignment { field });
             }
             // From here until this assignment's result is sent, close
             // accounting owns it.
@@ -521,8 +546,12 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
 
             self.stats.dials = self.stats.dials.saturating_add(1);
             attempt = attempt.saturating_add(1);
-            let outcome = match timeout(
-                self.schedule.per_dial,
+            // The per-dial bound never exceeds the remaining total
+            // budget (Go's dialCtx is a child of bctx): a hanging dial
+            // ends exactly at whichever deadline comes first.
+            let dial_by = (Instant::now() + self.schedule.per_dial).min(total_deadline);
+            let outcome = match timeout_at(
+                dial_by,
                 self.dialer
                     .dial(&assignment.backend_address, &assignment.cluster_name),
             )
@@ -587,11 +616,16 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
                 detail: String::new(),
             },
         };
-        self.stats.results_reported = self.stats.results_reported.saturating_add(1);
-        self.unretired = None;
+        // The retirement obligation transfers only once the send
+        // succeeded: a failed or cancelled send leaves `unretired` set
+        // (and stats untouched) so `ConnectionEvent(CLOSED)` accounting
+        // still covers the assignment the adapter may consider open.
         self.channel
             .report_result(result)
             .await
-            .map_err(AcquireError::Channel)
+            .map_err(AcquireError::Channel)?;
+        self.stats.results_reported = self.stats.results_reported.saturating_add(1);
+        self.unretired = None;
+        Ok(())
     }
 }

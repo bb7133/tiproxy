@@ -441,11 +441,12 @@ async fn handshake_failure_reselects_distinct_backend() {
     }
 }
 
-/// When the remaining budget cannot fit the next backoff, the pending
-/// assignment is still retired (with a not-attempted failure) before the
-/// engine reports exhaustion — nothing leaks router score.
+/// When the remaining budget cannot fit the next backoff, no failed
+/// result is sent (the session stops re-selecting): the pending
+/// assignment goes to `ConnectionEvent(CLOSED)` accounting — nothing
+/// leaks router score.
 #[tokio::test(start_paused = true)]
-async fn pre_dial_exhaustion_still_retires_the_assignment() {
+async fn pre_dial_exhaustion_hands_assignment_to_close_accounting() {
     let mut adapter = FakeAdapter::default();
     adapter
         .assignments
@@ -654,4 +655,183 @@ async fn jitter_semantics_are_deterministic_and_bounded() {
             "raw jitter {raw} maps to {expected_ms}ms"
         );
     }
+}
+
+/// The total budget bounds even an in-flight dial (Go's dialCtx is a
+/// child of bctx): with total < per-dial and a hanging first dial, the
+/// engine stops exactly at the total deadline and the assignment goes
+/// to close accounting.
+#[tokio::test(start_paused = true)]
+async fn total_budget_cuts_a_hanging_dial() {
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    let dialer = FakeDialer::new(&[("10.0.0.1:4000", Outcome::Hang)]);
+    let config = DialSchedule {
+        total: Duration::from_millis(300),
+        per_dial: Duration::from_secs(1),
+        ..DialSchedule::default()
+    };
+    let start = Instant::now();
+    let mut engine = engine(adapter, dialer, config);
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!("hanging dial past the budget must not connect")
+    };
+    assert!(matches!(
+        error,
+        AcquireError::BudgetExhausted {
+            last_failure: Some(DialFailure::Timeout)
+        }
+    ));
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_millis(300),
+        "cut exactly at the total deadline, not per-dial"
+    );
+    assert_eq!(
+        engine.unretired_assignment(),
+        Some("a-1"),
+        "the in-flight assignment goes to close accounting"
+    );
+    let (channel, _) = engine.into_parts();
+    assert!(channel.results.is_empty());
+}
+
+/// A result send that fails (or is cancelled mid-send) must not shed
+/// the retirement obligation: `unretired` stays set and the report
+/// count is untouched, so CLOSED accounting still covers the
+/// assignment the adapter may consider open.
+#[tokio::test(start_paused = true)]
+async fn failed_or_cancelled_report_keeps_the_obligation() {
+    // Case 1: the send fails with ControlLost.
+    struct FailingReport {
+        assignments: VecDeque<RouteAssignment>,
+    }
+    impl RouteChannel for FailingReport {
+        async fn request_route(
+            &mut self,
+            _excluded_backend_ids: Vec<String>,
+        ) -> Result<(), RouteChannelError> {
+            Ok(())
+        }
+        async fn next_assignment(&mut self) -> Result<RouteAssignment, RouteChannelError> {
+            self.assignments
+                .pop_front()
+                .ok_or(RouteChannelError::ControlLost)
+        }
+        async fn report_result(&mut self, _result: RouteResult) -> Result<(), RouteChannelError> {
+            Err(RouteChannelError::ControlLost)
+        }
+    }
+    struct HangingReport {
+        assignments: VecDeque<RouteAssignment>,
+    }
+    impl RouteChannel for HangingReport {
+        async fn request_route(
+            &mut self,
+            _excluded_backend_ids: Vec<String>,
+        ) -> Result<(), RouteChannelError> {
+            Ok(())
+        }
+        async fn next_assignment(&mut self) -> Result<RouteAssignment, RouteChannelError> {
+            self.assignments
+                .pop_front()
+                .ok_or(RouteChannelError::ControlLost)
+        }
+        async fn report_result(&mut self, _result: RouteResult) -> Result<(), RouteChannelError> {
+            std::future::pending().await
+        }
+    }
+    let mut assignments = VecDeque::new();
+    assignments.push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    let dialer = FakeDialer::new(&[("10.0.0.1:4000", Outcome::Refuse)]);
+    let mut engine = RouteEngine::new(
+        FailingReport { assignments },
+        dialer,
+        DialSchedule::default(),
+        CenteredJitter,
+        CONN_ID,
+    );
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!("send failure must surface")
+    };
+    assert_eq!(error, AcquireError::Channel(RouteChannelError::ControlLost));
+    assert_eq!(
+        engine.unretired_assignment(),
+        Some("a-1"),
+        "failed send keeps the obligation"
+    );
+    assert_eq!(engine.stats().results_reported, 0, "no phantom report");
+
+    // Case 2: the report future is cancelled mid-send.
+    let mut assignments = VecDeque::new();
+    assignments.push_back(assignment("a-1", "tidb-a", "10.0.0.1:4000"));
+    let dialer = FakeDialer::new(&[("10.0.0.1:4000", Outcome::Refuse)]);
+    let mut engine = RouteEngine::new(
+        HangingReport { assignments },
+        dialer,
+        DialSchedule::default(),
+        CenteredJitter,
+        CONN_ID,
+    );
+    {
+        let acquire = engine.acquire(Vec::new());
+        tokio::pin!(acquire);
+        let raced = tokio::time::timeout(Duration::from_millis(200), &mut acquire).await;
+        assert!(raced.is_err(), "the report send is mid-flight");
+        // Cancelled here: teardown while the result was in the queue.
+    }
+    assert_eq!(
+        engine.unretired_assignment(),
+        Some("a-1"),
+        "cancelled send keeps the obligation"
+    );
+    assert_eq!(engine.stats().results_reported, 0);
+}
+
+/// Only an explicit OK is a backend-carrying assignment: UNSPECIFIED
+/// (the proto default) and an OK assignment missing required backend
+/// fields are typed protocol terminals, never dialed.
+#[tokio::test(start_paused = true)]
+async fn unspecified_and_malformed_assignments_are_terminal() {
+    // UNSPECIFIED code.
+    let mut adapter = FakeAdapter::default();
+    adapter
+        .assignments
+        .push_back(terminal(ErrorCode::Unspecified, "default fields"));
+    let dialer = FakeDialer::new(&[]);
+    let mut unspecified_engine = engine(adapter, dialer, schedule());
+    let Err(error) = unspecified_engine.acquire(Vec::new()).await else {
+        unreachable!("UNSPECIFIED must be terminal")
+    };
+    assert_eq!(
+        error,
+        AcquireError::Routing {
+            code: ErrorCode::Unspecified,
+            detail: "default fields".to_owned()
+        }
+    );
+    let (_, dialer) = unspecified_engine.into_parts();
+    assert!(dialer.attempts.is_empty(), "never dialed");
+
+    // OK but missing backend_address.
+    let mut adapter = FakeAdapter::default();
+    adapter.assignments.push_back(RouteAssignment {
+        backend_address: String::new(),
+        ..assignment("a-1", "tidb-a", "ignored")
+    });
+    let dialer = FakeDialer::new(&[]);
+    let mut malformed_engine = engine(adapter, dialer, schedule());
+    let Err(error) = malformed_engine.acquire(Vec::new()).await else {
+        unreachable!("malformed OK must be terminal")
+    };
+    assert_eq!(
+        error,
+        AcquireError::MalformedAssignment {
+            field: "backend_address"
+        }
+    );
+    let (_, dialer) = malformed_engine.into_parts();
+    assert!(dialer.attempts.is_empty(), "never dialed");
 }
