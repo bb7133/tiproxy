@@ -24,6 +24,7 @@ pub mod admission;
 pub mod control_commands;
 pub mod control_dispatch;
 pub mod control_runtime;
+pub mod observability;
 pub mod registry;
 pub mod route;
 pub mod route_control;
@@ -45,6 +46,10 @@ pub use control_commands::{
 };
 pub use control_dispatch::{CommandKind, CommandToken, SessionDirective};
 pub use control_dispatch::{ControlCommandHandler, OutboundControl};
+pub use observability::{
+    DEFAULT_OBSERVATION_CAPACITY, MetricsExporter, MetricsRecorder, Observation, QuitSource,
+    SessionLogContext, spawn_metrics_exporter,
+};
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,
 };

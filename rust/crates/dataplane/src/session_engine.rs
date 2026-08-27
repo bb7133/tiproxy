@@ -61,6 +61,7 @@
 //! session-state transfer is the follow-up slice.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use control_proto::control_transport::ControlClient;
 use control_proto::v1::control_envelope::Body;
@@ -96,7 +97,12 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::control_dispatch::{CommandKind, CommandToken, ResponseKind};
-use crate::route::{CenteredJitter, DialSchedule, RouteChannel, RouteChannelError, RouteEngine};
+use crate::observability::{
+    BackendTraffic, MetricsRecorder, Observation, QuitSource, SessionLogContext, log_session,
+};
+use crate::route::{
+    AcquireError, CenteredJitter, DialSchedule, RouteChannel, RouteChannelError, RouteEngine,
+};
 use crate::route_control::{ClusterTcpDialer, TrafficTotals};
 use crate::server::{AcceptedConnection, ConnectionFuture, SessionSeat};
 use crate::session::{
@@ -188,7 +194,11 @@ enum EngineReport {
 struct EngineExit {
     totals: TrafficTotals,
     source: WireErrorSource,
+    quit_source: QuitSource,
     backend_id: String,
+    backend_address: String,
+    cluster: String,
+    capabilities: u64,
 }
 
 /// The event-source half: the loop's pump polls this; the engine feeds
@@ -318,6 +328,7 @@ pub struct EngineSessionOwner {
     shutdown: watch::Receiver<bool>,
     drain: watch::Receiver<bool>,
     loop_config: SessionLoopConfig,
+    metrics: MetricsRecorder,
 }
 
 impl EngineSessionOwner {
@@ -336,7 +347,15 @@ impl EngineSessionOwner {
             shutdown,
             drain,
             loop_config,
+            metrics: MetricsRecorder::default(),
         }
+    }
+
+    /// Attaches the process-wide non-blocking metrics recorder.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsRecorder) -> Self {
+        self.metrics = metrics;
+        self
     }
 }
 
@@ -351,9 +370,10 @@ impl BoundSessionHandler for EngineSessionOwner {
         let shutdown = self.shutdown.clone();
         let drain = self.drain.clone();
         let config = self.loop_config;
+        let metrics = self.metrics.clone();
         Box::pin(async move {
-            run_bound_session(
-                connection, binding, client, namespace, shutdown, drain, config,
+            run_bound_session_observed(
+                connection, binding, client, namespace, shutdown, drain, config, metrics,
             )
             .await;
         })
@@ -371,9 +391,34 @@ pub async fn run_bound_session(
     client: Arc<ControlClient>,
     namespace: String,
     shutdown: watch::Receiver<bool>,
-    mut drain: watch::Receiver<bool>,
+    drain: watch::Receiver<bool>,
     loop_config: SessionLoopConfig,
 ) {
+    run_bound_session_observed(
+        connection,
+        binding,
+        client,
+        namespace,
+        shutdown,
+        drain,
+        loop_config,
+        MetricsRecorder::default(),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_bound_session_observed(
+    connection: AcceptedConnection,
+    binding: SessionControlBinding,
+    client: Arc<ControlClient>,
+    namespace: String,
+    shutdown: watch::Receiver<bool>,
+    mut drain: watch::Receiver<bool>,
+    loop_config: SessionLoopConfig,
+    metrics: MetricsRecorder,
+) {
+    let accepted_at = tokio::time::Instant::now();
     let (stream, seat) = connection.into_session_io();
     let metadata = seat.metadata();
     let identity = ConnectionIdentity {
@@ -386,6 +431,14 @@ pub async fn run_bound_session(
     let endpoints = ConnectionEndpoints {
         listener_addr: metadata.listener_address,
         client_addr: metadata.peer_address,
+    };
+    let log_context = SessionLogContext {
+        connection_id: identity.connection_id,
+        listener: metadata.listener_address.to_string(),
+        client_address: metadata.peer_address.to_string(),
+        proxy_client_address: metadata.peer_address.to_string(),
+        namespace: namespace.clone(),
+        generation: seat.snapshot().generation(),
     };
     let (mut directives, responses, commander) = binding.split();
 
@@ -420,7 +473,11 @@ pub async fn run_bound_session(
         prepared: PreparedRegistry::new(),
         pending_command: None,
         wire_end: None,
+        quit_source: QuitSource::None,
         closing: false,
+        accepted_at,
+        metrics: metrics.clone(),
+        log_context: log_context.clone(),
         seat,
     };
 
@@ -554,6 +611,13 @@ pub async fn run_bound_session(
             .as_ref()
             .map_or(WireErrorSource::Proxy, |exit| exit.source)
     };
+    let quit_source = if forced {
+        QuitSource::ProxyQuit
+    } else {
+        engine_exit
+            .as_ref()
+            .map_or(QuitSource::ProxyError, |exit| exit.quit_source)
+    };
     // Exactness: an unresolved redirect terminal fails closed so the
     // gate id never dangles; an accepted close that ran the session to
     // its end reports under its exact admitted id.
@@ -573,6 +637,29 @@ pub async fn run_bound_session(
     if let Some(token) = close_token.take() {
         let _ = commander.close_finished(token.id.to_string()).await;
     }
+    metrics.try_record(Observation::SessionClosed {
+        source: quit_source,
+        lifetime: accepted_at.elapsed(),
+        traffic: totals,
+    });
+    let (backend_id, backend_address, cluster, capabilities) =
+        engine_exit.as_ref().map_or(("", "", "", 0), |exit| {
+            (
+                exit.backend_id.as_str(),
+                exit.backend_address.as_str(),
+                exit.cluster.as_str(),
+                exit.capabilities,
+            )
+        });
+    log_session(
+        "connection_closed",
+        &log_context,
+        backend_id,
+        backend_address,
+        cluster,
+        capabilities,
+        quit_source,
+    );
     let _ = commander.session_closed(forced, source, totals).await;
 }
 
@@ -621,13 +708,20 @@ struct BackendIo {
     reader: PacketReader<OwnedReadHalf>,
     writer: PacketWriter<OwnedWriteHalf>,
     id: String,
+    address: String,
+    cluster: String,
+    local: bool,
 }
 
 /// One client command held between its event and the FSM's forward
 /// authorization.
 struct PendingCommand {
     payload: Vec<u8>,
+    command: Command,
     expected: ExpectedResponse,
+    started: tokio::time::Instant,
+    since_connection: Duration,
+    traffic_before: BackendTraffic,
 }
 
 /// The single owner of all session wire I/O.
@@ -657,7 +751,11 @@ struct Engine {
     prepared: PreparedRegistry,
     pending_command: Option<PendingCommand>,
     wire_end: Option<WireErrorSource>,
+    quit_source: QuitSource,
     closing: bool,
+    accepted_at: tokio::time::Instant,
+    metrics: MetricsRecorder,
+    log_context: SessionLogContext,
     seat: SessionSeat,
 }
 
@@ -674,6 +772,9 @@ impl Engine {
         let end = self.lifecycle().await;
         if let Some(source) = end {
             self.wire_end.get_or_insert(source);
+            if self.quit_source == QuitSource::None {
+                self.quit_source = coarse_quit_source(source);
+            }
         }
         // Drain remaining effects so teardown commands (close/classify)
         // execute even after a wire failure ended the lifecycle early.
@@ -683,14 +784,24 @@ impl Engine {
             }
         }
         self.shutdown_io().await;
+        let (backend_id, backend_address, cluster) = self.backend.as_ref().map_or_else(
+            || (String::new(), String::new(), String::new()),
+            |backend| {
+                (
+                    backend.id.clone(),
+                    backend.address.clone(),
+                    backend.cluster.clone(),
+                )
+            },
+        );
         EngineExit {
             totals: self.totals(),
             source: self.wire_end.unwrap_or(WireErrorSource::ClientNetwork),
-            backend_id: self
-                .backend
-                .as_ref()
-                .map(|backend| backend.id.clone())
-                .unwrap_or_default(),
+            quit_source: self.quit_source,
+            backend_id,
+            backend_address,
+            cluster,
+            capabilities: u64::from(self.negotiated.bits()),
         }
     }
 
@@ -724,12 +835,14 @@ impl Engine {
             Err(error) => return Some(self.client_read_end(&error).await),
         };
         let Ok(parsed) = parse_handshake_response(&payload) else {
+            self.quit_source = QuitSource::ProxyMalformed;
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Some(WireErrorSource::ClientNetwork);
         };
         let negotiation = match negotiate_frontend(parsed.capabilities, proxy_capabilities()) {
             Ok(negotiation) => negotiation,
             Err(missing) => {
+                self.quit_source = QuitSource::ClientHandshake;
                 let (code, state, message) = missing.client_response();
                 self.client_w
                     .reset_sequence(self.client_r.expected_sequence());
@@ -842,16 +955,34 @@ impl Engine {
         };
         let mut route_engine = RouteEngine::new(
             channel,
-            ClusterTcpDialer,
+            ClusterTcpDialer::new(self.metrics.clone()),
             DialSchedule::default(),
             CenteredJitter,
             self.connection_id,
         );
-        let Ok(acquired) = route_engine.acquire(Vec::new()).await else {
-            let _ = self.events.send(SessionEvent::BackendIoError).await;
-            return Some(WireErrorSource::Proxy);
+        let acquisition_started = tokio::time::Instant::now();
+        let acquired = match route_engine.acquire(Vec::new()).await {
+            Ok(acquired) => {
+                self.metrics.try_record(Observation::GetBackend {
+                    duration: acquisition_started.elapsed(),
+                    succeeded: true,
+                });
+                acquired
+            }
+            Err(error) => {
+                self.metrics.try_record(Observation::GetBackend {
+                    duration: acquisition_started.elapsed(),
+                    succeeded: false,
+                });
+                self.quit_source = acquire_quit_source(&error);
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+                return Some(WireErrorSource::Proxy);
+            }
         };
         let backend_id = acquired.backend.backend_id.clone();
+        let backend_address = acquired.backend.address.clone();
+        let backend_cluster = acquired.backend.cluster_name.clone();
+        let backend_local = acquired.backend.local;
         // Health-appropriate keepalive at dial time (KA-003 family):
         // the snapshot's healthy/unhealthy backend policy follows the
         // router-reported health of this assignment. Mid-session
@@ -875,22 +1006,29 @@ impl Engine {
             reader: PacketReader::new(backend_read),
             writer: PacketWriter::new(backend_write),
             id: backend_id.clone(),
+            address: backend_address,
+            cluster: backend_cluster,
+            local: backend_local,
         };
         let Ok(greeting_packet) = backend.reader.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await else {
+            self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
         };
         let greeting_payload = greeting_packet.payload;
         let Ok(backend_greeting) = mysql_wire::parse_initial_handshake(&greeting_payload) else {
+            self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
         };
         let backend_caps = backend_greeting.capabilities;
         if verify_backend(backend_caps, self.negotiated, proxy_capabilities(), false).is_err() {
+            self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
         }
         let Ok(plan) = plan_backend_handshake(&routing, backend_caps, false, false) else {
+            self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::Proxy);
         };
@@ -918,6 +1056,7 @@ impl Engine {
         // keeps the `using password` semantics on failure.
         let forwarded = {
             let Ok(parsed) = parse_handshake_response(&self.client_handshake_raw) else {
+                self.quit_source = QuitSource::ProxyMalformed;
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::Proxy);
             };
@@ -938,6 +1077,7 @@ impl Engine {
                 attributes: attributes.as_deref(),
                 zstd_level: parsed.zstd_level,
             }) else {
+                self.quit_source = QuitSource::ProxyMalformed;
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::Proxy);
             };
@@ -954,6 +1094,7 @@ impl Engine {
                 .await
                 .is_err()
             {
+                self.quit_source = QuitSource::BackendHandshake;
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
                 return Some(WireErrorSource::BackendNetwork);
             }
@@ -968,6 +1109,7 @@ impl Engine {
                     let payload = match self.backend_read(HANDSHAKE_PAYLOAD_LIMIT).await {
                         Ok(payload) => payload,
                         Err(source) => {
+                            self.quit_source = QuitSource::BackendHandshake;
                             let _ = self.events.send(SessionEvent::BackendIoError).await;
                             return Some(source);
                         }
@@ -979,12 +1121,14 @@ impl Engine {
                         },
                         Ok(event) => event,
                         Err(_) => {
+                            self.quit_source = QuitSource::BackendHandshake;
                             let _ = self.events.send(SessionEvent::BackendIoError).await;
                             return Some(WireErrorSource::BackendNetwork);
                         }
                     };
                     self.relay_hold = Some(payload);
                     let Ok(step) = relay.on_event(event) else {
+                        self.quit_source = QuitSource::BackendHandshake;
                         let _ = self.events.send(SessionEvent::BackendIoError).await;
                         return Some(WireErrorSource::Proxy);
                     };
@@ -1002,6 +1146,7 @@ impl Engine {
                     };
                     self.relay_hold = Some(payload);
                     let Ok(step) = relay.on_event(AuthEvent::ClientAuthResponse) else {
+                        self.quit_source = QuitSource::ClientHandshake;
                         let _ = self.events.send(SessionEvent::ClientIoError).await;
                         return Some(WireErrorSource::Proxy);
                     };
@@ -1015,6 +1160,7 @@ impl Engine {
                 AuthTurn::AwaitingReconnect | AuthTurn::Finished => {
                     // Reconnect is never approved in this slice, and a
                     // finished relay exits through the outcome above.
+                    self.quit_source = QuitSource::BackendHandshake;
                     let _ = self.events.send(SessionEvent::BackendIoError).await;
                     return Some(WireErrorSource::Proxy);
                 }
@@ -1039,8 +1185,30 @@ impl Engine {
                 ) {
                     return None;
                 }
+                let current = self.backend_traffic();
+                self.metrics.try_record(Observation::HandshakeCompleted {
+                    backend: self
+                        .backend
+                        .as_ref()
+                        .map_or_else(String::new, |backend| backend.address.clone()),
+                    duration: self.accepted_at.elapsed(),
+                    traffic: current,
+                    local: self.backend.as_ref().is_some_and(|backend| backend.local),
+                });
+                if let Some(backend) = &self.backend {
+                    log_session(
+                        "connection_ready",
+                        &self.log_context,
+                        &backend.id,
+                        &backend.address,
+                        &backend.cluster,
+                        u64::from(self.negotiated.bits()),
+                        QuitSource::None,
+                    );
+                }
             }
             AuthOutcome::Failed(kind) => {
+                self.quit_source = failure_quit_source(kind);
                 let _ = self.events.send(SessionEvent::BackendAuthFailed).await;
                 return Some(failure_source(kind));
             }
@@ -1052,6 +1220,7 @@ impl Engine {
     }
 
     /// Ready/command/response/infile phases.
+    #[allow(clippy::too_many_lines)]
     async fn command_phase(&mut self) -> Option<WireErrorSource> {
         loop {
             if self.closing {
@@ -1067,7 +1236,7 @@ impl Engine {
             // header is visible the logical read runs uncontended; a
             // client stalling mid-frame is bounded by the owner's force
             // deadline, like any other mid-command stall.
-            let payload = tokio::select! {
+            let (payload, command_started) = tokio::select! {
                 cmd = self.cmds.recv() => {
                     let cmd = cmd?;
                     match self.handle_cmd(cmd).await {
@@ -1080,8 +1249,12 @@ impl Engine {
                         let source = self.client_read_end(&error).await;
                         return Some(source);
                     }
+                    // The idle wait ends when the packet header becomes
+                    // visible. Match Go's ExecuteCmd timer: include packet
+                    // read/dispatch/response work, never connection idle time.
+                    let started = tokio::time::Instant::now();
                     match self.client_r.read_logical(COMMAND_PAYLOAD_LIMIT).await {
-                        Ok(packet) => packet.payload,
+                        Ok(packet) => (packet.payload, started),
                         Err(error) => {
                             let source = self.client_read_end(&error).await;
                             return Some(source);
@@ -1116,13 +1289,23 @@ impl Engine {
             } else {
                 SessionEvent::ClientCommand
             };
-            self.pending_command = Some(PendingCommand { payload, expected });
+            self.pending_command = Some(PendingCommand {
+                payload,
+                command,
+                expected,
+                started: command_started,
+                since_connection: command_started.saturating_duration_since(self.accepted_at),
+                traffic_before: self.backend_traffic(),
+            });
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
             }
             if event == SessionEvent::ClientCommandQuit {
                 // Quit tears down: the FSM goes straight to Closing and
                 // the teardown effects arrive; drain them here.
+                if let Some(pending) = self.pending_command.take() {
+                    self.record_command(&pending);
+                }
                 return None;
             }
             if !matches!(
@@ -1136,6 +1319,7 @@ impl Engine {
                 return Some(WireErrorSource::Proxy);
             };
             if let Some(source) = self.forward_command_to_backend(&pending).await {
+                self.record_command(&pending);
                 return Some(source);
             }
             if let Some(sync) = self.apply_command_mutations(&pending, false)
@@ -1153,9 +1337,12 @@ impl Engine {
                 {
                     return Some(WireErrorSource::Proxy);
                 }
+                self.record_command(&pending);
                 continue;
             }
-            if let Some(source) = self.response_rounds(&pending).await {
+            let response_source = self.response_rounds(&pending).await;
+            self.record_command(&pending);
+            if let Some(source) = response_source {
                 return Some(source);
             }
             if self.closing {
@@ -1638,6 +1825,46 @@ impl Engine {
                 .map_or(0, |backend| backend.writer.out_bytes()),
         }
     }
+
+    fn backend_traffic(&self) -> BackendTraffic {
+        self.backend
+            .as_ref()
+            .map_or(BackendTraffic::default(), |backend| BackendTraffic {
+                inbound_bytes: backend.reader.in_bytes(),
+                inbound_packets: backend.reader.in_packets(),
+                outbound_bytes: backend.writer.out_bytes(),
+                outbound_packets: backend.writer.out_packets(),
+            })
+    }
+
+    fn record_command(&self, pending: &PendingCommand) {
+        let current = self.backend_traffic();
+        let traffic = BackendTraffic {
+            inbound_bytes: current
+                .inbound_bytes
+                .saturating_sub(pending.traffic_before.inbound_bytes),
+            inbound_packets: current
+                .inbound_packets
+                .saturating_sub(pending.traffic_before.inbound_packets),
+            outbound_bytes: current
+                .outbound_bytes
+                .saturating_sub(pending.traffic_before.outbound_bytes),
+            outbound_packets: current
+                .outbound_packets
+                .saturating_sub(pending.traffic_before.outbound_packets),
+        };
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        self.metrics.try_record(Observation::CommandCompleted {
+            backend: backend.address.clone(),
+            command: pending.command,
+            duration: pending.started.elapsed(),
+            since_connection: pending.since_connection,
+            traffic,
+            local: backend.local,
+        });
+    }
 }
 
 /// Maps an auth failure to the wire error source.
@@ -1656,6 +1883,46 @@ const fn failure_source(kind: FailureKind) -> WireErrorSource {
             WireErrorSource::Proxy
         }
         FailureKind::Shutdown => WireErrorSource::Shutdown,
+    }
+}
+
+const fn failure_quit_source(kind: FailureKind) -> QuitSource {
+    match kind {
+        FailureKind::AuthenticationFailed => QuitSource::ClientAuthFail,
+        FailureKind::ClientHandshake
+        | FailureKind::ClientCapability
+        | FailureKind::PacketTooLarge => QuitSource::ClientHandshake,
+        FailureKind::BackendHandshake
+        | FailureKind::BackendCapability
+        | FailureKind::BackendNoTls
+        | FailureKind::BackendProxyProtocol => QuitSource::BackendHandshake,
+        FailureKind::NoBackend => QuitSource::ProxyNoBackend,
+        FailureKind::ProxyNoTls | FailureKind::ProxyInternal | FailureKind::ControlPlane => {
+            QuitSource::ProxyError
+        }
+        FailureKind::Shutdown => QuitSource::ProxyQuit,
+    }
+}
+
+const fn acquire_quit_source(error: &AcquireError) -> QuitSource {
+    match error {
+        AcquireError::NoBackend { .. }
+        | AcquireError::BudgetExhausted { .. }
+        | AcquireError::ClusterUnsupported { .. } => QuitSource::ProxyNoBackend,
+        AcquireError::Routing { .. }
+        | AcquireError::MalformedAssignment { .. }
+        | AcquireError::Channel(_) => QuitSource::ProxyError,
+    }
+}
+
+const fn coarse_quit_source(source: WireErrorSource) -> QuitSource {
+    match source {
+        WireErrorSource::ClientNetwork => QuitSource::ClientNetwork,
+        WireErrorSource::BackendNetwork => QuitSource::BackendNetwork,
+        WireErrorSource::Shutdown => QuitSource::ProxyQuit,
+        WireErrorSource::BackendSql => QuitSource::ClientSqlError,
+        WireErrorSource::Proxy | WireErrorSource::Control => QuitSource::ProxyError,
+        WireErrorSource::Unspecified => QuitSource::None,
     }
 }
 

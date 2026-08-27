@@ -22,13 +22,14 @@ use control_proto::v1::{
     ConnectionEventKind, ConnectionIdentity, ErrorCode, ErrorSource, HandshakeMetadata,
     RouteAssignment,
 };
+use dataplane::observability::{MetricsRecorder, Observation};
 use dataplane::route::{
     AcquireError, BackendDialer, CenteredJitter, DialSchedule, RouteChannel, RouteChannelError,
     RouteEngine,
 };
 use dataplane::route_control::{
-    AssignmentRouter, ControlRouteChannel, EnvelopeSink, TcpDialer, TrafficTotals,
-    connection_closed, connection_opened,
+    AssignmentRouter, ClusterTcpDialer, ControlRouteChannel, EnvelopeSink, TcpDialer,
+    TrafficTotals, connection_closed, connection_opened,
 };
 use tokio::sync::mpsc;
 
@@ -272,7 +273,7 @@ async fn tcp_dialer_connects_and_stays_cluster_unaware() {
         Ok(address) => address.to_string(),
         Err(error) => unreachable!("local_addr: {error}"),
     };
-    let mut dialer = TcpDialer;
+    let mut dialer = TcpDialer::default();
     assert!(dialer.dial(&address, "").await.is_ok(), "loopback connects");
 
     // A cluster-scoped assignment through the engine fails closed:
@@ -284,7 +285,7 @@ async fn tcp_dialer_connects_and_stays_cluster_unaware() {
     };
     let mut engine = RouteEngine::new(
         OneAssignment(Some(scoped)),
-        TcpDialer,
+        TcpDialer::default(),
         DialSchedule::default(),
         CenteredJitter,
         CONN_ID,
@@ -298,4 +299,44 @@ async fn tcp_dialer_connects_and_stays_cluster_unaware() {
             cluster_name: "serverless-1".to_owned()
         }
     );
+}
+
+/// DPL-07's system-resolver dialer accepts the current concrete-address
+/// cluster scope while preserving DPL-05's non-blocking failed-dial metric.
+#[tokio::test]
+async fn cluster_tcp_dialer_is_cluster_aware_and_observable() {
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) => unreachable!("bind: {error}"),
+    };
+    let address = match listener.local_addr() {
+        Ok(address) => address.to_string(),
+        Err(error) => unreachable!("local_addr: {error}"),
+    };
+    let scoped = RouteAssignment {
+        cluster_name: "default".to_owned(),
+        ..assignment("as-cluster", "tidb-cluster", address.as_str())
+    };
+    let mut engine = RouteEngine::new(
+        OneAssignment(Some(scoped)),
+        ClusterTcpDialer::default(),
+        DialSchedule::default(),
+        CenteredJitter,
+        CONN_ID,
+    );
+    let acquired = match engine.acquire(Vec::new()).await {
+        Ok(acquired) => acquired,
+        Err(error) => unreachable!("cluster-scoped loopback connects: {error:?}"),
+    };
+    assert_eq!(acquired.backend.cluster_name, "default");
+
+    let (metrics, mut observations) = MetricsRecorder::channel(1);
+    let mut dialer = ClusterTcpDialer::new(metrics);
+    assert!(dialer.dial("127.0.0.1:0", "default").await.is_err());
+    match observations.try_recv() {
+        Ok(Observation::DialBackendFailed { backend }) => {
+            assert_eq!(backend, "127.0.0.1:0");
+        }
+        other => unreachable!("one failed-dial observation: {other:?}"),
+    }
 }

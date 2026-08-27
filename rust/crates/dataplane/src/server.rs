@@ -135,7 +135,7 @@ struct ServerCounters {
 }
 
 /// Connection and listener lifecycle metrics without a Prometheus dependency.
-/// DPL-06 exports these atomics through the control-plane metrics batch.
+/// DPL-05 exports these atomics through the control-plane metrics batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServerMetricsSnapshot {
     /// Current admitted connections.

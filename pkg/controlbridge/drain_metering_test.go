@@ -25,6 +25,7 @@ import (
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
+	proxymetrics "github.com/pingcap/tiproxy/pkg/metrics"
 )
 
 // mustDrainIssuer builds an issuer or fails the test: crypto/rand is
@@ -200,6 +201,50 @@ func TestMeteringConsumerDeduplicatesBySequence(t *testing.T) {
 	require.EqualValues(t, 4, consumer.LastApplied())
 	response, _ = consumer.Totals("ks-a", "tidb-a", false)
 	require.EqualValues(t, 158, response)
+}
+
+func TestCompositeHandlerAppliesMetricsWithoutControlFailure(t *testing.T) {
+	adapter := newTestAdapter(t, &recordingHandler{rt: router.NewStaticRouter(nil)})
+	composite, err := NewCompositeControlHandler(adapter, mustDrainIssuer(t), NewMeteringConsumer())
+	require.NoError(t, err)
+	peer := newFakeSender(61)
+
+	query := proxymetrics.QueryTotalCounter.WithLabelValues("rust-composite-test", "Query")
+	queryBefore, err := proxymetrics.ReadCounter(query)
+	require.NoError(t, err)
+	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
+		RequestId: 1,
+		Body: &controlpb.ControlEnvelope_MetricsBatch{MetricsBatch: &controlpb.MetricsBatch{
+			Sequence: 1,
+			Metrics: []*controlpb.MetricDelta{{
+				Name: "tiproxy_session_query_total",
+				Labels: map[string]string{
+					proxymetrics.LblBackend: "rust-composite-test",
+					proxymetrics.LblCmdType: "Query",
+				},
+				CounterDelta: 2,
+			}},
+		}},
+	}))
+	queryAfter, err := proxymetrics.ReadCounter(query)
+	require.NoError(t, err)
+	require.Equal(t, queryBefore+2, queryAfter)
+
+	invalid := proxymetrics.ServerErrCounter.WithLabelValues("rust_metrics_invalid")
+	invalidBefore, err := proxymetrics.ReadCounter(invalid)
+	require.NoError(t, err)
+	// Unknown metrics are observable but intentionally do not close or fail
+	// the control stream: SQL/control work must continue when metrics degrade.
+	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
+		RequestId: 2,
+		Body: &controlpb.ControlEnvelope_MetricsBatch{MetricsBatch: &controlpb.MetricsBatch{
+			Sequence: 2,
+			Metrics:  []*controlpb.MetricDelta{{Name: "not_in_the_closed_catalog"}},
+		}},
+	}))
+	invalidAfter, err := proxymetrics.ReadCounter(invalid)
+	require.NoError(t, err)
+	require.Equal(t, invalidBefore+1, invalidAfter)
 }
 
 // Go↔Rust drain roundtrip at the wire-type level: the command the

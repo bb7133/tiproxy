@@ -34,6 +34,7 @@ use control_proto::v1::{
 use dataplane::control_dispatch::{
     ControlCommandHandler, DispatchSender, spawn_control_dispatch_parts,
 };
+use dataplane::observability::{MetricsRecorder, Observation, QuitSource};
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
@@ -378,6 +379,7 @@ struct Stack {
     server_task: tokio::task::JoinHandle<()>,
     dispatch_task: tokio::task::JoinHandle<Result<(), dataplane::control_dispatch::DispatchFatal>>,
     backend_port: u16,
+    metrics_rx: mpsc::Receiver<Observation>,
 }
 
 async fn spawn_stack() -> Stack {
@@ -404,20 +406,24 @@ async fn spawn_stack() -> Stack {
 
     // The engine owner over a real (never-connecting) control client.
     let client = control_client();
+    let (metrics, metrics_rx) = MetricsRecorder::channel(128);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (drain_tx, drain_rx) = watch::channel(false);
-    let owner: Arc<dyn BoundSessionHandler> = Arc::new(EngineSessionOwner::new(
-        Arc::clone(&client),
-        "default",
-        shutdown_rx,
-        drain_rx,
-        SessionLoopConfig {
-            handshake_deadline: Duration::from_secs(5),
-            drain_deadline: Duration::from_millis(400),
-            backend_check_interval: Duration::from_secs(60),
-            cleanup_deadline: Duration::from_secs(2),
-        },
-    ));
+    let owner: Arc<dyn BoundSessionHandler> = Arc::new(
+        EngineSessionOwner::new(
+            Arc::clone(&client),
+            "default",
+            shutdown_rx,
+            drain_rx,
+            SessionLoopConfig {
+                handshake_deadline: Duration::from_secs(5),
+                drain_deadline: Duration::from_millis(400),
+                backend_check_interval: Duration::from_secs(60),
+                cleanup_deadline: Duration::from_secs(2),
+            },
+        )
+        .with_metrics(metrics),
+    );
     let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
     assert!(installer.install(handle));
 
@@ -453,6 +459,7 @@ async fn spawn_stack() -> Stack {
         server_task,
         dispatch_task,
         backend_port: backend_addr.port(),
+        metrics_rx,
     }
 }
 
@@ -786,6 +793,68 @@ async fn select_one_roundtrip_end_to_end() {
     };
     assert!(event.client_in_bytes > 0, "totals captured: {event:?}");
     assert!(event.backend_in_bytes > 0);
+    stack.dispatch_task.abort();
+}
+
+/// The real session path emits payload-free metrics with the legacy command
+/// and quit-source labels. This is the bridge between the DPL-04 engine and
+/// the DPL-05 exporter, not only an aggregator unit test.
+#[tokio::test]
+async fn session_path_emits_query_traffic_and_exact_quit_source() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("SELECT 1").await);
+    client.quit().await;
+
+    let mut saw_handshake = false;
+    let mut saw_query = false;
+    let mut saw_close = false;
+    let received = timeout(Duration::from_secs(5), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            match observation {
+                Observation::HandshakeCompleted {
+                    backend, traffic, ..
+                } => {
+                    assert!(backend.ends_with(&stack.backend_port.to_string()));
+                    assert!(traffic.inbound_bytes > 0);
+                    assert!(traffic.outbound_bytes > 0);
+                    saw_handshake = true;
+                }
+                Observation::CommandCompleted {
+                    backend,
+                    command,
+                    traffic,
+                    ..
+                } if command.name() == "Query" => {
+                    assert!(backend.ends_with(&stack.backend_port.to_string()));
+                    assert!(traffic.inbound_bytes > 0);
+                    assert!(traffic.outbound_bytes > 0);
+                    saw_query = true;
+                }
+                Observation::SessionClosed { source, .. } => {
+                    assert_eq!(source, QuitSource::None);
+                    saw_close = true;
+                }
+                _ => {}
+            }
+            if saw_handshake && saw_query && saw_close {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        received.is_ok(),
+        "session observations reach the bounded queue"
+    );
+    assert!(saw_handshake && saw_query && saw_close);
     stack.dispatch_task.abort();
 }
 

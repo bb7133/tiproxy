@@ -26,6 +26,7 @@ import (
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
+	"github.com/pingcap/tiproxy/pkg/metrics"
 )
 
 // DrainIssuer owns the Go side of scoped drain (CTL-06): it issues
@@ -222,6 +223,15 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 		// through the reconcile snapshot. Refused batches are the
 		// producer's replay concern, not an error.
 		_ = handler.consumer.Apply(body.MeteringBatch)
+		return nil
+	case *controlpb.ControlEnvelope_MetricsBatch:
+		// Metrics are deliberately best effort: invalid or stale batches are
+		// counted and ignored without taking down the control stream. The
+		// closed metric catalog and bounded series store prevent arbitrary
+		// labels from becoming an allocation channel.
+		if err := metrics.ApplyRustMetricsBatch(sender.Epoch(), body.MetricsBatch); err != nil {
+			metrics.ServerErrCounter.WithLabelValues("rust_metrics_invalid").Inc()
+		}
 		return nil
 	case *controlpb.ControlEnvelope_DrainResult:
 		return handler.issuer.HandleDrainResult(body.DrainResult)

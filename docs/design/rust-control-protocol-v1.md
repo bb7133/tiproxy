@@ -139,6 +139,40 @@ redirect, drain, assignment result, connection-close, and reconciliation
 records are never displaced by metrics. Queue accounting includes protobuf
 bytes and fixed per-entry overhead, not only message count.
 
+### Metrics batch catalog semantics
+
+`MetricDelta` is interpreted only through the closed metric catalog shared by
+the Rust producer and Go consumer. Counters carry a non-negative
+`counter_delta`. Gauges carry an absolute `gauge` value and are resent every
+export interval, including after reconnect. Histograms carry the sample-count
+delta in `counter_delta`, the sample-sum delta in `gauge`, and one cumulative
+bucket delta for every finite bucket of the named existing Prometheus
+histogram, in ascending-bound order. The Go collector adds these remote
+values to the same names, help strings, labels, sums, counts, and buckets as
+the Go dataplane; no parallel Rust-only series is exposed.
+
+Names, label keys, enumerated label values, label byte lengths, batch entries,
+and retained series are bounded at both peers. Unknown or malformed metric
+entries are counted and discarded without closing the control stream. The SQL
+path writes only to a bounded non-blocking observation queue; a full queue or
+bulk lane increments a local drop counter and never blocks SQL, drain,
+reconciliation, or metering. Counter/histogram deltas remain locally
+coalesced until a batch is accepted by the Rust transport, while metrics as a
+whole remain best effort once written. Metering continues to use its separate
+durable, acknowledged ledger and never shares this loss policy.
+
+| Owner/source | Existing Prometheus series carried by `MetricsBatch` | Bounded labels |
+|---|---|---|
+| Listener/session lifecycle | `tiproxy_server_connections`, `tiproxy_server_create_connection_total`, `tiproxy_server_reject_connection_total`, `tiproxy_server_disconnection_total` | rejection `type` is `memory` or `max_connections`; disconnection `type` is the closed Go quit-source enum |
+| Session commands | `tiproxy_session_query_total`, `tiproxy_session_query_duration_seconds`, `tiproxy_session_handshake_duration_seconds`, `tiproxy_session_query_time_since_conn_creation_seconds`, `tiproxy_session_conn_lifetime_seconds` | backend address plus the fixed 32-value MySQL command enum where applicable |
+| Routing/traffic | `tiproxy_backend_get_backend_duration_seconds`, `tiproxy_backend_get_backend`, `tiproxy_backend_dial_backend_fail`, `tiproxy_traffic_inbound_bytes`, `tiproxy_traffic_inbound_packets`, `tiproxy_traffic_outbound_bytes`, `tiproxy_traffic_outbound_packets`, `tiproxy_traffic_cross_location_bytes` | backend address and `res={succeed,fail}` where applicable |
+| Rust/control health | `tiproxy_server_event`, `tiproxy_server_err` | closed Rust event/error enums for reconnects, local observation/batch drops, control drops/failures, and listener/runtime failures |
+
+Migration counters, pending gauges, and backend connection gauges remain
+Go-owned observations of projected connection/redirect lifecycle events; they
+are not duplicated in `MetricsBatch`. This preserves their current names and
+single ownership while Rust session migration support is completed separately.
+
 ## Heartbeats, deadlines, and reconnect
 
 Both peers send a heartbeat every second when no higher-priority record has
