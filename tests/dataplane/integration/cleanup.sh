@@ -54,6 +54,11 @@ stop_owned_process() {
 }
 
 cleanup_status=0
+# Error-parity conflict phase leftovers (present only when that phase
+# started and then failed before its own teardown).
+stop_owned_process "${HOLDER_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
+stop_owned_process "${CONFLICT_PID:-}" "$run_dir/tiproxy-conflict.toml" || cleanup_status=1
+stop_owned_process "${RUST_CONFLICT_PID:-}" "$run_dir/absent.sock" || cleanup_status=1
 stop_owned_process "${FAULT_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
 # SIGINT drives tiproxy-rs's coordinated shutdown (stop-accept ->
 # graceful drain -> force -> join); its command line carries this run's

@@ -231,7 +231,9 @@ async fn spawn_health(
     }
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
-        .map_err(|error| format!("bind health endpoint: {error}"))?;
+        // The operator diagnostic names the exact port: a bind conflict
+        // must be traceable to the address that caused it.
+        .map_err(|error| format!("bind health endpoint 127.0.0.1:{port}: {error}"))?;
     Ok(Some(tokio::spawn(health::serve(listener, serving))))
 }
 

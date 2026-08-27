@@ -1009,6 +1009,22 @@ impl Engine {
                     succeeded: false,
                 });
                 self.quit_source = acquire_quit_source(&error);
+                // Go parity: a NO_BACKEND refusal reaches the client
+                // as the approved vocabulary before the session closes
+                // (Go maps router.ErrNoBackend to ErrProxyNoBackend in
+                // ErrToClient); other acquire failures keep Go's
+                // behavior of closing without a client error packet.
+                if matches!(error, AcquireError::NoBackend { .. }) {
+                    self.client_w
+                        .reset_sequence(self.client_r.expected_sequence());
+                    let _ = self
+                        .write_client_error(
+                            1105,
+                            *b"HY000",
+                            "No available TiDB instances, please make sure TiDB is available",
+                        )
+                        .await;
+                }
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
                 return Some(WireErrorSource::Proxy);
             }
