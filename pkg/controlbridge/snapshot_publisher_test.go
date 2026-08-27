@@ -181,3 +181,90 @@ func TestSnapshotPublisherRejectsFalseOKWithoutMutatingStatus(t *testing.T) {
 	require.Equal(t, uint64(0), status.AppliedGeneration)
 	require.Equal(t, controlpb.ErrorCode_ERROR_CODE_UNSPECIFIED, status.LastResultCode)
 }
+
+func TestSnapshotPublisherCarriesTopologyProjection(t *testing.T) {
+	cfg := config.NewConfig()
+	builder, err := NewSnapshotBuilder(cfg, nil)
+	require.NoError(t, err)
+	publisher, err := NewSnapshotPublisher(SnapshotPublisherConfig{
+		Builder:              builder,
+		Initial:              cfg,
+		AdvertisedCapability: 123,
+		ServerVersion:        "test-server",
+		Topology: func() ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
+			return []*controlpb.BackendSnapshot{{
+					BackendId:   "alpha/tidb-1:4000",
+					Address:     "tidb-1:4000",
+					ClusterName: "alpha",
+					Keyspace:    "ks-a",
+					Healthy:     true,
+				}}, []*controlpb.NamespaceSnapshot{{
+					Name:           "ns-alpha",
+					Users:          []string{"alice"},
+					BackendCluster: "alpha",
+				}}
+		},
+	})
+	require.NoError(t, err)
+
+	sender := &snapshotSender{epoch: 7}
+	require.NoError(t, publisher.Sync(context.Background(), sender))
+	sent := sender.envelopes()
+	require.NotEmpty(t, sent)
+	snapshot := sent[len(sent)-1].GetStateSnapshot()
+	require.NotNil(t, snapshot)
+	require.Len(t, snapshot.GetBackends(), 1, "the wire snapshot carries the backend topology")
+	require.Equal(t, "alpha/tidb-1:4000", snapshot.GetBackends()[0].GetBackendId())
+	require.Equal(t, "ks-a", snapshot.GetBackends()[0].GetKeyspace())
+	require.Len(t, snapshot.GetNamespaces(), 1, "the wire snapshot carries the namespace topology")
+	require.Equal(t, "ns-alpha", snapshot.GetNamespaces()[0].GetName())
+	require.Equal(t, []string{"alice"}, snapshot.GetNamespaces()[0].GetUsers())
+	require.Equal(t, "alpha", snapshot.GetNamespaces()[0].GetBackendCluster())
+}
+
+func TestSnapshotPublisherStagesTopologyRefreshOnlyOnChange(t *testing.T) {
+	var mu sync.Mutex
+	cluster := "alpha"
+	cfg := config.NewConfig()
+	builder, err := NewSnapshotBuilder(cfg, nil)
+	require.NoError(t, err)
+	publisher, err := NewSnapshotPublisher(SnapshotPublisherConfig{
+		Builder:              builder,
+		Initial:              cfg,
+		AdvertisedCapability: 123,
+		ServerVersion:        "test-server",
+		Topology: func() ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
+			mu.Lock()
+			defer mu.Unlock()
+			return []*controlpb.BackendSnapshot{{
+					BackendId:   cluster + "/tidb:4000",
+					Address:     "tidb:4000",
+					ClusterName: cluster,
+					Healthy:     true,
+				}}, []*controlpb.NamespaceSnapshot{{
+					Name:           "default",
+					BackendCluster: cluster,
+				}}
+		},
+	})
+	require.NoError(t, err)
+	staged := publisher.Status().DesiredGeneration
+
+	// Unchanged topology stages nothing: generations advance only on
+	// real change.
+	require.NoError(t, publisher.RefreshTopology())
+	require.Equal(t, staged, publisher.Status().DesiredGeneration)
+
+	// A live change (namespace commit, backend health) stages a fresh
+	// generation carrying the new projection.
+	mu.Lock()
+	cluster = "beta"
+	mu.Unlock()
+	require.NoError(t, publisher.RefreshTopology())
+	require.Equal(t, staged+1, publisher.Status().DesiredGeneration)
+	publisher.mu.Lock()
+	snapshot := publisher.desired.GetStateSnapshot()
+	publisher.mu.Unlock()
+	require.Equal(t, "beta", snapshot.GetNamespaces()[0].GetBackendCluster())
+	require.Equal(t, "beta/tidb:4000", snapshot.GetBackends()[0].GetBackendId())
+}

@@ -72,13 +72,20 @@ func (handler *DefaultHandshakeHandler) HandleHandshakeErr(ctx ConnContext, err 
 	return false
 }
 
+// ErrNamespaceNotFound refuses a handshake whose user matches no
+// namespace when no default namespace exists. Its exact text is part
+// of the approved client-facing vocabulary (control protocol v1 ADR):
+// Go mode has always sent it to the client, and the Rust decision
+// surfaces the same message.
+var ErrNamespaceNotFound = errors.New("failed to find a namespace")
+
 func (handler *DefaultHandshakeHandler) GetRouter(ctx ConnContext, resp *pnet.HandshakeResp) (router.Router, error) {
 	ns, ok := handler.nsManager.GetNamespaceByUser(resp.User)
 	if !ok {
 		ns, ok = handler.nsManager.GetNamespace("default")
 	}
 	if !ok {
-		return nil, errors.New("failed to find a namespace")
+		return nil, ErrNamespaceNotFound
 	}
 	ctx.SetValue(ConnContextKeyNamespace, ns.Name())
 	ctx.UpdateLogger(zap.String("ns", ns.Name()))

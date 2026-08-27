@@ -151,6 +151,11 @@ func (bridge *Bridge) Run(ctx context.Context) error {
 				_ = bridge.adapter.ResolveOrphans(ctx)
 			case <-snapshotTicker.C:
 				if bridge.publisher != nil {
+					// A topology change (namespace commit, backend
+					// health) stages a fresh generation before the
+					// sync, so the wire snapshot stays live without a
+					// config change.
+					_ = bridge.publisher.RefreshTopology()
 					_ = bridge.publisher.Sync(ctx, bridge.server.Active())
 				}
 			}
