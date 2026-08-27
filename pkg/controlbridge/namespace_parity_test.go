@@ -5,6 +5,7 @@ package controlbridge
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -16,8 +17,10 @@ import (
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/manager/namespace"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
+	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/encoding/prototext"
 )
 
 // manualObserver feeds scripted health results through the production
@@ -271,4 +274,45 @@ func TestDynamicNamespaceChangeKeepsExistingSession(t *testing.T) {
 	// A brand-new connection observes the committed change.
 	address, _ := rustModeSelection(t, adapter, peer, 501, "0.0.0.0:6000", "root")
 	require.Equal(t, "new-tidb:4000", address)
+}
+
+// failingHandler refuses every handshake with an arbitrary diagnostic
+// error, standing in for a custom handler whose text must never cross
+// to the client.
+type failingHandler struct {
+	recordingHandler
+	err error
+}
+
+func (handler *failingHandler) GetRouter(backend.ConnContext, *pnet.HandshakeResp) (router.Router, error) {
+	return nil, handler.err
+}
+
+// v1 ADR trust boundary: only APPROVED messages reach the client. The
+// unknown-namespace refusal is approved (Go mode's exact text); any
+// other handler diagnostic stays server-side — no outbound envelope
+// may carry it.
+func TestHandshakeRejectionMessageAllowlist(t *testing.T) {
+	secret := "secret-token-XYZ-must-not-leak"
+	adapter := newTestAdapter(t, &failingHandler{err: errors.New(secret)})
+	peer := newFakeSender(1)
+	sendHandshake(t, adapter, peer, 600, "0.0.0.0:6000", "root")
+	decision := lastDecision(t, peer)
+	require.False(t, decision.GetAccept())
+	require.Equal(t, "handshake rejected", decision.GetClientMessage(),
+		"an arbitrary handler diagnostic collapses to the generic refusal")
+	peer.mu.Lock()
+	outbound := append([]*controlpb.ControlEnvelope(nil), peer.messages...)
+	peer.mu.Unlock()
+	for _, envelope := range outbound {
+		require.NotContains(t, prototext.Format(envelope), secret,
+			"no outbound envelope carries the handler's diagnostic")
+	}
+
+	// The approved unknown-namespace refusal keeps Go mode's exact text.
+	emptyAdapter := newTestAdapter(t, backend.NewDefaultHandshakeHandler(namespace.NewNamespaceManager()))
+	emptyPeer := newFakeSender(1)
+	sendHandshake(t, emptyAdapter, emptyPeer, 601, "0.0.0.0:6000", "root")
+	require.Equal(t, backend.ErrNamespaceNotFound.Error(),
+		lastDecision(t, emptyPeer).GetClientMessage())
 }

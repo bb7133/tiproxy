@@ -285,12 +285,15 @@ func (adapter *RouterAdapter) rejectHandshakeLocked(
 	state *connectionState,
 	err error,
 ) error {
-	// Parity: Go mode surfaces the handshake handler's own message to
-	// the client (ER_UNKNOWN_ERROR text via MakeUserError), so the
-	// decision carries the same text instead of a generic phrase.
+	// v1 ADR: client-facing errors carry an enumerated code plus an
+	// APPROVED message — arbitrary Go diagnostic text stays in the
+	// server-side notification and never crosses to the client. The
+	// unknown-namespace refusal is part of the approved vocabulary and
+	// matches Go mode's exact client text; everything else stays
+	// generic.
 	message := "handshake rejected"
-	if err != nil {
-		message = err.Error()
+	if errors.Is(err, backend.ErrNamespaceNotFound) {
+		message = backend.ErrNamespaceNotFound.Error()
 	}
 	state.decision = &controlpb.HandshakeDecision{
 		ConnectionId:  state.conn.ConnectionID(),

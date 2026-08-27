@@ -935,7 +935,10 @@ fn validate_backends(backends: &[BackendSnapshot]) -> Result<(), SnapshotError> 
             return Err(SnapshotError::invalid("backend_id is duplicated"));
         }
         validate_host_port(&backend.address, "backend address")?;
-        if backend.cluster_name.is_empty() || backend.cluster_name.len() > 255 {
+        // A clusterless backend is the honest legacy projection: static
+        // `backend.instances` carry no cluster name at all (DPL-07).
+        // Empty is legal; a present name is length-bounded.
+        if backend.cluster_name.len() > 255 {
             return Err(SnapshotError::invalid("backend cluster_name is invalid"));
         }
         for cidr in &backend.cidrs {
