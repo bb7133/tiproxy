@@ -2129,3 +2129,236 @@ async fn queued_adoption_precedes_the_automatic_reconcile() {
     );
     harness.task.abort();
 }
+
+/// A sender whose session-scoped sends fail on demand — the repair
+/// path must not presume an always-successful transport.
+struct ScriptedSender {
+    next: AtomicU64,
+    sent: Mutex<Vec<ControlEnvelope>>,
+    fail_scoped_with: Mutex<Option<ScriptedFailure>>,
+}
+
+#[derive(Clone, Copy)]
+enum ScriptedFailure {
+    StaleEpoch,
+    QueueFull,
+    Closed,
+}
+
+impl ScriptedSender {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next: AtomicU64::new(0),
+            sent: Mutex::new(Vec::new()),
+            fail_scoped_with: Mutex::new(None),
+        })
+    }
+
+    fn sent(&self) -> Vec<ControlEnvelope> {
+        let Ok(sent) = self.sent.lock() else {
+            unreachable!("sent lock poisoned")
+        };
+        sent.clone()
+    }
+
+    fn fail_scoped_with(&self, failure: Option<ScriptedFailure>) {
+        let Ok(mut mode) = self.fail_scoped_with.lock() else {
+            unreachable!("mode lock poisoned")
+        };
+        *mode = failure;
+    }
+}
+
+impl DispatchSender for ScriptedSender {
+    fn allocate_request_id(&self) -> Option<u64> {
+        Some(self.next.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    async fn send_envelope(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
+        let Ok(mut sent) = self.sent.lock() else {
+            unreachable!("sent lock poisoned")
+        };
+        sent.push(envelope);
+        Ok(())
+    }
+
+    async fn send_session_scoped(
+        &self,
+        envelope: ControlEnvelope,
+        _epoch: u64,
+    ) -> Result<(), TransportError> {
+        let failure = {
+            let Ok(mode) = self.fail_scoped_with.lock() else {
+                unreachable!("mode lock poisoned")
+            };
+            *mode
+        };
+        match failure {
+            Some(ScriptedFailure::StaleEpoch) => Err(TransportError::StaleSessionEpoch),
+            Some(ScriptedFailure::QueueFull) => Err(TransportError::QueueFull),
+            Some(ScriptedFailure::Closed) => Err(TransportError::Closed),
+            None => {
+                let Ok(mut sent) = self.sent.lock() else {
+                    unreachable!("sent lock poisoned")
+                };
+                sent.push(envelope);
+                Ok(())
+            }
+        }
+    }
+}
+
+struct ScriptedHarness {
+    sender: Arc<ScriptedSender>,
+    state_tx: watch::Sender<ConnectionState>,
+    notice_tx: mpsc::Sender<DispatchNotice>,
+    /// Held open so the loop's inbound arm never observes closure.
+    _inbound_tx: mpsc::Sender<ControlEnvelope>,
+    /// Held open so snapshot forwarding never observes closure.
+    _snapshot_rx: mpsc::Receiver<ControlEnvelope>,
+    task: tokio::task::JoinHandle<Result<(), DispatchFatal>>,
+}
+
+fn spawn_scripted_loop(handler: ControlCommandHandler) -> ScriptedHarness {
+    let sender = ScriptedSender::new();
+    let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+    let (inbound_tx, inbound_rx) = mpsc::channel(16);
+    let (notice_tx, notice_rx) = mpsc::channel(16);
+    let (snapshot_tx, snapshot_rx) = mpsc::channel(4);
+    let task = tokio::spawn(run_control_dispatch(
+        handler,
+        Arc::clone(&sender),
+        state_rx,
+        inbound_rx,
+        notice_rx,
+        snapshot_tx,
+        Duration::from_secs(3600),
+        || 1_000_000,
+    ));
+    ScriptedHarness {
+        sender,
+        state_tx,
+        notice_tx,
+        _inbound_tx: inbound_tx,
+        _snapshot_rx: snapshot_rx,
+        task,
+    }
+}
+
+async fn wait_for_scripted_sent(
+    sender: &Arc<ScriptedSender>,
+    count: usize,
+) -> Vec<ControlEnvelope> {
+    for _ in 0..1_000 {
+        let sent = sender.sent();
+        if sent.len() >= count {
+            return sent;
+        }
+        tokio::task::yield_now().await;
+    }
+    unreachable!("scripted loop never sent {count} envelopes")
+}
+
+fn scripted_stale_export_handler() -> ControlCommandHandler {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7);
+    let (tx, rx) = mpsc::channel(8);
+    std::mem::forget(rx);
+    handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
+    handler
+}
+
+/// An unrecoverable repair enqueue failure withholds the applied ack:
+/// the commander observes `false` and the session fails closed instead
+/// of routing while the peer's last observation is the stale seed.
+#[tokio::test(start_paused = true)]
+async fn failed_repair_send_withholds_the_namespace_ack() {
+    for failure in [ScriptedFailure::QueueFull, ScriptedFailure::Closed] {
+        let harness = spawn_scripted_loop(scripted_stale_export_handler());
+        harness
+            .state_tx
+            .send(ConnectionState::Connected {
+                epoch: 1,
+                capabilities: full_caps(),
+            })
+            .ok();
+        // The automatic reconcile succeeds and exports the seed.
+        let _ = wait_for_scripted_sent(&harness.sender, 1).await;
+        // Every later session-scoped send fails unrecoverably.
+        harness.sender.fail_scoped_with(Some(failure));
+        let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+        assert!(
+            harness
+                .notice_tx
+                .send(DispatchNotice::SetNamespace {
+                    connection_id: 1,
+                    namespace: "ns-wired".to_owned(),
+                    applied: applied_tx,
+                })
+                .await
+                .is_ok()
+        );
+        assert!(
+            applied_rx.await.is_err(),
+            "an unrecoverable repair failure must not ack the adoption"
+        );
+        harness.task.abort();
+    }
+}
+
+/// A stale-epoch repair outcome still acks: the gate already holds the
+/// adopted value, so the next Connected transition's automatic
+/// reconcile IS the barrier — proven here by reconnecting and reading
+/// the re-export.
+#[tokio::test(start_paused = true)]
+async fn stale_epoch_repair_acks_and_the_next_reconcile_re_exports() {
+    let harness = spawn_scripted_loop(scripted_stale_export_handler());
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let _ = wait_for_scripted_sent(&harness.sender, 1).await;
+    // The session dies between the export and the adoption: the repair
+    // send observes a stale epoch.
+    harness
+        .sender
+        .fail_scoped_with(Some(ScriptedFailure::StaleEpoch));
+    let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+    assert!(
+        harness
+            .notice_tx
+            .send(DispatchNotice::SetNamespace {
+                connection_id: 1,
+                namespace: "ns-wired".to_owned(),
+                applied: applied_tx,
+            })
+            .await
+            .is_ok()
+    );
+    assert!(
+        applied_rx.await.is_ok(),
+        "a stale-epoch repair is barriered by the next reconcile and acks"
+    );
+    // The barrier is real: the next Connected transition re-exports the
+    // adopted value from the gate.
+    harness.sender.fail_scoped_with(None);
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let sent = wait_for_scripted_sent(&harness.sender, 2).await;
+    let Some(Body::ReconcileRequest(request)) = &sent[sent.len() - 1].body else {
+        unreachable!("the reconnect reconciles automatically")
+    };
+    assert_eq!(
+        request.connections[0].namespace, "ns-wired",
+        "the next-epoch reconcile exports the adopted namespace"
+    );
+    harness.task.abort();
+}
