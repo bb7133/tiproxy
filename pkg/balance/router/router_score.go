@@ -364,6 +364,15 @@ func (router *ScoreBasedRouter) updateGroups() {
 		case MatchAll:
 			if len(router.groups) == 0 {
 				group, _ = NewGroup(nil, router.bpCreator, router.matchType, router.logger)
+				// A new group must observe the CURRENT config, exactly
+				// like the label/port branches below: without this a
+				// startup fail-backend-list (and failover-timeout) is
+				// silently ignored for MatchAll routers.
+				if router.cfgGetter != nil {
+					if cfg := router.cfgGetter.GetConfig(); cfg != nil {
+						group.SetConfig(cfg)
+					}
+				}
 				router.groups = append(router.groups, group)
 			}
 			group = router.groups[0]

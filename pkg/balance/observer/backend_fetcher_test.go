@@ -42,6 +42,26 @@ func TestPDFetcher(t *testing.T) {
 			},
 		},
 		{
+			// The path-parsed keyspace must survive projection into
+			// BackendInfo — routing's cross-keyspace guard depends on
+			// it, and it must win over any operator label.
+			infos: map[string]*infosync.TiDBTopologyInfo{
+				"3.3.3.3:4000": {
+					Addr:       "3.3.3.3:4000",
+					Keyspace:   "ks-path",
+					Labels:     map[string]string{"keyspace": "ks-label"},
+					IP:         "3.3.3.3",
+					StatusPort: 10080,
+				},
+			},
+			check: func(m map[string]*BackendInfo) {
+				require.Len(t, m, 1)
+				require.NotNil(t, m["3.3.3.3:4000"])
+				require.Equal(t, "ks-path", m["3.3.3.3:4000"].Keyspace)
+				require.Equal(t, map[string]string{"keyspace": "ks-label"}, m["3.3.3.3:4000"].Labels)
+			},
+		},
+		{
 			infos: map[string]*infosync.TiDBTopologyInfo{
 				"1.1.1.1:4000": {
 					Addr:       "1.1.1.1:4000",
