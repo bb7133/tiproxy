@@ -52,7 +52,8 @@
 //! This slice serves the TLS-disabled, uncompressed path: the greeting
 //! advertises neither SSL nor compression, so a compliant client never
 //! negotiates them; an `SSLRequest` against a no-SSL greeting is a
-//! protocol violation and closes the session. `COM_CHANGE_USER` is
+//! protocol violation and closes the session. `COM_CHANGE_USER` and
+//! `COM_STMT_PREPARE` (the prepared special response flow) are
 //! answered with a fixed unsupported error and the session closes. A
 //! control redirect reports `NotifyRedirectFailed` fail-closed (the
 //! gate terminal is exact and the session keeps its backend — Go's
@@ -69,13 +70,13 @@ use control_proto::v1::{
     RouteResult,
 };
 use mysql_wire::{
-    CapabilityFlags, CommandPacket, StatusFlags, encode_error_packet, encode_initial_handshake,
-    parse_handshake_response,
+    CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags, encode_error_packet,
+    encode_handshake_response, encode_initial_handshake, parse_handshake_response,
 };
 use proxy_io::{PacketReader, PacketWriter};
 use session_core::auth::{
-    AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, classify_backend_auth_packet,
-    plan_backend_handshake,
+    AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, UNKNOWN_AUTH_PLUGIN,
+    classify_backend_auth_packet, plan_backend_handshake,
 };
 use session_core::command::{
     Command, CommandSessionState, CommandStateEffects, ExpectedResponse, SessionMutation, dispatch,
@@ -85,6 +86,7 @@ use session_core::fsm::{SessionEffect, SessionEvent};
 use session_core::handshake::{
     ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend, verify_backend,
 };
+use session_core::prepared::PreparedRegistry;
 use session_core::response::{
     DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseObserver,
     ResponsePacket,
@@ -151,6 +153,12 @@ const ER_CHANGE_USER_UNSUPPORTED: (u16, [u8; 5], &str) = (
     1105,
     *b"HY000",
     "TiProxy-rs: COM_CHANGE_USER is not supported yet",
+);
+/// Fixed error for the fail-closed `COM_STMT_PREPARE` slice boundary.
+const ER_STMT_PREPARE_UNSUPPORTED: (u16, [u8; 5], &str) = (
+    1105,
+    *b"HY000",
+    "TiProxy-rs: COM_STMT_PREPARE is not supported yet",
 );
 
 /// Commands into the engine task.
@@ -418,12 +426,17 @@ pub async fn run_bound_session(
         relay_hold: None,
         cmd_state: None,
         in_transaction: false,
+        prepared: PreparedRegistry::new(),
         pending_command: None,
         wire_end: None,
         closing: false,
         seat,
     };
 
+    // The owner watches the same shutdown signal the loop consumes, so
+    // it can arm the shared absolute force budget the moment the signal
+    // fires — not only when the loop finishes its own cleanup.
+    let mut owner_shutdown = shutdown.clone();
     let session_loop = SessionLoop::new(
         EventRx { events: event_rx },
         CmdTx {
@@ -433,8 +446,8 @@ pub async fn run_bound_session(
         shutdown,
         loop_config,
     );
-    let mut loop_task = tokio::spawn(session_loop.run());
-    let engine_task = tokio::spawn(engine.run());
+    let mut loop_task = AbortOnDrop(tokio::spawn(session_loop.run()));
+    let mut engine_task = AbortOnDrop(tokio::spawn(engine.run()));
 
     // The owner: forwards directives while holding the exact command
     // tokens, consumes engine reports, and waits for the loop.
@@ -442,6 +455,13 @@ pub async fn run_bound_session(
     let mut close_token: Option<CommandToken> = None;
     let mut directives_open = true;
     let mut forced_by_control = false;
+    // One absolute force budget: armed when the force signal is first
+    // observed, it bounds the loop's own cleanup AND the engine join
+    // below — never two stacked deadlines.
+    let mut force_deadline: Option<tokio::time::Instant> = None;
+    if *owner_shutdown.borrow() {
+        force_deadline = Some(tokio::time::Instant::now() + loop_config.cleanup_deadline);
+    }
     let mut drain_signaled = *drain.borrow();
     if drain_signaled {
         // Admitted after stop-accept began: close at the first safe
@@ -450,8 +470,14 @@ pub async fn run_bound_session(
     }
     let summary: Option<SessionSummary> = loop {
         tokio::select! {
-            joined = &mut loop_task => {
+            joined = &mut loop_task.0 => {
                 break joined.ok();
+            }
+            changed = owner_shutdown.changed(), if force_deadline.is_none() => {
+                if changed.is_err() || *owner_shutdown.borrow() {
+                    force_deadline =
+                        Some(tokio::time::Instant::now() + loop_config.cleanup_deadline);
+                }
             }
             changed = drain.changed(), if !drain_signaled => {
                 if changed.is_ok() && *drain.borrow() {
@@ -483,6 +509,9 @@ pub async fn run_bound_session(
                 }
                 if directive.control == SessionControl::CloseImmediate {
                     forced_by_control = true;
+                    force_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + loop_config.cleanup_deadline
+                    });
                 }
                 let _ = control_tx.send(directive.control).await;
             }
@@ -498,19 +527,21 @@ pub async fn run_bound_session(
     // gone; drop ours so the engine drains and exits, then join it.
     drop(cmd_tx);
     // The engine may be blocked in a socket forward (a stalled backend
-    // mid-command); the force semantics bound that wait with the same
-    // absolute cleanup budget the loop uses, then hard-cancel — the
-    // sockets drop with the task, which IS the force close.
-    let mut engine_task = engine_task;
-    let engine_exit = if let Ok(joined) =
-        tokio::time::timeout(loop_config.cleanup_deadline, &mut engine_task).await
-    {
-        joined.ok()
-    } else {
-        engine_task.abort();
-        let _ = engine_task.await;
-        None
-    };
+    // mid-command). A forced end shares the ONE absolute budget armed at
+    // the force signal — whatever the loop's own cleanup already spent
+    // is not re-granted here — then hard-cancels: the sockets drop with
+    // the task, which IS the force close. A non-forced end (the client
+    // quit) budgets its ordinary cleanup from now.
+    let join_deadline = force_deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + loop_config.cleanup_deadline);
+    let engine_exit =
+        if let Ok(joined) = tokio::time::timeout_at(join_deadline, &mut engine_task.0).await {
+            joined.ok()
+        } else {
+            engine_task.0.abort();
+            let _ = (&mut engine_task.0).await;
+            None
+        };
     while let Ok(report) = report_rx.try_recv() {
         consume_report(report, &commander, &mut redirect_token).await;
     }
@@ -552,6 +583,17 @@ pub async fn run_bound_session(
         let _ = commander.close_finished(token.id.to_string()).await;
     }
     let _ = commander.session_closed(forced, source, totals).await;
+}
+
+/// Aborts the owned task when dropped: an externally cancelled session
+/// owner never detaches its loop or engine task — abort cancels them at
+/// their next await point and their sockets drop with them.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 async fn consume_report(
@@ -619,6 +661,9 @@ struct Engine {
     relay_hold: Option<Vec<u8>>,
     cmd_state: Option<CommandSessionState>,
     in_transaction: bool,
+    /// SES-00 prepared-statement registry: long-data/cursor guards
+    /// synchronize into the FSM before command-completion boundaries.
+    prepared: PreparedRegistry,
     pending_command: Option<PendingCommand>,
     wire_end: Option<WireErrorSource>,
     closing: bool,
@@ -821,14 +866,39 @@ impl Engine {
         ) {
             return None;
         }
-        // Forward the client's response re-scoped to the planned
-        // capability mask: the raw payload is byte-preserved except the
-        // leading capability word, exactly Go's rewrite.
-        let mut forwarded = self.client_handshake_raw.clone();
-        let planned = plan.capabilities.bits().to_le_bytes();
-        if forwarded.len() >= 4 {
-            forwarded[..4].copy_from_slice(&planned);
-        }
+        // Go's `handshakeFirstTime` rewrite: forward the client's
+        // response under the planned capability mask with the plugin
+        // replaced by `auth_unknown_plugin` and the original auth data
+        // preserved, so the backend re-requests authentication against
+        // its own salt (the client's scramble answered the proxy's) and
+        // keeps the `using password` semantics on failure.
+        let forwarded = {
+            let Ok(parsed) = parse_handshake_response(&self.client_handshake_raw) else {
+                let _ = self.events.send(SessionEvent::ClientIoError).await;
+                return Some(WireErrorSource::Proxy);
+            };
+            let attributes = parsed.attributes.map(|attributes| {
+                attributes
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .collect::<Vec<_>>()
+            });
+            let Ok(forwarded) = encode_handshake_response(HandshakeResponseParams {
+                capabilities: plan.capabilities,
+                max_packet_size: parsed.max_packet_size,
+                collation: parsed.collation,
+                username: parsed.username,
+                auth_response: parsed.auth_response,
+                database: parsed.database,
+                auth_plugin_name: Some(UNKNOWN_AUTH_PLUGIN),
+                attributes: attributes.as_deref(),
+                zstd_level: parsed.zstd_level,
+            }) else {
+                let _ = self.events.send(SessionEvent::ClientIoError).await;
+                return Some(WireErrorSource::Proxy);
+            };
+            forwarded
+        };
         if let Some(backend) = self.backend.as_mut() {
             // Continue the backend channel's connection-phase counter
             // after its greeting.
@@ -994,11 +1064,7 @@ impl Engine {
                     .await;
                 continue;
             };
-            if command == Command::ChangeUser {
-                // Fail-closed slice boundary.
-                let (code, state, message) = ER_CHANGE_USER_UNSUPPORTED;
-                let _ = self.write_client_error(code, state, message).await;
-                let _ = self.events.send(SessionEvent::ClientIoError).await;
+            if self.refuse_unsupported_command(command, expected).await {
                 return Some(WireErrorSource::ClientNetwork);
             }
             let event = if command == Command::Quit {
@@ -1028,7 +1094,11 @@ impl Engine {
             if let Some(source) = self.forward_command_to_backend(&pending).await {
                 return Some(source);
             }
-            self.apply_command_mutations(&pending, false);
+            if let Some(sync) = self.apply_command_mutations(&pending, false)
+                && self.events.send(sync).await.is_err()
+            {
+                return Some(WireErrorSource::Proxy);
+            }
 
             if !pending.expected.waits_for_backend() {
                 if self
@@ -1048,6 +1118,30 @@ impl Engine {
                 return None;
             }
         }
+    }
+
+    /// Answers the fail-closed slice boundaries before any forward:
+    /// `COM_CHANGE_USER` and the prepared special response flow
+    /// (`COM_STMT_PREPARE` column metadata, cursors) are follow-up
+    /// slices — an explicit refusal, never a silent teardown.
+    async fn refuse_unsupported_command(
+        &mut self,
+        command: Command,
+        expected: ExpectedResponse,
+    ) -> bool {
+        let refusal = if command == Command::ChangeUser {
+            Some(ER_CHANGE_USER_UNSUPPORTED)
+        } else if expected == ExpectedResponse::Prepare {
+            Some(ER_STMT_PREPARE_UNSUPPORTED)
+        } else {
+            None
+        };
+        let Some((code, state, message)) = refusal else {
+            return false;
+        };
+        let _ = self.write_client_error(code, state, message).await;
+        let _ = self.events.send(SessionEvent::ClientIoError).await;
+        true
     }
 
     /// Forwards one accepted command to the backend on a fresh exchange:
@@ -1117,6 +1211,16 @@ impl Engine {
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::ClientNetwork);
             }
+            let completes = matches!(
+                effect.disposition,
+                ResponseDisposition::CompleteSuccess | ResponseDisposition::CompleteRaw
+            );
+            if completes
+                && let Some(sync) = self.apply_command_mutations(pending, true)
+                && self.events.send(sync).await.is_err()
+            {
+                return Some(WireErrorSource::Proxy);
+            }
             let event = effect.session_event();
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
@@ -1138,11 +1242,9 @@ impl Engine {
                         return None;
                     }
                 }
-                ResponseDisposition::CompleteSuccess | ResponseDisposition::CompleteRaw => {
-                    self.apply_command_mutations(pending, true);
-                    return None;
-                }
-                ResponseDisposition::CompleteError { .. } => {
+                ResponseDisposition::CompleteSuccess
+                | ResponseDisposition::CompleteRaw
+                | ResponseDisposition::CompleteError { .. } => {
                     return None;
                 }
             }
@@ -1315,18 +1417,25 @@ impl Engine {
         }
     }
 
-    fn apply_command_mutations(&mut self, pending: &PendingCommand, success_stage: bool) {
-        let Some(state) = self.cmd_state.as_mut() else {
-            return;
-        };
+    /// Applies the plan's session and prepared mutations at their
+    /// declared boundary. A prepared-registry change returns its SES-00
+    /// synchronization event, which the caller MUST deliver before the
+    /// command-completion boundary so a queued drain or redirect never
+    /// crosses an unfinished long-data/cursor guard.
+    fn apply_command_mutations(
+        &mut self,
+        pending: &PendingCommand,
+        success_stage: bool,
+    ) -> Option<SessionEvent> {
+        let state = self.cmd_state.as_mut()?;
         // Re-derive the plan's mutations from the held payload: the
         // borrowed plan cannot outlive its packet, so mutations are
         // re-computed at their application point.
         let Ok(packet) = CommandPacket::decode(&pending.payload) else {
-            return;
+            return None;
         };
         let Ok(plan) = dispatch(packet) else {
-            return;
+            return None;
         };
         let effects: CommandStateEffects<'_> = if success_stage {
             plan.after_success
@@ -1339,7 +1448,10 @@ impl Engine {
                 self.wire_end.get_or_insert(WireErrorSource::ClientNetwork);
             }
         }
-        let _ = pending;
+        effects.prepared.map(|mutation| {
+            self.prepared.apply_mutation(mutation);
+            self.prepared.session_event()
+        })
     }
 
     async fn run_auth_effects(&mut self, effects: &[AuthEffect]) -> Result<(), WireErrorSource> {

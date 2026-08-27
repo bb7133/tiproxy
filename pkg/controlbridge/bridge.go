@@ -79,6 +79,20 @@ var ErrForeignDrainActive = errors.New("a previous incarnation's drain is still 
 // exists to carry the drain.
 var ErrNoDataplaneSession = errors.New("no active Rust dataplane control session")
 
+// maxDrainDeadlineAhead mirrors the Rust gate's absolute-deadline cap
+// (MAX_DRAIN_DEADLINE_AHEAD_MILLIS): each computed deadline must land
+// within this window or the command would be rejected on the wire.
+const maxDrainDeadlineAhead = 30 * 24 * time.Hour
+
+// ErrInvalidDrainBudget rejects a drain whose budget is negative or
+// whose deadlines would exceed the shared 30-day cap.
+var ErrInvalidDrainBudget = errors.New("drain budget is negative or exceeds the 30-day deadline cap")
+
+// ErrSnapshotNotReady rejects a drain before the first applied
+// configuration generation exists: a generation-0 command from a
+// modern peer would be judged stale by the Rust gate.
+var ErrSnapshotNotReady = errors.New("no applied configuration generation yet")
+
 // activeDrainState retains the wire-independent request so reconnects
 // re-send the same operation idempotently.
 type activeDrainState struct {
@@ -186,6 +200,20 @@ func (bridge *Bridge) Publisher() *SnapshotPublisher {
 func (bridge *Bridge) StartDrain(ctx context.Context, request DrainRequest) error {
 	if request.DrainID == "" {
 		return errors.New("drain id is required")
+	}
+	// Fail before any reservation: a budget the Rust gate would reject
+	// (negative waits, deadlines past the shared cap) or a command it
+	// would judge stale (no applied generation yet) must never consume
+	// the single-flight slot. Each bound is checked individually first,
+	// so the sum cannot overflow.
+	if request.GracefulWait < 0 || request.ForceTimeout < 0 ||
+		request.GracefulWait > maxDrainDeadlineAhead ||
+		request.ForceTimeout > maxDrainDeadlineAhead ||
+		request.GracefulWait+request.ForceTimeout > maxDrainDeadlineAhead {
+		return ErrInvalidDrainBudget
+	}
+	if bridge.publisher != nil && bridge.publisher.Status().AppliedGeneration == 0 {
+		return ErrSnapshotNotReady
 	}
 	sender := bridge.server.Active()
 	if sender == nil {

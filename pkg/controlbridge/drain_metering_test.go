@@ -18,6 +18,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -360,4 +361,67 @@ func TestForeignDrainClearsOnTerminalAndSignalsRetry(t *testing.T) {
 	require.NotNil(t, resolved, "the retry signal is armed")
 	require.Equal(t, "old@deadbeef", resolved.GetDrainId())
 	require.Nil(t, issuer.ForeignDrainResolved(), "the retry signal consumes once")
+}
+
+func TestProtocolFailureReleasesDrainSlot(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+	sender := &recordingSender{}
+	requestID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, requestID, 7,
+		&controlpb.DrainCommand{DrainId: "d-bad"}))
+
+	// The rejected issuance holds the single-flight slot until resolved.
+	blockedID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.ErrorIs(t, issuer.StartDrain(context.Background(), sender, blockedID, 7,
+		&controlpb.DrainCommand{DrainId: "d-next"}), ErrDrainInProgress)
+
+	// An uncorrelated error stays with the generic transport handling.
+	require.False(t, issuer.HandleProtocolFailure(99_999, &controlpb.ProtocolError{
+		Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
+	}))
+
+	// The correlated ProtocolError (via offending_request_id) completes
+	// the issuance as an observable failure and releases the slot.
+	require.True(t, issuer.HandleProtocolFailure(0, &controlpb.ProtocolError{
+		Code:               controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
+		OffendingRequestId: requestID,
+		Detail:             "drain minted before applied snapshot",
+	}))
+	result, completed := issuer.Progress("d-bad")
+	require.True(t, completed)
+	require.Equal(t, controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION, result.GetCode())
+
+	// The next drain id proceeds on a fresh issuance.
+	nextID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, nextID, 7,
+		&controlpb.DrainCommand{DrainId: "d-next"}))
+}
+
+func TestStartDrainRejectsInvalidBudgetsBeforeReservation(t *testing.T) {
+	bridge := &Bridge{}
+	for name, request := range map[string]DrainRequest{
+		"negative graceful": {DrainID: "d", GracefulWait: -time.Second},
+		"negative force":    {DrainID: "d", ForceTimeout: -time.Second},
+		"graceful over cap": {DrainID: "d", GracefulWait: maxDrainDeadlineAhead + time.Second},
+		"force over cap":    {DrainID: "d", ForceTimeout: maxDrainDeadlineAhead + time.Second},
+		"sum over cap": {
+			DrainID:      "d",
+			GracefulWait: maxDrainDeadlineAhead - time.Second,
+			ForceTimeout: 2 * time.Second,
+		},
+	} {
+		require.ErrorIs(t, bridge.StartDrain(context.Background(), request),
+			ErrInvalidDrainBudget, name)
+	}
+}
+
+func TestStartDrainRejectsBeforeFirstAppliedGeneration(t *testing.T) {
+	bridge := &Bridge{publisher: &SnapshotPublisher{}}
+	require.ErrorIs(t,
+		bridge.StartDrain(context.Background(), DrainRequest{DrainID: "d-early"}),
+		ErrSnapshotNotReady)
 }

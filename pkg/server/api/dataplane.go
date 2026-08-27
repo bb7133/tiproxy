@@ -52,7 +52,10 @@ func (h *Server) DataplaneDrain(c *gin.Context) {
 	switch err := h.mgr.DataplaneDrainer.StartDrain(c.Request.Context(), request); {
 	case err == nil:
 		c.JSON(http.StatusAccepted, gin.H{"drain_id": body.DrainID})
-	case errors.Is(err, controlbridge.ErrNoDataplaneSession):
+	case errors.Is(err, controlbridge.ErrInvalidDrainBudget):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case errors.Is(err, controlbridge.ErrNoDataplaneSession),
+		errors.Is(err, controlbridge.ErrSnapshotNotReady):
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 	case errors.Is(err, controlbridge.ErrDrainInProgress),
 		errors.Is(err, controlbridge.ErrForeignDrainActive):

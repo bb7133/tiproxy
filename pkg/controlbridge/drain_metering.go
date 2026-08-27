@@ -57,7 +57,11 @@ type DrainIssuer struct {
 	// within this incarnation: the same label across reconnects (new
 	// epochs) of ONE incarnation keeps its original wire id/sequence.
 	callerIndex map[string]string
-	activeID    string
+	// requestIndex maps a sent envelope's request id to its wire id
+	// while the issuance awaits its result, so a correlated
+	// ProtocolError can resolve that issuance as an observable failure.
+	requestIndex map[uint64]string
+	activeID     string
 	// sequence is the issuer-wide monotonically increasing command
 	// sequence; restored from the reconcile watermark after a restart
 	// so new drains are never judged obsolete by the Rust gate.
@@ -75,11 +79,12 @@ type DrainIssuer struct {
 }
 
 type drainOperation struct {
-	wireID    string
-	sequence  uint64
-	latest    *controlpb.DrainResult
-	completed bool
-	everSent  bool
+	wireID        string
+	sequence      uint64
+	latest        *controlpb.DrainResult
+	completed     bool
+	everSent      bool
+	lastRequestID uint64
 }
 
 // ErrDrainInProgress rejects a second concurrent drain locally.
@@ -96,9 +101,10 @@ func NewDrainIssuer() (*DrainIssuer, error) {
 		return nil, fmt.Errorf("drain issuer incarnation nonce: %w", err)
 	}
 	return &DrainIssuer{
-		incarnation: hex.EncodeToString(nonce),
-		operations:  make(map[string]*drainOperation),
-		callerIndex: make(map[string]string),
+		incarnation:  hex.EncodeToString(nonce),
+		operations:   make(map[string]*drainOperation),
+		callerIndex:  make(map[string]string),
+		requestIndex: make(map[uint64]string),
 	}, nil
 }
 
@@ -207,6 +213,12 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 		return nil
 	case *controlpb.ControlEnvelope_DrainResult:
 		return handler.issuer.HandleDrainResult(body.DrainResult)
+	case *controlpb.ControlEnvelope_Error:
+		// A ProtocolError correlated to a drain issuance is that
+		// drain's observable failure; anything else keeps the
+		// transport's generic (ignore) handling via the adapter.
+		_ = handler.issuer.HandleProtocolFailure(envelope.GetRequestId(), body.Error)
+		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
 	case *controlpb.ControlEnvelope_ReconcileRequest:
 		// Restore the issuer-wide drain watermark before the adapter
 		// answers, so drains issued after the reconcile resume from
@@ -300,6 +312,8 @@ func (issuer *DrainIssuer) StartDrain(
 	issuer.mu.Lock()
 	if err == nil {
 		operation.everSent = true
+		operation.lastRequestID = requestID
+		issuer.requestIndex[requestID] = wireID
 	} else if !operation.everSent && !operation.completed && issuer.activeID == wireID {
 		// Never reached the wire: release the single-flight slot so a
 		// different drain is not blocked forever; the binding itself is
@@ -367,11 +381,55 @@ func (issuer *DrainIssuer) HandleDrainResult(result *controlpb.DrainResult) erro
 	operation.latest = result
 	if result.GetComplete() {
 		operation.completed = true
+		delete(issuer.requestIndex, operation.lastRequestID)
 		if issuer.activeID == operation.wireID {
 			issuer.activeID = ""
 		}
 	}
 	return nil
+}
+
+// HandleProtocolFailure resolves a correlated ProtocolError against the
+// issuance whose request it rejects: the operation completes as an
+// observable failure and the single-flight slot is released, so one
+// rejected drain (malformed deadlines, a too-early generation) can
+// never wedge every later drain. Uncorrelated errors report false and
+// stay with the transport's generic handling.
+func (issuer *DrainIssuer) HandleProtocolFailure(
+	requestID uint64,
+	failure *controlpb.ProtocolError,
+) bool {
+	if failure == nil {
+		return false
+	}
+	if offending := failure.GetOffendingRequestId(); offending != 0 {
+		requestID = offending
+	}
+	if requestID == 0 {
+		return false
+	}
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	wireID, correlated := issuer.requestIndex[requestID]
+	if !correlated {
+		return false
+	}
+	delete(issuer.requestIndex, requestID)
+	operation := issuer.operations[wireID]
+	if operation == nil || operation.completed {
+		return operation != nil
+	}
+	operation.completed = true
+	operation.latest = &controlpb.DrainResult{
+		DrainId:  wireID,
+		Complete: true,
+		Code:     failure.GetCode(),
+		Detail:   failure.GetDetail(),
+	}
+	if issuer.activeID == wireID {
+		issuer.activeID = ""
+	}
+	return true
 }
 
 // Progress returns the latest observed result for the operator's drain

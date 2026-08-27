@@ -233,7 +233,19 @@ drain id, idempotent re-issue under the incarnation-scoped wire
 binding, foreign-drain rejection until its terminal resolves, epoch
 re-sync replaying the active drain to a restarted lineage, and the
 issuer's send-failure semantics keeping responsibility with the next
-retry.
+retry. Drain budgets are validated before any reservation (negative
+waits, deadlines past the shared 30-day cap, or a not-yet-applied
+configuration generation are rejected as 400/503), and a correlated
+`ProtocolError` completes its issuance as an observable failure and
+releases the single-flight slot. The force phase is one ownership
+chain: session owners hold abort-on-drop guards over their loop and
+engine tasks, the force budget is a single absolute deadline armed at
+the force signal (never stacked cleanup deadlines), and the server's
+listener owners hold their abort backstop
+(`DataplaneServer::with_force_join_grace`) until every session owner
+finishes its terminal work — the CLOSED notice survives the
+executable's back-to-back session/server shutdown even with a
+permanently stuck backend.
 
 **Scope honesty**: DPL-03 starts both composition entries behind the
 Go `rust-dataplane.enabled` gate. Go owns the bridge and monotonic
