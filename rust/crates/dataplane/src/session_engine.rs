@@ -959,17 +959,25 @@ impl Engine {
         }
         // The accepted decision names the namespace the Go handshake
         // handler RESOLVED for this connection — the routing truth.
-        // Adopt it for the route conversation and every lifecycle/log
-        // surface; the process seed was only the pre-decision default.
+        // Adopt it VERBATIM for the route conversation and every wire
+        // surface: Go imposes no 255-byte namespace bound, so any local
+        // truncation would silently rename an identity (and a byte
+        // bound could split a multibyte character). Only the log layer
+        // bounds it, via its char-boundary-safe field escaping.
         let mut resolved_namespace = decision.namespace;
-        resolved_namespace.truncate(255);
         if resolved_namespace.is_empty() {
             resolved_namespace = seed.namespace;
         }
         self.log_context.namespace.clone_from(&resolved_namespace);
         // The dispatcher's per-session record adopts it too, so CLOSED
-        // events and reconciliation carry the routing truth on the wire.
-        let _ = commander.set_namespace(resolved_namespace.clone()).await;
+        // events and reconciliation carry the routing truth on the
+        // wire. The commander waits for the applied acknowledgement; a
+        // lost acknowledgement means later observers could still see
+        // the pre-decision seed, so the session fails closed instead
+        // of routing with ambiguous attribution.
+        if !commander.set_namespace(resolved_namespace.clone()).await {
+            return Some(WireErrorSource::Proxy);
+        }
         let channel = BindingRouteChannel {
             client: seed.client,
             commander: seed.commander,

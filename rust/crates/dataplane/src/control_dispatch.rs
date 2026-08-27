@@ -1287,12 +1287,18 @@ pub enum DispatchNotice {
         /// Completed when the registration is applied.
         applied: tokio::sync::oneshot::Sender<()>,
     },
-    /// Adopts the decision-resolved namespace for a session.
+    /// Adopts the decision-resolved namespace for a session. The
+    /// applied acknowledgement is a causal barrier: reconcile and
+    /// lifecycle evidence reflect the update only after it fires, so
+    /// callers proceed to the route conversation knowing every later
+    /// observer sees the resolved namespace.
     SetNamespace {
         /// Stable connection id.
         connection_id: u64,
         /// The decision-resolved namespace.
         namespace: String,
+        /// Completed when the update is applied.
+        applied: tokio::sync::oneshot::Sender<()>,
     },
     /// The session's backend attached or changed.
     SetBackend {
@@ -1476,13 +1482,22 @@ impl ControlDispatchHandle {
     }
 
     /// Adopts the decision-resolved namespace for this session's
-    /// lifecycle events and reconciliation.
+    /// lifecycle events and reconciliation, and WAITS for the applied
+    /// acknowledgement: after this returns true, no reconcile or
+    /// lifecycle observation can still report the pre-decision seed.
     pub async fn set_namespace(&self, connection_id: u64, namespace: String) -> bool {
-        self.notify(DispatchNotice::SetNamespace {
-            connection_id,
-            namespace,
-        })
-        .await
+        let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::SetNamespace {
+                connection_id,
+                namespace,
+                applied: applied_tx,
+            })
+            .await
+        {
+            return false;
+        }
+        applied_rx.await.is_ok()
     }
 
     /// Arms the session's response expectation and **waits for the
@@ -2055,8 +2070,10 @@ async fn apply_notice<S: DispatchSender>(
         DispatchNotice::SetNamespace {
             connection_id,
             namespace,
+            applied,
         } => {
             handler.set_namespace(connection_id, &namespace);
+            let _ = applied.send(());
         }
         DispatchNotice::ExpectResponse {
             connection_id,

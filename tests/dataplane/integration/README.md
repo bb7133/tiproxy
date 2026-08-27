@@ -41,10 +41,13 @@ tag: macOS caps `sun_path` well below the artifact path length), starts
 only after the first applied generation, and then runs the same
 `SELECT 1`, drop-next recovery, diagnostics, and port-release checks as
 the Go baseline. Both modes additionally prove the namespace/topology
-matrix (DPL-07 #41): two admin-API-seeded namespaces pin one backend
-each through static instances, and `SELECT @@port` proves alice lands
-on ns-alpha's TiDB, bob on ns-beta's, while root keeps the PD-backed
-default namespace. Cleanup stops the Rust process with SIGINT — the
+matrix (DPL-07 #41): two admin-API-seeded namespaces map alice and bob
+over the PD-backed backend set (`proxy.pd-addrs` always registers an
+implicit backend cluster, so `backend.instances` cannot pin a backend),
+`SELECT @@port` proves each user lands on a real backend, and
+delta-scoped per-connection log evidence attributes each row's single
+connection to exactly its expected namespace — ns-alpha, ns-beta, and
+root's PD-backed default. Cleanup stops the Rust process with SIGINT — the
 coordinated-shutdown path. TLS, PROXY protocol, and compression
 variants remain refused by the capability contract until their Rust
 slices exist; a raw TCP relay or the Go dataplane is never reported as
