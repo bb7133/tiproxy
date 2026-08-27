@@ -42,6 +42,7 @@ use control_proto::v1::{
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::observability::{MetricsRecorder, Observation};
 use crate::route::{BackendDialer, DialFailure, RouteChannel, RouteChannelError};
 
 /// Sends one control body on the session's behalf. The dataplane
@@ -250,17 +251,32 @@ pub fn connection_closed(
 /// configured. Deliberately **not** cluster-aware — the engine fails
 /// closed on cluster-scoped assignments instead of dialing outside the
 /// scope (cluster DNS is DPL-07).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TcpDialer;
+#[derive(Clone, Default)]
+pub struct TcpDialer {
+    metrics: MetricsRecorder,
+}
+
+impl TcpDialer {
+    /// Creates a direct dialer that reports failed attempts through the
+    /// non-blocking metrics recorder.
+    #[must_use]
+    pub const fn new(metrics: MetricsRecorder) -> Self {
+        Self { metrics }
+    }
+}
 
 impl BackendDialer for TcpDialer {
     // CLUSTER_AWARE stays false: never silently ignore a cluster scope.
     type Conn = TcpStream;
 
     async fn dial(&mut self, address: &str, _cluster_name: &str) -> Result<TcpStream, DialFailure> {
-        match TcpStream::connect(address).await {
-            Ok(stream) => Ok(stream),
-            Err(_) => Err(DialFailure::Connect),
+        if let Ok(stream) = TcpStream::connect(address).await {
+            Ok(stream)
+        } else {
+            self.metrics.try_record(Observation::DialBackendFailed {
+                backend: address.to_owned(),
+            });
+            Err(DialFailure::Connect)
         }
     }
 }
@@ -272,17 +288,32 @@ impl BackendDialer for TcpDialer {
 /// (`BackendCluster.NSServers` is not projected). A future serverless
 /// projection carrying per-cluster name servers must extend this
 /// dialer's resolution rather than fall back to it silently.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ClusterTcpDialer;
+#[derive(Clone, Default)]
+pub struct ClusterTcpDialer {
+    metrics: MetricsRecorder,
+}
+
+impl ClusterTcpDialer {
+    /// Creates the cluster-capable system dialer with the same non-blocking
+    /// failed-attempt observation path as the direct dialer.
+    #[must_use]
+    pub const fn new(metrics: MetricsRecorder) -> Self {
+        Self { metrics }
+    }
+}
 
 impl BackendDialer for ClusterTcpDialer {
     const CLUSTER_AWARE: bool = true;
     type Conn = TcpStream;
 
     async fn dial(&mut self, address: &str, _cluster_name: &str) -> Result<TcpStream, DialFailure> {
-        match TcpStream::connect(address).await {
-            Ok(stream) => Ok(stream),
-            Err(_) => Err(DialFailure::Connect),
+        if let Ok(stream) = TcpStream::connect(address).await {
+            Ok(stream)
+        } else {
+            self.metrics.try_record(Observation::DialBackendFailed {
+                backend: address.to_owned(),
+            });
+            Err(DialFailure::Connect)
         }
     }
 }

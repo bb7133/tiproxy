@@ -33,7 +33,9 @@ use dataplane::control_runtime::spawn_control_runtime_with_client;
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
-    BoundSessionHandler, DataplaneSnapshotConsumer, DispatchConnectionHandler, SystemMemoryProbe,
+    BoundSessionHandler, DEFAULT_OBSERVATION_CAPACITY, DataplaneServingHandle,
+    DataplaneSnapshotConsumer, DispatchConnectionHandler, MetricsRecorder, SystemMemoryProbe,
+    spawn_metrics_exporter,
 };
 use tokio::sync::watch;
 
@@ -139,13 +141,17 @@ async fn run(options: Options) -> Result<(), String> {
     let (drain_tx, drain_rx) = watch::channel(false);
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
     let loop_config = session_loop_config(options.drain_grace);
-    let owner: Arc<dyn BoundSessionHandler> = Arc::new(EngineSessionOwner::new(
-        Arc::clone(&shared_client),
-        "default",
-        session_shutdown_rx,
-        drain_rx,
-        loop_config,
-    ));
+    let (metrics, observations) = MetricsRecorder::channel(DEFAULT_OBSERVATION_CAPACITY);
+    let owner: Arc<dyn BoundSessionHandler> = Arc::new(
+        EngineSessionOwner::new(
+            Arc::clone(&shared_client),
+            "default",
+            session_shutdown_rx,
+            drain_rx,
+            loop_config,
+        )
+        .with_metrics(metrics.clone()),
+    );
     let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
     let (consumer, serving) = DataplaneSnapshotConsumer::new(
         Arc::new(SystemMemoryProbe::new()),
@@ -167,18 +173,19 @@ async fn run(options: Options) -> Result<(), String> {
         runtime.shutdown();
         return Err("install control dispatch handle exactly once".to_owned());
     }
+    let metrics_exporter = spawn_metrics_exporter(
+        Arc::clone(&shared_client),
+        serving.clone(),
+        runtime.stats(),
+        &metrics,
+        observations,
+        Duration::from_secs(1),
+    );
 
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
-    let health_task = if options.health_port > 0 {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", options.health_port))
-            .await
-            .map_err(|error| format!("bind health endpoint: {error}"))?;
-        Some(tokio::spawn(health::serve(listener, serving.clone())))
-    } else {
-        None
-    };
+    let health_task = spawn_health(options.health_port, serving.clone()).await?;
 
     // Coordinated shutdown on SIGTERM/SIGINT:
     // stop-accept → graceful drain (per-session force at the loop's
@@ -204,11 +211,28 @@ async fn run(options: Options) -> Result<(), String> {
         let _ = task.await;
     }
     let serving_result = serving.shutdown().await;
+    metrics_exporter.shutdown();
+    metrics_exporter.join().await;
     match (control_result, serving_result) {
         (Err(error), _) => Err(error.to_string()),
         (Ok(()), Err(error)) => Err(format!("shut down SQL listeners: {error}")),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+/// Binds the optional integration readiness endpoint before its serving task
+/// starts, so a port conflict fails the composition synchronously.
+async fn spawn_health(
+    port: u16,
+    serving: DataplaneServingHandle,
+) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
+    if port == 0 {
+        return Ok(None);
+    }
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|error| format!("bind health endpoint: {error}"))?;
+    Ok(Some(tokio::spawn(health::serve(listener, serving))))
 }
 
 /// ONE grace lineage: the CLI's validated drain grace IS the

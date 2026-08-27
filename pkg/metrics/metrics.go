@@ -88,7 +88,7 @@ func (mm *MetricsManager) registerProxyMetrics() {
 	prometheus.DefaultRegisterer.Unregister(collectors.NewGoCollector())
 	prometheus.MustRegister(collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsGC, collectors.MetricsMemory, collectors.MetricsScheduler)))
 	for _, c := range colls {
-		prometheus.MustRegister(c)
+		prometheus.MustRegister(collectorWithRustMetrics(c))
 	}
 }
 
@@ -143,6 +143,7 @@ func DelBackend(addr string) {
 }
 
 func delLabelValues(labels prometheus.Labels) {
+	rustMetrics.deletePartial(labels)
 	for _, c := range colls {
 		field := reflect.Indirect(reflect.ValueOf(c)).FieldByName("MetricVec")
 		if field.IsValid() {

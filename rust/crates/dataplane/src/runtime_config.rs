@@ -229,6 +229,13 @@ impl DataplaneServingHandle {
         self.status.snapshot()
     }
 
+    /// Returns the current listener/session metrics snapshot. `None` means
+    /// no config generation has bound the SQL server yet.
+    pub async fn metrics(&self) -> Option<crate::server::ServerMetricsSnapshot> {
+        let serving = self.state.lock().await;
+        serving.handle.as_ref().map(DataplaneHandle::metrics)
+    }
+
     /// Stops accepting new connections while existing sessions keep
     /// running (the first coordinated-shutdown phase); a no-op before
     /// the first bind.
