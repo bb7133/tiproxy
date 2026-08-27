@@ -965,7 +965,13 @@ fn validate_namespaces(namespaces: &[NamespaceSnapshot]) -> Result<(), SnapshotE
         if !names.insert(namespace.name.as_str()) {
             return Err(SnapshotError::invalid("namespace name is duplicated"));
         }
-        if namespace.backend_cluster.is_empty() || namespace.backend_cluster.len() > 255 {
+        // An empty backend_cluster is a legal, honest projection: Go
+        // namespaces carry no cluster binding of their own, so the
+        // cluster is reported only when every backend of the namespace
+        // agrees (DPL-07). A namespace with no backends yet (the boot
+        // default) or a mixed-cluster namespace is unscoped, not
+        // invalid.
+        if namespace.backend_cluster.len() > 255 {
             return Err(SnapshotError::invalid(
                 "namespace backend_cluster is invalid",
             ));
@@ -1084,5 +1090,33 @@ mod tests {
             .ok_or("unconfigured common name unexpectedly allowed")?;
         assert!(error.to_string().contains("common name is not allowed"));
         Ok(())
+    }
+
+    #[test]
+    fn unscoped_namespaces_are_valid() {
+        // DPL-07 contract: a namespace with no unambiguous cluster
+        // (no backends yet, or backends across clusters) projects an
+        // empty backend_cluster and MUST be accepted — the boot-time
+        // default namespace always starts this way.
+        let namespaces = vec![
+            NamespaceSnapshot {
+                name: "default".to_owned(),
+                users: Vec::new(),
+                backend_cluster: String::new(),
+            },
+            NamespaceSnapshot {
+                name: "ns-alpha".to_owned(),
+                users: vec!["alice".to_owned()],
+                backend_cluster: "alpha".to_owned(),
+            },
+        ];
+        assert!(validate_namespaces(&namespaces).is_ok());
+
+        let overlong = vec![NamespaceSnapshot {
+            name: "ns".to_owned(),
+            users: Vec::new(),
+            backend_cluster: "c".repeat(256),
+        }];
+        assert!(validate_namespaces(&overlong).is_err());
     }
 }

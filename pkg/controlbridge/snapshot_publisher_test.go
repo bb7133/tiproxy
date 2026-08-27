@@ -221,3 +221,50 @@ func TestSnapshotPublisherCarriesTopologyProjection(t *testing.T) {
 	require.Equal(t, []string{"alice"}, snapshot.GetNamespaces()[0].GetUsers())
 	require.Equal(t, "alpha", snapshot.GetNamespaces()[0].GetBackendCluster())
 }
+
+func TestSnapshotPublisherStagesTopologyRefreshOnlyOnChange(t *testing.T) {
+	var mu sync.Mutex
+	cluster := "alpha"
+	cfg := config.NewConfig()
+	builder, err := NewSnapshotBuilder(cfg, nil)
+	require.NoError(t, err)
+	publisher, err := NewSnapshotPublisher(SnapshotPublisherConfig{
+		Builder:              builder,
+		Initial:              cfg,
+		AdvertisedCapability: 123,
+		ServerVersion:        "test-server",
+		Topology: func() ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
+			mu.Lock()
+			defer mu.Unlock()
+			return []*controlpb.BackendSnapshot{{
+					BackendId:   cluster + "/tidb:4000",
+					Address:     "tidb:4000",
+					ClusterName: cluster,
+					Healthy:     true,
+				}}, []*controlpb.NamespaceSnapshot{{
+					Name:           "default",
+					BackendCluster: cluster,
+				}}
+		},
+	})
+	require.NoError(t, err)
+	staged := publisher.Status().DesiredGeneration
+
+	// Unchanged topology stages nothing: generations advance only on
+	// real change.
+	require.NoError(t, publisher.RefreshTopology())
+	require.Equal(t, staged, publisher.Status().DesiredGeneration)
+
+	// A live change (namespace commit, backend health) stages a fresh
+	// generation carrying the new projection.
+	mu.Lock()
+	cluster = "beta"
+	mu.Unlock()
+	require.NoError(t, publisher.RefreshTopology())
+	require.Equal(t, staged+1, publisher.Status().DesiredGeneration)
+	publisher.mu.Lock()
+	snapshot := publisher.desired.GetStateSnapshot()
+	publisher.mu.Unlock()
+	require.Equal(t, "beta", snapshot.GetNamespaces()[0].GetBackendCluster())
+	require.Equal(t, "beta/tidb:4000", snapshot.GetBackends()[0].GetBackendId())
+}

@@ -54,6 +54,9 @@ type SnapshotPublisher struct {
 	topology             SnapshotTopologyProvider
 	nextGeneration       uint64
 	desired              *controlpb.ControlEnvelope
+	// lastConfig is the config behind the last successfully staged
+	// generation; topology refreshes re-stage it with fresh topology.
+	lastConfig *config.Config
 
 	pendingEpoch      uint64
 	pendingRequestID  uint64
@@ -90,18 +93,28 @@ func (publisher *SnapshotPublisher) Update(cfg *config.Config) error {
 	if cfg == nil {
 		return errors.New("snapshot config is required")
 	}
-	publisher.mu.Lock()
-	defer publisher.mu.Unlock()
-	if publisher.nextGeneration == ^uint64(0) {
-		return errors.New("snapshot generation space is exhausted")
-	}
-	publisher.nextGeneration++
-	generation := publisher.nextGeneration
 	var backends []*controlpb.BackendSnapshot
 	var namespaces []*controlpb.NamespaceSnapshot
 	if publisher.topology != nil {
 		backends, namespaces = publisher.topology()
 	}
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	return publisher.stageLocked(cfg, backends, namespaces)
+}
+
+// stageLocked mints the next generation for cfg plus the given topology
+// projection. Callers hold publisher.mu.
+func (publisher *SnapshotPublisher) stageLocked(
+	cfg *config.Config,
+	backends []*controlpb.BackendSnapshot,
+	namespaces []*controlpb.NamespaceSnapshot,
+) error {
+	if publisher.nextGeneration == ^uint64(0) {
+		return errors.New("snapshot generation space is exhausted")
+	}
+	publisher.nextGeneration++
+	generation := publisher.nextGeneration
 	envelope, err := publisher.builder.Build(
 		generation,
 		cfg,
@@ -120,8 +133,56 @@ func (publisher *SnapshotPublisher) Update(cfg *config.Config) error {
 		return err
 	}
 	publisher.desired = envelope
+	publisher.lastConfig = cfg
 	publisher.status.DesiredGeneration = generation
 	return nil
+}
+
+// RefreshTopology re-projects the live topology and stages a new
+// generation when it differs from the desired snapshot's, so namespace
+// commits and backend-health changes reach the wire without a config
+// change (DPL-07). Unchanged topology stages nothing: generations only
+// advance on real change.
+func (publisher *SnapshotPublisher) RefreshTopology() error {
+	if publisher.topology == nil {
+		return nil
+	}
+	backends, namespaces := publisher.topology()
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if publisher.lastConfig == nil {
+		return nil
+	}
+	if desired := publisher.desired.GetStateSnapshot(); desired != nil &&
+		topologyEqual(desired.GetBackends(), backends) &&
+		namespacesEqual(desired.GetNamespaces(), namespaces) {
+		return nil
+	}
+	return publisher.stageLocked(publisher.lastConfig, backends, namespaces)
+}
+
+func topologyEqual(current, fresh []*controlpb.BackendSnapshot) bool {
+	if len(current) != len(fresh) {
+		return false
+	}
+	for index, backend := range current {
+		if !proto.Equal(backend, fresh[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func namespacesEqual(current, fresh []*controlpb.NamespaceSnapshot) bool {
+	if len(current) != len(fresh) {
+		return false
+	}
+	for index, namespace := range current {
+		if !proto.Equal(namespace, fresh[index]) {
+			return false
+		}
+	}
+	return true
 }
 
 // Sync sends the latest desired snapshot once per negotiated epoch and once
