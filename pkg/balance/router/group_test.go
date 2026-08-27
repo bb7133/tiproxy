@@ -462,3 +462,36 @@ func TestCrossKeyspaceRefusalIsBounded(t *testing.T) {
 	require.Equal(t, 0, fromBackend.ConnCount())
 	require.Equal(t, 20, toBackend.ConnCount())
 }
+
+// A fail-backend-list configured BEFORE the first backend arrives must
+// apply to the newly created MatchAll group: the startup config was
+// previously ignored on this path (the group was created without
+// SetConfig), which let "pinned" topologies silently route to every
+// backend. Red-first: this test FAILS without the MatchAll SetConfig
+// injection.
+func TestStartupFailoverListAppliesToNewMatchAllGroup(t *testing.T) {
+	tester := newRouterTester(t, nil)
+	// The config exists BEFORE any backend/group does - the production
+	// path reads it through the router's config getter at group
+	// creation, exactly like a startup fail-backend-list.
+	tester.router.cfgGetter = newMockConfigGetter(&config.Config{
+		Proxy: config.ProxyServer{
+			ProxyServerOnline: config.ProxyServerOnline{
+				FailBackendList: []string{"1"},
+				FailoverTimeout: 60,
+			},
+		},
+	})
+	tester.addBackends(2)
+
+	require.False(t, tester.getBackendByIndex(0).Healthy(),
+		"the startup fail-backend-list must reach the new MatchAll group")
+	require.True(t, tester.getBackendByIndex(1).Healthy())
+
+	selector := tester.router.GetBackendSelector(ClientInfo{})
+	backend, err := selector.Next()
+	require.NoError(t, err)
+	selector.Finish(nil, false)
+	require.Equal(t, tester.getBackendByIndex(1).Addr(), backend.Addr(),
+		"routing must exclude the startup-failed backend")
+}

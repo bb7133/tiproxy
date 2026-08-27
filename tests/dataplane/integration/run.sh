@@ -805,7 +805,31 @@ mysql_ka_root() {
 		-h 127.0.0.1 -P "$ka_sql_port" -u root \
 		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} -e "$1"
 }
-# Absorption of the initial pin: a new connection can only land A0.
+# EXACT absorption of the initial pin, evidence-first: the structured
+# failover records must show B and A1 entering failover and A0 NOT -
+# only then is a probe landing on A0 discriminating rather than a
+# lucky sequence over three routeable backends. (The startup
+# fail-list reaching a new MatchAll group at all is the product fix
+# locked by TestStartupFailoverListAppliesToNewMatchAllGroup.)
+ka_failover_ready=false
+for _ in {1..30}; do
+	if grep -qs "\"backend enters failover\".*\"127\.0\.0\.1:$TIDB_PORT_B\"" "$run_dir/tiproxy-ka.log" &&
+		grep -qs "\"backend enters failover\".*\"127\.0\.0\.1:$TIDB_PORT_1\"" "$run_dir/tiproxy-ka.log"; then
+		ka_failover_ready=true
+		break
+	fi
+	sleep 1
+done
+if [[ $ka_failover_ready != true ]]; then
+	echo "keyspace-guard phase: initial fail-list never produced failover evidence for B and A1" >&2
+	grep -s "backend enters failover" "$run_dir/tiproxy-ka.log" | tail -4 >&2 || true
+	exit 1
+fi
+if grep -qs "\"backend enters failover\".*\"127\.0\.0\.1:$TIDB_PORT_0\"" "$run_dir/tiproxy-ka.log"; then
+	echo "keyspace-guard phase: A0 unexpectedly entered failover under the initial pin" >&2
+	exit 1
+fi
+grep -s "backend enters failover" "$run_dir/tiproxy-ka.log" | tail -2 | sed 's/^/initial pin evidence: /'
 ka_pin_ready=false
 for _ in {1..30}; do
 	pin_port=$(mysql_ka_root 'SELECT @@port' 2>/dev/null || true)
