@@ -57,6 +57,13 @@ type SnapshotPublisher struct {
 	// lastConfig is the config behind the last successfully staged
 	// generation; topology refreshes re-stage it with fresh topology.
 	lastConfig *config.Config
+	// rejectedBackends/rejectedNamespaces memoize a projection whose
+	// staging failed, so an unchanged invalid topology never burns a
+	// generation per cadence tick — it retries only when the
+	// projection (or the config, which clears the memo) changes.
+	rejectedTopology   bool
+	rejectedBackends   []*controlpb.BackendSnapshot
+	rejectedNamespaces []*controlpb.NamespaceSnapshot
 
 	pendingEpoch      uint64
 	pendingRequestID  uint64
@@ -134,6 +141,9 @@ func (publisher *SnapshotPublisher) stageLocked(
 	}
 	publisher.desired = envelope
 	publisher.lastConfig = cfg
+	publisher.rejectedTopology = false
+	publisher.rejectedBackends = nil
+	publisher.rejectedNamespaces = nil
 	publisher.status.DesiredGeneration = generation
 	return nil
 }
@@ -158,7 +168,21 @@ func (publisher *SnapshotPublisher) RefreshTopology() error {
 		namespacesEqual(desired.GetNamespaces(), namespaces) {
 		return nil
 	}
-	return publisher.stageLocked(publisher.lastConfig, backends, namespaces)
+	if publisher.rejectedTopology &&
+		topologyEqual(publisher.rejectedBackends, backends) &&
+		namespacesEqual(publisher.rejectedNamespaces, namespaces) {
+		// The same invalid projection again: staying on the last-good
+		// desired snapshot is already recorded in the status; burning
+		// another generation every tick would add nothing.
+		return nil
+	}
+	err := publisher.stageLocked(publisher.lastConfig, backends, namespaces)
+	if err != nil {
+		publisher.rejectedTopology = true
+		publisher.rejectedBackends = backends
+		publisher.rejectedNamespaces = namespaces
+	}
+	return err
 }
 
 func topologyEqual(current, fresh []*controlpb.BackendSnapshot) bool {
