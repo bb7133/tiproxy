@@ -47,7 +47,19 @@ implicit backend cluster, so `backend.instances` cannot pin a backend),
 `SELECT @@port` proves each user lands on a real backend, and
 delta-scoped per-connection log evidence attributes each row's single
 connection to exactly its expected namespace — ns-alpha, ns-beta, and
-root's PD-backed default. Error parity (same slice of DPL-07) then
+root's PD-backed default. The cluster×listener matrix (DPL-07 cluster
+dimension) then proves deterministic backend-class selection: the
+topology runs TWO real PD-backed clusters (a second playground under
+its own tag and port window), the proxy exposes two consecutive
+listeners via `proxy.port-range` with `balance.routing-rule = "port"`,
+and each cluster's TiDB instances carry that listener's
+`tiproxy-port` topology label — so listener A can only select
+cluster-a and listener B only cluster-b, identically in both modes,
+with per-listener delta-scoped evidence (Go route `target`, Rust
+`connection_ready` backend_addr+cluster) and bidirectional
+cross-checks. Per-cluster NSServer parity is explicitly out of scope
+(the wire snapshot does not project name servers). Error parity (same
+slice family) then
 proves the same semantic ERR in both modes: a bind conflict fails fast
 naming the port with no residue, and with both TiDB servers killed and
 evicted a new connection receives Go's approved 1105/HY000 "No

@@ -91,6 +91,25 @@ if [[ -d $tiup_data ]]; then
 	fi
 fi
 
+# Second backend cluster's playground (dual-cluster runs): same
+# stop/clean/marker discipline under its own tag.
+if [[ ${TAG_B:-} == tiproxy-dp-go-*-b || ${TAG_B:-} == tiproxy-dp-rust-*-b ]]; then
+	if [[ ${TIUP_B_PID:-} =~ ^[0-9]+$ ]] && command -v tiup >/dev/null 2>&1; then
+		tiup clean "$TAG_B" >>"$run_dir/cleanup.log" 2>&1 || true
+	fi
+	stop_owned_process "${TIUP_B_PID:-}" "$TAG_B" || cleanup_status=1
+	tiup_data_b="$tiup_root/data/$TAG_B"
+	marker_b="$tiup_data_b/.tiproxy-integration-owned"
+	if [[ -d $tiup_data_b ]]; then
+		if [[ -f $marker_b && $(<"$marker_b") == "$run_dir" ]]; then
+			rm -rf "$tiup_data_b"
+		elif [[ ${TIUP_B_PID:-} =~ ^[0-9]+$ ]]; then
+			echo "refusing to remove unmarked TiUP data directory: $tiup_data_b" >&2
+			cleanup_status=1
+		fi
+	fi
+fi
+
 if [[ -x ${FAULT_PROXY_BIN:-$run_dir/faultproxy} && -n ${PORTS:-} ]]; then
 	for port in $PORTS; do
 		for _ in {1..30}; do
