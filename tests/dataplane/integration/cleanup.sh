@@ -55,6 +55,13 @@ stop_owned_process() {
 
 cleanup_status=0
 stop_owned_process "${FAULT_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
+# SIGINT drives tiproxy-rs's coordinated shutdown (stop-accept ->
+# graceful drain -> force -> join); its command line carries this run's
+# unique control-socket path, satisfying the ownership check.
+if [[ -n ${RUST_SOCKET:-} ]]; then
+	stop_owned_process "${RUST_PID:-}" "$RUST_SOCKET" || cleanup_status=1
+	rm -f "$RUST_SOCKET"
+fi
 
 # Ask only a playground this run actually started to stop and clean before
 # signaling its launcher. Calling `tiup clean` for a preflight-only run creates

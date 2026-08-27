@@ -24,29 +24,27 @@ released. Run one variant with:
 tests/dataplane/integration/run.sh --mode go --variant plain
 ```
 
-The Rust entrypoint is intentionally blocked:
+The Rust dataplane runs the same plain-variant topology for real:
 
 ```sh
-make dataplane-integration
+tests/dataplane/integration/run.sh --mode rust --variant plain
 ```
 
-FND-01 currently provides only `tiproxy-rs --version`; it has no MySQL listener,
-Go control bridge, health endpoint, or shutdown protocol. `preflight.sh`
-therefore exits 78 before starting TiDB. It requires an explicit, comma-separated
-`--integration-capabilities` response and still refuses to launch until the real
-Go/Rust launch contract is wired. A raw TCP relay or the Go dataplane is never
-reported as Rust success.
-
-The remaining implementation dependencies are:
-
-- Go/Rust control bridge and lifecycle contract: #10-#15.
-- MySQL wire and transport path: #17-#19 and #21-#24; compression also needs #20.
-- Session command path sufficient for `SELECT 1`: #25-#29.
-- Operational Rust runtime, readiness, and shutdown: #34-#37.
-
-Those issues must update the preflight/launcher contract when their real
-interfaces exist. Until then, the Rust part of issue #6's first acceptance item
-and Rust log collection cannot truthfully pass.
+`preflight.sh` demands the capability contract from
+`tiproxy-rs --integration-capabilities` — currently
+`control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown`.
+The launcher enables the Go config's `rust-dataplane` gate (the Go
+process cedes the SQL listeners and serves only the control plane and
+API), waits for the control socket (created under `/tmp` with the run's
+tag: macOS caps `sun_path` well below the artifact path length), starts
+`tiproxy-rs` with a `--health-port` readiness endpoint that answers 200
+only after the first applied generation, and then runs the same
+`SELECT 1`, drop-next recovery, diagnostics, and port-release checks as
+the Go baseline. Cleanup stops the Rust process with SIGINT — the
+coordinated-shutdown path. TLS, PROXY protocol, and compression
+variants remain refused by the capability contract until their Rust
+slices exist; a raw TCP relay or the Go dataplane is never reported as
+Rust success.
 
 ## Diagnostics and safety
 

@@ -268,3 +268,44 @@ func TestSnapshotPublisherStagesTopologyRefreshOnlyOnChange(t *testing.T) {
 	require.Equal(t, "beta", snapshot.GetNamespaces()[0].GetBackendCluster())
 	require.Equal(t, "beta/tidb:4000", snapshot.GetBackends()[0].GetBackendId())
 }
+
+func TestRefreshTopologyRetriesInvalidProjectionOnlyOnChange(t *testing.T) {
+	var mu sync.Mutex
+	cluster := "alpha"
+	cfg := config.NewConfig()
+	builder, err := NewSnapshotBuilder(cfg, nil)
+	require.NoError(t, err)
+	publisher, err := NewSnapshotPublisher(SnapshotPublisherConfig{
+		Builder:              builder,
+		Initial:              cfg,
+		AdvertisedCapability: 123,
+		ServerVersion:        "test-server",
+		Topology: func() ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
+			mu.Lock()
+			defer mu.Unlock()
+			return nil, []*controlpb.NamespaceSnapshot{{Name: "default", BackendCluster: cluster}}
+		},
+	})
+	require.NoError(t, err)
+
+	// Force every further staging attempt to fail.
+	publisher.mu.Lock()
+	publisher.nextGeneration = ^uint64(0)
+	publisher.mu.Unlock()
+
+	// A changed projection attempts to stage and fails once.
+	mu.Lock()
+	cluster = "beta"
+	mu.Unlock()
+	require.Error(t, publisher.RefreshTopology())
+
+	// The SAME failing projection is memoized: no attempt, no error,
+	// no generation churn per cadence tick.
+	require.NoError(t, publisher.RefreshTopology())
+
+	// A further change retries (and fails again, observably).
+	mu.Lock()
+	cluster = "gamma"
+	mu.Unlock()
+	require.Error(t, publisher.RefreshTopology())
+}

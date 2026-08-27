@@ -28,8 +28,8 @@ use control_proto::control_transport::{
 };
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
-    CloseCommand, ControlEnvelope, DrainCommand, ErrorCode, Hello, RedirectCommand, Role,
-    RouteAssignment,
+    CloseCommand, ControlEnvelope, DrainCommand, ErrorCode, HandshakeDecision, Hello,
+    RedirectCommand, Role, RouteAssignment,
 };
 use dataplane::control_dispatch::{
     ControlCommandHandler, DispatchSender, spawn_control_dispatch_parts,
@@ -679,6 +679,29 @@ impl MysqlClient {
 fn spawn_route_answer(stack: &Stack, connection_id: u64, request_id: u64) {
     let forwarder = Arc::clone(&stack.forwarder);
     let backend_port = stack.backend_port;
+    tokio::spawn(async move {
+        // The production adapter always answers the handshake event
+        // with a correlated accept decision; the engine consumes it
+        // before requesting a route.
+        let decision = ControlEnvelope {
+            request_id: request_id - 1,
+            generation: 1,
+            body: Some(Body::HandshakeDecision(HandshakeDecision {
+                connection_id,
+                accept: true,
+                retry: false,
+                code: ErrorCode::Ok as i32,
+                client_message: String::new(),
+                namespace: "default".to_owned(),
+            })),
+            ..ControlEnvelope::default()
+        };
+        for _ in 0..200 {
+            let _ = forwarder.handle(decision.clone()).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let forwarder = Arc::clone(&stack.forwarder);
     tokio::spawn(async move {
         let assignment = ControlEnvelope {
             request_id,

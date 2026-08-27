@@ -97,7 +97,7 @@ use tokio::task::JoinSet;
 
 use crate::control_dispatch::{CommandKind, CommandToken, ResponseKind};
 use crate::route::{CenteredJitter, DialSchedule, RouteChannel, RouteChannelError, RouteEngine};
-use crate::route_control::{TcpDialer, TrafficTotals};
+use crate::route_control::{ClusterTcpDialer, TrafficTotals};
 use crate::server::{AcceptedConnection, ConnectionFuture, SessionSeat};
 use crate::session::{
     EffectHandler, SessionControl, SessionEnd, SessionEventSource, SessionLoop, SessionLoopConfig,
@@ -236,7 +236,7 @@ struct BindingRouteChannel {
     identity: ConnectionIdentity,
     metadata: HandshakeMetadata,
     namespace: String,
-    handshake_event_sent: bool,
+    generation: u64,
 }
 
 impl BindingRouteChannel {
@@ -263,16 +263,6 @@ impl RouteChannel for BindingRouteChannel {
         &mut self,
         excluded_backend_ids: Vec<String>,
     ) -> Result<(), RouteChannelError> {
-        if !self.handshake_event_sent {
-            // The Go adapter admits routing only for a connection whose
-            // handshake event it has seen.
-            self.send_durable(Body::HandshakeResponse(HandshakeResponseEvent {
-                connection: Some(self.identity.clone()),
-                handshake: Some(self.metadata.clone()),
-            }))
-            .await?;
-            self.handshake_event_sent = true;
-        }
         let Some(request_id) = self.client.allocate_request_id() else {
             return Err(RouteChannelError::ControlLost);
         };
@@ -284,6 +274,7 @@ impl RouteChannel for BindingRouteChannel {
             .map_err(|_| RouteChannelError::ControlLost)?;
         let envelope = ControlEnvelope {
             request_id,
+            generation: self.generation,
             priority: Priority::Control.into(),
             body: Some(Body::RouteRequest(RouteRequest {
                 connection: Some(self.identity.clone()),
@@ -783,10 +774,63 @@ impl Engine {
         }
 
         // Route + dial + backend greeting + verification + plan.
-        let Some(seed) = self.route.take() else {
+        let Some(mut seed) = self.route.take() else {
             return Some(WireErrorSource::Proxy);
         };
         let commander = seed.commander.clone();
+        // The handshake event is a correlated exchange, not
+        // fire-and-forget: the Go adapter ALWAYS answers it with a
+        // HandshakeDecision, which must be consumed under its own armed
+        // expectation — and a rejected handshake refuses the client
+        // with the decision's approved message instead of routing.
+        let Some(decision_id) = seed.client.allocate_request_id() else {
+            return Some(WireErrorSource::Proxy);
+        };
+        if seed
+            .commander
+            .expect_response(decision_id, ResponseKind::HandshakeDecision)
+            .await
+            .is_err()
+        {
+            return Some(WireErrorSource::Proxy);
+        }
+        // Provenance: the adapter validates that handshake/route
+        // envelopes carry the nonzero generation this connection was
+        // admitted under.
+        let admission_generation = self.seat.snapshot().generation();
+        let event_envelope = ControlEnvelope {
+            request_id: decision_id,
+            generation: admission_generation,
+            priority: Priority::Control.into(),
+            body: Some(Body::HandshakeResponse(HandshakeResponseEvent {
+                connection: Some(seed.identity.clone()),
+                handshake: Some(metadata.clone()),
+            })),
+            ..ControlEnvelope::default()
+        };
+        if seed.client.send(event_envelope).await.is_err() {
+            return Some(WireErrorSource::Proxy);
+        }
+        let decision = loop {
+            let Some(answer) = seed.responses.recv().await else {
+                return Some(WireErrorSource::Proxy);
+            };
+            if let Some(Body::HandshakeDecision(decision)) = answer.body {
+                break decision;
+            }
+        };
+        if !decision.accept {
+            let message = if decision.client_message.is_empty() {
+                "handshake rejected"
+            } else {
+                decision.client_message.as_str()
+            };
+            self.client_w
+                .reset_sequence(self.client_r.expected_sequence());
+            let _ = self.write_client_error(1105, *b"HY000", message).await;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Some(WireErrorSource::Proxy);
+        }
         let channel = BindingRouteChannel {
             client: seed.client,
             commander: seed.commander,
@@ -794,11 +838,11 @@ impl Engine {
             identity: seed.identity,
             metadata,
             namespace: seed.namespace,
-            handshake_event_sent: false,
+            generation: admission_generation,
         };
         let mut route_engine = RouteEngine::new(
             channel,
-            TcpDialer,
+            ClusterTcpDialer,
             DialSchedule::default(),
             CenteredJitter,
             self.connection_id,
