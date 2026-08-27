@@ -556,3 +556,103 @@ func TestOrphanCloseRetainedWhenSenderRotatesInFlight(t *testing.T) {
 	require.NotNil(t, lastEnvelope(t, replacement).GetCloseCommand())
 	require.Equal(t, 0, adapter.OrphanCount())
 }
+
+// A SUCCESSFUL RouteResult lost on the wire, followed by the SAME Rust
+// lineage reconnecting (same identity, same generation) with the
+// authoritative record naming the assigned backend, must COMPLETE the
+// pending assignment exactly once: router/backend accounting reaches
+// EXACT 1 and the snapshot echoes the backend. Red-first: the pre-fix
+// handleReconcile skipped known same-identity states without aligning
+// the remote backend to the pending assignment, so accounting stayed 0
+// and the snapshot echoed an empty backend.
+func TestReconcileCompletesLostSuccessfulAssignment(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler := &recordingHandler{rt: rt}
+	adapter := newTestAdapter(t, handler)
+	adapter.AttachRouterLookup(func(string) (router.Router, error) { return rt, nil })
+
+	oldPeer := newFakeSender(50)
+	sendHandshake(t, adapter, oldPeer, 7, "0.0.0.0:6000", "root")
+	sendRoute(t, adapter, oldPeer, 7, "0.0.0.0:6000", "root")
+	assignment := lastAssignment(t, oldPeer)
+	require.Equal(t, "tidb-a:4000", assignment.GetBackendAddress())
+	// The successful RouteResult is LOST: accounting never advanced.
+	require.Equal(t, 0, rt.ConnCount())
+
+	// The SAME lineage reconnects on a new control session and reports
+	// the live connection with the exact identity, generation, and the
+	// backend it is really connected to.
+	newPeer := newFakeSender(51,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
+	remote := &controlpb.ReconcileConnection{
+		ConnectionId: 7,
+		BackendId:    assignment.GetBackendId(),
+		Namespace:    "ns-a",
+		Generation:   7,
+		Identity:     testIdentity(7, "0.0.0.0:6000"),
+	}
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), newPeer, reconcileRequestEnvelope(910, remote)))
+	require.Equal(t, 1, rt.ConnCount(), "reconcile must repair the lost successful assignment")
+
+	snapshot := lastEnvelope(t, newPeer).GetReconcileSnapshot()
+	require.Len(t, snapshot.GetConnections(), 1)
+	require.Equal(t, assignment.GetBackendId(), snapshot.GetConnections()[0].GetBackendId(),
+		"the snapshot echoes the completed backend, not an empty one")
+
+	// The LATE original RouteResult must be absorbed idempotently.
+	sendRouteResult(t, adapter, newPeer, assignment, true)
+	require.Equal(t, 1, rt.ConnCount(), "late RouteResult never double-accounts")
+
+	// A remote record naming a DIFFERENT backend than the pending
+	// assignment is a DIVERGENCE: the session must terminate (no-op
+	// survival is not fail-closed) - the local state retires with the
+	// selector's single Finish(false), a precise force CloseCommand
+	// goes to the Rust side, no ghost remains, and the late original
+	// RouteResult is still a tombstone no-op.
+	rt2 := router.NewStaticRouter([]string{"tidb-a:4000"})
+	handler2 := &recordingHandler{rt: rt2}
+	adapter2 := newTestAdapter(t, handler2)
+	adapter2.AttachRouterLookup(func(string) (router.Router, error) { return rt2, nil })
+	oldPeer2 := newFakeSender(52)
+	sendHandshake(t, adapter2, oldPeer2, 9, "0.0.0.0:6000", "root")
+	sendRoute(t, adapter2, oldPeer2, 9, "0.0.0.0:6000", "root")
+	divergedAssignment := lastAssignment(t, oldPeer2)
+	mismatched := &controlpb.ReconcileConnection{
+		ConnectionId: 9,
+		BackendId:    "tidb-b:4000",
+		Namespace:    "ns-a",
+		Generation:   7,
+		Identity:     testIdentity(9, "0.0.0.0:6000"),
+	}
+	newPeer2 := newFakeSender(53,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE))
+	closesBefore := handler2.closeCalls
+	require.NoError(t, adapter2.HandleEnvelope(context.Background(), newPeer2, reconcileRequestEnvelope(911, mismatched)))
+	require.Equal(t, 0, rt2.ConnCount(), "a diverged backend never joins accounting")
+	require.Equal(t, closesBefore+1, handler2.closeCalls, "the diverged session retires exactly once")
+	require.Nil(t, adapter2.get(9), "no ghost state remains")
+	var divergedClose *controlpb.CloseCommand
+	newPeer2.mu.Lock()
+	for _, envelope := range newPeer2.messages {
+		if cc := envelope.GetCloseCommand(); cc != nil && cc.GetConnectionId() == 9 {
+			divergedClose = cc
+		}
+	}
+	newPeer2.mu.Unlock()
+	require.NotNil(t, divergedClose, "the Rust side receives a precise CloseCommand")
+	require.True(t, divergedClose.GetForce())
+	// The late original RouteResult stays a tombstone/unknown no-op.
+	sendRouteResultRaw := &controlpb.ControlEnvelope{
+		RequestId: 912,
+		Body: &controlpb.ControlEnvelope_RouteResult{RouteResult: &controlpb.RouteResult{
+			ConnectionId: 9,
+			AssignmentId: divergedAssignment.GetAssignmentId(),
+			Connected:    true,
+		}},
+	}
+	require.NoError(t, adapter2.HandleEnvelope(context.Background(), newPeer2, sendRouteResultRaw))
+	require.Equal(t, 0, rt2.ConnCount(), "late RouteResult after divergence never resurrects accounting")
+}

@@ -448,22 +448,120 @@ func (adapter *RouterAdapter) handleRouteResult(
 	if assignment.finished {
 		return nil
 	}
-	assignment.finished = true
-	state.selector.Finish(state.conn, result.GetConnected())
 	if result.GetConnected() {
-		state.currentBackend = assignment.backend
-		state.conn.setBackend(assignment.backend)
-		// ScoreBasedRouter installs its receiver from Finish. Static/custom
-		// routers may expose the receiver directly instead.
-		if state.conn.eventReceiver() == nil {
-			if receiver, ok := state.router.(router.ConnEventReceiver); ok {
-				state.conn.SetEventReceiver(receiver)
-			}
-		}
+		completeAssignmentLocked(state)
 		return nil
 	}
+	assignment.finished = true
+	state.selector.Finish(state.conn, false)
 	state.assignment = nil
 	return adapter.nextAssignmentLocked(ctx, sender, requestID, state, nil)
+}
+
+// completeAssignmentLocked applies the success semantics of a connected
+// RouteResult exactly once: it tombstones the pending assignment,
+// finishes the selector, installs the current backend, and wires the
+// event receiver. Callers hold state.mu and have verified the
+// assignment is non-nil and unfinished. It is shared by the live
+// RouteResult path and the reconcile repair of a LOST successful
+// RouteResult, so both seams have identical exactly-once effects.
+func completeAssignmentLocked(state *connectionState) {
+	assignment := state.assignment
+	assignment.finished = true
+	state.selector.Finish(state.conn, true)
+	state.currentBackend = assignment.backend
+	state.conn.setBackend(assignment.backend)
+	// ScoreBasedRouter installs its receiver from Finish. Static/custom
+	// routers may expose the receiver directly instead.
+	if state.conn.eventReceiver() == nil {
+		if receiver, ok := state.router.(router.ConnEventReceiver); ok {
+			state.conn.SetEventReceiver(receiver)
+		}
+	}
+}
+
+// lostAssignmentVerdict reports what the same-lineage reconcile record
+// implied about a pending (unconfirmed) assignment.
+type lostAssignmentVerdict int
+
+const (
+	// lostAssignmentNone: no pending assignment to repair.
+	lostAssignmentNone lostAssignmentVerdict = iota
+	// lostAssignmentCompleted: the record named EXACTLY the pending
+	// assignment's backend; the assignment completed exactly once.
+	lostAssignmentCompleted
+	// lostAssignmentDiverged: the record names a DIFFERENT backend (or
+	// none) than the pending assignment - the Rust session is really
+	// attached to something the local selector never confirmed. The
+	// caller must terminate the session; letting it silently serve
+	// would repeat the divergence on every reconcile forever.
+	lostAssignmentDiverged
+)
+
+// completeLostAssignment repairs the lost-successful-RouteResult seam:
+// the SAME lineage's authoritative reconcile record names the backend
+// the connection is really attached to while the local state still
+// holds the pending assignment. An EXACT backend match completes the
+// assignment through the same exactly-once path a connected
+// RouteResult takes. Anything else is a DIVERGENCE verdict: fail
+// closed means terminating that session (never attaching an arbitrary
+// remote backend, never silently keeping it alive). A late original
+// RouteResult remains idempotent either way — completion and close
+// both leave a finished tombstone.
+func completeLostAssignment(state *connectionState, remote *controlpb.ReconcileConnection) lostAssignmentVerdict {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed || state.currentBackend != nil || state.selector == nil {
+		return lostAssignmentNone
+	}
+	assignment := state.assignment
+	if assignment == nil || assignment.finished || assignment.backend == nil {
+		return lostAssignmentNone
+	}
+	if remote.GetBackendId() != "" && remote.GetBackendId() == assignment.backend.ID() {
+		completeAssignmentLocked(state)
+		return lostAssignmentCompleted
+	}
+	return lostAssignmentDiverged
+}
+
+// closeDivergedAssignment terminates a session whose reconcile record
+// diverged from its pending assignment: the local state retires
+// exactly once (the unfinished assignment's selector gets its single
+// Finish(false) inside closeStateLocked), and the Rust side receives a
+// precise CloseCommand so the client terminates instead of serving on
+// an unconfirmed backend.
+func (adapter *RouterAdapter) closeDivergedAssignment(
+	ctx context.Context,
+	sender EnvelopeSender,
+	state *connectionState,
+	remote *controlpb.ReconcileConnection,
+) error {
+	state.mu.Lock()
+	adapter.closeStateLocked(state, backend.SrcProxyErr)
+	state.mu.Unlock()
+	if !sender.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE)) {
+		return nil
+	}
+	requestID, err := sender.AllocateRequestID()
+	if err != nil {
+		return err
+	}
+	return sender.Send(ctx, &controlpb.ControlEnvelope{
+		RequestId:  requestID,
+		Generation: remote.GetGeneration(),
+		Priority:   controlpb.Priority_PRIORITY_CRITICAL,
+		RequiredCapabilities: []uint64{
+			uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE),
+		},
+		Body: &controlpb.ControlEnvelope_CloseCommand{CloseCommand: &controlpb.CloseCommand{
+			ConnectionId: remote.GetConnectionId(),
+			CloseId:      adapter.newOperationID("diverged-assignment-close", sender.Epoch(), remote.GetConnectionId()),
+			ErrorSource:  controlpb.ErrorSource_ERROR_SOURCE_PROXY,
+			Reason:       "reconcile diverged from the pending assignment",
+			Force:        true,
+		}},
+	})
 }
 
 func (adapter *RouterAdapter) handleHandshakeResult(
@@ -649,6 +747,18 @@ func (adapter *RouterAdapter) handleReconcile(
 				}
 				existing.mu.Unlock()
 				if !mismatch {
+					// Same lineage, same identity: repair a lost
+					// successful RouteResult before skipping, so the
+					// authoritative record's backend is never dropped
+					// on the floor (accounting would stay short and
+					// the snapshot would echo an empty backend). A
+					// DIVERGED record terminates the session instead -
+					// no-op survival is not fail-closed.
+					if completeLostAssignment(existing, remote) == lostAssignmentDiverged {
+						if err := adapter.closeDivergedAssignment(ctx, sender, existing, remote); err != nil {
+							return err
+						}
+					}
 					continue
 				}
 				adapter.forgetClosedState(existing)
