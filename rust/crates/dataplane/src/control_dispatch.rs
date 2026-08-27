@@ -1496,17 +1496,19 @@ impl ControlDispatchHandle {
 
     /// Adopts the decision-resolved namespace for this session's
     /// lifecycle events and reconciliation, and WAITS for the applied
-    /// acknowledgement. The precise guarantee: after this returns
-    /// true, every reconcile built later exports the resolved value,
-    /// and any reconcile that raced ahead with the seed has already
-    /// been succeeded — in wire order, before the ack fired — by an
-    /// explicit repair reconcile carrying the resolved value. A stale
-    /// export is also always backend-less (notices apply in order), so
-    /// the peer can only have parked it as an orphan — never a live
-    /// session under the seed. The orphan resolves under the adopted
-    /// values once the backend repair re-exports a routable record, or
-    /// the session terminates cleanly (peer orphan cleanup / failed
-    /// route conversation); it is never attributed stale.
+    /// acknowledgement. The precise guarantee: `true` means every
+    /// reconcile built later exports the resolved value AND any
+    /// reconcile that raced ahead with the seed has already been
+    /// succeeded — in wire order, before the ack fired — by an
+    /// explicit repair reconcile that actually entered the outbound
+    /// path. `false` means the repair could not be placed on the wire
+    /// (the epoch died or the enqueue failed): the caller must fail
+    /// the session closed instead of routing. A stale export is also
+    /// always backend-less (notices apply in order), so the peer can
+    /// only have parked it as an orphan — never a live session under
+    /// the seed — and the gate keeps the adopted value, so every later
+    /// export (including the next epoch's automatic reconcile) reports
+    /// it for accounting.
     pub async fn set_namespace(&self, connection_id: u64, namespace: String) -> bool {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
         if !self
@@ -2222,18 +2224,24 @@ async fn apply_notice<S: DispatchSender>(
             namespace,
             applied,
         } => {
-            // The repair enters the outbound path BEFORE the ack: once
-            // the commander observes `true`, the stale export is
-            // already succeeded (in wire order) by the repaired one —
-            // or the epoch died, in which case the gate (which already
-            // holds the adopted value) feeds the next transition's
-            // automatic reconcile: an explicit next-epoch barrier. Only
-            // a live-session enqueue failure leaves the stale export as
-            // the peer's last observation: then the ack is withheld
-            // (dropped, the commander observes `false`) and the session
-            // fails closed instead of routing.
+            // The ack is granted ONLY when no repair was owed or the
+            // repair actually entered the outbound path (`Sent`): the
+            // commander observing `true` then means the stale export
+            // is already succeeded, in wire order, by the repaired
+            // one. `StaleEpoch` is NOT a wire barrier — an acked
+            // session would immediately enqueue its durable
+            // `RouteRequest`, which can reach the new peer before the
+            // dispatcher even observes the `Connected` transition that
+            // sends the automatic reconcile — and `Failed` never left
+            // this process. Both drop the ack: the commander observes
+            // `false` and the SQL session fails closed, which is
+            // exactly the agreed boundary (a mid-handshake connection
+            // does not survive a control-session loss; the gate still
+            // holds the adopted value, so every later export —
+            // including the next epoch's automatic reconcile — reports
+            // it for accounting).
             let upheld = if handler.set_namespace(connection_id, &namespace) {
-                repair_stale_export(sender, handler).await? != SendOutcome::Failed
+                repair_stale_export(sender, handler).await? == SendOutcome::Sent
             } else {
                 true
             };

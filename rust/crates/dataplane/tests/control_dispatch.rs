@@ -2268,12 +2268,21 @@ fn scripted_stale_export_handler() -> ControlCommandHandler {
     handler
 }
 
-/// An unrecoverable repair enqueue failure withholds the applied ack:
-/// the commander observes `false` and the session fails closed instead
-/// of routing while the peer's last observation is the stale seed.
+/// A repair that did not actually enter the outbound path withholds
+/// the applied ack: the commander observes `false` and the session
+/// fails closed instead of routing while the peer's last observation
+/// is the stale seed. `StaleEpoch` is included deliberately — it is
+/// not a wire barrier: an acked session would enqueue its durable
+/// `RouteRequest`, which can reach the new peer before the dispatcher
+/// even observes the `Connected` transition that sends the automatic
+/// reconcile.
 #[tokio::test(start_paused = true)]
 async fn failed_repair_send_withholds_the_namespace_ack() {
-    for failure in [ScriptedFailure::QueueFull, ScriptedFailure::Closed] {
+    for failure in [
+        ScriptedFailure::StaleEpoch,
+        ScriptedFailure::QueueFull,
+        ScriptedFailure::Closed,
+    ] {
         let harness = spawn_scripted_loop(scripted_stale_export_handler());
         harness
             .state_tx
@@ -2306,12 +2315,13 @@ async fn failed_repair_send_withholds_the_namespace_ack() {
     }
 }
 
-/// A stale-epoch repair outcome still acks: the gate already holds the
-/// adopted value, so the next Connected transition's automatic
-/// reconcile IS the barrier — proven here by reconnecting and reading
-/// the re-export.
+/// A stale-epoch repair withholds the ack (the session fails closed),
+/// and the gate still converges for accounting: it holds the adopted
+/// value, so the next Connected transition's automatic reconcile
+/// re-exports it — proven here by reconnecting and reading the
+/// re-export.
 #[tokio::test(start_paused = true)]
-async fn stale_epoch_repair_acks_and_the_next_reconcile_re_exports() {
+async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports() {
     let harness = spawn_scripted_loop(scripted_stale_export_handler());
     harness
         .state_tx
@@ -2339,11 +2349,11 @@ async fn stale_epoch_repair_acks_and_the_next_reconcile_re_exports() {
             .is_ok()
     );
     assert!(
-        applied_rx.await.is_ok(),
-        "a stale-epoch repair is barriered by the next reconcile and acks"
+        applied_rx.await.is_err(),
+        "a stale-epoch repair never entered the wire: the ack is withheld"
     );
-    // The barrier is real: the next Connected transition re-exports the
-    // adopted value from the gate.
+    // The gate still converges for accounting: the next Connected
+    // transition re-exports the adopted value.
     harness.sender.fail_scoped_with(None);
     harness
         .state_tx
