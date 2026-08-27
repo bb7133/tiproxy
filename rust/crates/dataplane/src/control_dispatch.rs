@@ -1502,8 +1502,11 @@ impl ControlDispatchHandle {
     /// been succeeded — in wire order, before the ack fired — by an
     /// explicit repair reconcile carrying the resolved value. A stale
     /// export is also always backend-less (notices apply in order), so
-    /// the peer can only have parked it as an orphan, which the repair
-    /// record resolves.
+    /// the peer can only have parked it as an orphan — never a live
+    /// session under the seed. The orphan resolves under the adopted
+    /// values once the backend repair re-exports a routable record, or
+    /// the session terminates cleanly (peer orphan cleanup / failed
+    /// route conversation); it is never attributed stale.
     pub async fn set_namespace(&self, connection_id: u64, namespace: String) -> bool {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
         if !self
@@ -1997,8 +2000,18 @@ async fn drain_pending_notices<S: DispatchSender>(
     handler: &mut ControlCommandHandler,
     notices: &mut mpsc::Receiver<DispatchNotice>,
 ) -> Result<(), DispatchFatal> {
-    while let Ok(notice) = notices.try_recv() {
-        apply_notice(sender, handler, notice).await?;
+    // Bounded by the queue length observed at entry. This queue also
+    // carries continuous producers (metering, session terminals,
+    // redirect results) that can refill freed slots while apply awaits
+    // outbound sends — chasing them would let the drain starve the
+    // very transition it feeds. A notice arriving during the drain is
+    // exactly the case the stale-export repair covers.
+    let budget = notices.len();
+    for _ in 0..budget {
+        match notices.try_recv() {
+            Ok(notice) => apply_notice(sender, handler, notice).await?,
+            Err(_) => break,
+        }
     }
     Ok(())
 }
@@ -2087,10 +2100,16 @@ async fn send_reconcile_request<S: DispatchSender>(
 /// makes the repair the peer's LAST observation of the record, and the
 /// gate's notice-order guarantee (namespace adopts before any backend
 /// exists) means a stale export is always backend-less: it can only
-/// have parked as an orphan, which the repair's fresh record resolves
-/// under the adopted values. No active or reconcile-incapable session:
-/// nothing was exported to repair — the next session's automatic
-/// reconcile carries the adopted record.
+/// have parked as an orphan, never a live wrong-router session. The
+/// orphan then converges one of two ways, both clean: the backend
+/// adoption's repair re-exports a routable record that resolves it
+/// under the adopted values, or the peer's bounded orphan cleanup (or
+/// the failed route conversation) terminates the session with an
+/// ordinary CLOSED — a mid-handshake connection is not guaranteed to
+/// SURVIVE a peer restart, only to never be attributed stale. No
+/// active or reconcile-incapable session: nothing was exported to
+/// repair — the next session's automatic reconcile carries the
+/// adopted record.
 async fn repair_stale_export<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
