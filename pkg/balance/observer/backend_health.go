@@ -81,6 +81,11 @@ type BackendInfo struct {
 	Labels      map[string]string
 	IP          string
 	StatusPort  uint
+	// Keyspace is the authoritative, path-parsed keyspace this backend
+	// was discovered under (/keyspaces/tidb/<ks>/...). Empty for the
+	// classic topology. Routing consumers must prefer it over any
+	// operator-set label.
+	Keyspace string
 }
 
 func (bi BackendInfo) Equals(other BackendInfo) bool {
@@ -88,6 +93,7 @@ func (bi BackendInfo) Equals(other BackendInfo) bool {
 		bi.ClusterName == other.ClusterName &&
 		bi.IP == other.IP &&
 		bi.StatusPort == other.StatusPort &&
+		bi.Keyspace == other.Keyspace &&
 		maps.Equal(bi.Labels, other.Labels)
 }
 

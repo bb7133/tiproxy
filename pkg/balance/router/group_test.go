@@ -5,6 +5,7 @@ package router
 
 import (
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -286,4 +287,178 @@ func TestFailoverTimeoutForceClose(t *testing.T) {
 	}
 	tester.closeConnections(3, false)
 	tester.checkBackendConnMetrics()
+}
+
+// setBackendKeyspace stamps the path-parsed (authoritative) keyspace on
+// an already-added backend and re-notifies health, mirroring how a
+// keyspace-scoped topology reaches the router.
+func setBackendKeyspace(tester *routerTester, index int, keyspace string) {
+	addr := strconv.Itoa(index + 1)
+	health := tester.backends[addr]
+	require.NotNil(tester.t, health)
+	health.BackendInfo.Keyspace = keyspace
+	tester.notifyHealth()
+}
+
+// The cross-keyspace guard at the FINAL issuance boundary: a failover
+// that would migrate existing sessions into a different keyspace must
+// refuse every redirect (the sessions stay on the failed backend until
+// failover-timeout force-close), while a same-keyspace failover keeps
+// migrating. This is the DPL-07 (#41) no-keyspace-migration acceptance
+// regression: it was RED before Group.redirectConn enforced the
+// invariant.
+func TestCrossKeyspaceFailoverRefusesRedirect(t *testing.T) {
+	tester := newRouterTester(t, nil)
+	tester.addBackends(2)
+	setBackendKeyspace(tester, 0, "ks-old")
+	setBackendKeyspace(tester, 1, "ks-new")
+	tester.addConnections(20)
+
+	fromBackend := tester.getBackendByIndex(0)
+	toBackend := tester.getBackendByIndex(1)
+	fromCount := fromBackend.ConnCount()
+	toCount := toBackend.ConnCount()
+	require.Positive(t, fromCount)
+
+	tester.router.setConfig(&config.Config{
+		Proxy: config.ProxyServer{
+			ProxyServerOnline: config.ProxyServerOnline{
+				FailBackendList: []string{fromBackend.PodName()},
+				FailoverTimeout: 60,
+			},
+		},
+	})
+	tester.rebalance(3)
+
+	// No redirect was issued: every connection keeps its backend and no
+	// connection holds a redirect target.
+	require.Equal(t, fromCount, fromBackend.ConnCount())
+	require.Equal(t, toCount, toBackend.ConnCount())
+	for _, conn := range tester.conns {
+		require.Empty(t, conn.GetRedirectingBackendID(),
+			"connection %d received a cross-keyspace redirect", conn.connID)
+	}
+}
+
+// Same NON-EMPTY keyspace on both sides: the guard must not block the
+// ordinary failover migration.
+func TestSameKeyspaceFailoverStillRedirects(t *testing.T) {
+	tester := newRouterTester(t, nil)
+	tester.addBackends(2)
+	setBackendKeyspace(tester, 0, "ks-same")
+	setBackendKeyspace(tester, 1, "ks-same")
+	tester.addConnections(20)
+
+	fromBackend := tester.getBackendByIndex(0)
+	toBackend := tester.getBackendByIndex(1)
+	fromCount := fromBackend.ConnCount()
+	require.Positive(t, fromCount)
+
+	tester.router.setConfig(&config.Config{
+		Proxy: config.ProxyServer{
+			ProxyServerOnline: config.ProxyServerOnline{
+				FailBackendList: []string{fromBackend.PodName()},
+				FailoverTimeout: 60,
+			},
+		},
+	})
+	tester.rebalance(1)
+	tester.redirectFinish(fromCount, true)
+	require.Equal(t, 0, fromBackend.ConnCount())
+	require.Equal(t, 20, toBackend.ConnCount())
+}
+
+// Legacy empty==empty keyspaces: unchanged failover behavior.
+func TestEmptyKeyspaceFailoverStillRedirects(t *testing.T) {
+	tester := newRouterTester(t, nil)
+	tester.addBackends(2)
+	tester.addConnections(20)
+
+	fromBackend := tester.getBackendByIndex(0)
+	toBackend := tester.getBackendByIndex(1)
+	fromCount := fromBackend.ConnCount()
+	require.Positive(t, fromCount)
+
+	tester.router.setConfig(&config.Config{
+		Proxy: config.ProxyServer{
+			ProxyServerOnline: config.ProxyServerOnline{
+				FailBackendList: []string{fromBackend.PodName()},
+				FailoverTimeout: 60,
+			},
+		},
+	})
+	tester.rebalance(1)
+	tester.redirectFinish(fromCount, true)
+	require.Equal(t, 0, fromBackend.ConnCount())
+	require.Equal(t, 20, toBackend.ConnCount())
+}
+
+// Empty vs non-empty is a MISMATCH: ambiguity fails closed.
+func TestEmptyToNonemptyKeyspaceFailoverRefused(t *testing.T) {
+	tester := newRouterTester(t, nil)
+	tester.addBackends(2)
+	setBackendKeyspace(tester, 1, "ks-new")
+	tester.addConnections(20)
+
+	fromBackend := tester.getBackendByIndex(0)
+	toBackend := tester.getBackendByIndex(1)
+	fromCount := fromBackend.ConnCount()
+	toCount := toBackend.ConnCount()
+	require.Positive(t, fromCount)
+
+	tester.router.setConfig(&config.Config{
+		Proxy: config.ProxyServer{
+			ProxyServerOnline: config.ProxyServerOnline{
+				FailBackendList: []string{fromBackend.PodName()},
+				FailoverTimeout: 60,
+			},
+		},
+	})
+	tester.rebalance(3)
+	require.Equal(t, fromCount, fromBackend.ConnCount())
+	require.Equal(t, toCount, toBackend.ConnCount())
+	for _, conn := range tester.conns {
+		require.Empty(t, conn.GetRedirectingBackendID())
+	}
+}
+
+// Boundedness: one cross-keyspace rebalance round refuses the WHOLE
+// pair with a single counted attempt — never one warning/attempt per
+// connection — and never calls conn.Redirect. Flipping the target to
+// the same keyspace resumes ordinary migration.
+func TestCrossKeyspaceRefusalIsBounded(t *testing.T) {
+	tester := newRouterTester(t, nil)
+	tester.addBackends(2)
+	setBackendKeyspace(tester, 0, "ks-old")
+	setBackendKeyspace(tester, 1, "ks-new")
+	tester.addConnections(20)
+
+	fromBackend := tester.getBackendByIndex(0)
+	toBackend := tester.getBackendByIndex(1)
+	fromCount := fromBackend.ConnCount()
+	require.Positive(t, fromCount)
+
+	tester.router.setConfig(&config.Config{
+		Proxy: config.ProxyServer{
+			ProxyServerOnline: config.ProxyServerOnline{
+				FailBackendList: []string{fromBackend.PodName()},
+				FailoverTimeout: 60,
+			},
+		},
+	})
+	tester.rebalance(3)
+	group := tester.router.groups[0]
+	require.Equal(t, uint64(3), group.crossKeyspaceSkipCount,
+		"one counted attempt per refused round, not per connection")
+	for _, conn := range tester.conns {
+		require.Empty(t, conn.GetRedirectingBackendID())
+	}
+	require.Equal(t, fromCount, fromBackend.ConnCount())
+
+	// Same keyspace again: migration resumes.
+	setBackendKeyspace(tester, 1, "ks-old")
+	tester.rebalance(1)
+	tester.redirectFinish(fromCount, true)
+	require.Equal(t, 0, fromBackend.ConnCount())
+	require.Equal(t, 20, toBackend.ConnCount())
 }

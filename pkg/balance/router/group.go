@@ -63,6 +63,12 @@ type Group struct {
 	ignoreFailover  bool
 	// To limit the speed of redirection.
 	lastRedirectTime time.Time
+	// Cross-keyspace guard evidence: attempts are counted per skip
+	// decision (one per Balance round for a refused pair, never one
+	// per connection) and the structured record is rate-limited per
+	// group.
+	crossKeyspaceSkipCount uint64
+	lastCrossKeyspaceWarn  time.Time
 }
 
 func NewGroup(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger) (*Group, error) {
@@ -335,6 +341,34 @@ func (g *Group) Route(excluded []BackendInst) (policy.BackendCtx, error) {
 	return backend, nil
 }
 
+// crossKeyspaceWarnInterval bounds the guard's structured evidence to
+// one record per group per interval, independent of connection count.
+const crossKeyspaceWarnInterval = 10 * time.Second
+
+// logCrossKeyspaceSkip counts one refused migration attempt and emits
+// the bounded structured evidence record. Callers hold the group lock.
+func (g *Group) logCrossKeyspaceSkip(fromBackend, toBackend *backendWrapper,
+	fromKeyspace, toKeyspace, reason string, curTime time.Time) {
+	g.crossKeyspaceSkipCount++
+	if curTime.Sub(g.lastCrossKeyspaceWarn) < crossKeyspaceWarnInterval {
+		return
+	}
+	g.lastCrossKeyspaceWarn = curTime
+	fields := []zap.Field{
+		zap.String("from", fromBackend.addr),
+		zap.String("to", toBackend.addr),
+		zap.String("from_keyspace", fromKeyspace),
+		zap.String("to_keyspace", toKeyspace),
+		zap.String("reason", reason),
+		zap.Int("blocked_conn_count", fromBackend.connList.Len()),
+		zap.Uint64("skip_count", g.crossKeyspaceSkipCount),
+	}
+	if ele := fromBackend.connList.Front(); ele != nil {
+		fields = append(fields, zap.Uint64("sample_conn_id", ele.Value.ConnectionID()))
+	}
+	g.lg.Warn("skip cross-keyspace redirect", fields...)
+}
+
 func (g *Group) Balance(ctx context.Context) {
 	g.Lock()
 	defer g.Unlock()
@@ -351,6 +385,15 @@ func (g *Group) Balance(ctx context.Context) {
 
 	// Control the speed of migration.
 	curTime := time.Now()
+	// Cross-keyspace fast path (DPL-07 #41): the WHOLE pair is refused
+	// for this round before the per-connection loop runs — one counted
+	// attempt and one rate-limited record, never a warning per
+	// connection. The redirectConn backstop below remains for any
+	// future caller that bypasses Balance.
+	if fromKeyspace, toKeyspace := fromBackend.Keyspace(), toBackend.Keyspace(); fromKeyspace != toKeyspace {
+		g.logCrossKeyspaceSkip(fromBackend, toBackend, fromKeyspace, toKeyspace, reason, curTime)
+		return
+	}
 	migrationInterval := time.Duration(float64(time.Second) / balanceCount)
 	count := 0
 	if migrationInterval < rebalanceInterval*2 {
@@ -597,6 +640,30 @@ func (g *Group) OnConnClosed(backendID string, conn RedirectableConn) error {
 
 func (g *Group) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toBackend *backendWrapper,
 	reason string, logFields []zap.Field, curTime time.Time) bool {
+	// Cross-keyspace guard (DPL-07 #41): a dynamic change may never
+	// migrate an existing session to another keyspace. This is the
+	// FINAL issuance boundary - Go's BackendConnManager and the Rust
+	// dataplane's projected sessions both receive their redirects from
+	// here, so one strict-equality invariant constrains both seams.
+	// Legacy ""=="" is allowed; any mismatch, including empty vs
+	// non-empty, fails closed: the connection is safely skipped for
+	// this round (never rerouted to the foreign keyspace; a failed
+	// backend's remaining sessions force-close on failover-timeout).
+	// Per-keyspace candidate selection is a recorded follow-up
+	// availability/balance boundary.
+	fromKeyspace := fromBackend.Keyspace()
+	toKeyspace := toBackend.Keyspace()
+	if fromKeyspace != toKeyspace {
+		// Backstop only: Balance's pair-level fast path normally
+		// refuses first. The evidence goes through the same
+		// group-level limiter/counter — never an unbounded per-
+		// connection warning — and the redirect timestamps advance
+		// exactly as a failed redirect would.
+		g.logCrossKeyspaceSkip(fromBackend, toBackend, fromKeyspace, toKeyspace, reason, curTime)
+		conn.phase = phaseRedirectFail
+		conn.lastRedirect = curTime
+		return false
+	}
 	// Skip the connection if it's closing.
 	fields := []zap.Field{
 		zap.Uint64("connID", conn.ConnectionID()),

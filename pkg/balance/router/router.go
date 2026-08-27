@@ -233,6 +233,12 @@ func (b *backendWrapper) SupportRedirection() bool {
 func (b *backendWrapper) Keyspace() string {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	// The path-parsed topology keyspace is authoritative; the label is
+	// only a fallback channel (classic-topology discrimination in
+	// tests/operations) and can never override a real keyspace.
+	if b.mu.BackendHealth.BackendInfo.Keyspace != "" {
+		return b.mu.BackendHealth.BackendInfo.Keyspace
+	}
 	labels := b.mu.BackendHealth.Labels
 	if labels == nil {
 		return ""

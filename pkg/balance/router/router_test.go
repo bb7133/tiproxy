@@ -4,6 +4,7 @@
 package router
 
 import (
+	"github.com/pingcap/tiproxy/lib/config"
 	"testing"
 
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
@@ -31,4 +32,26 @@ func TestBackendWrapper(t *testing.T) {
 	require.False(t, b.Local())
 	require.Equal(t, "a", b.GetBackendInfo().Labels["keyspace"])
 	require.Equal(t, "b", b.GetBackendInfo().Labels["zone"])
+}
+
+// The path-parsed topology keyspace is authoritative: a conflicting
+// operator label can never override it; the label remains only a
+// fallback channel for classic (keyspace-less) topologies.
+func TestBackendKeyspacePrefersPathParsedOverLabel(t *testing.T) {
+	backend := newBackendWrapper("b1", observer.BackendHealth{
+		BackendInfo: observer.BackendInfo{
+			Addr:     "1.1.1.1:4000",
+			Keyspace: "ks-path",
+			Labels:   map[string]string{config.KeyspaceLabelName: "ks-label"},
+		},
+	})
+	require.Equal(t, "ks-path", backend.Keyspace())
+
+	labelOnly := newBackendWrapper("b2", observer.BackendHealth{
+		BackendInfo: observer.BackendInfo{
+			Addr:   "2.2.2.2:4000",
+			Labels: map[string]string{config.KeyspaceLabelName: "ks-label"},
+		},
+	})
+	require.Equal(t, "ks-label", labelOnly.Keyspace())
 }

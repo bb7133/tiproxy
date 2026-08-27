@@ -56,6 +56,10 @@ func (pf *PDFetcher) GetBackendList(ctx context.Context) (map[string]*BackendInf
 			Labels:      backend.Labels,
 			IP:          backend.IP,
 			StatusPort:  backend.StatusPort,
+			// The path-parsed keyspace must survive projection: it is
+			// the authoritative value routing uses to refuse
+			// cross-keyspace migration.
+			Keyspace: backend.Keyspace,
 		}
 	}
 	return infos, nil
