@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 
+mod health;
+
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -54,13 +56,22 @@ struct Options {
     control_uid: u32,
     tls_roots: Vec<PathBuf>,
     drain_grace: Duration,
+    health_port: u16,
 }
 
 enum Command {
     Run(Options),
     Version,
     Help,
+    IntegrationCapabilities,
 }
+
+/// The integration harness's capability contract (DPL-07): only what
+/// this binary truthfully provides today. The TLS-off/uncompressed
+/// slice deliberately does NOT advertise tls/proxy-v2/zlib/zstd, so
+/// the topology preflight admits only the plain variant.
+const INTEGRATION_CAPABILITIES: &str =
+    "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -78,6 +89,10 @@ async fn main() -> ExitCode {
         }
         Command::Help => {
             println!("{}", usage());
+            ExitCode::SUCCESS
+        }
+        Command::IntegrationCapabilities => {
+            println!("{INTEGRATION_CAPABILITIES}");
             ExitCode::SUCCESS
         }
         Command::Run(options) => match run(options).await {
@@ -153,6 +168,18 @@ async fn run(options: Options) -> Result<(), String> {
         return Err("install control dispatch handle exactly once".to_owned());
     }
 
+    // Readiness probe for the integration topology: answers 503 until
+    // the first applied generation, 200 after. Bound before serving so
+    // a bad port fails fast; the task is owned and aborted at exit.
+    let health_task = if options.health_port > 0 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", options.health_port))
+            .await
+            .map_err(|error| format!("bind health endpoint: {error}"))?;
+        Some(tokio::spawn(health::serve(listener, serving.clone())))
+    } else {
+        None
+    };
+
     // Coordinated shutdown on SIGTERM/SIGINT:
     // stop-accept → graceful drain (per-session force at the loop's
     // drain deadline) → absolute grace deadline force → join everything.
@@ -172,6 +199,10 @@ async fn run(options: Options) -> Result<(), String> {
     }
 
     let control_result = runtime.join().await;
+    if let Some(task) = health_task {
+        task.abort();
+        let _ = task.await;
+    }
     let serving_result = serving.shutdown().await;
     match (control_result, serving_result) {
         (Err(error), _) => Err(error.to_string()),
@@ -217,10 +248,12 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         .map(|value| env::split_paths(&value).collect())
         .unwrap_or_default();
     let mut drain_grace = Duration::from_secs(30);
+    let mut health_port: u16 = 0;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--version" | "-V" => return Ok(Command::Version),
             "--help" | "-h" => return Ok(Command::Help),
+            "--integration-capabilities" => return Ok(Command::IntegrationCapabilities),
             "--control-socket" => {
                 socket =
                     Some(PathBuf::from(arguments.next().ok_or_else(|| {
@@ -239,6 +272,14 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                     .next()
                     .ok_or_else(|| "--tls-root requires a path".to_owned())?,
             )),
+            "--health-port" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--health-port requires a port".to_owned())?;
+                health_port = value
+                    .parse()
+                    .map_err(|_| format!("health port must be a u16, got {value:?}"))?;
+            }
             "--drain-grace-seconds" => {
                 let value = arguments
                     .next()
@@ -271,6 +312,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
             .ok_or_else(|| format!("--control-uid or {CONTROL_UID_ENV} is required"))?,
         tls_roots,
         drain_grace,
+        health_port,
     }))
 }
 
@@ -282,7 +324,7 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 
 fn usage() -> &'static str {
     "Usage: tiproxy-rs --control-socket <absolute-path> --control-uid <uid> \
-     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>]\n\
+     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>]\n\
      Environment: TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 
@@ -295,8 +337,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Command, MAX_DRAIN_GRACE_SECONDS, Options, parse_options, session_loop_config,
-        version_output,
+        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options, parse_options,
+        session_loop_config, version_output,
     };
 
     #[test]
@@ -327,6 +369,7 @@ mod tests {
                 control_uid: 42,
                 tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
                 drain_grace: std::time::Duration::from_secs(30),
+                health_port: 0,
             }
         );
     }
@@ -349,6 +392,51 @@ mod tests {
             session_loop_config(options.drain_grace).drain_deadline,
             std::time::Duration::from_secs(45),
             "one lineage: the CLI grace is the per-session FSM deadline"
+        );
+    }
+
+    #[test]
+    fn integration_capabilities_are_the_honest_contract() {
+        let Ok(Command::IntegrationCapabilities) =
+            parse_options(["--integration-capabilities".to_owned()])
+        else {
+            unreachable!("the capability probe needs no other arguments")
+        };
+        assert_eq!(
+            INTEGRATION_CAPABILITIES,
+            "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown",
+            "only what the TLS-off/uncompressed slice truthfully provides"
+        );
+        for absent in ["tls", "proxy-v2", "zlib", "zstd"] {
+            assert!(
+                !INTEGRATION_CAPABILITIES.contains(absent),
+                "unimplemented variant capability {absent:?} must not be advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_health_port() {
+        let command = parse_options([
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--health-port".to_owned(),
+            "8081".to_owned(),
+        ]);
+        let Ok(Command::Run(options)) = command else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(options.health_port, 8081);
+        assert!(
+            parse_options([
+                "--control-socket".to_owned(),
+                "/tmp/control.sock".to_owned(),
+                "--health-port".to_owned(),
+                "not-a-port".to_owned(),
+            ])
+            .is_err()
         );
     }
 

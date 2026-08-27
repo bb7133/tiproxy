@@ -264,3 +264,25 @@ impl BackendDialer for TcpDialer {
         }
     }
 }
+
+/// Cluster-scoped TCP dialer (DPL-07). A standard cluster resolves its
+/// backend addresses with the system resolver — exactly Go's
+/// `DNSDialer` when the cluster declares no name servers, which is the
+/// only shape the wire snapshot can express today
+/// (`BackendCluster.NSServers` is not projected). A future serverless
+/// projection carrying per-cluster name servers must extend this
+/// dialer's resolution rather than fall back to it silently.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClusterTcpDialer;
+
+impl BackendDialer for ClusterTcpDialer {
+    const CLUSTER_AWARE: bool = true;
+    type Conn = TcpStream;
+
+    async fn dial(&mut self, address: &str, _cluster_name: &str) -> Result<TcpStream, DialFailure> {
+        match TcpStream::connect(address).await {
+            Ok(stream) => Ok(stream),
+            Err(_) => Err(DialFailure::Connect),
+        }
+    }
+}

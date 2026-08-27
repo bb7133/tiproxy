@@ -354,7 +354,14 @@ func (bridge *Bridge) Run(ctx context.Context) error {
 					// sync, so the wire snapshot stays live without a
 					// config change.
 					_ = bridge.publisher.RefreshTopology()
-					_ = bridge.publisher.Sync(ctx, bridge.server.Active())
+					// The nil check MUST happen on the concrete
+					// *Session: converting a nil pointer into the
+					// EnvelopeSender interface would defeat Sync's
+					// own guard and dereference nil on first tick
+					// of every boot that precedes the peer.
+					if sender := bridge.server.Active(); sender != nil {
+						_ = bridge.publisher.Sync(ctx, sender)
+					}
 				}
 				bridge.syncDrain(ctx)
 			}

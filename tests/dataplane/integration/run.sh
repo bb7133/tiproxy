@@ -100,15 +100,10 @@ if ((preflight_status != 0)); then
 	exit "$preflight_status"
 fi
 
+rust_binary=
 if [[ $mode == rust ]]; then
-	cat >"$run_dir/rust-launch-blocker.log" <<'EOF'
-Rust capabilities were reported, but DPL-03 intentionally does not claim a
-truthful SELECT-1 topology yet: DPL-04 must install the concrete session owner
-and DPL-07 must project namespace/backend topology. Refusing to substitute the
-Go proxy or a raw TCP relay for either missing owner.
-EOF
-	cat "$run_dir/rust-launch-blocker.log" >&2
-	exit 78
+	# Preflight already verified the binary and its capability contract.
+	rust_binary=${TIPROXY_RS_BIN:-$repo_root/rust/target/debug/tiproxy-rs}
 fi
 
 make -C "$repo_root" cmd_tiproxy >"$run_dir/go-build.log" 2>&1
@@ -118,13 +113,28 @@ go build -o "$run_dir/faultproxy" "$script_dir/faultproxy"
 source "$run_dir/variant.env"
 
 PORTS="$PD_PORT $((2380 + port_offset)) $((20160 + port_offset)) $((20180 + port_offset)) $TIDB_PORT_0 $TIDB_PORT_1 $((10080 + port_offset)) $((10081 + port_offset)) $TIPROXY_PORT $TIPROXY_API_PORT $FAULT_PORT $FAULT_ADMIN_PORT"
+RUST_HEALTH_PORT=$((8090 + port_offset))
+RUST_SOCKET="${TMPDIR:-/tmp}/$tag.sock"
+if [[ $mode == rust ]]; then
+	# The Go process cedes the SQL listeners entirely: with the gate
+	# enabled it serves only the control plane and API, and the Rust
+	# process binds proxy.addr from its wire snapshot. The socket lives
+	# under /tmp with the run's unique tag: macOS caps sun_path around
+	# 104 bytes, far shorter than the artifact directory path.
+	printf '\n[rust-dataplane]\nenabled = true\ncontrol-socket = "%s"\n' \
+		"$RUST_SOCKET" >>"$run_dir/tiproxy.toml"
+	PORTS="$PORTS $RUST_HEALTH_PORT"
+fi
 FAULT_PROXY_BIN="$run_dir/faultproxy"
 TIUP_PID=
 FAULT_PID=
+RUST_PID=
 write_state() {
 	{
 		printf 'TIUP_PID=%q\n' "$TIUP_PID"
 		printf 'FAULT_PID=%q\n' "$FAULT_PID"
+		printf 'RUST_PID=%q\n' "$RUST_PID"
+		printf 'RUST_SOCKET=%q\n' "$RUST_SOCKET"
 		printf 'FAULT_PROXY_BIN=%q\n' "$FAULT_PROXY_BIN"
 		printf 'PORTS=%q\n' "$PORTS"
 	} >"$run_dir/state.env"
@@ -159,6 +169,29 @@ if [[ -d $tiup_data ]]; then
 	printf '%s\n' "$run_dir" >"$tiup_data/.tiproxy-integration-owned"
 fi
 
+if [[ $mode == rust ]]; then
+	control_socket="$RUST_SOCKET"
+	# The Go control plane creates the socket when it starts; waiting
+	# here keeps the launch independent of client reconnect timing.
+	for _ in {1..600}; do
+		[[ -S $control_socket ]] && break
+		if ! kill -0 "$TIUP_PID" 2>/dev/null; then
+			echo "TiUP playground exited before the control socket appeared" >&2
+			exit 1
+		fi
+		sleep 0.1
+	done
+	if [[ ! -S $control_socket ]]; then
+		echo "Rust control socket did not appear: $control_socket" >&2
+		exit 1
+	fi
+	"$rust_binary" --control-socket "$control_socket" --control-uid "$(id -u)" \
+		--health-port "$RUST_HEALTH_PORT" \
+		>"$run_dir/tiproxy-rs.log" 2>&1 &
+	RUST_PID=$!
+	write_state
+fi
+
 faultproxy_args=(
 	--listen "127.0.0.1:$FAULT_PORT"
 	--admin "127.0.0.1:$FAULT_ADMIN_PORT"
@@ -172,6 +205,27 @@ FAULT_PID=$!
 write_state
 
 "$script_dir/readiness.sh" "$run_dir" 180 | tee "$run_dir/readiness.log"
+
+if [[ $mode == rust ]]; then
+	rust_ready=false
+	for _ in {1..180}; do
+		if curl --noproxy '*' --fail --silent \
+			"http://127.0.0.1:$RUST_HEALTH_PORT/health" \
+			>"$run_dir/tiproxy-rs-health.json" 2>/dev/null; then
+			rust_ready=true
+			break
+		fi
+		if ! kill -0 "$RUST_PID" 2>/dev/null; then
+			echo "tiproxy-rs exited before readiness; see tiproxy-rs.log" >&2
+			exit 1
+		fi
+		sleep 1
+	done
+	if [[ $rust_ready != true ]]; then
+		echo "Rust dataplane health endpoint was not ready after 180s" >&2
+		exit 1
+	fi
+fi
 
 mysql_tls_args=()
 if [[ $TLS_ENABLED == true ]]; then
@@ -207,4 +261,8 @@ if [[ $(mysql_ingress 'SELECT 1') != 1 ]]; then
 	exit 1
 fi
 
-echo "PASS: Go baseline $variant executed SELECT 1 and recovered from drop-next"
+if [[ $mode == rust ]]; then
+	echo "PASS: Rust dataplane $variant executed SELECT 1 and recovered from drop-next"
+else
+	echo "PASS: Go baseline $variant executed SELECT 1 and recovered from drop-next"
+fi

@@ -308,6 +308,46 @@ func TestBridgeOperatorDrainLifecycle(t *testing.T) {
 	require.EqualValues(t, 2, next.GetCommandSequence(), "the issuer-wide sequence advanced")
 }
 
+// Every boot precedes its peer: the snapshot cadence must tick with a
+// publisher configured and NO active session without dereferencing the
+// typed-nil sender (the panic killed the whole process in production).
+func TestBridgeCadenceSurvivesTicksWithoutAPeer(t *testing.T) {
+	cfg := config.NewConfig()
+	builder, err := NewSnapshotBuilder(cfg, nil)
+	require.NoError(t, err)
+	publisher, err := NewSnapshotPublisher(SnapshotPublisherConfig{
+		Builder:              builder,
+		Initial:              cfg,
+		AdvertisedCapability: 1,
+		ServerVersion:        "test-server",
+	})
+	require.NoError(t, err)
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	bridge, err := NewBridge(BridgeConfig{
+		Transport:             bridgeTransportConfig(t),
+		Handshake:             &recordingHandler{rt: rt},
+		OrphanResolveInterval: time.Hour,
+		Publisher:             publisher,
+		SnapshotSyncInterval:  5 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx) }()
+
+	// Many peerless ticks: a typed-nil dereference would crash here.
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridge did not stop on context cancellation")
+	}
+	require.NoError(t, bridge.Close())
+}
+
 // A topology change reaches the WIRE without any config change: the
 // bridge cadence re-projects, stages a fresh generation, and streams
 // the new StateSnapshot to the negotiated Rust peer (DPL-07).

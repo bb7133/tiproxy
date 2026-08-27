@@ -1,0 +1,94 @@
+// Copyright 2026 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Minimal readiness endpoint for the integration topology (DPL-07).
+//!
+//! One GET on the configured port answers `200` once a configuration
+//! generation has been applied — the SQL listeners are bound and
+//! serving — and `503` before that. The HTTP/1.0 responder is
+//! hand-rolled over the runtime's own socket types so the supply
+//! chain gains no HTTP dependency for a health probe.
+
+use std::time::Duration;
+
+use dataplane::{DataplaneServingHandle, GenerationStatusSnapshot};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+/// Serves readiness probes until the listener errors or the task is
+/// aborted by the composition's shutdown.
+pub async fn serve(listener: TcpListener, serving: DataplaneServingHandle) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let serving = serving.clone();
+        tokio::spawn(async move {
+            // Best-effort request consumption: the response does not
+            // depend on the request, only on the serving state.
+            let mut scratch = [0_u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch)).await;
+            let response = render(&serving.status());
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+/// Renders the full HTTP response for one probe.
+fn render(status: &GenerationStatusSnapshot) -> String {
+    let ready = status.applied_generation > 0;
+    let (code, reason, state) = if ready {
+        (200, "OK", "OK")
+    } else {
+        (503, "Service Unavailable", "NOT_READY")
+    };
+    let body = format!(
+        "{{\"status\":\"{state}\",\"applied_generation\":{}}}",
+        status.applied_generation
+    );
+    format!(
+        "HTTP/1.0 {code} {reason}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(applied: u64) -> GenerationStatusSnapshot {
+        GenerationStatusSnapshot {
+            applied_generation: applied,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn not_ready_before_the_first_applied_generation() {
+        let response = render(&snapshot(0));
+        assert!(response.starts_with("HTTP/1.0 503 "));
+        assert!(response.contains("\"status\":\"NOT_READY\""));
+        assert!(response.contains("\"applied_generation\":0"));
+    }
+
+    #[test]
+    fn ready_once_a_generation_is_applied() {
+        let response = render(&snapshot(3));
+        assert!(response.starts_with("HTTP/1.0 200 OK"));
+        assert!(response.contains("\"status\":\"OK\""));
+        assert!(response.contains("\"applied_generation\":3"));
+    }
+}
