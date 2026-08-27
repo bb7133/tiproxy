@@ -199,6 +199,10 @@ struct EngineExit {
     backend_address: String,
     cluster: String,
     capabilities: u64,
+    /// The namespace the accepted decision resolved (the process seed
+    /// until a decision arrives), so the owner's close log attributes
+    /// the connection to its real routing class.
+    namespace: String,
 }
 
 /// The event-source half: the loop's pump polls this; the engine feeds
@@ -651,6 +655,14 @@ async fn run_bound_session_observed(
                 exit.capabilities,
             )
         });
+    // Attribute the close to the namespace the decision resolved, not
+    // the pre-decision process seed.
+    let mut log_context = log_context;
+    if let Some(exit) = engine_exit.as_ref()
+        && !exit.namespace.is_empty()
+    {
+        log_context.namespace.clone_from(&exit.namespace);
+    }
     log_session(
         "connection_closed",
         &log_context,
@@ -802,6 +814,7 @@ impl Engine {
             backend_address,
             cluster,
             capabilities: u64::from(self.negotiated.bits()),
+            namespace: self.log_context.namespace.clone(),
         }
     }
 
@@ -944,13 +957,26 @@ impl Engine {
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Some(WireErrorSource::Proxy);
         }
+        // The accepted decision names the namespace the Go handshake
+        // handler RESOLVED for this connection — the routing truth.
+        // Adopt it for the route conversation and every lifecycle/log
+        // surface; the process seed was only the pre-decision default.
+        let mut resolved_namespace = decision.namespace;
+        resolved_namespace.truncate(255);
+        if resolved_namespace.is_empty() {
+            resolved_namespace = seed.namespace;
+        }
+        self.log_context.namespace.clone_from(&resolved_namespace);
+        // The dispatcher's per-session record adopts it too, so CLOSED
+        // events and reconciliation carry the routing truth on the wire.
+        let _ = commander.set_namespace(resolved_namespace.clone()).await;
         let channel = BindingRouteChannel {
             client: seed.client,
             commander: seed.commander,
             responses: seed.responses,
             identity: seed.identity,
             metadata,
-            namespace: seed.namespace,
+            namespace: resolved_namespace,
             generation: admission_generation,
         };
         let mut route_engine = RouteEngine::new(

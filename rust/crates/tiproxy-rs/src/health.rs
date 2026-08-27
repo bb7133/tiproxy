@@ -23,25 +23,28 @@
 use std::time::Duration;
 
 use dataplane::{DataplaneServingHandle, GenerationStatusSnapshot};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 /// Serves readiness probes until the listener errors or the task is
 /// aborted by the composition's shutdown.
 /// Probes are handled INLINE — no per-connection task is ever spawned,
-/// so aborting this one task leaves nothing detached, and a slow
-/// prober is bounded by the read timeout, not unbounded task growth.
+/// so aborting this one task leaves nothing detached. The response
+/// depends only on the serving state, so it is written IMMEDIATELY on
+/// accept: a prober that never sends a byte cannot head-of-line-block
+/// later probes, and the write itself is deadline-bounded so a
+/// non-reading peer cannot either.
 pub async fn serve(listener: TcpListener, serving: DataplaneServingHandle) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        // Best-effort request consumption: the response does not
-        // depend on the request, only on the serving state.
-        let mut scratch = [0_u8; 1024];
-        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch)).await;
         let response = render(&serving.status(), serving.is_serving().await);
-        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream.write_all(response.as_bytes()),
+        )
+        .await;
         let _ = stream.shutdown().await;
     }
 }
@@ -94,6 +97,69 @@ mod tests {
         let response = render(&snapshot(3), false);
         assert!(response.starts_with("HTTP/1.0 503 "));
         assert!(response.contains("\"status\":\"NOT_READY\""));
+    }
+
+    #[tokio::test]
+    async fn idle_probers_cannot_delay_later_probes() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+
+        use tokio::io::AsyncReadExt;
+
+        use dataplane::{DataplaneSnapshotConsumer, SystemMemoryProbe};
+        use tokio::net::TcpStream;
+
+        struct NopHandler;
+        impl dataplane::ConnectionHandler for NopHandler {
+            fn handle(
+                &self,
+                _connection: dataplane::AcceptedConnection,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+        }
+        let (_consumer, serving) = DataplaneSnapshotConsumer::new(
+            Arc::new(SystemMemoryProbe::new()),
+            Arc::new(NopHandler),
+        );
+        let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+            unreachable!("ephemeral bind")
+        };
+        let Ok(address) = listener.local_addr() else {
+            unreachable!("bound address")
+        };
+        let server = tokio::spawn(serve(listener, serving));
+
+        // Several probers that never send a byte...
+        let mut idle = Vec::new();
+        for _ in 0..5 {
+            let Ok(connection) = TcpStream::connect(address).await else {
+                unreachable!("idle connect")
+            };
+            idle.push(connection);
+        }
+        // ...must not delay a real probe: the response is written on
+        // accept, within one write deadline, not after N read windows.
+        let Ok(mut probe) = TcpStream::connect(address).await else {
+            unreachable!("probe connect")
+        };
+        let mut body = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(3), async {
+            probe.read_to_end(&mut body).await
+        })
+        .await;
+        assert!(
+            read.is_ok(),
+            "the probe answered promptly despite idle peers"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.starts_with("HTTP/1.0 503 "),
+            "unbound consumer: {text}"
+        );
+        server.abort();
+        drop(idle);
     }
 
     #[test]

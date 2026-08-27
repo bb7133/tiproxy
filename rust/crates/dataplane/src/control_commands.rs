@@ -394,6 +394,23 @@ impl CommandGate {
             .map(|connection| connection.backend_id.clone())
     }
 
+    /// Returns the connection's current (decision-resolved) namespace.
+    #[must_use]
+    pub fn connection_namespace(&self, connection_id: u64) -> Option<String> {
+        self.connections
+            .get(&connection_id)
+            .map(|connection| connection.namespace.clone())
+    }
+
+    /// Adopts the namespace the accepted handshake decision resolved:
+    /// lifecycle events and reconciliation report the routing truth,
+    /// not the pre-decision registration seed.
+    pub fn set_namespace(&mut self, connection_id: u64, namespace: &str) {
+        if let Some(connection) = self.connections.get_mut(&connection_id) {
+            namespace.clone_into(&mut connection.namespace);
+        }
+    }
+
     /// Records the connection's current backend (after a successful
     /// route/redirect).
     pub fn set_backend(&mut self, connection_id: u64, backend_id: &str) {

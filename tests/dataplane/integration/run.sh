@@ -211,7 +211,7 @@ if [[ $mode == rust ]]; then
 	# here instead of burning the full readiness timeout.
 	rust_ready=false
 	for _ in {1..180}; do
-		if curl --noproxy '*' --fail --silent \
+		if curl --noproxy '*' --fail --silent --max-time 5 \
 			"http://127.0.0.1:$RUST_HEALTH_PORT/health" \
 			>"$run_dir/tiproxy-rs-health.json" 2>/dev/null; then
 			rust_ready=true
@@ -229,7 +229,24 @@ if [[ $mode == rust ]]; then
 	fi
 fi
 
-"$script_dir/readiness.sh" "$run_dir" 180 | tee "$run_dir/readiness.log"
+# The shared readiness phase is monitored: if the Rust process dies
+# mid-phase the run fails immediately instead of burning the timeout.
+"$script_dir/readiness.sh" "$run_dir" 180 >"$run_dir/readiness.log" 2>&1 &
+READINESS_PID=$!
+while kill -0 "$READINESS_PID" 2>/dev/null; do
+	if [[ -n ${RUST_PID:-} ]] && ! kill -0 "$RUST_PID" 2>/dev/null; then
+		kill "$READINESS_PID" 2>/dev/null
+		cat "$run_dir/readiness.log"
+		echo "tiproxy-rs died during readiness; see tiproxy-rs.log" >&2
+		exit 1
+	fi
+	sleep 1
+done
+if ! wait "$READINESS_PID"; then
+	cat "$run_dir/readiness.log"
+	exit 1
+fi
+cat "$run_dir/readiness.log"
 
 mysql_tls_args=()
 if [[ $TLS_ENABLED == true ]]; then
@@ -295,11 +312,16 @@ curl --noproxy '*' --fail --silent --show-error -X POST \
 	"$namespace_api/commit?namespace=ns-alpha&namespace=ns-beta" -o /dev/null
 
 namespace_matrix() {
-	local alice_port bob_port root_ok
+	local alice_port bob_port root_port
 	alice_port=$(mysql_ingress_as alice 'SELECT @@port' 2>/dev/null) || return 1
 	bob_port=$(mysql_ingress_as bob 'SELECT @@port' 2>/dev/null) || return 1
-	root_ok=$(mysql_ingress_as root 'SELECT 1' 2>/dev/null) || return 1
-	[[ $alice_port == "$TIDB_PORT_0" && $bob_port == "$TIDB_PORT_1" && $root_ok == 1 ]]
+	# root resolves to the PD-backed default namespace, whose router
+	# holds BOTH backends: its landing must be one of the two real
+	# TiDB ports — the property that distinguishes the default class
+	# from the single-backend pinned namespaces.
+	root_port=$(mysql_ingress_as root 'SELECT @@port' 2>/dev/null) || return 1
+	[[ $alice_port == "$TIDB_PORT_0" && $bob_port == "$TIDB_PORT_1" ]] || return 1
+	[[ $root_port == "$TIDB_PORT_0" || $root_port == "$TIDB_PORT_1" ]]
 }
 namespace_ready=false
 for _ in {1..30}; do
@@ -314,9 +336,32 @@ if [[ $namespace_ready != true ]]; then
 		echo "namespace matrix failed:"
 		echo "  alice -> $(mysql_ingress_as alice 'SELECT @@port' 2>&1 | tail -1) (want $TIDB_PORT_0)"
 		echo "  bob   -> $(mysql_ingress_as bob 'SELECT @@port' 2>&1 | tail -1) (want $TIDB_PORT_1)"
-		echo "  root  -> $(mysql_ingress_as root 'SELECT 1' 2>&1 | tail -1) (want 1)"
+		echo "  root  -> $(mysql_ingress_as root 'SELECT @@port' 2>&1 | tail -1) (want $TIDB_PORT_0 or $TIDB_PORT_1)"
 	} >&2
 	exit 1
+fi
+# The third matrix row needs DISCRIMINATING evidence, not mere
+# success: the lifecycle logs attribute every connection to the
+# namespace the handshake decision resolved. In Rust mode the engine's
+# closed-schema logs carry it exactly; in Go mode the per-connection
+# logger fields carry it for the pinned namespaces.
+if [[ $mode == rust ]]; then
+	for expected in '"namespace":"ns-alpha"' '"namespace":"ns-beta"' '"namespace":"default"'; do
+		if ! grep -q "\"event\":\"connection_ready\".*$expected" "$run_dir/tiproxy-rs.log"; then
+			echo "missing Rust lifecycle namespace attribution: $expected" >&2
+			exit 1
+		fi
+	done
+else
+	# Under TiUP the Go component logs live in the run's tag data
+	# directory (still alive here; cleanup removes it later).
+	go_log_root="${TIUP_HOME:-${HOME}/.tiup}/data/$tag"
+	for expected in '"ns":"ns-alpha"' '"ns":"ns-beta"'; do
+		if ! grep -rq "$expected" "$go_log_root"; then
+			echo "missing Go connection namespace attribution: $expected" >&2
+			exit 1
+		fi
+	done
 fi
 echo "namespace matrix: alice->ns-alpha($TIDB_PORT_0) bob->ns-beta($TIDB_PORT_1) root->default"
 

@@ -1265,6 +1265,87 @@ async fn drain_waits_for_prepared_long_data_guard() {
     stack.dispatch_task.abort();
 }
 
+/// The accepted decision's namespace is the routing truth: it must
+/// reach the wire on the session's CLOSED lifecycle event (and drive
+/// the route conversation), not the pre-decision registration seed.
+#[tokio::test]
+async fn resolved_namespace_reaches_the_closed_event() {
+    let stack = spawn_stack().await;
+    // Decision resolves a NON-default namespace; route answers follow.
+    let forwarder = Arc::clone(&stack.forwarder);
+    tokio::spawn(async move {
+        let decision = ControlEnvelope {
+            request_id: 1,
+            generation: 1,
+            body: Some(Body::HandshakeDecision(HandshakeDecision {
+                connection_id: 1,
+                accept: true,
+                retry: false,
+                code: ErrorCode::Ok as i32,
+                client_message: String::new(),
+                namespace: "ns-wired".to_owned(),
+            })),
+            ..ControlEnvelope::default()
+        };
+        for _ in 0..200 {
+            let _ = forwarder.handle(decision.clone()).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let forwarder = Arc::clone(&stack.forwarder);
+    let backend_port = stack.backend_port;
+    tokio::spawn(async move {
+        let assignment = ControlEnvelope {
+            request_id: 2,
+            generation: 1,
+            body: Some(Body::RouteAssignment(RouteAssignment {
+                connection_id: 1,
+                assignment_id: "a-ns".to_owned(),
+                backend_id: "tidb-fake".to_owned(),
+                backend_address: format!("127.0.0.1:{backend_port}"),
+                cluster_name: String::new(),
+                keyspace: String::new(),
+                healthy: true,
+                local: true,
+                code: ErrorCode::Ok as i32,
+                detail: String::new(),
+            })),
+            ..ControlEnvelope::default()
+        };
+        for _ in 0..200 {
+            let _ = forwarder.handle(assignment.clone()).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("SELECT 1").await);
+    client.quit().await;
+
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(closed) = closed else {
+        unreachable!("the session reports CLOSED")
+    };
+    let Some(Body::ConnectionEvent(event)) = closed.body else {
+        unreachable!()
+    };
+    assert_eq!(
+        event.namespace, "ns-wired",
+        "the CLOSED event carries the decision-resolved namespace"
+    );
+    stack.dispatch_task.abort();
+}
+
 /// A REJECTED handshake decision refuses the client on the wire with
 /// the decision's approved message (never routes, never silently
 /// hangs), and the session reports CLOSED.

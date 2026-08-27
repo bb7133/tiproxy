@@ -369,6 +369,12 @@ impl ControlCommandHandler {
         self.gate.set_backend(connection_id, backend_id);
     }
 
+    /// Adopts the decision-resolved namespace for lifecycle events and
+    /// reconciliation.
+    pub fn set_namespace(&mut self, connection_id: u64, namespace: &str) {
+        self.gate.set_namespace(connection_id, namespace);
+    }
+
     /// Arms the session's response expectation: the initiating request
     /// id it just sent and the body kind it awaits. Re-arming replaces
     /// the previous expectation (one outstanding exchange per session).
@@ -477,6 +483,10 @@ impl ControlCommandHandler {
             .gate
             .connection_backend(connection_id)
             .unwrap_or_default();
+        let namespace = self
+            .gate
+            .connection_namespace(connection_id)
+            .unwrap_or_default();
         let drain_terminal = self.gate.record_drain_close(connection_id, forced);
         self.gate.unregister_connection(connection_id);
         self.sessions.remove(&connection_id);
@@ -494,6 +504,7 @@ impl ControlCommandHandler {
             outbound.push(closed_event_envelope(
                 identity,
                 &backend_id,
+                &namespace,
                 generation,
                 error_source,
                 traffic,
@@ -1127,6 +1138,7 @@ impl ControlCommandHandler {
                 let mut event = closed_event_envelope(
                     identity,
                     &remote.backend_id,
+                    &remote.namespace,
                     remote.generation,
                     ErrorSource::Proxy,
                     TrafficTotals::default(),
@@ -1211,6 +1223,7 @@ fn result_envelope(outbound: OutboundControl, generation: u64, request_id: u64) 
 fn closed_event_envelope(
     identity: ConnectionIdentity,
     backend_id: &str,
+    namespace: &str,
     generation: u64,
     error_source: ErrorSource,
     traffic: TrafficTotals,
@@ -1230,7 +1243,7 @@ fn closed_event_envelope(
             kind: ConnectionEventKind::Closed.into(),
             connection: Some(identity),
             backend_id: backend_id.to_owned(),
-            namespace: String::new(),
+            namespace: namespace.to_owned(),
             error_source: error_source.into(),
             client_in_bytes: traffic.client_in,
             client_out_bytes: traffic.client_out,
@@ -1273,6 +1286,13 @@ pub enum DispatchNotice {
         responses: Option<mpsc::Sender<ControlEnvelope>>,
         /// Completed when the registration is applied.
         applied: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Adopts the decision-resolved namespace for a session.
+    SetNamespace {
+        /// Stable connection id.
+        connection_id: u64,
+        /// The decision-resolved namespace.
+        namespace: String,
     },
     /// The session's backend attached or changed.
     SetBackend {
@@ -1451,6 +1471,16 @@ impl ControlDispatchHandle {
         self.notify(DispatchNotice::SetBackend {
             connection_id,
             backend_id,
+        })
+        .await
+    }
+
+    /// Adopts the decision-resolved namespace for this session's
+    /// lifecycle events and reconciliation.
+    pub async fn set_namespace(&self, connection_id: u64, namespace: String) -> bool {
+        self.notify(DispatchNotice::SetNamespace {
+            connection_id,
+            namespace,
         })
         .await
     }
@@ -2021,6 +2051,12 @@ async fn apply_notice<S: DispatchSender>(
             backend_id,
         } => {
             handler.set_backend(connection_id, &backend_id);
+        }
+        DispatchNotice::SetNamespace {
+            connection_id,
+            namespace,
+        } => {
+            handler.set_namespace(connection_id, &namespace);
         }
         DispatchNotice::ExpectResponse {
             connection_id,
