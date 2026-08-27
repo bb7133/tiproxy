@@ -44,7 +44,7 @@ case "$variant" in
 esac
 
 missing=()
-for command_name in awk curl find go grep make mysql openssl sed tiup; do
+for command_name in awk curl find go grep lsof make mysql openssl python3 sed tiup; do
 	if ! command -v "$command_name" >/dev/null 2>&1; then
 		missing+=("$command_name")
 	fi

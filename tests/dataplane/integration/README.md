@@ -47,7 +47,14 @@ implicit backend cluster, so `backend.instances` cannot pin a backend),
 `SELECT @@port` proves each user lands on a real backend, and
 delta-scoped per-connection log evidence attributes each row's single
 connection to exactly its expected namespace — ns-alpha, ns-beta, and
-root's PD-backed default. Cleanup stops the Rust process with SIGINT — the
+root's PD-backed default. Error parity (same slice of DPL-07) then
+proves the same semantic ERR in both modes: a bind conflict fails fast
+naming the port with no residue, and with both TiDB servers killed and
+evicted a new connection receives Go's approved 1105/HY000 "No
+available TiDB instances" vocabulary; the unknown-namespace refusal is
+documented as unreachable under the current public bootstrap/admin
+semantics (in-memory namespace store + default auto-create + upsert-only
+commit) with the vocabulary contract pinned by a session-engine e2e. Cleanup stops the Rust process with SIGINT — the
 coordinated-shutdown path. TLS, PROXY protocol, and compression
 variants remain refused by the capability contract until their Rust
 slices exist; a raw TCP relay or the Go dataplane is never reported as

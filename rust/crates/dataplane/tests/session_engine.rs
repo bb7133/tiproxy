@@ -1431,6 +1431,27 @@ async fn long_multibyte_namespace_is_preserved_verbatim() {
     stack.dispatch_task.abort();
 }
 
+/// Exact `MySQL` ERR packet contract (`CLIENT_PROTOCOL_41`): `0xFF` marker,
+/// little-endian error code, `#` sql-state marker, 5-byte SQLSTATE,
+/// and the FULL remaining message — approved vocabulary is asserted
+/// verbatim, never by substring.
+fn assert_exact_err_packet(payload: &[u8], code: u16, sqlstate: [u8; 5], message: &str) {
+    assert_eq!(payload.first(), Some(&0xFF), "ERR marker: {payload:?}");
+    assert!(payload.len() > 9, "ERR packet too short: {payload:?}");
+    assert_eq!(
+        u16::from_le_bytes([payload[1], payload[2]]),
+        code,
+        "ERR code: {payload:?}"
+    );
+    assert_eq!(payload[3], b'#', "sql-state marker: {payload:?}");
+    assert_eq!(payload[4..9], sqlstate, "SQLSTATE: {payload:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&payload[9..]),
+        message,
+        "ERR message must equal the approved vocabulary verbatim"
+    );
+}
+
 /// A REJECTED handshake decision refuses the client on the wire with
 /// the decision's approved message (never routes, never silently
 /// hangs), and the session reports CLOSED.
@@ -1470,14 +1491,87 @@ async fn rejected_handshake_decision_refuses_the_client() {
     let Err(denied) = refused else {
         unreachable!("a rejected decision must refuse the client")
     };
-    assert_eq!(
-        denied.first(),
-        Some(&0xFF),
-        "MySQL error packet: {denied:?}"
-    );
-    assert!(
-        String::from_utf8_lossy(&denied).contains("failed to find a namespace"),
-        "the decision's approved message reaches the client: {denied:?}"
+    assert_exact_err_packet(&denied, 1105, *b"HY000", "failed to find a namespace");
+
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(closed.is_some(), "the refused session reports CLOSED");
+    stack.dispatch_task.abort();
+}
+
+/// A `NO_BACKEND` route answer refuses the client with Go's approved
+/// vocabulary (error-parity row: `ErrProxyNoBackend` reaches the client
+/// in Go mode) instead of silently dropping the connection, and the
+/// session reports CLOSED.
+#[tokio::test]
+async fn no_backend_route_answer_refuses_the_client() {
+    let stack = spawn_stack().await;
+    // Accepted decision at request 1; the route request (2) answers a
+    // terminal NO_BACKEND assignment.
+    let forwarder = Arc::clone(&stack.forwarder);
+    tokio::spawn(async move {
+        let decision = ControlEnvelope {
+            request_id: 1,
+            generation: 1,
+            body: Some(Body::HandshakeDecision(HandshakeDecision {
+                connection_id: 1,
+                accept: true,
+                retry: false,
+                code: ErrorCode::Ok as i32,
+                client_message: String::new(),
+                namespace: String::new(),
+            })),
+            ..ControlEnvelope::default()
+        };
+        for _ in 0..200 {
+            let _ = forwarder.handle(decision.clone()).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let forwarder = Arc::clone(&stack.forwarder);
+    tokio::spawn(async move {
+        let refusal = ControlEnvelope {
+            request_id: 2,
+            generation: 1,
+            body: Some(Body::RouteAssignment(RouteAssignment {
+                connection_id: 1,
+                assignment_id: String::new(),
+                backend_id: String::new(),
+                backend_address: String::new(),
+                cluster_name: String::new(),
+                keyspace: String::new(),
+                healthy: false,
+                local: false,
+                code: ErrorCode::NoBackend as i32,
+                detail: "no available backend".to_owned(),
+            })),
+            ..ControlEnvelope::default()
+        };
+        for _ in 0..200 {
+            let _ = forwarder.handle(refusal.clone()).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    let Ok(refused) = timeout(
+        Duration::from_secs(5),
+        MysqlClient::login(stack.sql_port, FAKE_BACKEND_PASSWORD),
+    )
+    .await
+    else {
+        unreachable!("the NO_BACKEND refusal terminates the login promptly")
+    };
+    let Err(denied) = refused else {
+        unreachable!("a NO_BACKEND answer must refuse the client")
+    };
+    assert_exact_err_packet(
+        &denied,
+        1105,
+        *b"HY000",
+        "No available TiDB instances, please make sure TiDB is available",
     );
 
     let closed = wait_sent(

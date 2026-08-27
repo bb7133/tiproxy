@@ -414,8 +414,254 @@ attribution_row bob ns-beta || exit 1
 attribution_row root default || exit 1
 echo "namespace matrix: alice->ns-alpha bob->ns-beta root->default (per-connection route attribution)"
 
+# ---- Error parity (DPL-07 #41): the same semantic ERR in both modes.
+# The oracle freezes the ERR packet's SEMANTIC fields (code + SQLSTATE
+# + message), never handshake bytes. Free-text equality of operator
+# diagnostics between modes is NOT asserted — only bind semantics.
+
+# Unknown-namespace row: unreachable under the CURRENT public
+# bootstrap/admin semantics, and therefore deliberately absent from
+# the real-topology matrix. The refusal ("failed to find a
+# namespace", 1105/HY000) requires a runtime with no default
+# namespace, which no public path can produce: the namespace store is
+# per-process in-memory (pkg/manager/config/manager.go Init builds a
+# fresh btree; nothing persists namespaces), server bootstrap
+# auto-creates "default" whenever the store is empty
+# (pkg/server/server.go), CommitNamespaces only upserts into the live
+# map, and the commit API hardcodes its delete flags to false — so
+# "default" exists from boot and cannot leave a running process via
+# the admin API. Package-internal callers (CommitNamespaces with
+# delete flags), injected managers in tests, or a future persistent
+# store could still reach the refusal — which is why the vocabulary
+# contract stays pinned end-to-end by the session engine e2e
+# `rejected_handshake_decision_refuses_the_client`: IF the Go
+# handshake handler rejects with ErrNamespaceNotFound, the Rust
+# dataplane relays the exact approved message.
+
+# Row 2 (bind conflict): operator parity. Each mode's own listener
+# bind must fail fast against an occupied port, name the port in its
+# diagnostic, and leave no residue. The holder keeps the fd open for
+# the whole phase, proving the conflict is live at bind time.
+conflict_port=$((8091 + port_offset))
+conflict_admin_port=$((8092 + port_offset))
+conflict_api_port=$((8093 + port_offset))
+for port in "$conflict_port" "$conflict_admin_port" "$conflict_api_port"; do
+	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
+		echo "conflict-phase port is already in use: $port" >&2
+		exit 1
+	fi
+done
+"$FAULT_PROXY_BIN" --listen "127.0.0.1:$conflict_port" \
+	--admin "127.0.0.1:$conflict_admin_port" --target 127.0.0.1:1 \
+	>"$run_dir/conflict-holder.log" 2>&1 &
+HOLDER_PID=$!
+printf 'HOLDER_PID=%q\n' "$HOLDER_PID" >>"$run_dir/state.env"
+
+holder_ready=false
+for _ in {1..50}; do
+	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$conflict_port" >/dev/null 2>&1; then
+		holder_ready=true
+		break
+	fi
+	sleep 0.1
+done
+if [[ $holder_ready != true ]]; then
+	echo "conflict holder never bound" >&2
+	exit 1
+fi
+# The Go instance binds its SQL listener directly (no rust-dataplane
+# gate): strip the gate section and repoint every listener/path.
+sed '/^\[rust-dataplane\]/,$d' "$run_dir/tiproxy.toml" >"$run_dir/tiproxy-conflict.toml"
+python3 - "$run_dir/tiproxy-conflict.toml" "$conflict_port" "$conflict_api_port" "$run_dir" <<'PYCONF'
+import re, sys
+path, sql_port, api_port, run_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+text = open(path).read()
+text = re.sub(r'(?m)^workdir = .*$', f'workdir = "{run_dir}/conflict-workdir"', text)
+text = re.sub(r'(?m)^addr = "127\.0\.0\.1:\d+"$',
+              lambda m, it=iter([sql_port, api_port]): f'addr = "127.0.0.1:{next(it)}"',
+              text, count=2)
+text = re.sub(r'(?m)^filename = .*$', f'filename = "{run_dir}/tiproxy-conflict.log"', text)
+open(path, 'w').write(text)
+PYCONF
+"$repo_root/bin/tiproxy" --config "$run_dir/tiproxy-conflict.toml" \
+	>"$run_dir/tiproxy-conflict.out" 2>&1 &
+CONFLICT_PID=$!
+printf 'CONFLICT_PID=%q\n' "$CONFLICT_PID" >>"$run_dir/state.env"
+
+conflict_exited=false
+for _ in {1..40}; do
+	if ! kill -0 "$CONFLICT_PID" 2>/dev/null; then
+		conflict_exited=true
+		break
+	fi
+	sleep 0.5
+done
+if [[ $conflict_exited != true ]]; then
+	kill -9 "$CONFLICT_PID" 2>/dev/null || true
+	echo "Go bind-conflict instance did not fail within the deadline" >&2
+	exit 1
+fi
+if wait "$CONFLICT_PID"; then
+	echo "Go bind-conflict instance exited zero" >&2
+	exit 1
+fi
+if ! grep -Eqs "address already in use|bind" \
+	"$run_dir/tiproxy-conflict.out" "$run_dir/tiproxy-conflict.log"; then
+	echo "Go bind-conflict diagnostic lacks bind semantics" >&2
+	exit 1
+fi
+if ! grep -qs "$conflict_port" \
+	"$run_dir/tiproxy-conflict.out" "$run_dir/tiproxy-conflict.log"; then
+	echo "Go bind-conflict diagnostic does not name the port" >&2
+	exit 1
+fi
+if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$conflict_api_port" >/dev/null 2>&1; then
+	echo "Go bind-conflict instance left its API listener behind" >&2
+	exit 1
+fi
+if ! "$FAULT_PROXY_BIN" --probe "127.0.0.1:$conflict_port" >/dev/null 2>&1; then
+	echo "conflict holder died during the Go bind-conflict check" >&2
+	exit 1
+fi
 if [[ $mode == rust ]]; then
-	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, and recovered from drop-next"
+	# The Rust operator-facing listener is the health endpoint, bound
+	# at startup before serving precisely so a bad port fails fast.
+	"$rust_binary" --control-socket "$run_dir/absent.sock" \
+		--control-uid "$(id -u)" --health-port "$conflict_port" \
+		>"$run_dir/tiproxy-rs-conflict.out" 2>&1 &
+	RUST_CONFLICT_PID=$!
+	printf 'RUST_CONFLICT_PID=%q\n' "$RUST_CONFLICT_PID" >>"$run_dir/state.env"
+
+	rust_conflict_exited=false
+	for _ in {1..40}; do
+		if ! kill -0 "$RUST_CONFLICT_PID" 2>/dev/null; then
+			rust_conflict_exited=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $rust_conflict_exited != true ]]; then
+		kill -9 "$RUST_CONFLICT_PID" 2>/dev/null || true
+		echo "Rust bind-conflict instance did not fail within the deadline" >&2
+		exit 1
+	fi
+	if wait "$RUST_CONFLICT_PID"; then
+		echo "Rust bind-conflict instance exited zero" >&2
+		exit 1
+	fi
+	if ! grep -Eq "bind health endpoint|[Aa]ddress.*in use" \
+		"$run_dir/tiproxy-rs-conflict.out"; then
+		echo "Rust bind-conflict diagnostic lacks bind semantics" >&2
+		exit 1
+	fi
+	if ! grep -q "$conflict_port" "$run_dir/tiproxy-rs-conflict.out"; then
+		echo "Rust bind-conflict diagnostic does not name the port" >&2
+		exit 1
+	fi
+	if ! "$FAULT_PROXY_BIN" --probe "127.0.0.1:$conflict_port" >/dev/null 2>&1; then
+		echo "conflict holder died during the Rust bind-conflict check" >&2
+		exit 1
+	fi
+fi
+kill "$HOLDER_PID" 2>/dev/null || true
+wait "$HOLDER_PID" 2>/dev/null || true
+# The conflict ports join the post-run leak sweep.
+printf 'PORTS=%q\n' "$PORTS $conflict_port $conflict_admin_port $conflict_api_port" >>"$run_dir/state.env"
+echo "error parity: bind conflict -> fast nonzero exit, port named, no residue"
+
+# Row 3 (no healthy backend): TERMINAL phase — it destroys the SQL
+# plane, so nothing SQL-visible may follow. Both TiDB servers are
+# killed (expected; the shared readiness gate has already completed
+# and cleanup stops TiUP itself, so this never reads as a harness
+# failure). The poll then pins the oracle to the eviction-complete
+# state: mid-race dial failures surface a different message and keep
+# polling; only the frozen vocabulary ends the loop — 1105/HY000
+# "No available TiDB instances, please make sure TiDB is available"
+# (Go: ErrProxyNoBackend in pkg/proxy/backend/error.go, reached from
+# router.ErrNoBackend; Rust: the AcquireError::NoBackend client
+# refusal).
+# Per-port discipline: EACH TiDB port must have exactly one LISTEN
+# owner and the two owners must be distinct processes — an already-dead
+# backend or an accidentally shared port is a hard error, never a
+# silently "successful" double kill. (Under pipefail a no-match lsof
+# would abort the capture silently, so each probe is explicitly
+# allowed to fail and reports its owners on error.)
+tidb_pid_0=$(lsof -ti "tcp:$TIDB_PORT_0" -sTCP:LISTEN 2>/dev/null || true)
+tidb_pid_1=$(lsof -ti "tcp:$TIDB_PORT_1" -sTCP:LISTEN 2>/dev/null || true)
+for pair in "$TIDB_PORT_0:$tidb_pid_0" "$TIDB_PORT_1:$tidb_pid_1"; do
+	port=${pair%%:*}
+	owner=${pair#*:}
+	if [[ ! $owner =~ ^[0-9]+$ ]]; then
+		{
+			echo "port $port must have exactly one LISTEN owner for the no-backend row; got: '$owner'"
+			lsof -i "tcp:$port" || true
+		} >&2
+		exit 1
+	fi
+done
+if [[ $tidb_pid_0 == "$tidb_pid_1" ]]; then
+	echo "both TiDB ports are owned by the same PID $tidb_pid_0; refusing the no-backend row" >&2
+	exit 1
+fi
+tidb_pids="$tidb_pid_0
+$tidb_pid_1"
+# Ownership gate: kill ONLY processes provably belonging to this
+# run's playground — every TiUP component command line carries the
+# run's unique tag path. A foreign owner of the port is a hard error,
+# never a kill target.
+for pid in $tidb_pids; do
+	pid_cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+	if [[ $pid_cmd != *"$tag"* ]]; then
+		echo "refusing to kill PID $pid for the no-backend row: not owned by tag $tag: $pid_cmd" >&2
+		exit 1
+	fi
+done
+# Source-branch evidence is delta-scoped to the no-backend window:
+# only records logged AFTER the kill count (same discipline as the
+# matrix rows).
+if [[ $mode == go ]]; then
+	go_evidence_offset=$(evidence_lines)
+fi
+echo "no-backend row: killing TiDB listeners: $(tr '\n' ' ' <<<"$tidb_pids")"
+# shellcheck disable=SC2086
+kill -9 $tidb_pids
+no_backend_ok=false
+root_err=
+for _ in {1..60}; do
+	# The client failing IS the expected outcome: the capture must
+	# not let pipefail turn it into a silent abort.
+	root_err=$(mysql_ingress_as root 'SELECT 1' 2>&1 >/dev/null | tail -1 || true)
+	if grep -q "ERROR 1105 (HY000)" <<<"$root_err" &&
+		grep -q "No available TiDB instances, please make sure TiDB is available" <<<"$root_err"; then
+		no_backend_ok=true
+		break
+	fi
+	sleep 1
+done
+if [[ $no_backend_ok != true ]]; then
+	echo "no-backend parity failed; last client error: $root_err" >&2
+	exit 1
+fi
+if [[ $mode == go ]]; then
+	# Source-branch evidence: ONE fresh record must carry BOTH the
+	# get-backend failure and, in its structured last_err field, the
+	# frozen ErrProxyNoBackend text — a generic "get backend failed"
+	# alone could be an earlier dial/EOF retry from the eviction race,
+	# which proves nothing about the branch that refused the client.
+	if ! evidence_tail "$go_evidence_offset" |
+		grep -Eqs '"get backend failed".*"last_err":"No available TiDB instances, please make sure TiDB is available"'; then
+		{
+			echo "Go no-backend source-branch evidence missing from the row's window"
+			echo "fresh get-backend records were:"
+			evidence_tail "$go_evidence_offset" | grep -s "get backend failed" | tail -5
+		} >&2
+		exit 1
+	fi
+fi
+echo "error parity: no healthy backend -> 1105/HY000 'No available TiDB instances'"
+
+if [[ $mode == rust ]]; then
+	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, error parity, and recovered from drop-next"
 else
-	echo "PASS: Go baseline $variant executed SELECT 1, namespace matrix, and recovered from drop-next"
+	echo "PASS: Go baseline $variant executed SELECT 1, namespace matrix, error parity, and recovered from drop-next"
 fi
