@@ -285,11 +285,21 @@ func (adapter *RouterAdapter) rejectHandshakeLocked(
 	state *connectionState,
 	err error,
 ) error {
+	// v1 ADR: client-facing errors carry an enumerated code plus an
+	// APPROVED message — arbitrary Go diagnostic text stays in the
+	// server-side notification and never crosses to the client. The
+	// unknown-namespace refusal is part of the approved vocabulary and
+	// matches Go mode's exact client text; everything else stays
+	// generic.
+	message := "handshake rejected"
+	if errors.Is(err, backend.ErrNamespaceNotFound) {
+		message = backend.ErrNamespaceNotFound.Error()
+	}
 	state.decision = &controlpb.HandshakeDecision{
 		ConnectionId:  state.conn.ConnectionID(),
 		Accept:        false,
 		Code:          controlpb.ErrorCode_ERROR_CODE_HANDSHAKE_REJECTED,
-		ClientMessage: "handshake rejected",
+		ClientMessage: bounded(message),
 	}
 	adapter.notifyHandshakeLocked(state, "", err, backend.SrcProxyErr)
 	return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CONTROL,

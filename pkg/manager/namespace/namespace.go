@@ -34,3 +34,10 @@ func (n *Namespace) Close() {
 	n.router.Close()
 	n.bo.Close()
 }
+
+// NewNamespaceForTest assembles a namespace from prebuilt parts for
+// topology-projection tests in other packages. Close must not be
+// called on the result when the observer is nil.
+func NewNamespaceForTest(name, user string, rt router.Router) *Namespace {
+	return &Namespace{name: name, user: user, router: rt}
+}

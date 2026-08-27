@@ -297,3 +297,52 @@ fn path_text(path: &Path) -> Result<String, Box<dyn Error>> {
 fn validation_time() -> UnixTime {
     UnixTime::since_unix_epoch(Duration::from_secs(VALIDATION_TIME_SECONDS))
 }
+
+/// DPL-07 cross-language contract: the Go projection's honest edge
+/// shapes — an unscoped namespace (no unambiguous cluster: the
+/// boot-time default before backends report, or a mixed-cluster
+/// namespace) and a clusterless legacy static backend — must apply
+/// through the full store path, not merely parse.
+#[test]
+fn unscoped_topology_applies_through_the_store() -> Result<(), Box<dyn Error>> {
+    use control_proto::v1::{BackendSnapshot, NamespaceSnapshot};
+
+    let directory = TestDirectory::create()?;
+    let store = SnapshotStore::new([directory.path().to_path_buf()])?;
+    let mut snapshot = valid_snapshot(TlsPolicy::default());
+    snapshot.backends = vec![
+        BackendSnapshot {
+            backend_id: "alpha/tidb-1:4000".to_owned(),
+            address: "tidb-1:4000".to_owned(),
+            cluster_name: "alpha".to_owned(),
+            keyspace: "ks-a".to_owned(),
+            healthy: true,
+            ..Default::default()
+        },
+        BackendSnapshot {
+            backend_id: "legacy-tidb:4000".to_owned(),
+            address: "legacy-tidb:4000".to_owned(),
+            cluster_name: String::new(),
+            healthy: true,
+            ..Default::default()
+        },
+    ];
+    snapshot.namespaces = vec![
+        NamespaceSnapshot {
+            name: "default".to_owned(),
+            users: Vec::new(),
+            backend_cluster: String::new(),
+        },
+        NamespaceSnapshot {
+            name: "ns-alpha".to_owned(),
+            users: vec!["alice".to_owned()],
+            backend_cluster: "alpha".to_owned(),
+        },
+    ];
+    let applied = store.apply(11, snapshot, validation_time())?;
+    assert!(applied.changed);
+    assert_eq!(applied.snapshot.generation(), 11);
+    assert_eq!(applied.snapshot.raw().namespaces.len(), 2);
+    assert_eq!(applied.snapshot.raw().backends.len(), 2);
+    Ok(())
+}

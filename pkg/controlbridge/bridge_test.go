@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
@@ -305,4 +306,109 @@ func TestBridgeOperatorDrainLifecycle(t *testing.T) {
 		return envelope.GetDrainCommand() != nil && strings.HasPrefix(envelope.GetDrainCommand().GetDrainId(), "d-next@")
 	}).GetDrainCommand()
 	require.EqualValues(t, 2, next.GetCommandSequence(), "the issuer-wide sequence advanced")
+}
+
+// A topology change reaches the WIRE without any config change: the
+// bridge cadence re-projects, stages a fresh generation, and streams
+// the new StateSnapshot to the negotiated Rust peer (DPL-07).
+func TestBridgeStreamsTopologyChangesToTheWire(t *testing.T) {
+	var mu sync.Mutex
+	cluster := "alpha"
+	cfg := config.NewConfig()
+	builder, err := NewSnapshotBuilder(cfg, nil)
+	require.NoError(t, err)
+	publisher, err := NewSnapshotPublisher(SnapshotPublisherConfig{
+		Builder:              builder,
+		Initial:              cfg,
+		AdvertisedCapability: 1,
+		ServerVersion:        "test-server",
+		Topology: func() ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
+			mu.Lock()
+			defer mu.Unlock()
+			return []*controlpb.BackendSnapshot{{
+					BackendId:   cluster + "/tidb:4000",
+					Address:     "tidb:4000",
+					ClusterName: cluster,
+					Healthy:     true,
+				}}, []*controlpb.NamespaceSnapshot{{
+					Name:           "default",
+					BackendCluster: cluster,
+				}}
+		},
+	})
+	require.NoError(t, err)
+
+	transportConfig := bridgeTransportConfig(t)
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	bridge, err := NewBridge(BridgeConfig{
+		Transport:             transportConfig,
+		Handshake:             &recordingHandler{rt: rt},
+		OrphanResolveInterval: time.Hour,
+		Publisher:             publisher,
+		SnapshotSyncInterval:  20 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, <-done)
+		require.NoError(t, bridge.Close())
+	})
+
+	peer, epoch := bridgeFakeRustPeer(t, transportConfig.SocketPath)
+
+	readSnapshot := func() *controlpb.ControlEnvelope {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			require.NoError(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
+			envelope, err := controlpb.ReadFrame(peer, controlpb.DefaultMaxFrameBytes)
+			if err != nil {
+				select {
+				case runErr := <-done:
+					t.Fatalf("bridge run ended: %v (read err %v)", runErr, err)
+				default:
+					t.Fatalf("read failed while bridge alive: %v", err)
+				}
+			}
+			require.NoError(t, err)
+			if envelope.GetStateSnapshot() != nil {
+				return envelope
+			}
+		}
+		t.Fatal("no StateSnapshot arrived")
+		return nil
+	}
+	acknowledge := func(envelope *controlpb.ControlEnvelope) {
+		require.NoError(t, controlpb.WriteFrame(peer, &controlpb.ControlEnvelope{
+			ProtocolVersion: controlpb.ProtocolV1,
+			ControlEpoch:    epoch,
+			RequestId:       envelope.GetRequestId(),
+			Generation:      envelope.GetGeneration(),
+			Priority:        controlpb.Priority_PRIORITY_CRITICAL,
+			Body: &controlpb.ControlEnvelope_SnapshotResult{SnapshotResult: &controlpb.SnapshotResult{
+				AppliedGeneration: envelope.GetGeneration(),
+				Code:              controlpb.ErrorCode_ERROR_CODE_OK,
+			}},
+		}, controlpb.DefaultMaxFrameBytes))
+	}
+
+	first := readSnapshot()
+	require.Equal(t, "alpha",
+		first.GetStateSnapshot().GetNamespaces()[0].GetBackendCluster())
+	acknowledge(first)
+
+	// A live topology change — no config change — reaches the wire as
+	// a fresh generation.
+	mu.Lock()
+	cluster = "beta"
+	mu.Unlock()
+	second := readSnapshot()
+	require.Greater(t, second.GetGeneration(), first.GetGeneration())
+	require.Equal(t, "beta",
+		second.GetStateSnapshot().GetNamespaces()[0].GetBackendCluster())
+	require.Equal(t, "beta/tidb:4000",
+		second.GetStateSnapshot().GetBackends()[0].GetBackendId())
+	acknowledge(second)
 }

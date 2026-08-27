@@ -42,3 +42,16 @@ func TestReady(t *testing.T) {
 	ns.router = rt
 	require.True(t, nsMgr.Ready())
 }
+
+func TestListNamespaces(t *testing.T) {
+	nsMgr := NewNamespaceManager()
+	nsMgr.nsm = map[string]*Namespace{
+		"beta":  {name: "beta", user: "bob"},
+		"alpha": {name: "alpha", user: "alice"},
+	}
+	names := make([]string, 0, 2)
+	for _, ns := range nsMgr.ListNamespaces() {
+		names = append(names, ns.Name())
+	}
+	require.Equal(t, []string{"alpha", "beta"}, names, "deterministic name order")
+}

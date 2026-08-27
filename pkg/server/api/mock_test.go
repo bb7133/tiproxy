@@ -32,6 +32,10 @@ func newMockNamespaceManager() *mockNamespaceManager {
 func (m *mockNamespaceManager) SetBackendNetwork(_ observer.BackendNetwork) {
 }
 
+func (m *mockNamespaceManager) ListNamespaces() []*namespace.Namespace {
+	return nil
+}
+
 func (m *mockNamespaceManager) Init(_ *zap.Logger, _ []*config.Namespace, _ observer.TopologyFetcher,
 	_ metricsreader.PromInfoFetcher, _ *http.Client, _ *mconfig.ConfigManager, _ metricsreader.MetricsQuerier) error {
 	return nil
