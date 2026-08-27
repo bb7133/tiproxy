@@ -204,9 +204,11 @@ fi
 FAULT_PID=$!
 write_state
 
-"$script_dir/readiness.sh" "$run_dir" 180 | tee "$run_dir/readiness.log"
-
 if [[ $mode == rust ]]; then
+	# Gate the shared readiness phase on the Rust process itself: the
+	# health endpoint turns 200 once the first generation applies
+	# (independent of TiDB warm-up), and a dead tiproxy-rs fails fast
+	# here instead of burning the full readiness timeout.
 	rust_ready=false
 	for _ in {1..180}; do
 		if curl --noproxy '*' --fail --silent \
@@ -226,6 +228,8 @@ if [[ $mode == rust ]]; then
 		exit 1
 	fi
 fi
+
+"$script_dir/readiness.sh" "$run_dir" 180 | tee "$run_dir/readiness.log"
 
 mysql_tls_args=()
 if [[ $TLS_ENABLED == true ]]; then
@@ -261,8 +265,63 @@ if [[ $(mysql_ingress 'SELECT 1') != 1 ]]; then
 	exit 1
 fi
 
+# Namespace/topology matrix (DPL-07 #41): three username-resolved
+# combinations against the REAL cluster, identical in both modes. Each
+# custom namespace pins ONE backend through static instances, so
+# `SELECT @@port` proves which backend class served the client; root
+# keeps the PD-backed default namespace.
+mysql_backend_admin() {
+	mysql --batch --skip-column-names --connect-timeout=2 \
+		-h 127.0.0.1 -P "$TIDB_PORT_0" -u root --ssl-mode=DISABLED -e "$1"
+}
+mysql_ingress_as() {
+	local user=$1
+	local query=$2
+	mysql --batch --skip-column-names --connect-timeout=4 \
+		-h 127.0.0.1 -P "$FAULT_PORT" -u "$user" \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} -e "$query"
+}
+mysql_backend_admin "CREATE USER IF NOT EXISTS 'alice'@'%'; CREATE USER IF NOT EXISTS 'bob'@'%';"
+namespace_api="http://127.0.0.1:$TIPROXY_API_PORT/api/admin/namespace"
+curl --noproxy '*' --fail --silent --show-error -X PUT \
+	-H 'Content-Type: application/json' \
+	-d "{\"namespace\":\"ns-alpha\",\"frontend\":{\"user\":\"alice\"},\"backend\":{\"instances\":[\"127.0.0.1:$TIDB_PORT_0\"]}}" \
+	"$namespace_api/ns-alpha" -o /dev/null
+curl --noproxy '*' --fail --silent --show-error -X PUT \
+	-H 'Content-Type: application/json' \
+	-d "{\"namespace\":\"ns-beta\",\"frontend\":{\"user\":\"bob\"},\"backend\":{\"instances\":[\"127.0.0.1:$TIDB_PORT_1\"]}}" \
+	"$namespace_api/ns-beta" -o /dev/null
+curl --noproxy '*' --fail --silent --show-error -X POST \
+	"$namespace_api/commit?namespace=ns-alpha&namespace=ns-beta" -o /dev/null
+
+namespace_matrix() {
+	local alice_port bob_port root_ok
+	alice_port=$(mysql_ingress_as alice 'SELECT @@port' 2>/dev/null) || return 1
+	bob_port=$(mysql_ingress_as bob 'SELECT @@port' 2>/dev/null) || return 1
+	root_ok=$(mysql_ingress_as root 'SELECT 1' 2>/dev/null) || return 1
+	[[ $alice_port == "$TIDB_PORT_0" && $bob_port == "$TIDB_PORT_1" && $root_ok == 1 ]]
+}
+namespace_ready=false
+for _ in {1..30}; do
+	if namespace_matrix; then
+		namespace_ready=true
+		break
+	fi
+	sleep 1
+done
+if [[ $namespace_ready != true ]]; then
+	{
+		echo "namespace matrix failed:"
+		echo "  alice -> $(mysql_ingress_as alice 'SELECT @@port' 2>&1 | tail -1) (want $TIDB_PORT_0)"
+		echo "  bob   -> $(mysql_ingress_as bob 'SELECT @@port' 2>&1 | tail -1) (want $TIDB_PORT_1)"
+		echo "  root  -> $(mysql_ingress_as root 'SELECT 1' 2>&1 | tail -1) (want 1)"
+	} >&2
+	exit 1
+fi
+echo "namespace matrix: alice->ns-alpha($TIDB_PORT_0) bob->ns-beta($TIDB_PORT_1) root->default"
+
 if [[ $mode == rust ]]; then
-	echo "PASS: Rust dataplane $variant executed SELECT 1 and recovered from drop-next"
+	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, and recovered from drop-next"
 else
-	echo "PASS: Go baseline $variant executed SELECT 1 and recovered from drop-next"
+	echo "PASS: Go baseline $variant executed SELECT 1, namespace matrix, and recovered from drop-next"
 fi

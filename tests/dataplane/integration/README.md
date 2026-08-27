@@ -40,7 +40,11 @@ tag: macOS caps `sun_path` well below the artifact path length), starts
 `tiproxy-rs` with a `--health-port` readiness endpoint that answers 200
 only after the first applied generation, and then runs the same
 `SELECT 1`, drop-next recovery, diagnostics, and port-release checks as
-the Go baseline. Cleanup stops the Rust process with SIGINT — the
+the Go baseline. Both modes additionally prove the namespace/topology
+matrix (DPL-07 #41): two admin-API-seeded namespaces pin one backend
+each through static instances, and `SELECT @@port` proves alice lands
+on ns-alpha's TiDB, bob on ns-beta's, while root keeps the PD-backed
+default namespace. Cleanup stops the Rust process with SIGINT — the
 coordinated-shutdown path. TLS, PROXY protocol, and compression
 variants remain refused by the capability contract until their Rust
 slices exist; a raw TCP relay or the Go dataplane is never reported as

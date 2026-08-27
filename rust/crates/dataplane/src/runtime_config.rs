@@ -236,6 +236,22 @@ impl DataplaneServingHandle {
         serving.handle.as_ref().map(DataplaneHandle::metrics)
     }
 
+    /// Whether the SQL serving side is live for readiness probes: an
+    /// owner task exists and has not finished, the listeners are not in
+    /// the stop-accept phase, and shutdown has not begun.
+    pub async fn is_serving(&self) -> bool {
+        let serving = self.state.lock().await;
+        let owner_alive = serving
+            .owner
+            .as_ref()
+            .is_some_and(|owner| !owner.is_finished());
+        let accepting = serving
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_draining());
+        owner_alive && accepting && !serving.shutting_down
+    }
+
     /// Stops accepting new connections while existing sessions keep
     /// running (the first coordinated-shutdown phase); a no-op before
     /// the first bind.

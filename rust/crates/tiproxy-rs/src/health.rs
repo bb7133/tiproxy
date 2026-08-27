@@ -28,27 +28,30 @@ use tokio::net::TcpListener;
 
 /// Serves readiness probes until the listener errors or the task is
 /// aborted by the composition's shutdown.
+/// Probes are handled INLINE — no per-connection task is ever spawned,
+/// so aborting this one task leaves nothing detached, and a slow
+/// prober is bounded by the read timeout, not unbounded task growth.
 pub async fn serve(listener: TcpListener, serving: DataplaneServingHandle) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        let serving = serving.clone();
-        tokio::spawn(async move {
-            // Best-effort request consumption: the response does not
-            // depend on the request, only on the serving state.
-            let mut scratch = [0_u8; 1024];
-            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch)).await;
-            let response = render(&serving.status());
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-        });
+        // Best-effort request consumption: the response does not
+        // depend on the request, only on the serving state.
+        let mut scratch = [0_u8; 1024];
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch)).await;
+        let response = render(&serving.status(), serving.is_serving().await);
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
     }
 }
 
-/// Renders the full HTTP response for one probe.
-fn render(status: &GenerationStatusSnapshot) -> String {
-    let ready = status.applied_generation > 0;
+/// Renders the full HTTP response for one probe: ready requires BOTH an
+/// applied generation AND a live SQL owner still accepting — after a
+/// drain begins or the owner exits, the probe turns not-ready even
+/// though a generation was applied earlier.
+fn render(status: &GenerationStatusSnapshot, serving_live: bool) -> String {
+    let ready = status.applied_generation > 0 && serving_live;
     let (code, reason, state) = if ready {
         (200, "OK", "OK")
     } else {
@@ -78,15 +81,24 @@ mod tests {
 
     #[test]
     fn not_ready_before_the_first_applied_generation() {
-        let response = render(&snapshot(0));
+        let response = render(&snapshot(0), true);
         assert!(response.starts_with("HTTP/1.0 503 "));
         assert!(response.contains("\"status\":\"NOT_READY\""));
         assert!(response.contains("\"applied_generation\":0"));
     }
 
     #[test]
+    fn not_ready_once_the_sql_owner_is_gone_or_draining() {
+        // An applied generation alone is not readiness: after the
+        // owner exits or stop-accept begins, the probe must flip back.
+        let response = render(&snapshot(3), false);
+        assert!(response.starts_with("HTTP/1.0 503 "));
+        assert!(response.contains("\"status\":\"NOT_READY\""));
+    }
+
+    #[test]
     fn ready_once_a_generation_is_applied() {
-        let response = render(&snapshot(3));
+        let response = render(&snapshot(3), true);
         assert!(response.starts_with("HTTP/1.0 200 OK"));
         assert!(response.contains("\"status\":\"OK\""));
         assert!(response.contains("\"applied_generation\":3"));

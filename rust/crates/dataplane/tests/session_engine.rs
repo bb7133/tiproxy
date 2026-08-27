@@ -1265,6 +1265,64 @@ async fn drain_waits_for_prepared_long_data_guard() {
     stack.dispatch_task.abort();
 }
 
+/// A REJECTED handshake decision refuses the client on the wire with
+/// the decision's approved message (never routes, never silently
+/// hangs), and the session reports CLOSED.
+#[tokio::test]
+async fn rejected_handshake_decision_refuses_the_client() {
+    let stack = spawn_stack().await;
+    // Inject only a REJECT decision; no route answer exists at all.
+    let forwarder = Arc::clone(&stack.forwarder);
+    tokio::spawn(async move {
+        let decision = ControlEnvelope {
+            request_id: 1,
+            generation: 1,
+            body: Some(Body::HandshakeDecision(HandshakeDecision {
+                connection_id: 1,
+                accept: false,
+                retry: false,
+                code: ErrorCode::HandshakeRejected as i32,
+                client_message: "failed to find a namespace".to_owned(),
+                namespace: String::new(),
+            })),
+            ..ControlEnvelope::default()
+        };
+        for _ in 0..200 {
+            let _ = forwarder.handle(decision.clone()).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    let Ok(refused) = timeout(
+        Duration::from_secs(5),
+        MysqlClient::login(stack.sql_port, FAKE_BACKEND_PASSWORD),
+    )
+    .await
+    else {
+        unreachable!("the refusal terminates the login promptly")
+    };
+    let Err(denied) = refused else {
+        unreachable!("a rejected decision must refuse the client")
+    };
+    assert_eq!(
+        denied.first(),
+        Some(&0xFF),
+        "MySQL error packet: {denied:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("failed to find a namespace"),
+        "the decision's approved message reaches the client: {denied:?}"
+    );
+
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(closed.is_some(), "the refused session reports CLOSED");
+    stack.dispatch_task.abort();
+}
+
 /// Control-plane loss must not tear down a healthy session (control-v1
 /// last-good): with the dispatcher gone, established traffic continues.
 #[tokio::test]
