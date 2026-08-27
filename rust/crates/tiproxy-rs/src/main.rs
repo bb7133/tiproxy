@@ -43,6 +43,11 @@ const CONTROL_SOCKET_ENV: &str = "TIPROXY_CONTROL_SOCKET";
 const CONTROL_UID_ENV: &str = "TIPROXY_CONTROL_UID";
 const TLS_ROOTS_ENV: &str = "TIPROXY_TLS_ROOTS";
 
+/// Upper bound for `--drain-grace-seconds` (30 days, the drain
+/// subsystem's shared deadline cap): far above any real grace and small
+/// enough that deadline arithmetic on `Instant` can never overflow.
+const MAX_DRAIN_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     control_socket: PathBuf,
@@ -118,7 +123,7 @@ async fn run(options: Options) -> Result<(), String> {
     let shared_client = Arc::new(ControlClient::new(client).map_err(|error| error.to_string())?);
     let (drain_tx, drain_rx) = watch::channel(false);
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
-    let loop_config = SessionLoopConfig::default();
+    let loop_config = session_loop_config(options.drain_grace);
     let owner: Arc<dyn BoundSessionHandler> = Arc::new(EngineSessionOwner::new(
         Arc::clone(&shared_client),
         "default",
@@ -172,6 +177,16 @@ async fn run(options: Options) -> Result<(), String> {
         (Err(error), _) => Err(error.to_string()),
         (Ok(()), Err(error)) => Err(format!("shut down SQL listeners: {error}")),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// ONE grace lineage: the CLI's validated drain grace IS the
+/// per-session FSM drain deadline, so the coordinator's absolute grace
+/// and the loop's own force timer never diverge.
+fn session_loop_config(drain_grace: Duration) -> SessionLoopConfig {
+    SessionLoopConfig {
+        drain_deadline: drain_grace,
+        ..SessionLoopConfig::default()
     }
 }
 
@@ -231,6 +246,12 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                 let seconds: u64 = value
                     .parse()
                     .map_err(|_| format!("drain grace must be a u64, got {value:?}"))?;
+                if seconds > MAX_DRAIN_GRACE_SECONDS {
+                    return Err(format!(
+                        "--drain-grace-seconds must be at most {MAX_DRAIN_GRACE_SECONDS} \
+                         (30 days), got {seconds}"
+                    ));
+                }
                 drain_grace = Duration::from_secs(seconds);
             }
             _ => return Err(format!("unknown argument {argument:?}")),
@@ -273,7 +294,10 @@ fn version_output() -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Command, Options, parse_options, version_output};
+    use super::{
+        Command, MAX_DRAIN_GRACE_SECONDS, Options, parse_options, session_loop_config,
+        version_output,
+    };
 
     #[test]
     fn version_output_labels_all_build_metadata() {
@@ -305,6 +329,42 @@ mod tests {
                 drain_grace: std::time::Duration::from_secs(30),
             }
         );
+    }
+
+    #[test]
+    fn drain_grace_is_the_session_drain_deadline() {
+        let command = parse_options([
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--drain-grace-seconds".to_owned(),
+            "45".to_owned(),
+        ]);
+        let Ok(Command::Run(options)) = command else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(options.drain_grace, std::time::Duration::from_secs(45));
+        assert_eq!(
+            session_loop_config(options.drain_grace).drain_deadline,
+            std::time::Duration::from_secs(45),
+            "one lineage: the CLI grace is the per-session FSM deadline"
+        );
+    }
+
+    #[test]
+    fn rejects_over_bound_drain_grace() {
+        let Err(error) = parse_options([
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--drain-grace-seconds".to_owned(),
+            (MAX_DRAIN_GRACE_SECONDS + 1).to_string(),
+        ]) else {
+            unreachable!("an over-bound grace must be rejected")
+        };
+        assert!(error.contains("at most"), "the bound is named: {error}");
     }
 
     #[test]
