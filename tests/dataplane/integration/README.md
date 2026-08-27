@@ -2,9 +2,12 @@
 
 This directory owns a reproducible, test-only TiDB topology for dataplane
 validation. Component versions are pinned in `versions.env`; the topology uses
-one PD, one TiKV, **two TiDB backends**, one TiProxy process, and a deliberately
-protocol-agnostic TCP fault injector. Certificates are generated for each run
-and removed during cleanup.
+TWO real PD-backed clusters — cluster-a with one PD, one TiKV, and **two TiDB
+backends** (plus the TiProxy process), and cluster-b as a second playground
+under its own tag and port window (+100) with one PD, one TiKV, and **one TiDB
+backend** — plus a deliberately protocol-agnostic TCP fault injector.
+Certificates are generated for each run and removed during cleanup; each run
+therefore consumes two 100-port windows.
 
 ## Current capability boundary
 
@@ -61,7 +64,7 @@ cross-checks. Per-cluster NSServer parity is explicitly out of scope
 (the wire snapshot does not project name servers). Error parity (same
 slice family) then
 proves the same semantic ERR in both modes: a bind conflict fails fast
-naming the port with no residue, and with both TiDB servers killed and
+naming the port with no residue, and with ALL THREE TiDB servers (both clusters) killed and
 evicted a new connection receives Go's approved 1105/HY000 "No
 available TiDB instances" vocabulary; the unknown-namespace refusal is
 documented as unreachable under the current public bootstrap/admin

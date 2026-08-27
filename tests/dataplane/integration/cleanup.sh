@@ -92,8 +92,14 @@ if [[ -d $tiup_data ]]; then
 fi
 
 # Second backend cluster's playground (dual-cluster runs): same
-# stop/clean/marker discipline under its own tag.
-if [[ ${TAG_B:-} == tiproxy-dp-go-*-b || ${TAG_B:-} == tiproxy-dp-rust-*-b ]]; then
+# stop/clean/marker discipline. TAG_B must be EXACTLY this run's
+# derived secondary tag — a state file naming any other playground is
+# refused, never cleaned.
+if [[ -n ${TAG_B:-} && ${TAG_B} != "$tag-b" ]]; then
+	echo "refusing secondary cleanup: TAG_B '$TAG_B' is not '$tag-b'" >&2
+	cleanup_status=1
+fi
+if [[ ${TAG_B:-} == "$tag-b" ]]; then
 	if [[ ${TIUP_B_PID:-} =~ ^[0-9]+$ ]] && command -v tiup >/dev/null 2>&1; then
 		tiup clean "$TAG_B" >>"$run_dir/cleanup.log" 2>&1 || true
 	fi

@@ -51,7 +51,7 @@ if [[ $variant == all ]]; then
 	variants=(plain tls proxy compress-zlib compress-zstd tls-proxy-zstd)
 	for index in "${!variants[@]}"; do
 		"$0" --mode "$mode" --variant "${variants[$index]}" \
-			--artifact-root "$artifact_root" --port-offset "$((port_offset + index * 100))"
+			--artifact-root "$artifact_root" --port-offset "$((port_offset + index * 200))"
 	done
 	exit 0
 fi
@@ -63,8 +63,10 @@ case "$variant" in
 		exit 2
 		;;
 esac
-if [[ ! $port_offset =~ ^[0-9]+$ ]] || ((port_offset < 1000 || port_offset > 20000)); then
-	echo "port offset must be an integer from 1000 through 20000" >&2
+# Each run consumes TWO 100-port windows (the second backend cluster
+# lives at +100), so the cap matches the renderer's.
+if [[ ! $port_offset =~ ^[0-9]+$ ]] || ((port_offset < 1000 || port_offset > 19900)); then
+	echo "port offset must be an integer from 1000 through 19900" >&2
 	exit 2
 fi
 
@@ -383,7 +385,11 @@ if [[ $mode == rust ]]; then
 else
 	go_log_root="${TIUP_HOME:-${HOME}/.tiup}/data/$tag"
 	evidence_files() {
-		find "$go_log_root" -type f -name '*.log' -path '*tiproxy*' 2>/dev/null | sort
+		# EXACTLY the main component log: concatenating multiple
+		# matching files would misalign the line-count offsets the
+		# delta windows depend on whenever any other file grows
+		# (old records would "reappear" inside a fresh tail).
+		find "$go_log_root" -type f -name 'tiproxy.log' 2>/dev/null | sort
 	}
 	evidence_pattern() { printf '"logger":"main\\.nsmgr\\.router\\.policy".*"msg":"route".*"namespace":"%s"' "$1"; }
 fi
@@ -459,15 +465,28 @@ mysql_listener_as() {
 		-h 127.0.0.1 -P "$port" -u root \
 		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} -e "$query"
 }
+mysql_backend_on() {
+	mysql --batch --skip-column-names --connect-timeout=2 \
+		-h 127.0.0.1 -P "$1" -u root --ssl-mode=DISABLED -e "$2"
+}
 # Absorption gate for the EXACT healthy set: GetTiDBTopology tolerates
 # partial merges, so readiness alone can pass with one cluster absent.
 # Both listeners must deterministically reach their own cluster before
 # any evidence row runs.
+# Cluster-B's OWN liveness is checked directly (playground process
+# alive + direct SQL against its TiDB), so a proxy-side fallback can
+# never mask a dead second cluster.
 cluster_matrix_ready=false
 for _ in {1..60}; do
+	if ! kill -0 "$TIUP_B_PID" 2>/dev/null; then
+		echo "cluster-B playground died during absorption; see tiup-playground-b.log" >&2
+		tail -20 "$run_dir/tiup-playground-b.log" >&2 || true
+		exit 1
+	fi
+	direct_b=$(mysql_backend_on "$TIDB_PORT_B" 'SELECT 1' 2>/dev/null || true)
 	port_a=$(mysql_listener_as "$TIPROXY_PORT" 'SELECT @@port' 2>/dev/null || true)
 	port_b=$(mysql_listener_as "$TIPROXY_PORT_B" 'SELECT @@port' 2>/dev/null || true)
-	if [[ ($port_a == "$TIDB_PORT_0" || $port_a == "$TIDB_PORT_1") && $port_b == "$TIDB_PORT_B" ]]; then
+	if [[ $direct_b == 1 && ($port_a == "$TIDB_PORT_0" || $port_a == "$TIDB_PORT_1") && $port_b == "$TIDB_PORT_B" ]]; then
 		cluster_matrix_ready=true
 		break
 	fi
@@ -488,47 +507,141 @@ fi
 # classes are covered explicitly (one connection per listener), and a
 # fresh record pairing the OTHER cluster's port is a hard failure —
 # as is any phantom/empty cluster attribution in rust mode.
+# The Go route record is asserted in BOTH modes (the Go control plane
+# routes in rust mode too): its ONE record must carry the claimed
+# group key values=["cluster:listener"], the exact per-group backend
+# COUNT, every expected member address, and a target inside the set —
+# the per-group exact-membership proof CodexM5 asked readiness for.
+go_route_files() {
+	# EXACTLY the main component log (see evidence_files): a second
+	# matching file growing would shift the concatenated line count
+	# and leak old records into fresh windows intermittently.
+	find "${TIUP_HOME:-${HOME}/.tiup}/data/$tag" -type f -name 'tiproxy.log' 2>/dev/null | sort
+}
+go_route_lines() {
+	local files
+	files=$(go_route_files)
+	if [[ -z $files ]]; then
+		echo 0
+		return
+	fi
+	# shellcheck disable=SC2086
+	cat $files 2>/dev/null | wc -l | tr -d ' '
+}
+go_route_tail() {
+	local files
+	files=$(go_route_files)
+	[[ -n $files ]] || return 0
+	# shellcheck disable=SC2086
+	cat $files 2>/dev/null | tail -n "+$(($1 + 1))"
+}
+# Evidence logs are file-buffered: a record written logically before a
+# row can flush physically after its window opens. Each row therefore
+# waits for BOTH logs to go quiet before capturing its offsets, so
+# earlier phases' late flushes can never pollute the window.
+quiesce_evidence_logs() {
+	local prev_go=-1 prev_ev=-1 now_go now_ev
+	for _ in {1..30}; do
+		now_go=$(go_route_lines)
+		now_ev=$(evidence_lines)
+		if [[ $now_go == "$prev_go" && $now_ev == "$prev_ev" ]]; then
+			return 0
+		fi
+		prev_go=$now_go
+		prev_ev=$now_ev
+		sleep 0.5
+	done
+	return 0
+}
 cluster_row() {
 	local listener=$1 cluster=$2 want_ports=$3 other_ports=$4
-	local offset fresh port matched=false
-	offset=$(evidence_lines)
-	port=$(mysql_listener_as "$listener" 'SELECT @@port' 2>/dev/null || true)
-	if [[ " $want_ports " != *" $port "* ]]; then
-		echo "listener $listener landed on '$port' (want one of: $want_ports)" >&2
-		return 1
-	fi
-	for _ in {1..20}; do
-		fresh=$(evidence_tail "$offset")
-		if [[ $mode == rust ]]; then
-			if grep -qE "\"event\":\"connection_ready\".*\"backend_addr\":\"127\.0\.0\.1:$port\".*\"cluster\":\"$cluster\"" <<<"$fresh"; then
-				matched=true
-				break
-			fi
-		else
-			if grep -qE "\"msg\":\"route\".*\"target\":\"127\.0\.0\.1:$port\"" <<<"$fresh"; then
-				matched=true
-				break
-			fi
+	local offset go_offset fresh go_fresh port record go_record matched=false
+	local expected_num
+	expected_num=$(wc -w <<<"$want_ports" | tr -d ' ')
+	# The QUERY sits inside the retry loop: a group whose second
+	# member has not been absorbed yet routes with a partial
+	# backend_num, and that record can never satisfy the full-
+	# membership pattern — only a NEW query after absorption can.
+	local go_pattern rust_pattern attempt
+	for attempt in {1..30}; do
+		quiesce_evidence_logs
+		offset=$(evidence_lines)
+		go_offset=$(go_route_lines)
+		port=$(mysql_listener_as "$listener" 'SELECT @@port' 2>/dev/null || true)
+		if [[ " $want_ports " != *" $port "* ]]; then
+			echo "listener $listener landed on '$port' (want one of: $want_ports)" >&2
+			return 1
 		fi
-		sleep 0.5
+		go_pattern="\"msg\":\"route\".*\"values\":\[\"$cluster:$listener\"\].*\"backend_num\":$expected_num.*\"target\":\"127\.0\.0\.1:$port\""
+		rust_pattern="\"event\":\"connection_ready\".*\"listener\":\"127\.0\.0\.1:$listener\".*\"backend_addr\":\"127\.0\.0\.1:$port\".*\"cluster\":\"$cluster\""
+		for _ in {1..10}; do
+			go_fresh=$(go_route_tail "$go_offset")
+			go_record=$(grep -E "$go_pattern" <<<"$go_fresh" | head -1 || true)
+			if [[ $mode == rust ]]; then
+				fresh=$(evidence_tail "$offset")
+				record=$(grep -E "$rust_pattern" <<<"$fresh" | head -1 || true)
+				if [[ -n $record && -n $go_record ]]; then
+					matched=true
+					break
+				fi
+			else
+				fresh=$go_fresh
+				record=$go_record
+				if [[ -n $record ]]; then
+					matched=true
+					break
+				fi
+			fi
+			sleep 0.5
+		done
+		[[ $matched == true ]] && break
+		sleep 1
 	done
 	if [[ $matched != true ]]; then
 		echo "missing $mode cluster attribution for listener $listener (cluster $cluster, port $port)" >&2
+		echo "fresh go route candidates:" >&2
+		grep -s '"msg":"route"' <<<"${go_fresh:-}" | tail -3 >&2 || true
 		return 1
 	fi
-	# The matched record IS the review evidence: print it verbatim
+	# Exact group membership: the ONE Go route record must list every
+	# expected member address (count already pinned by backend_num).
+	local member
+	for member in $want_ports; do
+		if [[ $go_record != *"127.0.0.1:$member"* ]]; then
+			echo "group $cluster:$listener route record misses member 127.0.0.1:$member: $go_record" >&2
+			return 1
+		fi
+	done
+	# The matched records ARE the review evidence: print them verbatim
 	# (addresses and ports only — nothing sensitive).
+	printf 'cluster evidence (go route, listener %s): %s\n' "$listener" "$go_record"
 	if [[ $mode == rust ]]; then
-		grep -E "\"event\":\"connection_ready\".*\"backend_addr\":\"127\.0\.0\.1:$port\"" <<<"$fresh" |
-			head -1 | sed "s/^/cluster evidence (rust, listener $listener): /"
-	else
-		grep -E "\"msg\":\"route\".*\"target\":\"127\.0\.0\.1:$port\"" <<<"$fresh" |
-			head -1 | sed "s/^/cluster evidence (go, listener $listener): /"
+		printf 'cluster evidence (rust, listener %s): %s\n' "$listener" "$record"
 	fi
+	# Bidirectional cross-check over BOTH evidence windows, scoped to
+	# the per-connection record kinds (route decisions / lifecycle
+	# events): the other cluster's ports may not appear in any of this
+	# row's fresh ROUTING records — a route record that even SCORED a
+	# foreign backend for this listener's group trips it. Background
+	# health/observer records legitimately name every backend at debug
+	# level and prove nothing about routing, so they are out of scope.
 	local other
 	for other in $other_ports; do
-		if grep -q "127\.0\.0\.1:$other" <<<"$fresh"; then
-			echo "listener $listener's window contains the other cluster's port $other" >&2
+		if grep '"msg":"route"' <<<"$go_fresh" | grep -q "127\.0\.0\.1:$other"; then
+			{
+				echo "listener $listener's window has a route record with the other cluster's port $other"
+				echo "foreign route records in the window:"
+				grep '"msg":"route"' <<<"$go_fresh" | grep "127\.0\.0\.1:$other" | tail -3
+			} >&2
+			return 1
+		fi
+		# connection_ready ONLY: a CLOSED record for an earlier
+		# phase's connection is written asynchronously after its
+		# client disconnects and can land inside this row's window —
+		# it is not a routing decision of this row.
+		if [[ $mode == rust ]] &&
+			grep '"event":"connection_ready"' <<<"$fresh" | grep -q "127\.0\.0\.1:$other"; then
+			echo "listener $listener's window has a ready record with the other cluster's port $other" >&2
 			return 1
 		fi
 	done
@@ -785,8 +898,19 @@ if [[ $mode == go ]]; then
 	# frozen ErrProxyNoBackend text — a generic "get backend failed"
 	# alone could be an earlier dial/EOF retry from the eviction race,
 	# which proves nothing about the branch that refused the client.
-	if ! evidence_tail "$go_evidence_offset" |
-		grep -Eqs '"get backend failed".*"last_err":"No available TiDB instances, please make sure TiDB is available"'; then
+	# The client's 1105 and this log record are written near-
+	# simultaneously: the record can land milliseconds after the
+	# client observed the refusal, so the read retries briefly.
+	go_source_evidence=false
+	for _ in {1..20}; do
+		if evidence_tail "$go_evidence_offset" |
+			grep -Eqs '"get backend failed".*"last_err":"No available TiDB instances, please make sure TiDB is available"'; then
+			go_source_evidence=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $go_source_evidence != true ]]; then
 		{
 			echo "Go no-backend source-branch evidence missing from the row's window"
 			echo "fresh get-backend records were:"
