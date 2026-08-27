@@ -70,6 +70,15 @@ func (sender *recordingSender) sent() []*controlpb.ControlEnvelope {
 	return append([]*controlpb.ControlEnvelope(nil), sender.envelopes...)
 }
 
+// epochedSender overrides the fixed epoch so tests can model transport
+// reconnects (request ids restart every epoch).
+type epochedSender struct {
+	recordingSender
+	epoch uint64
+}
+
+func (sender *epochedSender) Epoch() uint64 { return sender.epoch }
+
 func drainResult(id string, active, graceful, forced uint64, complete bool) *controlpb.DrainResult {
 	return &controlpb.DrainResult{
 		DrainId:           id,
@@ -379,13 +388,13 @@ func TestProtocolFailureReleasesDrainSlot(t *testing.T) {
 		&controlpb.DrainCommand{DrainId: "d-next"}), ErrDrainInProgress)
 
 	// An uncorrelated error stays with the generic transport handling.
-	require.False(t, issuer.HandleProtocolFailure(99_999, &controlpb.ProtocolError{
+	require.False(t, issuer.HandleProtocolFailure(1, 99_999, &controlpb.ProtocolError{
 		Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
 	}))
 
 	// The correlated ProtocolError (via offending_request_id) completes
 	// the issuance as an observable failure and releases the slot.
-	require.True(t, issuer.HandleProtocolFailure(0, &controlpb.ProtocolError{
+	require.True(t, issuer.HandleProtocolFailure(1, 0, &controlpb.ProtocolError{
 		Code:               controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
 		OffendingRequestId: requestID,
 		Detail:             "drain minted before applied snapshot",
@@ -399,6 +408,46 @@ func TestProtocolFailureReleasesDrainSlot(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, issuer.StartDrain(context.Background(), sender, nextID, 7,
 		&controlpb.DrainCommand{DrainId: "d-next"}))
+}
+
+func TestLateEpochErrorNeverResolvesNewEpochIssuance(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+
+	// Epoch 1: drain d-one on request 1 runs to its ordinary terminal.
+	epochOne := &epochedSender{epoch: 1}
+	firstID, err := epochOne.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), epochOne, firstID, 7,
+		&controlpb.DrainCommand{DrainId: "d-one"}))
+	sent := epochOne.sent()
+	require.Len(t, sent, 1)
+	wireID := sent[0].GetDrainCommand().GetDrainId()
+	require.NoError(t, issuer.HandleDrainResult(drainResult(wireID, 1, 1, 0, true)))
+
+	// Epoch 2 (reconnect): request ids restart, so drain d-two also
+	// sends on request 1.
+	epochTwo := &epochedSender{epoch: 2}
+	secondID, err := epochTwo.AllocateRequestID()
+	require.NoError(t, err)
+	require.Equal(t, firstID, secondID, "the collision under test")
+	require.NoError(t, issuer.StartDrain(context.Background(), epochTwo, secondID, 8,
+		&controlpb.DrainCommand{DrainId: "d-two"}))
+
+	// A late epoch-1 error for request 1 must not touch d-two.
+	require.False(t, issuer.HandleProtocolFailure(1, firstID, &controlpb.ProtocolError{
+		Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
+	}))
+	_, completed := issuer.Progress("d-two")
+	require.False(t, completed, "the new epoch's issuance stays live")
+
+	// The epoch-2 correlated error resolves d-two observably.
+	require.True(t, issuer.HandleProtocolFailure(2, secondID, &controlpb.ProtocolError{
+		Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
+	}))
+	result, completed := issuer.Progress("d-two")
+	require.True(t, completed)
+	require.Equal(t, controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION, result.GetCode())
 }
 
 func TestStartDrainRejectsInvalidBudgetsBeforeReservation(t *testing.T) {

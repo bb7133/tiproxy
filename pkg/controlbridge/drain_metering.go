@@ -57,10 +57,10 @@ type DrainIssuer struct {
 	// within this incarnation: the same label across reconnects (new
 	// epochs) of ONE incarnation keeps its original wire id/sequence.
 	callerIndex map[string]string
-	// requestIndex maps a sent envelope's request id to its wire id
+	// requestIndex maps an armed (epoch, request id) to its wire id
 	// while the issuance awaits its result, so a correlated
 	// ProtocolError can resolve that issuance as an observable failure.
-	requestIndex map[uint64]string
+	requestIndex map[drainRequestKey]string
 	activeID     string
 	// sequence is the issuer-wide monotonically increasing command
 	// sequence; restored from the reconcile watermark after a restart
@@ -78,13 +78,25 @@ type DrainIssuer struct {
 	foreignResolved *controlpb.DrainResult
 }
 
+// drainRequestKey scopes an outstanding request to its control epoch:
+// transport request ids restart from 1 every epoch, so the epoch is
+// part of the correlation identity — a late error from an old epoch
+// must never resolve a new epoch's issuance.
+type drainRequestKey struct {
+	epoch     uint64
+	requestID uint64
+}
+
 type drainOperation struct {
-	wireID        string
-	sequence      uint64
-	latest        *controlpb.DrainResult
-	completed     bool
-	everSent      bool
-	lastRequestID uint64
+	wireID    string
+	sequence  uint64
+	latest    *controlpb.DrainResult
+	completed bool
+	everSent  bool
+	// outstanding holds every armed (epoch, request) key that has not
+	// yet been resolved by a terminal, a correlated failure, or a send
+	// failure; all are cleared together when the operation ends.
+	outstanding []drainRequestKey
 }
 
 // ErrDrainInProgress rejects a second concurrent drain locally.
@@ -104,7 +116,7 @@ func NewDrainIssuer() (*DrainIssuer, error) {
 		incarnation:  hex.EncodeToString(nonce),
 		operations:   make(map[string]*drainOperation),
 		callerIndex:  make(map[string]string),
-		requestIndex: make(map[uint64]string),
+		requestIndex: make(map[drainRequestKey]string),
 	}, nil
 }
 
@@ -217,7 +229,7 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 		// A ProtocolError correlated to a drain issuance is that
 		// drain's observable failure; anything else keeps the
 		// transport's generic (ignore) handling via the adapter.
-		_ = handler.issuer.HandleProtocolFailure(envelope.GetRequestId(), body.Error)
+		_ = handler.issuer.HandleProtocolFailure(sender.Epoch(), envelope.GetRequestId(), body.Error)
 		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
 	case *controlpb.ControlEnvelope_ReconcileRequest:
 		// Restore the issuer-wide drain watermark before the adapter
@@ -303,6 +315,13 @@ func (issuer *DrainIssuer) StartDrain(
 	}
 	wire.DrainId = wireID
 	wire.CommandSequence = sequence
+	// Arm the correlation before the send: an error answered faster
+	// than the send call returns must still find its issuance.
+	key := drainRequestKey{epoch: sender.Epoch(), requestID: requestID}
+	issuer.mu.Lock()
+	issuer.requestIndex[key] = wireID
+	operation.outstanding = append(operation.outstanding, key)
+	issuer.mu.Unlock()
 	err := sender.Send(ctx, &controlpb.ControlEnvelope{
 		RequestId:  requestID,
 		Generation: generation,
@@ -312,17 +331,38 @@ func (issuer *DrainIssuer) StartDrain(
 	issuer.mu.Lock()
 	if err == nil {
 		operation.everSent = true
-		operation.lastRequestID = requestID
-		issuer.requestIndex[requestID] = wireID
-	} else if !operation.everSent && !operation.completed && issuer.activeID == wireID {
-		// Never reached the wire: release the single-flight slot so a
-		// different drain is not blocked forever; the binding itself is
-		// retained (the id stays bound to its one sequence for any
-		// retry).
-		issuer.activeID = ""
+	} else {
+		delete(issuer.requestIndex, key)
+		operation.outstanding = removeDrainKey(operation.outstanding, key)
+		if !operation.everSent && !operation.completed && issuer.activeID == wireID {
+			// Never reached the wire: release the single-flight slot so
+			// a different drain is not blocked forever; the binding
+			// itself is retained (the id stays bound to its one
+			// sequence for any retry).
+			issuer.activeID = ""
+		}
 	}
 	issuer.mu.Unlock()
 	return err
+}
+
+func removeDrainKey(keys []drainRequestKey, key drainRequestKey) []drainRequestKey {
+	kept := keys[:0]
+	for _, candidate := range keys {
+		if candidate != key {
+			kept = append(kept, candidate)
+		}
+	}
+	return kept
+}
+
+// resolveOutstandingLocked clears every armed correlation key of a
+// finished operation. Callers hold issuer.mu.
+func (issuer *DrainIssuer) resolveOutstandingLocked(operation *drainOperation) {
+	for _, key := range operation.outstanding {
+		delete(issuer.requestIndex, key)
+	}
+	operation.outstanding = nil
 }
 
 // HandleDrainResult applies one progress or terminal result. Duplicate
@@ -381,7 +421,7 @@ func (issuer *DrainIssuer) HandleDrainResult(result *controlpb.DrainResult) erro
 	operation.latest = result
 	if result.GetComplete() {
 		operation.completed = true
-		delete(issuer.requestIndex, operation.lastRequestID)
+		issuer.resolveOutstandingLocked(operation)
 		if issuer.activeID == operation.wireID {
 			issuer.activeID = ""
 		}
@@ -396,6 +436,7 @@ func (issuer *DrainIssuer) HandleDrainResult(result *controlpb.DrainResult) erro
 // never wedge every later drain. Uncorrelated errors report false and
 // stay with the transport's generic handling.
 func (issuer *DrainIssuer) HandleProtocolFailure(
+	epoch uint64,
 	requestID uint64,
 	failure *controlpb.ProtocolError,
 ) bool {
@@ -410,16 +451,18 @@ func (issuer *DrainIssuer) HandleProtocolFailure(
 	}
 	issuer.mu.Lock()
 	defer issuer.mu.Unlock()
-	wireID, correlated := issuer.requestIndex[requestID]
+	key := drainRequestKey{epoch: epoch, requestID: requestID}
+	wireID, correlated := issuer.requestIndex[key]
 	if !correlated {
 		return false
 	}
-	delete(issuer.requestIndex, requestID)
 	operation := issuer.operations[wireID]
 	if operation == nil || operation.completed {
+		delete(issuer.requestIndex, key)
 		return operation != nil
 	}
 	operation.completed = true
+	issuer.resolveOutstandingLocked(operation)
 	operation.latest = &controlpb.DrainResult{
 		DrainId:  wireID,
 		Complete: true,
