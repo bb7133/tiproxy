@@ -262,6 +262,12 @@ struct ConnectionControl {
     /// watermark, not by cache residency.
     redirect_terminals: VecDeque<TerminalRecord>,
     close: CloseState,
+    /// True once this record, AS CURRENTLY STORED, was exported in a
+    /// reconcile request. A later namespace/backend adoption on an
+    /// exported record means the peer may have rehydrated from the
+    /// stale export, so the adoption reports a repair obligation and
+    /// the caller answers with a fresh reconcile request.
+    exported: bool,
 }
 
 impl ConnectionControl {
@@ -366,6 +372,7 @@ impl CommandGate {
                 redirect_watermark: 0,
                 redirect_terminals: VecDeque::new(),
                 close: CloseState::Open,
+                exported: false,
             },
         );
     }
@@ -394,12 +401,42 @@ impl CommandGate {
             .map(|connection| connection.backend_id.clone())
     }
 
+    /// Returns the connection's current (decision-resolved) namespace.
+    #[must_use]
+    pub fn connection_namespace(&self, connection_id: u64) -> Option<String> {
+        self.connections
+            .get(&connection_id)
+            .map(|connection| connection.namespace.clone())
+    }
+
+    /// Adopts the namespace the accepted handshake decision resolved:
+    /// lifecycle events and reconciliation report the routing truth,
+    /// not the pre-decision registration seed. Returns true when the
+    /// record was already exported in a reconcile request: the peer may
+    /// have rehydrated from the stale export, and the caller owes a
+    /// fresh reconcile request as the explicit repair.
+    #[must_use]
+    pub fn set_namespace(&mut self, connection_id: u64, namespace: &str) -> bool {
+        if let Some(connection) = self.connections.get_mut(&connection_id) {
+            namespace.clone_into(&mut connection.namespace);
+            return connection.exported;
+        }
+        false
+    }
+
     /// Records the connection's current backend (after a successful
-    /// route/redirect).
-    pub fn set_backend(&mut self, connection_id: u64, backend_id: &str) {
+    /// route/redirect). Returns true when the record was already
+    /// exported in a reconcile request (same repair obligation as
+    /// [`Self::set_namespace`]): a backend-less export can only park as
+    /// an orphan on the peer, and the repair request is what lets it
+    /// rehydrate under the resolved namespace/backend pair.
+    #[must_use]
+    pub fn set_backend(&mut self, connection_id: u64, backend_id: &str) -> bool {
         if let Some(connection) = self.connections.get_mut(&connection_id) {
             backend_id.clone_into(&mut connection.backend_id);
+            return connection.exported;
         }
+        false
     }
 
     /// Removes a connection after its terminal CLOSED event; the drain
@@ -886,36 +923,42 @@ impl CommandGate {
     /// pairs, redirect-pending flags, and delivery sequences).
     #[must_use]
     pub fn build_reconcile_request(
-        &self,
+        &mut self,
         known_generation: u64,
         last_metrics_sequence: u64,
         last_metering_sequence: u64,
     ) -> ReconcileRequest {
         let mut connections: Vec<ReconcileConnection> = self
             .connections
-            .iter()
-            .map(|(connection_id, connection)| ReconcileConnection {
-                connection_id: *connection_id,
-                backend_id: connection.backend_id.clone(),
-                namespace: connection.namespace.clone(),
-                // "Pending" to the peer means: a redirect id whose
-                // terminal result the peer may not have seen — either
-                // truly in flight or finished with an unacknowledged
-                // (possibly lost) result. The exact id lets a fresh
-                // lineage restore it and lets the snapshot answer prove
-                // which tombstone to replay.
-                redirect_pending: matches!(connection.redirect, RedirectState::Pending { .. })
-                    || connection.latest_unacked().is_some(),
-                generation: connection.snapshot_generation,
-                pending_redirect_id: match &connection.redirect {
-                    RedirectState::Pending { redirect_id, .. } => redirect_id.clone(),
-                    RedirectState::Idle => connection
-                        .latest_unacked()
-                        .map(|result| result.redirect_id.clone())
-                        .unwrap_or_default(),
-                },
-                identity: Some(connection.identity.clone()),
-                last_redirect_command_sequence: connection.redirect_watermark,
+            .iter_mut()
+            .map(|(connection_id, connection)| {
+                // The export marker is per stored value: any later
+                // namespace/backend adoption on this record reports a
+                // repair obligation answered with a fresh request.
+                connection.exported = true;
+                ReconcileConnection {
+                    connection_id: *connection_id,
+                    backend_id: connection.backend_id.clone(),
+                    namespace: connection.namespace.clone(),
+                    // "Pending" to the peer means: a redirect id whose
+                    // terminal result the peer may not have seen — either
+                    // truly in flight or finished with an unacknowledged
+                    // (possibly lost) result. The exact id lets a fresh
+                    // lineage restore it and lets the snapshot answer prove
+                    // which tombstone to replay.
+                    redirect_pending: matches!(connection.redirect, RedirectState::Pending { .. })
+                        || connection.latest_unacked().is_some(),
+                    generation: connection.snapshot_generation,
+                    pending_redirect_id: match &connection.redirect {
+                        RedirectState::Pending { redirect_id, .. } => redirect_id.clone(),
+                        RedirectState::Idle => connection
+                            .latest_unacked()
+                            .map(|result| result.redirect_id.clone())
+                            .unwrap_or_default(),
+                    },
+                    identity: Some(connection.identity.clone()),
+                    last_redirect_command_sequence: connection.redirect_watermark,
+                }
             })
             .collect();
         connections.sort_by_key(|connection| connection.connection_id);

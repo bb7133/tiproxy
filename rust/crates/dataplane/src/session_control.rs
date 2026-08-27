@@ -110,6 +110,14 @@ impl SessionControlBinding {
             .await
     }
 
+    /// Adopts the decision-resolved namespace for lifecycle events and
+    /// reconciliation.
+    pub async fn set_namespace(&self, namespace: impl Into<String>) -> bool {
+        self.dispatch
+            .set_namespace(self.connection_id, namespace.into())
+            .await
+    }
+
     /// Receives the next control directive for the single-owner session
     /// loop: the signal plus — for gate-admitted per-session commands —
     /// the exact [`CommandToken`](crate::control_dispatch::CommandToken)
@@ -208,6 +216,14 @@ impl SessionCommander {
     pub async fn set_backend(&self, backend_id: impl Into<String>) -> bool {
         self.dispatch
             .set_backend(self.connection_id, backend_id.into())
+            .await
+    }
+
+    /// Adopts the decision-resolved namespace for lifecycle events and
+    /// reconciliation.
+    pub async fn set_namespace(&self, namespace: impl Into<String>) -> bool {
+        self.dispatch
+            .set_namespace(self.connection_id, namespace.into())
             .await
     }
 

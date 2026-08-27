@@ -327,6 +327,14 @@ impl ControlCommandHandler {
         self.active_session.map(|(epoch, _)| epoch)
     }
 
+    /// The active session's negotiated `(epoch, capabilities)`, if
+    /// connected (the stale-export repair path re-derives its
+    /// capability gating from this).
+    #[must_use]
+    pub const fn active_session(&self) -> Option<(u64, u64)> {
+        self.active_session
+    }
+
     /// Records the applied config snapshot generation (drain
     /// provenance).
     pub fn set_applied_generation(&mut self, generation: u64) {
@@ -365,8 +373,19 @@ impl ControlCommandHandler {
     }
 
     /// Records the session's current backend (route/redirect success).
-    pub fn set_backend(&mut self, connection_id: u64, backend_id: &str) {
-        self.gate.set_backend(connection_id, backend_id);
+    /// Returns true when the record was already exported in a reconcile
+    /// request (the caller owes a stale-export repair).
+    #[must_use]
+    pub fn set_backend(&mut self, connection_id: u64, backend_id: &str) -> bool {
+        self.gate.set_backend(connection_id, backend_id)
+    }
+
+    /// Adopts the decision-resolved namespace for lifecycle events and
+    /// reconciliation. Returns true when the record was already exported
+    /// in a reconcile request (the caller owes a stale-export repair).
+    #[must_use]
+    pub fn set_namespace(&mut self, connection_id: u64, namespace: &str) -> bool {
+        self.gate.set_namespace(connection_id, namespace)
     }
 
     /// Arms the session's response expectation: the initiating request
@@ -477,6 +496,10 @@ impl ControlCommandHandler {
             .gate
             .connection_backend(connection_id)
             .unwrap_or_default();
+        let namespace = self
+            .gate
+            .connection_namespace(connection_id)
+            .unwrap_or_default();
         let drain_terminal = self.gate.record_drain_close(connection_id, forced);
         self.gate.unregister_connection(connection_id);
         self.sessions.remove(&connection_id);
@@ -494,6 +517,7 @@ impl ControlCommandHandler {
             outbound.push(closed_event_envelope(
                 identity,
                 &backend_id,
+                &namespace,
                 generation,
                 error_source,
                 traffic,
@@ -1086,7 +1110,7 @@ impl ControlCommandHandler {
     /// Builds the reconcile request from the gate's authoritative state
     /// plus the metering watermark.
     #[must_use]
-    pub fn build_reconcile_request(&self, known_generation: u64) -> ReconcileRequest {
+    pub fn build_reconcile_request(&mut self, known_generation: u64) -> ReconcileRequest {
         self.gate
             .build_reconcile_request(known_generation, 0, self.metering.last_sequence())
     }
@@ -1127,6 +1151,7 @@ impl ControlCommandHandler {
                 let mut event = closed_event_envelope(
                     identity,
                     &remote.backend_id,
+                    &remote.namespace,
                     remote.generation,
                     ErrorSource::Proxy,
                     TrafficTotals::default(),
@@ -1211,6 +1236,7 @@ fn result_envelope(outbound: OutboundControl, generation: u64, request_id: u64) 
 fn closed_event_envelope(
     identity: ConnectionIdentity,
     backend_id: &str,
+    namespace: &str,
     generation: u64,
     error_source: ErrorSource,
     traffic: TrafficTotals,
@@ -1230,7 +1256,7 @@ fn closed_event_envelope(
             kind: ConnectionEventKind::Closed.into(),
             connection: Some(identity),
             backend_id: backend_id.to_owned(),
-            namespace: String::new(),
+            namespace: namespace.to_owned(),
             error_source: error_source.into(),
             client_in_bytes: traffic.client_in,
             client_out_bytes: traffic.client_out,
@@ -1272,6 +1298,19 @@ pub enum DispatchNotice {
         /// decisions/results) for this session, when it routes.
         responses: Option<mpsc::Sender<ControlEnvelope>>,
         /// Completed when the registration is applied.
+        applied: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Adopts the decision-resolved namespace for a session. The
+    /// applied acknowledgement is a causal barrier: reconcile and
+    /// lifecycle evidence reflect the update only after it fires, so
+    /// callers proceed to the route conversation knowing every later
+    /// observer sees the resolved namespace.
+    SetNamespace {
+        /// Stable connection id.
+        connection_id: u64,
+        /// The decision-resolved namespace.
+        namespace: String,
+        /// Completed when the update is applied.
         applied: tokio::sync::oneshot::Sender<()>,
     },
     /// The session's backend attached or changed.
@@ -1453,6 +1492,36 @@ impl ControlDispatchHandle {
             backend_id,
         })
         .await
+    }
+
+    /// Adopts the decision-resolved namespace for this session's
+    /// lifecycle events and reconciliation, and WAITS for the applied
+    /// acknowledgement. The precise guarantee: `true` means every
+    /// reconcile built later exports the resolved value AND any
+    /// reconcile that raced ahead with the seed has already been
+    /// succeeded — in wire order, before the ack fired — by an
+    /// explicit repair reconcile that actually entered the outbound
+    /// path. `false` means the repair could not be placed on the wire
+    /// (the epoch died or the enqueue failed): the caller must fail
+    /// the session closed instead of routing. A stale export is also
+    /// always backend-less (notices apply in order), so the peer can
+    /// only have parked it as an orphan — never a live session under
+    /// the seed — and the gate keeps the adopted value, so every later
+    /// export (including the next epoch's automatic reconcile) reports
+    /// it for accounting.
+    pub async fn set_namespace(&self, connection_id: u64, namespace: String) -> bool {
+        let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::SetNamespace {
+                connection_id,
+                namespace,
+                applied: applied_tx,
+            })
+            .await
+        {
+            return false;
+        }
+        applied_rx.await.is_ok()
     }
 
     /// Arms the session's response expectation and **waits for the
@@ -1792,12 +1861,26 @@ impl std::fmt::Display for DispatchFatal {
 /// **after** a successful send — a failed send converges through
 /// reconcile omission instead of poisoning the watermark. Terminal
 /// send failures are counted, never silent.
-async fn dispatch_send<S: DispatchSender>(
+/// Where one outbound dispatch ended up — for callers whose guarantee
+/// depends on it (the stale-export repair must not be presumed sent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    /// Entered the outbound path.
+    Sent,
+    /// The bound epoch is no longer negotiated (or no session exists):
+    /// the next `Connected` transition's automatic reconcile
+    /// regenerates this state from the gate.
+    StaleEpoch,
+    /// Unrecoverable enqueue failure (queue full, owner closed, …).
+    Failed,
+}
+
+async fn dispatch_send_outcome<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
     mut envelope: ControlEnvelope,
     scope: SendScope,
-) -> Result<(), DispatchFatal> {
+) -> Result<SendOutcome, DispatchFatal> {
     if envelope.request_id == NEEDS_ALLOCATION {
         let Some(id) = sender.allocate_request_id() else {
             // The id space is exhausted: every future send would have
@@ -1817,12 +1900,26 @@ async fn dispatch_send<S: DispatchSender>(
             if is_event {
                 handler.record_event_sequence(request_id);
             }
+            Ok(SendOutcome::Sent)
         }
         // Regenerated by the next Connected transition by design.
-        Err(TransportError::StaleSessionEpoch) => {}
-        Err(_) => handler.count_send_failure(),
+        Err(TransportError::StaleSessionEpoch) => Ok(SendOutcome::StaleEpoch),
+        Err(_) => {
+            handler.count_send_failure();
+            Ok(SendOutcome::Failed)
+        }
     }
-    Ok(())
+}
+
+async fn dispatch_send<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+    envelope: ControlEnvelope,
+    scope: SendScope,
+) -> Result<(), DispatchFatal> {
+    dispatch_send_outcome(sender, handler, envelope, scope)
+        .await
+        .map(|_| ())
 }
 
 /// Runs the production dispatch loop: connection-state transitions
@@ -1865,6 +1962,12 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 // `changed()` marked the newest value seen: apply it
                 // directly, then drain anything that raced in after.
                 let snapshot = *state.borrow();
+                // Causal barrier: adoptions enqueued before this
+                // transition was observed apply BEFORE the
+                // transition's automatic reconcile, so its export
+                // already carries them. (Adoptions enqueued after are
+                // covered by the stale-export repair.)
+                drain_pending_notices(&sender, &mut handler, &mut notices).await?;
                 let applied = apply_state(&sender, &mut handler, snapshot).await;
                 match applied {
                     Ok(()) => {
@@ -1921,6 +2024,28 @@ async fn apply_state_transitions<S: DispatchSender>(
     Ok(())
 }
 
+/// Applies every notice already sitting in the queue (never blocks).
+async fn drain_pending_notices<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+    notices: &mut mpsc::Receiver<DispatchNotice>,
+) -> Result<(), DispatchFatal> {
+    // Bounded by the queue length observed at entry. This queue also
+    // carries continuous producers (metering, session terminals,
+    // redirect results) that can refill freed slots while apply awaits
+    // outbound sends — chasing them would let the drain starve the
+    // very transition it feeds. A notice arriving during the drain is
+    // exactly the case the stale-export repair covers.
+    let budget = notices.len();
+    for _ in 0..budget {
+        match notices.try_recv() {
+            Ok(notice) => apply_notice(sender, handler, notice).await?,
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
 /// Applies one observed connection state to the handler.
 async fn apply_state<S: DispatchSender>(
     sender: &Arc<S>,
@@ -1955,20 +2080,7 @@ async fn on_connected_transition<S: DispatchSender>(
 ) -> Result<(), DispatchFatal> {
     handler.on_connected(epoch, capabilities);
     if handler.reconcile_capable() {
-        let request = handler.build_reconcile_request(handler.applied_generation());
-        let mut required = vec![ControlCapability::ReconcileConnections as u64];
-        if (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1 {
-            required.push(ControlCapability::ReconcileSessionRehydration as u64);
-        }
-        let envelope = ControlEnvelope {
-            request_id: NEEDS_ALLOCATION,
-            generation: request.known_generation,
-            priority: Priority::Critical.into(),
-            required_capabilities: required,
-            body: Some(Body::ReconcileRequest(request)),
-            ..ControlEnvelope::default()
-        };
-        dispatch_send(sender, handler, envelope, SendScope::Session(epoch)).await?;
+        let _ = send_reconcile_request(sender, handler, epoch, capabilities).await?;
     }
     // Unacked metering is durable: delivery matters with or without an
     // ack path, and the consumer dedups by contiguous sequence.
@@ -1980,6 +2092,83 @@ async fn on_connected_transition<S: DispatchSender>(
             ..ControlEnvelope::default()
         };
         dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+    }
+    Ok(())
+}
+
+/// Builds and sends one fresh reconcile request to the active session,
+/// with the same capability gating as the automatic reconcile at
+/// connection. Shared by the connected transition and the stale-export
+/// repair path.
+async fn send_reconcile_request<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+    epoch: u64,
+    capabilities: u64,
+) -> Result<SendOutcome, DispatchFatal> {
+    let request = handler.build_reconcile_request(handler.applied_generation());
+    let mut required = vec![ControlCapability::ReconcileConnections as u64];
+    if (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1 {
+        required.push(ControlCapability::ReconcileSessionRehydration as u64);
+    }
+    let envelope = ControlEnvelope {
+        request_id: NEEDS_ALLOCATION,
+        generation: request.known_generation,
+        priority: Priority::Critical.into(),
+        required_capabilities: required,
+        body: Some(Body::ReconcileRequest(request)),
+        ..ControlEnvelope::default()
+    };
+    dispatch_send_outcome(sender, handler, envelope, SendScope::Session(epoch)).await
+}
+
+/// Explicit repair for a stale export. A namespace/backend adoption
+/// that lands on a record some reconcile request already exported means
+/// the peer may have observed (and rehydrated or parked an orphan
+/// from) the pre-adoption value, and known ids are not updated by
+/// later reconciles on the peer — only orphans are retried. Wire FIFO
+/// makes the repair the peer's LAST observation of the record, and the
+/// gate's notice-order guarantee (namespace adopts before any backend
+/// exists) means a stale export is always backend-less: it can only
+/// have parked as an orphan, never a live wrong-router session. The
+/// orphan then converges one of two ways, both clean: the backend
+/// adoption's repair re-exports a routable record that resolves it
+/// under the adopted values, or the peer's bounded orphan cleanup (or
+/// the failed route conversation) terminates the session with an
+/// ordinary CLOSED — a mid-handshake connection is not guaranteed to
+/// SURVIVE a peer restart, only to never be attributed stale. No
+/// active or reconcile-incapable session: nothing was exported to
+/// repair — the next session's automatic reconcile carries the
+/// adopted record.
+async fn repair_stale_export<S: DispatchSender>(
+    sender: &Arc<S>,
+    handler: &mut ControlCommandHandler,
+) -> Result<SendOutcome, DispatchFatal> {
+    if !handler.reconcile_capable() {
+        return Ok(SendOutcome::StaleEpoch);
+    }
+    let Some((epoch, capabilities)) = handler.active_session() else {
+        return Ok(SendOutcome::StaleEpoch);
+    };
+    send_reconcile_request(sender, handler, epoch, capabilities).await
+}
+
+/// Records one metering delta and acks in one await-free step: the
+/// verdict the producer sees is exactly the ledger's, and the delta is
+/// either absorbed or still owned by the producer — never
+/// accepted-then-dropped.
+fn apply_metering_notice(
+    handler: &mut ControlCommandHandler,
+    delta: control_proto::v1::MeteringDelta,
+    ack: tokio::sync::oneshot::Sender<Result<(), MeteringError>>,
+) -> Result<(), DispatchFatal> {
+    let result = handler.record_metering(delta);
+    let fatal = matches!(result, Err(MeteringError::SequenceExhausted));
+    let _ = ack.send(result);
+    if fatal {
+        // The strictly monotonic sequence space is gone: every future
+        // seal would fail; stop fail-closed.
+        return Err(DispatchFatal::MeteringSequenceExhausted);
     }
     Ok(())
 }
@@ -2020,7 +2209,45 @@ async fn apply_notice<S: DispatchSender>(
             connection_id,
             backend_id,
         } => {
-            handler.set_backend(connection_id, &backend_id);
+            if handler.set_backend(connection_id, &backend_id) {
+                // No ack path exists for backend adoption. A failed
+                // repair still converges: the adopted value is already
+                // in the gate, so the next Connected transition's
+                // automatic reconcile re-exports it, and until then the
+                // peer's stale record can only be a parked orphan whose
+                // bounded cleanup terminates the session cleanly.
+                let _ = repair_stale_export(sender, handler).await?;
+            }
+        }
+        DispatchNotice::SetNamespace {
+            connection_id,
+            namespace,
+            applied,
+        } => {
+            // The ack is granted ONLY when no repair was owed or the
+            // repair actually entered the outbound path (`Sent`): the
+            // commander observing `true` then means the stale export
+            // is already succeeded, in wire order, by the repaired
+            // one. `StaleEpoch` is NOT a wire barrier — an acked
+            // session would immediately enqueue its durable
+            // `RouteRequest`, which can reach the new peer before the
+            // dispatcher even observes the `Connected` transition that
+            // sends the automatic reconcile — and `Failed` never left
+            // this process. Both drop the ack: the commander observes
+            // `false` and the SQL session fails closed, which is
+            // exactly the agreed boundary (a mid-handshake connection
+            // does not survive a control-session loss; the gate still
+            // holds the adopted value, so every later export —
+            // including the next epoch's automatic reconcile — reports
+            // it for accounting).
+            let upheld = if handler.set_namespace(connection_id, &namespace) {
+                repair_stale_export(sender, handler).await? == SendOutcome::Sent
+            } else {
+                true
+            };
+            if upheld {
+                let _ = applied.send(());
+            }
         }
         DispatchNotice::ExpectResponse {
             connection_id,
@@ -2032,18 +2259,7 @@ async fn apply_notice<S: DispatchSender>(
             let _ = applied.send(verdict);
         }
         DispatchNotice::Metering { delta, ack } => {
-            // Record and ack in one await-free step: the verdict the
-            // producer sees is exactly the ledger's, and the delta is
-            // either absorbed or still owned by the producer — never
-            // accepted-then-dropped.
-            let result = handler.record_metering(*delta);
-            let fatal = matches!(result, Err(MeteringError::SequenceExhausted));
-            let _ = ack.send(result);
-            if fatal {
-                // The strictly monotonic sequence space is gone:
-                // every future seal would fail; stop fail-closed.
-                return Err(DispatchFatal::MeteringSequenceExhausted);
-            }
+            apply_metering_notice(handler, *delta, ack)?;
         }
         DispatchNotice::SessionClosed {
             connection_id,

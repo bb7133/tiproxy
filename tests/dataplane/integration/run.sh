@@ -204,12 +204,14 @@ fi
 FAULT_PID=$!
 write_state
 
-"$script_dir/readiness.sh" "$run_dir" 180 | tee "$run_dir/readiness.log"
-
 if [[ $mode == rust ]]; then
+	# Gate the shared readiness phase on the Rust process itself: the
+	# health endpoint turns 200 once the first generation applies
+	# (independent of TiDB warm-up), and a dead tiproxy-rs fails fast
+	# here instead of burning the full readiness timeout.
 	rust_ready=false
 	for _ in {1..180}; do
-		if curl --noproxy '*' --fail --silent \
+		if curl --noproxy '*' --fail --silent --max-time 5 \
 			"http://127.0.0.1:$RUST_HEALTH_PORT/health" \
 			>"$run_dir/tiproxy-rs-health.json" 2>/dev/null; then
 			rust_ready=true
@@ -226,6 +228,25 @@ if [[ $mode == rust ]]; then
 		exit 1
 	fi
 fi
+
+# The shared readiness phase is monitored: if the Rust process dies
+# mid-phase the run fails immediately instead of burning the timeout.
+"$script_dir/readiness.sh" "$run_dir" 180 >"$run_dir/readiness.log" 2>&1 &
+READINESS_PID=$!
+while kill -0 "$READINESS_PID" 2>/dev/null; do
+	if [[ -n ${RUST_PID:-} ]] && ! kill -0 "$RUST_PID" 2>/dev/null; then
+		kill "$READINESS_PID" 2>/dev/null
+		cat "$run_dir/readiness.log"
+		echo "tiproxy-rs died during readiness; see tiproxy-rs.log" >&2
+		exit 1
+	fi
+	sleep 1
+done
+if ! wait "$READINESS_PID"; then
+	cat "$run_dir/readiness.log"
+	exit 1
+fi
+cat "$run_dir/readiness.log"
 
 mysql_tls_args=()
 if [[ $TLS_ENABLED == true ]]; then
@@ -261,8 +282,140 @@ if [[ $(mysql_ingress 'SELECT 1') != 1 ]]; then
 	exit 1
 fi
 
+# Namespace/topology matrix (DPL-07 #41): three username-resolved
+# combinations against the REAL cluster, identical in both modes.
+# `proxy.pd-addrs` always registers an implicit PD-backed backend
+# cluster, and once ANY backend cluster exists the Go FallbackFetcher
+# serves every namespace the full PD topology — `backend.instances`
+# is ignored, so no namespace can pin a backend and `SELECT @@port`
+# cannot discriminate the rows. The namespaces therefore list BOTH
+# real backends (the set routing actually uses), behavior asserts a
+# landing inside that set, and the DISCRIMINATING evidence is
+# per-connection namespace attribution: each row runs alone against a
+# captured log offset, and the freshly appended records must
+# attribute that one connection to exactly the expected namespace.
+mysql_backend_admin() {
+	mysql --batch --skip-column-names --connect-timeout=2 \
+		-h 127.0.0.1 -P "$TIDB_PORT_0" -u root --ssl-mode=DISABLED -e "$1"
+}
+mysql_ingress_as() {
+	local user=$1
+	local query=$2
+	mysql --batch --skip-column-names --connect-timeout=4 \
+		-h 127.0.0.1 -P "$FAULT_PORT" -u "$user" \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} -e "$query"
+}
+mysql_backend_admin "CREATE USER IF NOT EXISTS 'alice'@'%'; CREATE USER IF NOT EXISTS 'bob'@'%';"
+namespace_api="http://127.0.0.1:$TIPROXY_API_PORT/api/admin/namespace"
+curl --noproxy '*' --fail --silent --show-error -X PUT \
+	-H 'Content-Type: application/json' \
+	-d "{\"namespace\":\"ns-alpha\",\"frontend\":{\"user\":\"alice\"},\"backend\":{\"instances\":[\"127.0.0.1:$TIDB_PORT_0\",\"127.0.0.1:$TIDB_PORT_1\"]}}" \
+	"$namespace_api/ns-alpha" -o /dev/null
+curl --noproxy '*' --fail --silent --show-error -X PUT \
+	-H 'Content-Type: application/json' \
+	-d "{\"namespace\":\"ns-beta\",\"frontend\":{\"user\":\"bob\"},\"backend\":{\"instances\":[\"127.0.0.1:$TIDB_PORT_0\",\"127.0.0.1:$TIDB_PORT_1\"]}}" \
+	"$namespace_api/ns-beta" -o /dev/null
+curl --noproxy '*' --fail --silent --show-error -X POST \
+	"$namespace_api/commit?namespace=ns-alpha&namespace=ns-beta" -o /dev/null
+
+# Absorption gate: the committed namespaces become routable once the
+# proxy rebuilds its user→namespace map and each router observes the
+# PD topology. Every user must then land on a REAL backend.
+namespace_resolved() {
+	local port
+	port=$(mysql_ingress_as "$1" 'SELECT @@port' 2>/dev/null) || return 1
+	[[ $port == "$TIDB_PORT_0" || $port == "$TIDB_PORT_1" ]]
+}
+namespace_ready=false
+for _ in {1..30}; do
+	if namespace_resolved alice && namespace_resolved bob && namespace_resolved root; then
+		namespace_ready=true
+		break
+	fi
+	sleep 1
+done
+if [[ $namespace_ready != true ]]; then
+	{
+		echo "namespace absorption failed:"
+		for user in alice bob root; do
+			echo "  $user -> $(mysql_ingress_as "$user" 'SELECT @@port' 2>&1 | tail -1) (want $TIDB_PORT_0 or $TIDB_PORT_1)"
+		done
+	} >&2
+	exit 1
+fi
+# Per-connection attribution evidence. In Rust mode the engine's
+# closed-schema lifecycle log names the decision-resolved namespace;
+# in Go mode the per-namespace router logs every route at debug level
+# under its namespace field (the tiup component log lives in the tag
+# data directory, still alive here; cleanup removes it later).
 if [[ $mode == rust ]]; then
-	echo "PASS: Rust dataplane $variant executed SELECT 1 and recovered from drop-next"
+	evidence_files() { printf '%s\n' "$run_dir/tiproxy-rs.log"; }
+	evidence_pattern() { printf '"event":"connection_ready".*"namespace":"%s"' "$1"; }
 else
-	echo "PASS: Go baseline $variant executed SELECT 1 and recovered from drop-next"
+	go_log_root="${TIUP_HOME:-${HOME}/.tiup}/data/$tag"
+	evidence_files() {
+		find "$go_log_root" -type f -name '*.log' -path '*tiproxy*' 2>/dev/null | sort
+	}
+	evidence_pattern() { printf '"logger":"main\\.nsmgr\\.router\\.policy".*"msg":"route".*"namespace":"%s"' "$1"; }
+fi
+evidence_lines() {
+	local files
+	files=$(evidence_files)
+	if [[ -z $files ]]; then
+		echo 0
+		return
+	fi
+	# shellcheck disable=SC2086
+	cat $files 2>/dev/null | wc -l | tr -d ' '
+}
+evidence_tail() {
+	local files
+	files=$(evidence_files)
+	if [[ -z $files ]]; then
+		return
+	fi
+	# shellcheck disable=SC2086
+	cat $files 2>/dev/null | tail -n "+$(($1 + 1))"
+}
+# One row = one connection run ALONE against a captured log offset:
+# the fresh records must attribute it to exactly the expected
+# namespace and to NO other, which discriminates all three rows even
+# though every namespace routes over the same PD-backed backend set.
+attribution_row() {
+	local user=$1 expected=$2 offset fresh matched=false
+	offset=$(evidence_lines)
+	if ! namespace_resolved "$user"; then
+		echo "$user query failed during the attribution row" >&2
+		return 1
+	fi
+	for _ in {1..20}; do
+		fresh=$(evidence_tail "$offset")
+		if grep -qE "$(evidence_pattern "$expected")" <<<"$fresh"; then
+			matched=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $matched != true ]]; then
+		echo "missing $mode namespace attribution for $user: $expected" >&2
+		return 1
+	fi
+	local other
+	for other in ns-alpha ns-beta default; do
+		[[ $other == "$expected" ]] && continue
+		if grep -qE "$(evidence_pattern "$other")" <<<"$fresh"; then
+			echo "$user connection was also attributed to $other" >&2
+			return 1
+		fi
+	done
+}
+attribution_row alice ns-alpha || exit 1
+attribution_row bob ns-beta || exit 1
+attribution_row root default || exit 1
+echo "namespace matrix: alice->ns-alpha bob->ns-beta root->default (per-connection route attribution)"
+
+if [[ $mode == rust ]]; then
+	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, and recovered from drop-next"
+else
+	echo "PASS: Go baseline $variant executed SELECT 1, namespace matrix, and recovered from drop-next"
 fi
