@@ -664,6 +664,330 @@ cluster_row "$TIPROXY_PORT" cluster-a "$TIDB_PORT_0 $TIDB_PORT_1" "$TIDB_PORT_B"
 cluster_row "$TIPROXY_PORT_B" cluster-b "$TIDB_PORT_B" "$TIDB_PORT_0 $TIDB_PORT_1" || exit 1
 echo "cluster matrix: listener $TIPROXY_PORT->cluster-a listener $TIPROXY_PORT_B->cluster-b (deterministic port routing)"
 
+# ---- No-keyspace-migration (DPL-07 #41 acceptance) ----
+# An isolated MatchAll proxy instance puts cluster-a (ks-old) and
+# cluster-b (ks-new) into ONE routing group, pins a persistent session
+# onto cluster-a via fail-backend-list, then hot-swaps the list so the
+# router genuinely tries to push that session to ks-new. The product
+# guard must refuse at the shared issuance boundary while a NEW
+# connection proves the change absorbed. Keyspaces are injected via
+# topology labels (the classic-topology discrimination channel); real
+# /keyspaces/tidb/<ks> propagation is locked by PDFetcher unit tests.
+ka_sql_port=$((8097 + port_offset))
+ka_api_port=$((8098 + port_offset))
+ka_health_port=$((8099 + port_offset))
+KA_SOCKET="${TMPDIR:-/tmp}/$tag-ka.sock"
+for port in "$ka_sql_port" "$ka_api_port" "$ka_health_port"; do
+	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
+		echo "keyspace-guard phase port is already in use: $port" >&2
+		exit 1
+	fi
+done
+sed '/^\[rust-dataplane\]/,$d' "$run_dir/tiproxy.toml" >"$run_dir/tiproxy-ka.toml"
+python3 - "$run_dir/tiproxy-ka.toml" "$ka_sql_port" "$ka_api_port" "$run_dir" "$TIDB_PORT_1" "$TIDB_PORT_B" <<'PYKA'
+import re, sys
+path, sql_port, api_port, run_dir, tidb_a1, tidb_b = sys.argv[1:7]
+text = open(path).read()
+text = re.sub(r'(?m)^workdir = .*$', f'workdir = "{run_dir}/ka-workdir"', text)
+text = re.sub(r'(?m)^addr = "127\.0\.0\.1:\d+"$',
+              lambda m, it=iter([sql_port, api_port]): f'addr = "127.0.0.1:{next(it)}"',
+              text, count=2)
+text = re.sub(r'(?m)^filename = .*$', f'filename = "{run_dir}/tiproxy-ka.log"', text)
+# MatchAll: no port-range listeners, no port routing rule - one group
+# holds every backend of both clusters.
+text = re.sub(r'(?m)^port-range = .*\n', '', text)
+text = re.sub(r'(?m)^routing-rule = .*\n', '', text)
+# Initial pin: cluster-b and cluster-a's second backend are failed, so
+# the persistent session can only land on A0/ks-old. The failover
+# timeout is far beyond the phase duration - the guard, not a force
+# close, must be what the old session experiences.
+text = re.sub(r'(?m)^graceful-wait-before-shutdown = 0$',
+              'graceful-wait-before-shutdown = 0\n'
+              f'fail-backend-list = ["127.0.0.1:{tidb_b}", "127.0.0.1:{tidb_a1}"]\n'
+              'failover-timeout = 300',
+              text)
+open(path, 'w').write(text)
+PYKA
+if [[ $mode == rust ]]; then
+	printf '\n[rust-dataplane]\nenabled = true\ncontrol-socket = "%s"\n' \
+		"$KA_SOCKET" >>"$run_dir/tiproxy-ka.toml"
+	printf 'KA_SOCKET=%q\n' "$KA_SOCKET" >>"$run_dir/state.env"
+fi
+"$repo_root/bin/tiproxy" --config "$run_dir/tiproxy-ka.toml" \
+	>"$run_dir/tiproxy-ka.out" 2>&1 &
+KA_PID=$!
+printf 'KA_PID=%q\n' "$KA_PID" >>"$run_dir/state.env"
+ka_api_up=false
+for _ in {1..100}; do
+	if ! kill -0 "$KA_PID" 2>/dev/null; then
+		break
+	fi
+	if curl --noproxy '*' --fail --silent \
+		"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+		ka_api_up=true
+		break
+	fi
+	sleep 0.2
+done
+if [[ $ka_api_up != true ]]; then
+	echo "keyspace-guard instance API never came up" >&2
+	tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
+	exit 1
+fi
+if [[ $mode == rust ]]; then
+	"$rust_binary" --control-socket "$KA_SOCKET" --control-uid "$(id -u)" \
+		--health-port "$ka_health_port" \
+		>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
+	KA_RUST_PID=$!
+	printf 'KA_RUST_PID=%q\n' "$KA_RUST_PID" >>"$run_dir/state.env"
+	ka_ready=false
+	for _ in {1..150}; do
+		if ! kill -0 "$KA_RUST_PID" 2>/dev/null; then
+			break
+		fi
+		if curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_health_port/" -o /dev/null; then
+			ka_ready=true
+			break
+		fi
+		sleep 0.2
+	done
+	if [[ $ka_ready != true ]]; then
+		echo "keyspace-guard rust dataplane never became ready" >&2
+		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
+		exit 1
+	fi
+fi
+ka_log_lines() {
+	[[ -f "$run_dir/tiproxy-ka.log" ]] || { echo 0; return; }
+	wc -l <"$run_dir/tiproxy-ka.log" | tr -d ' '
+}
+ka_log_tail() {
+	[[ -f "$run_dir/tiproxy-ka.log" ]] || return 0
+	tail -n "+$(($1 + 1))" "$run_dir/tiproxy-ka.log"
+}
+# Redirection-capability gate: EVERY backend of BOTH clusters must
+# report its signing cert (per-backend structured evidence), and the
+# router's AND-aggregate must have flipped to true and never back -
+# otherwise rebalance never runs and the "pressure" would be fake.
+# The health check logs backends by their STATUS address.
+ka_status_addrs=("127.0.0.1:$((10080 + port_offset))" "127.0.0.1:$((10081 + port_offset))" "127.0.0.1:$((10080 + PORT_OFFSET_B))")
+ka_caps_ready=false
+for _ in {1..60}; do
+	caps=0
+	for addr in "${ka_status_addrs[@]}"; do
+		if grep -qs "\"backend has updated signing cert\".*\"$addr\".*\"support_redirection\":true" "$run_dir/tiproxy-ka.log"; then
+			caps=$((caps + 1))
+		fi
+	done
+	if ((caps == 3)) &&
+		grep -qs '"updated supporting redirection".*"support":true' "$run_dir/tiproxy-ka.log"; then
+		ka_caps_ready=true
+		break
+	fi
+	sleep 1
+done
+if [[ $ka_caps_ready != true ]]; then
+	echo "keyspace-guard phase: not all backends report redirection capability" >&2
+	grep -s "signing cert\|supporting redirection" "$run_dir/tiproxy-ka.log" | tail -6 >&2 || true
+	exit 1
+fi
+if grep -qs '"updated supporting redirection".*"support":false' "$run_dir/tiproxy-ka.log"; then
+	echo "keyspace-guard phase: router redirection support flipped off" >&2
+	exit 1
+fi
+for addr in "${ka_status_addrs[@]}"; do
+	grep -s "\"backend has updated signing cert\".*\"$addr\".*\"support_redirection\":true" "$run_dir/tiproxy-ka.log" |
+		head -1 | sed 's/^/redirection capability: /'
+done
+mysql_ka_root() {
+	mysql --batch --skip-column-names --connect-timeout=4 \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} -e "$1"
+}
+# Absorption of the initial pin: a new connection can only land A0.
+ka_pin_ready=false
+for _ in {1..30}; do
+	pin_port=$(mysql_ka_root 'SELECT @@port' 2>/dev/null || true)
+	if [[ $pin_port == "$TIDB_PORT_0" ]]; then
+		ka_pin_ready=true
+		break
+	fi
+	sleep 1
+done
+if [[ $ka_pin_ready != true ]]; then
+	echo "keyspace-guard phase: initial pin never absorbed (landed '$pin_port', want $TIDB_PORT_0)" >&2
+	exit 1
+fi
+# The persistent OLD session: a FIFO-driven mysql client that stays
+# open across the dynamic swap. FD 9 keeps the FIFO writable.
+KA_FIFO="$run_dir/ka-session.fifo"
+mkfifo "$KA_FIFO"
+# The guard's sample_conn_id is the PROXY-side connection id, not the
+# backend CONNECTION_ID(): capture it from the session's own fresh
+# "new connection" record (rust mode: the connection_ready record).
+ka_session_offset=$(ka_log_lines)
+if [[ $mode == rust ]]; then
+	ka_rust_session_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+fi
+printf 'KA_FIFO=%q\n' "$KA_FIFO" >>"$run_dir/state.env"
+# --unbuffered: the client's stdout goes to a file and would otherwise
+# sit in a block buffer - the marker poll needs per-query flushes.
+mysql --batch --skip-column-names --force --unbuffered \
+	-h 127.0.0.1 -P "$ka_sql_port" -u root \
+	"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+	<"$KA_FIFO" >"$run_dir/ka-session.out" 2>&1 &
+KA_SESSION_PID=$!
+printf 'KA_SESSION_PID=%q\n' "$KA_SESSION_PID" >>"$run_dir/state.env"
+exec 9>"$KA_FIFO"
+session_query() {
+	local marker=$1 sql=$2 line=
+	printf '%s\n' "$sql" >&9
+	for _ in {1..40}; do
+		line=$(grep -s "^$marker|" "$run_dir/ka-session.out" | tail -1 || true)
+		if [[ -n $line ]]; then
+			printf '%s\n' "$line"
+			return 0
+		fi
+		if ! kill -0 "$KA_SESSION_PID" 2>/dev/null; then
+			echo "persistent session died; tail:" >&2
+			tail -5 "$run_dir/ka-session.out" >&2 || true
+			return 1
+		fi
+		sleep 0.5
+	done
+	echo "persistent session never answered marker $marker" >&2
+	return 1
+}
+baseline=$(session_query BASE "SELECT CONCAT('BASE|', CONNECTION_ID(), '|', @@port);") || exit 1
+base_conn_id=$(cut -d'|' -f2 <<<"$baseline")
+base_port=$(cut -d'|' -f3 <<<"$baseline")
+if [[ $base_port != "$TIDB_PORT_0" ]]; then
+	echo "old session landed on '$base_port' (want $TIDB_PORT_0)" >&2
+	exit 1
+fi
+proxy_conn_id=
+for _ in {1..20}; do
+	if [[ $mode == rust ]]; then
+		proxy_conn_id=$(tail -n "+$((ka_rust_session_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | head -1 |
+			sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p')
+	else
+		proxy_conn_id=$(ka_log_tail "$ka_session_offset" |
+			grep '"new connection"' | head -1 |
+			sed -n 's/.*"connID":\([0-9]*\).*/\1/p')
+	fi
+	[[ -n $proxy_conn_id ]] && break
+	sleep 0.5
+done
+if [[ -z $proxy_conn_id ]]; then
+	echo "could not capture the old session's proxy-side connection id" >&2
+	exit 1
+fi
+echo "old session baseline: CONNECTION_ID=$base_conn_id proxy_conn_id=$proxy_conn_id backend=127.0.0.1:$base_port (ks-old)"
+# THE DYNAMIC SWAP: fail A0+A1 so only ks-new remains routeable. The
+# router now genuinely tries to push the old session to cluster-b.
+ka_guard_offset=$(ka_log_lines)
+cat > "$run_dir/ka-swap.toml" <<KATOML
+[proxy]
+fail-backend-list = ["127.0.0.1:$TIDB_PORT_0", "127.0.0.1:$TIDB_PORT_1"]
+KATOML
+curl --noproxy '*' --fail --silent --show-error -X PUT \
+	--data-binary "@$run_dir/ka-swap.toml" \
+	"http://127.0.0.1:$ka_api_port/api/admin/config/" -o /dev/null
+# Anti-false-pass: a NEW connection must land on ks-new, proving the
+# swap absorbed. Only then does the old session's stability MEAN
+# anything.
+ka_swap_ready=false
+for _ in {1..30}; do
+	new_port=$(mysql_ka_root 'SELECT @@port' 2>/dev/null || true)
+	if [[ $new_port == "$TIDB_PORT_B" ]]; then
+		ka_swap_ready=true
+		break
+	fi
+	sleep 1
+done
+if [[ $ka_swap_ready != true ]]; then
+	echo "keyspace-guard phase: swap never absorbed (new connection landed '$new_port', want $TIDB_PORT_B)" >&2
+	exit 1
+fi
+echo "swap absorbed: new connection -> 127.0.0.1:$new_port (ks-new)"
+# The guard hit: fresh structured evidence that the router ATTEMPTED
+# to migrate ks-old -> ks-new and refused - tied to the old
+# connection via sample_conn_id (it is the only connection there).
+ka_guard_hit=
+for _ in {1..40}; do
+	ka_guard_hit=$(ka_log_tail "$ka_guard_offset" |
+		grep -s '"skip cross-keyspace redirect".*"from_keyspace":"ks-old".*"to_keyspace":"ks-new"' |
+		head -1 || true)
+	if [[ -n $ka_guard_hit ]]; then
+		break
+	fi
+	sleep 0.5
+done
+if [[ -z $ka_guard_hit ]]; then
+	echo "keyspace-guard phase: no fresh guard hit after the swap" >&2
+	ka_log_tail "$ka_guard_offset" | tail -5 >&2 || true
+	exit 1
+fi
+if [[ $ka_guard_hit != *"\"sample_conn_id\":$proxy_conn_id"* ]]; then
+	echo "guard hit is not attributed to the old connection (proxy_conn_id=$proxy_conn_id): $ka_guard_hit" >&2
+	exit 1
+fi
+if [[ $ka_guard_hit != *'"blocked_conn_count":1'* ]]; then
+	echo "guard hit does not show exactly the one pinned connection: $ka_guard_hit" >&2
+	exit 1
+fi
+echo "guard hit: $ka_guard_hit"
+# No redirect was ever issued for the old connection.
+if ka_log_tail "$ka_guard_offset" | grep -qs "\"begin redirect connection\".*\"connID\":$proxy_conn_id"; then
+	echo "old connection received a redirect despite the guard" >&2
+	exit 1
+fi
+# Old-session oracles on the SAME session: identity and backend both
+# unchanged, still serving.
+check=$(session_query CHK "SELECT CONCAT('CHK|', CONNECTION_ID(), '|', @@port);") || exit 1
+chk_conn_id=$(cut -d'|' -f2 <<<"$check")
+chk_port=$(cut -d'|' -f3 <<<"$check")
+if [[ $chk_conn_id != "$base_conn_id" || $chk_port != "$base_port" ]]; then
+	echo "old session changed identity/backend: $check (baseline $baseline)" >&2
+	exit 1
+fi
+echo "old session intact after swap: CONNECTION_ID=$chk_conn_id backend=127.0.0.1:$chk_port (ks-old)"
+# Restore the initial pin well before failover-timeout, close the old
+# session cleanly, and tear the instance down.
+cat > "$run_dir/ka-swap.toml" <<KATOML
+[proxy]
+fail-backend-list = ["127.0.0.1:$TIDB_PORT_B", "127.0.0.1:$TIDB_PORT_1"]
+KATOML
+curl --noproxy '*' --fail --silent --show-error -X PUT \
+	--data-binary "@$run_dir/ka-swap.toml" \
+	"http://127.0.0.1:$ka_api_port/api/admin/config/" -o /dev/null
+exec 9>&-
+for _ in {1..40}; do
+	kill -0 "$KA_SESSION_PID" 2>/dev/null || break
+	sleep 0.5
+done
+kill "$KA_SESSION_PID" 2>/dev/null || true
+wait "$KA_SESSION_PID" 2>/dev/null || true
+if [[ $mode == rust ]]; then
+	kill -s INT "$KA_RUST_PID" 2>/dev/null || true
+	for _ in {1..100}; do
+		kill -0 "$KA_RUST_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	rm -f "$KA_SOCKET"
+fi
+kill -s INT "$KA_PID" 2>/dev/null || true
+for _ in {1..100}; do
+	kill -0 "$KA_PID" 2>/dev/null || break
+	sleep 0.1
+done
+kill "$KA_PID" 2>/dev/null || true
+rm -f "$KA_FIFO"
+printf 'PORTS=%q\n' "$PORTS $ka_sql_port $ka_api_port $ka_health_port" >>"$run_dir/state.env"
+echo "no-keyspace-migration: old session pinned to ks-old under real migration pressure; guard refused ks-new"
+
 # ---- Error parity (DPL-07 #41): the same semantic ERR in both modes.
 # The oracle freezes the ERR packet's SEMANTIC fields (code + SQLSTATE
 # + message), never handshake bytes. Free-text equality of operator
@@ -930,7 +1254,7 @@ fi
 echo "error parity: no healthy backend -> 1105/HY000 'No available TiDB instances'"
 
 if [[ $mode == rust ]]; then
-	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, error parity, and recovered from drop-next"
+	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, keyspace guard, error parity, and recovered from drop-next"
 else
-	echo "PASS: Go baseline $variant executed SELECT 1, namespace matrix, error parity, and recovered from drop-next"
+	echo "PASS: Go baseline $variant executed SELECT 1, namespace matrix, keyspace guard, error parity, and recovered from drop-next"
 fi

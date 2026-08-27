@@ -62,7 +62,21 @@ cluster-a and listener B only cluster-b, identically in both modes,
 with per-listener delta-scoped evidence (Go route `target`, Rust
 `connection_ready` backend_addr+cluster) and bidirectional
 cross-checks. Per-cluster NSServer parity is explicitly out of scope
-(the wire snapshot does not project name servers). Error parity (same
+(the wire snapshot does not project name servers). The
+no-keyspace-migration phase (DPL-07 acceptance) then proves that
+router-issued dynamic backend redirects are keyspace-stable: an
+isolated MatchAll instance puts both clusters (label-injected
+keyspaces ks-old/ks-new, with session-token signing certs on every
+backend so redirection support is real and evidenced per backend)
+into one group, pins a persistent FIFO-driven session onto ks-old via
+fail-backend-list, hot-swaps the list so the router genuinely tries
+to push it to ks-new, and asserts the bounded structured guard hit
+attributed to that exact connection, the swap's absorption through a
+NEW connection landing on ks-new, and the old session's unchanged
+CONNECTION_ID and backend. The claim is deliberately scoped: the
+guard constrains router-issued redirects at their shared issuance
+boundary; direct connection-manager Redirect calls are a separate
+seam. Error parity (same
 slice family) then
 proves the same semantic ERR in both modes: a bind conflict fails fast
 naming the port with no residue, and with ALL THREE TiDB servers (both clusters) killed and

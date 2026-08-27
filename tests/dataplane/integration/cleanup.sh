@@ -56,6 +56,19 @@ stop_owned_process() {
 cleanup_status=0
 # Error-parity conflict phase leftovers (present only when that phase
 # started and then failed before its own teardown).
+# Keyspace-guard phase leftovers (present only when that phase started
+# and then failed before its own teardown).
+if [[ -n ${KA_SOCKET:-} ]]; then
+	stop_owned_process "${KA_RUST_PID:-}" "$KA_SOCKET" || cleanup_status=1
+	rm -f "$KA_SOCKET"
+fi
+stop_owned_process "${KA_PID:-}" "$run_dir/tiproxy-ka.toml" || cleanup_status=1
+if [[ ${KA_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
+	kill "${KA_SESSION_PID}" 2>/dev/null || true
+fi
+if [[ -n ${KA_FIFO:-} ]]; then
+	rm -f "$KA_FIFO"
+fi
 stop_owned_process "${HOLDER_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
 stop_owned_process "${CONFLICT_PID:-}" "$run_dir/tiproxy-conflict.toml" || cleanup_status=1
 stop_owned_process "${RUST_CONFLICT_PID:-}" "$run_dir/absent.sock" || cleanup_status=1

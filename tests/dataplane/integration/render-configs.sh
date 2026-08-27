@@ -58,6 +58,17 @@ case "$variant" in
 		;;
 esac
 
+# Session-token signing material is generated for EVERY variant: the
+# redirect machinery (and the keyspace-guard phase) requires all
+# backends to expose a signing cert, or support_redirection stays
+# false and rebalance never runs.
+mkdir -p "$output_dir/certs"
+session_token_cert="$output_dir/certs/session-token-cert.pem"
+session_token_key="$output_dir/certs/session-token-key.pem"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+	-subj "/CN=tiproxy-dataplane-session-token" \
+	-keyout "$session_token_key" -out "$session_token_cert" >/dev/null 2>&1
+
 ca_cert=
 server_cert=
 server_key=
@@ -123,6 +134,8 @@ render() {
 		-e "s|@REQUIRE_BACKEND_TLS@|$require_backend_tls|g" \
 		-e "s|@SQL_TLS_SKIP_CA@|$sql_tls_skip_ca|g" \
 		-e "s|@WORK_DIR@|$(sed_escape "$work_dir")|g" \
+		-e "s|@SESSION_TOKEN_CERT@|$(sed_escape "$session_token_cert")|g" \
+		-e "s|@SESSION_TOKEN_KEY@|$(sed_escape "$session_token_key")|g" \
 		-e "s|@PD_PORT@|$pd_port|g" \
 		-e "s|@PD_PORT_B@|$pd_port_b|g" \
 		-e "s|@TIPROXY_PORT@|$tiproxy_port|g" \
@@ -138,9 +151,9 @@ render "$script_dir/config/tiproxy.toml.tpl" "$output_dir/tiproxy.toml"
 # instances carry listener A's port label, cluster B's carry listener
 # B's. Each playground has its own --db.config, so the label is
 # per-cluster by construction.
-printf '\n[labels]\ntiproxy-port = "%s"\n' "$tiproxy_port" >>"$output_dir/tidb.toml"
+printf '\n[labels]\ntiproxy-port = "%s"\nkeyspace = "ks-old"\n' "$tiproxy_port" >>"$output_dir/tidb.toml"
 render "$script_dir/config/tidb.toml.tpl" "$output_dir/tidb-b.toml"
-printf '\n[labels]\ntiproxy-port = "%s"\n' "$tiproxy_port_b" >>"$output_dir/tidb-b.toml"
+printf '\n[labels]\ntiproxy-port = "%s"\nkeyspace = "ks-new"\n' "$tiproxy_port_b" >>"$output_dir/tidb-b.toml"
 
 {
 	printf 'VARIANT=%q\n' "$variant"
