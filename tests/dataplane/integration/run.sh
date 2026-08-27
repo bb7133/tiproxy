@@ -48,6 +48,14 @@ case "$mode" in
 esac
 
 if [[ $variant == all ]]; then
+	# The FULL range is validated up front: six variants at stride 200
+	# (each run consumes two 100-port windows), so the base must leave
+	# room for 18900 + 5*200 = 19900. Failing late on index 5 after
+	# five expensive successful runs is exactly what this prevents.
+	if [[ ! $port_offset =~ ^[0-9]+$ ]] || ((port_offset < 1000 || port_offset > 18900)); then
+		echo "port offset for --variant all must be an integer from 1000 through 18900" >&2
+		exit 2
+	fi
 	variants=(plain tls proxy compress-zlib compress-zstd tls-proxy-zstd)
 	for index in "${!variants[@]}"; do
 		"$0" --mode "$mode" --variant "${variants[$index]}" \

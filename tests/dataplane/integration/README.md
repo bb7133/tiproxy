@@ -45,8 +45,9 @@ only after the first applied generation, and then runs the same
 `SELECT 1`, drop-next recovery, diagnostics, and port-release checks as
 the Go baseline. Both modes additionally prove the namespace/topology
 matrix (DPL-07 #41): two admin-API-seeded namespaces map alice and bob
-over the PD-backed backend set (`proxy.pd-addrs` always registers an
-implicit backend cluster, so `backend.instances` cannot pin a backend),
+over the PD-backed backend set (with any explicit backend cluster
+configured — as here — the `FallbackFetcher` serves the merged PD
+topology and `backend.instances` cannot pin a backend),
 `SELECT @@port` proves each user lands on a real backend, and
 delta-scoped per-connection log evidence attributes each row's single
 connection to exactly its expected namespace — ns-alpha, ns-beta, and
@@ -99,11 +100,9 @@ make dataplane-integration-self-test
 relevant pull requests and pushes. Its manual dispatch is the CI entrypoint for
 a real topology: it installs the exact TiUP release from `versions.env` only
 after verifying the published archive SHA-256, runs the selected mode/variant,
-and uploads the redacted artifact directory even on failure. Rust dispatches
-are expected to fail at capability preflight until the dependencies above land;
-their diagnostic artifact makes that boundary observable without claiming a
-successful Rust query.
+and uploads the redacted artifact directory even on failure.
 
 Override `DATAPLANE_PORT_OFFSET` for a reserved CI port range. The default is a
-process-derived offset between 10000 and 11900; the `all` run reserves six
-non-overlapping 100-port ranges.
+process-derived offset between 10000 and 11900; each run consumes two 100-port
+windows (the second backend cluster lives at +100), and the `all` run reserves
+six non-overlapping 200-port allocations — twelve 100-port windows in total.
