@@ -27,9 +27,10 @@ use std::sync::{Arc, OnceLock};
 use control_proto::v1::{ConnectionIdentity, ControlEnvelope};
 use tokio::sync::{mpsc, watch};
 
-use crate::control_dispatch::{ControlDispatchHandle, ExpectResponseError, ResponseKind};
+use crate::control_dispatch::{
+    ControlDispatchHandle, ExpectResponseError, ResponseKind, SessionDirective,
+};
 use crate::server::{AcceptedConnection, ConnectionFuture, ConnectionHandler};
-use crate::session::SessionControl;
 
 const SESSION_CONTROL_CAPACITY: usize = 8;
 const SESSION_RESPONSE_CAPACITY: usize = 1;
@@ -38,7 +39,7 @@ const SESSION_RESPONSE_CAPACITY: usize = 1;
 pub struct SessionControlBinding {
     dispatch: ControlDispatchHandle,
     connection_id: u64,
-    control: mpsc::Receiver<SessionControl>,
+    control: mpsc::Receiver<SessionDirective>,
     responses: mpsc::Receiver<ControlEnvelope>,
 }
 
@@ -109,15 +110,138 @@ impl SessionControlBinding {
             .await
     }
 
-    /// Receives the next redirect/close command for the single-owner session
-    /// loop. `None` means the dispatcher detached.
-    pub async fn recv_control(&mut self) -> Option<SessionControl> {
+    /// Receives the next control directive for the single-owner session
+    /// loop: the signal plus — for gate-admitted per-session commands —
+    /// the exact [`CommandToken`](crate::control_dispatch::CommandToken)
+    /// whose id the completion notice must return. `None` means the
+    /// dispatcher detached (control-v1 last-good: never a teardown
+    /// reason by itself).
+    pub async fn recv_control(&mut self) -> Option<SessionDirective> {
         self.control.recv().await
     }
 
     /// Receives the exactly correlated handshake/route response.
     pub async fn recv_response(&mut self) -> Option<ControlEnvelope> {
         self.responses.recv().await
+    }
+
+    /// Splits the binding into its three independent halves so the
+    /// session owner can consume control directives, route/handshake
+    /// responses, and the typed dispatch surface from different tasks
+    /// without a lock: the directive stream (with its command tokens),
+    /// the correlated-response stream, and the commander (dispatch
+    /// operations bound to this connection id).
+    #[must_use]
+    pub fn split(self) -> (DirectiveStream, ResponseStream, SessionCommander) {
+        (
+            DirectiveStream {
+                control: self.control,
+            },
+            ResponseStream {
+                responses: self.responses,
+            },
+            SessionCommander {
+                dispatch: self.dispatch,
+                connection_id: self.connection_id,
+            },
+        )
+    }
+}
+
+/// The control-directive half of a split [`SessionControlBinding`].
+pub struct DirectiveStream {
+    control: mpsc::Receiver<SessionDirective>,
+}
+
+impl DirectiveStream {
+    /// Receives the next control directive; `None` means the dispatcher
+    /// detached (control-v1 last-good: never a teardown reason).
+    pub async fn recv(&mut self) -> Option<SessionDirective> {
+        self.control.recv().await
+    }
+}
+
+/// The correlated-response half of a split [`SessionControlBinding`].
+pub struct ResponseStream {
+    responses: mpsc::Receiver<ControlEnvelope>,
+}
+
+impl ResponseStream {
+    /// Receives the next exactly correlated response envelope.
+    pub async fn recv(&mut self) -> Option<ControlEnvelope> {
+        self.responses.recv().await
+    }
+}
+
+/// The typed dispatch surface of a split [`SessionControlBinding`],
+/// bound to one connection id.
+#[derive(Clone)]
+pub struct SessionCommander {
+    dispatch: ControlDispatchHandle,
+    connection_id: u64,
+}
+
+impl SessionCommander {
+    /// The bound connection id.
+    #[must_use]
+    pub const fn connection_id(&self) -> u64 {
+        self.connection_id
+    }
+
+    /// Arms the one expected Go response; send the initiating request
+    /// only after `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the dispatcher's fail-closed verdict.
+    pub async fn expect_response(
+        &self,
+        request_id: u64,
+        kind: ResponseKind,
+    ) -> Result<(), ExpectResponseError> {
+        self.dispatch
+            .expect_response(self.connection_id, request_id, kind)
+            .await
+    }
+
+    /// Records the currently connected backend.
+    pub async fn set_backend(&self, backend_id: impl Into<String>) -> bool {
+        self.dispatch
+            .set_backend(self.connection_id, backend_id.into())
+            .await
+    }
+
+    /// Reports a finished redirect under its exact admitted id.
+    pub async fn redirect_finished(
+        &self,
+        redirect_id: String,
+        succeeded: bool,
+        backend_id: String,
+        code: control_proto::v1::ErrorCode,
+    ) -> bool {
+        self.dispatch
+            .redirect_finished(self.connection_id, redirect_id, succeeded, backend_id, code)
+            .await
+    }
+
+    /// Reports a finished accepted close under its exact admitted id.
+    pub async fn close_finished(&self, close_id: String) -> bool {
+        self.dispatch
+            .close_finished(self.connection_id, close_id)
+            .await
+    }
+
+    /// Reports the session's termination with its failure attribution
+    /// and final traffic totals.
+    pub async fn session_closed(
+        &self,
+        forced: bool,
+        error_source: control_proto::v1::ErrorSource,
+        traffic: crate::route_control::TrafficTotals,
+    ) -> bool {
+        self.dispatch
+            .session_closed(self.connection_id, forced, error_source, traffic)
+            .await
     }
 }
 

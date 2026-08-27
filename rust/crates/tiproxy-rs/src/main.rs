@@ -24,12 +24,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_proto::CONTROL_PROTOCOL_V1;
 use control_proto::control_transport::ClientConfig;
+use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
-use dataplane::control_runtime::{ControlRuntimeConfig, spawn_control_runtime};
+use dataplane::control_runtime::spawn_control_runtime_with_client;
+use dataplane::session::SessionLoopConfig;
+use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, DataplaneSnapshotConsumer, DispatchConnectionHandler, SystemMemoryProbe,
 };
+use tokio::sync::watch;
 
 const VERSION: &str = env!("TIPROXY_BUILD_VERSION");
 const COMMIT: &str = env!("TIPROXY_BUILD_COMMIT");
@@ -39,11 +43,17 @@ const CONTROL_SOCKET_ENV: &str = "TIPROXY_CONTROL_SOCKET";
 const CONTROL_UID_ENV: &str = "TIPROXY_CONTROL_UID";
 const TLS_ROOTS_ENV: &str = "TIPROXY_TLS_ROOTS";
 
+/// Upper bound for `--drain-grace-seconds` (30 days, the drain
+/// subsystem's shared deadline cap): far above any real grace and small
+/// enough that deadline arithmetic on `Instant` can never overflow.
+const MAX_DRAIN_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     control_socket: PathBuf,
     control_uid: u32,
     tls_roots: Vec<PathBuf>,
+    drain_grace: Duration,
 }
 
 enum Command {
@@ -107,31 +117,58 @@ async fn run(options: Options) -> Result<(), String> {
     let store = SnapshotStore::new(options.tls_roots)
         .map_err(|error| format!("create snapshot store: {error}"))?;
 
-    // DPL-03 installs the typed live-session control seam. DPL-04 replaces
-    // this parked owner with the concrete SessionLoop/effect composition;
-    // until then admitted sockets stay owned and cancellable instead of
-    // running an incomplete forwarding path.
-    let parked: Arc<dyn BoundSessionHandler> = Arc::new(|_connection, _binding| async move {
-        std::future::pending::<()>().await;
-    });
-    let (connection_handler, installer) = DispatchConnectionHandler::new("default", parked);
+    // DPL-04: the real session owner replaces DPL-03's parked handler.
+    // Sessions share the control client with the runtime; the drain and
+    // session-shutdown watches drive the coordinated local shutdown.
+    let shared_client = Arc::new(ControlClient::new(client).map_err(|error| error.to_string())?);
+    let (drain_tx, drain_rx) = watch::channel(false);
+    let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+    let loop_config = session_loop_config(options.drain_grace);
+    let owner: Arc<dyn BoundSessionHandler> = Arc::new(EngineSessionOwner::new(
+        Arc::clone(&shared_client),
+        "default",
+        session_shutdown_rx,
+        drain_rx,
+        loop_config,
+    ));
+    let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
     let (consumer, serving) = DataplaneSnapshotConsumer::new(
         Arc::new(SystemMemoryProbe::new()),
         Arc::new(connection_handler),
     );
-    let runtime = spawn_control_runtime(
-        ControlRuntimeConfig {
-            client,
-            tick_interval: Duration::from_millis(100),
-            snapshot_queue: 8,
-        },
+    // Forced shutdown lets each session owner finish its bounded
+    // terminal work (close notice + engine join) before the abort
+    // backstop fires.
+    let consumer =
+        consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
+    let runtime = spawn_control_runtime_with_client(
+        Arc::clone(&shared_client),
+        Duration::from_millis(100),
+        8,
         store,
         consumer,
-    )
-    .map_err(|error| error.to_string())?;
+    );
     if !installer.install(runtime.handle()) {
         runtime.shutdown();
         return Err("install control dispatch handle exactly once".to_owned());
+    }
+
+    // Coordinated shutdown on SIGTERM/SIGINT:
+    // stop-accept → graceful drain (per-session force at the loop's
+    // drain deadline) → absolute grace deadline force → join everything.
+    {
+        let serving = serving.clone();
+        let runtime_client = Arc::clone(&shared_client);
+        let grace = options.drain_grace;
+        tokio::spawn(async move {
+            wait_for_termination_signal().await;
+            serving.stop_accepting().await;
+            drain_tx.send_replace(true);
+            tokio::time::sleep(grace).await;
+            session_shutdown_tx.send_replace(true);
+            let _ = serving.shutdown().await;
+            runtime_client.shutdown();
+        });
     }
 
     let control_result = runtime.join().await;
@@ -140,6 +177,32 @@ async fn run(options: Options) -> Result<(), String> {
         (Err(error), _) => Err(error.to_string()),
         (Ok(()), Err(error)) => Err(format!("shut down SQL listeners: {error}")),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// ONE grace lineage: the CLI's validated drain grace IS the
+/// per-session FSM drain deadline, so the coordinator's absolute grace
+/// and the loop's own force timer never diverge.
+fn session_loop_config(drain_grace: Duration) -> SessionLoopConfig {
+    SessionLoopConfig {
+        drain_deadline: drain_grace,
+        ..SessionLoopConfig::default()
+    }
+}
+
+/// Resolves on SIGTERM or SIGINT.
+async fn wait_for_termination_signal() {
+    let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        return std::future::pending::<()>().await;
+    };
+    let Ok(mut sigint) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    else {
+        return std::future::pending::<()>().await;
+    };
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
     }
 }
 
@@ -153,6 +216,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let mut tls_roots: Vec<PathBuf> = env::var_os(TLS_ROOTS_ENV)
         .map(|value| env::split_paths(&value).collect())
         .unwrap_or_default();
+    let mut drain_grace = Duration::from_secs(30);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--version" | "-V" => return Ok(Command::Version),
@@ -175,6 +239,21 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                     .next()
                     .ok_or_else(|| "--tls-root requires a path".to_owned())?,
             )),
+            "--drain-grace-seconds" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--drain-grace-seconds requires a number".to_owned())?;
+                let seconds: u64 = value
+                    .parse()
+                    .map_err(|_| format!("drain grace must be a u64, got {value:?}"))?;
+                if seconds > MAX_DRAIN_GRACE_SECONDS {
+                    return Err(format!(
+                        "--drain-grace-seconds must be at most {MAX_DRAIN_GRACE_SECONDS} \
+                         (30 days), got {seconds}"
+                    ));
+                }
+                drain_grace = Duration::from_secs(seconds);
+            }
             _ => return Err(format!("unknown argument {argument:?}")),
         }
     }
@@ -191,6 +270,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         control_uid: uid
             .ok_or_else(|| format!("--control-uid or {CONTROL_UID_ENV} is required"))?,
         tls_roots,
+        drain_grace,
     }))
 }
 
@@ -201,7 +281,8 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: tiproxy-rs --control-socket <absolute-path> --control-uid <uid> [--tls-root <absolute-path>]...\n\
+    "Usage: tiproxy-rs --control-socket <absolute-path> --control-uid <uid> \
+     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>]\n\
      Environment: TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 
@@ -213,7 +294,10 @@ fn version_output() -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Command, Options, parse_options, version_output};
+    use super::{
+        Command, MAX_DRAIN_GRACE_SECONDS, Options, parse_options, session_loop_config,
+        version_output,
+    };
 
     #[test]
     fn version_output_labels_all_build_metadata() {
@@ -242,8 +326,45 @@ mod tests {
                 control_socket: PathBuf::from("/tmp/control.sock"),
                 control_uid: 42,
                 tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
+                drain_grace: std::time::Duration::from_secs(30),
             }
         );
+    }
+
+    #[test]
+    fn drain_grace_is_the_session_drain_deadline() {
+        let command = parse_options([
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--drain-grace-seconds".to_owned(),
+            "45".to_owned(),
+        ]);
+        let Ok(Command::Run(options)) = command else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(options.drain_grace, std::time::Duration::from_secs(45));
+        assert_eq!(
+            session_loop_config(options.drain_grace).drain_deadline,
+            std::time::Duration::from_secs(45),
+            "one lineage: the CLI grace is the per-session FSM deadline"
+        );
+    }
+
+    #[test]
+    fn rejects_over_bound_drain_grace() {
+        let Err(error) = parse_options([
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--drain-grace-seconds".to_owned(),
+            (MAX_DRAIN_GRACE_SECONDS + 1).to_string(),
+        ]) else {
+            unreachable!("an over-bound grace must be rejected")
+        };
+        assert!(error.contains("at most"), "the bound is named: {error}");
     }
 
     #[test]

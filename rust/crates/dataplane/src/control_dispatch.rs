@@ -77,6 +77,7 @@ use crate::control_commands::{
     CloseAdmission, CommandGate, DrainAdmission, DrainPhase, MeteringError, MeteringLedger,
     RedirectAdmission,
 };
+use crate::route_control::TrafficTotals;
 use crate::session::SessionControl;
 
 /// Observable dispatch counters, shared between the loop's handler and
@@ -146,11 +147,59 @@ pub enum ResponseKind {
     HandshakeDecision,
 }
 
+/// The exact gate-admitted command identity a control directive
+/// carries. The token enters the session channel **together with** the
+/// command — before the session can observe it — so the terminal the
+/// session later reports is bound to precisely the effect it executed:
+/// there is no shared slot to write after the send and no state to
+/// infer from, and an instantly completing session cannot outrun the
+/// binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandToken {
+    /// Which command family admitted this id.
+    pub kind: CommandKind,
+    /// The gate-admitted exact id (redirect id or close id).
+    pub id: Arc<str>,
+}
+
+/// The command family a [`CommandToken`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    /// A per-session redirect (`redirect_id`).
+    Redirect,
+    /// A per-session close (`close_id`).
+    Close,
+}
+
+/// One unit on a session's control channel: the control signal plus —
+/// for gate-admitted per-session commands — the token whose id the
+/// completion notice must return. Drain-driven closes carry no token:
+/// their terminal is the drain's own `DrainResult`, produced through
+/// the close accounting path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDirective {
+    /// The control signal for the session loop.
+    pub control: SessionControl,
+    /// The admitted command identity, when one exists.
+    pub command: Option<CommandToken>,
+}
+
+impl SessionDirective {
+    /// A drain- or shutdown-driven directive with no per-command id.
+    #[must_use]
+    pub const fn bare(control: SessionControl) -> Self {
+        Self {
+            control,
+            command: None,
+        }
+    }
+}
+
 /// One registered live session: its control channel, its correlated
 /// Go-response channel, the currently armed response expectation, and
 /// the drain-scoping metadata.
 struct SessionEntry {
-    control: mpsc::Sender<SessionControl>,
+    control: mpsc::Sender<SessionDirective>,
     responses: Option<mpsc::Sender<ControlEnvelope>>,
     /// Fail-closed correlation: only a response matching the armed
     /// `(initiating request id, body kind)` is delivered; everything
@@ -298,7 +347,7 @@ impl ControlCommandHandler {
         namespace: &str,
         snapshot_generation: u64,
         listener_name: &str,
-        control: mpsc::Sender<SessionControl>,
+        control: mpsc::Sender<SessionDirective>,
         responses: Option<mpsc::Sender<ControlEnvelope>>,
     ) {
         let connection_id = identity.connection_id;
@@ -420,6 +469,7 @@ impl ControlCommandHandler {
         connection_id: u64,
         forced: bool,
         error_source: ErrorSource,
+        traffic: TrafficTotals,
     ) -> Vec<ControlEnvelope> {
         let identity = self.gate.connection_identity(connection_id);
         let generation = self.gate.connection_generation(connection_id).unwrap_or(0);
@@ -446,6 +496,7 @@ impl ControlCommandHandler {
                 &backend_id,
                 generation,
                 error_source,
+                traffic,
             ));
         }
         if let Some(terminal) = drain_terminal {
@@ -667,7 +718,14 @@ impl ControlCommandHandler {
                     (command.connection_id, command.redirect_id.clone()),
                     request_id,
                 );
-                match self.forward(command.connection_id, SessionControl::Redirect) {
+                let directive = SessionDirective {
+                    control: SessionControl::Redirect,
+                    command: Some(CommandToken {
+                        kind: CommandKind::Redirect,
+                        id: Arc::from(command.redirect_id.as_str()),
+                    }),
+                };
+                match self.forward(command.connection_id, directive) {
                     ForwardOutcome::Sent => Vec::new(),
                     // The session vanished (or its channel is jammed)
                     // between registration and dispatch: retire the
@@ -753,12 +811,18 @@ impl ControlCommandHandler {
                     (command.connection_id, command.close_id.clone()),
                     request_id,
                 );
-                let control = if force {
-                    SessionControl::CloseImmediate
-                } else {
-                    SessionControl::GracefulClose
+                let directive = SessionDirective {
+                    control: if force {
+                        SessionControl::CloseImmediate
+                    } else {
+                        SessionControl::GracefulClose
+                    },
+                    command: Some(CommandToken {
+                        kind: CommandKind::Close,
+                        id: Arc::from(command.close_id.as_str()),
+                    }),
                 };
-                match self.forward(command.connection_id, control) {
+                match self.forward(command.connection_id, directive) {
                     ForwardOutcome::Sent => Vec::new(),
                     // Retire the accepted close with its terminal
                     // immediately so the gate never sticks in Closing.
@@ -869,7 +933,8 @@ impl ControlCommandHandler {
                     outbound.extend(self.force_close_remaining());
                 } else {
                     for id in &matched {
-                        let _ = self.forward(*id, SessionControl::GracefulClose);
+                        let _ = self
+                            .forward(*id, SessionDirective::bare(SessionControl::GracefulClose));
                     }
                 }
                 // A zero-match admission completes on arrival: its very
@@ -935,7 +1000,7 @@ impl ControlCommandHandler {
             if self.force_notified.contains(&id) {
                 continue;
             }
-            match self.forward(id, SessionControl::CloseImmediate) {
+            match self.forward(id, SessionDirective::bare(SessionControl::CloseImmediate)) {
                 ForwardOutcome::Sent => {
                     self.force_notified.insert(id);
                 }
@@ -943,7 +1008,12 @@ impl ControlCommandHandler {
                     // Real backpressure: retry on the next tick.
                 }
                 ForwardOutcome::Gone => {
-                    outbound.extend(self.session_closed(id, true, ErrorSource::Proxy));
+                    outbound.extend(self.session_closed(
+                        id,
+                        true,
+                        ErrorSource::Proxy,
+                        TrafficTotals::default(),
+                    ));
                 }
             }
         }
@@ -1059,6 +1129,7 @@ impl ControlCommandHandler {
                     &remote.backend_id,
                     remote.generation,
                     ErrorSource::Proxy,
+                    TrafficTotals::default(),
                 );
                 event.required_capabilities =
                     vec![ControlCapability::ReconcileSessionRehydration as u64];
@@ -1086,9 +1157,9 @@ impl ControlCommandHandler {
         self.metering.seal()
     }
 
-    fn forward(&mut self, connection_id: u64, control: SessionControl) -> ForwardOutcome {
+    fn forward(&mut self, connection_id: u64, directive: SessionDirective) -> ForwardOutcome {
         match self.sessions.get(&connection_id) {
-            Some(entry) => match entry.control.try_send(control) {
+            Some(entry) => match entry.control.try_send(directive) {
                 Ok(()) => ForwardOutcome::Sent,
                 Err(mpsc::error::TrySendError::Full(_)) => ForwardOutcome::Full,
                 Err(mpsc::error::TrySendError::Closed(_)) => ForwardOutcome::Gone,
@@ -1142,6 +1213,7 @@ fn closed_event_envelope(
     backend_id: &str,
     generation: u64,
     error_source: ErrorSource,
+    traffic: TrafficTotals,
 ) -> ControlEnvelope {
     ControlEnvelope {
         protocol_version: 0,
@@ -1160,10 +1232,10 @@ fn closed_event_envelope(
             backend_id: backend_id.to_owned(),
             namespace: String::new(),
             error_source: error_source.into(),
-            client_in_bytes: 0,
-            client_out_bytes: 0,
-            backend_in_bytes: 0,
-            backend_out_bytes: 0,
+            client_in_bytes: traffic.client_in,
+            client_out_bytes: traffic.client_out,
+            backend_in_bytes: traffic.backend_in,
+            backend_out_bytes: traffic.backend_out,
         })),
     }
 }
@@ -1195,7 +1267,7 @@ pub enum DispatchNotice {
         /// Configured listener name (drain scoping).
         listener_name: String,
         /// The session loop's control channel.
-        control: mpsc::Sender<SessionControl>,
+        control: mpsc::Sender<SessionDirective>,
         /// Correlated Go answers (route assignments, handshake
         /// decisions/results) for this session, when it routes.
         responses: Option<mpsc::Sender<ControlEnvelope>>,
@@ -1241,6 +1313,8 @@ pub enum DispatchNotice {
         forced: bool,
         /// Failure attribution for the CLOSED event.
         error_source: ErrorSource,
+        /// Final byte totals for the CLOSED lifecycle event.
+        traffic: TrafficTotals,
     },
     /// A session's redirect finished.
     RedirectFinished {
@@ -1351,7 +1425,7 @@ impl ControlDispatchHandle {
         namespace: String,
         snapshot_generation: u64,
         listener_name: String,
-        control: mpsc::Sender<SessionControl>,
+        control: mpsc::Sender<SessionDirective>,
         responses: Option<mpsc::Sender<ControlEnvelope>>,
     ) -> bool {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
@@ -1460,11 +1534,13 @@ impl ControlDispatchHandle {
         connection_id: u64,
         forced: bool,
         error_source: ErrorSource,
+        traffic: TrafficTotals,
     ) -> bool {
         self.notify(DispatchNotice::SessionClosed {
             connection_id,
             forced,
             error_source,
+            traffic,
         })
         .await
     }
@@ -1973,8 +2049,9 @@ async fn apply_notice<S: DispatchSender>(
             connection_id,
             forced,
             error_source,
+            traffic,
         } => {
-            for envelope in handler.session_closed(connection_id, forced, error_source) {
+            for envelope in handler.session_closed(connection_id, forced, error_source, traffic) {
                 dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
             }
         }
@@ -2108,18 +2185,37 @@ pub fn spawn_control_dispatch_with_handler(
     InboundForwarder,
     tokio::task::JoinHandle<Result<(), DispatchFatal>>,
 ) {
+    let state = client.subscribe_state();
+    spawn_control_dispatch_parts(handler, client, state, snapshot_tx, tick_interval)
+}
+
+/// The fully generic assembly seam: any [`DispatchSender`] plus an
+/// externally owned connection-state watch. Compositions and
+/// regressions that need an observable sender (or a driven state
+/// watch) build here; the production paths delegate to it.
+#[must_use]
+pub fn spawn_control_dispatch_parts<S: DispatchSender + 'static>(
+    handler: ControlCommandHandler,
+    sender: Arc<S>,
+    state: watch::Receiver<ConnectionState>,
+    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    tick_interval: Duration,
+) -> (
+    ControlDispatchHandle,
+    InboundForwarder,
+    tokio::task::JoinHandle<Result<(), DispatchFatal>>,
+) {
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let (notice_tx, notice_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
-    let state = client.subscribe_state();
     let forwarder = InboundForwarder {
         inbound: inbound_tx,
-        state: client.subscribe_state(),
+        state: state.clone(),
         retained: Arc::new(StdMutex::new(None)),
     };
     let handler_stats = handler.stats();
     let task = tokio::spawn(run_control_dispatch(
         handler,
-        client,
+        sender,
         state,
         inbound_rx,
         notice_rx,

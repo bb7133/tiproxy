@@ -18,6 +18,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -68,6 +69,15 @@ func (sender *recordingSender) sent() []*controlpb.ControlEnvelope {
 	defer sender.mu.Unlock()
 	return append([]*controlpb.ControlEnvelope(nil), sender.envelopes...)
 }
+
+// epochedSender overrides the fixed epoch so tests can model transport
+// reconnects (request ids restart every epoch).
+type epochedSender struct {
+	recordingSender
+	epoch uint64
+}
+
+func (sender *epochedSender) Epoch() uint64 { return sender.epoch }
 
 func drainResult(id string, active, graceful, forced uint64, complete bool) *controlpb.DrainResult {
 	return &controlpb.DrainResult{
@@ -360,4 +370,225 @@ func TestForeignDrainClearsOnTerminalAndSignalsRetry(t *testing.T) {
 	require.NotNil(t, resolved, "the retry signal is armed")
 	require.Equal(t, "old@deadbeef", resolved.GetDrainId())
 	require.Nil(t, issuer.ForeignDrainResolved(), "the retry signal consumes once")
+}
+
+func TestProtocolFailureReleasesDrainSlot(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+	sender := &recordingSender{}
+	requestID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, requestID, 7,
+		&controlpb.DrainCommand{DrainId: "d-bad"}))
+
+	// The rejected issuance holds the single-flight slot until resolved.
+	blockedID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.ErrorIs(t, issuer.StartDrain(context.Background(), sender, blockedID, 7,
+		&controlpb.DrainCommand{DrainId: "d-next"}), ErrDrainInProgress)
+
+	// An uncorrelated error stays with the generic transport handling.
+	require.False(t, issuer.HandleProtocolFailure(1, 99_999, &controlpb.ProtocolError{
+		Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
+	}))
+
+	// The correlated ProtocolError (via offending_request_id) completes
+	// the issuance as an observable failure and releases the slot.
+	require.True(t, issuer.HandleProtocolFailure(1, 0, &controlpb.ProtocolError{
+		Code:               controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
+		OffendingRequestId: requestID,
+		Detail:             "drain minted before applied snapshot",
+	}))
+	result, completed := issuer.Progress("d-bad")
+	require.True(t, completed)
+	require.Equal(t, controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION, result.GetCode())
+
+	// The next drain id proceeds on a fresh issuance.
+	nextID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, nextID, 7,
+		&controlpb.DrainCommand{DrainId: "d-next"}))
+}
+
+func TestLateEpochErrorNeverResolvesNewEpochIssuance(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+
+	// Epoch 1: drain d-one on request 1 runs to its ordinary terminal.
+	epochOne := &epochedSender{epoch: 1}
+	firstID, err := epochOne.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), epochOne, firstID, 7,
+		&controlpb.DrainCommand{DrainId: "d-one"}))
+	sent := epochOne.sent()
+	require.Len(t, sent, 1)
+	wireID := sent[0].GetDrainCommand().GetDrainId()
+	require.NoError(t, issuer.HandleDrainResult(drainResult(wireID, 1, 1, 0, true)))
+
+	// Epoch 2 (reconnect): request ids restart, so drain d-two also
+	// sends on request 1.
+	epochTwo := &epochedSender{epoch: 2}
+	secondID, err := epochTwo.AllocateRequestID()
+	require.NoError(t, err)
+	require.Equal(t, firstID, secondID, "the collision under test")
+	require.NoError(t, issuer.StartDrain(context.Background(), epochTwo, secondID, 8,
+		&controlpb.DrainCommand{DrainId: "d-two"}))
+
+	// A late epoch-1 error for request 1 must not touch d-two.
+	require.False(t, issuer.HandleProtocolFailure(1, firstID, &controlpb.ProtocolError{
+		Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
+	}))
+	_, completed := issuer.Progress("d-two")
+	require.False(t, completed, "the new epoch's issuance stays live")
+
+	// The epoch-2 correlated error resolves d-two observably.
+	require.True(t, issuer.HandleProtocolFailure(2, secondID, &controlpb.ProtocolError{
+		Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION,
+	}))
+	result, completed := issuer.Progress("d-two")
+	require.True(t, completed)
+	require.Equal(t, controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION, result.GetCode())
+}
+
+func TestStartDrainRejectsInvalidBudgetsBeforeReservation(t *testing.T) {
+	bridge := &Bridge{}
+	for name, request := range map[string]DrainRequest{
+		"negative graceful": {DrainID: "d", GracefulWait: -time.Second},
+		"negative force":    {DrainID: "d", ForceTimeout: -time.Second},
+		"graceful over cap": {DrainID: "d", GracefulWait: MaxDrainDeadlineAhead + time.Second},
+		"force over cap":    {DrainID: "d", ForceTimeout: MaxDrainDeadlineAhead + time.Second},
+		"sum over cap": {
+			DrainID:      "d",
+			GracefulWait: MaxDrainDeadlineAhead - time.Second,
+			ForceTimeout: 2 * time.Second,
+		},
+	} {
+		require.ErrorIs(t, bridge.StartDrain(context.Background(), request),
+			ErrInvalidDrainBudget, name)
+	}
+}
+
+func TestStartDrainRejectsBeforeFirstAppliedGeneration(t *testing.T) {
+	bridge := &Bridge{publisher: &SnapshotPublisher{}}
+	require.ErrorIs(t,
+		bridge.StartDrain(context.Background(), DrainRequest{DrainID: "d-early"}),
+		ErrSnapshotNotReady)
+}
+
+// earlyErrorSender answers every drain send with a synchronous
+// correlated ProtocolError BEFORE Send returns — the fastest possible
+// error must still find its armed issuance.
+type earlyErrorSender struct {
+	recordingSender
+	issuer *DrainIssuer
+	hit    bool
+}
+
+func (sender *earlyErrorSender) Send(
+	ctx context.Context,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	sender.hit = sender.issuer.HandleProtocolFailure(sender.Epoch(), envelope.GetRequestId(),
+		&controlpb.ProtocolError{Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION})
+	return sender.recordingSender.Send(ctx, envelope)
+}
+
+func TestSynchronousEarlyErrorStillCorrelates(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+	sender := &earlyErrorSender{issuer: issuer}
+	requestID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, requestID, 7,
+		&controlpb.DrainCommand{DrainId: "d-early"}))
+	require.True(t, sender.hit, "the error arrived before Send returned and still correlated")
+	result, completed := issuer.Progress("d-early")
+	require.True(t, completed, "the issuance resolved as an observable failure")
+	require.Equal(t, controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION, result.GetCode())
+
+	// The slot is free for the next drain id.
+	nextID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), &sender.recordingSender, nextID, 7,
+		&controlpb.DrainCommand{DrainId: "d-after"}))
+}
+
+func TestCompletedDrainReplayLeavesNoCorrelationState(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+	sender := &recordingSender{}
+	firstID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, firstID, 7,
+		&controlpb.DrainCommand{DrainId: "d-done"}))
+	sent := sender.sent()
+	require.Len(t, sent, 1)
+	wireID := sent[0].GetDrainCommand().GetDrainId()
+	require.NoError(t, issuer.HandleDrainResult(drainResult(wireID, 1, 1, 0, true)))
+
+	// Re-issuing the completed id (the Rust gate replays the terminal)
+	// must never accumulate correlation state, however often it runs.
+	for i := 0; i < 3; i++ {
+		replayID, err := sender.AllocateRequestID()
+		require.NoError(t, err)
+		require.NoError(t, issuer.StartDrain(context.Background(), sender, replayID, 7,
+			&controlpb.DrainCommand{DrainId: "d-done"}))
+	}
+	issuer.mu.Lock()
+	indexSize := len(issuer.requestIndex)
+	outstanding := len(issuer.operations[wireID].outstanding)
+	issuer.mu.Unlock()
+	require.Zero(t, indexSize, "a completed drain's replays arm nothing")
+	require.Zero(t, outstanding)
+
+	// The slot is free for the next drain id.
+	nextID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, nextID, 7,
+		&controlpb.DrainCommand{DrainId: "d-next"}))
+}
+
+// terminalDuringSendSender delivers the operation's terminal result
+// while Send is still in flight — the arm→re-lock window — so the
+// terminal's cleanup runs before the new key exists in its view.
+type terminalDuringSendSender struct {
+	recordingSender
+	issuer *DrainIssuer
+}
+
+func (sender *terminalDuringSendSender) Send(
+	ctx context.Context,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	_ = sender.issuer.HandleDrainResult(&controlpb.DrainResult{
+		DrainId:           envelope.GetDrainCommand().GetDrainId(),
+		ActiveConnections: 1,
+		GracefullyClosed:  1,
+		Complete:          true,
+		Code:              controlpb.ErrorCode_ERROR_CODE_OK,
+	})
+	return sender.recordingSender.Send(ctx, envelope)
+}
+
+func TestTerminalDuringSendLeavesNoCorrelationState(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+	sender := &terminalDuringSendSender{issuer: issuer}
+	requestID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, requestID, 7,
+		&controlpb.DrainCommand{DrainId: "d-race"}))
+
+	issuer.mu.Lock()
+	indexSize := len(issuer.requestIndex)
+	var outstanding int
+	for _, operation := range issuer.operations {
+		outstanding += len(operation.outstanding)
+	}
+	completed := issuer.activeID == ""
+	issuer.mu.Unlock()
+	require.Zero(t, indexSize,
+		"a terminal landing mid-send leaves no armed key behind")
+	require.Zero(t, outstanding)
+	require.True(t, completed, "the slot released with the terminal")
 }

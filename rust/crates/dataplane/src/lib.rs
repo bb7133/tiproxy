@@ -31,6 +31,7 @@ pub mod runtime_config;
 pub mod server;
 pub mod session;
 pub mod session_control;
+pub mod session_engine;
 
 pub use admission::{
     AdmissionController, AdmissionMetricsSnapshot, AdmissionPolicy, AdmissionPolicyError,
@@ -42,6 +43,7 @@ pub use control_commands::{
     MAX_UNACKED_METERING_BATCHES, MeteringError, MeteringLedger, ReconcileRepairs,
     RedirectAdmission,
 };
+pub use control_dispatch::{CommandKind, CommandToken, SessionDirective};
 pub use control_dispatch::{ControlCommandHandler, OutboundControl};
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,
@@ -65,6 +67,7 @@ pub use server::{
 pub use session_control::{
     BoundSessionHandler, DispatchConnectionHandler, DispatchHandleInstaller, SessionControlBinding,
 };
+pub use session_engine::{EngineSessionOwner, run_bound_session};
 
 /// Names and stable roles of the library crates composed by the dataplane.
 #[must_use]

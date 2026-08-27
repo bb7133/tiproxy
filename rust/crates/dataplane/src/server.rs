@@ -43,6 +43,10 @@ use crate::registry::{ConnectionLease, ConnectionMetadata, ConnectionRegistry, R
 const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(5);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
+/// How much longer the listener-task join waits than the session-task
+/// join it contains, so the inner grace can elapse first.
+const FORCE_JOIN_MARGIN: Duration = Duration::from_secs(1);
+
 /// Immutable configured SQL listener.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ListenerSpec {
@@ -162,6 +166,7 @@ pub struct ServerMetricsSnapshot {
 pub struct DataplaneHandle {
     snapshot_tx: watch::Sender<Arc<ValidatedSnapshot>>,
     shutdown_tx: watch::Sender<bool>,
+    draining_tx: watch::Sender<bool>,
     listener_signature: ListenerSignature,
     listeners: Arc<[BoundListenerInfo]>,
     admission: AdmissionController,
@@ -191,6 +196,20 @@ impl DataplaneHandle {
     /// Requests idempotent listener and session-task shutdown.
     pub fn shutdown(&self) {
         self.shutdown_tx.send_replace(true);
+    }
+
+    /// Stops accepting new connections on every listener while existing
+    /// sessions keep running — the first phase of the coordinated
+    /// shutdown order (stop-accept → graceful drain → deadline force →
+    /// join). [`DataplaneHandle::shutdown`] remains the force phase.
+    pub fn stop_accepting(&self) {
+        self.draining_tx.send_replace(true);
+    }
+
+    /// Whether accepting has been stopped.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        *self.draining_tx.borrow()
     }
 
     /// Returns whether shutdown has been requested.
@@ -270,6 +289,42 @@ impl AcceptedConnection {
     pub const fn stream_mut(&mut self) -> &mut TcpStream {
         &mut self.stream
     }
+
+    /// Consumes the admission into the owned stream plus a seat that
+    /// keeps the registry lease (and the captured snapshot) alive for
+    /// the session's whole lifetime. Dropping the seat releases the
+    /// admission exactly as dropping the connection would.
+    #[must_use]
+    pub fn into_session_io(self) -> (TcpStream, SessionSeat) {
+        (
+            self.stream,
+            SessionSeat {
+                snapshot: self.snapshot,
+                lease: self.lease,
+            },
+        )
+    }
+}
+
+/// The non-I/O remainder of an admitted connection: the captured
+/// snapshot and the registry lease, alive until dropped.
+pub struct SessionSeat {
+    snapshot: Arc<ValidatedSnapshot>,
+    lease: ConnectionLease,
+}
+
+impl SessionSeat {
+    /// The immutable snapshot captured at admission.
+    #[must_use]
+    pub fn snapshot(&self) -> &Arc<ValidatedSnapshot> {
+        &self.snapshot
+    }
+
+    /// Payload-free identity and accounting metadata.
+    #[must_use]
+    pub const fn metadata(&self) -> &ConnectionMetadata {
+        self.lease.metadata()
+    }
 }
 
 impl fmt::Debug for AcceptedConnection {
@@ -306,6 +361,7 @@ where
 pub struct DataplaneServer {
     listeners: Vec<NamedListener>,
     handle: DataplaneHandle,
+    force_join_grace: Duration,
 }
 
 impl DataplaneServer {
@@ -354,19 +410,36 @@ impl DataplaneServer {
         }
         let (snapshot_tx, _) = watch::channel(Arc::clone(&snapshot));
         let (shutdown_tx, _) = watch::channel(false);
+        let (draining_tx, _) = watch::channel(false);
         let admission = AdmissionController::new(memory);
         let registry = ConnectionRegistry::new();
         let counters = Arc::new(ServerCounters::default());
         let handle = DataplaneHandle {
             snapshot_tx,
             shutdown_tx,
+            draining_tx,
             listener_signature: ListenerSignature::from_snapshot(&snapshot)?,
             listeners: listener_info.into(),
             admission,
             registry,
             counters,
         };
-        Ok(Self { listeners, handle })
+        Ok(Self {
+            listeners,
+            handle,
+            force_join_grace: Duration::ZERO,
+        })
+    }
+
+    /// Bounds how long forced shutdown waits for session tasks to finish
+    /// their own terminal work (close notices, bounded engine joins)
+    /// before the abort backstop. Zero — the default — aborts
+    /// immediately; compositions whose sessions self-bound their force
+    /// path should pass that bound plus margin.
+    #[must_use]
+    pub fn with_force_join_grace(mut self, grace: Duration) -> Self {
+        self.force_join_grace = grace;
+        self
     }
 
     /// Returns a cloneable control/reload/diagnostic handle before `run`
@@ -394,9 +467,11 @@ impl DataplaneServer {
                 Arc::clone(&handler),
                 self.handle.snapshot_tx.subscribe(),
                 self.handle.shutdown_tx.subscribe(),
+                self.handle.draining_tx.subscribe(),
                 self.handle.admission.clone(),
                 self.handle.registry.clone(),
                 Arc::clone(&self.handle.counters),
+                self.force_join_grace,
             ));
         }
         let mut shutdown = self.handle.shutdown_tx.subscribe();
@@ -425,6 +500,24 @@ impl DataplaneServer {
             }
         };
         self.handle.shutdown();
+        if outcome.is_ok() && !self.force_join_grace.is_zero() {
+            // Ordered force: the listener owners are themselves waiting
+            // out the same grace for their sessions' terminal work, so
+            // hold the abort backstop a margin longer than they do.
+            let deadline = sleep(self.force_join_grace + FORCE_JOIN_MARGIN);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut deadline => break,
+                    joined = listener_tasks.join_next() => {
+                        if joined.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         listener_tasks.abort_all();
         while listener_tasks.join_next().await.is_some() {}
         outcome
@@ -519,7 +612,9 @@ fn snapshot_config(snapshot: &ValidatedSnapshot) -> Result<&ConfigSnapshot, Serv
         .ok_or(ServerError::MissingConfig)
 }
 
-fn snapshot_keepalive(policy: &SnapshotKeepalive) -> KeepalivePolicy {
+/// Converts a snapshot keepalive policy into the socket layer's.
+#[must_use]
+pub fn snapshot_keepalive(policy: &SnapshotKeepalive) -> KeepalivePolicy {
     KeepalivePolicy {
         enabled: policy.enabled,
         idle: Duration::from_millis(policy.idle_millis),
@@ -589,14 +684,17 @@ fn format_listener_address(host: &str, port: u16) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_listener(
     named: NamedListener,
     handler: Arc<dyn ConnectionHandler>,
     snapshot_rx: watch::Receiver<Arc<ValidatedSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
+    mut draining: watch::Receiver<bool>,
     admission: AdmissionController,
     registry: ConnectionRegistry,
     counters: Arc<ServerCounters>,
+    force_join_grace: Duration,
 ) {
     let NamedListener {
         name,
@@ -606,13 +704,20 @@ async fn run_listener(
     let mut sessions = JoinSet::new();
     let mut backoff = AcceptBackoff::new();
     loop {
-        if *shutdown.borrow() {
+        if *shutdown.borrow() || *draining.borrow() {
             break;
         }
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            changed = draining.changed() => {
+                if changed.is_err() || *draining.borrow() {
+                    // Stop-accept phase: close the listener but keep
+                    // every running session alive.
                     break;
                 }
             }
@@ -657,10 +762,74 @@ async fn run_listener(
         }
     }
     drop(listener);
+    // Drain mode: sessions keep running until they finish on their own
+    // (the composition injects graceful closes and per-session drain
+    // deadlines); the shutdown signal remains the force phase that
+    // aborts whatever is left.
+    if !*shutdown.borrow() {
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                joined = sessions.join_next(), if !sessions.is_empty() => {
+                    match joined {
+                        Some(result) => {
+                            if result.is_err_and(|error| error.is_panic()) {
+                                counters.handler_panics.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+            if sessions.is_empty() {
+                break;
+            }
+        }
+    }
+    join_sessions_bounded(&mut sessions, force_join_grace, &counters).await;
     sessions.abort_all();
     while let Some(joined) = sessions.join_next().await {
         if joined.is_err_and(|error| error.is_panic()) {
             counters.handler_panics.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Force phase: session owners still emit their close notices and join
+/// their engines under the per-session cleanup bound; hold the abort
+/// backstop until they finish or the grace ends.
+async fn join_sessions_bounded(
+    sessions: &mut JoinSet<()>,
+    grace: Duration,
+    counters: &ServerCounters,
+) {
+    if grace.is_zero() || sessions.is_empty() {
+        return;
+    }
+    let deadline = sleep(grace);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut deadline => break,
+            joined = sessions.join_next() => {
+                match joined {
+                    Some(result) => {
+                        if result.is_err_and(|error| error.is_panic()) {
+                            counters.handler_panics.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        if sessions.is_empty() {
+            break;
         }
     }
 }

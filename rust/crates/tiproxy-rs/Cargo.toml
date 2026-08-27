@@ -14,7 +14,7 @@ default = []
 [dependencies]
 control-proto.workspace = true
 dataplane.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 
 [lints]
 workspace = true

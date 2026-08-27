@@ -125,6 +125,7 @@ pub struct DataplaneSnapshotConsumer {
     memory: Arc<dyn MemoryProbe>,
     handler: Arc<dyn ConnectionHandler>,
     status: GenerationStatus,
+    force_join_grace: Duration,
 }
 
 /// Cloneable shutdown/join/status surface retained by the executable while
@@ -150,9 +151,18 @@ impl DataplaneSnapshotConsumer {
                 memory,
                 handler,
                 status: status.clone(),
+                force_join_grace: Duration::ZERO,
             },
             DataplaneServingHandle { state, status },
         )
+    }
+
+    /// Forwards the forced-shutdown join grace to every server this
+    /// consumer binds (see [`DataplaneServer::with_force_join_grace`]).
+    #[must_use]
+    pub fn with_force_join_grace(mut self, grace: Duration) -> Self {
+        self.force_join_grace = grace;
+        self
     }
 }
 
@@ -166,6 +176,7 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
         let memory = Arc::clone(&self.memory);
         let handler = Arc::clone(&self.handler);
         let status = self.status.clone();
+        let force_join_grace = self.force_join_grace;
         async move {
             let generation = snapshot.generation();
             let mut serving = state.lock().await;
@@ -187,6 +198,7 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
             } else {
                 match DataplaneServer::bind(snapshot, memory).await {
                     Ok(server) => {
+                        let server = server.with_force_join_grace(force_join_grace);
                         let handle = server.handle();
                         let owner = tokio::spawn(server.run(SharedConnectionHandler(handler)));
                         serving.handle = Some(handle);
@@ -215,6 +227,16 @@ impl DataplaneServingHandle {
     #[must_use]
     pub fn status(&self) -> GenerationStatusSnapshot {
         self.status.snapshot()
+    }
+
+    /// Stops accepting new connections while existing sessions keep
+    /// running (the first coordinated-shutdown phase); a no-op before
+    /// the first bind.
+    pub async fn stop_accepting(&self) {
+        let serving = self.state.lock().await;
+        if let Some(handle) = &serving.handle {
+            handle.stop_accepting();
+        }
     }
 
     /// Requests listener/session shutdown and joins the one SQL server owner.

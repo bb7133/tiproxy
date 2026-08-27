@@ -19,6 +19,7 @@ import (
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/pkg/controlbridge"
+	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	mgrcrt "github.com/pingcap/tiproxy/pkg/manager/cert"
 	mgrns "github.com/pingcap/tiproxy/pkg/manager/namespace"
 	"github.com/pingcap/tiproxy/pkg/proxy/proxyprotocol"
@@ -55,18 +56,25 @@ type ConfigManager interface {
 }
 
 type Managers struct {
-	CfgMgr          ConfigManager
-	NsMgr           mgrns.NamespaceManager
-	CertMgr         *mgrcrt.CertManager
-	BackendReader   BackendReader
-	ReplayJobMgr    mgrrp.JobManager
-	DataplaneStatus DataplaneStatusReader
+	CfgMgr           ConfigManager
+	NsMgr            mgrns.NamespaceManager
+	CertMgr          *mgrcrt.CertManager
+	BackendReader    BackendReader
+	ReplayJobMgr     mgrrp.JobManager
+	DataplaneStatus  DataplaneStatusReader
+	DataplaneDrainer DataplaneDrainer
 }
 
 // DataplaneStatusReader exposes the Go snapshot publisher without coupling the
 // HTTP surface to Bridge lifecycle operations.
 type DataplaneStatusReader interface {
 	Status() controlbridge.SnapshotStatus
+}
+
+// DataplaneDrainer exposes the operator drain entry (DPL-04).
+type DataplaneDrainer interface {
+	StartDrain(ctx context.Context, request controlbridge.DrainRequest) error
+	DrainStatus(drainID string) (*controlpb.DrainResult, bool)
 }
 
 type Server struct {
