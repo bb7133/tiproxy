@@ -79,10 +79,12 @@ var ErrForeignDrainActive = errors.New("a previous incarnation's drain is still 
 // exists to carry the drain.
 var ErrNoDataplaneSession = errors.New("no active Rust dataplane control session")
 
-// maxDrainDeadlineAhead mirrors the Rust gate's absolute-deadline cap
+// MaxDrainDeadlineAhead mirrors the Rust gate's absolute-deadline cap
 // (MAX_DRAIN_DEADLINE_AHEAD_MILLIS): each computed deadline must land
-// within this window or the command would be rejected on the wire.
-const maxDrainDeadlineAhead = 30 * 24 * time.Hour
+// within this window or the command would be rejected on the wire. The
+// HTTP layer shares it to validate millisecond inputs BEFORE duration
+// conversion, so oversized values can never overflow into small ones.
+const MaxDrainDeadlineAhead = 30 * 24 * time.Hour
 
 // ErrInvalidDrainBudget rejects a drain whose budget is negative or
 // whose deadlines would exceed the shared 30-day cap.
@@ -207,9 +209,9 @@ func (bridge *Bridge) StartDrain(ctx context.Context, request DrainRequest) erro
 	// the single-flight slot. Each bound is checked individually first,
 	// so the sum cannot overflow.
 	if request.GracefulWait < 0 || request.ForceTimeout < 0 ||
-		request.GracefulWait > maxDrainDeadlineAhead ||
-		request.ForceTimeout > maxDrainDeadlineAhead ||
-		request.GracefulWait+request.ForceTimeout > maxDrainDeadlineAhead {
+		request.GracefulWait > MaxDrainDeadlineAhead ||
+		request.ForceTimeout > MaxDrainDeadlineAhead ||
+		request.GracefulWait+request.ForceTimeout > MaxDrainDeadlineAhead {
 		return ErrInvalidDrainBudget
 	}
 	if bridge.publisher != nil && bridge.publisher.Status().AppliedGeneration == 0 {

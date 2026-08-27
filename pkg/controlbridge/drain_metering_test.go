@@ -455,11 +455,11 @@ func TestStartDrainRejectsInvalidBudgetsBeforeReservation(t *testing.T) {
 	for name, request := range map[string]DrainRequest{
 		"negative graceful": {DrainID: "d", GracefulWait: -time.Second},
 		"negative force":    {DrainID: "d", ForceTimeout: -time.Second},
-		"graceful over cap": {DrainID: "d", GracefulWait: maxDrainDeadlineAhead + time.Second},
-		"force over cap":    {DrainID: "d", ForceTimeout: maxDrainDeadlineAhead + time.Second},
+		"graceful over cap": {DrainID: "d", GracefulWait: MaxDrainDeadlineAhead + time.Second},
+		"force over cap":    {DrainID: "d", ForceTimeout: MaxDrainDeadlineAhead + time.Second},
 		"sum over cap": {
 			DrainID:      "d",
-			GracefulWait: maxDrainDeadlineAhead - time.Second,
+			GracefulWait: MaxDrainDeadlineAhead - time.Second,
 			ForceTimeout: 2 * time.Second,
 		},
 	} {
@@ -473,4 +473,42 @@ func TestStartDrainRejectsBeforeFirstAppliedGeneration(t *testing.T) {
 	require.ErrorIs(t,
 		bridge.StartDrain(context.Background(), DrainRequest{DrainID: "d-early"}),
 		ErrSnapshotNotReady)
+}
+
+// earlyErrorSender answers every drain send with a synchronous
+// correlated ProtocolError BEFORE Send returns — the fastest possible
+// error must still find its armed issuance.
+type earlyErrorSender struct {
+	recordingSender
+	issuer *DrainIssuer
+	hit    bool
+}
+
+func (sender *earlyErrorSender) Send(
+	ctx context.Context,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	sender.hit = sender.issuer.HandleProtocolFailure(sender.Epoch(), envelope.GetRequestId(),
+		&controlpb.ProtocolError{Code: controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION})
+	return sender.recordingSender.Send(ctx, envelope)
+}
+
+func TestSynchronousEarlyErrorStillCorrelates(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+	sender := &earlyErrorSender{issuer: issuer}
+	requestID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, requestID, 7,
+		&controlpb.DrainCommand{DrainId: "d-early"}))
+	require.True(t, sender.hit, "the error arrived before Send returned and still correlated")
+	result, completed := issuer.Progress("d-early")
+	require.True(t, completed, "the issuance resolved as an observable failure")
+	require.Equal(t, controlpb.ErrorCode_ERROR_CODE_STALE_GENERATION, result.GetCode())
+
+	// The slot is free for the next drain id.
+	nextID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), &sender.recordingSender, nextID, 7,
+		&controlpb.DrainCommand{DrainId: "d-after"}))
 }

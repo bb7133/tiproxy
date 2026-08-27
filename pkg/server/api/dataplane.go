@@ -5,6 +5,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -40,14 +41,28 @@ func (h *Server) DataplaneDrain(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// Validate the raw millisecond inputs BEFORE any conversion: a
+	// negative budget is a client error (never silently clamped), and
+	// bounding each value by the shared 30-day cap first means the
+	// duration multiplication below can never overflow int64.
+	const maxDrainBudgetMS = int64(controlbridge.MaxDrainDeadlineAhead / time.Millisecond)
+	if body.GracefulWaitMS < 0 || body.ForceTimeoutMS < 0 ||
+		body.GracefulWaitMS > maxDrainBudgetMS || body.ForceTimeoutMS > maxDrainBudgetMS {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf(
+				"graceful_wait_ms and force_timeout_ms must be within [0, %d] (30 days)",
+				maxDrainBudgetMS),
+		})
+		return
+	}
 	request := controlbridge.DrainRequest{
 		DrainID: body.DrainID,
 		Scope: controlbridge.DrainScope{
 			ListenerNames: body.ListenerNames,
 			BackendIDs:    body.BackendIDs,
 		},
-		GracefulWait: time.Duration(max(body.GracefulWaitMS, 0)) * time.Millisecond,
-		ForceTimeout: time.Duration(max(body.ForceTimeoutMS, 0)) * time.Millisecond,
+		GracefulWait: time.Duration(body.GracefulWaitMS) * time.Millisecond,
+		ForceTimeout: time.Duration(body.ForceTimeoutMS) * time.Millisecond,
 	}
 	switch err := h.mgr.DataplaneDrainer.StartDrain(c.Request.Context(), request); {
 	case err == nil:
