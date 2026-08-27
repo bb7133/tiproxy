@@ -2,9 +2,12 @@
 
 This directory owns a reproducible, test-only TiDB topology for dataplane
 validation. Component versions are pinned in `versions.env`; the topology uses
-one PD, one TiKV, **two TiDB backends**, one TiProxy process, and a deliberately
-protocol-agnostic TCP fault injector. Certificates are generated for each run
-and removed during cleanup.
+TWO real PD-backed clusters — cluster-a with one PD, one TiKV, and **two TiDB
+backends** (plus the TiProxy process), and cluster-b as a second playground
+under its own tag and port window (+100) with one PD, one TiKV, and **one TiDB
+backend** — plus a deliberately protocol-agnostic TCP fault injector.
+Certificates are generated for each run and removed during cleanup; each run
+therefore consumes two 100-port windows.
 
 ## Current capability boundary
 
@@ -42,14 +45,27 @@ only after the first applied generation, and then runs the same
 `SELECT 1`, drop-next recovery, diagnostics, and port-release checks as
 the Go baseline. Both modes additionally prove the namespace/topology
 matrix (DPL-07 #41): two admin-API-seeded namespaces map alice and bob
-over the PD-backed backend set (`proxy.pd-addrs` always registers an
-implicit backend cluster, so `backend.instances` cannot pin a backend),
+over the PD-backed backend set (with any explicit backend cluster
+configured — as here — the `FallbackFetcher` serves the merged PD
+topology and `backend.instances` cannot pin a backend),
 `SELECT @@port` proves each user lands on a real backend, and
 delta-scoped per-connection log evidence attributes each row's single
 connection to exactly its expected namespace — ns-alpha, ns-beta, and
-root's PD-backed default. Error parity (same slice of DPL-07) then
+root's PD-backed default. The cluster×listener matrix (DPL-07 cluster
+dimension) then proves deterministic backend-class selection: the
+topology runs TWO real PD-backed clusters (a second playground under
+its own tag and port window), the proxy exposes two consecutive
+listeners via `proxy.port-range` with `balance.routing-rule = "port"`,
+and each cluster's TiDB instances carry that listener's
+`tiproxy-port` topology label — so listener A can only select
+cluster-a and listener B only cluster-b, identically in both modes,
+with per-listener delta-scoped evidence (Go route `target`, Rust
+`connection_ready` backend_addr+cluster) and bidirectional
+cross-checks. Per-cluster NSServer parity is explicitly out of scope
+(the wire snapshot does not project name servers). Error parity (same
+slice family) then
 proves the same semantic ERR in both modes: a bind conflict fails fast
-naming the port with no residue, and with both TiDB servers killed and
+naming the port with no residue, and with ALL THREE TiDB servers (both clusters) killed and
 evicted a new connection receives Go's approved 1105/HY000 "No
 available TiDB instances" vocabulary; the unknown-namespace refusal is
 documented as unreachable under the current public bootstrap/admin
@@ -84,11 +100,9 @@ make dataplane-integration-self-test
 relevant pull requests and pushes. Its manual dispatch is the CI entrypoint for
 a real topology: it installs the exact TiUP release from `versions.env` only
 after verifying the published archive SHA-256, runs the selected mode/variant,
-and uploads the redacted artifact directory even on failure. Rust dispatches
-are expected to fail at capability preflight until the dependencies above land;
-their diagnostic artifact makes that boundary observable without claiming a
-successful Rust query.
+and uploads the redacted artifact directory even on failure.
 
 Override `DATAPLANE_PORT_OFFSET` for a reserved CI port range. The default is a
-process-derived offset between 10000 and 11900; the `all` run reserves six
-non-overlapping 100-port ranges.
+process-derived offset between 10000 and 11900; each run consumes two 100-port
+windows (the second backend cluster lives at +100), and the `all` run reserves
+six non-overlapping 200-port allocations — twelve 100-port windows in total.

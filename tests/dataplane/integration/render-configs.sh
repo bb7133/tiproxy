@@ -21,10 +21,13 @@ case "$variant" in
 		exit 2
 		;;
 esac
-if [[ ! $port_offset =~ ^[0-9]+$ ]] || ((port_offset < 1000 || port_offset > 20000)); then
-	echo "PORT_OFFSET must be an integer from 1000 through 20000" >&2
+# The run consumes TWO 100-port windows: the second backend cluster's
+# playground lives at PORT_OFFSET+100.
+if [[ ! $port_offset =~ ^[0-9]+$ ]] || ((port_offset < 1000 || port_offset > 19900)); then
+	echo "PORT_OFFSET must be an integer from 1000 through 19900" >&2
 	exit 2
 fi
+port_offset_b=$((port_offset + 100))
 
 mkdir -p "$output_dir"
 output_dir=$(cd "$output_dir" && pwd)
@@ -88,9 +91,14 @@ pd_port=$((2379 + port_offset))
 tidb_port_0=$((4000 + port_offset))
 tidb_port_1=$((4001 + port_offset))
 tiproxy_port=$((6000 + port_offset))
+# port-range listeners must be consecutive: listener B is A+1.
+tiproxy_port_b=$((6001 + port_offset))
 tiproxy_api_port=$((3080 + port_offset))
 fault_port=$((6100 + port_offset))
 fault_admin_port=$((18474 + port_offset))
+# Second backend cluster (its own playground window).
+pd_port_b=$((2379 + port_offset_b))
+tidb_port_b=$((4000 + port_offset_b))
 
 sed_escape() {
 	local value=$1
@@ -116,7 +124,9 @@ render() {
 		-e "s|@SQL_TLS_SKIP_CA@|$sql_tls_skip_ca|g" \
 		-e "s|@WORK_DIR@|$(sed_escape "$work_dir")|g" \
 		-e "s|@PD_PORT@|$pd_port|g" \
+		-e "s|@PD_PORT_B@|$pd_port_b|g" \
 		-e "s|@TIPROXY_PORT@|$tiproxy_port|g" \
+		-e "s|@TIPROXY_PORT_B@|$tiproxy_port_b|g" \
 		-e "s|@TIPROXY_API_PORT@|$tiproxy_api_port|g" \
 		-e "s|@TIPROXY_LOG@|$(sed_escape "$output_dir/tiproxy.log")|g" \
 		"$input" >"$output"
@@ -124,6 +134,13 @@ render() {
 
 render "$script_dir/config/tidb.toml.tpl" "$output_dir/tidb.toml"
 render "$script_dir/config/tiproxy.toml.tpl" "$output_dir/tiproxy.toml"
+# Listener->cluster binding (routing-rule = "port"): cluster A's TiDB
+# instances carry listener A's port label, cluster B's carry listener
+# B's. Each playground has its own --db.config, so the label is
+# per-cluster by construction.
+printf '\n[labels]\ntiproxy-port = "%s"\n' "$tiproxy_port" >>"$output_dir/tidb.toml"
+render "$script_dir/config/tidb.toml.tpl" "$output_dir/tidb-b.toml"
+printf '\n[labels]\ntiproxy-port = "%s"\n' "$tiproxy_port_b" >>"$output_dir/tidb-b.toml"
 
 {
 	printf 'VARIANT=%q\n' "$variant"
@@ -135,9 +152,13 @@ render "$script_dir/config/tiproxy.toml.tpl" "$output_dir/tiproxy.toml"
 	printf 'TIDB_PORT_0=%q\n' "$tidb_port_0"
 	printf 'TIDB_PORT_1=%q\n' "$tidb_port_1"
 	printf 'TIPROXY_PORT=%q\n' "$tiproxy_port"
+	printf 'TIPROXY_PORT_B=%q\n' "$tiproxy_port_b"
 	printf 'TIPROXY_API_PORT=%q\n' "$tiproxy_api_port"
 	printf 'FAULT_PORT=%q\n' "$fault_port"
 	printf 'FAULT_ADMIN_PORT=%q\n' "$fault_admin_port"
+	printf 'PORT_OFFSET_B=%q\n' "$port_offset_b"
+	printf 'PD_PORT_B=%q\n' "$pd_port_b"
+	printf 'TIDB_PORT_B=%q\n' "$tidb_port_b"
 	printf 'CA_CERT=%q\n' "$ca_cert"
 	printf 'SERVER_CERT=%q\n' "$server_cert"
 	printf 'SERVER_KEY=%q\n' "$server_key"
