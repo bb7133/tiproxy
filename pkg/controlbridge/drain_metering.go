@@ -316,11 +316,17 @@ func (issuer *DrainIssuer) StartDrain(
 	wire.DrainId = wireID
 	wire.CommandSequence = sequence
 	// Arm the correlation before the send: an error answered faster
-	// than the send call returns must still find its issuance.
+	// than the send call returns must still find its issuance. A replay
+	// of a COMPLETED drain needs no correlation — the Rust gate answers
+	// the recorded terminal — so arming would only leak keys on every
+	// reissue of a finished id.
 	key := drainRequestKey{epoch: sender.Epoch(), requestID: requestID}
 	issuer.mu.Lock()
-	issuer.requestIndex[key] = wireID
-	operation.outstanding = append(operation.outstanding, key)
+	armed := !operation.completed
+	if armed {
+		issuer.requestIndex[key] = wireID
+		operation.outstanding = append(operation.outstanding, key)
+	}
 	issuer.mu.Unlock()
 	err := sender.Send(ctx, &controlpb.ControlEnvelope{
 		RequestId:  requestID,
@@ -329,11 +335,22 @@ func (issuer *DrainIssuer) StartDrain(
 		Body:       &controlpb.ControlEnvelope_DrainCommand{DrainCommand: wire},
 	})
 	issuer.mu.Lock()
+	if armed && operation.completed {
+		// A terminal (an earlier retry's result, or a correlated
+		// failure) resolved the operation between arming and this
+		// re-lock: the terminal's cleanup ran before this key existed
+		// in its view, so drop it here — nothing may outlive the
+		// operation's end.
+		delete(issuer.requestIndex, key)
+		operation.outstanding = removeDrainKey(operation.outstanding, key)
+	}
 	if err == nil {
 		operation.everSent = true
 	} else {
-		delete(issuer.requestIndex, key)
-		operation.outstanding = removeDrainKey(operation.outstanding, key)
+		if armed {
+			delete(issuer.requestIndex, key)
+			operation.outstanding = removeDrainKey(operation.outstanding, key)
+		}
 		if !operation.everSent && !operation.completed && issuer.activeID == wireID {
 			// Never reached the wire: release the single-flight slot so
 			// a different drain is not blocked forever; the binding

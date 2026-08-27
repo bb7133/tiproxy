@@ -512,3 +512,83 @@ func TestSynchronousEarlyErrorStillCorrelates(t *testing.T) {
 	require.NoError(t, issuer.StartDrain(context.Background(), &sender.recordingSender, nextID, 7,
 		&controlpb.DrainCommand{DrainId: "d-after"}))
 }
+
+func TestCompletedDrainReplayLeavesNoCorrelationState(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+	sender := &recordingSender{}
+	firstID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, firstID, 7,
+		&controlpb.DrainCommand{DrainId: "d-done"}))
+	sent := sender.sent()
+	require.Len(t, sent, 1)
+	wireID := sent[0].GetDrainCommand().GetDrainId()
+	require.NoError(t, issuer.HandleDrainResult(drainResult(wireID, 1, 1, 0, true)))
+
+	// Re-issuing the completed id (the Rust gate replays the terminal)
+	// must never accumulate correlation state, however often it runs.
+	for i := 0; i < 3; i++ {
+		replayID, err := sender.AllocateRequestID()
+		require.NoError(t, err)
+		require.NoError(t, issuer.StartDrain(context.Background(), sender, replayID, 7,
+			&controlpb.DrainCommand{DrainId: "d-done"}))
+	}
+	issuer.mu.Lock()
+	indexSize := len(issuer.requestIndex)
+	outstanding := len(issuer.operations[wireID].outstanding)
+	issuer.mu.Unlock()
+	require.Zero(t, indexSize, "a completed drain's replays arm nothing")
+	require.Zero(t, outstanding)
+
+	// The slot is free for the next drain id.
+	nextID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, nextID, 7,
+		&controlpb.DrainCommand{DrainId: "d-next"}))
+}
+
+// terminalDuringSendSender delivers the operation's terminal result
+// while Send is still in flight — the arm→re-lock window — so the
+// terminal's cleanup runs before the new key exists in its view.
+type terminalDuringSendSender struct {
+	recordingSender
+	issuer *DrainIssuer
+}
+
+func (sender *terminalDuringSendSender) Send(
+	ctx context.Context,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	_ = sender.issuer.HandleDrainResult(&controlpb.DrainResult{
+		DrainId:           envelope.GetDrainCommand().GetDrainId(),
+		ActiveConnections: 1,
+		GracefullyClosed:  1,
+		Complete:          true,
+		Code:              controlpb.ErrorCode_ERROR_CODE_OK,
+	})
+	return sender.recordingSender.Send(ctx, envelope)
+}
+
+func TestTerminalDuringSendLeavesNoCorrelationState(t *testing.T) {
+	issuer, err := NewDrainIssuer()
+	require.NoError(t, err)
+	sender := &terminalDuringSendSender{issuer: issuer}
+	requestID, err := sender.AllocateRequestID()
+	require.NoError(t, err)
+	require.NoError(t, issuer.StartDrain(context.Background(), sender, requestID, 7,
+		&controlpb.DrainCommand{DrainId: "d-race"}))
+
+	issuer.mu.Lock()
+	indexSize := len(issuer.requestIndex)
+	var outstanding int
+	for _, operation := range issuer.operations {
+		outstanding += len(operation.outstanding)
+	}
+	completed := issuer.activeID == ""
+	issuer.mu.Unlock()
+	require.Zero(t, indexSize,
+		"a terminal landing mid-send leaves no armed key behind")
+	require.Zero(t, outstanding)
+	require.True(t, completed, "the slot released with the terminal")
+}

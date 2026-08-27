@@ -93,6 +93,8 @@ func TestDataplaneDrainAPIRejectsInvalidBudgetsBeforeConversion(t *testing.T) {
 		"overflow graceful": `{"drain_id":"d","graceful_wait_ms":9223372036854775807}`,
 		"overflow force":    `{"drain_id":"d","force_timeout_ms":9223372036854775807}`,
 		"over 30-day cap":   `{"drain_id":"d","graceful_wait_ms":2592000001}`,
+		"sum over cap": `{"drain_id":"d",` +
+			`"graceful_wait_ms":1728000000,"force_timeout_ms":1728000000}`,
 	} {
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(
@@ -103,10 +105,11 @@ func TestDataplaneDrainAPIRejectsInvalidBudgetsBeforeConversion(t *testing.T) {
 		require.Zero(t, drainer.calls, "invalid budgets never reach the bridge: %s", name)
 	}
 
-	// A boundary-valid budget passes through unclamped.
+	// A boundary-valid budget (sum exactly at the cap) passes through
+	// unclamped.
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/dataplane/drain",
-		strings.NewReader(`{"drain_id":"d","graceful_wait_ms":2592000000}`))
+		strings.NewReader(`{"drain_id":"d","graceful_wait_ms":2591999000,"force_timeout_ms":1000}`))
 	request.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusAccepted, recorder.Code)

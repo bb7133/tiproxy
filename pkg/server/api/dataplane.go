@@ -46,8 +46,11 @@ func (h *Server) DataplaneDrain(c *gin.Context) {
 	// bounding each value by the shared 30-day cap first means the
 	// duration multiplication below can never overflow int64.
 	const maxDrainBudgetMS = int64(controlbridge.MaxDrainDeadlineAhead / time.Millisecond)
+	// The summed budget must also fit the cap; with both fields already
+	// bounded, the subtraction form cannot overflow.
 	if body.GracefulWaitMS < 0 || body.ForceTimeoutMS < 0 ||
-		body.GracefulWaitMS > maxDrainBudgetMS || body.ForceTimeoutMS > maxDrainBudgetMS {
+		body.GracefulWaitMS > maxDrainBudgetMS || body.ForceTimeoutMS > maxDrainBudgetMS ||
+		body.GracefulWaitMS > maxDrainBudgetMS-body.ForceTimeoutMS {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": fmt.Sprintf(
 				"graceful_wait_ms and force_timeout_ms must be within [0, %d] (30 days)",
