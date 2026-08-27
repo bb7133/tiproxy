@@ -8,6 +8,8 @@ package controlbridge
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -50,6 +52,9 @@ var _ transport.Handler = (*RouterAdapter)(nil)
 // mutex is never held while invoking a HandshakeHandler or router callback.
 type RouterAdapter struct {
 	handler backend.HandshakeHandler
+	// incarnation is a random 128-bit boot nonce (see NewRouterAdapter):
+	// operation ids stay unique across Go process restarts.
+	incarnation string
 
 	mu          sync.Mutex
 	connections map[uint64]*connectionState
@@ -147,8 +152,20 @@ func NewRouterAdapter(handler backend.HandshakeHandler) (*RouterAdapter, error) 
 	if handler == nil {
 		return nil, errors.New("handshake handler is required")
 	}
+	// A random 128-bit process-incarnation nonce (same model as
+	// DrainIssuer): Rust's CommandGate keeps redirect tombstones and
+	// sequence watermarks ACROSS Go restarts, while epoch, connection
+	// id, and the adapter-local counter can all restart from identical
+	// values - without the nonce a new Go lineage re-mints an old
+	// operation id, hits the surviving tombstone, and its legal
+	// operation is rejected with SequenceMismatch forever.
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("router adapter incarnation nonce: %w", err)
+	}
 	return &RouterAdapter{
 		handler:     handler,
+		incarnation: hex.EncodeToString(nonce),
 		connections: make(map[uint64]*connectionState),
 		closedIDs:   make(map[uint64]uint64),
 		orphans:     make(map[uint64]*orphanState),
@@ -1256,7 +1273,9 @@ func (adapter *RouterAdapter) currentSender() EnvelopeSender {
 }
 
 func (adapter *RouterAdapter) newOperationID(kind string, epoch, connectionID uint64) string {
-	return fmt.Sprintf("%s-%d-%d-%d", kind, epoch, connectionID, adapter.operationID.Add(1))
+	// The incarnation nonce makes ids unique across Go restarts even
+	// when kind/epoch/connection/counter all repeat.
+	return fmt.Sprintf("%s-%s-%d-%d-%d", kind, adapter.incarnation, epoch, connectionID, adapter.operationID.Add(1))
 }
 
 func (adapter *RouterAdapter) sendProtocolError(

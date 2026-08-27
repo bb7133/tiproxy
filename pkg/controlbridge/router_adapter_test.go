@@ -613,3 +613,30 @@ func lastAssignment(t *testing.T, peer *fakeSender) *controlpb.RouteAssignment {
 
 var _ backend.HandshakeHandler = (*recordingHandler)(nil)
 var _ router.Router = (*portRouter)(nil)
+
+// Operation ids must be unique ACROSS Go process incarnations: Rust's
+// CommandGate keeps redirect tombstones and sequence watermarks across
+// Go restarts, while epoch, connection id, and the adapter-local
+// counter can all restart from identical values. Two fresh adapters
+// (= two Go incarnations) minting ids for the SAME
+// {kind, epoch, connection, counter} tuple must never alias - the old
+// lineage's tombstone would otherwise reject the new lineage's legal
+// operation with SequenceMismatch forever.
+func TestOperationIDsUniqueAcrossIncarnations(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	adapterA, err := NewRouterAdapter(backend.NewDefaultHandshakeHandler(nil))
+	require.NoError(t, err)
+	adapterB, err := NewRouterAdapter(backend.NewDefaultHandshakeHandler(nil))
+	require.NoError(t, err)
+	_ = rt
+
+	idA := adapterA.newOperationID("redirect", 1, 1)
+	idB := adapterB.newOperationID("redirect", 1, 1)
+	require.NotEqual(t, idA, idB,
+		"identical {kind,epoch,conn,counter} across incarnations must not alias")
+	require.NotEqual(t, idA, adapterA.newOperationID("redirect", 1, 1),
+		"the counter keeps ids unique within one incarnation")
+	require.Contains(t, idA, adapterA.incarnation)
+	require.Contains(t, idB, adapterB.incarnation)
+	require.Len(t, adapterA.incarnation, 32, "128-bit hex nonce")
+}
