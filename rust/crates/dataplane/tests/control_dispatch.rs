@@ -92,7 +92,7 @@ fn register(
 ) -> Session {
     let (tx, rx) = mpsc::channel(8);
     handler.register_session(identity(connection_id), "ns-a", 7, listener, tx, None);
-    handler.set_backend(connection_id, backend);
+    let _ = handler.set_backend(connection_id, backend);
     Session { control: rx }
 }
 
@@ -690,7 +690,7 @@ async fn force_close_marks_only_on_delivery() {
     // Capacity-1 control channel, pre-filled so the force send jams.
     let (tx, mut rx) = mpsc::channel(1);
     handler.register_session(identity(1), "ns-a", 7, "sql-a", tx.clone(), None);
-    handler.set_backend(1, "tidb-a");
+    let _ = handler.set_backend(1, "tidb-a");
     assert!(
         tx.try_send(SessionDirective::bare(SessionControl::GracefulClose))
             .is_ok(),
@@ -1993,5 +1993,139 @@ async fn instant_completion_binds_exact_terminal_id() {
     assert_eq!(sent[1].request_id, 41);
 
     instant_session.abort();
+    harness.task.abort();
+}
+
+/// A reconcile that raced ahead of the decision adoption is never the
+/// peer's LAST word: adopting namespace (and later backend) on an
+/// already-exported record sends an explicit repair reconcile — in
+/// wire order after the stale export, and for the namespace adoption
+/// BEFORE its applied acknowledgement fires.
+#[tokio::test(start_paused = true)]
+async fn stale_namespace_export_is_repaired_by_a_fresh_reconcile() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7);
+    let (tx, _session_rx) = mpsc::channel(8);
+    handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
+
+    let harness = spawn_loop(handler);
+    // The reconnect wins the race: the automatic reconcile exports the
+    // registration seed — necessarily backend-less (the notice order
+    // guarantees no backend exists before the namespace adoption).
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    let Some(Body::ReconcileRequest(request)) = &sent[0].body else {
+        unreachable!("the connected transition reconciles automatically")
+    };
+    assert_eq!(request.connections[0].namespace, "default");
+    assert!(
+        request.connections[0].backend_id.is_empty(),
+        "a pre-decision export is always backend-less"
+    );
+
+    // The adoption lands after the export: by the time the applied ack
+    // fires, the repair reconcile is already in the outbound path.
+    let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+    assert!(
+        harness
+            .notice_tx
+            .send(DispatchNotice::SetNamespace {
+                connection_id: 1,
+                namespace: "ns-wired".to_owned(),
+                applied: applied_tx,
+            })
+            .await
+            .is_ok()
+    );
+    assert!(applied_rx.await.is_ok());
+    let sent = harness.sender.sent();
+    let Some(Body::ReconcileRequest(repair)) = &sent[1].body else {
+        unreachable!("the adoption on an exported record repairs by reconcile")
+    };
+    assert_eq!(
+        repair.connections[0].namespace, "ns-wired",
+        "the repair re-exports the adopted namespace"
+    );
+
+    // The backend adoption on the (again) exported record repairs too:
+    // that fresh record is what lets the peer resolve a parked orphan
+    // under the resolved namespace/backend pair.
+    assert!(
+        harness
+            .notice_tx
+            .send(DispatchNotice::SetBackend {
+                connection_id: 1,
+                backend_id: "tidb-a".to_owned(),
+            })
+            .await
+            .is_ok()
+    );
+    let sent = wait_for_sent(&harness.sender, 3).await;
+    let Some(Body::ReconcileRequest(repair)) = &sent[2].body else {
+        unreachable!("the backend adoption on an exported record repairs by reconcile")
+    };
+    assert_eq!(repair.connections[0].namespace, "ns-wired");
+    assert_eq!(repair.connections[0].backend_id, "tidb-a");
+    harness.task.abort();
+}
+
+/// An adoption already queued when the reconnect is observed applies
+/// BEFORE the transition's automatic reconcile (the causal drain
+/// barrier): the one export carries the adopted namespace and no
+/// repair is ever needed.
+#[tokio::test(start_paused = true)]
+async fn queued_adoption_precedes_the_automatic_reconcile() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7);
+    let (tx, _session_rx) = mpsc::channel(8);
+    handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
+
+    let harness = spawn_loop(handler);
+    // Queue the adoption first — completed sends are visible to the
+    // barrier no matter which select arm wins.
+    let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+    assert!(
+        harness
+            .notice_tx
+            .send(DispatchNotice::SetNamespace {
+                connection_id: 1,
+                namespace: "ns-wired".to_owned(),
+                applied: applied_tx,
+            })
+            .await
+            .is_ok()
+    );
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            capabilities: full_caps(),
+        })
+        .ok();
+    assert!(applied_rx.await.is_ok());
+
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    let Some(Body::ReconcileRequest(request)) = &sent[0].body else {
+        unreachable!("the connected transition reconciles automatically")
+    };
+    assert_eq!(
+        request.connections[0].namespace, "ns-wired",
+        "the export already carries the queued adoption"
+    );
+    // Give the loop a chance to (wrongly) emit a repair; none may come.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.sender.sent().len(),
+        1,
+        "an unexported adoption owes no repair"
+    );
     harness.task.abort();
 }

@@ -65,7 +65,7 @@ fn identity(connection_id: u64) -> ConnectionIdentity {
 fn gate_with_connection(connection_id: u64, backend: &str) -> CommandGate {
     let mut gate = CommandGate::new();
     gate.register_connection(identity(connection_id), "ns-a", 7);
-    gate.set_backend(connection_id, backend);
+    let _ = gate.set_backend(connection_id, backend);
     gate
 }
 
@@ -381,9 +381,9 @@ async fn drain_is_single_flight_with_replayable_progress() {
 fn go_restart_preserves_rust_sessions() {
     let mut gate = CommandGate::new();
     gate.register_connection(identity(1), "ns-a", 7);
-    gate.set_backend(1, "tidb-a");
+    let _ = gate.set_backend(1, "tidb-a");
     gate.register_connection(identity(2), "ns-b", 7);
-    gate.set_backend(2, "tidb-b");
+    let _ = gate.set_backend(2, "tidb-b");
     let _ = gate.admit_redirect(&redirect(2, "r-1", 1), 7);
     // Outgoing events carry allocator-issued ids; the gate records the
     // maximum as the reconcile watermark.
@@ -531,7 +531,7 @@ fn rust_restart_clears_ghosts_and_replays_lost_results() {
 fn stale_generations_never_affect_new_connections() {
     let mut gate = CommandGate::new();
     gate.register_connection(identity(1), "ns-a", 7);
-    gate.set_backend(1, "tidb-a");
+    let _ = gate.set_backend(1, "tidb-a");
     // The connection closes; a new one is admitted under generation 9
     // reusing nothing from the old id.
     gate.unregister_connection(1);
@@ -541,7 +541,7 @@ fn stale_generations_never_affect_new_connections() {
         "commands for the retired incarnation never act"
     );
     gate.register_connection(identity(2), "ns-a", 9);
-    gate.set_backend(2, "tidb-b");
+    let _ = gate.set_backend(2, "tidb-b");
     let request = gate.build_reconcile_request(9, 0, 0);
     assert_eq!(request.connections.len(), 1);
     assert_eq!(request.connections[0].connection_id, 2);
@@ -734,7 +734,7 @@ fn id_reuse_across_generations_rejects_stale_commands() {
     gate.unregister_connection(1);
     // Rust restarted: ids start from 1 again, new snapshot generation.
     gate.register_connection(identity(1), "ns-a", 9);
-    gate.set_backend(1, "tidb-a");
+    let _ = gate.set_backend(1, "tidb-a");
 
     assert_eq!(
         gate.admit_redirect(&redirect(1, "r-old", 1), 7),
