@@ -285,11 +285,18 @@ func (adapter *RouterAdapter) rejectHandshakeLocked(
 	state *connectionState,
 	err error,
 ) error {
+	// Parity: Go mode surfaces the handshake handler's own message to
+	// the client (ER_UNKNOWN_ERROR text via MakeUserError), so the
+	// decision carries the same text instead of a generic phrase.
+	message := "handshake rejected"
+	if err != nil {
+		message = err.Error()
+	}
 	state.decision = &controlpb.HandshakeDecision{
 		ConnectionId:  state.conn.ConnectionID(),
 		Accept:        false,
 		Code:          controlpb.ErrorCode_ERROR_CODE_HANDSHAKE_REJECTED,
-		ClientMessage: "handshake rejected",
+		ClientMessage: bounded(message),
 	}
 	adapter.notifyHandshakeLocked(state, "", err, backend.SrcProxyErr)
 	return sendBody(ctx, sender, requestID, controlpb.Priority_PRIORITY_CONTROL,

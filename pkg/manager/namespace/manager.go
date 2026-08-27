@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"sort"
 	"sync"
 
 	"github.com/pingcap/tiproxy/lib/config"
@@ -31,6 +32,7 @@ type NamespaceManager interface {
 	CommitNamespaces(nss []*config.Namespace, nssDelete []bool) error
 	GetNamespace(nm string) (*Namespace, bool)
 	GetNamespaceByUser(user string) (*Namespace, bool)
+	ListNamespaces() []*Namespace
 	RedirectConnections() []error
 	Ready() bool
 	Close() error
@@ -143,6 +145,30 @@ func (mgr *namespaceManager) GetNamespaceByUser(user string) (*Namespace, bool) 
 		}
 	}
 	return nil, false
+}
+
+// SetNamespaceForTest installs a prebuilt namespace without building
+// routers or observers; used by cross-package routing-parity tests.
+func (mgr *namespaceManager) SetNamespaceForTest(ns *Namespace) {
+	mgr.Lock()
+	defer mgr.Unlock()
+	if mgr.nsm == nil {
+		mgr.nsm = make(map[string]*Namespace)
+	}
+	mgr.nsm[ns.Name()] = ns
+}
+
+// ListNamespaces snapshots the live namespaces in name order for the
+// control-plane topology projection (DPL-07).
+func (mgr *namespaceManager) ListNamespaces() []*Namespace {
+	mgr.RLock()
+	defer mgr.RUnlock()
+	namespaces := make([]*Namespace, 0, len(mgr.nsm))
+	for _, ns := range mgr.nsm {
+		namespaces = append(namespaces, ns)
+	}
+	sort.Slice(namespaces, func(i, j int) bool { return namespaces[i].Name() < namespaces[j].Name() })
+	return namespaces
 }
 
 func (mgr *namespaceManager) RedirectConnections() []error {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/pingcap/tiproxy/pkg/controlbridge"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
+	mgrns "github.com/pingcap/tiproxy/pkg/manager/namespace"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
 	"github.com/pingcap/tiproxy/pkg/util/versioninfo"
 	"go.uber.org/zap"
@@ -51,6 +53,12 @@ func (srv *Server) startRustDataplane(
 		Initial:              cfg,
 		AdvertisedCapability: handshake.GetCapability().Uint32(),
 		ServerVersion:        handshake.GetServerVersion(),
+		// DPL-07: the wire snapshot carries the live namespace/backend
+		// topology so the Rust dataplane observes the same routing
+		// truth the Go proxy serves from.
+		Topology: func() ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
+			return projectControlTopology(srv.namespaceManager)
+		},
 	})
 	if err != nil {
 		return err
@@ -120,4 +128,60 @@ func (srv *Server) startRustDataplane(
 		}
 	}, logger)
 	return nil
+}
+
+// projectControlTopology projects the live namespaces and their
+// routers' backends into the control-snapshot topology (DPL-07).
+// Backends are deduplicated by id across namespaces; a namespace whose
+// backends all share one cluster reports that cluster, anything else
+// stays honestly empty. Routers that cannot enumerate (the static
+// test router) contribute no backends.
+func projectControlTopology(
+	nsMgr mgrns.NamespaceManager,
+) ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
+	namespaces := nsMgr.ListNamespaces()
+	nsSnapshots := make([]*controlpb.NamespaceSnapshot, 0, len(namespaces))
+	backendIndex := make(map[string]*controlpb.BackendSnapshot)
+	for _, ns := range namespaces {
+		var users []string
+		if user := ns.User(); user != "" {
+			users = []string{user}
+		}
+		cluster := ""
+		clusters := make(map[string]struct{})
+		if enumerator, ok := ns.GetRouter().(router.TopologyEnumerator); ok {
+			for _, backend := range enumerator.EnumerateTopology() {
+				clusters[backend.ClusterName] = struct{}{}
+				if _, seen := backendIndex[backend.ID]; seen {
+					continue
+				}
+				backendIndex[backend.ID] = &controlpb.BackendSnapshot{
+					BackendId:   backend.ID,
+					Address:     backend.Addr,
+					ClusterName: backend.ClusterName,
+					Keyspace:    backend.Keyspace,
+					Healthy:     backend.Healthy,
+					Local:       backend.Local,
+					Cidrs:       backend.CIDRs,
+					Labels:      backend.Labels,
+				}
+			}
+		}
+		if len(clusters) == 1 {
+			for name := range clusters {
+				cluster = name
+			}
+		}
+		nsSnapshots = append(nsSnapshots, &controlpb.NamespaceSnapshot{
+			Name:           ns.Name(),
+			Users:          users,
+			BackendCluster: cluster,
+		})
+	}
+	backends := make([]*controlpb.BackendSnapshot, 0, len(backendIndex))
+	for _, backend := range backendIndex {
+		backends = append(backends, backend)
+	}
+	sort.Slice(backends, func(i, j int) bool { return backends[i].GetBackendId() < backends[j].GetBackendId() })
+	return backends, nsSnapshots
 }
