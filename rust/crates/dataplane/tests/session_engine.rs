@@ -1431,6 +1431,27 @@ async fn long_multibyte_namespace_is_preserved_verbatim() {
     stack.dispatch_task.abort();
 }
 
+/// Exact `MySQL` ERR packet contract (`CLIENT_PROTOCOL_41`): `0xFF` marker,
+/// little-endian error code, `#` sql-state marker, 5-byte SQLSTATE,
+/// and the FULL remaining message — approved vocabulary is asserted
+/// verbatim, never by substring.
+fn assert_exact_err_packet(payload: &[u8], code: u16, sqlstate: [u8; 5], message: &str) {
+    assert_eq!(payload.first(), Some(&0xFF), "ERR marker: {payload:?}");
+    assert!(payload.len() > 9, "ERR packet too short: {payload:?}");
+    assert_eq!(
+        u16::from_le_bytes([payload[1], payload[2]]),
+        code,
+        "ERR code: {payload:?}"
+    );
+    assert_eq!(payload[3], b'#', "sql-state marker: {payload:?}");
+    assert_eq!(payload[4..9], sqlstate, "SQLSTATE: {payload:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&payload[9..]),
+        message,
+        "ERR message must equal the approved vocabulary verbatim"
+    );
+}
+
 /// A REJECTED handshake decision refuses the client on the wire with
 /// the decision's approved message (never routes, never silently
 /// hangs), and the session reports CLOSED.
@@ -1470,15 +1491,7 @@ async fn rejected_handshake_decision_refuses_the_client() {
     let Err(denied) = refused else {
         unreachable!("a rejected decision must refuse the client")
     };
-    assert_eq!(
-        denied.first(),
-        Some(&0xFF),
-        "MySQL error packet: {denied:?}"
-    );
-    assert!(
-        String::from_utf8_lossy(&denied).contains("failed to find a namespace"),
-        "the decision's approved message reaches the client: {denied:?}"
-    );
+    assert_exact_err_packet(&denied, 1105, *b"HY000", "failed to find a namespace");
 
     let closed = wait_sent(
         &stack.sender,
@@ -1554,15 +1567,11 @@ async fn no_backend_route_answer_refuses_the_client() {
     let Err(denied) = refused else {
         unreachable!("a NO_BACKEND answer must refuse the client")
     };
-    assert_eq!(
-        denied.first(),
-        Some(&0xFF),
-        "MySQL error packet: {denied:?}"
-    );
-    assert!(
-        String::from_utf8_lossy(&denied)
-            .contains("No available TiDB instances, please make sure TiDB is available"),
-        "Go's approved no-backend message reaches the client: {denied:?}"
+    assert_exact_err_packet(
+        &denied,
+        1105,
+        *b"HY000",
+        "No available TiDB instances, please make sure TiDB is available",
     );
 
     let closed = wait_sent(

@@ -580,19 +580,47 @@ echo "error parity: bind conflict -> fast nonzero exit, port named, no residue"
 # (Go: ErrProxyNoBackend in pkg/proxy/backend/error.go, reached from
 # router.ErrNoBackend; Rust: the AcquireError::NoBackend client
 # refusal).
-# Under pipefail a no-match lsof would abort the capture silently, so
-# each probe is explicitly allowed to fail and the empty case reports
-# what actually owns the ports.
-tidb_pids=$( { lsof -ti "tcp:$TIDB_PORT_0" -sTCP:LISTEN || true; lsof -ti "tcp:$TIDB_PORT_1" -sTCP:LISTEN || true; } 2>/dev/null | sort -u)
-if [[ -z $tidb_pids ]]; then
-	{
-		echo "no TiDB listeners found to kill for the no-backend row"
-		echo "port $TIDB_PORT_0 owners:"
-		lsof -i "tcp:$TIDB_PORT_0" || true
-		echo "port $TIDB_PORT_1 owners:"
-		lsof -i "tcp:$TIDB_PORT_1" || true
-	} >&2
+# Per-port discipline: EACH TiDB port must have exactly one LISTEN
+# owner and the two owners must be distinct processes — an already-dead
+# backend or an accidentally shared port is a hard error, never a
+# silently "successful" double kill. (Under pipefail a no-match lsof
+# would abort the capture silently, so each probe is explicitly
+# allowed to fail and reports its owners on error.)
+tidb_pid_0=$(lsof -ti "tcp:$TIDB_PORT_0" -sTCP:LISTEN 2>/dev/null || true)
+tidb_pid_1=$(lsof -ti "tcp:$TIDB_PORT_1" -sTCP:LISTEN 2>/dev/null || true)
+for pair in "$TIDB_PORT_0:$tidb_pid_0" "$TIDB_PORT_1:$tidb_pid_1"; do
+	port=${pair%%:*}
+	owner=${pair#*:}
+	if [[ ! $owner =~ ^[0-9]+$ ]]; then
+		{
+			echo "port $port must have exactly one LISTEN owner for the no-backend row; got: '$owner'"
+			lsof -i "tcp:$port" || true
+		} >&2
+		exit 1
+	fi
+done
+if [[ $tidb_pid_0 == "$tidb_pid_1" ]]; then
+	echo "both TiDB ports are owned by the same PID $tidb_pid_0; refusing the no-backend row" >&2
 	exit 1
+fi
+tidb_pids="$tidb_pid_0
+$tidb_pid_1"
+# Ownership gate: kill ONLY processes provably belonging to this
+# run's playground — every TiUP component command line carries the
+# run's unique tag path. A foreign owner of the port is a hard error,
+# never a kill target.
+for pid in $tidb_pids; do
+	pid_cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+	if [[ $pid_cmd != *"$tag"* ]]; then
+		echo "refusing to kill PID $pid for the no-backend row: not owned by tag $tag: $pid_cmd" >&2
+		exit 1
+	fi
+done
+# Source-branch evidence is delta-scoped to the no-backend window:
+# only records logged AFTER the kill count (same discipline as the
+# matrix rows).
+if [[ $mode == go ]]; then
+	go_evidence_offset=$(evidence_lines)
 fi
 echo "no-backend row: killing TiDB listeners: $(tr '\n' ' ' <<<"$tidb_pids")"
 # shellcheck disable=SC2086
@@ -615,11 +643,18 @@ if [[ $no_backend_ok != true ]]; then
 	exit 1
 fi
 if [[ $mode == go ]]; then
-	# Source-branch evidence: the refusal came from the no-backend
-	# path, not a dial/EOF race on a freshly dead TiDB.
-	go_log_root="${TIUP_HOME:-${HOME}/.tiup}/data/$tag"
-	if ! grep -rqs "get backend failed" "$go_log_root"; then
-		echo "Go no-backend source-branch evidence missing" >&2
+	# Source-branch evidence: ONE fresh record must carry BOTH the
+	# get-backend failure and, in its structured last_err field, the
+	# frozen ErrProxyNoBackend text — a generic "get backend failed"
+	# alone could be an earlier dial/EOF retry from the eviction race,
+	# which proves nothing about the branch that refused the client.
+	if ! evidence_tail "$go_evidence_offset" |
+		grep -Eqs '"get backend failed".*"last_err":"No available TiDB instances, please make sure TiDB is available"'; then
+		{
+			echo "Go no-backend source-branch evidence missing from the row's window"
+			echo "fresh get-backend records were:"
+			evidence_tail "$go_evidence_offset" | grep -s "get backend failed" | tail -5
+		} >&2
 		exit 1
 	fi
 fi
