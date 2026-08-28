@@ -773,10 +773,16 @@ if [[ $ka_use_dropper == true ]]; then
 	# No pre-removal here: the dropper's own start() Lstat-checks the
 	# front path and removes ONLY a pre-existing socket (failing closed
 	# on a regular file), so a blind rm would bypass that audited guard.
+	# --pause-after-drop: a drop tears the control link and holds
+	# reconnects until /release, giving each chain a clean "frame lost,
+	# no reconcile yet" observation window and then a deterministic
+	# reconnect that fires Rust's automatic ReconcileRequest. It never
+	# triggers while unarmed, so the transparent passthrough is unaffected.
 	"$run_dir/controldropper" \
 		--front-socket "$KA_DROP_SOCKET" \
 		--target-socket "$KA_SOCKET" \
 		--admin "127.0.0.1:$ka_drop_admin_port" \
+		--pause-after-drop \
 		>"$run_dir/controldropper.log" 2>&1 &
 	KA_DROP_PID=$!
 	printf 'KA_DROP_PID=%q\n' "$KA_DROP_PID" >>"$run_dir/state.env"
@@ -1098,6 +1104,168 @@ for _ in {1..40}; do
 done
 kill "$KA_SESSION_PID" 2>/dev/null || true
 wait "$KA_SESSION_PID" 2>/dev/null || true
+if [[ $ka_use_dropper == true ]]; then
+	# ---- CTL-06 chaos chain (b): a dropped ConnectionEvent{CLOSED}
+	# leaves Go's per-backend accounting holding a ghost; the automatic
+	# ReconcileRequest on the next control reconnect clears it to EXACTLY
+	# the live count (never negative). Evidence is Go's
+	# tiproxy_balance_b_conn gauge plus the dropper's own drop record.
+	ka_backend_conn() {
+		curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_api_port/api/metrics/" 2>/dev/null |
+			awk -v b="backend=\"$1\"" \
+				'$0 ~ /^tiproxy_balance_b_conn\{/ && index($0, b) { v=$NF } END { print (v==""?0:v) }'
+	}
+	ka_drop_state() {
+		curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_drop_admin_port/state" 2>/dev/null
+	}
+	# A fresh persistent connection whose CLOSED we will lose. With the
+	# initial pin restored it lands on the sole routeable backend (ks-old).
+	KB_FIFO="$run_dir/kb-session.fifo"
+	mkfifo "$KB_FIFO"
+	printf 'KB_FIFO=%q\n' "$KB_FIFO" >>"$run_dir/state.env"
+	kb_rust_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$KB_FIFO" >"$run_dir/kb-session.out" 2>&1 &
+	KB_SESSION_PID=$!
+	printf 'KB_SESSION_PID=%q\n' "$KB_SESSION_PID" >>"$run_dir/state.env"
+	exec 8>"$KB_FIFO"
+	printf "SELECT CONCAT('KB|', CONNECTION_ID(), '|', @@port);\n" >&8
+	kb_line=
+	for _ in {1..40}; do
+		kb_line=$(grep -s '^KB|' "$run_dir/kb-session.out" | tail -1 || true)
+		[[ -n $kb_line ]] && break
+		if ! kill -0 "$KB_SESSION_PID" 2>/dev/null; then
+			echo "chain-b: session died before establishing" >&2
+			tail -5 "$run_dir/kb-session.out" >&2 || true
+			exit 1
+		fi
+		sleep 0.5
+	done
+	[[ -n $kb_line ]] || { echo "chain-b: session never answered" >&2; exit 1; }
+	# Capture the proxy-side connection id + backend id from Rust's own
+	# connection_ready record for this new session.
+	kb_conn_id= kb_backend_id= kb_backend_addr=
+	for _ in {1..20}; do
+		kb_ready=$(tail -n "+$((kb_rust_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | tail -1 || true)
+		if [[ -n $kb_ready ]]; then
+			kb_conn_id=$(sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p' <<<"$kb_ready")
+			kb_backend_id=$(sed -n 's/.*"backend_id":"\([^"]*\)".*/\1/p' <<<"$kb_ready")
+			kb_backend_addr=$(sed -n 's/.*"backend_addr":"\([^"]*\)".*/\1/p' <<<"$kb_ready")
+		fi
+		[[ -n $kb_conn_id && -n $kb_backend_id && -n $kb_backend_addr ]] && break
+		sleep 0.5
+	done
+	if [[ -z $kb_conn_id || -z $kb_backend_id || -z $kb_backend_addr ]]; then
+		echo "chain-b: could not capture connection_ready identity" >&2
+		exit 1
+	fi
+	echo "chain-b: new session proxy_conn_id=$kb_conn_id backend_id=$kb_backend_id addr=$kb_backend_addr"
+	# The connection must be reflected in Go's accounting before we start.
+	kb_conn_open=$(ka_backend_conn "$kb_backend_addr")
+	if ((kb_conn_open < 1)); then
+		echo "chain-b: backend $kb_backend_addr shows $kb_conn_open conns, expected >=1 with the session open" >&2
+		exit 1
+	fi
+	# Arm the exact CLOSED drop for THIS connection on THIS backend.
+	curl --noproxy '*' --fail --silent --show-error -X POST \
+		--data-binary "{\"kind\":\"connection-event-closed\",\"connection_id\":$kb_conn_id,\"backend_id\":\"$kb_backend_id\"}" \
+		"http://127.0.0.1:$ka_drop_admin_port/arm" -o /dev/null
+	# Close the client: Rust emits ConnectionEvent{CLOSED}, the dropper
+	# swallows it and (pause-after-drop) tears + holds the control link.
+	exec 8>&-
+	for _ in {1..40}; do
+		kill -0 "$KB_SESSION_PID" 2>/dev/null || break
+		sleep 0.25
+	done
+	kill "$KB_SESSION_PID" 2>/dev/null || true
+	wait "$KB_SESSION_PID" 2>/dev/null || true
+	kb_dropped=false
+	for _ in {1..40}; do
+		if [[ $(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("drop_count"))' 2>/dev/null) == 1 ]]; then
+			kb_dropped=true
+			break
+		fi
+		sleep 0.25
+	done
+	if [[ $kb_dropped != true ]]; then
+		echo "chain-b: the CLOSED frame was never dropped" >&2
+		ka_drop_state >&2 || true
+		exit 1
+	fi
+	# Oracle 1 (ghost): Go never saw the CLOSED and no reconcile has run,
+	# so the accounting still holds the now-dead connection.
+	kb_conn_ghost=$(ka_backend_conn "$kb_backend_addr")
+	if ((kb_conn_ghost != kb_conn_open)); then
+		echo "chain-b: expected ghost accounting to stay $kb_conn_open, got $kb_conn_ghost" >&2
+		exit 1
+	fi
+	ka_drop_state >"$run_dir/controldropper-state-chainb-ghost.json"
+	if ! python3 - "$run_dir/controldropper-state-chainb-ghost.json" "$kb_conn_id" "$kb_backend_id" <<'PYB'
+import json, sys
+s = json.load(open(sys.argv[1]))
+conn_id, backend_id = int(sys.argv[2]), sys.argv[3]
+errs = []
+if s.get("drop_count") != 1:
+    errs.append(f'drop_count={s.get("drop_count")}')
+dropped = s.get("dropped") or []
+if len(dropped) != 1:
+    errs.append(f'len(dropped)={len(dropped)}')
+else:
+    d = dropped[0]
+    if d.get("kind") != "connection-event-closed":
+        errs.append(f'kind={d.get("kind")}')
+    if d.get("connection_id") != conn_id:
+        errs.append(f'conn_id={d.get("connection_id")}!={conn_id}')
+    if d.get("backend_id") != backend_id:
+        errs.append(f'backend_id={d.get("backend_id")!r}!={backend_id!r}')
+    if d.get("assignment_id"):
+        errs.append(f'unexpected assignment_id={d.get("assignment_id")!r}')
+if s.get("held") is not True:
+    errs.append(f'held={s.get("held")}')
+if errs:
+    print("chain-b ghost-state oracle failed: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+print(f'chain-b ghost: drop_count=1 conn={conn_id} backend={backend_id} held=true')
+PYB
+	then
+		echo "chain-b: dropper ghost-state oracle failed" >&2
+		exit 1
+	fi
+	echo "chain-b ghost: backend $kb_backend_addr still shows $kb_conn_ghost (CLOSED lost, no reconcile yet)"
+	# Release the hold: the next Rust reconnect fires the automatic
+	# reconcile, whose inventory omits the dead connection, so Go clears
+	# the ghost to EXACTLY the live count.
+	curl --noproxy '*' --fail --silent --show-error -X POST \
+		"http://127.0.0.1:$ka_drop_admin_port/release" -o /dev/null
+	kb_expected=$((kb_conn_open - 1))
+	kb_cleared=false
+	kb_now=$kb_conn_ghost
+	for _ in {1..60}; do
+		kb_now=$(ka_backend_conn "$kb_backend_addr")
+		if ((kb_now < 0)); then
+			echo "chain-b: accounting went negative ($kb_now)" >&2
+			exit 1
+		fi
+		if ((kb_now == kb_expected)); then
+			kb_cleared=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $kb_cleared != true ]]; then
+		echo "chain-b: reconcile never cleared the ghost to $kb_expected (last $kb_now)" >&2
+		exit 1
+	fi
+	ka_drop_state >"$run_dir/controldropper-state-chainb-reconciled.json"
+	echo "chain-b: reconcile cleared the ghost -> backend $kb_backend_addr now $kb_now (exactly open-1)"
+	rm -f "$KB_FIFO"
+	echo "control-frame-drop-closed: a lost ConnectionEvent{CLOSED} left a ghost; the automatic reconcile cleared it exactly"
+fi
 if [[ $mode == rust ]]; then
 	kill -s INT "$KA_RUST_PID" 2>/dev/null || true
 	for _ in {1..100}; do

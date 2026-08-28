@@ -98,6 +98,14 @@ fi
 if [[ -n ${KA_FIFO:-} ]]; then
 	rm -f "$KA_FIFO"
 fi
+# Chaos chain (b) persistent session + FIFO (present only when that chain
+# started and then failed before its own teardown).
+if [[ ${KB_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
+	kill "${KB_SESSION_PID}" 2>/dev/null || true
+fi
+if [[ -n ${KB_FIFO:-} ]]; then
+	rm -f "$KB_FIFO"
+fi
 stop_owned_process "${HOLDER_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
 stop_owned_process "${CONFLICT_PID:-}" "$run_dir/tiproxy-conflict.toml" || cleanup_status=1
 stop_owned_process "${RUST_CONFLICT_PID:-}" "$run_dir/absent.sock" || cleanup_status=1
