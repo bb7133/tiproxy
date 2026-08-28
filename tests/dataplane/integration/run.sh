@@ -1724,6 +1724,21 @@ if [[ $ka_use_dropper == true ]]; then
 	# the dead session's accounting is zeroed to exactly 0, a fresh session
 	# is served + counted, and its connection_ready carries a generation
 	# (the new session applied a snapshot).
+	# Quiesced baseline: the pin must be exactly 0 (the previous chain fully
+	# drained) so the session we open is the only thing that can move it,
+	# and the ghost we later observe is unambiguously this session's.
+	cd_quiesced=false
+	cd_base=1
+	for _ in {1..60}; do
+		cd_base=$(ka_backend_conn "$ka_pinned_addr")
+		((cd_base == 0)) && { cd_quiesced=true; break; }
+		sleep 0.5
+	done
+	if [[ $cd_quiesced != true ]]; then
+		echo "chain-d: pinned backend never quiesced to 0 before the chain (got $cd_base)" >&2
+		exit 1
+	fi
+	cd_rust_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
 	CD_FIFO="$run_dir/cd-session.fifo"
 	mkfifo "$CD_FIFO"
 	printf 'CD_FIFO=%q\n' "$CD_FIFO" >>"$run_dir/state.env"
@@ -1748,19 +1763,42 @@ if [[ $ka_use_dropper == true ]]; then
 		echo "chain-d: session landed on @@port=$cd_port, expected the pinned $TIDB_PORT_0" >&2
 		exit 1
 	fi
+	# Bind the session to A0 via its own fresh connection_ready and require a
+	# positive applied generation (a real snapshot, not a zero field).
+	cd_gen= cd_backend_addr=
+	for _ in {1..20}; do
+		cd_ready=$(tail -n "+$((cd_rust_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | tail -1 || true)
+		if [[ -n $cd_ready ]]; then
+			cd_backend_addr=$(sed -n 's/.*"backend_addr":"\([^"]*\)".*/\1/p' <<<"$cd_ready")
+			cd_gen=$(sed -n 's/.*"generation":\([0-9]*\).*/\1/p' <<<"$cd_ready")
+		fi
+		[[ -n $cd_backend_addr && -n $cd_gen ]] && break
+		sleep 0.5
+	done
+	if [[ $cd_backend_addr != "$ka_pinned_addr" ]]; then
+		echo "chain-d: session backend $cd_backend_addr is not the pinned $ka_pinned_addr" >&2
+		exit 1
+	fi
+	if [[ ! $cd_gen =~ ^[1-9][0-9]*$ ]]; then
+		echo "chain-d: session connection_ready generation '$cd_gen' is not a positive integer" >&2
+		exit 1
+	fi
+	# Confirm the session raised the pin from the quiesced 0 to EXACTLY 1.
 	cd_before_ready=false
 	cd_before=0
 	for _ in {1..60}; do
 		cd_before=$(ka_backend_conn "$ka_pinned_addr")
+		((cd_before > 1)) && { echo "chain-d: pin over-counted to $cd_before opening the session" >&2; exit 1; }
 		((cd_before == 1)) && { cd_before_ready=true; break; }
 		sleep 0.5
 	done
 	if [[ $cd_before_ready != true ]]; then
-		echo "chain-d: pinned backend did not settle to the 1 live session (got $cd_before)" >&2
+		echo "chain-d: opening the session did not raise the pin from 0 to exactly 1 (got $cd_before)" >&2
 		exit 1
 	fi
 	cd_old_rust=$KA_RUST_PID
-	echo "chain-d: live session backend=127.0.0.1:$cd_port; Rust pid=$cd_old_rust; gauge=$cd_before"
+	echo "chain-d: live session backend=127.0.0.1:$cd_port generation=$cd_gen; Rust pid=$cd_old_rust; gauge 0 -> $cd_before"
 	# SIGKILL the Rust dataplane; its client session dies without a CLOSED.
 	sigkill_owned_process "$cd_old_rust" "$ka_rust_control_socket" ||
 		{ echo "chain-d: could not SIGKILL Rust $cd_old_rust" >&2; exit 1; }
@@ -1768,6 +1806,17 @@ if [[ $ka_use_dropper == true ]]; then
 	kill "$CD_SESSION_PID" 2>/dev/null || true
 	wait "$CD_SESSION_PID" 2>/dev/null || true
 	printf 'CD_SESSION_PID=\n' >>"$run_dir/state.env"
+	# Ghost window: with the old Rust dead and no CLOSED sent, Go must still
+	# hold the session — assert the pin is STILL exactly 1 BEFORE any
+	# successor starts, so the later zeroing is attributable solely to the
+	# successor Rust control session's empty reconcile (not a delayed CLOSED
+	# or the control disconnect).
+	cd_ghost=$(ka_backend_conn "$ka_pinned_addr")
+	if ((cd_ghost != 1)); then
+		echo "chain-d: dead session did not persist as a ghost at 1 before restart (got $cd_ghost)" >&2
+		exit 1
+	fi
+	echo "chain-d: dead session persists as a ghost (gauge=$cd_ghost) before the successor starts"
 	# Restart Rust on the same control socket (the dropper front) + health
 	# port; it reconnects with an empty inventory.
 	"$rust_binary" --control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
@@ -1866,8 +1915,8 @@ if [[ $ka_use_dropper == true ]]; then
 		[[ -n $cd2_gen ]] && break
 		sleep 0.25
 	done
-	if [[ -z $cd2_gen ]]; then
-		echo "chain-d: the new session logged no connection_ready generation" >&2
+	if [[ ! $cd2_gen =~ ^[1-9][0-9]*$ ]]; then
+		echo "chain-d: the new session connection_ready generation '$cd2_gen' is not a positive integer" >&2
 		exit 1
 	fi
 	echo "chain-d: new session counted -> backend $ka_pinned_addr now $cd2_now, connection_ready generation=$cd2_gen"
