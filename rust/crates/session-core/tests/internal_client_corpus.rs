@@ -147,6 +147,7 @@ fn migration_query_and_result_match_go_corpus() -> Result<(), Box<dyn Error>> {
     };
     assert_eq!(snapshot.session_states(), r#"{"current-db":"corpus_db"}"#);
     assert_eq!(snapshot.session_token(), "synthetic-token-1");
+    assert_eq!(snapshot.current_database(), Some("corpus_db"));
     assert_eq!(parser.state(), InternalParserState::Complete);
     Ok(())
 }
