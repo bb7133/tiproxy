@@ -22,7 +22,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
@@ -164,8 +164,39 @@ impl ClientConfig {
     }
 }
 
+/// One negotiated control session's non-reusable identity.
+///
+/// The `serial` is minted locally per successful handshake and never
+/// reused within this Rust process, so it distinguishes SESSIONS even
+/// when the wire `epoch` value repeats (a restarted Go assigns epochs
+/// from its own counter). The peer fields identify the Go process
+/// LINEAGE — validated non-empty/non-zero at Hello under the
+/// production capability closure — so consumers can tell a same-Go
+/// reconnect (generation lineage continues) from a new Go process
+/// (generation lineage restarts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMeta {
+    /// Rust-local, strictly increasing per successful handshake.
+    pub serial: u64,
+    /// The wire control epoch frames are stamped with.
+    pub epoch: u64,
+    /// The Go peer's process id from its Hello.
+    pub peer_process_id: Arc<str>,
+    /// The Go peer's start time from its Hello.
+    pub peer_started_unix_millis: u64,
+}
+
+impl SessionMeta {
+    /// Whether `other` belongs to the same Go process lineage.
+    #[must_use]
+    pub fn same_lineage(&self, other: &Self) -> bool {
+        self.peer_process_id == other.peer_process_id
+            && self.peer_started_unix_millis == other.peer_started_unix_millis
+    }
+}
+
 /// Observable connection state from the single mutable transport owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     /// No negotiated Go owner is available.
     Disconnected,
@@ -180,6 +211,19 @@ pub enum ConnectionState {
         epoch: u64,
         /// Bitmask of negotiated capability ids.
         capabilities: u64,
+        /// The Rust-local session serial (see [`SessionMeta`]): unique
+        /// per successful handshake even when the wire epoch value
+        /// repeats across Go restarts.
+        serial: u64,
+        /// The Go peer's process id from its Hello — the lineage half
+        /// of the session identity. Frames tagged with a DIFFERENT
+        /// lineage than the live session must be dropped before any
+        /// serving/store/gate side effect (wire epoch values repeat
+        /// across Go restarts, so lineage is the only safe test).
+        peer_process_id: Arc<str>,
+        /// The Go peer's start time from its Hello (lineage, with
+        /// `peer_process_id`).
+        peer_started_unix_millis: u64,
     },
     /// The transport was explicitly shut down.
     Shutdown,
@@ -299,10 +343,10 @@ pub trait Handler: Send + Sync {
     /// Returning an error ends the session before any frame is read.
     fn resume_session(
         &self,
-        epoch: u64,
+        session: SessionMeta,
     ) -> impl Future<Output = Result<(), TransportError>> + Send {
         async move {
-            let _ = epoch;
+            let _ = session;
             Ok(())
         }
     }
@@ -324,6 +368,9 @@ pub struct ControlClient {
     shutdown_tx: watch::Sender<bool>,
     state_tx: watch::Sender<ConnectionState>,
     epoch: AtomicU64,
+    /// Rust-local session serial: incremented per successful handshake,
+    /// never reused within this process (see [`SessionMeta`]).
+    session_serial: AtomicU64,
     negotiated_frame_limit: AtomicU64,
     /// Bitmask of negotiated control capabilities (bit per capability id
     /// below 64), set on connect and cleared on disconnect.
@@ -334,8 +381,21 @@ pub struct ControlClient {
     /// no longer negotiated at write (or enqueue) time; the owner
     /// regenerates that work on the next `Connected` transition.
     session_scoped_dropped: AtomicU64,
+    /// Inbound `StateSnapshot`s the snapshot owner dropped because their
+    /// origin Go lineage was not the live session's (a queued snapshot
+    /// the owner outran across a Go restart) — never staged, applied,
+    /// committed, or allowed to move last-good / applied-generation.
+    foreign_snapshot_dropped: AtomicU64,
     reconnect_attempts: AtomicU64,
     running: AtomicBool,
+    /// Serializes a new session's `Connected` publication against the
+    /// snapshot owner's serving/commit transaction. The owner holds
+    /// this across [check current lineage -> serving swap -> store
+    /// commit] and the transport holds it across publishing a new
+    /// `Connected`, so the two are linearized: a snapshot either
+    /// applies fully under its own live session or observes the
+    /// successor and does nothing — never a serving/store split.
+    session_lease: Arc<Mutex<()>>,
     last_received: StdMutex<Option<Instant>>,
     last_good_snapshot: StdMutex<Option<(u64, Instant)>>,
     last_disconnect: StdMutex<Option<String>>,
@@ -359,17 +419,35 @@ impl ControlClient {
             shutdown_tx,
             state_tx,
             epoch: AtomicU64::new(0),
+            session_serial: AtomicU64::new(0),
             negotiated_frame_limit: AtomicU64::new(u64::from(initial_frame_limit)),
             negotiated_caps: AtomicU64::new(0),
             next_request_id: AtomicU64::new(0),
             metrics_dropped: AtomicU64::new(0),
             session_scoped_dropped: AtomicU64::new(0),
+            foreign_snapshot_dropped: AtomicU64::new(0),
             reconnect_attempts: AtomicU64::new(0),
             running: AtomicBool::new(false),
+            session_lease: Arc::new(Mutex::new(())),
             last_received: StdMutex::new(None),
             last_good_snapshot: StdMutex::new(None),
             last_disconnect: StdMutex::new(None),
         })
+    }
+
+    /// Publishes a connection-state transition under the session
+    /// ownership lease. EVERY publication that establishes, changes, or
+    /// clears the active session goes through here, so a snapshot
+    /// owner's whole transaction (which also holds the lease) is
+    /// linearized against all of them: the owner either observes the
+    /// transition before its lineage check or completes its entire
+    /// transaction before the transition is visible. Nothing that
+    /// revokes A's ownership — a teardown `Disconnected`, `Connecting`,
+    /// `Shutdown`, or a successor `Connected` — can land in the middle
+    /// of A's serving swap / store commit / applied-generation barrier.
+    async fn publish_state(&self, state: ConnectionState) {
+        let _lease = self.session_lease.lock().await;
+        let _ = self.state_tx.send(state);
     }
 
     /// Runs connect, Hello, the active session, and capped full-jitter reconnect.
@@ -396,15 +474,15 @@ impl ControlClient {
         let mut jitter = FullJitter::new(self.config.reconnect_jitter_seed);
         loop {
             if *shutdown.borrow() {
-                let _ = self.state_tx.send(ConnectionState::Shutdown);
+                self.publish_state(ConnectionState::Shutdown).await;
                 return Ok(());
             }
-            let _ = self.state_tx.send(ConnectionState::Connecting);
+            self.publish_state(ConnectionState::Connecting).await;
             let connection = tokio::select! {
                 result = self.connect_and_handshake() => result,
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        let _ = self.state_tx.send(ConnectionState::Shutdown);
+                        self.publish_state(ConnectionState::Shutdown).await;
                         return Ok(());
                     }
                     Err(TransportError::Protocol("shutdown state regressed".to_owned()))
@@ -413,6 +491,17 @@ impl ControlClient {
             match connection {
                 Ok(negotiated) => {
                     backoff = self.config.reconnect_base;
+                    let Some(serial) = self.allocate_session_serial() else {
+                        // The Rust-local session serial space is
+                        // exhausted (2^64 handshakes): fail closed
+                        // rather than publish a wrapped serial 0 that
+                        // would break every session-scoped send. The
+                        // supervisor surfaces this terminal condition.
+                        self.publish_state(ConnectionState::Disconnected).await;
+                        return Err(TransportError::Protocol(
+                            "session serial space exhausted".to_owned(),
+                        ));
+                    };
                     self.epoch.store(negotiated.epoch, Ordering::Release);
                     self.negotiated_frame_limit
                         .store(u64::from(negotiated.max_frame_bytes), Ordering::Release);
@@ -424,11 +513,15 @@ impl ControlClient {
                     }
                     self.negotiated_caps.store(caps_mask, Ordering::Release);
                     set_instant(&self.last_received, Some(Instant::now()));
-                    let _ = self.state_tx.send(ConnectionState::Connected {
+                    self.publish_state(ConnectionState::Connected {
                         epoch: negotiated.epoch,
                         capabilities: caps_mask,
-                    });
-                    let result = self.run_connected(negotiated, handler).await;
+                        serial,
+                        peer_process_id: Arc::clone(&negotiated.peer_process_id),
+                        peer_started_unix_millis: negotiated.peer_started_unix_millis,
+                    })
+                    .await;
+                    let result = self.run_connected(negotiated, serial, handler).await;
                     if !matches!(result, Err(TransportError::Closed)) {
                         set_string(&self.last_disconnect, Some(result_to_string(&result)));
                     }
@@ -441,7 +534,7 @@ impl ControlClient {
             self.negotiated_caps.store(0, Ordering::Release);
             self.negotiated_frame_limit
                 .store(u64::from(self.config.max_frame_bytes), Ordering::Release);
-            let _ = self.state_tx.send(ConnectionState::Disconnected);
+            self.publish_state(ConnectionState::Disconnected).await;
             if *shutdown.borrow() {
                 continue;
             }
@@ -452,7 +545,7 @@ impl ControlClient {
                 () = sleep(reconnect_wait) => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        let _ = self.state_tx.send(ConnectionState::Shutdown);
+                        self.publish_state(ConnectionState::Shutdown).await;
                         return Ok(());
                     }
                 }
@@ -476,7 +569,7 @@ impl ControlClient {
     async fn enqueue(
         &self,
         mut envelope: ControlEnvelope,
-        session_epoch: Option<u64>,
+        session_serial: Option<u64>,
     ) -> Result<(), TransportError> {
         if *self.shutdown_tx.borrow() {
             return Err(TransportError::Closed);
@@ -503,7 +596,7 @@ impl ControlClient {
                 QueuedEnvelope {
                     envelope,
                     size,
-                    session_epoch,
+                    session_serial,
                 },
                 drop_metrics,
                 self.shutdown_tx.subscribe(),
@@ -516,28 +609,31 @@ impl ControlClient {
         result
     }
 
-    /// Queues a **session-scoped** envelope bound to `epoch`: it is
-    /// written only while that exact epoch is negotiated and otherwise
-    /// dropped (counted in
+    /// Queues a **session-scoped** envelope bound to the Rust-local
+    /// session `serial` (see [`SessionMeta`]): it is written only while
+    /// that exact session is live and otherwise dropped (counted in
     /// [`ControlClient::session_scoped_dropped`]) — correct because the
-    /// owner regenerates such work on every `Connected` transition.
-    /// Durable cross-reconnect work (results, lifecycle events,
-    /// metering batches) must use [`ControlClient::send`] instead.
+    /// owner regenerates such work on every `Connected` transition. The
+    /// serial, not the wire epoch, is the binding: a restarted Go can
+    /// negotiate the same epoch VALUE, and epoch-bound work from the
+    /// dead session must never reach it. Durable cross-reconnect work
+    /// (results with incarnation-qualified operation ids, lifecycle
+    /// events, metering batches) must use [`ControlClient::send`].
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::StaleSessionEpoch`] when `epoch` is
-    /// no longer the negotiated epoch at enqueue time, plus every
+    /// Returns [`TransportError::StaleSessionEpoch`] when `serial` is
+    /// no longer the live session at enqueue time, plus every
     /// [`ControlClient::send`] failure mode.
     pub async fn send_session_scoped(
         &self,
         envelope: ControlEnvelope,
-        epoch: u64,
+        serial: u64,
     ) -> Result<(), TransportError> {
-        if epoch == 0 || self.epoch.load(Ordering::Acquire) != epoch {
+        if serial == 0 || self.session_serial.load(Ordering::Acquire) != serial {
             return Err(TransportError::StaleSessionEpoch);
         }
-        self.enqueue(envelope, Some(epoch)).await
+        self.enqueue(envelope, Some(serial)).await
     }
 
     /// Whether shutdown has been requested on this client.
@@ -588,6 +684,27 @@ impl ControlClient {
             .map(|previous| previous + 1)
     }
 
+    /// Mints the next Rust-local session serial (strictly increasing,
+    /// starting at 1, never reused). Like [`Self::allocate_request_id`]
+    /// it refuses at [`u64::MAX`] via compare-and-swap rather than
+    /// wrapping: a plain `fetch_add` would publish serial 0 (which
+    /// [`Self::send_session_scoped`] treats as permanently stale) and
+    /// then hand a second session the duplicate serial 1. Exhaustion
+    /// fails the handshake closed instead of ever publishing a
+    /// `Connected { serial: 0 }`.
+    fn allocate_session_serial(&self) -> Option<u64> {
+        self.session_serial
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                if current == u64::MAX {
+                    None
+                } else {
+                    Some(current + 1)
+                }
+            })
+            .ok()
+            .map(|previous| previous + 1)
+    }
+
     /// Returns the currently negotiated epoch, or zero when disconnected.
     #[must_use]
     pub fn epoch(&self) -> u64 {
@@ -614,23 +731,52 @@ impl ControlClient {
         self.metrics_dropped.load(Ordering::Relaxed)
     }
 
+    /// The session-ownership lease (see the field docs): the snapshot
+    /// owner locks it across its whole serving/commit transaction so a
+    /// new session's `Connected` cannot be published mid-transaction.
+    #[must_use]
+    pub fn session_lease(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.session_lease)
+    }
+
+    /// Returns how many inbound snapshots the owner dropped for
+    /// belonging to a foreign Go lineage (observable evidence that the
+    /// owner-side lineage gate fired).
+    #[must_use]
+    pub fn foreign_snapshot_dropped(&self) -> u64 {
+        self.foreign_snapshot_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Records one owner-side foreign-lineage snapshot drop.
+    pub fn count_foreign_snapshot_dropped(&self) {
+        self.foreign_snapshot_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns the age of the last complete, validated peer frame.
     #[must_use]
     pub fn last_received_age(&self) -> Option<Duration> {
         lock_std(&self.last_received).map(|received| received.elapsed())
     }
 
-    /// Records an atomically applied last-good snapshot generation.
+    /// Records the generation the authoritative [`SnapshotStore`] just
+    /// committed as last-good, with the current time.
     ///
-    /// Lower generations never move the clock or generation backwards.
+    /// There is deliberately NO generation-monotonic guard here: the
+    /// store is the single authority on what may commit, and it is
+    /// lineage-aware. A same-lineage stale or conflicting generation is
+    /// rejected by the store and never reaches this call; a restarted Go
+    /// is a NEW lineage whose generations reset to 1, and its first
+    /// committed generation must replace the dead lineage's — exactly as
+    /// the Go publisher's status follows this process's applied result.
+    /// Guarding on `generation >= current` here would wrongly pin the
+    /// diagnostics (and the heartbeat's reported generation) to the dead
+    /// lineage's higher number.
     pub fn mark_last_good_snapshot(&self, generation: u64) {
         if generation == 0 {
             return;
         }
-        let mut last_good = lock_std(&self.last_good_snapshot);
-        if last_good.is_none_or(|(current, _)| generation >= current) {
-            *last_good = Some((generation, Instant::now()));
-        }
+        *lock_std(&self.last_good_snapshot) = Some((generation, Instant::now()));
     }
 
     /// Returns the last-good snapshot generation and its current age.
@@ -673,6 +819,16 @@ impl ControlClient {
                 "peer Hello must advertise Go role and protocol v1".to_owned(),
             ));
         }
+        // Lineage identity is fail-closed: generation lineage decisions
+        // depend on these two fields, and two restarted peers both
+        // presenting ("", 0) would be indistinguishable — the
+        // generation-reset acceptance would silently regress.
+        if remote_hello.process_id.is_empty() || remote_hello.process_started_unix_millis == 0 {
+            return Err(TransportError::Protocol(
+                "peer Hello must carry a nonempty process_id and a nonzero process_started_unix_millis"
+                    .to_owned(),
+            ));
+        }
 
         let local_hello = self.config.local_hello.clone();
         write_frame_async(
@@ -712,12 +868,15 @@ impl ControlClient {
             epoch: remote_ack.control_epoch,
             max_frame_bytes: remote_ack.max_frame_bytes,
             capabilities: remote_ack.negotiated_capabilities,
+            peer_process_id: Arc::from(remote_hello.process_id.as_str()),
+            peer_started_unix_millis: remote_hello.process_started_unix_millis,
         })
     }
 
     async fn run_connected<H: Handler>(
         &self,
         negotiated: Negotiated,
+        serial: u64,
         handler: &H,
     ) -> Result<(), TransportError> {
         let Negotiated {
@@ -725,7 +884,15 @@ impl ControlClient {
             epoch,
             max_frame_bytes,
             capabilities,
+            peer_process_id,
+            peer_started_unix_millis,
         } = negotiated;
+        let session = SessionMeta {
+            serial,
+            epoch,
+            peer_process_id,
+            peer_started_unix_millis,
+        };
         let (mut reader, mut writer) = stream.into_split();
         let last_sent = StdMutex::new(Instant::now());
         let mut shutdown = self.shutdown_tx.subscribe();
@@ -742,7 +909,7 @@ impl ControlClient {
             // contract) so the join below always converges.
             let mut resume_stop = session_stop_tx.subscribe();
             tokio::select! {
-                result = handler.resume_session(epoch) => result?,
+                result = handler.resume_session(session.clone()) => result?,
                 changed = resume_stop.changed() => {
                     if changed.is_err() || *resume_stop.borrow() {
                         return Err(TransportError::Closed);
@@ -765,6 +932,7 @@ impl ControlClient {
         let write_loop = self.write_loop(
             &mut writer,
             epoch,
+            serial,
             max_frame_bytes,
             &last_sent,
             session_stop_tx.subscribe(),
@@ -792,7 +960,7 @@ impl ControlClient {
         // lanes only a future session can drain.
         self.epoch.store(0, Ordering::Release);
         self.negotiated_caps.store(0, Ordering::Release);
-        let _ = self.state_tx.send(ConnectionState::Disconnected);
+        self.publish_state(ConnectionState::Disconnected).await;
         match first {
             CompletedLoop::Read(result) => {
                 let _ = tokio::join!(&mut write_loop, &mut heartbeat_loop);
@@ -845,12 +1013,13 @@ impl ControlClient {
         &self,
         writer: &mut W,
         epoch: u64,
+        serial: u64,
         max_frame_bytes: u32,
         last_sent: &StdMutex<Instant>,
         mut session_stop: watch::Receiver<bool>,
     ) -> Result<(), TransportError> {
         loop {
-            let (mut envelope, session_epoch) = tokio::select! {
+            let (mut envelope, session_serial) = tokio::select! {
                 result = self.queues.next(self.shutdown_tx.subscribe()) => result?,
                 changed = session_stop.changed() => {
                     if changed.is_err() || *session_stop.borrow() {
@@ -859,13 +1028,15 @@ impl ControlClient {
                     continue;
                 }
             };
-            if let Some(bound) = session_epoch
-                && bound != epoch
+            if let Some(bound) = session_serial
+                && bound != serial
             {
-                // Session-scoped work bound to a dead epoch: consume it
-                // (freeing lane space for durable work) and count — the
-                // owner regenerated it on this session's `Connected`
-                // transition.
+                // Session-scoped work bound to a dead SESSION (by the
+                // Rust-local serial — a restarted Go may reuse the
+                // epoch value, so the serial is the only safe binding):
+                // consume it (freeing lane space for durable work) and
+                // count — the owner regenerated it on this session's
+                // `Connected` transition.
                 self.queues.commit(&envelope).await?;
                 self.session_scoped_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -936,11 +1107,11 @@ impl ControlClient {
                 })),
                 ..Default::default()
             };
-            let session_epoch = self.epoch.load(Ordering::Acquire);
+            let session_serial = self.session_serial.load(Ordering::Acquire);
             tokio::select! {
                 result = timeout(
                     self.config.peer_timeout,
-                    self.send_session_scoped(heartbeat, session_epoch),
+                    self.send_session_scoped(heartbeat, session_serial),
                 ) => {
                     match result.map_err(|_| TransportError::Timeout("heartbeat queue"))? {
                         // The session ended between the interval firing
@@ -965,6 +1136,8 @@ struct Negotiated {
     epoch: u64,
     max_frame_bytes: u32,
     capabilities: Vec<u64>,
+    peer_process_id: Arc<str>,
+    peer_started_unix_millis: u64,
 }
 
 enum CompletedLoop {
@@ -986,13 +1159,17 @@ impl Drop for RunningGuard<'_> {
 struct QueuedEnvelope {
     envelope: ControlEnvelope,
     size: usize,
-    /// `Some(epoch)` marks a session-scoped envelope: it may only be
-    /// written under exactly this negotiated epoch and is dropped
-    /// (counted) otherwise — the owner regenerates it on the next
-    /// `Connected` transition. `None` marks durable-across-reconnect
-    /// work (results, lifecycle events, metering batches) that must
-    /// never be dropped; the peer dedups it by request id / sequence.
-    session_epoch: Option<u64>,
+    /// `Some(serial)` marks a session-scoped envelope: it may only be
+    /// written under exactly this Rust-local session serial and is
+    /// dropped (counted) otherwise — the owner regenerates it on the
+    /// next `Connected` transition. The serial (not the wire epoch,
+    /// whose VALUE a restarted Go can reuse) is the binding, so work
+    /// queued for a dead session can never be written to a new peer
+    /// that happens to negotiate the same epoch number. `None` marks
+    /// durable-across-reconnect work (results, lifecycle events,
+    /// metering batches) that must never be dropped; the peer dedups
+    /// it by request id / sequence.
+    session_serial: Option<u64>,
 }
 
 struct LaneState {
@@ -1070,9 +1247,9 @@ impl LaneQueue {
         }
         let item = state.items.pop_front()?;
         let envelope = item.envelope.clone();
-        let session_epoch = item.session_epoch;
+        let session_serial = item.session_serial;
         state.in_flight = Some(item);
-        Some((envelope, session_epoch))
+        Some((envelope, session_serial))
     }
 
     async fn commit(&self) -> Result<(), TransportError> {
@@ -1493,6 +1670,9 @@ mod tests {
         Hello {
             role: Role::GoControl as i32,
             process_id: "go-fake-server".to_owned(),
+            // The lineage identity contract requires a nonzero start
+            // time; fixtures model the production fact.
+            process_started_unix_millis: 1_700_000_000_000,
             supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
             capabilities: vec![2, 3, 5],
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
@@ -1655,6 +1835,131 @@ mod tests {
         assert!(matches!(received.body, Some(Body::Heartbeat(_))));
         assert_eq!(client.epoch(), 2);
         assert!(client.reconnect_attempts() >= 1);
+        client.shutdown();
+        timeout(Duration::from_secs(1), client_task).await???;
+        server_task.await??;
+        Ok(())
+    }
+
+    /// Fix-2 outbound-binding regression: an envelope enqueued
+    /// session-scoped while its session is already dead must NEVER be
+    /// written to the replacement session — even one that negotiated
+    /// the SAME wire epoch value — while a durable envelope enqueued
+    /// AFTER it (same priority queue, FIFO) still flows. After the
+    /// replacement is live, scoping to the dead serial fails fast.
+    #[tokio::test]
+    async fn session_scoped_queue_never_reaches_the_next_session() -> Result<(), Box<dyn Error>> {
+        let (socket, listener) = TestSocket::bind()?;
+        let client = Arc::new(ControlClient::new(test_config(&socket))?);
+        let mut state = client.subscribe_state();
+        let run_client = Arc::clone(&client);
+        let client_task = tokio::spawn(async move { run_client.run(&|_envelope| Ok(())).await });
+
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let server_task = tokio::spawn(async move {
+            let first = fake_go_handshake(&listener, 1, false).await?;
+            drop(first);
+            // The replacement negotiates the SAME wire epoch value 1.
+            let mut second = fake_go_handshake(&listener, 1, false).await?;
+            loop {
+                let frame = read_frame_async(&mut second, DEFAULT_MAX_FRAME_BYTES).await?;
+                let done = frame.request_id == 888;
+                if seen_tx.send(frame).is_err() || done {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+            Ok::<(), TransportError>(())
+        });
+
+        // Session 1 is live: capture its serial, then wait for the
+        // client to observe its death.
+        let first_serial = loop {
+            if let ConnectionState::Connected { serial, .. } = &*state.borrow_and_update() {
+                let serial = *serial;
+                break serial;
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| TransportError::Configuration("state channel closed".to_owned()))?;
+        };
+        loop {
+            if !matches!(
+                *state.borrow_and_update(),
+                ConnectionState::Connected { .. }
+            ) {
+                break;
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| TransportError::Configuration("state channel closed".to_owned()))?;
+        }
+
+        // Dead-session-bound first, durable second — same critical
+        // queue, FIFO: if the durable arrives, the bound one was
+        // dropped at dequeue, not merely reordered.
+        let scoped = ControlEnvelope {
+            request_id: 777,
+            priority: Priority::Critical.into(),
+            body: Some(Body::Heartbeat(Heartbeat::default())),
+            ..ControlEnvelope::default()
+        };
+        client.send_session_scoped(scoped, first_serial).await?;
+        let durable = ControlEnvelope {
+            request_id: 888,
+            priority: Priority::Critical.into(),
+            body: Some(Body::Heartbeat(Heartbeat::default())),
+            ..ControlEnvelope::default()
+        };
+        client.send(durable).await?;
+
+        // The replacement session delivers the durable envelope and
+        // never the dead-session-bound one.
+        let mut delivered = Vec::new();
+        while let Some(frame) = seen_rx.recv().await {
+            let done = frame.request_id == 888;
+            delivered.push(frame.request_id);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            delivered.contains(&888),
+            "durable outbound survives: {delivered:?}"
+        );
+        assert!(
+            !delivered.contains(&777),
+            "the dead session's scoped outbound must never reach the next session: {delivered:?}"
+        );
+
+        // With the replacement live, the dead serial fails fast.
+        let second_serial = loop {
+            match &*state.borrow_and_update() {
+                ConnectionState::Connected { serial, .. } if *serial != first_serial => {
+                    break *serial;
+                }
+                _ => {}
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| TransportError::Configuration("state channel closed".to_owned()))?;
+        };
+        assert_ne!(second_serial, first_serial);
+        let late = ControlEnvelope {
+            request_id: 779,
+            priority: Priority::Critical.into(),
+            body: Some(Body::Heartbeat(Heartbeat::default())),
+            ..ControlEnvelope::default()
+        };
+        let refused = client.send_session_scoped(late, first_serial).await;
+        assert!(
+            matches!(refused, Err(TransportError::StaleSessionEpoch)),
+            "scoping to a dead serial fails fast: {refused:?}"
+        );
+
         client.shutdown();
         timeout(Duration::from_secs(1), client_task).await???;
         server_task.await??;
@@ -1891,16 +2196,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_good_generation_is_monotonic_and_jitter_is_capped() -> Result<(), Box<dyn Error>>
-    {
+    async fn last_good_generation_follows_the_store_and_jitter_is_capped()
+    -> Result<(), Box<dyn Error>> {
         let (socket, _listener) = TestSocket::bind()?;
         let client = ControlClient::new(test_config(&socket))?;
+        // last-good follows the authoritative store, not a local
+        // monotonic guard: a restarted Go is a new lineage whose
+        // generation resets, so its committed generation replaces the
+        // dead lineage's higher one.
         client.mark_last_good_snapshot(9);
         client.mark_last_good_snapshot(8);
         let (generation, _) = client
             .last_good_snapshot_age()
             .ok_or("missing last-good snapshot")?;
-        assert_eq!(generation, 9);
+        assert_eq!(generation, 8);
 
         let mut first = FullJitter::new(42);
         let mut second = FullJitter::new(42);
@@ -1930,7 +2239,7 @@ mod tests {
             Ok(())
         }
 
-        async fn resume_session(&self, _epoch: u64) -> Result<(), TransportError> {
+        async fn resume_session(&self, _session: SessionMeta) -> Result<(), TransportError> {
             self.resume_calls.fetch_add(1, Ordering::Relaxed);
             let mut release = self.release.clone();
             loop {
@@ -1947,6 +2256,85 @@ mod tests {
     /// Two-phase reconnect: no frame is read (the handler is not
     /// invoked) until `resume_session` completes, even when the peer
     /// already wrote one — and releasing the gate delivers it.
+    /// A Go Hello with an empty `process_id` is rejected at handshake —
+    /// the lineage identity contract is fail-closed and unconditional.
+    #[tokio::test]
+    async fn handshake_rejects_hello_missing_process_id() -> Result<(), Box<dyn Error>> {
+        let (socket, listener) = TestSocket::bind()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut hello = go_hello();
+            hello.process_id = String::new();
+            write_frame_async(&mut stream, &hello_envelope(hello), DEFAULT_MAX_FRAME_BYTES).await?;
+            // The client rejects before answering; give it a beat.
+            sleep(Duration::from_millis(50)).await;
+            Ok::<(), TransportError>(())
+        });
+        let client = ControlClient::new(test_config(&socket))?;
+        let result = client.connect_and_handshake().await;
+        let Err(TransportError::Protocol(message)) = result else {
+            unreachable!("a missing process_id must fail the handshake")
+        };
+        assert!(
+            message.contains("nonempty process_id"),
+            "the rejection names the identity contract: {message}"
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// A Go Hello with a zero `process_started_unix_millis` is rejected
+    /// at handshake for the same lineage-identity reason.
+    #[tokio::test]
+    async fn handshake_rejects_hello_zero_started() -> Result<(), Box<dyn Error>> {
+        let (socket, listener) = TestSocket::bind()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut hello = go_hello();
+            hello.process_started_unix_millis = 0;
+            write_frame_async(&mut stream, &hello_envelope(hello), DEFAULT_MAX_FRAME_BYTES).await?;
+            sleep(Duration::from_millis(50)).await;
+            Ok::<(), TransportError>(())
+        });
+        let client = ControlClient::new(test_config(&socket))?;
+        let result = client.connect_and_handshake().await;
+        let Err(TransportError::Protocol(message)) = result else {
+            unreachable!("a zero start time must fail the handshake")
+        };
+        assert!(
+            message.contains("nonzero process_started_unix_millis"),
+            "the rejection names the identity contract: {message}"
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_serial_refuses_to_wrap_at_max() -> Result<(), Box<dyn Error>> {
+        let (socket, _listener) = TestSocket::bind()?;
+        let client = ControlClient::new(test_config(&socket))?;
+        // One handshake before exhaustion: the last legal serial is
+        // u64::MAX, minted from the pre-MAX counter value.
+        client.session_serial.store(u64::MAX - 1, Ordering::Release);
+        assert_eq!(
+            client.allocate_session_serial(),
+            Some(u64::MAX),
+            "the last serial before exhaustion is u64::MAX, never a wrap to 0"
+        );
+        // Now exhausted: the allocator refuses instead of publishing 0.
+        assert_eq!(
+            client.allocate_session_serial(),
+            None,
+            "an exhausted serial space fails closed, never reissues 0 or 1"
+        );
+        assert_eq!(
+            client.allocate_session_serial(),
+            None,
+            "exhaustion is stable"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reader_waits_for_resume_session() -> Result<(), Box<dyn Error>> {
         let (socket, listener) = TestSocket::bind()?;

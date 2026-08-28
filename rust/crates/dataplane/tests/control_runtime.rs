@@ -21,8 +21,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use control_proto::control_transport::{ClientConfig, ControlClient, TransportError};
-use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime};
+use control_proto::control_transport::{
+    ClientConfig, ConnectionState, ControlClient, SessionMeta, TransportError,
+};
+use control_proto::snapshot::{SnapshotError, SnapshotLineage, SnapshotStore, UnixTime};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     ConfigSnapshot, ControlEnvelope, Hello, KeepalivePolicy, Listener, ProxyProtocolMode, Role,
@@ -30,7 +32,8 @@ use control_proto::v1::{
 };
 use dataplane::control_dispatch::DispatchFatal;
 use dataplane::control_dispatch::{
-    ExpectResponseError, MeteringRecordError, ResponseKind, spawn_control_dispatch_with_handler,
+    ExpectResponseError, MeteringRecordError, ResponseKind, TaggedEnvelope,
+    spawn_control_dispatch_with_handler,
 };
 use dataplane::control_runtime::{
     ControlRuntime, ControlRuntimeConfig, SnapshotStep, process_state_snapshot,
@@ -75,7 +78,9 @@ async fn runtime_shutdown_cascades_to_clean_join() {
     let handle = runtime.handle();
     // The session surface is live even while disconnected.
     assert!(
-        handle.applied_generation(7).await,
+        handle
+            .applied_generation(7, Arc::from("go-fixture"), 1_700_000_000_000)
+            .await,
         "the dispatch task accepts notices"
     );
     runtime.shutdown();
@@ -124,6 +129,95 @@ fn snapshot_envelope(request_id: u64, generation: u64) -> ControlEnvelope {
     }
 }
 
+fn test_session() -> SessionMeta {
+    SessionMeta {
+        serial: 7,
+        epoch: 1,
+        peer_process_id: Arc::from("go-fixture"),
+        peer_started_unix_millis: 1_700_000_000_000,
+    }
+}
+
+fn tagged(envelope: ControlEnvelope) -> TaggedEnvelope {
+    TaggedEnvelope {
+        envelope,
+        origin: test_session(),
+    }
+}
+
+fn tagged_as(envelope: ControlEnvelope, process_id: &str, serial: u64) -> TaggedEnvelope {
+    TaggedEnvelope {
+        envelope,
+        origin: SessionMeta {
+            serial,
+            epoch: 1,
+            peer_process_id: Arc::from(process_id),
+            peer_started_unix_millis: 1_700_000_000_000,
+        },
+    }
+}
+
+/// A live-session state watch matching a `tagged_as` origin lineage.
+fn live_state_as(process_id: &str, serial: u64) -> tokio::sync::watch::Receiver<ConnectionState> {
+    let (keep_tx, rx) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: 1,
+        capabilities: 0,
+        serial,
+        peer_process_id: Arc::from(process_id),
+        peer_started_unix_millis: 1_700_000_000_000,
+    });
+    std::mem::forget(keep_tx);
+    rx
+}
+
+/// A watch receiver whose live session matches a given origin's Go
+/// lineage — the owner's lineage gate passes for that origin.
+fn live_state_for(origin: &SessionMeta) -> tokio::sync::watch::Receiver<ConnectionState> {
+    let (keep_tx, rx) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: origin.epoch,
+        capabilities: 0,
+        serial: origin.serial,
+        peer_process_id: Arc::clone(&origin.peer_process_id),
+        peer_started_unix_millis: origin.peer_started_unix_millis,
+    });
+    // Keep the sender alive so borrow() never sees a closed channel.
+    std::mem::forget(keep_tx);
+    rx
+}
+
+/// A watch receiver whose live session is a DIFFERENT Go lineage than
+/// `origin` — the owner's lineage gate drops that origin.
+fn foreign_state_for(origin: &SessionMeta) -> tokio::sync::watch::Receiver<ConnectionState> {
+    let (tx, rx) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: origin.epoch,
+        capabilities: 0,
+        serial: origin.serial + 1,
+        peer_process_id: Arc::from("go-successor"),
+        peer_started_unix_millis: origin.peer_started_unix_millis + 1,
+    });
+    std::mem::forget(tx);
+    rx
+}
+
+/// `valid_snapshot` with a different listener port — equal generation,
+/// different content.
+fn variant_snapshot() -> StateSnapshot {
+    let mut snapshot = valid_snapshot();
+    if let Some(config) = snapshot.config.as_mut() {
+        config.listeners[0].port = 6001;
+    }
+    snapshot
+}
+
+fn variant_envelope(request_id: u64, generation: u64) -> ControlEnvelope {
+    ControlEnvelope {
+        request_id,
+        generation,
+        body: Some(Body::StateSnapshot(variant_snapshot())),
+        ..ControlEnvelope::default()
+    }
+}
+
 fn test_now() -> UnixTime {
     UnixTime::since_unix_epoch(Duration::from_secs(1_700_000_000))
 }
@@ -139,6 +233,7 @@ impl dataplane::control_runtime::SnapshotConsumer for CountingConsumer {
     fn apply(
         &mut self,
         _snapshot: &Arc<control_proto::snapshot::ValidatedSnapshot>,
+        _still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if call <= self.reject_first {
@@ -162,10 +257,17 @@ async fn consumer_rejection_never_advances_the_store() {
         calls: Arc::clone(&calls),
         reject_first: 1,
     };
+    let owner_state = live_state_for(&test_session());
 
     // First delivery: the consumer rejects generation 1.
-    let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(10, 1), test_now()).await;
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &owner_state,
+        &tagged(snapshot_envelope(10, 1)),
+        test_now(),
+    )
+    .await;
     assert_eq!(applied, None, "no applied generation on rejection");
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("the owner answers a snapshot result")
@@ -190,8 +292,14 @@ async fn consumer_rejection_never_advances_the_store() {
 
     // Replay of the SAME generation: the consumer runs again — no
     // false acknowledgement off an advanced store — and now succeeds.
-    let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(11, 1), test_now()).await;
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &owner_state,
+        &tagged(snapshot_envelope(11, 1)),
+        test_now(),
+    )
+    .await;
     assert_eq!(applied, Some(1), "committed after consumer success");
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("result body")
@@ -206,8 +314,14 @@ async fn consumer_rejection_never_advances_the_store() {
 
     // Post-commit replay: committed implies the consumer succeeded —
     // answered OK without re-running it.
-    let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(12, 1), test_now()).await;
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &owner_state,
+        &tagged(snapshot_envelope(12, 1)),
+        test_now(),
+    )
+    .await;
     assert_eq!(applied, Some(1));
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("result body")
@@ -230,14 +344,28 @@ async fn staged_token_serializes_concurrent_writers() {
         unreachable!("store constructs")
     };
     let store = Arc::new(store);
-    let Ok(staged) = store.stage(1, valid_snapshot(), test_now()) else {
+    let Ok(staged) = store.stage(
+        1,
+        valid_snapshot(),
+        test_now(),
+        SnapshotLineage::for_tests("go-fixture"),
+    ) else {
         unreachable!("generation 1 stages")
     };
     // A concurrent writer tries to jump to generation 2 while the
     // token is held: it must WAIT, not win.
     let racer = {
         let store = Arc::clone(&store);
-        std::thread::spawn(move || store.apply(2, valid_snapshot(), test_now()).is_ok())
+        std::thread::spawn(move || {
+            store
+                .apply(
+                    2,
+                    valid_snapshot(),
+                    test_now(),
+                    SnapshotLineage::for_tests("go-fixture"),
+                )
+                .is_ok()
+        })
     };
     std::thread::sleep(Duration::from_millis(50));
     // The consumer "succeeded" during the reservation: commit MUST
@@ -265,7 +393,12 @@ async fn dropped_staged_token_releases_concurrent_writer() {
         unreachable!("store constructs")
     };
     let store = Arc::new(store);
-    let Ok(staged) = store.stage(1, valid_snapshot(), test_now()) else {
+    let Ok(staged) = store.stage(
+        1,
+        valid_snapshot(),
+        test_now(),
+        SnapshotLineage::for_tests("go-fixture"),
+    ) else {
         unreachable!("generation 1 stages")
     };
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
@@ -274,7 +407,14 @@ async fn dropped_staged_token_releases_concurrent_writer() {
         let store = Arc::clone(&store);
         std::thread::spawn(move || {
             let _ = started_tx.send(());
-            let applied = store.apply(2, valid_snapshot(), test_now()).is_ok();
+            let applied = store
+                .apply(
+                    2,
+                    valid_snapshot(),
+                    test_now(),
+                    SnapshotLineage::for_tests("go-fixture"),
+                )
+                .is_ok();
             let _ = finished_tx.send(applied);
         })
     };
@@ -630,12 +770,14 @@ async fn snapshot_owner_shutdown_boundary() {
         calls: Arc::new(AtomicU64::new(0)),
         reject_first: 0,
     };
+    let owner_state = live_state_for(&test_session());
     let step = snapshot_owner_step(
         &client,
         &handle,
         &store,
         &mut consumer,
-        &snapshot_envelope(20, 1),
+        &owner_state,
+        &tagged(snapshot_envelope(20, 1)),
     )
     .await;
     let Ok(SnapshotStep::CleanExit) = step else {
@@ -662,12 +804,14 @@ async fn snapshot_owner_shutdown_boundary() {
     let Ok(store) = SnapshotStore::new(Vec::new()) else {
         unreachable!("store constructs")
     };
+    let owner_state = live_state_for(&test_session());
     let step = snapshot_owner_step(
         &client,
         &handle,
         &store,
         &mut consumer,
-        &snapshot_envelope(21, 1),
+        &owner_state,
+        &tagged(snapshot_envelope(21, 1)),
     )
     .await;
     let Err(error) = step else {
@@ -753,4 +897,470 @@ async fn snapshot_clean_first_exit_is_unexpected() {
             .contains("snapshot owner exited without a requested shutdown"),
         "the first-exit task is named: {error}"
     );
+}
+
+/// Fix-2 collision regression: Go restarts and its replacement — a
+/// DIFFERENT lineage on the SAME wire epoch value — re-sends the SAME
+/// {request id, generation} with DIFFERENT content. The old rules
+/// would reject it as a same-generation conflict (or falsely
+/// deduplicate byte-equal content); the lineage-aware store applies it
+/// as a fresh sequence, and the consumer serves the NEW content.
+#[tokio::test]
+async fn restarted_go_same_generation_different_content_applies_fresh() {
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let calls = Arc::new(AtomicU64::new(0));
+    let mut consumer = CountingConsumer {
+        calls: Arc::clone(&calls),
+        reject_first: 0,
+    };
+
+    // Incarnation A commits {request 1, generation 1}.
+    let state_a = live_state_as("go-a", 1);
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &state_a,
+        &tagged_as(snapshot_envelope(1, 1), "go-a", 1),
+        test_now(),
+    )
+    .await;
+    assert_eq!(applied, Some(1));
+    let Some(Body::SnapshotResult(result)) = &answer.body else {
+        unreachable!("result body")
+    };
+    assert_eq!(result.code(), control_proto::v1::ErrorCode::Ok);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    // Incarnation B (new lineage, same epoch VALUE, same request id,
+    // same generation, different content): fresh sequence, applied,
+    // consumer re-ran with the new content.
+    let state_b = live_state_as("go-b", 2);
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &state_b,
+        &tagged_as(variant_envelope(1, 1), "go-b", 2),
+        test_now(),
+    )
+    .await;
+    assert_eq!(applied, Some(1), "the new lineage's generation 1 commits");
+    let Some(Body::SnapshotResult(result)) = &answer.body else {
+        unreachable!("result body")
+    };
+    assert_eq!(
+        result.code(),
+        control_proto::v1::ErrorCode::Ok,
+        "no same-generation conflict across lineages"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "the consumer served the replacement content"
+    );
+    let Ok(Some(current)) = store.current() else {
+        unreachable!("store serves the rollover")
+    };
+    let Some(port) = current
+        .raw()
+        .config
+        .as_ref()
+        .and_then(|config| config.listeners.first())
+        .map(|listener| listener.port)
+    else {
+        unreachable!("listener survives the apply")
+    };
+    assert_eq!(port, 6001, "the NEW lineage's content is the one serving");
+
+    // WITHIN incarnation B the ordinary rules are back: the same
+    // generation with different content is a conflict again.
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &state_b,
+        &tagged_as(snapshot_envelope(2, 1), "go-b", 2),
+        test_now(),
+    )
+    .await;
+    assert_eq!(applied, None);
+    let Some(Body::SnapshotResult(result)) = &answer.body else {
+        unreachable!("result body")
+    };
+    assert_ne!(result.code(), control_proto::v1::ErrorCode::Ok);
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "no consumer run");
+}
+
+/// Fix-2 lineage-gate regression: a snapshot whose ORIGIN belongs to a
+/// DIFFERENT Go lineage than the live session must be dropped BEFORE
+/// any transaction side effect — not staged, not consumed, not
+/// committed, and never allowed to move last-good or the applied
+/// generation. Its desired state belongs to a process that no longer
+/// owns the control plane; the live Go re-sends on its own session.
+#[tokio::test]
+async fn foreign_lineage_snapshot_never_stages_or_advances_state() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(1);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
+    };
+    // The live session is a DIFFERENT Go lineage than the snapshot's
+    // origin: the gate must fire before any transaction step.
+    let origin = test_session();
+    let owner_state = foreign_state_for(&origin);
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &owner_state,
+        &tagged(snapshot_envelope(30, 1)),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("a foreign-lineage snapshot is dropped, not fatal: {step:?}")
+    };
+    // NOTHING advanced: no consumer run, no store commit, no last-good.
+    assert_eq!(
+        consumer.calls.load(Ordering::Relaxed),
+        0,
+        "the serving consumer never ran"
+    );
+    let Ok(current) = store.current() else {
+        unreachable!("store readable")
+    };
+    assert!(current.is_none(), "the store was never advanced");
+    assert!(
+        client.last_good_snapshot_age().is_none(),
+        "last-good was never moved by a foreign lineage"
+    );
+    dispatch.abort();
+    client.shutdown();
+}
+
+/// Fix-2 companion: a snapshot from the LIVE lineage — including a
+/// same-lineage reconnect at a new serial/epoch — still applies once,
+/// so the gate is lineage-specific and never blocks the current Go's
+/// desired state.
+#[tokio::test]
+async fn live_lineage_snapshot_applies_even_across_epoch_bump() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(1);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
+    };
+    // Same Go lineage as the origin, but a later serial/epoch (a
+    // reconnect): the gate passes on lineage, and the snapshot applies.
+    let origin = test_session();
+    let (keep_tx, owner_state) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: origin.epoch + 5,
+        capabilities: 0,
+        serial: origin.serial + 5,
+        peer_process_id: Arc::clone(&origin.peer_process_id),
+        peer_started_unix_millis: origin.peer_started_unix_millis,
+    });
+    std::mem::forget(keep_tx);
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &owner_state,
+        &tagged(snapshot_envelope(31, 1)),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("the live lineage's snapshot applies: {step:?}")
+    };
+    assert_eq!(
+        consumer.calls.load(Ordering::Relaxed),
+        1,
+        "consumer ran once"
+    );
+    let Ok(Some(current)) = store.current() else {
+        unreachable!("the snapshot committed")
+    };
+    assert_eq!(current.generation(), 1);
+    dispatch.abort();
+    client.shutdown();
+}
+
+/// Fix-2 deadlock-avoidance + applied-generation lineage qualification
+/// (the cross-await blocker): the owner must NOT hold the session lease
+/// while awaiting the single-threaded dispatcher's applied-generation
+/// ack, because the dispatcher can be blocked enqueuing outbound on a
+/// lane that only drains after a transport teardown/reconnect — which
+/// itself needs the lease. Here the dispatcher is wedged in a blocked
+/// send; the owner commits A under the lease, releases it, and enters
+/// the barrier. A teardown publisher that models the transport (locks
+/// the SAME production lease and publishes Disconnected + Connected B)
+/// must converge promptly — proving the lease is free during the
+/// barrier. Once the send unblocks, the dispatcher applies the
+/// successor and, under session B, REJECTS A's generation; the owner
+/// converges. Everything is deadline-bounded.
+struct BlockingSender {
+    release: tokio::sync::watch::Receiver<bool>,
+    next: AtomicU64,
+}
+
+impl dataplane::control_dispatch::DispatchSender for BlockingSender {
+    fn allocate_request_id(&self) -> Option<u64> {
+        Some(self.next.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    fn send_envelope(
+        &self,
+        _envelope: ControlEnvelope,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send {
+        let mut release = self.release.clone();
+        async move {
+            // Block until released — models a full outbound lane that
+            // does not drain until a reconnect.
+            while !*release.borrow() {
+                if release.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn send_session_scoped(
+        &self,
+        envelope: ControlEnvelope,
+        _epoch: u64,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send {
+        self.send_envelope(envelope)
+    }
+}
+
+#[tokio::test]
+async fn owner_releases_lease_before_the_dispatcher_barrier() {
+    let client = supervised_client();
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let sender = Arc::new(BlockingSender {
+        release: release_rx,
+        next: AtomicU64::new(0),
+    });
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(4);
+    // One shared state watch drives the dispatcher's active session AND
+    // the owner's lineage check.
+    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Disconnected);
+    let caps = 1u64 << 2; // RECONCILE_CONNECTIONS: on_connected sends a reconcile.
+    let (handle, _forwarder, dispatch) = dataplane::control_dispatch::spawn_control_dispatch_parts(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&sender),
+        state_rx.clone(),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+
+    // Publish Connected A: on_connected sends a reconcile request, which
+    // blocks on the sender — the dispatcher is now wedged.
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            capabilities: caps,
+            serial: 1,
+            peer_process_id: Arc::from("go-a"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
+    };
+
+    // Owner for A: commits + last-good under the lease, releases the
+    // lease, then blocks in the applied-generation barrier (dispatcher
+    // wedged).
+    let owner_client = Arc::clone(&client);
+    let owner_state = state_rx.clone();
+    let owner = tokio::spawn(async move {
+        let step = snapshot_owner_step(
+            &owner_client,
+            &handle,
+            &store,
+            &mut consumer,
+            &owner_state,
+            &tagged_as(snapshot_envelope(50, 1), "go-a", 1),
+        )
+        .await;
+        (owner_client, store, step)
+    });
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+
+    // The teardown publisher models the transport: it locks the SAME
+    // production lease and publishes teardown + successor. If the owner
+    // held the lease across the barrier (the deadlock), this would hang;
+    // it must converge well within the deadline.
+    let teardown_client = Arc::clone(&client);
+    let teardown_state = state_tx.clone();
+    let teardown = tokio::time::timeout(Duration::from_secs(5), async move {
+        let lease = teardown_client.session_lease();
+        let _guard = lease.lock().await;
+        teardown_state.send(ConnectionState::Disconnected).ok();
+        teardown_state
+            .send(ConnectionState::Connected {
+                epoch: 1,
+                capabilities: caps,
+                serial: 2,
+                peer_process_id: Arc::from("go-b"),
+                peer_started_unix_millis: 2_000_000_000_000,
+            })
+            .ok();
+    })
+    .await;
+    assert!(
+        teardown.is_ok(),
+        "teardown through the lease converges — the owner does not hold the lease across the barrier"
+    );
+
+    // Unblock the dispatcher: it drains the wedged send, applies the
+    // successor transition, then processes the applied-generation notice
+    // under session B — rejecting A's generation — and acks. The owner
+    // converges within the deadline.
+    release_tx.send(true).ok();
+    let joined = tokio::time::timeout(Duration::from_secs(5), owner).await;
+    let Ok(Ok((client, store, step))) = joined else {
+        unreachable!("the owner converges after the dispatcher drains")
+    };
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("the owner step continues: {step:?}")
+    };
+    // A's serving/store/last-good landed under its own session.
+    let Ok(Some(current)) = store.current() else {
+        unreachable!("the store committed A")
+    };
+    assert_eq!(current.generation(), 1);
+    let Some((generation, _)) = client.last_good_snapshot_age() else {
+        unreachable!("last-good advanced to A's generation")
+    };
+    assert_eq!(generation, 1);
+    let _ = release_tx;
+    dispatch.abort();
+    client.shutdown();
+}
+
+/// Fix-2 last-good rollover across Go lineage (through the real owner +
+/// client): a restarted Go is a new lineage whose generation resets, so
+/// its committed generation must become the client's last-good even
+/// though it is LOWER than the dead lineage's. A same-lineage stale
+/// generation is still rejected by the authoritative store and leaves
+/// last-good untouched.
+#[tokio::test]
+async fn last_good_rolls_over_to_a_restarted_go_lower_generation() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(4);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
+    };
+
+    // Lineage A commits generation 2.
+    let state_a = live_state_as("go-a", 1);
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &state_a,
+        &tagged_as(snapshot_envelope(60, 2), "go-a", 1),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("A's snapshot applies: {step:?}")
+    };
+    assert_eq!(
+        client
+            .last_good_snapshot_age()
+            .map(|(generation, _)| generation),
+        Some(2),
+        "A's generation 2 is last-good"
+    );
+
+    // A same-lineage stale generation (1 < 2) is rejected by the store;
+    // last-good does not move.
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &state_a,
+        &tagged_as(snapshot_envelope(61, 1), "go-a", 1),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("the stale snapshot is answered, not fatal: {step:?}")
+    };
+    assert_eq!(
+        client
+            .last_good_snapshot_age()
+            .map(|(generation, _)| generation),
+        Some(2),
+        "a same-lineage stale generation leaves last-good at 2"
+    );
+
+    // Go restarts as lineage B, generation 1: the store commits it as a
+    // fresh lineage sequence, and last-good rolls over to 1.
+    let state_b = live_state_as("go-b", 2);
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &state_b,
+        &tagged_as(snapshot_envelope(62, 1), "go-b", 2),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("B's fresh-lineage snapshot applies: {step:?}")
+    };
+    assert_eq!(
+        client
+            .last_good_snapshot_age()
+            .map(|(generation, _)| generation),
+        Some(1),
+        "the restarted Go's generation 1 becomes last-good, replacing A's 2"
+    );
+    dispatch.abort();
+    client.shutdown();
 }

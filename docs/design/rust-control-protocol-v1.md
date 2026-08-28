@@ -67,6 +67,22 @@ greater epoch. Rust closes an older connection after accepting a newer epoch;
 Go rejects a simultaneous second connection for the same Rust process ID.
 Messages from an old epoch are stale and must not mutate state.
 
+The Go `Hello` **must** carry a nonempty `process_id` and a nonzero
+`process_started_unix_millis`. Together these two fields are the Go **process
+lineage**: the identity generation-application, snapshot rollover, and
+session-scoped work are all judged against (see "Envelope identity and
+ordering" and "Snapshots and generation application"). This requirement is
+**v1-global and unconditional** — it does not depend on any negotiated
+capability, because the wire `control_epoch` VALUE is reused across Go restarts
+(a fresh Go process starts its generation sequence at 1 and can be assigned an
+epoch value a previous process already used), so the lineage pair is the only
+field that safely distinguishes one Go process from its own restart. Two
+restarted peers both presenting `("", 0)` would be indistinguishable and the
+generation-reset acceptance would silently regress to serving a dead process's
+desired state. Rust therefore rejects a Go `Hello` missing either field at
+handshake, before `HelloAck`, with a `PROTOCOL_VIOLATION`-class transport
+error; the connection is not established and Rust reconnects.
+
 `required_capabilities` is an envelope-level guard. A receiver that lacks any
 listed capability rejects that request with `MISSING_CAPABILITY`; it must not
 silently approximate the operation. Unknown optional protobuf fields and
@@ -79,6 +95,12 @@ The v1 capability registry is append-only:
 | ---: | --- | --- |
 | 1 | `PER_CONNECTION_CLOSE` | `CloseCommand` / `CloseResult` |
 | 2 | `RECONCILE_CONNECTIONS` | the `ReconcileRequest.connections` field |
+| 3 | `RECONCILE_SESSION_REHYDRATION` | connection rehydration under `RECONCILE_CONNECTIONS`: the reconcile carries per-connection identity, applied generation, and pending-command watermarks so Rust re-adopts surviving sessions across a control reconnect and Go resumes their redirect/drain/close lifecycle without re-issuing terminals or orphaning in-flight commands |
+
+The mandatory Go `Hello` process lineage (above) is deliberately **not** gated
+on any of these capabilities: it is required whenever a Go control plane speaks
+v1 at all, so lineage safety holds even for a peer that negotiates none of the
+optional capabilities.
 
 A sender sets the corresponding value in `required_capabilities` whenever it
 uses one of these additions. An older peer therefore rejects the guarded
@@ -375,6 +397,41 @@ Schema field numbers are never reused; removed fields are reserved.
   and error code, but not secrets.
 - Traffic capture/replay enabled in a snapshot is
   `UNSUPPORTED_CONFIGURATION`; Rust mode must fail fast.
+
+## CTL-06 chaos-E2E acceptance
+
+The lost-event repair and one-sided-restart guarantees above are exercised
+end-to-end against a real TiUP playground by four chaos chains in
+`tests/dataplane/integration` (`run.sh --mode rust --variant plain`, the
+keyspace-guard phase). A test-only control-frame dropper
+(`controldropper/`) sits transparently between the Rust dataplane and the Go
+control socket and, when armed, loses exactly one identified Rust→Go frame; the
+Go router's per-backend `tiproxy_balance_b_conn` gauge and the successor
+`/api/dataplane/status` generation are the oracles. Each chain asserts an
+*exact* accounting transition, not merely a direction:
+
+- **(a) lost `RouteResult{connected}`** — the connection is live but Go's
+  accounting is short by one; the automatic reconcile on the next control
+  reconnect completes the lost assignment, restoring the count to exactly `+1`
+  (never double-counted). Proves the exactly-once reconcile repair of a
+  successful RouteResult the Go side accepted-as-sent but never observed.
+- **(b) lost `ConnectionEvent{CLOSED}`** — Go holds a ghost; the reconcile's
+  identification-by-omission closes it to exactly the live count, never negative.
+- **(c) one-sided Go restart** — the Rust data session rides through the
+  control-plane crash unchanged (same `CONNECTION_ID()`, same backend), the new
+  Go incarnation (distinct PID, fresh generation sequence) applies a snapshot,
+  and its accounting rehydrates to exactly the surviving count.
+- **(d) one-sided Rust restart** — the dead session leaves a ghost (no CLOSED
+  was sent); the successor Rust reconnects with an empty inventory, the reconcile
+  omission zeroes the ghost, and a fresh session is admitted and counted under
+  the new incarnation (`connection_ready` carries the applied generation).
+
+The dropper selectors are exact on `connection_id` (mandatory) so a concurrent
+same-kind frame for another connection is never eaten;
+`route-result-connected` leaves `assignment_id` optional because it is
+unobservable before the frame is sent, while `connection-event-closed` also
+pins `backend_id`. See `tests/dataplane/integration/README.md` for the harness
+contract and evidence surface.
 
 ## Review and change control
 

@@ -98,6 +98,10 @@ fn client_config_with_roots(ca_pem: Option<&str>) -> Result<Arc<ClientConfig>, B
     ))
 }
 
+fn lineage() -> control_proto::snapshot::SnapshotLineage {
+    control_proto::snapshot::SnapshotLineage::for_tests("go-fixture")
+}
+
 /// Frontend upgrade with part of the client hello already buffered: the
 /// prefix is replayed before the socket, so no handshake byte is lost.
 #[tokio::test]
@@ -414,6 +418,7 @@ async fn snapshot_reload_preserves_last_good_and_applies_new() -> Result<(), Box
         1,
         snapshot(first.clone(), backend_skip.clone()),
         validation_time(),
+        lineage(),
     )?;
     let config_one = generation_one
         .snapshot
@@ -464,6 +469,7 @@ async fn snapshot_reload_preserves_last_good_and_applies_new() -> Result<(), Box
         2,
         snapshot(mismatched, backend_skip.clone()),
         validation_time(),
+        lineage(),
     );
     assert!(failed.is_err(), "mismatched key must be rejected");
     let current = store
@@ -488,7 +494,12 @@ async fn snapshot_reload_preserves_last_good_and_applies_new() -> Result<(), Box
         "third",
         &make_leaf(&ca, "frontend.local", false)?,
     )?;
-    let generation_three = store.apply(3, snapshot(third, backend_skip), validation_time())?;
+    let generation_three = store.apply(
+        3,
+        snapshot(third, backend_skip),
+        validation_time(),
+        lineage(),
+    )?;
     let config_three = generation_three
         .snapshot
         .frontend_server_config
@@ -516,7 +527,12 @@ async fn skip_ca_policy_accepts_untrusted_backend() -> Result<(), Box<dyn Error>
         ..Default::default()
     };
     let store = SnapshotStore::new([directory.path().to_path_buf()])?;
-    let applied = store.apply(1, snapshot(frontend_pair, backend_skip), validation_time())?;
+    let applied = store.apply(
+        1,
+        snapshot(frontend_pair, backend_skip),
+        validation_time(),
+        lineage(),
+    )?;
     let backend_config = build_backend_config(&applied.snapshot.backend_tls)
         .map_err(|error| -> Box<dyn Error> { error.to_string().into() })?;
 

@@ -118,6 +118,12 @@ fi
 
 make -C "$repo_root" cmd_tiproxy >"$run_dir/go-build.log" 2>&1
 go build -o "$run_dir/faultproxy" "$script_dir/faultproxy"
+# The keyspace-guard phase (rust+plain only) inserts a control-frame
+# dropper between the Rust dataplane and the Go control socket to drive
+# the chaos-E2E chains.
+if [[ $mode == rust && $variant == plain ]]; then
+	go build -o "$run_dir/controldropper" "$script_dir/controldropper"
+fi
 "$script_dir/render-configs.sh" "$run_dir" "$variant" "$port_offset" >"$run_dir/render.log"
 # shellcheck disable=SC1090
 source "$run_dir/variant.env"
@@ -156,6 +162,10 @@ write_state() {
 	} >"$run_dir/state.env"
 }
 write_state
+
+# One-sided restart helpers (sigkill_owned_process,
+# remove_dead_backend_socket) for the chaos-E2E chains.
+source "$script_dir/restart-helpers.sh"
 
 for port in $PORTS; do
 	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
@@ -677,12 +687,32 @@ ka_sql_port=$((8097 + port_offset))
 ka_api_port=$((8098 + port_offset))
 ka_health_port=$((8099 + port_offset))
 KA_SOCKET="${TMPDIR:-/tmp}/$tag-ka.sock"
-for port in "$ka_sql_port" "$ka_api_port" "$ka_health_port"; do
+# Control-frame dropper (rust+plain only): Rust dials KA_DROP_SOCKET,
+# the dropper forwards to the Go control KA_SOCKET, and its admin port
+# arms per-chain drops. Transparent (byte-identical) until armed.
+ka_use_dropper=false
+if [[ $mode == rust && $variant == plain ]]; then
+	ka_use_dropper=true
+fi
+KA_DROP_SOCKET="${TMPDIR:-/tmp}/$tag-ka-drop.sock"
+ka_drop_admin_port=$((8100 + port_offset))
+ka_phase_ports=("$ka_sql_port" "$ka_api_port" "$ka_health_port")
+if [[ $ka_use_dropper == true ]]; then
+	ka_phase_ports+=("$ka_drop_admin_port")
+fi
+for port in "${ka_phase_ports[@]}"; do
 	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
 		echo "keyspace-guard phase port is already in use: $port" >&2
 		exit 1
 	fi
 done
+# Fold the KA-phase ports (incl. dropper admin) into the live PORTS ledger
+# BEFORE starting any KA process and persist immediately, so a mid-phase
+# failure still leaves them in the post-run leak sweep and the later
+# conflict phase appends on top of them instead of overwriting state.env
+# with a KA-less list.
+PORTS="$PORTS ${ka_phase_ports[*]}"
+printf 'PORTS=%q\n' "$PORTS" >>"$run_dir/state.env"
 sed '/^\[rust-dataplane\]/,$d' "$run_dir/tiproxy.toml" >"$run_dir/tiproxy-ka.toml"
 python3 - "$run_dir/tiproxy-ka.toml" "$ka_sql_port" "$ka_api_port" "$run_dir" "$TIDB_PORT_1" "$TIDB_PORT_B" <<'PYKA'
 import re, sys
@@ -734,8 +764,54 @@ if [[ $ka_api_up != true ]]; then
 	tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
 	exit 1
 fi
+# The Rust dataplane normally dials the Go control socket directly. In
+# the dropper chains it dials the dropper's front socket instead; the
+# dropper forwards to the Go control socket and stays byte-transparent
+# until an /arm request selects a frame to drop.
+ka_rust_control_socket=$KA_SOCKET
+if [[ $ka_use_dropper == true ]]; then
+	# No pre-removal here: the dropper's own start() Lstat-checks the
+	# front path and removes ONLY a pre-existing socket (failing closed
+	# on a regular file), so a blind rm would bypass that audited guard.
+	# --pause-after-drop: a drop tears the control link and holds
+	# reconnects until /release, giving each chain a clean "frame lost,
+	# no reconcile yet" observation window and then a deterministic
+	# reconnect that fires Rust's automatic ReconcileRequest. It never
+	# triggers while unarmed, so the transparent passthrough is unaffected.
+	"$run_dir/controldropper" \
+		--front-socket "$KA_DROP_SOCKET" \
+		--target-socket "$KA_SOCKET" \
+		--admin "127.0.0.1:$ka_drop_admin_port" \
+		--pause-after-drop \
+		>"$run_dir/controldropper.log" 2>&1 &
+	KA_DROP_PID=$!
+	printf 'KA_DROP_PID=%q\n' "$KA_DROP_PID" >>"$run_dir/state.env"
+	printf 'KA_DROP_SOCKET=%q\n' "$KA_DROP_SOCKET" >>"$run_dir/state.env"
+	ka_drop_ready=false
+	for _ in {1..100}; do
+		if ! kill -0 "$KA_DROP_PID" 2>/dev/null; then
+			break
+		fi
+		if [[ -S $KA_DROP_SOCKET ]] &&
+			curl --noproxy '*' --fail --silent --max-time 5 \
+				"http://127.0.0.1:$ka_drop_admin_port/state" -o /dev/null; then
+			ka_drop_ready=true
+			break
+		fi
+		sleep 0.1
+	done
+	if [[ $ka_drop_ready != true ]]; then
+		echo "keyspace-guard phase: control dropper never became ready" >&2
+		tail -20 "$run_dir/controldropper.log" >&2 || true
+		exit 1
+	fi
+	ka_rust_control_socket=$KA_DROP_SOCKET
+fi
+# cleanup.sh reaps the KA Rust process by the control socket it actually
+# binds; under the dropper that is KA_DROP_SOCKET, not KA_SOCKET.
+printf 'KA_RUST_CONTROL_SOCKET=%q\n' "$ka_rust_control_socket" >>"$run_dir/state.env"
 if [[ $mode == rust ]]; then
-	"$rust_binary" --control-socket "$KA_SOCKET" --control-uid "$(id -u)" \
+	"$rust_binary" --control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 		--health-port "$ka_health_port" \
 		>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
 	KA_RUST_PID=$!
@@ -756,6 +832,40 @@ if [[ $mode == rust ]]; then
 		echo "keyspace-guard rust dataplane never became ready" >&2
 		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
 		exit 1
+	fi
+	if [[ $ka_use_dropper == true ]]; then
+		# Durable transparent-passthrough oracle: with Rust connected and
+		# control frames already flowing but nothing armed, the dropper
+		# must be a pure forwarder. Snapshot /state into the artifact and
+		# assert it, so a silent loss of transparency fails the run.
+		curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$ka_drop_admin_port/state" \
+			-o "$run_dir/controldropper-state-transparent.json"
+		if ! python3 - "$run_dir/controldropper-state-transparent.json" "$KA_SOCKET" <<'PYDROP'
+import json, sys
+state = json.load(open(sys.argv[1]))
+ka_socket = sys.argv[2]
+errors = []
+if state.get("target") != ka_socket:
+    errors.append(f'target={state.get("target")!r} != KA_SOCKET {ka_socket!r}')
+if state.get("armed") is not False:
+    errors.append(f'armed={state.get("armed")!r} (want false)')
+if state.get("drop_count") != 0:
+    errors.append(f'drop_count={state.get("drop_count")!r} (want 0)')
+if not isinstance(state.get("connect_count"), int) or state["connect_count"] < 1:
+    errors.append(f'connect_count={state.get("connect_count")!r} (want >=1)')
+if not isinstance(state.get("forwarded"), int) or state["forwarded"] < 1:
+    errors.append(f'forwarded={state.get("forwarded")!r} (want >0)')
+if errors:
+    print("dropper transparent-state oracle failed: " + "; ".join(errors), file=sys.stderr)
+    sys.exit(1)
+print(f'dropper transparent: target=KA_SOCKET armed=false drop_count=0 '
+      f'connect_count={state["connect_count"]} forwarded={state["forwarded"]}')
+PYDROP
+		then
+			echo "keyspace-guard phase: dropper transparent-state oracle failed" >&2
+			exit 1
+		fi
 	fi
 fi
 ka_log_lines() {
@@ -994,6 +1104,831 @@ for _ in {1..40}; do
 done
 kill "$KA_SESSION_PID" 2>/dev/null || true
 wait "$KA_SESSION_PID" 2>/dev/null || true
+if [[ $ka_use_dropper == true ]]; then
+	# ---- CTL-06 chaos chain (b): a dropped ConnectionEvent{CLOSED}
+	# leaves Go's per-backend accounting holding a ghost; the automatic
+	# ReconcileRequest on the next control reconnect clears it to EXACTLY
+	# the live count (never negative). Evidence is Go's
+	# tiproxy_balance_b_conn gauge plus the dropper's own drop record.
+	ka_backend_conn() {
+		curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_api_port/api/metrics/" 2>/dev/null |
+			awk -v b="backend=\"$1\"" \
+				'$0 ~ /^tiproxy_balance_b_conn\{/ && index($0, b) { v=$NF } END { print (v==""?0:v) }'
+	}
+	ka_drop_state() {
+		curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_drop_admin_port/state" 2>/dev/null
+	}
+	# The pin is restored to A0 (ks-old): it is the sole routeable
+	# backend, so a new session lands there and its gauge is the one under
+	# test. Read the baseline BEFORE opening so a pre-existing ghost or an
+	# unrelated connection can never masquerade as our +1.
+	ka_pinned_addr="127.0.0.1:$TIDB_PORT_0"
+	kb_before=$(ka_backend_conn "$ka_pinned_addr")
+	# A fresh persistent connection whose CLOSED we will lose.
+	KB_FIFO="$run_dir/kb-session.fifo"
+	mkfifo "$KB_FIFO"
+	printf 'KB_FIFO=%q\n' "$KB_FIFO" >>"$run_dir/state.env"
+	kb_rust_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$KB_FIFO" >"$run_dir/kb-session.out" 2>&1 &
+	KB_SESSION_PID=$!
+	printf 'KB_SESSION_PID=%q\n' "$KB_SESSION_PID" >>"$run_dir/state.env"
+	exec 8>"$KB_FIFO"
+	printf "SELECT CONCAT('KB|', CONNECTION_ID(), '|', @@port);\n" >&8
+	kb_line=
+	for _ in {1..40}; do
+		kb_line=$(grep -s '^KB|' "$run_dir/kb-session.out" | tail -1 || true)
+		[[ -n $kb_line ]] && break
+		if ! kill -0 "$KB_SESSION_PID" 2>/dev/null; then
+			echo "chain-b: session died before establishing" >&2
+			tail -5 "$run_dir/kb-session.out" >&2 || true
+			exit 1
+		fi
+		sleep 0.5
+	done
+	[[ -n $kb_line ]] || { echo "chain-b: session never answered" >&2; exit 1; }
+	kb_port=$(cut -d'|' -f3 <<<"$kb_line")
+	if [[ $kb_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-b: session landed on @@port=$kb_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	# Capture the proxy-side connection id + backend id from Rust's own
+	# connection_ready record for this new session.
+	kb_conn_id= kb_backend_id= kb_backend_addr=
+	for _ in {1..20}; do
+		kb_ready=$(tail -n "+$((kb_rust_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | tail -1 || true)
+		if [[ -n $kb_ready ]]; then
+			kb_conn_id=$(sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p' <<<"$kb_ready")
+			kb_backend_id=$(sed -n 's/.*"backend_id":"\([^"]*\)".*/\1/p' <<<"$kb_ready")
+			kb_backend_addr=$(sed -n 's/.*"backend_addr":"\([^"]*\)".*/\1/p' <<<"$kb_ready")
+		fi
+		[[ -n $kb_conn_id && -n $kb_backend_id && -n $kb_backend_addr ]] && break
+		sleep 0.5
+	done
+	if [[ -z $kb_conn_id || -z $kb_backend_id || -z $kb_backend_addr ]]; then
+		echo "chain-b: could not capture connection_ready identity" >&2
+		exit 1
+	fi
+	if [[ $kb_backend_addr != "$ka_pinned_addr" || $kb_backend_id != *"$ka_pinned_addr" ]]; then
+		echo "chain-b: session backend $kb_backend_id/$kb_backend_addr is not the pinned $ka_pinned_addr" >&2
+		exit 1
+	fi
+	echo "chain-b: new session proxy_conn_id=$kb_conn_id backend_id=$kb_backend_id addr=$kb_backend_addr port=$kb_port"
+	# The new session must raise the pinned backend's gauge by EXACTLY one
+	# (its RouteResult{connected} is forwarded normally and counted).
+	kb_open=$kb_before
+	for _ in {1..40}; do
+		kb_open=$(ka_backend_conn "$ka_pinned_addr")
+		((kb_open == kb_before + 1)) && break
+		sleep 0.25
+	done
+	if ((kb_open != kb_before + 1)); then
+		echo "chain-b: opening the session did not raise accounting from $kb_before to $((kb_before + 1)) (got $kb_open)" >&2
+		exit 1
+	fi
+	echo "chain-b: pinned backend $ka_pinned_addr before=$kb_before open=$kb_open (exactly +1)"
+	# Arm the exact CLOSED drop for THIS connection on THIS backend.
+	curl --noproxy '*' --fail --silent --show-error -X POST \
+		--data-binary "{\"kind\":\"connection-event-closed\",\"connection_id\":$kb_conn_id,\"backend_id\":\"$kb_backend_id\"}" \
+		"http://127.0.0.1:$ka_drop_admin_port/arm" -o /dev/null
+	# Close the client: Rust emits ConnectionEvent{CLOSED}, the dropper
+	# swallows it and (pause-after-drop) tears + holds the control link.
+	exec 8>&-
+	for _ in {1..40}; do
+		kill -0 "$KB_SESSION_PID" 2>/dev/null || break
+		sleep 0.25
+	done
+	kill "$KB_SESSION_PID" 2>/dev/null || true
+	wait "$KB_SESSION_PID" 2>/dev/null || true
+	# The session is gone: retract its now-stale PID so the final cleanup
+	# never signals a possibly-reused PID without ownership.
+	printf 'KB_SESSION_PID=\n' >>"$run_dir/state.env"
+	kb_dropped=false
+	for _ in {1..40}; do
+		if [[ $(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("drop_count"))' 2>/dev/null) == 1 ]]; then
+			kb_dropped=true
+			break
+		fi
+		sleep 0.25
+	done
+	if [[ $kb_dropped != true ]]; then
+		echo "chain-b: the CLOSED frame was never dropped" >&2
+		ka_drop_state >&2 || true
+		exit 1
+	fi
+	# Oracle 1 (ghost): Go never saw the CLOSED and no reconcile has run,
+	# so the accounting still holds the now-dead connection at before+1.
+	kb_ghost=$(ka_backend_conn "$ka_pinned_addr")
+	if ((kb_ghost != kb_before + 1)); then
+		echo "chain-b: expected ghost accounting to stay $((kb_before + 1)), got $kb_ghost" >&2
+		exit 1
+	fi
+	ka_drop_state >"$run_dir/controldropper-state-chainb-ghost.json"
+	if ! python3 - "$run_dir/controldropper-state-chainb-ghost.json" "$kb_conn_id" "$kb_backend_id" <<'PYB'
+import json, sys
+s = json.load(open(sys.argv[1]))
+conn_id, backend_id = int(sys.argv[2]), sys.argv[3]
+errs = []
+if s.get("drop_count") != 1:
+    errs.append(f'drop_count={s.get("drop_count")}')
+dropped = s.get("dropped") or []
+if len(dropped) != 1:
+    errs.append(f'len(dropped)={len(dropped)}')
+else:
+    d = dropped[0]
+    if d.get("kind") != "connection-event-closed":
+        errs.append(f'kind={d.get("kind")}')
+    if d.get("connection_id") != conn_id:
+        errs.append(f'conn_id={d.get("connection_id")}!={conn_id}')
+    if d.get("backend_id") != backend_id:
+        errs.append(f'backend_id={d.get("backend_id")!r}!={backend_id!r}')
+    if d.get("assignment_id"):
+        errs.append(f'unexpected assignment_id={d.get("assignment_id")!r}')
+if s.get("held") is not True:
+    errs.append(f'held={s.get("held")}')
+if errs:
+    print("chain-b ghost-state oracle failed: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+print(f'chain-b ghost: drop_count=1 conn={conn_id} backend={backend_id} held=true')
+PYB
+	then
+		echo "chain-b: dropper ghost-state oracle failed" >&2
+		exit 1
+	fi
+	echo "chain-b ghost: backend $ka_pinned_addr still shows $kb_ghost (CLOSED lost, no reconcile yet)"
+	# Release the hold: the next Rust reconnect dials upstream again and,
+	# on the fresh Connected session, automatically sends a ReconcileRequest
+	# whose inventory omits the dead connection, so Go clears the ghost to
+	# EXACTLY the pre-open count.
+	curl --noproxy '*' --fail --silent --show-error -X POST \
+		"http://127.0.0.1:$ka_drop_admin_port/release" -o /dev/null
+	kb_reconciled=false
+	kb_now=$kb_ghost
+	for _ in {1..60}; do
+		kb_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((kb_now < 0)); then
+			echo "chain-b: accounting went negative ($kb_now)" >&2
+			exit 1
+		fi
+		if ((kb_now == kb_before)); then
+			kb_reconciled=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $kb_reconciled != true ]]; then
+		echo "chain-b: reconcile never cleared the ghost to the pre-open $kb_before (last $kb_now)" >&2
+		exit 1
+	fi
+	ka_drop_state >"$run_dir/controldropper-state-chainb-reconciled.json"
+	# Causal proof: the clear followed a real upstream reconnect
+	# (release -> dialing-upstream connect), not some other clearing path.
+	if ! python3 - "$run_dir/controldropper-state-chainb-ghost.json" "$run_dir/controldropper-state-chainb-reconciled.json" <<'PYR'
+import json, sys
+ghost = json.load(open(sys.argv[1]))
+rec = json.load(open(sys.argv[2]))
+errs = []
+if rec.get("held") is not False:
+    errs.append(f'held={rec.get("held")}')
+if rec.get("release_count") != 1:
+    errs.append(f'release_count={rec.get("release_count")} (want 1)')
+if not (rec.get("connect_count", 0) > ghost.get("connect_count", 0)):
+    errs.append(f'connect_count {rec.get("connect_count")} !> ghost {ghost.get("connect_count")}')
+if not (rec.get("reconnect_count", 0) > ghost.get("reconnect_count", 0)):
+    errs.append(f'reconnect_count {rec.get("reconnect_count")} !> ghost {ghost.get("reconnect_count")}')
+events = rec.get("events") or []
+drop_seq = max((e["seq"] for e in events if e.get("type") == "drop"), default=None)
+if drop_seq is None:
+    errs.append('no drop event')
+else:
+    rel = next((e for e in events if e.get("type") == "release" and e["seq"] > drop_seq), None)
+    if rel is None:
+        errs.append('no release after the drop')
+    else:
+        dial = next((e for e in events if e.get("type") == "connect"
+                     and "dialing upstream" in (e.get("detail") or "") and e["seq"] > rel["seq"]), None)
+        if dial is None:
+            errs.append('no dialing-upstream connect after the release')
+if errs:
+    print("chain-b reconnect-causality oracle failed: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+print(f'chain-b reconnect: held=false release_count=1 '
+      f'connect {ghost.get("connect_count")}->{rec.get("connect_count")} '
+      f'reconnect {ghost.get("reconnect_count")}->{rec.get("reconnect_count")}; '
+      f'drop->release->dialing-upstream ordered')
+PYR
+	then
+		echo "chain-b: reconnect-causality oracle failed" >&2
+		exit 1
+	fi
+	echo "chain-b: reconcile cleared the ghost -> backend $ka_pinned_addr now $kb_now (exactly the pre-open $kb_before)"
+	rm -f "$KB_FIFO"
+	# The FIFO is gone: retract its path so the final cleanup treats it as
+	# already handled.
+	printf 'KB_FIFO=\n' >>"$run_dir/state.env"
+	echo "control-frame-drop-closed: a lost ConnectionEvent{CLOSED} left a ghost; a real reconnect's reconcile cleared it exactly"
+fi
+if [[ $ka_use_dropper == true ]]; then
+	# ---- CTL-06 chaos chain (a): a dropped RouteResult{connected=true}
+	# leaves the new connection LIVE but uncounted on Go's side, so its
+	# per-backend accounting is short by one. The automatic reconcile on
+	# the next control reconnect completes the lost assignment, restoring
+	# the count to EXACTLY +1 (never double-counted). The dropper's
+	# drop/release counters accumulate across chains, so every assertion
+	# here is a DELTA from a baseline captured at chain (a)'s start.
+	ca_before=$(ka_backend_conn "$ka_pinned_addr")
+	ca_drop_base=$(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("drop_count",0))')
+	ca_release_base=$(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("release_count",0))')
+	# Predict the next proxy connection id: ids are allocated sequentially
+	# within a Rust lineage and nothing else opens a client connection in
+	# this quiesced window, so the next new session is (max seen)+1. The
+	# connection_ready and the drop record are both asserted to equal it,
+	# so a mispredict fails closed (the frame is never dropped) rather than
+	# passing.
+	ca_max=$(grep -s '"event":"connection_ready"' "$run_dir/tiproxy-rs-ka.log" |
+		sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p' | sort -n | tail -1)
+	[[ -n $ca_max ]] || ca_max=0
+	ca_target=$((ca_max + 1))
+	# Arm the exact RouteResult{connected} drop for the predicted
+	# connection. assignment_id is unobservable before the frame is sent;
+	# connection_id alone is exact within the lineage (the reviewed
+	# option-1 selector).
+	curl --noproxy '*' --fail --silent --show-error -X POST \
+		--data-binary "{\"kind\":\"route-result-connected\",\"connection_id\":$ca_target}" \
+		"http://127.0.0.1:$ka_drop_admin_port/arm" -o /dev/null
+	CA_FIFO="$run_dir/ca-session.fifo"
+	mkfifo "$CA_FIFO"
+	printf 'CA_FIFO=%q\n' "$CA_FIFO" >>"$run_dir/state.env"
+	ca_rust_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$CA_FIFO" >"$run_dir/ca-session.out" 2>&1 &
+	CA_SESSION_PID=$!
+	printf 'CA_SESSION_PID=%q\n' "$CA_SESSION_PID" >>"$run_dir/state.env"
+	exec 7>"$CA_FIFO"
+	printf "SELECT CONCAT('CA|', CONNECTION_ID(), '|', @@port);\n" >&7
+	ca_line=
+	for _ in {1..40}; do
+		ca_line=$(grep -s '^CA|' "$run_dir/ca-session.out" | tail -1 || true)
+		[[ -n $ca_line ]] && break
+		if ! kill -0 "$CA_SESSION_PID" 2>/dev/null; then
+			echo "chain-a: session died before establishing" >&2
+			tail -5 "$run_dir/ca-session.out" >&2 || true
+			exit 1
+		fi
+		sleep 0.5
+	done
+	[[ -n $ca_line ]] || { echo "chain-a: session never answered" >&2; exit 1; }
+	ca_port=$(cut -d'|' -f3 <<<"$ca_line")
+	if [[ $ca_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-a: session landed on @@port=$ca_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	ca_conn_id= ca_backend_addr=
+	for _ in {1..20}; do
+		ca_ready=$(tail -n "+$((ca_rust_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | tail -1 || true)
+		if [[ -n $ca_ready ]]; then
+			ca_conn_id=$(sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p' <<<"$ca_ready")
+			ca_backend_addr=$(sed -n 's/.*"backend_addr":"\([^"]*\)".*/\1/p' <<<"$ca_ready")
+		fi
+		[[ -n $ca_conn_id && -n $ca_backend_addr ]] && break
+		sleep 0.5
+	done
+	if [[ -z $ca_conn_id || -z $ca_backend_addr ]]; then
+		echo "chain-a: could not capture connection_ready identity" >&2
+		exit 1
+	fi
+	if [[ $ca_conn_id != "$ca_target" ]]; then
+		echo "chain-a: connection-id prediction missed (predicted $ca_target, got $ca_conn_id)" >&2
+		exit 1
+	fi
+	if [[ $ca_backend_addr != "$ka_pinned_addr" ]]; then
+		echo "chain-a: session backend $ca_backend_addr is not the pinned $ka_pinned_addr" >&2
+		exit 1
+	fi
+	echo "chain-a: new session proxy_conn_id=$ca_conn_id addr=$ca_backend_addr port=$ca_port (predicted $ca_target)"
+	# The RouteResult{connected} for this connection must have been dropped
+	# (drop_count advances by exactly one from the chain baseline).
+	ca_want_drops=$((ca_drop_base + 1))
+	ca_dropped=false
+	for _ in {1..40}; do
+		if [[ $(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("drop_count",0))' 2>/dev/null) == "$ca_want_drops" ]]; then
+			ca_dropped=true
+			break
+		fi
+		sleep 0.25
+	done
+	if [[ $ca_dropped != true ]]; then
+		echo "chain-a: the RouteResult{connected} frame was never dropped" >&2
+		ka_drop_state >&2 || true
+		exit 1
+	fi
+	# Oracle 1 (uncounted): the connect was lost, so Go's accounting stays
+	# at the pre-open baseline even though the session is up.
+	ca_lost=$(ka_backend_conn "$ka_pinned_addr")
+	if ((ca_lost != ca_before)); then
+		echo "chain-a: expected accounting to stay short at $ca_before, got $ca_lost" >&2
+		exit 1
+	fi
+	# The session still serves a query through the (data-plane) path: it is
+	# a LIVE but uncounted connection, not a dead one.
+	printf "SELECT CONCAT('CA2|', CONNECTION_ID(), '|', @@port);\n" >&7
+	ca_alive=false
+	for _ in {1..40}; do
+		if grep -qs '^CA2|' "$run_dir/ca-session.out"; then
+			ca_alive=true
+			break
+		fi
+		kill -0 "$CA_SESSION_PID" 2>/dev/null || break
+		sleep 0.25
+	done
+	if [[ $ca_alive != true ]]; then
+		echo "chain-a: the uncounted session is not serving (expected live-but-uncounted)" >&2
+		exit 1
+	fi
+	ka_drop_state >"$run_dir/controldropper-state-chaina-lost.json"
+	if ! python3 - "$run_dir/controldropper-state-chaina-lost.json" "$ca_target" "$ca_want_drops" <<'PYA'
+import json, sys
+s = json.load(open(sys.argv[1]))
+conn_id, want_drops = int(sys.argv[2]), int(sys.argv[3])
+errs = []
+if s.get("drop_count") != want_drops:
+    errs.append(f'drop_count={s.get("drop_count")} (want {want_drops})')
+dropped = s.get("dropped") or []
+if not dropped:
+    errs.append('no dropped records')
+else:
+    d = dropped[-1]  # this chain's drop is the most recent record
+    if d.get("kind") != "route-result-connected":
+        errs.append(f'kind={d.get("kind")}')
+    if d.get("connection_id") != conn_id:
+        errs.append(f'conn_id={d.get("connection_id")}!={conn_id}')
+    if not d.get("assignment_id"):
+        errs.append('missing assignment_id evidence')
+if s.get("held") is not True:
+    errs.append(f'held={s.get("held")}')
+if errs:
+    print("chain-a lost-state oracle failed: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+print(f'chain-a lost: drop conn={conn_id} assignment_id={dropped[-1].get("assignment_id")!r} held=true')
+PYA
+	then
+		echo "chain-a: dropper lost-state oracle failed" >&2
+		exit 1
+	fi
+	echo "chain-a lost: backend $ka_pinned_addr still shows $ca_lost (RouteResult lost, session live but uncounted)"
+	# Release: the reconnect's automatic reconcile reports the live
+	# connection, so Go completes the lost assignment and the gauge rises
+	# to EXACTLY ca_before+1.
+	curl --noproxy '*' --fail --silent --show-error -X POST \
+		"http://127.0.0.1:$ka_drop_admin_port/release" -o /dev/null
+	ca_want=$((ca_before + 1))
+	ca_repaired=false
+	ca_now=$ca_lost
+	for _ in {1..60}; do
+		ca_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((ca_now > ca_want)); then
+			echo "chain-a: accounting over-counted ($ca_now > $ca_want)" >&2
+			exit 1
+		fi
+		if ((ca_now == ca_want)); then
+			ca_repaired=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $ca_repaired != true ]]; then
+		echo "chain-a: reconcile never restored accounting to $ca_want (last $ca_now)" >&2
+		exit 1
+	fi
+	ka_drop_state >"$run_dir/controldropper-state-chaina-repaired.json"
+	if ! python3 - "$run_dir/controldropper-state-chaina-lost.json" "$run_dir/controldropper-state-chaina-repaired.json" "$ca_release_base" <<'PYAR'
+import json, sys
+lost = json.load(open(sys.argv[1]))
+rep = json.load(open(sys.argv[2]))
+release_base = int(sys.argv[3])
+errs = []
+if rep.get("held") is not False:
+    errs.append(f'held={rep.get("held")}')
+if rep.get("release_count") != release_base + 1:
+    errs.append(f'release_count={rep.get("release_count")} (want {release_base + 1})')
+if not (rep.get("connect_count", 0) > lost.get("connect_count", 0)):
+    errs.append(f'connect_count {rep.get("connect_count")} !> lost {lost.get("connect_count")}')
+if not (rep.get("reconnect_count", 0) > lost.get("reconnect_count", 0)):
+    errs.append(f'reconnect_count {rep.get("reconnect_count")} !> lost {lost.get("reconnect_count")}')
+events = rep.get("events") or []
+drop_seq = max((e["seq"] for e in events if e.get("type") == "drop"), default=None)
+if drop_seq is None:
+    errs.append('no drop event')
+else:
+    rel = next((e for e in events if e.get("type") == "release" and e["seq"] > drop_seq), None)
+    if rel is None:
+        errs.append('no release after this chain drop')
+    else:
+        dial = next((e for e in events if e.get("type") == "connect"
+                     and "dialing upstream" in (e.get("detail") or "") and e["seq"] > rel["seq"]), None)
+        if dial is None:
+            errs.append('no dialing-upstream connect after the release')
+if errs:
+    print("chain-a reconnect-causality oracle failed: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+print(f'chain-a reconnect: held=false release_count={rep.get("release_count")} '
+      f'connect {lost.get("connect_count")}->{rep.get("connect_count")} '
+      f'reconnect {lost.get("reconnect_count")}->{rep.get("reconnect_count")}; '
+      f'drop->release->dialing-upstream ordered')
+PYAR
+	then
+		echo "chain-a: reconnect-causality oracle failed" >&2
+		exit 1
+	fi
+	echo "chain-a: reconcile restored the lost connect -> backend $ka_pinned_addr now $ca_now (exactly ca_before+1 = $ca_want)"
+	# Close the now-counted session cleanly and retract its lifecycle vars.
+	exec 7>&-
+	for _ in {1..40}; do
+		kill -0 "$CA_SESSION_PID" 2>/dev/null || break
+		sleep 0.25
+	done
+	kill "$CA_SESSION_PID" 2>/dev/null || true
+	wait "$CA_SESSION_PID" 2>/dev/null || true
+	printf 'CA_SESSION_PID=\n' >>"$run_dir/state.env"
+	rm -f "$CA_FIFO"
+	printf 'CA_FIFO=\n' >>"$run_dir/state.env"
+	echo "control-frame-drop-connected: a lost RouteResult{connected} left the session uncounted; a real reconnect's reconcile restored it exactly"
+fi
+if [[ $ka_use_dropper == true ]]; then
+	# ---- CTL-06 chaos chain (c): a one-sided Go control-plane restart.
+	# The Go process is SIGKILLed (unclean crash) and restarted on the
+	# same control socket + config; the Rust dataplane keeps serving its
+	# established session throughout, reconnects to the NEW Go incarnation
+	# through the dropper, and rehydrates. Oracles: the old session
+	# survives with an unchanged identity+backend, the new incarnation
+	# applies a snapshot, its per-backend accounting rehydrates to the
+	# exact live count, and a fresh connection works.
+	CC_FIFO="$run_dir/cc-session.fifo"
+	mkfifo "$CC_FIFO"
+	printf 'CC_FIFO=%q\n' "$CC_FIFO" >>"$run_dir/state.env"
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$CC_FIFO" >"$run_dir/cc-session.out" 2>&1 &
+	CC_SESSION_PID=$!
+	printf 'CC_SESSION_PID=%q\n' "$CC_SESSION_PID" >>"$run_dir/state.env"
+	exec 6>"$CC_FIFO"
+	cc_query() {
+		local marker=$1 sql=$2 line=
+		printf '%s\n' "$sql" >&6
+		for _ in {1..40}; do
+			line=$(grep -s "^$marker|" "$run_dir/cc-session.out" | tail -1 || true)
+			if [[ -n $line ]]; then
+				printf '%s\n' "$line"
+				return 0
+			fi
+			kill -0 "$CC_SESSION_PID" 2>/dev/null || { echo "chain-c: session died" >&2; return 1; }
+			sleep 0.5
+		done
+		echo "chain-c: session never answered $marker" >&2
+		return 1
+	}
+	cc_baseline=$(cc_query CC1 "SELECT CONCAT('CC1|', CONNECTION_ID(), '|', @@port);") || exit 1
+	cc_conn_id=$(cut -d'|' -f2 <<<"$cc_baseline")
+	cc_port=$(cut -d'|' -f3 <<<"$cc_baseline")
+	if [[ $cc_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-c: old session landed on @@port=$cc_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	# Clean baseline: this new session must be the ONLY live connection on
+	# the pin (poll until the gauge settles to exactly 1, which also
+	# confirms the previous chain fully drained). rehydrate is checked
+	# against this exact value.
+	cc_before=0
+	cc_baseline_ready=false
+	for _ in {1..60}; do
+		cc_before=$(ka_backend_conn "$ka_pinned_addr")
+		((cc_before == 1)) && { cc_baseline_ready=true; break; }
+		sleep 0.5
+	done
+	if [[ $cc_baseline_ready != true ]]; then
+		echo "chain-c: pinned backend did not settle to exactly the 1 old session (got $cc_before)" >&2
+		exit 1
+	fi
+	cc_old_pid=$KA_PID
+	echo "chain-c: old session CONNECTION_ID=$cc_conn_id backend=127.0.0.1:$cc_port; Go pid=$cc_old_pid; gauge=$cc_before"
+	# SIGKILL the Go control plane and clear its dead control socket, then
+	# restart it on the same socket + config (ownership-checked helpers).
+	sigkill_owned_process "$cc_old_pid" "tiproxy-ka.toml" ||
+		{ echo "chain-c: could not SIGKILL Go $cc_old_pid" >&2; exit 1; }
+	remove_dead_backend_socket "$KA_SOCKET" "$cc_old_pid" ||
+		{ echo "chain-c: could not clear the dead Go control socket" >&2; exit 1; }
+	"$repo_root/bin/tiproxy" --config "$run_dir/tiproxy-ka.toml" \
+		>>"$run_dir/tiproxy-ka.out" 2>&1 &
+	KA_PID=$!
+	printf 'KA_PID=%q\n' "$KA_PID" >>"$run_dir/state.env"
+	if [[ $KA_PID == "$cc_old_pid" ]]; then
+		echo "chain-c: restarted Go reused pid $KA_PID (cannot distinguish incarnations)" >&2
+		exit 1
+	fi
+	echo "chain-c: Go restarted pid $cc_old_pid -> $KA_PID"
+	cc_api_up=false
+	for _ in {1..100}; do
+		if ! kill -0 "$KA_PID" 2>/dev/null; then break; fi
+		if curl --noproxy '*' --fail --silent \
+			"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+			cc_api_up=true
+			break
+		fi
+		sleep 0.2
+	done
+	if [[ $cc_api_up != true ]]; then
+		echo "chain-c: restarted Go API never came up" >&2
+		tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
+		exit 1
+	fi
+	# The dataplane must re-sync with the NEW incarnation: it applies a
+	# snapshot from the fresh generation sequence.
+	cc_synced=false
+	cc_applied=0
+	for _ in {1..100}; do
+		cc_applied=$(curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_api_port/api/dataplane/status" 2>/dev/null |
+			python3 -c 'import json,sys; print(json.load(sys.stdin).get("applied_generation",0))' 2>/dev/null || echo 0)
+		if [[ ${cc_applied:-0} =~ ^[0-9]+$ ]] && ((cc_applied > 0)); then
+			cc_synced=true
+			break
+		fi
+		sleep 0.2
+	done
+	if [[ $cc_synced != true ]]; then
+		echo "chain-c: dataplane never re-synced with the restarted Go (applied_generation stayed 0)" >&2
+		exit 1
+	fi
+	echo "chain-c: dataplane re-synced with the new Go incarnation (applied_generation=$cc_applied)"
+	# Oracle: the OLD session survived with an unchanged identity+backend.
+	cc_check=$(cc_query CC2 "SELECT CONCAT('CC2|', CONNECTION_ID(), '|', @@port);") || exit 1
+	cc_conn_id2=$(cut -d'|' -f2 <<<"$cc_check")
+	cc_port2=$(cut -d'|' -f3 <<<"$cc_check")
+	if [[ $cc_conn_id2 != "$cc_conn_id" || $cc_port2 != "$cc_port" ]]; then
+		echo "chain-c: old session changed across the restart: $cc_check (baseline $cc_baseline)" >&2
+		exit 1
+	fi
+	echo "chain-c: old session intact across Go restart: CONNECTION_ID=$cc_conn_id2 backend=127.0.0.1:$cc_port2"
+	# Oracle: the new Go rehydrated its per-backend accounting to EXACTLY
+	# the live count (the surviving session), never over.
+	cc_rehydrated=false
+	cc_now=0
+	for _ in {1..60}; do
+		cc_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((cc_now > cc_before)); then
+			echo "chain-c: rehydrated accounting over-counted ($cc_now > $cc_before)" >&2
+			exit 1
+		fi
+		if ((cc_now == cc_before)); then
+			cc_rehydrated=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $cc_rehydrated != true ]]; then
+		echo "chain-c: new Go never rehydrated accounting to $cc_before (last $cc_now)" >&2
+		exit 1
+	fi
+	echo "chain-c: new Go rehydrated accounting -> backend $ka_pinned_addr now $cc_now (exact live count)"
+	# Oracle: a fresh connection through the restarted control plane works.
+	cc_new_port=$(mysql_ka_root 'SELECT @@port' 2>/dev/null || true)
+	if [[ $cc_new_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-c: a new connection after restart landed on '$cc_new_port', expected $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	echo "chain-c: new connection after restart served by 127.0.0.1:$cc_new_port"
+	exec 6>&-
+	for _ in {1..40}; do kill -0 "$CC_SESSION_PID" 2>/dev/null || break; sleep 0.25; done
+	kill "$CC_SESSION_PID" 2>/dev/null || true
+	wait "$CC_SESSION_PID" 2>/dev/null || true
+	printf 'CC_SESSION_PID=\n' >>"$run_dir/state.env"
+	rm -f "$CC_FIFO"
+	printf 'CC_FIFO=\n' >>"$run_dir/state.env"
+	echo "go-one-sided-restart: the Go control plane crashed and restarted; the Rust session survived and the new incarnation rehydrated exactly"
+fi
+if [[ $ka_use_dropper == true ]]; then
+	# ---- CTL-06 chaos chain (d): a one-sided Rust dataplane restart. The
+	# Rust process is SIGKILLed; its client session dies WITHOUT a CLOSED,
+	# so Go keeps it as a ghost. A fresh Rust process reconnects with an
+	# EMPTY inventory, and Go's reconcile omission zeroes that ghost; a new
+	# session then works and is counted under the new incarnation. Oracles:
+	# the dead session's accounting is zeroed to exactly 0, a fresh session
+	# is served + counted, and its connection_ready carries a generation
+	# (the new session applied a snapshot).
+	# Quiesced baseline: the pin must be exactly 0 (the previous chain fully
+	# drained) so the session we open is the only thing that can move it,
+	# and the ghost we later observe is unambiguously this session's.
+	cd_quiesced=false
+	cd_base=1
+	for _ in {1..60}; do
+		cd_base=$(ka_backend_conn "$ka_pinned_addr")
+		((cd_base == 0)) && { cd_quiesced=true; break; }
+		sleep 0.5
+	done
+	if [[ $cd_quiesced != true ]]; then
+		echo "chain-d: pinned backend never quiesced to 0 before the chain (got $cd_base)" >&2
+		exit 1
+	fi
+	cd_rust_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+	CD_FIFO="$run_dir/cd-session.fifo"
+	mkfifo "$CD_FIFO"
+	printf 'CD_FIFO=%q\n' "$CD_FIFO" >>"$run_dir/state.env"
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$CD_FIFO" >"$run_dir/cd-session.out" 2>&1 &
+	CD_SESSION_PID=$!
+	printf 'CD_SESSION_PID=%q\n' "$CD_SESSION_PID" >>"$run_dir/state.env"
+	exec 5>"$CD_FIFO"
+	printf "SELECT CONCAT('CD|', CONNECTION_ID(), '|', @@port);\n" >&5
+	cd_line=
+	for _ in {1..40}; do
+		cd_line=$(grep -s '^CD|' "$run_dir/cd-session.out" | tail -1 || true)
+		[[ -n $cd_line ]] && break
+		kill -0 "$CD_SESSION_PID" 2>/dev/null || { echo "chain-d: session died before establishing" >&2; exit 1; }
+		sleep 0.5
+	done
+	[[ -n $cd_line ]] || { echo "chain-d: session never answered" >&2; exit 1; }
+	cd_port=$(cut -d'|' -f3 <<<"$cd_line")
+	if [[ $cd_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-d: session landed on @@port=$cd_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	# Bind the session to A0 via its own fresh connection_ready and require a
+	# positive applied generation (a real snapshot, not a zero field).
+	cd_gen= cd_backend_addr=
+	for _ in {1..20}; do
+		cd_ready=$(tail -n "+$((cd_rust_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | tail -1 || true)
+		if [[ -n $cd_ready ]]; then
+			cd_backend_addr=$(sed -n 's/.*"backend_addr":"\([^"]*\)".*/\1/p' <<<"$cd_ready")
+			cd_gen=$(sed -n 's/.*"generation":\([0-9]*\).*/\1/p' <<<"$cd_ready")
+		fi
+		[[ -n $cd_backend_addr && -n $cd_gen ]] && break
+		sleep 0.5
+	done
+	if [[ $cd_backend_addr != "$ka_pinned_addr" ]]; then
+		echo "chain-d: session backend $cd_backend_addr is not the pinned $ka_pinned_addr" >&2
+		exit 1
+	fi
+	if [[ ! $cd_gen =~ ^[1-9][0-9]*$ ]]; then
+		echo "chain-d: session connection_ready generation '$cd_gen' is not a positive integer" >&2
+		exit 1
+	fi
+	# Confirm the session raised the pin from the quiesced 0 to EXACTLY 1.
+	cd_before_ready=false
+	cd_before=0
+	for _ in {1..60}; do
+		cd_before=$(ka_backend_conn "$ka_pinned_addr")
+		((cd_before > 1)) && { echo "chain-d: pin over-counted to $cd_before opening the session" >&2; exit 1; }
+		((cd_before == 1)) && { cd_before_ready=true; break; }
+		sleep 0.5
+	done
+	if [[ $cd_before_ready != true ]]; then
+		echo "chain-d: opening the session did not raise the pin from 0 to exactly 1 (got $cd_before)" >&2
+		exit 1
+	fi
+	cd_old_rust=$KA_RUST_PID
+	echo "chain-d: live session backend=127.0.0.1:$cd_port generation=$cd_gen; Rust pid=$cd_old_rust; gauge 0 -> $cd_before"
+	# SIGKILL the Rust dataplane; its client session dies without a CLOSED.
+	sigkill_owned_process "$cd_old_rust" "$ka_rust_control_socket" ||
+		{ echo "chain-d: could not SIGKILL Rust $cd_old_rust" >&2; exit 1; }
+	exec 5>&-
+	kill "$CD_SESSION_PID" 2>/dev/null || true
+	wait "$CD_SESSION_PID" 2>/dev/null || true
+	printf 'CD_SESSION_PID=\n' >>"$run_dir/state.env"
+	# Ghost window: with the old Rust dead and no CLOSED sent, Go must still
+	# hold the session — assert the pin is STILL exactly 1 BEFORE any
+	# successor starts, so the later zeroing is attributable solely to the
+	# successor Rust control session's empty reconcile (not a delayed CLOSED
+	# or the control disconnect).
+	cd_ghost=$(ka_backend_conn "$ka_pinned_addr")
+	if ((cd_ghost != 1)); then
+		echo "chain-d: dead session did not persist as a ghost at 1 before restart (got $cd_ghost)" >&2
+		exit 1
+	fi
+	echo "chain-d: dead session persists as a ghost (gauge=$cd_ghost) before the successor starts"
+	# Restart Rust on the same control socket (the dropper front) + health
+	# port; it reconnects with an empty inventory.
+	"$rust_binary" --control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
+		--health-port "$ka_health_port" \
+		>>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
+	KA_RUST_PID=$!
+	printf 'KA_RUST_PID=%q\n' "$KA_RUST_PID" >>"$run_dir/state.env"
+	if [[ $KA_RUST_PID == "$cd_old_rust" ]]; then
+		echo "chain-d: restarted Rust reused pid $KA_RUST_PID" >&2
+		exit 1
+	fi
+	echo "chain-d: Rust restarted pid $cd_old_rust -> $KA_RUST_PID"
+	cd_ready=false
+	for _ in {1..150}; do
+		if ! kill -0 "$KA_RUST_PID" 2>/dev/null; then break; fi
+		if curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_health_port/" -o /dev/null; then
+			cd_ready=true
+			break
+		fi
+		sleep 0.2
+	done
+	if [[ $cd_ready != true ]]; then
+		echo "chain-d: restarted Rust never became ready" >&2
+		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
+		exit 1
+	fi
+	# Oracle: the dead session's ghost is zeroed by the new session's
+	# reconcile (empty inventory -> Go omission-closes the ghost).
+	cd_zeroed=false
+	cd_now=$cd_before
+	for _ in {1..60}; do
+		cd_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((cd_now == 0)); then
+			cd_zeroed=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $cd_zeroed != true ]]; then
+		echo "chain-d: the dead session's ghost was never zeroed (gauge stuck at $cd_now)" >&2
+		exit 1
+	fi
+	echo "chain-d: dead session ghost zeroed -> backend $ka_pinned_addr now $cd_now"
+	# Oracle: a fresh session under the new incarnation works, lands on the
+	# pin, IS counted (gauge -> 1), and its connection_ready carries a
+	# generation (a snapshot was applied under the new session).
+	CD2_FIFO="$run_dir/cd2-session.fifo"
+	mkfifo "$CD2_FIFO"
+	printf 'CD2_FIFO=%q\n' "$CD2_FIFO" >>"$run_dir/state.env"
+	cd2_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$CD2_FIFO" >"$run_dir/cd2-session.out" 2>&1 &
+	CD2_SESSION_PID=$!
+	printf 'CD2_SESSION_PID=%q\n' "$CD2_SESSION_PID" >>"$run_dir/state.env"
+	exec 4>"$CD2_FIFO"
+	printf "SELECT CONCAT('CD2|', CONNECTION_ID(), '|', @@port);\n" >&4
+	cd2_line=
+	for _ in {1..40}; do
+		cd2_line=$(grep -s '^CD2|' "$run_dir/cd2-session.out" | tail -1 || true)
+		[[ -n $cd2_line ]] && break
+		kill -0 "$CD2_SESSION_PID" 2>/dev/null || { echo "chain-d: new session died before establishing" >&2; exit 1; }
+		sleep 0.5
+	done
+	[[ -n $cd2_line ]] || { echo "chain-d: new session never answered" >&2; exit 1; }
+	cd2_port=$(cut -d'|' -f3 <<<"$cd2_line")
+	if [[ $cd2_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-d: new session landed on @@port=$cd2_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	cd2_counted=false
+	cd2_now=0
+	for _ in {1..60}; do
+		cd2_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((cd2_now == 1)); then
+			cd2_counted=true
+			break
+		fi
+		if ((cd2_now > 1)); then
+			echo "chain-d: new session over-counted (gauge $cd2_now > 1)" >&2
+			exit 1
+		fi
+		sleep 0.5
+	done
+	if [[ $cd2_counted != true ]]; then
+		echo "chain-d: the new session was not counted to 1 (last $cd2_now)" >&2
+		exit 1
+	fi
+	cd2_gen=
+	for _ in {1..20}; do
+		cd2_gen=$(tail -n "+$((cd2_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | tail -1 |
+			sed -n 's/.*"generation":\([0-9]*\).*/\1/p')
+		[[ -n $cd2_gen ]] && break
+		sleep 0.25
+	done
+	if [[ ! $cd2_gen =~ ^[1-9][0-9]*$ ]]; then
+		echo "chain-d: the new session connection_ready generation '$cd2_gen' is not a positive integer" >&2
+		exit 1
+	fi
+	echo "chain-d: new session counted -> backend $ka_pinned_addr now $cd2_now, connection_ready generation=$cd2_gen"
+	exec 4>&-
+	for _ in {1..40}; do kill -0 "$CD2_SESSION_PID" 2>/dev/null || break; sleep 0.25; done
+	kill "$CD2_SESSION_PID" 2>/dev/null || true
+	wait "$CD2_SESSION_PID" 2>/dev/null || true
+	printf 'CD2_SESSION_PID=\n' >>"$run_dir/state.env"
+	rm -f "$CD_FIFO" "$CD2_FIFO"
+	printf 'CD_FIFO=\nCD2_FIFO=\n' >>"$run_dir/state.env"
+	echo "rust-one-sided-restart: the Rust dataplane crashed; its dead session's ghost was zeroed by the new session's reconcile and a new counted session works"
+fi
 if [[ $mode == rust ]]; then
 	kill -s INT "$KA_RUST_PID" 2>/dev/null || true
 	for _ in {1..100}; do
@@ -1002,6 +1937,33 @@ if [[ $mode == rust ]]; then
 	done
 	rm -f "$KA_SOCKET"
 fi
+if [[ $ka_use_dropper == true ]]; then
+	kill -s INT "$KA_DROP_PID" 2>/dev/null || true
+	ka_drop_stopped=false
+	for _ in {1..100}; do
+		if ! kill -0 "$KA_DROP_PID" 2>/dev/null; then
+			ka_drop_stopped=true
+			break
+		fi
+		sleep 0.1
+	done
+	if [[ $ka_drop_stopped != true ]]; then
+		kill -s KILL "$KA_DROP_PID" 2>/dev/null || true
+		for _ in {1..50}; do
+			if ! kill -0 "$KA_DROP_PID" 2>/dev/null; then
+				ka_drop_stopped=true
+				break
+			fi
+			sleep 0.1
+		done
+	fi
+	# Unlink the front socket ONLY once its owning dropper is confirmed
+	# gone; otherwise leave the inode for cleanup.sh's ownership-checked
+	# path rather than orphaning a live socket.
+	if [[ $ka_drop_stopped == true ]]; then
+		rm -f "$KA_DROP_SOCKET"
+	fi
+fi
 kill -s INT "$KA_PID" 2>/dev/null || true
 for _ in {1..100}; do
 	kill -0 "$KA_PID" 2>/dev/null || break
@@ -1009,7 +1971,8 @@ for _ in {1..100}; do
 done
 kill "$KA_PID" 2>/dev/null || true
 rm -f "$KA_FIFO"
-printf 'PORTS=%q\n' "$PORTS $ka_sql_port $ka_api_port $ka_health_port" >>"$run_dir/state.env"
+# KA-phase ports were folded into PORTS and persisted before the phase
+# started (see the pre-check above), so no separate PORTS append here.
 echo "no-keyspace-migration: old session pinned to ks-old under real migration pressure; guard refused ks-new"
 
 # ---- Error parity (DPL-07 #41): the same semantic ERR in both modes.

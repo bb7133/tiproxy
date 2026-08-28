@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use control_proto::snapshot::SnapshotLineage;
 use control_proto::snapshot::{SnapshotErrorKind, SnapshotStore};
 use control_proto::v1::{
     ConfigSnapshot, ErrorCode, KeepalivePolicy, Listener, ProxyProtocolMode, StateSnapshot,
@@ -56,13 +57,22 @@ impl Drop for TestDirectory {
     }
 }
 
+fn lineage_a() -> SnapshotLineage {
+    SnapshotLineage::for_tests("go-lineage-a")
+}
+
 #[test]
 fn rotation_and_rename_swap_atomically_while_old_sessions_retain_state()
 -> Result<(), Box<dyn Error>> {
     let directory = TestDirectory::create()?;
     let first = write_valid_pair(directory.path(), "first")?;
     let store = SnapshotStore::new([directory.path().to_path_buf()])?;
-    let generation_one = store.apply(1, valid_snapshot(first.clone()), validation_time())?;
+    let generation_one = store.apply(
+        1,
+        valid_snapshot(first.clone()),
+        validation_time(),
+        lineage_a(),
+    )?;
     let existing_session = Arc::clone(&generation_one.snapshot);
     assert!(generation_one.changed);
 
@@ -78,7 +88,12 @@ fn rotation_and_rename_swap_atomically_while_old_sessions_retain_state()
         ..Default::default()
     };
     let generation_two_snapshot = valid_snapshot(rotated);
-    let generation_two = store.apply(2, generation_two_snapshot.clone(), validation_time())?;
+    let generation_two = store.apply(
+        2,
+        generation_two_snapshot.clone(),
+        validation_time(),
+        lineage_a(),
+    )?;
     assert!(generation_two.changed);
     assert_eq!(existing_session.generation(), 1);
     assert_eq!(generation_two.snapshot.generation(), 2);
@@ -90,7 +105,7 @@ fn rotation_and_rename_swap_atomically_while_old_sessions_retain_state()
     assert!(generation_two.snapshot.frontend_tls.private_key().is_some());
     assert!(!Arc::ptr_eq(&existing_session, &generation_two.snapshot));
 
-    let duplicate = store.apply(2, generation_two_snapshot, validation_time())?;
+    let duplicate = store.apply(2, generation_two_snapshot, validation_time(), lineage_a())?;
     assert!(!duplicate.changed);
     assert!(Arc::ptr_eq(&duplicate.snapshot, &generation_two.snapshot));
     assert_eq!(duplicate.to_result().code, ErrorCode::Ok as i32);
@@ -103,7 +118,12 @@ fn invalid_conflicting_and_stale_generations_keep_last_good() -> Result<(), Box<
     let valid = write_valid_pair(directory.path(), "valid")?;
     let mismatch = write_valid_pair(directory.path(), "mismatch")?;
     let store = SnapshotStore::new([directory.path().to_path_buf()])?;
-    let applied = store.apply(7, valid_snapshot(valid.clone()), validation_time())?;
+    let applied = store.apply(
+        7,
+        valid_snapshot(valid.clone()),
+        validation_time(),
+        lineage_a(),
+    )?;
 
     let mismatched = TlsPolicy {
         certificate_path: valid.certificate_path.clone(),
@@ -111,7 +131,12 @@ fn invalid_conflicting_and_stale_generations_keep_last_good() -> Result<(), Box<
         ..Default::default()
     };
     let error = store
-        .apply(8, valid_snapshot(mismatched), validation_time())
+        .apply(
+            8,
+            valid_snapshot(mismatched),
+            validation_time(),
+            lineage_a(),
+        )
         .err()
         .ok_or("mismatched key unexpectedly applied")?;
     assert_eq!(error.kind(), SnapshotErrorKind::Invalid);
@@ -123,13 +148,23 @@ fn invalid_conflicting_and_stale_generations_keep_last_good() -> Result<(), Box<
     assert_eq!(store.current()?.ok_or("missing last-good")?.generation(), 7);
 
     let stale = store
-        .apply(6, valid_snapshot(valid.clone()), validation_time())
+        .apply(
+            6,
+            valid_snapshot(valid.clone()),
+            validation_time(),
+            lineage_a(),
+        )
         .err()
         .ok_or("stale generation unexpectedly applied")?;
     assert_eq!(stale.kind(), SnapshotErrorKind::Stale);
 
     let conflicting = store
-        .apply(7, valid_snapshot(TlsPolicy::default()), validation_time())
+        .apply(
+            7,
+            valid_snapshot(TlsPolicy::default()),
+            validation_time(),
+            lineage_a(),
+        )
         .err()
         .ok_or("conflicting generation unexpectedly applied")?;
     assert_eq!(conflicting.kind(), SnapshotErrorKind::Invalid);
@@ -147,10 +182,15 @@ fn expiry_ca_tls_policy_and_unsupported_configuration_are_rejected_atomically()
     let valid = write_valid_pair(directory.path(), "valid")?;
     let expired = write_expired_pair(directory.path(), "expired")?;
     let store = SnapshotStore::new([directory.path().to_path_buf()])?;
-    store.apply(1, valid_snapshot(valid.clone()), validation_time())?;
+    store.apply(
+        1,
+        valid_snapshot(valid.clone()),
+        validation_time(),
+        lineage_a(),
+    )?;
 
     let expired_error = store
-        .apply(2, valid_snapshot(expired), validation_time())
+        .apply(2, valid_snapshot(expired), validation_time(), lineage_a())
         .err()
         .ok_or("expired certificate unexpectedly applied")?;
     assert_eq!(expired_error.kind(), SnapshotErrorKind::Invalid);
@@ -160,7 +200,7 @@ fn expiry_ca_tls_policy_and_unsupported_configuration_are_rejected_atomically()
     let config = missing_ca.config.as_mut().ok_or("missing config")?;
     config.require_backend_tls = true;
     let missing_ca_error = store
-        .apply(2, missing_ca, validation_time())
+        .apply(2, missing_ca, validation_time(), lineage_a())
         .err()
         .ok_or("backend TLS without CA unexpectedly applied")?;
     assert!(missing_ca_error.detail().contains("backend CA"));
@@ -175,7 +215,7 @@ fn expiry_ca_tls_policy_and_unsupported_configuration_are_rejected_atomically()
         allowed_common_names: vec!["backend.test".to_owned()],
         ..Default::default()
     });
-    let applied = store.apply(2, with_ca, validation_time())?;
+    let applied = store.apply(2, with_ca, validation_time(), lineage_a())?;
     assert_eq!(applied.snapshot.backend_tls.roots.len(), 1);
     assert_eq!(applied.snapshot.backend_tls.minimum_version, "1.3");
     assert_eq!(
@@ -190,7 +230,11 @@ fn expiry_ca_tls_policy_and_unsupported_configuration_are_rejected_atomically()
         skip_ca_verification: true,
         ..Default::default()
     });
-    assert!(store.apply(3, skip_ca, validation_time()).is_ok());
+    assert!(
+        store
+            .apply(3, skip_ca, validation_time(), lineage_a())
+            .is_ok()
+    );
 
     let mut replay = valid_snapshot(valid);
     replay
@@ -199,7 +243,7 @@ fn expiry_ca_tls_policy_and_unsupported_configuration_are_rejected_atomically()
         .ok_or("missing config")?
         .traffic_replay_enabled = true;
     let replay_error = store
-        .apply(4, replay, validation_time())
+        .apply(4, replay, validation_time(), lineage_a())
         .err()
         .ok_or("traffic replay unexpectedly applied")?;
     assert_eq!(replay_error.kind(), SnapshotErrorKind::Unsupported);
@@ -214,7 +258,7 @@ fn tls_paths_must_remain_beneath_the_allowlist() -> Result<(), Box<dyn Error>> {
     let pair = write_valid_pair(outside.path(), "outside")?;
     let store = SnapshotStore::new([allowed.path().to_path_buf()])?;
     let error = store
-        .apply(1, valid_snapshot(pair), validation_time())
+        .apply(1, valid_snapshot(pair), validation_time(), lineage_a())
         .err()
         .ok_or("outside TLS path unexpectedly applied")?;
     assert_eq!(error.kind(), SnapshotErrorKind::Invalid);
@@ -339,10 +383,123 @@ fn unscoped_topology_applies_through_the_store() -> Result<(), Box<dyn Error>> {
             backend_cluster: "alpha".to_owned(),
         },
     ];
-    let applied = store.apply(11, snapshot, validation_time())?;
+    let applied = store.apply(11, snapshot, validation_time(), lineage_a())?;
     assert!(applied.changed);
     assert_eq!(applied.snapshot.generation(), 11);
     assert_eq!(applied.snapshot.raw().namespaces.len(), 2);
     assert_eq!(applied.snapshot.raw().backends.len(), 2);
+    Ok(())
+}
+
+fn lineage_b() -> SnapshotLineage {
+    SnapshotLineage::for_tests("go-lineage-b")
+}
+
+/// Fix-2 lineage rollover triad: (1) generation monotonicity keeps
+/// rejecting same-lineage lower generations; (2) a restarted Go — a
+/// NEW lineage — starts a fresh generation sequence at 1 without
+/// tripping the stale/duplicate rules; (3) an invalid new-lineage
+/// candidate is rejected atomically and must NOT advance the store's
+/// lineage: the old last-good and the old lineage's sequence rules
+/// stay in force, because lineage advances only at COMMIT.
+#[test]
+fn lineage_rollover_is_fresh_and_only_commit_advances_lineage() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::create()?;
+    let valid = write_valid_pair(directory.path(), "valid")?;
+    let mismatch = write_valid_pair(directory.path(), "mismatch")?;
+    let store = SnapshotStore::new([directory.path().to_path_buf()])?;
+
+    // Lineage A serves generation 5.
+    let applied = store.apply(
+        5,
+        valid_snapshot(valid.clone()),
+        validation_time(),
+        lineage_a(),
+    )?;
+    assert_eq!(applied.snapshot.generation(), 5);
+
+    // (1) Same lineage, lower generation: stale.
+    let stale = store
+        .apply(
+            4,
+            valid_snapshot(valid.clone()),
+            validation_time(),
+            lineage_a(),
+        )
+        .err()
+        .ok_or("same-lineage lower generation unexpectedly applied")?;
+    assert_eq!(stale.kind(), SnapshotErrorKind::Stale);
+
+    // (3) An INVALID candidate from new lineage B is rejected
+    // atomically…
+    let broken = TlsPolicy {
+        certificate_path: valid.certificate_path.clone(),
+        private_key_path: mismatch.private_key_path.clone(),
+        ..Default::default()
+    };
+    let invalid = store
+        .apply(1, valid_snapshot(broken), validation_time(), lineage_b())
+        .err()
+        .ok_or("invalid new-lineage candidate unexpectedly applied")?;
+    assert_eq!(invalid.kind(), SnapshotErrorKind::Invalid);
+    // …the old last-good still serves…
+    assert!(Arc::ptr_eq(
+        &applied.snapshot,
+        &store.current()?.ok_or("missing last-good")?
+    ));
+    // …and the lineage did NOT advance: lineage A's sequence rules
+    // still bind after the failed rollover.
+    let still_stale = store
+        .apply(
+            4,
+            valid_snapshot(valid.clone()),
+            validation_time(),
+            lineage_a(),
+        )
+        .err()
+        .ok_or("post-failure same-lineage lower generation unexpectedly applied")?;
+    assert_eq!(still_stale.kind(), SnapshotErrorKind::Stale);
+    let advanced = store.apply(
+        6,
+        valid_snapshot(TlsPolicy::default()),
+        validation_time(),
+        lineage_a(),
+    )?;
+    assert_eq!(advanced.snapshot.generation(), 6);
+
+    // (2) A VALID new lineage B starts a fresh sequence: generation 1
+    // — far below the committed 6 — applies as changed content.
+    let rolled = store.apply(
+        1,
+        valid_snapshot(valid.clone()),
+        validation_time(),
+        lineage_b(),
+    )?;
+    assert!(rolled.changed);
+    assert_eq!(rolled.snapshot.generation(), 1);
+    assert_eq!(store.current()?.ok_or("missing last-good")?.generation(), 1);
+
+    // The rollover COMMITTED lineage B: within B the same-generation
+    // different-content replay now conflicts…
+    let conflict = store
+        .apply(
+            1,
+            valid_snapshot(TlsPolicy::default()),
+            validation_time(),
+            lineage_b(),
+        )
+        .err()
+        .ok_or("same-lineage B conflict unexpectedly applied")?;
+    assert_eq!(conflict.kind(), SnapshotErrorKind::Invalid);
+    // …while A — itself a different lineage from the committed one —
+    // rolls over fresh again: restart ping-pong stays consistent.
+    let back = store.apply(
+        1,
+        valid_snapshot(TlsPolicy::default()),
+        validation_time(),
+        lineage_a(),
+    )?;
+    assert!(back.changed);
+    assert_eq!(back.snapshot.generation(), 1);
     Ok(())
 }

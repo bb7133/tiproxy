@@ -54,15 +54,20 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_proto::control_transport::{ClientConfig, ControlClient, TransportError};
-use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime, ValidatedSnapshot};
+use control_proto::control_transport::{
+    ClientConfig, ConnectionState, ControlClient, SessionMeta, TransportError,
+};
+use control_proto::snapshot::{
+    SnapshotError, SnapshotLineage, SnapshotStore, UnixTime, ValidatedSnapshot,
+};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{ControlEnvelope, Priority};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::control_dispatch::{
-    ControlDispatchHandle, DispatchFatal, DispatchStats, spawn_control_dispatch, system_unix_millis,
+    ControlDispatchHandle, DispatchFatal, DispatchStats, TaggedEnvelope, spawn_control_dispatch,
+    system_unix_millis,
 };
 
 /// Applies each newly validated snapshot to the serving side (for
@@ -74,12 +79,25 @@ use crate::control_dispatch::{
 pub trait SnapshotConsumer: Send + 'static {
     /// Applies one validated snapshot.
     ///
+    /// `still_current` is a cheap synchronous check of whether the
+    /// control session that produced this snapshot is still the live
+    /// one. A consumer that performs an externally visible serving
+    /// swap **must** call it immediately before that swap, inside
+    /// whatever lock guards the swap and with no `.await` between the
+    /// check and the swap, and reject (return an error, applying
+    /// nothing) when it returns `false`. The snapshot owner can span a
+    /// Go restart at any `.await` inside `apply`; without this check a
+    /// dead lineage's config could become the served generation after
+    /// its process is gone. Consumers with no serving side effect may
+    /// ignore it.
+    ///
     /// # Errors
     ///
     /// Returns the rejection reported to the peer.
     fn apply(
         &mut self,
         snapshot: &Arc<ValidatedSnapshot>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> impl Future<Output = Result<(), SnapshotError>> + Send;
 }
 
@@ -91,6 +109,7 @@ where
     fn apply(
         &mut self,
         snapshot: &Arc<ValidatedSnapshot>,
+        _still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
         self(snapshot)
     }
@@ -332,16 +351,32 @@ pub fn spawn_control_runtime_with_client<C: SnapshotConsumer>(
 pub async fn process_state_snapshot<C: SnapshotConsumer>(
     store: &SnapshotStore,
     consumer: &mut C,
-    envelope: &ControlEnvelope,
+    state: &watch::Receiver<ConnectionState>,
+    tagged: &TaggedEnvelope,
     now: UnixTime,
 ) -> (ControlEnvelope, Option<u64>) {
+    // The caller ([`snapshot_owner_step`]) holds the session-ownership
+    // lease across this whole call and the following last-good move (but
+    // releases it BEFORE the applied-generation barrier, which is made
+    // safe by lineage-qualifying that barrier instead), so the stage →
+    // serving swap → commit here is linearized against every
+    // session-state publication.
+    let envelope = &tagged.envelope;
+    let lineage = SnapshotLineage {
+        peer_process_id: Arc::clone(&tagged.origin.peer_process_id),
+        peer_started_unix_millis: tagged.origin.peer_started_unix_millis,
+    };
     let generation = envelope.generation;
     let (result, applied) = match &envelope.body {
         Some(Body::StateSnapshot(snapshot)) => {
-            match store.stage(generation, snapshot.clone(), now) {
+            match store.stage(generation, snapshot.clone(), now, lineage) {
                 Ok(staged) => {
                     let consumer_verdict = if staged.is_changed() {
-                        consumer.apply(staged.snapshot()).await
+                        // The consumer calls this immediately before any
+                        // serving swap so a lineage superseded mid-apply
+                        // never becomes the served generation.
+                        let still_current = || origin_matches_live_session(state, &tagged.origin);
+                        consumer.apply(staged.snapshot(), &still_current).await
                     } else {
                         // Already committed — which implies the whole
                         // two-phase apply (consumer included) succeeded
@@ -349,6 +384,24 @@ pub async fn process_state_snapshot<C: SnapshotConsumer>(
                         Ok(())
                     };
                     match consumer_verdict {
+                        // Re-check lineage AFTER the consumer's apply
+                        // (its await points can span a Go restart): if
+                        // the live session is no longer this snapshot's
+                        // lineage, the staged token is dropped
+                        // uncommitted — the store, last-good, and the
+                        // applied-generation barrier never advance under
+                        // a dead lineage. (The serving consumer may have
+                        // already swapped its generation; the live Go's
+                        // own desired snapshot re-applies its config, and
+                        // the dispatch loop's applied-generation barrier
+                        // never binds commands to this uncommitted view.)
+                        Ok(()) if !origin_matches_live_session(state, &tagged.origin) => (
+                            SnapshotError::unsupported(
+                                "control session changed lineage during snapshot apply",
+                            )
+                            .to_result(store_generation(store)),
+                            None,
+                        ),
                         Ok(()) => match store.commit(staged) {
                             Ok(outcome) => {
                                 let applied = outcome.snapshot.generation();
@@ -397,15 +450,40 @@ async fn run_snapshot_owner<C: SnapshotConsumer>(
     handle: ControlDispatchHandle,
     store: SnapshotStore,
     mut consumer: C,
-    mut snapshots: mpsc::Receiver<ControlEnvelope>,
+    mut snapshots: mpsc::Receiver<TaggedEnvelope>,
 ) -> Result<(), TransportError> {
-    while let Some(envelope) = snapshots.recv().await {
-        match snapshot_owner_step(&client, &handle, &store, &mut consumer, &envelope).await? {
+    let state = client.subscribe_state();
+    while let Some(tagged) = snapshots.recv().await {
+        match snapshot_owner_step(&client, &handle, &store, &mut consumer, &state, &tagged).await? {
             SnapshotStep::Continue => {}
             SnapshotStep::CleanExit => return Ok(()),
         }
     }
     Ok(())
+}
+
+/// Whether the current live control session belongs to the SAME Go
+/// lineage that produced `origin`. A snapshot can sit in the owner
+/// queue across a session switch: wire epoch VALUES repeat across Go
+/// restarts, so a snapshot from a dead lineage must be recognized by
+/// its peer identity — never staged, applied, committed, or allowed to
+/// move last-good / applied-generation against the current session's
+/// desired state.
+fn origin_matches_live_session(
+    state: &watch::Receiver<ConnectionState>,
+    origin: &SessionMeta,
+) -> bool {
+    match &*state.borrow() {
+        ConnectionState::Connected {
+            peer_process_id,
+            peer_started_unix_millis,
+            ..
+        } => {
+            peer_process_id.as_ref() == origin.peer_process_id.as_ref()
+                && *peer_started_unix_millis == origin.peer_started_unix_millis
+        }
+        _ => false,
+    }
 }
 
 /// Outcome of one snapshot-owner step.
@@ -433,24 +511,83 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     handle: &ControlDispatchHandle,
     store: &SnapshotStore,
     consumer: &mut C,
-    envelope: &ControlEnvelope,
+    state: &watch::Receiver<ConnectionState>,
+    tagged: &TaggedEnvelope,
 ) -> Result<SnapshotStep, TransportError> {
+    // The session-ownership lease is held across the lineage check, the
+    // serving swap, the store commit, and the last-good move — every
+    // session-state publication (a successor `Connected`, a teardown
+    // `Disconnected`, `Connecting`, `Shutdown`) goes through the
+    // transport's lease-guarded `publish_state`, so none of them can
+    // land in the middle of the serving/store transaction. A snapshot
+    // therefore either observes the successor before its check (and does
+    // nothing) or completes serving + store + last-good under its own
+    // live session before the successor becomes visible.
+    //
+    // The lease is RELEASED before the applied-generation barrier. That
+    // barrier awaits the single-threaded dispatcher, which can itself be
+    // blocked enqueuing outbound while a dead session's lane is not yet
+    // draining; holding the lease across it would deadlock the transport
+    // teardown/reconnect that is the only thing that drains the lane.
+    // The barrier is instead made safe by LINEAGE-QUALIFYING it: it
+    // carries the origin Go lineage and the dispatcher records the
+    // generation only while that lineage is still live, so a successor
+    // published during the barrier rejects this generation rather than
+    // taking it onto its command gate. The session-scoped answer is sent
+    // after the barrier; a stale send is dropped by the existing rules.
+    let lease = client.session_lease();
+    let guard = lease.lock().await;
+    // Lineage gate BEFORE the transaction: a snapshot whose origin Go
+    // lineage is not the live session's — because Go restarted while
+    // this snapshot waited in the owner queue, or because there is no
+    // live session at all — must not be staged, applied, committed, or
+    // allowed to advance last-good / the applied-generation barrier.
+    // Its desired state belongs to a process that no longer owns the
+    // control plane; the current Go re-sends on its own session.
+    if !origin_matches_live_session(state, &tagged.origin) {
+        client.count_foreign_snapshot_dropped();
+        drop(guard);
+        return Ok(SnapshotStep::Continue);
+    }
     let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
-    let (answer, applied) = process_state_snapshot(store, consumer, envelope, now).await;
+    let (answer, applied) = process_state_snapshot(store, consumer, state, tagged, now).await;
     if let Some(generation) = applied {
         client.mark_last_good_snapshot(generation);
-        if !handle.applied_generation(generation).await {
-            if client.is_shutdown() {
-                return Ok(SnapshotStep::CleanExit);
-            }
-            return Err(TransportError::Configuration(
-                "dispatch task gone before the applied-generation barrier".to_owned(),
-            ));
-        }
     }
-    match client.send(answer).await {
-        Ok(()) => Ok(SnapshotStep::Continue),
-        Err(TransportError::Closed) if client.is_shutdown() => Ok(SnapshotStep::CleanExit),
+    // Serving, store, and last-good are durable under the live session;
+    // release the lease BEFORE the (possibly transport-dependent)
+    // applied-generation barrier and the session-scoped answer.
+    drop(guard);
+    if let Some(generation) = applied
+        && !handle
+            .applied_generation(
+                generation,
+                Arc::clone(&tagged.origin.peer_process_id),
+                tagged.origin.peer_started_unix_millis,
+            )
+            .await
+    {
+        if client.is_shutdown() {
+            return Ok(SnapshotStep::CleanExit);
+        }
+        return Err(TransportError::Configuration(
+            "dispatch task gone before the applied-generation barrier".to_owned(),
+        ));
+    }
+    match client
+        .send_session_scoped(answer, tagged.origin.serial)
+        .await
+    {
+        // Any answer-send failure under a requested shutdown is the
+        // normal cascade.
+        Err(TransportError::StaleSessionEpoch | TransportError::Closed) if client.is_shutdown() => {
+            Ok(SnapshotStep::CleanExit)
+        }
+        // Stale without shutdown: the session that carried this
+        // snapshot is gone, and the answer would false-ack (or
+        // false-nack) a DIFFERENT session's exchange — it is dropped.
+        // Go re-sends the snapshot on the new session.
+        Ok(()) | Err(TransportError::StaleSessionEpoch) => Ok(SnapshotStep::Continue),
         Err(error) => Err(error),
     }
 }

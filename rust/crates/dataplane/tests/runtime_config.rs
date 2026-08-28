@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control_proto::control_transport::{ClientConfig, ControlClient};
-use control_proto::snapshot::{SnapshotErrorKind, SnapshotStore, UnixTime, ValidatedSnapshot};
+use control_proto::snapshot::{
+    SnapshotErrorKind, SnapshotLineage, SnapshotStore, UnixTime, ValidatedSnapshot,
+};
 use control_proto::v1::{
     ConfigSnapshot, Hello, KeepalivePolicy, Listener, ProxyProtocolMode, Role, StateSnapshot,
     TlsPolicy,
@@ -104,6 +106,7 @@ fn snapshot(generation: u64, port: u16) -> Result<Arc<ValidatedSnapshot>, Box<dy
             generation,
             raw,
             UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+            SnapshotLineage::for_tests("go-fixture"),
         )?
         .snapshot)
 }
@@ -123,14 +126,14 @@ async fn first_bind_reload_reject_and_shutdown_keep_one_last_good_generation()
     });
     let (mut consumer, serving) = DataplaneSnapshotConsumer::new(Arc::new(FixedMemory), handler);
 
-    consumer.apply(&snapshot(1, port)?).await?;
+    consumer.apply(&snapshot(1, port)?, &|| true).await?;
     let first = TcpStream::connect(("127.0.0.1", port)).await?;
     assert_eq!(
         timeout(Duration::from_secs(2), seen_rx.recv()).await?,
         Some(1)
     );
 
-    consumer.apply(&snapshot(2, port)?).await?;
+    consumer.apply(&snapshot(2, port)?, &|| true).await?;
     let second = TcpStream::connect(("127.0.0.1", port)).await?;
     assert_eq!(
         timeout(Duration::from_secs(2), seen_rx.recv()).await?,
@@ -138,7 +141,7 @@ async fn first_bind_reload_reject_and_shutdown_keep_one_last_good_generation()
         "new admission captures the complete newly applied Arc"
     );
 
-    let error = match consumer.apply(&snapshot(3, other_port)?).await {
+    let error = match consumer.apply(&snapshot(3, other_port)?, &|| true).await {
         Ok(()) => return Err("listener change unexpectedly applied".into()),
         Err(error) => error,
     };

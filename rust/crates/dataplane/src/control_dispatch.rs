@@ -63,7 +63,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use control_proto::control_transport::{ConnectionState, ControlClient, Handler, TransportError};
+use control_proto::control_transport::{
+    ConnectionState, ControlClient, Handler, SessionMeta, TransportError,
+};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     CloseCommand, CloseResult, ConnectionEvent, ConnectionEventKind, ConnectionIdentity,
@@ -232,7 +234,14 @@ pub struct ControlCommandHandler {
     /// must be modeled, not just an old epoch left behind). Inbound
     /// envelopes carry their origin epoch on the wire, so staleness is
     /// decidable per frame against this.
-    active_session: Option<(u64, u64)>,
+    active_session: Option<(u64, u64, u64)>,
+    /// The live session's Go lineage (peer process id + start time).
+    /// `None` whenever `active_session` is `None`. A tagged frame whose
+    /// origin lineage differs from this belongs to a DIFFERENT Go
+    /// process — it must be dropped before ANY serving/store/gate side
+    /// effect, because wire epoch VALUES repeat across Go restarts and
+    /// only the lineage tells the processes apart.
+    active_lineage: Option<(Arc<str>, u64)>,
     /// Whether the current session negotiated `RECONCILE_CONNECTIONS`:
     /// gates both sending reconcile requests and accepting snapshots.
     reconcile_capable: bool,
@@ -269,6 +278,7 @@ impl ControlCommandHandler {
         Self {
             gate: CommandGate::new(),
             active_session: None,
+            active_lineage: None,
             reconcile_capable: true,
             metering: MeteringLedger::new(),
             sessions: HashMap::new(),
@@ -296,8 +306,23 @@ impl ControlCommandHandler {
     /// closure `RECONCILE_CONNECTIONS && RECONCILE_SESSION_REHYDRATION`
     /// (the handshake already rejects the illegal cap-3-only
     /// combination; this is the defensive derivation).
-    pub fn on_connected(&mut self, epoch: u64, capabilities: u64) {
-        self.active_session = Some((epoch, capabilities));
+    pub fn on_connected(
+        &mut self,
+        epoch: u64,
+        capabilities: u64,
+        serial: u64,
+        peer_process_id: Arc<str>,
+        peer_started_unix_millis: u64,
+    ) {
+        self.active_session = Some((serial, epoch, capabilities));
+        // Scope the gate's applied-generation to this Go lineage: a
+        // restarted Go's gate reads back 0, while a same-Go reconnect
+        // keeps the applied generation.
+        self.gate.set_active_origin(Some((
+            Arc::clone(&peer_process_id),
+            peer_started_unix_millis,
+        )));
+        self.active_lineage = Some((peer_process_id, peer_started_unix_millis));
         let reconcile = (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
         let rehydration = reconcile
             && (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1;
@@ -313,6 +338,37 @@ impl ControlCommandHandler {
     /// accepted as current.
     pub fn on_disconnected(&mut self) {
         self.active_session = None;
+        self.active_lineage = None;
+        self.gate.set_active_origin(None);
+    }
+
+    /// Classifies a tagged frame's origin against the live session so
+    /// the dispatch loop can enforce the lineage policy before any
+    /// side effect. A frame from a DIFFERENT Go lineage than the live
+    /// session (or any frame while a live session exists whose lineage
+    /// the origin does not match) must be dropped; same-lineage and
+    /// exact-session frames keep their existing semantics.
+    #[must_use]
+    pub fn origin_is_foreign_lineage(&self, origin: &SessionMeta) -> bool {
+        match &self.active_lineage {
+            // A live session exists: any frame from a different Go
+            // process is foreign and must not touch serving/store/gate.
+            Some((process_id, started)) => {
+                process_id.as_ref() != origin.peer_process_id.as_ref()
+                    || *started != origin.peer_started_unix_millis
+            }
+            // No live session: nothing to contradict the origin here.
+            // Snapshots are still re-checked against live state by the
+            // owner; commands fall through to the gate's own invariants.
+            None => false,
+        }
+    }
+
+    /// Counts a frame dropped because its origin belongs to a foreign
+    /// Go lineage (shares the stale-drop counter — both are
+    /// "superseded by a newer session" drops).
+    pub fn count_cross_lineage_dropped(&self) {
+        self.stats.stale_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether the current session can reconcile (`RECONCILE_CONNECTIONS`).
@@ -324,26 +380,27 @@ impl ControlCommandHandler {
     /// The active session's negotiated epoch, if connected.
     #[must_use]
     pub fn active_epoch(&self) -> Option<u64> {
-        self.active_session.map(|(epoch, _)| epoch)
+        self.active_session.map(|(_, epoch, _)| epoch)
     }
 
-    /// The active session's negotiated `(epoch, capabilities)`, if
+    /// The active session's `(serial, epoch, capabilities)`, if
     /// connected (the stale-export repair path re-derives its
-    /// capability gating from this).
+    /// capability gating from this; the SERIAL, not the reusable wire
+    /// epoch value, scopes session-bound sends).
     #[must_use]
-    pub const fn active_session(&self) -> Option<(u64, u64)> {
+    pub const fn active_session(&self) -> Option<(u64, u64, u64)> {
         self.active_session
     }
 
     /// Records the applied config snapshot generation (drain
     /// provenance).
-    pub fn set_applied_generation(&mut self, generation: u64) {
-        self.gate.set_applied_generation(generation);
+    pub fn set_applied_generation(&mut self, generation: u64, origin: Option<(Arc<str>, u64)>) {
+        self.gate.set_applied_generation(generation, origin);
     }
 
     /// The applied generation (the reconcile known-generation).
     #[must_use]
-    pub const fn applied_generation(&self) -> u64 {
+    pub fn applied_generation(&self) -> u64 {
         self.gate.applied_generation()
     }
 
@@ -589,7 +646,7 @@ impl ControlCommandHandler {
                     // gets a fresh snapshot, and applying the stale
                     // view could regress acked metering / ghost state.
                     match self.active_session {
-                        Some((epoch, _)) if epoch == envelope.control_epoch => {}
+                        Some((_, epoch, _)) if epoch == envelope.control_epoch => {}
                         _ => {
                             self.count_stale_dropped();
                             return Vec::new();
@@ -1277,7 +1334,19 @@ pub enum DispatchNotice {
     AppliedGeneration {
         /// The committed generation.
         generation: u64,
-        /// Completed when the dispatcher recorded it.
+        /// The Go lineage (process id, start time) of the session that
+        /// produced the snapshot. The dispatcher records the generation
+        /// ONLY while this lineage is still live — a snapshot whose Go
+        /// process was superseded (a restart) must not stamp its
+        /// generation onto the successor lineage's command gate, while a
+        /// same-Go reconnect keeps it. The ack fires either way so the
+        /// owner (which no longer holds the session lease here) always
+        /// makes progress.
+        origin_process_id: Arc<str>,
+        /// The Go lineage's start time (with `origin_process_id`).
+        origin_started_unix_millis: u64,
+        /// Completed when the dispatcher has processed it (recorded, or
+        /// dropped as superseded).
         applied: tokio::sync::oneshot::Sender<()>,
     },
     /// An admitted session registers its channels. `applied` is the
@@ -1436,15 +1505,26 @@ impl ControlDispatchHandle {
         Arc::clone(&self.stats)
     }
 
-    /// Records the applied config snapshot generation and **waits
-    /// until the dispatcher recorded it** — the barrier callers (the
-    /// snapshot owner) must pass before acknowledging the generation
-    /// to Go. Returns false when the dispatch task is gone.
-    pub async fn applied_generation(&self, generation: u64) -> bool {
+    /// Hands the applied config snapshot generation to the dispatcher,
+    /// tagged with its Go lineage, and **waits until the dispatcher has
+    /// processed it** — the barrier callers (the snapshot owner) must
+    /// pass before acknowledging the generation to Go. The dispatcher
+    /// RECORDS it only while that lineage is still live; a superseded
+    /// lineage's generation is dropped. The ack fires either way, so
+    /// this returns true once processed and false only when the dispatch
+    /// task is gone.
+    pub async fn applied_generation(
+        &self,
+        generation: u64,
+        origin_process_id: Arc<str>,
+        origin_started_unix_millis: u64,
+    ) -> bool {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
         if !self
             .notify(DispatchNotice::AppliedGeneration {
                 generation,
+                origin_process_id,
+                origin_started_unix_millis,
                 applied: applied_tx,
             })
             .await
@@ -1643,6 +1723,20 @@ impl ControlDispatchHandle {
     }
 }
 
+/// One inbound control frame together with the exact session it
+/// arrived on. The origin travels with the frame everywhere — a frame
+/// retained across a reconnect, or sitting in the dispatch queue while
+/// sessions change, must never be judged (or answered) against a
+/// DIFFERENT session: wire epoch values can repeat across Go restarts,
+/// so only the tagged [`SessionMeta`] tells lineage and session apart.
+#[derive(Debug, Clone)]
+pub struct TaggedEnvelope {
+    /// The control frame.
+    pub envelope: ControlEnvelope,
+    /// The session the frame was read on.
+    pub origin: SessionMeta,
+}
+
 /// The transport receive half with **global single in-flight
 /// ownership**. `handle` awaits a bounded queue reservation (real
 /// backpressure through the read loop and TCP); on session teardown
@@ -1653,9 +1747,13 @@ impl ControlDispatchHandle {
 /// second retained frame can never come into existence: the next
 /// reader starts only once the slot is empty.
 pub struct InboundForwarder {
-    inbound: mpsc::Sender<ControlEnvelope>,
+    inbound: mpsc::Sender<TaggedEnvelope>,
     state: watch::Receiver<ConnectionState>,
-    retained: Arc<StdMutex<Option<ControlEnvelope>>>,
+    retained: Arc<StdMutex<Option<TaggedEnvelope>>>,
+    /// The live session set by `resume_session` before any frame is
+    /// read; `handle` tags every frame with it.
+    current_session: Arc<StdMutex<Option<SessionMeta>>>,
+    cross_lineage_retained_dropped: Arc<AtomicU64>,
 }
 
 /// Construction and observability for the forwarder.
@@ -1665,14 +1763,25 @@ impl InboundForwarder {
     /// production path is [`spawn_control_dispatch`]).
     #[must_use]
     pub fn new(
-        inbound: mpsc::Sender<ControlEnvelope>,
+        inbound: mpsc::Sender<TaggedEnvelope>,
         state: watch::Receiver<ConnectionState>,
     ) -> Self {
         Self {
             inbound,
             state,
             retained: Arc::new(StdMutex::new(None)),
+            current_session: Arc::new(StdMutex::new(None)),
+            cross_lineage_retained_dropped: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Frames retained from a dead session and dropped because the next
+    /// session belongs to a DIFFERENT Go lineage (each such frame is
+    /// regenerated by its owner: Go re-sends desired snapshots and
+    /// commands, Rust re-issues its reconcile request).
+    #[must_use]
+    pub fn cross_lineage_retained_dropped(&self) -> u64 {
+        self.cross_lineage_retained_dropped.load(Ordering::Relaxed)
     }
 
     /// Whether a frame from a torn-down session is currently retained.
@@ -1692,6 +1801,23 @@ impl InboundForwarder {
 
 impl Handler for InboundForwarder {
     async fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
+        // The transport guarantees resume_session ran before the first
+        // read of this session, so the current session is always set
+        // here — every frame is tagged with its exact origin.
+        let origin = {
+            let Ok(current) = self.current_session.lock() else {
+                return Err(TransportError::Configuration(
+                    "current session slot poisoned".to_owned(),
+                ));
+            };
+            let Some(origin) = current.clone() else {
+                return Err(TransportError::Configuration(
+                    "frame read before resume_session set the session".to_owned(),
+                ));
+            };
+            origin
+        };
+        let tagged = TaggedEnvelope { envelope, origin };
         let mut state = self.state.clone();
         tokio::select! {
             biased;
@@ -1701,26 +1827,52 @@ impl Handler for InboundForwarder {
                         "control dispatch task is gone".to_owned(),
                     ));
                 };
-                permit.send(envelope);
+                permit.send(tagged);
                 Ok(())
             }
             _ = state.wait_for(|s| !matches!(s, ConnectionState::Connected { .. })) => {
                 // Session teardown while the dispatcher is jammed:
                 // retain the one in-flight frame (the slot is empty by
-                // the resume invariant) and end the stream without
-                // depending on outbound drain.
+                // the resume invariant) — WITH its origin — and end the
+                // stream without depending on outbound drain.
                 let Ok(mut slot) = self.retained.lock() else {
                     return Err(TransportError::Configuration(
                         "retained slot poisoned".to_owned(),
                     ));
                 };
-                *slot = Some(envelope);
+                *slot = Some(tagged);
                 Err(TransportError::Closed)
             }
         }
     }
 
-    async fn resume_session(&self, _epoch: u64) -> Result<(), TransportError> {
+    async fn resume_session(&self, session: SessionMeta) -> Result<(), TransportError> {
+        {
+            let Ok(mut current) = self.current_session.lock() else {
+                return Err(TransportError::Configuration(
+                    "current session slot poisoned".to_owned(),
+                ));
+            };
+            *current = Some(session.clone());
+        }
+        // Cross-lineage retained frames are DROPPED, not pumped: the
+        // frame was produced by (and correlated against) a different Go
+        // process; its owner regenerates the work. Only a same-lineage
+        // reconnect keeps the one-shot retained delivery.
+        {
+            let Ok(mut slot) = self.retained.lock() else {
+                return Err(TransportError::Configuration(
+                    "retained slot poisoned".to_owned(),
+                ));
+            };
+            if let Some(retained) = slot.as_ref()
+                && !retained.origin.same_lineage(&session)
+            {
+                *slot = None;
+                self.cross_lineage_retained_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         loop {
             // Clone-then-take keeps this cancel-safe: if the session
             // dies (or this future is dropped) mid-send, the slot still
@@ -1825,8 +1977,9 @@ enum SendScope {
     /// Cross-reconnect retention: results, lifecycle events, metering
     /// batches — the peer dedups by request id / sequence.
     Durable,
-    /// Valid only under exactly this negotiated epoch; regenerated by
-    /// the next `Connected` transition when dropped as stale.
+    /// Valid only under exactly this Rust-local session serial (wire
+    /// epoch VALUES can repeat across Go restarts); regenerated by the
+    /// next `Connected` transition when dropped as stale.
     Session(u64),
 }
 
@@ -1944,15 +2097,37 @@ pub async fn run_control_dispatch<S: DispatchSender>(
     mut handler: ControlCommandHandler,
     sender: Arc<S>,
     mut state: watch::Receiver<ConnectionState>,
-    mut inbound: mpsc::Receiver<ControlEnvelope>,
+    mut inbound: mpsc::Receiver<TaggedEnvelope>,
     mut notices: mpsc::Receiver<DispatchNotice>,
-    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_tx: mpsc::Sender<TaggedEnvelope>,
     tick_interval: Duration,
     unix_now_millis: UnixMillisFn,
 ) -> Result<(), DispatchFatal> {
     let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A frame dequeued in the narrow race where a session teardown was
+    // observed AFTER the inbound arm was enabled but BEFORE the state
+    // barrier ran: it cannot be classified without a live lineage, so
+    // it is held here and processed on the next `Connected` transition
+    // (same-lineage → processed, foreign → dropped). At most one such
+    // frame can exist because the inbound arm is disabled while it is
+    // pending.
+    let mut deferred: Option<TaggedEnvelope> = None;
     loop {
+        // A deferred frame is retried the moment a live session exists;
+        // until then it waits (the select below blocks on a transition).
+        if let Some(frame) = deferred.take() {
+            if handler.active_session().is_some() {
+                apply_state_transitions(&sender, &mut handler, &mut state).await?;
+                if handler.active_session().is_some() {
+                    process_inbound(&sender, &mut handler, &snapshot_tx, frame, unix_now_millis)
+                        .await?;
+                    continue;
+                }
+            }
+            // Still no live session: keep holding it.
+            deferred = Some(frame);
+        }
         let step = tokio::select! {
             changed = state.changed() => {
                 if changed.is_err() {
@@ -1961,26 +2136,72 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 }
                 // `changed()` marked the newest value seen: apply it
                 // directly, then drain anything that raced in after.
-                let snapshot = *state.borrow();
+                let snapshot = state.borrow().clone();
+                // A shutdown transition ends the loop even while a frame
+                // is deferred (its origin session is gone; no successor
+                // is coming). Without this the deferred-frame guard
+                // would keep the inbound arm disabled and the loop would
+                // never observe the inbound close.
+                if matches!(snapshot, ConnectionState::Shutdown) {
+                    return Ok(());
+                }
                 // Causal barrier: adoptions enqueued before this
                 // transition was observed apply BEFORE the
                 // transition's automatic reconcile, so its export
                 // already carries them. (Adoptions enqueued after are
                 // covered by the stale-export repair.)
-                drain_pending_notices(&sender, &mut handler, &mut notices).await?;
+                let deferred =
+                    drain_pending_notices(&sender, &mut handler, &mut notices).await?;
                 let applied = apply_state(&sender, &mut handler, snapshot).await;
                 match applied {
                     Ok(()) => {
-                        apply_state_transitions(&sender, &mut handler, &mut state).await
+                        apply_state_transitions(&sender, &mut handler, &mut state).await?;
+                        // Deferred applied-generation notices are
+                        // recorded now, under the session that is live
+                        // AFTER the transition — a superseded origin is
+                        // rejected by the gate's lineage-scoped state.
+                        for notice in deferred {
+                            apply_notice(&sender, &mut handler, notice).await?;
+                        }
+                        Ok(())
                     }
                     Err(fatal) => Err(fatal),
                 }
             }
             notice = notices.recv() => {
                 let Some(notice) = notice else { return Ok(()) };
+                // The applied-generation ack must be judged against the
+                // CURRENT session: apply any pending connection
+                // transition first for it (only), so a successor
+                // published while the ack waited is visible and a
+                // superseded generation is rejected rather than stamped
+                // onto the new session. Every OTHER notice (adoption
+                // registrations) intentionally applies BEFORE the
+                // pending transition, so that transition's automatic
+                // reconcile export carries the adoption.
+                if matches!(notice, DispatchNotice::AppliedGeneration { .. }) {
+                    apply_state_transitions(&sender, &mut handler, &mut state).await?;
+                }
                 apply_notice(&sender, &mut handler, notice).await
             }
-            envelope = inbound.recv() => {
+            // Inbound is processed ONLY while a live session exists.
+            // Between a session teardown and the next `Connected` there
+            // is no lineage to judge a frame against: processing it then
+            // would let a dead lineage's Redirect/Close/Drain reach the
+            // gate (its `origin_is_foreign_lineage` is vacuously false
+            // with no live lineage) and would let the owner drop a
+            // queued snapshot a same-lineage reconnect should still get.
+            // With the arm gated, such frames wait in the bounded queue
+            // until the next `Connected` transition applies a live
+            // lineage, and are then classified same-lineage (processed)
+            // or foreign (dropped) deterministically. A pending
+            // `Connected` still in the watch re-enables this arm on the
+            // next loop turn (the state arm applies it first).
+            // The arm stays enabled while no frame is deferred, so an
+            // `inbound` close (transport gone / shutdown) still
+            // terminates the loop. A frame dequeued with no live session
+            // is deferred below rather than processed.
+            envelope = inbound.recv(), if deferred.is_none() => {
                 let Some(envelope) = envelope else { return Ok(()) };
                 // Deterministic state barrier: whatever order the
                 // select observed things in, any pending connection
@@ -1988,14 +2209,24 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 // pumped from a previous session can never be judged
                 // against a session snapshot that predates it.
                 apply_state_transitions(&sender, &mut handler, &mut state).await?;
-                process_inbound(
-                    &sender,
-                    &mut handler,
-                    &snapshot_tx,
-                    envelope,
-                    unix_now_millis,
-                )
-                .await
+                if handler.active_session().is_some() {
+                    process_inbound(
+                        &sender,
+                        &mut handler,
+                        &snapshot_tx,
+                        envelope,
+                        unix_now_millis,
+                    )
+                    .await
+                } else {
+                    // The barrier just applied a teardown: there is no
+                    // live lineage to judge this frame against. Hold it
+                    // until the next `Connected` rather than processing
+                    // it under an absent lineage (which would let a dead
+                    // session's command reach the gate).
+                    deferred = Some(envelope);
+                    Ok(())
+                }
             }
             _ = ticker.tick() => {
                 run_tick(&sender, &mut handler).await
@@ -2018,7 +2249,7 @@ async fn apply_state_transitions<S: DispatchSender>(
     state: &mut watch::Receiver<ConnectionState>,
 ) -> Result<(), DispatchFatal> {
     while state.has_changed().unwrap_or(false) {
-        let snapshot = *state.borrow_and_update();
+        let snapshot = state.borrow_and_update().clone();
         apply_state(sender, handler, snapshot).await?;
     }
     Ok(())
@@ -2029,21 +2260,31 @@ async fn drain_pending_notices<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
     notices: &mut mpsc::Receiver<DispatchNotice>,
-) -> Result<(), DispatchFatal> {
+) -> Result<Vec<DispatchNotice>, DispatchFatal> {
     // Bounded by the queue length observed at entry. This queue also
     // carries continuous producers (metering, session terminals,
     // redirect results) that can refill freed slots while apply awaits
     // outbound sends — chasing them would let the drain starve the
     // very transition it feeds. A notice arriving during the drain is
     // exactly the case the stale-export repair covers.
+    //
+    // `AppliedGeneration` notices are DEFERRED (returned, not applied
+    // here): their generation must be recorded against the session that
+    // is live AFTER the transition this drain feeds, not the one before
+    // it — otherwise a snapshot from the outgoing session would stamp
+    // its generation just before the incoming session becomes active.
+    // Every other (adoption) notice is applied before the transition so
+    // its automatic reconcile export carries the adoption.
     let budget = notices.len();
+    let mut deferred = Vec::new();
     for _ in 0..budget {
         match notices.try_recv() {
+            Ok(notice @ DispatchNotice::AppliedGeneration { .. }) => deferred.push(notice),
             Ok(notice) => apply_notice(sender, handler, notice).await?,
             Err(_) => break,
         }
     }
-    Ok(())
+    Ok(deferred)
 }
 
 /// Applies one observed connection state to the handler.
@@ -2056,7 +2297,21 @@ async fn apply_state<S: DispatchSender>(
         ConnectionState::Connected {
             epoch,
             capabilities,
-        } => on_connected_transition(sender, handler, epoch, capabilities).await,
+            serial,
+            peer_process_id,
+            peer_started_unix_millis,
+        } => {
+            on_connected_transition(
+                sender,
+                handler,
+                epoch,
+                capabilities,
+                serial,
+                peer_process_id,
+                peer_started_unix_millis,
+            )
+            .await
+        }
         ConnectionState::Disconnected | ConnectionState::Connecting | ConnectionState::Shutdown => {
             handler.on_disconnected();
             Ok(())
@@ -2077,10 +2332,19 @@ async fn on_connected_transition<S: DispatchSender>(
     handler: &mut ControlCommandHandler,
     epoch: u64,
     capabilities: u64,
+    serial: u64,
+    peer_process_id: Arc<str>,
+    peer_started_unix_millis: u64,
 ) -> Result<(), DispatchFatal> {
-    handler.on_connected(epoch, capabilities);
+    handler.on_connected(
+        epoch,
+        capabilities,
+        serial,
+        peer_process_id,
+        peer_started_unix_millis,
+    );
     if handler.reconcile_capable() {
-        let _ = send_reconcile_request(sender, handler, epoch, capabilities).await?;
+        let _ = send_reconcile_request(sender, handler, serial, capabilities).await?;
     }
     // Unacked metering is durable: delivery matters with or without an
     // ack path, and the consumer dedups by contiguous sequence.
@@ -2103,7 +2367,7 @@ async fn on_connected_transition<S: DispatchSender>(
 async fn send_reconcile_request<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
-    epoch: u64,
+    serial: u64,
     capabilities: u64,
 ) -> Result<SendOutcome, DispatchFatal> {
     let request = handler.build_reconcile_request(handler.applied_generation());
@@ -2119,7 +2383,7 @@ async fn send_reconcile_request<S: DispatchSender>(
         body: Some(Body::ReconcileRequest(request)),
         ..ControlEnvelope::default()
     };
-    dispatch_send_outcome(sender, handler, envelope, SendScope::Session(epoch)).await
+    dispatch_send_outcome(sender, handler, envelope, SendScope::Session(serial)).await
 }
 
 /// Explicit repair for a stale export. A namespace/backend adoption
@@ -2147,10 +2411,10 @@ async fn repair_stale_export<S: DispatchSender>(
     if !handler.reconcile_capable() {
         return Ok(SendOutcome::StaleEpoch);
     }
-    let Some((epoch, capabilities)) = handler.active_session() else {
+    let Some((serial, _epoch, capabilities)) = handler.active_session() else {
         return Ok(SendOutcome::StaleEpoch);
     };
-    send_reconcile_request(sender, handler, epoch, capabilities).await
+    send_reconcile_request(sender, handler, serial, capabilities).await
 }
 
 /// Records one metering delta and acks in one await-free step: the
@@ -2173,6 +2437,10 @@ fn apply_metering_notice(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over every dispatch notice variant reads best in one place"
+)]
 async fn apply_notice<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
@@ -2181,9 +2449,22 @@ async fn apply_notice<S: DispatchSender>(
     match notice {
         DispatchNotice::AppliedGeneration {
             generation,
+            origin_process_id,
+            origin_started_unix_millis,
             applied,
         } => {
-            handler.set_applied_generation(generation);
+            // Lineage-qualified in the gate's persistent state: the
+            // generation is bound to its origin Go lineage and accepted
+            // only while that lineage is live, and it reads back as 0 for
+            // any other lineage. If Go restarted while this snapshot's
+            // owner transaction was in flight (the owner releases the
+            // lease before this barrier, so a successor CAN be published
+            // first), the successor's command gate never inherits it.
+            // The ack fires regardless so the owner always converges.
+            handler.set_applied_generation(
+                generation,
+                Some((origin_process_id, origin_started_unix_millis)),
+            );
             let _ = applied.send(());
         }
         DispatchNotice::RegisterSession {
@@ -2303,22 +2584,66 @@ async fn apply_notice<S: DispatchSender>(
 async fn process_inbound<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
-    snapshot_tx: &mpsc::Sender<ControlEnvelope>,
-    envelope: ControlEnvelope,
+    snapshot_tx: &mpsc::Sender<TaggedEnvelope>,
+    tagged: TaggedEnvelope,
     unix_now_millis: UnixMillisFn,
 ) -> Result<(), DispatchFatal> {
-    if matches!(envelope.body, Some(Body::StateSnapshot(_))) {
+    // General lineage policy, enforced before ANY handler/owner side
+    // effect: a frame whose origin belongs to a DIFFERENT Go lineage
+    // than the live session was produced by a process that no longer
+    // owns the control plane. It was already tagged and queued when its
+    // session was live; by the time it is dequeued a different Go may
+    // be connected (wire epoch VALUES repeat across restarts, so only
+    // the lineage separates them). Such a frame must never reach the
+    // serving consumer, the snapshot store, or the command gate — its
+    // owner regenerates the work on its own session. (Same-lineage
+    // reconnect and exact-session frames fall through to their existing
+    // per-body rules; a frame arriving with no live session at all is
+    // re-checked by the snapshot owner and, for commands, judged by the
+    // gate's own cross-epoch invariants.)
+    if handler.origin_is_foreign_lineage(&tagged.origin) {
+        handler.count_cross_lineage_dropped();
+        return Ok(());
+    }
+    // Session-bound inbound is judged by its tagged ORIGIN, never by
+    // the wire epoch value (which a restarted Go can reuse): a
+    // reconcile snapshot produced by a dead session — retained,
+    // queued, or slow — must not be applied against the current one.
+    if matches!(tagged.envelope.body, Some(Body::ReconcileSnapshot(_)))
+        && handler.active_session().map(|(serial, _, _)| serial) != Some(tagged.origin.serial)
+    {
+        handler.count_stale_dropped();
+        return Ok(());
+    }
+    if matches!(tagged.envelope.body, Some(Body::StateSnapshot(_))) {
         // The CTL-05 snapshot owner is a required dependency: the send
         // is awaited (its backpressure reaches the transport read
-        // loop), and its loss is fatal rather than a silent drop.
+        // loop), and its loss is fatal rather than a silent drop. The
+        // ORIGIN travels with the frame: the owner stages under the
+        // exact lineage that produced the snapshot and answers into
+        // exactly that session.
         return snapshot_tx
-            .send(envelope)
+            .send(tagged)
             .await
             .map_err(|_| DispatchFatal::SnapshotOwnerGone);
     }
-    let outbound = handler.handle_envelope(&envelope, Instant::now(), unix_now_millis());
+    let origin_serial = tagged.origin.serial;
+    let outbound = handler.handle_envelope(&tagged.envelope, Instant::now(), unix_now_millis());
     for out in outbound {
-        dispatch_send(sender, handler, out, SendScope::Durable).await?;
+        // Request-only inline errors carry nothing but the offending
+        // request id — across a Go restart the {epoch, request id}
+        // tuple can repeat, so a stale queued error would falsely
+        // resolve the NEW peer's unrelated operation. They are scoped
+        // to the exact origin session and dropped once it is gone (the
+        // current owner retries/reconciles). Terminals (redirect /
+        // close / drain results) carry incarnation-qualified operation
+        // ids in their bodies and stay durable.
+        let scope = if matches!(out.body, Some(Body::Error(_))) {
+            SendScope::Session(origin_serial)
+        } else {
+            SendScope::Durable
+        };
+        dispatch_send(sender, handler, out, scope).await?;
     }
     Ok(())
 }
@@ -2372,7 +2697,7 @@ const INBOUND_QUEUE_CAPACITY: usize = 256;
 #[must_use]
 pub fn spawn_control_dispatch(
     client: Arc<ControlClient>,
-    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_tx: mpsc::Sender<TaggedEnvelope>,
     tick_interval: Duration,
 ) -> (
     ControlDispatchHandle,
@@ -2394,7 +2719,7 @@ pub fn spawn_control_dispatch(
 pub fn spawn_control_dispatch_with_handler(
     handler: ControlCommandHandler,
     client: Arc<ControlClient>,
-    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_tx: mpsc::Sender<TaggedEnvelope>,
     tick_interval: Duration,
 ) -> (
     ControlDispatchHandle,
@@ -2414,7 +2739,7 @@ pub fn spawn_control_dispatch_parts<S: DispatchSender + 'static>(
     handler: ControlCommandHandler,
     sender: Arc<S>,
     state: watch::Receiver<ConnectionState>,
-    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_tx: mpsc::Sender<TaggedEnvelope>,
     tick_interval: Duration,
 ) -> (
     ControlDispatchHandle,
@@ -2423,11 +2748,7 @@ pub fn spawn_control_dispatch_parts<S: DispatchSender + 'static>(
 ) {
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let (notice_tx, notice_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
-    let forwarder = InboundForwarder {
-        inbound: inbound_tx,
-        state: state.clone(),
-        retained: Arc::new(StdMutex::new(None)),
-    };
+    let forwarder = InboundForwarder::new(inbound_tx, state.clone());
     let handler_stats = handler.stats();
     let task = tokio::spawn(run_control_dispatch(
         handler,

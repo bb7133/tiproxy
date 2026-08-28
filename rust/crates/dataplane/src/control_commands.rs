@@ -59,6 +59,7 @@
 //! carry identifiers, addresses, and counters only.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use std::collections::VecDeque;
 
@@ -330,8 +331,23 @@ pub struct CommandGate {
     completed_drains: VecDeque<DrainState>,
     event_sequence: u64,
     /// The last applied config snapshot generation (CTL-05): drain
-    /// provenance is checked against it.
+    /// provenance and the reconcile known-generation are checked
+    /// against it. It is scoped to the Go **lineage** that produced it
+    /// (`applied_origin`): a snapshot's generation belongs to its Go
+    /// process lineage, so a same-Go reconnect keeps it (generations
+    /// stay monotonic within a lineage) while a restarted Go — a
+    /// different lineage whose generations reset to 1 — never inherits
+    /// it. The EFFECTIVE value (see [`CommandGate::applied_generation`])
+    /// is this only while its origin lineage is the live one; otherwise
+    /// it reads as 0.
     applied_generation: u64,
+    /// The Go lineage (process id, start time) that set
+    /// `applied_generation`.
+    applied_origin: Option<(Arc<str>, u64)>,
+    /// The live session's Go lineage (`None` when disconnected). A
+    /// generation is recorded only for the live lineage and read back
+    /// only while that lineage is still live.
+    active_origin: Option<(Arc<str>, u64)>,
     /// Issuer-wide drain sequence watermark (same obsolescence role as
     /// the per-connection redirect watermark).
     drain_watermark: u64,
@@ -465,17 +481,40 @@ impl CommandGate {
         self.legacy_peer = legacy;
     }
 
-    /// Records the applied config snapshot generation (from CTL-05
-    /// snapshot application) for drain provenance checks.
-    pub fn set_applied_generation(&mut self, generation: u64) {
-        self.applied_generation = generation;
+    /// Sets the live session's Go lineage (`None` when disconnected).
+    /// Called on every connection transition. A previously recorded
+    /// generation immediately reads back as 0 for a DIFFERENT lineage,
+    /// so a restarted Go never inherits the dead lineage's applied
+    /// generation, while a same-Go reconnect keeps it.
+    pub fn set_active_origin(&mut self, origin: Option<(Arc<str>, u64)>) {
+        self.active_origin = origin;
     }
 
-    /// The applied config snapshot generation (the reconcile request's
-    /// known generation).
+    /// Records the applied config snapshot generation (from CTL-05
+    /// snapshot application) for drain / reconcile provenance. It is
+    /// bound to `origin` (the Go lineage, or `None` for a peer-less
+    /// unit context) and accepted only while that is the live lineage: a
+    /// stale notice from a superseded lineage cannot overwrite the live
+    /// lineage's applied generation.
+    pub fn set_applied_generation(&mut self, generation: u64, origin: Option<(Arc<str>, u64)>) {
+        if origin == self.active_origin {
+            self.applied_generation = generation;
+            self.applied_origin = origin;
+        }
+    }
+
+    /// The EFFECTIVE applied config snapshot generation (the reconcile
+    /// request's known generation): the recorded generation only while
+    /// its origin lineage is still the live one, otherwise 0. A
+    /// restarted Go's gate therefore reads 0 until its own snapshot
+    /// lands, while a same-Go reconnect keeps it.
     #[must_use]
-    pub const fn applied_generation(&self) -> u64 {
-        self.applied_generation
+    pub fn applied_generation(&self) -> u64 {
+        if self.applied_origin == self.active_origin {
+            self.applied_generation
+        } else {
+            0
+        }
     }
 
     /// Records the request id an outgoing connection event was sent
@@ -737,12 +776,13 @@ impl CommandGate {
         // longer exist. Per-connection generations are deliberately not
         // matched here — one command spans mixed-generation sessions.
         // Zero provenance is tolerated only from a declared legacy peer.
+        let effective_applied = self.applied_generation();
         if (command_generation == 0 && !self.legacy_peer)
-            || (command_generation != 0 && command_generation < self.applied_generation)
+            || (command_generation != 0 && command_generation < effective_applied)
         {
             return DrainAdmission::StaleGeneration {
                 command_generation,
-                applied_generation: self.applied_generation,
+                applied_generation: effective_applied,
             };
         }
         if let Some(active) = &self.drain {

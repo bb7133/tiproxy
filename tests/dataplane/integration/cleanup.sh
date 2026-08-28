@@ -59,8 +59,37 @@ cleanup_status=0
 # Keyspace-guard phase leftovers (present only when that phase started
 # and then failed before its own teardown).
 if [[ -n ${KA_SOCKET:-} ]]; then
-	stop_owned_process "${KA_RUST_PID:-}" "$KA_SOCKET" || cleanup_status=1
+	stop_owned_process "${KA_RUST_PID:-}" "${KA_RUST_CONTROL_SOCKET:-$KA_SOCKET}" || cleanup_status=1
 	rm -f "$KA_SOCKET"
+fi
+if [[ -n ${KA_DROP_SOCKET:-} ]]; then
+	# stop_owned_process returns 0 for an invalid/already-gone PID, so a
+	# success verdict alone does NOT prove the front path belongs to a
+	# stopped dropper. Discriminate the inode before unlinking so the
+	# fail-closed case (a pre-placed regular file that the dropper's own
+	# Lstat rejected, after which its PID vanished) can never delete a
+	# bystander: absent -> nothing to do; not a socket -> keep and fail;
+	# a socket -> remove only after an owned stop and with no live holder.
+	drop_stopped=0
+	if stop_owned_process "${KA_DROP_PID:-}" "$run_dir/controldropper"; then
+		drop_stopped=1
+	else
+		cleanup_status=1
+	fi
+	if [[ -e $KA_DROP_SOCKET ]]; then
+		if [[ ! -S $KA_DROP_SOCKET ]]; then
+			echo "refusing to remove $KA_DROP_SOCKET: not a socket" >&2
+			cleanup_status=1
+		elif lsof -- "$KA_DROP_SOCKET" >/dev/null 2>&1; then
+			echo "refusing to remove $KA_DROP_SOCKET: still held open" >&2
+			cleanup_status=1
+		elif ((drop_stopped)); then
+			rm -f "$KA_DROP_SOCKET"
+		else
+			echo "refusing to remove $KA_DROP_SOCKET: owner stop unconfirmed" >&2
+			cleanup_status=1
+		fi
+	fi
 fi
 stop_owned_process "${KA_PID:-}" "$run_dir/tiproxy-ka.toml" || cleanup_status=1
 if [[ ${KA_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
@@ -69,6 +98,34 @@ fi
 if [[ -n ${KA_FIFO:-} ]]; then
 	rm -f "$KA_FIFO"
 fi
+# Chaos chain (b)/(a) persistent sessions + FIFOs (present only when that
+# chain started and then failed before its own teardown).
+if [[ ${KB_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
+	kill "${KB_SESSION_PID}" 2>/dev/null || true
+fi
+if [[ -n ${KB_FIFO:-} ]]; then
+	rm -f "$KB_FIFO"
+fi
+if [[ ${CA_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
+	kill "${CA_SESSION_PID}" 2>/dev/null || true
+fi
+if [[ -n ${CA_FIFO:-} ]]; then
+	rm -f "$CA_FIFO"
+fi
+if [[ ${CC_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
+	kill "${CC_SESSION_PID}" 2>/dev/null || true
+fi
+if [[ -n ${CC_FIFO:-} ]]; then
+	rm -f "$CC_FIFO"
+fi
+for pid_var in CD_SESSION_PID CD2_SESSION_PID; do
+	pid=${!pid_var:-}
+	[[ $pid =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null || true
+done
+for fifo_var in CD_FIFO CD2_FIFO; do
+	fifo=${!fifo_var:-}
+	[[ -n $fifo ]] && rm -f "$fifo"
+done
 stop_owned_process "${HOLDER_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
 stop_owned_process "${CONFLICT_PID:-}" "$run_dir/tiproxy-conflict.toml" || cleanup_status=1
 stop_owned_process "${RUST_CONFLICT_PID:-}" "$run_dir/absent.sock" || cleanup_status=1

@@ -38,6 +38,7 @@ FAKE_MYSQL
 chmod 0700 "$temp_dir/tools/tiup" "$temp_dir/tools/mysql"
 
 go test "$repo_root/tests/dataplane/integration/faultproxy"
+go test "$repo_root/tests/dataplane/integration/controldropper"
 
 "$script_dir/generate-certs.sh" "$temp_dir/certs" >/dev/null
 openssl verify -CAfile "$temp_dir/certs/ca.pem" \
@@ -112,5 +113,179 @@ if find "$temp_dir/tiup/data" -mindepth 1 -print -quit | grep -q .; then
 	echo "preflight-only run created TiUP data" >&2
 	exit 1
 fi
+
+# One-sided restart helpers: ownership-checked SIGKILL and the
+# three-condition backend-socket removal, exercised with dummy
+# processes and sockets (no TiUP, no dataplane).
+source "$script_dir/restart-helpers.sh"
+
+# sigkill_owned_process kills a process whose command line matches, and
+# refuses one whose command line does not.
+sleep 30 &
+victim_pid=$!
+if ! sigkill_owned_process "$victim_pid" "sleep"; then
+	echo "sigkill_owned_process should kill a matching process" >&2
+	exit 1
+fi
+if kill -0 "$victim_pid" 2>/dev/null; then
+	echo "sigkill_owned_process left the victim alive" >&2
+	exit 1
+fi
+sleep 30 &
+bystander_pid=$!
+if sigkill_owned_process "$bystander_pid" "this-does-not-match"; then
+	echo "sigkill_owned_process must refuse a command-line mismatch" >&2
+	exit 1
+fi
+if ! kill -0 "$bystander_pid" 2>/dev/null; then
+	echo "a refused sigkill must not touch the bystander" >&2
+	exit 1
+fi
+# An empty ownership token must be refused, not treated as "matches
+# everything" — the bystander stays alive.
+if sigkill_owned_process "$bystander_pid" ""; then
+	echo "sigkill_owned_process must refuse an empty ownership token" >&2
+	exit 1
+fi
+if ! kill -0 "$bystander_pid" 2>/dev/null; then
+	echo "a refused empty-token sigkill must not touch the bystander" >&2
+	exit 1
+fi
+kill "$bystander_pid" 2>/dev/null || true
+wait "$bystander_pid" 2>/dev/null || true
+
+# remove_dead_backend_socket removes a socket whose owner is dead, and
+# refuses a live owner, a non-socket, and a still-held socket.
+sock="$temp_dir/backend.sock"
+python3 - "$sock" <<'PYSOCK'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PYSOCK
+# The python process has exited, so the socket has no live owner: a made
+# up dead PID plus the socket path must be removed.
+if ! remove_dead_backend_socket "$sock" 999999; then
+	echo "remove_dead_backend_socket should remove a dead-owner socket" >&2
+	exit 1
+fi
+[[ -e $sock ]] && {
+	echo "the dead-owner socket was not removed" >&2
+	exit 1
+}
+# Re-create the socket for the negative cases (the success case removed it).
+python3 - "$sock" <<'PYSOCK2'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PYSOCK2
+# An empty / non-numeric owner PID must be refused — it must not be
+# treated as "proven dead", so the socket stays.
+if remove_dead_backend_socket "$sock" ""; then
+	echo "remove_dead_backend_socket must refuse an empty owner PID" >&2
+	exit 1
+fi
+if remove_dead_backend_socket "$sock" "not-a-pid"; then
+	echo "remove_dead_backend_socket must refuse a non-numeric owner PID" >&2
+	exit 1
+fi
+[[ -S $sock ]] || {
+	echo "a refused invalid-PID removal must leave the socket" >&2
+	exit 1
+}
+# A live owner is refused.
+if remove_dead_backend_socket "$sock" "$$"; then
+	echo "remove_dead_backend_socket must refuse a live owner PID" >&2
+	exit 1
+fi
+rm -f -- "$sock"
+# A non-socket regular file is refused.
+regular="$temp_dir/not-a-socket"
+: >"$regular"
+if remove_dead_backend_socket "$regular" 999999; then
+	echo "remove_dead_backend_socket must refuse a non-socket path" >&2
+	exit 1
+fi
+[[ -e $regular ]] || {
+	echo "the refused non-socket must not be removed" >&2
+	exit 1
+}
+# A socket still held open by a live process is refused.
+held="$temp_dir/held.sock"
+python3 - "$held" <<'PYHOLD' &
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+s.listen()
+time.sleep(30)
+PYHOLD
+hold_pid=$!
+for _ in {1..50}; do [[ -S $held ]] && break; sleep 0.1; done
+if remove_dead_backend_socket "$held" 999999; then
+	echo "remove_dead_backend_socket must refuse a still-held socket" >&2
+	exit 1
+fi
+[[ -S $held ]] || {
+	echo "the still-held socket must not be removed" >&2
+	exit 1
+}
+kill "$hold_pid" 2>/dev/null || true
+wait "$hold_pid" 2>/dev/null || true
+
+# cleanup.sh dropper-front-socket fail-closed: the finalize path must
+# never delete a bystander left where the front socket would be (the
+# case where a pre-placed regular file made the dropper Lstat-reject and
+# exit, leaving a now-gone KA_DROP_PID), yet must still remove a genuine
+# leftover socket whose owner is gone.
+cleanup_bystander_dir="$temp_dir/cleanup-bystander"
+mkdir -p "$cleanup_bystander_dir"
+bystander_front="$cleanup_bystander_dir/ka-drop.sock"
+: >"$bystander_front" # a REGULAR file, not a socket
+cat >"$cleanup_bystander_dir/state.env" <<EOF
+KA_DROP_SOCKET=$bystander_front
+KA_DROP_PID=99999999
+EOF
+set +e
+"$script_dir/cleanup.sh" "$cleanup_bystander_dir" tiproxy-dp-rust-selftest \
+	>"$cleanup_bystander_dir/cleanup.out" 2>&1
+bystander_status=$?
+set -e
+if ((bystander_status == 0)); then
+	echo "cleanup must fail when the dropper front path is a bystander regular file" >&2
+	exit 1
+fi
+[[ -f $bystander_front ]] || {
+	echo "cleanup deleted a bystander regular file at the front-socket path" >&2
+	exit 1
+}
+
+cleanup_leftover_dir="$temp_dir/cleanup-leftover"
+mkdir -p "$cleanup_leftover_dir"
+# Bind under a short /tmp path: macOS caps sun_path near 104 bytes, far
+# shorter than the temp_dir the run lives under.
+leftover_front="/tmp/tiproxy-selftest-drop-$$.sock"
+rm -f "$leftover_front"
+python3 - "$leftover_front" <<'PYSOCK3'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PYSOCK3
+cat >"$cleanup_leftover_dir/state.env" <<EOF
+KA_DROP_SOCKET=$leftover_front
+KA_DROP_PID=99999999
+EOF
+set +e
+"$script_dir/cleanup.sh" "$cleanup_leftover_dir" tiproxy-dp-rust-selftest \
+	>"$cleanup_leftover_dir/cleanup.out" 2>&1
+leftover_status=$?
+set -e
+if ((leftover_status != 0)); then
+	echo "cleanup must succeed removing a genuine leftover front socket" >&2
+	cat "$cleanup_leftover_dir/cleanup.out" >&2
+	exit 1
+fi
+[[ -e $leftover_front ]] && {
+	echo "cleanup did not remove a genuine leftover front socket" >&2
+	exit 1
+}
 
 echo "PASS: integration framework self-tests"

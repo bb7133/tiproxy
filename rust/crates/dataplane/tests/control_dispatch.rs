@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use control_proto::control_transport::{ConnectionState, Handler, TransportError};
+use control_proto::control_transport::{ConnectionState, Handler, SessionMeta, TransportError};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     CloseCommand, ConnectionIdentity, ControlCapability, ControlEnvelope, DrainCommand, ErrorCode,
@@ -36,7 +36,8 @@ use control_proto::v1::{
 };
 use dataplane::control_dispatch::{
     CommandKind, CommandToken, ControlCommandHandler, DispatchFatal, DispatchNotice,
-    DispatchSender, InboundForwarder, ResponseKind, SessionDirective, run_control_dispatch,
+    DispatchSender, InboundForwarder, ResponseKind, SessionDirective, TaggedEnvelope,
+    run_control_dispatch,
 };
 use dataplane::session::SessionControl;
 use tokio::sync::{mpsc, watch};
@@ -219,7 +220,7 @@ async fn close_dispatch_end_to_end() {
 async fn drain_dispatch_runs_graceful_then_force() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let mut a = register(&mut handler, 1, "sql-a", "tidb-a");
     let mut b = register(&mut handler, 2, "sql-a", "tidb-a");
     let mut other = register(&mut handler, 3, "sql-b", "tidb-a");
@@ -337,7 +338,7 @@ async fn drain_dispatch_runs_graceful_then_force() {
 async fn zero_match_drain_answers_terminal_immediately() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let _session = register(&mut handler, 1, "sql-a", "tidb-a");
 
     let command = DrainCommand {
@@ -369,7 +370,7 @@ async fn zero_match_drain_answers_terminal_immediately() {
 async fn malformed_drain_deadlines_rejected() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let now = Instant::now();
 
     let inverted = DrainCommand {
@@ -475,7 +476,7 @@ async fn handler_survives_reconnect_and_replays_lost_terminal() {
 async fn handle_envelope_production_path() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
 
     let now = Instant::now();
@@ -685,7 +686,7 @@ async fn unroutable_bodies_are_answered_not_dropped() {
 async fn force_close_marks_only_on_delivery() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
 
     // Capacity-1 control channel, pre-filled so the force send jams.
     let (tx, mut rx) = mpsc::channel(1);
@@ -792,9 +793,35 @@ struct LoopHarness {
     sender: Arc<FakeSender>,
     state_tx: watch::Sender<ConnectionState>,
     notice_tx: mpsc::Sender<DispatchNotice>,
-    inbound_tx: mpsc::Sender<ControlEnvelope>,
-    snapshot_rx: mpsc::Receiver<ControlEnvelope>,
+    inbound_tx: mpsc::Sender<TaggedEnvelope>,
+    snapshot_rx: mpsc::Receiver<TaggedEnvelope>,
+    stats: Arc<dataplane::control_dispatch::DispatchStats>,
     task: tokio::task::JoinHandle<Result<(), DispatchFatal>>,
+}
+
+fn session_meta(serial: u64, epoch: u64) -> SessionMeta {
+    SessionMeta {
+        serial,
+        epoch,
+        peer_process_id: Arc::from("go-fixture"),
+        peer_started_unix_millis: 1_700_000_000_000,
+    }
+}
+
+fn session_meta_as(process_id: &str, serial: u64, epoch: u64) -> SessionMeta {
+    SessionMeta {
+        serial,
+        epoch,
+        peer_process_id: Arc::from(process_id),
+        peer_started_unix_millis: 1_700_000_000_000,
+    }
+}
+
+fn tagged_on(envelope: ControlEnvelope, serial: u64, epoch: u64) -> TaggedEnvelope {
+    TaggedEnvelope {
+        envelope,
+        origin: session_meta(serial, epoch),
+    }
 }
 
 fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopHarness {
@@ -803,6 +830,7 @@ fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopH
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let (notice_tx, notice_rx) = mpsc::channel(16);
     let (snapshot_tx, snapshot_rx) = mpsc::channel(4);
+    let stats = handler.stats();
     let task = tokio::spawn(run_control_dispatch(
         handler,
         Arc::clone(&sender),
@@ -819,8 +847,26 @@ fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopH
         notice_tx,
         inbound_tx,
         snapshot_rx,
+        stats,
         task,
     }
+}
+
+/// Sends a minimal (capability-less, so no automatic `ReconcileRequest`)
+/// `Connected` for the go-fixture lineage so a harness has a live
+/// session — the dispatch loop only processes inbound frames while a
+/// session is live (a frame with no live lineage is deferred).
+fn connect_go_fixture(harness: &LoopHarness, serial: u64) {
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: serial,
+            serial,
+            capabilities: 0,
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
 }
 
 fn spawn_loop(handler: ControlCommandHandler) -> LoopHarness {
@@ -853,7 +899,16 @@ async fn wait_for_sent(sender: &Arc<FakeSender>, count: usize) -> Vec<ControlEnv
 #[tokio::test(start_paused = true)]
 async fn connected_transition_reconciles_and_replays_metering() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    // The applied generation belongs to the connecting Go lineage, so a
+    // same-lineage reconnect reports it in the reconcile known-generation.
+    handler.on_connected(
+        1,
+        full_caps(),
+        1,
+        Arc::from("go-fixture"),
+        1_700_000_000_000,
+    );
+    handler.set_applied_generation(7, Some((Arc::from("go-fixture"), 1_700_000_000_000)));
     assert!(
         handler
             .metering()
@@ -875,7 +930,10 @@ async fn connected_transition_reconciles_and_replays_metering() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
 
@@ -937,7 +995,10 @@ async fn no_reconcile_capability_skips_request_and_replays_durably() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: 0,
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 1).await;
@@ -960,7 +1021,7 @@ async fn no_reconcile_capability_skips_request_and_replays_durably() {
 #[tokio::test(start_paused = true)]
 async fn closed_event_ids_feed_reconcile_watermark() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let harness = spawn_loop(handler);
 
     let (control_tx, _control_rx) = mpsc::channel(8);
@@ -1001,7 +1062,10 @@ async fn closed_event_ids_feed_reconcile_watermark() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
@@ -1141,7 +1205,13 @@ async fn wrong_direction_bodies_are_violations() {
 #[tokio::test(start_paused = true)]
 async fn reconcile_snapshot_epoch_and_capability_policy() {
     let mut handler = ControlCommandHandler::new();
-    handler.on_connected(5, full_caps());
+    handler.on_connected(
+        5,
+        full_caps(),
+        5,
+        Arc::from("go-fixture"),
+        1_700_000_000_000,
+    );
     let now = Instant::now();
 
     let snapshot_from = |origin: u64| ControlEnvelope {
@@ -1189,6 +1259,9 @@ async fn reconcile_snapshot_epoch_and_capability_policy() {
     legacy.on_connected(
         6,
         1u64 << (ControlCapability::ReconcileSessionRehydration as u64),
+        6,
+        Arc::from("go-fixture"),
+        1_700_000_000_000,
     );
     let out = legacy.handle_envelope(&snapshot_from(6), now, 4);
     assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
@@ -1238,6 +1311,7 @@ async fn metering_notices_seal_and_send_on_tick() {
 async fn state_snapshots_forward_to_owner() {
     let handler = ControlCommandHandler::new();
     let mut harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
     let snapshot = ControlEnvelope {
         request_id: 77,
         generation: 9,
@@ -1248,12 +1322,17 @@ async fn state_snapshots_forward_to_owner() {
         })),
         ..ControlEnvelope::default()
     };
-    harness.inbound_tx.send(snapshot).await.ok();
+    harness
+        .inbound_tx
+        .send(tagged_on(snapshot, 1, 1))
+        .await
+        .ok();
     let Some(forwarded) = harness.snapshot_rx.recv().await else {
         unreachable!("the snapshot owner receives the envelope")
     };
-    assert_eq!(forwarded.request_id, 77);
-    assert_eq!(forwarded.generation, 9);
+    assert_eq!(forwarded.envelope.request_id, 77);
+    assert_eq!(forwarded.envelope.generation, 9);
+    assert_eq!(forwarded.origin.serial, 1);
     harness.task.abort();
 }
 
@@ -1262,23 +1341,26 @@ async fn state_snapshots_forward_to_owner() {
 // pump (global ≤1, exactly-once, cancel-safe).
 // ---------------------------------------------------------------------
 
-fn forwarder_fixture(
+async fn forwarder_fixture(
     capacity: usize,
 ) -> (
     InboundForwarder,
-    mpsc::Receiver<ControlEnvelope>,
+    mpsc::Receiver<TaggedEnvelope>,
     watch::Sender<ConnectionState>,
 ) {
     let (inbound_tx, inbound_rx) = mpsc::channel(capacity);
     let (state_tx, state_rx) = watch::channel(ConnectionState::Connected {
         epoch: 1,
+        serial: 1,
         capabilities: full_caps(),
+        peer_process_id: Arc::from("go-fixture"),
+        peer_started_unix_millis: 1_700_000_000_000,
     });
-    (
-        InboundForwarder::new(inbound_tx, state_rx),
-        inbound_rx,
-        state_tx,
-    )
+    let forwarder = InboundForwarder::new(inbound_tx, state_rx);
+    let Ok(()) = forwarder.resume_session(session_meta(1, 1)).await else {
+        unreachable!("the first session's resume sets the origin")
+    };
+    (forwarder, inbound_rx, state_tx)
 }
 
 fn frame(request_id: u64) -> ControlEnvelope {
@@ -1290,7 +1372,7 @@ fn frame(request_id: u64) -> ControlEnvelope {
 /// `handle` errors so the read loop joins.
 #[tokio::test(start_paused = true)]
 async fn blocked_handle_retains_frame_on_teardown() {
-    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
     let Ok(()) = forwarder.handle(frame(1)).await else {
         unreachable!("first frame fits the queue")
     };
@@ -1310,7 +1392,7 @@ async fn blocked_handle_retains_frame_on_teardown() {
         unreachable!("exactly the in-flight frame is retained")
     };
     // Nothing was lost or double-delivered into the queue.
-    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
     assert!(inbound_rx.try_recv().is_err());
 }
 
@@ -1319,7 +1401,7 @@ async fn blocked_handle_retains_frame_on_teardown() {
 /// is empty and a new session\'s frames flow normally.
 #[tokio::test(start_paused = true)]
 async fn resume_pumps_retained_frame_exactly_once() {
-    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
     let Ok(()) = forwarder.handle(frame(1)).await else {
         unreachable!("first frame fits")
     };
@@ -1331,18 +1413,21 @@ async fn resume_pumps_retained_frame_exactly_once() {
 
     // Reconnect: drain the queue (the dispatcher made progress), then
     // the transport calls resume before reading any new frame.
-    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
     state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
-    let Ok(()) = forwarder.resume_session(2).await else {
+    let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
         unreachable!("the pump delivers the retained frame")
     };
     assert_eq!(
-        inbound_rx.try_recv().map(|e| e.request_id),
+        inbound_rx.try_recv().map(|e| e.envelope.request_id),
         Ok(2),
         "the retained frame arrives exactly once"
     );
@@ -1350,7 +1435,7 @@ async fn resume_pumps_retained_frame_exactly_once() {
         unreachable!("the slot is empty after the pump")
     };
     // A second resume is a no-op: no duplicate delivery.
-    let Ok(()) = forwarder.resume_session(2).await else {
+    let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
         unreachable!("empty pump succeeds")
     };
     assert!(inbound_rx.try_recv().is_err(), "no double delivery");
@@ -1362,7 +1447,7 @@ async fn resume_pumps_retained_frame_exactly_once() {
 /// started, so no second frame can exist (global ≤ 1).
 #[tokio::test(start_paused = true)]
 async fn teardown_during_resume_keeps_single_frame() {
-    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
     let Ok(()) = forwarder.handle(frame(1)).await else {
         unreachable!("first frame fits")
     };
@@ -1377,10 +1462,13 @@ async fn teardown_during_resume_keeps_single_frame() {
     state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
-    let resume = forwarder.resume_session(2);
+    let resume = forwarder.resume_session(session_meta(2, 2));
     tokio::pin!(resume);
     assert!(
         futures_pending(&mut resume).await,
@@ -1393,17 +1481,20 @@ async fn teardown_during_resume_keeps_single_frame() {
     };
 
     // Session 3: the queue drains, the pump completes, exactly once.
-    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
     state_tx
         .send(ConnectionState::Connected {
             epoch: 3,
+            serial: 3,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
-    let Ok(()) = forwarder.resume_session(3).await else {
+    let Ok(()) = forwarder.resume_session(session_meta(3, 3)).await else {
         unreachable!("the third session\'s pump delivers")
     };
-    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(2));
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(2));
     assert!(
         inbound_rx.try_recv().is_err(),
         "exactly once across sessions"
@@ -1449,7 +1540,7 @@ async fn futures_poll_once<F: Future + Unpin>(future: &mut F) -> Option<F::Outpu
 #[tokio::test(start_paused = true)]
 async fn stale_snapshot_after_coalesced_connect_never_acks() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     assert!(
         handler
             .metering()
@@ -1473,7 +1564,10 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     harness.state_tx.send(ConnectionState::Disconnected).ok();
@@ -1492,7 +1586,11 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
         })),
         ..ControlEnvelope::default()
     };
-    harness.inbound_tx.send(stale_ack).await.ok();
+    harness
+        .inbound_tx
+        .send(tagged_on(stale_ack, 2, 2))
+        .await
+        .ok();
 
     // The next real session replays everything unacknowledged: the
     // batch MUST still be there — the stale ack never applied.
@@ -1500,7 +1598,10 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 3,
+            serial: 3,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
@@ -1522,7 +1623,7 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
 #[tokio::test(start_paused = true)]
 async fn pending_connected_applies_before_queued_inbound() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     assert!(
         handler
             .metering()
@@ -1544,11 +1645,14 @@ async fn pending_connected_applies_before_queued_inbound() {
     let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let (notice_tx, notice_rx) = mpsc::channel(16);
-    let (snapshot_tx, _snapshot_rx) = mpsc::channel::<ControlEnvelope>(4);
+    let (snapshot_tx, _snapshot_rx) = mpsc::channel::<TaggedEnvelope>(4);
     state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let old_ack = ControlEnvelope {
@@ -1564,7 +1668,7 @@ async fn pending_connected_applies_before_queued_inbound() {
         })),
         ..ControlEnvelope::default()
     };
-    inbound_tx.try_send(old_ack).ok();
+    inbound_tx.try_send(tagged_on(old_ack, 1, 1)).ok();
     let task = tokio::spawn(run_control_dispatch(
         handler,
         Arc::clone(&sender),
@@ -1590,7 +1694,10 @@ async fn pending_connected_applies_before_queued_inbound() {
     state_tx
         .send(ConnectionState::Connected {
             epoch: 3,
+            serial: 3,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&sender, 4).await;
@@ -1615,6 +1722,7 @@ async fn pending_connected_applies_before_queued_inbound() {
 async fn applied_acks_order_arming_before_responses() {
     let handler = ControlCommandHandler::new();
     let harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
 
     let (control_tx, _control_rx) = mpsc::channel(8);
     let (resp_tx, mut resp_rx) = mpsc::channel(1);
@@ -1668,7 +1776,7 @@ async fn applied_acks_order_arming_before_responses() {
             detail: String::new(),
         }),
     );
-    harness.inbound_tx.send(answer).await.ok();
+    harness.inbound_tx.send(tagged_on(answer, 1, 1)).await.ok();
     let delivered = tokio::time::timeout(Duration::from_secs(1), resp_rx.recv()).await;
     let Ok(Some(delivered)) = delivered else {
         unreachable!("the armed answer is delivered: {delivered:?}")
@@ -1770,6 +1878,7 @@ async fn metering_saturation_rejects_producer_instead_of_dropping() {
 async fn applied_generation_ack_orders_before_inbound_commands() {
     let handler = ControlCommandHandler::new();
     let harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
 
     // Before any applied generation, old-provenance drains are legal.
     let early = envelope(
@@ -1784,7 +1893,7 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
             command_sequence: 1,
         }),
     );
-    harness.inbound_tx.send(early).await.ok();
+    harness.inbound_tx.send(tagged_on(early, 1, 1)).await.ok();
     let sent = wait_for_sent(&harness.sender, 1).await;
     assert!(
         matches!(sent[0].body, Some(Body::DrainResult(_))),
@@ -1798,6 +1907,8 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
         .notice_tx
         .send(DispatchNotice::AppliedGeneration {
             generation: 7,
+            origin_process_id: Arc::from("go-fixture"),
+            origin_started_unix_millis: 1_700_000_000_000,
             applied: ack_tx,
         })
         .await
@@ -1820,7 +1931,7 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
             command_sequence: 2,
         }),
     );
-    harness.inbound_tx.send(stale).await.ok();
+    harness.inbound_tx.send(tagged_on(stale, 1, 1)).await.ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
     assert_eq!(
         error_code(&sent[1]),
@@ -1837,7 +1948,7 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
 async fn directives_carry_exact_command_tokens() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
     let now = Instant::now();
 
@@ -1905,6 +2016,7 @@ async fn directives_carry_exact_command_tokens() {
 async fn instant_completion_binds_exact_terminal_id() {
     let handler = ControlCommandHandler::new();
     let harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
 
     // The instant session: every directive is answered with its
     // completion notice immediately, using only the carried token.
@@ -1954,10 +2066,10 @@ async fn instant_completion_binds_exact_terminal_id() {
     // carry redirect id "r-fast" AND answer request 40.
     harness
         .inbound_tx
-        .send(envelope(
-            40,
-            7,
-            Body::RedirectCommand(redirect(1, "r-fast", 1)),
+        .send(tagged_on(
+            envelope(40, 7, Body::RedirectCommand(redirect(1, "r-fast", 1))),
+            1,
+            1,
         ))
         .await
         .ok();
@@ -1982,7 +2094,7 @@ async fn instant_completion_binds_exact_terminal_id() {
     };
     harness
         .inbound_tx
-        .send(envelope(41, 7, Body::CloseCommand(close)))
+        .send(tagged_on(envelope(41, 7, Body::CloseCommand(close)), 1, 1))
         .await
         .ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
@@ -2004,7 +2116,7 @@ async fn instant_completion_binds_exact_terminal_id() {
 #[tokio::test(start_paused = true)]
 async fn stale_namespace_export_is_repaired_by_a_fresh_reconcile() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let (tx, _session_rx) = mpsc::channel(8);
     handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
 
@@ -2016,7 +2128,10 @@ async fn stale_namespace_export_is_repaired_by_a_fresh_reconcile() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 1).await;
@@ -2082,7 +2197,7 @@ async fn stale_namespace_export_is_repaired_by_a_fresh_reconcile() {
 #[tokio::test(start_paused = true)]
 async fn queued_adoption_precedes_the_automatic_reconcile() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let (tx, _session_rx) = mpsc::channel(8);
     handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
 
@@ -2105,7 +2220,10 @@ async fn queued_adoption_precedes_the_automatic_reconcile() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     assert!(applied_rx.await.is_ok());
@@ -2213,9 +2331,9 @@ struct ScriptedHarness {
     state_tx: watch::Sender<ConnectionState>,
     notice_tx: mpsc::Sender<DispatchNotice>,
     /// Held open so the loop's inbound arm never observes closure.
-    _inbound_tx: mpsc::Sender<ControlEnvelope>,
+    _inbound_tx: mpsc::Sender<TaggedEnvelope>,
     /// Held open so snapshot forwarding never observes closure.
-    _snapshot_rx: mpsc::Receiver<ControlEnvelope>,
+    _snapshot_rx: mpsc::Receiver<TaggedEnvelope>,
     task: tokio::task::JoinHandle<Result<(), DispatchFatal>>,
 }
 
@@ -2261,7 +2379,7 @@ async fn wait_for_scripted_sent(
 
 fn scripted_stale_export_handler() -> ControlCommandHandler {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let (tx, rx) = mpsc::channel(8);
     std::mem::forget(rx);
     handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
@@ -2288,7 +2406,10 @@ async fn failed_repair_send_withholds_the_namespace_ack() {
             .state_tx
             .send(ConnectionState::Connected {
                 epoch: 1,
+                serial: 1,
                 capabilities: full_caps(),
+                peer_process_id: Arc::from("go-fixture"),
+                peer_started_unix_millis: 1_700_000_000_000,
             })
             .ok();
         // The automatic reconcile succeeds and exports the seed.
@@ -2327,7 +2448,10 @@ async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports(
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let _ = wait_for_scripted_sent(&harness.sender, 1).await;
@@ -2359,7 +2483,10 @@ async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports(
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_scripted_sent(&harness.sender, 2).await;
@@ -2369,6 +2496,827 @@ async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports(
     assert_eq!(
         request.connections[0].namespace, "ns-wired",
         "the next-epoch reconcile exports the adopted namespace"
+    );
+    harness.task.abort();
+}
+
+/// Fix-2 lineage regression: a frame retained from lineage A's dead
+/// session must NOT be pumped into a session belonging to a DIFFERENT
+/// Go process — even when the new session negotiated the SAME wire
+/// epoch value. The frame is dropped and counted; its owner (the new
+/// Go) regenerates the desired state itself.
+#[tokio::test(start_paused = true)]
+async fn cross_lineage_retained_frame_is_dropped_not_pumped() {
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
+    let Ok(()) = forwarder.handle(frame(1)).await else {
+        unreachable!("first frame fits")
+    };
+    let blocked = forwarder.handle(frame(2));
+    tokio::pin!(blocked);
+    assert!(futures_pending(&mut blocked).await);
+    state_tx.send(ConnectionState::Disconnected).ok();
+    assert!(blocked.await.is_err());
+    let Ok(true) = forwarder.retains_frame() else {
+        unreachable!("the in-flight frame is retained")
+    };
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
+
+    // The replacement Go negotiates the SAME wire epoch value 1 — but
+    // it is a different process lineage.
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    let Ok(()) = forwarder
+        .resume_session(session_meta_as("go-restarted", 2, 1))
+        .await
+    else {
+        unreachable!("resume succeeds with nothing to pump")
+    };
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "the cross-lineage frame is NOT delivered"
+    );
+    let Ok(false) = forwarder.retains_frame() else {
+        unreachable!("the slot is emptied by the drop")
+    };
+    assert_eq!(
+        forwarder.cross_lineage_retained_dropped(),
+        1,
+        "the drop is observable"
+    );
+
+    // The new session's own frames flow normally, tagged with the NEW
+    // origin.
+    let Ok(()) = forwarder.handle(frame(3)).await else {
+        unreachable!("the new session's frame fits")
+    };
+    let Ok(delivered) = inbound_rx.try_recv() else {
+        unreachable!("the new session's frame is delivered")
+    };
+    assert_eq!(delivered.envelope.request_id, 3);
+    assert_eq!(delivered.origin.serial, 2);
+    assert_eq!(delivered.origin.peer_process_id.as_ref(), "go-restarted");
+}
+
+/// Fix-2 lineage regression, same-lineage side: a reconnect WITHIN one
+/// Go process (epoch 1 → 2) keeps the one-shot retained delivery, and
+/// the pumped frame still carries its ORIGIN session meta — it must be
+/// judged against the session it was read on, not the new one.
+#[tokio::test(start_paused = true)]
+async fn same_lineage_retained_frame_pumps_once_with_origin_meta() {
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
+    let Ok(()) = forwarder.handle(frame(1)).await else {
+        unreachable!("first frame fits")
+    };
+    let blocked = forwarder.handle(frame(2));
+    tokio::pin!(blocked);
+    assert!(futures_pending(&mut blocked).await);
+    state_tx.send(ConnectionState::Disconnected).ok();
+    assert!(blocked.await.is_err());
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
+
+    // Same Go process, next epoch.
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
+        unreachable!("the pump delivers the retained frame")
+    };
+    let Ok(delivered) = inbound_rx.try_recv() else {
+        unreachable!("the retained frame arrives")
+    };
+    assert_eq!(delivered.envelope.request_id, 2);
+    assert_eq!(
+        delivered.origin.serial, 1,
+        "the frame keeps the ORIGIN it was read on"
+    );
+    assert_eq!(delivered.origin.epoch, 1);
+    assert_eq!(forwarder.cross_lineage_retained_dropped(), 0);
+    // One-shot semantics unchanged.
+    let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
+        unreachable!("empty pump succeeds")
+    };
+    assert!(inbound_rx.try_recv().is_err(), "no double delivery");
+}
+
+/// Fix-2 dispatch-gate regression: wire epoch VALUES repeat across Go
+/// restarts, so a `ReconcileSnapshot` from a DEAD session that happens
+/// to carry the CURRENT epoch value must still be refused — only the
+/// tagged origin serial tells the sessions apart. The dead session's
+/// metering ack never applies, the batch replays to every successor,
+/// and each new session regenerates its own reconcile exchange.
+#[expect(
+    clippy::too_many_lines,
+    reason = "three full sessions plus an interleaved late ack are one scenario"
+)]
+#[tokio::test(start_paused = true)]
+async fn dead_session_snapshot_with_reused_epoch_value_never_acks() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7, None);
+    assert!(
+        handler
+            .metering()
+            .record(MeteringDelta {
+                keyspace: "ks-serial".to_owned(),
+                backend_id: "tidb-a".to_owned(),
+                public_endpoint: false,
+                response_bytes: 64,
+                cross_location_bytes: 0,
+            })
+            .is_ok()
+    );
+    let Ok(Some(batch)) = handler.seal_metering() else {
+        unreachable!("one batch seals")
+    };
+    let harness = spawn_loop(handler);
+
+    // Session A (serial 2, epoch 2): replays the unacked batch and
+    // issues its reconcile request.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    let replays = |sent: &[ControlEnvelope]| {
+        sent.iter()
+            .filter(|envelope| {
+                matches!(
+                    &envelope.body,
+                    Some(Body::MeteringBatch(replayed)) if replayed.sequence == batch.sequence
+                )
+            })
+            .count()
+    };
+    assert_eq!(replays(&sent), 1, "session A replays the unacked batch");
+
+    // Go restarts. The replacement session B negotiates the SAME wire
+    // epoch VALUE 2 — a different serial is the only discriminator.
+    harness.state_tx.send(ConnectionState::Disconnected).ok();
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 3,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+
+    // Session B replays the still-unacked batch too.
+    let mut sent = Vec::new();
+    for _ in 0..100_000 {
+        sent = harness.sender.sent();
+        if replays(&sent) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(replays(&sent), 2, "session B replays the unacked batch");
+
+    // A late ack minted by DEAD session A arrives: control_epoch 2
+    // matches the CURRENT epoch value, so an epoch-only gate would
+    // accept it — the origin serial must refuse it.
+    let late_ack = ControlEnvelope {
+        request_id: 60,
+        generation: 7,
+        control_epoch: 2,
+        body: Some(Body::ReconcileSnapshot(ReconcileSnapshot {
+            applied_generation: 7,
+            connection_event_sequence: 0,
+            metrics_sequence: 0,
+            metering_sequence: batch.sequence,
+            connections: Vec::new(),
+        })),
+        ..ControlEnvelope::default()
+    };
+    harness
+        .inbound_tx
+        .send(tagged_on(late_ack, 2, 2))
+        .await
+        .ok();
+    // A marker command queued BEHIND the ack (FIFO): once its terminal
+    // is out, the ack was judged — while the epoch value is STILL 2.
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            envelope(61, 7, Body::RedirectCommand(redirect(999, "marker-1", 1))),
+            3,
+            2,
+        ))
+        .await
+        .ok();
+    let mut sent = Vec::new();
+    for _ in 0..100_000 {
+        sent = harness.sender.sent();
+        if sent.iter().any(|envelope| envelope.request_id == 61) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        sent.iter().any(|envelope| envelope.request_id == 61),
+        "the marker terminal proves the ack was judged under epoch value 2"
+    );
+
+    // Session C proves the refusal observably: the batch is STILL
+    // unacked and replays a third time.
+    harness.state_tx.send(ConnectionState::Disconnected).ok();
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 3,
+            serial: 4,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    let mut final_sent = Vec::new();
+    for _ in 0..100_000 {
+        final_sent = harness.sender.sent();
+        if replays(&final_sent) >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        replays(&final_sent),
+        3,
+        "the dead session's same-epoch-value ack was refused: the batch replays"
+    );
+    // Every session regenerated its own reconcile exchange.
+    assert!(
+        final_sent
+            .iter()
+            .filter(|envelope| matches!(envelope.body, Some(Body::ReconcileRequest(_))))
+            .count()
+            >= 2,
+        "each successor session re-issues its reconcile request"
+    );
+    harness.task.abort();
+}
+
+/// Fix-2 outbound-scoping regression: an INLINE request error (a
+/// `ProtocolError` answering one inbound frame) is bound to the exact
+/// session the offending frame arrived on — if that session dies, the
+/// error dies with it and can never false-resolve a successor's
+/// exchange that reused the same request id. Lifecycle TERMINALS
+/// (drain results and kin) stay durable across reconnects.
+#[tokio::test(start_paused = true)]
+async fn inline_request_errors_are_session_scoped_and_terminals_durable() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_connected(
+        2,
+        full_caps(),
+        2,
+        Arc::from("go-fixture"),
+        1_700_000_000_000,
+    );
+    handler.set_applied_generation(7, Some((Arc::from("go-fixture"), 1_700_000_000_000)));
+    let harness = spawn_loop(handler);
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+
+    // A drain minted under a superseded generation draws an inline
+    // ProtocolError: scoped to the offending frame's origin session.
+    let stale = envelope(
+        70,
+        3,
+        Body::DrainCommand(DrainCommand {
+            drain_id: "d-scoped".to_owned(),
+            listener_names: Vec::new(),
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: 1_010_000,
+            force_deadline_unix_millis: 1_020_000,
+            command_sequence: 1,
+        }),
+    );
+    harness.inbound_tx.send(tagged_on(stale, 2, 2)).await.ok();
+    let mut with_scope = Vec::new();
+    for _ in 0..100_000 {
+        with_scope = harness.sender.sent_with_scope();
+        if with_scope
+            .iter()
+            .any(|(envelope, _)| envelope.request_id == 70)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let Some((error, scope)) = with_scope
+        .iter()
+        .find(|(envelope, _)| envelope.request_id == 70)
+    else {
+        unreachable!("the stale drain is answered")
+    };
+    assert_eq!(
+        error_code(error),
+        Some(ErrorCode::StaleGeneration),
+        "the answer is the inline request error"
+    );
+    assert_eq!(
+        *scope,
+        Some(2),
+        "the inline error is bound to the offending frame's origin session"
+    );
+
+    // A legal drain completes with a terminal: durable, never scoped.
+    let valid = envelope(
+        71,
+        7,
+        Body::DrainCommand(DrainCommand {
+            drain_id: "d-durable".to_owned(),
+            listener_names: Vec::new(),
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: 1_010_000,
+            force_deadline_unix_millis: 1_020_000,
+            command_sequence: 2,
+        }),
+    );
+    harness.inbound_tx.send(tagged_on(valid, 2, 2)).await.ok();
+    let mut with_scope = Vec::new();
+    for _ in 0..100_000 {
+        with_scope = harness.sender.sent_with_scope();
+        if with_scope.iter().any(|(envelope, _)| {
+            matches!(&envelope.body, Some(Body::DrainResult(result)) if result.drain_id == "d-durable")
+        }) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let Some((_, scope)) = with_scope.iter().find(|(envelope, _)| {
+        matches!(&envelope.body, Some(Body::DrainResult(result)) if result.drain_id == "d-durable")
+    }) else {
+        unreachable!("the legal drain reaches its terminal")
+    };
+    assert_eq!(*scope, None, "lifecycle terminals stay durable");
+    harness.task.abort();
+}
+
+/// Fix-2 queued-frame lineage regression (the "queued", not "retained",
+/// seam): a frame from Go lineage A already sitting in the dispatch
+/// inbound queue when Go restarts as lineage B must NOT reach the
+/// `CommandGate` once B is the live session — it is dropped before any
+/// handler side effect and answers nothing. An identical frame from the
+/// LIVE lineage B does reach the gate (its unroutable body is answered),
+/// proving the drop is lineage-specific rather than a blanket refusal.
+#[tokio::test(start_paused = true)]
+async fn queued_cross_lineage_frame_never_reaches_the_gate() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+
+    // Lineage B becomes the live session (wire epoch value 1). Its
+    // start time matches `session_meta_as`, so a go-b origin is
+    // exact-lineage and a go-a origin is foreign purely by process id.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+
+    // An unroutable body (a MeteringBatch is never inbound-legal)
+    // tagged with the DEAD lineage A, same wire epoch value 1: the gate
+    // would answer it with a ProtocolViolation — but the lineage drop
+    // must fire first, so it is swallowed with no answer.
+    let a_frame = envelope(
+        80,
+        0,
+        Body::MeteringBatch(control_proto::v1::MeteringBatch {
+            sequence: 1,
+            deltas: Vec::new(),
+        }),
+    );
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: a_frame,
+            origin: session_meta_as("go-a", 1, 1),
+        })
+        .await
+        .ok();
+
+    // The SAME unroutable body from the LIVE lineage B does reach the
+    // gate: it is answered (proving the drop above was lineage-specific,
+    // not a blanket refusal of unroutable bodies).
+    let b_frame = envelope(
+        81,
+        0,
+        Body::MeteringBatch(control_proto::v1::MeteringBatch {
+            sequence: 2,
+            deltas: Vec::new(),
+        }),
+    );
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: b_frame,
+            origin: session_meta_as("go-b", 2, 1),
+        })
+        .await
+        .ok();
+
+    // Both frames carry the same unroutable body, so each one that
+    // reaches the gate yields one ProtocolViolation answer. Wait for
+    // the drop and the answer, then confirm exactly one such answer
+    // exists (B's), exactly one frame was lineage dropped (A's), and
+    // exactly one frame was unrouted (B's). (B's connect also emits a
+    // ReconcileRequest, which is not a ProtocolViolation answer.)
+    let count_violations = |harness: &LoopHarness| {
+        harness
+            .sender
+            .sent()
+            .iter()
+            .filter(|envelope| error_code(envelope) == Some(ErrorCode::ProtocolViolation))
+            .count()
+    };
+    for _ in 0..100_000 {
+        if count_violations(&harness) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    wait_for_drop(&harness).await;
+    // Let any erroneously-forwarded A answer race in, then assert the
+    // totals.
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        count_violations(&harness),
+        1,
+        "only the live lineage's frame reached the gate and was answered"
+    );
+    assert_eq!(
+        harness.stats.stale_dropped.load(Ordering::Relaxed),
+        1,
+        "exactly the dead lineage's frame was lineage dropped"
+    );
+    assert_eq!(
+        harness.stats.unrouted.load(Ordering::Relaxed),
+        1,
+        "exactly the live lineage's frame was unrouted"
+    );
+    harness.task.abort();
+}
+
+async fn wait_for_drop(harness: &LoopHarness) {
+    for _ in 0..100_000 {
+        if harness.stats.stale_dropped.load(Ordering::Relaxed) >= 1 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Fix-2 no-live-session deferral (Blocker 1): a frame that arrives
+/// while there is NO live session (a teardown was observed before the
+/// frame was classified) must not be processed under an absent lineage
+/// — it is held until the next `Connected` and only then classified
+/// same-lineage (processed) or foreign (dropped). Here the deferred
+/// frame is from a lineage the successor does not share, so once the
+/// successor is live it is dropped, never reaching the gate; a frame
+/// from the successor's own lineage is answered, proving the successor
+/// is otherwise healthy.
+#[tokio::test(start_paused = true)]
+async fn no_live_session_frame_is_deferred_then_classified() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+    // The loop starts Disconnected: send a frame with NO live session.
+    let orphan = envelope(
+        70,
+        0,
+        Body::MeteringBatch(control_proto::v1::MeteringBatch {
+            sequence: 1,
+            deltas: Vec::new(),
+        }),
+    );
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: orphan,
+            origin: session_meta_as("go-a", 1, 1),
+        })
+        .await
+        .ok();
+
+    // While no session is live the frame is held: it neither reaches
+    // the gate (no unrouted answer) nor is counted as dropped.
+    for _ in 0..2_000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.stats.unrouted.load(Ordering::Relaxed),
+        0,
+        "a frame with no live session is not processed"
+    );
+    assert_eq!(
+        harness.stats.stale_dropped.load(Ordering::Relaxed),
+        0,
+        "and not yet dropped — it is deferred"
+    );
+    assert!(
+        harness.sender.sent().is_empty(),
+        "the deferred frame produced nothing"
+    );
+
+    // A DIFFERENT lineage becomes live: the deferred frame is now
+    // classified foreign and dropped before the gate.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    for _ in 0..100_000 {
+        if harness.stats.stale_dropped.load(Ordering::Relaxed) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.stats.stale_dropped.load(Ordering::Relaxed),
+        1,
+        "the deferred frame is dropped once the foreign successor is live"
+    );
+    assert_eq!(
+        harness.stats.unrouted.load(Ordering::Relaxed),
+        0,
+        "the deferred foreign frame never reached the gate"
+    );
+
+    // The live successor's own frame is answered — it is healthy.
+    let native = envelope(
+        71,
+        0,
+        Body::MeteringBatch(control_proto::v1::MeteringBatch {
+            sequence: 2,
+            deltas: Vec::new(),
+        }),
+    );
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: native,
+            origin: session_meta_as("go-b", 2, 1),
+        })
+        .await
+        .ok();
+    for _ in 0..100_000 {
+        if harness.stats.unrouted.load(Ordering::Relaxed) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.stats.unrouted.load(Ordering::Relaxed),
+        1,
+        "the successor lineage's own frame reaches the gate"
+    );
+    harness.task.abort();
+}
+
+/// Fix-2 applied-generation lineage qualification: a
+/// `DispatchNotice::AppliedGeneration` from a SUPERSEDED session (Go
+/// restarted while its snapshot owner was mid-transaction — the owner
+/// releases the session lease before this barrier, so a successor is
+/// already live) must not stamp its generation onto the successor's
+/// command gate; a notice from the live session does.
+#[tokio::test(start_paused = true)]
+async fn applied_generation_is_lineage_qualified() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+    // Live session B (serial 2, lineage go-b). Capability-less so no
+    // automatic ReconcileRequest pollutes the sender.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: 0,
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+
+    // A stale applied-generation from the dead session (serial 1): the
+    // barrier still acks so the owner converges, but B's gate must NOT
+    // record generation 7.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::AppliedGeneration {
+            generation: 7,
+            origin_process_id: Arc::from("go-a"),
+            origin_started_unix_millis: 1_700_000_000_000,
+            applied: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = ack_rx.await else {
+        unreachable!("the barrier acks even when it rejects the generation")
+    };
+
+    // A drain at generation 3 is admitted — the gate's applied
+    // generation did not advance to A's 7.
+    let drain_a = DrainCommand {
+        drain_id: "d-a".to_owned(),
+        listener_names: Vec::new(),
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: 1_010_000,
+        force_deadline_unix_millis: 1_020_000,
+        command_sequence: 1,
+    };
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: envelope(30, 3, Body::DrainCommand(drain_a)),
+            origin: session_meta_as("go-b", 2, 1),
+        })
+        .await
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    assert!(
+        matches!(sent[0].body, Some(Body::DrainResult(_))),
+        "the dead session's generation was rejected, so an older drain is still admitted"
+    );
+
+    // The LIVE session's applied-generation IS recorded.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::AppliedGeneration {
+            generation: 7,
+            origin_process_id: Arc::from("go-b"),
+            origin_started_unix_millis: 1_700_000_000_000,
+            applied: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = ack_rx.await else {
+        unreachable!("the live-session barrier acks")
+    };
+    let drain_b = DrainCommand {
+        drain_id: "d-b".to_owned(),
+        listener_names: Vec::new(),
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: 1_010_000,
+        force_deadline_unix_millis: 1_020_000,
+        command_sequence: 2,
+    };
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: envelope(31, 3, Body::DrainCommand(drain_b)),
+            origin: session_meta_as("go-b", 2, 1),
+        })
+        .await
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    assert_eq!(
+        error_code(&sent[1]),
+        Some(ErrorCode::StaleGeneration),
+        "the live session's generation 7 was recorded, so a generation-3 drain is stale"
+    );
+    harness.task.abort();
+}
+
+/// Fix-2 applied-generation auto-isolation across Go lineage: the
+/// generation is bound to its origin lineage in the gate's PERSISTENT
+/// state, so a restarted Go's gate reads 0 regardless of scheduling — a
+/// stale notice from the dead lineage cannot stamp it, and a same-Go
+/// reconnect keeps it. This is the deterministic core that makes the
+/// notice-arm and state-arm handoff races safe.
+#[tokio::test]
+async fn applied_generation_auto_isolates_across_go_lineage() {
+    let mut handler = ControlCommandHandler::new();
+    // Lineage A applies generation 5.
+    handler.on_connected(1, full_caps(), 1, Arc::from("go-a"), 1_000);
+    handler.set_applied_generation(5, Some((Arc::from("go-a"), 1_000)));
+    assert_eq!(handler.applied_generation(), 5);
+
+    // Go restarts as a DIFFERENT lineage B: the applied generation is
+    // isolated — B's gate reads 0.
+    handler.on_connected(1, full_caps(), 2, Arc::from("go-b"), 2_000);
+    assert_eq!(
+        handler.applied_generation(),
+        0,
+        "B never inherits A's applied generation"
+    );
+
+    // A stale notice from the dead lineage A cannot stamp B's gate.
+    handler.set_applied_generation(5, Some((Arc::from("go-a"), 1_000)));
+    assert_eq!(
+        handler.applied_generation(),
+        0,
+        "a stale A notice is rejected while B is live"
+    );
+
+    // A same-Go reconnect (lineage A again, new serial) KEEPS A's
+    // applied generation — generations stay monotonic within a lineage.
+    handler.on_connected(1, full_caps(), 3, Arc::from("go-a"), 1_000);
+    assert_eq!(
+        handler.applied_generation(),
+        5,
+        "a same-Go reconnect keeps the applied generation"
+    );
+}
+
+/// Fix-2 state-arm handoff: a `Connected(B)` transition drives the
+/// dispatch loop's state arm (drain-pending-notices → apply-state →
+/// automatic reconcile). B's reconcile known-generation must be 0, not
+/// the generation A applied — the lineage-scoped gate isolates it even
+/// on this path.
+#[tokio::test(start_paused = true)]
+async fn state_arm_reconcile_does_not_inherit_a_generation() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+
+    // Lineage A connects and applies generation 5 (via the ack path).
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 1,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-a"),
+            peer_started_unix_millis: 1_000,
+        })
+        .ok();
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::AppliedGeneration {
+            generation: 5,
+            origin_process_id: Arc::from("go-a"),
+            origin_started_unix_millis: 1_000,
+            applied: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = ack_rx.await else {
+        unreachable!("A's applied generation is acked")
+    };
+    // Drain A's automatic reconcile so the next one we read is B's.
+    let sent_a = wait_for_sent(&harness.sender, 1).await;
+    let Some(Body::ReconcileRequest(_)) = &sent_a[0].body else {
+        unreachable!("A reconciles on connect")
+    };
+
+    // Go restarts as lineage B. Its automatic reconcile must report
+    // known_generation 0 — B never inherits A's generation 5.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 2_000,
+        })
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    let Some(Body::ReconcileRequest(request)) = &sent[1].body else {
+        unreachable!("B reconciles on connect")
+    };
+    assert_eq!(
+        request.known_generation, 0,
+        "B's reconcile does not inherit A's applied generation"
     );
     harness.task.abort();
 }

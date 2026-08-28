@@ -170,6 +170,7 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
     fn apply(
         &mut self,
         snapshot: &Arc<ValidatedSnapshot>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
         let snapshot = Arc::clone(snapshot);
         let state = Arc::clone(&self.state);
@@ -192,12 +193,32 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
             }
 
             let result = if let Some(handle) = &serving.handle {
+                // Lineage check immediately before the serving swap,
+                // inside the serving lock with no await between: a
+                // snapshot whose control session was superseded during
+                // this apply must not become the served generation.
+                if !still_current() {
+                    status.rejected(generation);
+                    return Err(SnapshotError::unsupported(
+                        "control session superseded before snapshot swap",
+                    ));
+                }
                 handle
                     .update_snapshot(snapshot)
                     .map_err(|error| snapshot_apply_error(&error))
             } else {
                 match DataplaneServer::bind(snapshot, memory).await {
                     Ok(server) => {
+                        // The bind awaited above; re-check lineage before
+                        // committing the listener owner (no await between
+                        // this check and the swap), and drop the freshly
+                        // bound server if the session was superseded.
+                        if !still_current() {
+                            status.rejected(generation);
+                            return Err(SnapshotError::unsupported(
+                                "control session superseded before listener bind commit",
+                            ));
+                        }
                         let server = server.with_force_join_grace(force_join_grace);
                         let handle = server.handle();
                         let owner = tokio::spawn(server.run(SharedConnectionHandler(handler)));
