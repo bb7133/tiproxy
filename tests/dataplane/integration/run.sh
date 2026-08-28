@@ -706,6 +706,13 @@ for port in "${ka_phase_ports[@]}"; do
 		exit 1
 	fi
 done
+# Fold the KA-phase ports (incl. dropper admin) into the live PORTS ledger
+# BEFORE starting any KA process and persist immediately, so a mid-phase
+# failure still leaves them in the post-run leak sweep and the later
+# conflict phase appends on top of them instead of overwriting state.env
+# with a KA-less list.
+PORTS="$PORTS ${ka_phase_ports[*]}"
+printf 'PORTS=%q\n' "$PORTS" >>"$run_dir/state.env"
 sed '/^\[rust-dataplane\]/,$d' "$run_dir/tiproxy.toml" >"$run_dir/tiproxy-ka.toml"
 python3 - "$run_dir/tiproxy-ka.toml" "$ka_sql_port" "$ka_api_port" "$run_dir" "$TIDB_PORT_1" "$TIDB_PORT_B" <<'PYKA'
 import re, sys
@@ -763,7 +770,9 @@ fi
 # until an /arm request selects a frame to drop.
 ka_rust_control_socket=$KA_SOCKET
 if [[ $ka_use_dropper == true ]]; then
-	rm -f "$KA_DROP_SOCKET"
+	# No pre-removal here: the dropper's own start() Lstat-checks the
+	# front path and removes ONLY a pre-existing socket (failing closed
+	# on a regular file), so a blind rm would bypass that audited guard.
 	"$run_dir/controldropper" \
 		--front-socket "$KA_DROP_SOCKET" \
 		--target-socket "$KA_SOCKET" \
@@ -817,6 +826,40 @@ if [[ $mode == rust ]]; then
 		echo "keyspace-guard rust dataplane never became ready" >&2
 		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
 		exit 1
+	fi
+	if [[ $ka_use_dropper == true ]]; then
+		# Durable transparent-passthrough oracle: with Rust connected and
+		# control frames already flowing but nothing armed, the dropper
+		# must be a pure forwarder. Snapshot /state into the artifact and
+		# assert it, so a silent loss of transparency fails the run.
+		curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$ka_drop_admin_port/state" \
+			-o "$run_dir/controldropper-state-transparent.json"
+		if ! python3 - "$run_dir/controldropper-state-transparent.json" "$KA_SOCKET" <<'PYDROP'
+import json, sys
+state = json.load(open(sys.argv[1]))
+ka_socket = sys.argv[2]
+errors = []
+if state.get("target") != ka_socket:
+    errors.append(f'target={state.get("target")!r} != KA_SOCKET {ka_socket!r}')
+if state.get("armed") is not False:
+    errors.append(f'armed={state.get("armed")!r} (want false)')
+if state.get("drop_count") != 0:
+    errors.append(f'drop_count={state.get("drop_count")!r} (want 0)')
+if not isinstance(state.get("connect_count"), int) or state["connect_count"] < 1:
+    errors.append(f'connect_count={state.get("connect_count")!r} (want >=1)')
+if not isinstance(state.get("forwarded"), int) or state["forwarded"] < 1:
+    errors.append(f'forwarded={state.get("forwarded")!r} (want >0)')
+if errors:
+    print("dropper transparent-state oracle failed: " + "; ".join(errors), file=sys.stderr)
+    sys.exit(1)
+print(f'dropper transparent: target=KA_SOCKET armed=false drop_count=0 '
+      f'connect_count={state["connect_count"]} forwarded={state["forwarded"]}')
+PYDROP
+		then
+			echo "keyspace-guard phase: dropper transparent-state oracle failed" >&2
+			exit 1
+		fi
 	fi
 fi
 ka_log_lines() {
@@ -1065,12 +1108,30 @@ if [[ $mode == rust ]]; then
 fi
 if [[ $ka_use_dropper == true ]]; then
 	kill -s INT "$KA_DROP_PID" 2>/dev/null || true
+	ka_drop_stopped=false
 	for _ in {1..100}; do
-		kill -0 "$KA_DROP_PID" 2>/dev/null || break
+		if ! kill -0 "$KA_DROP_PID" 2>/dev/null; then
+			ka_drop_stopped=true
+			break
+		fi
 		sleep 0.1
 	done
-	kill "$KA_DROP_PID" 2>/dev/null || true
-	rm -f "$KA_DROP_SOCKET"
+	if [[ $ka_drop_stopped != true ]]; then
+		kill -s KILL "$KA_DROP_PID" 2>/dev/null || true
+		for _ in {1..50}; do
+			if ! kill -0 "$KA_DROP_PID" 2>/dev/null; then
+				ka_drop_stopped=true
+				break
+			fi
+			sleep 0.1
+		done
+	fi
+	# Unlink the front socket ONLY once its owning dropper is confirmed
+	# gone; otherwise leave the inode for cleanup.sh's ownership-checked
+	# path rather than orphaning a live socket.
+	if [[ $ka_drop_stopped == true ]]; then
+		rm -f "$KA_DROP_SOCKET"
+	fi
 fi
 kill -s INT "$KA_PID" 2>/dev/null || true
 for _ in {1..100}; do
@@ -1079,11 +1140,8 @@ for _ in {1..100}; do
 done
 kill "$KA_PID" 2>/dev/null || true
 rm -f "$KA_FIFO"
-ka_phase_ports_csv="$ka_sql_port $ka_api_port $ka_health_port"
-if [[ $ka_use_dropper == true ]]; then
-	ka_phase_ports_csv="$ka_phase_ports_csv $ka_drop_admin_port"
-fi
-printf 'PORTS=%q\n' "$PORTS $ka_phase_ports_csv" >>"$run_dir/state.env"
+# KA-phase ports were folded into PORTS and persisted before the phase
+# started (see the pre-check above), so no separate PORTS append here.
 echo "no-keyspace-migration: old session pinned to ks-old under real migration pressure; guard refused ks-new"
 
 # ---- Error parity (DPL-07 #41): the same semantic ERR in both modes.

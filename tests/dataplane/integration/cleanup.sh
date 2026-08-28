@@ -63,8 +63,14 @@ if [[ -n ${KA_SOCKET:-} ]]; then
 	rm -f "$KA_SOCKET"
 fi
 if [[ -n ${KA_DROP_SOCKET:-} ]]; then
-	stop_owned_process "${KA_DROP_PID:-}" "$run_dir/controldropper" || cleanup_status=1
-	rm -f "$KA_DROP_SOCKET"
+	# Unlink the front socket only if the owning dropper is confirmed
+	# stopped; a failed ownership stop keeps the inode and fails cleanup
+	# rather than orphaning a socket a live/foreign process may hold.
+	if stop_owned_process "${KA_DROP_PID:-}" "$run_dir/controldropper"; then
+		rm -f "$KA_DROP_SOCKET"
+	else
+		cleanup_status=1
+	fi
 fi
 stop_owned_process "${KA_PID:-}" "$run_dir/tiproxy-ka.toml" || cleanup_status=1
 if [[ ${KA_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
