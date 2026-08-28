@@ -1333,6 +1333,235 @@ PYR
 	printf 'KB_FIFO=\n' >>"$run_dir/state.env"
 	echo "control-frame-drop-closed: a lost ConnectionEvent{CLOSED} left a ghost; a real reconnect's reconcile cleared it exactly"
 fi
+if [[ $ka_use_dropper == true ]]; then
+	# ---- CTL-06 chaos chain (a): a dropped RouteResult{connected=true}
+	# leaves the new connection LIVE but uncounted on Go's side, so its
+	# per-backend accounting is short by one. The automatic reconcile on
+	# the next control reconnect completes the lost assignment, restoring
+	# the count to EXACTLY +1 (never double-counted). The dropper's
+	# drop/release counters accumulate across chains, so every assertion
+	# here is a DELTA from a baseline captured at chain (a)'s start.
+	ca_before=$(ka_backend_conn "$ka_pinned_addr")
+	ca_drop_base=$(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("drop_count",0))')
+	ca_release_base=$(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("release_count",0))')
+	# Predict the next proxy connection id: ids are allocated sequentially
+	# within a Rust lineage and nothing else opens a client connection in
+	# this quiesced window, so the next new session is (max seen)+1. The
+	# connection_ready and the drop record are both asserted to equal it,
+	# so a mispredict fails closed (the frame is never dropped) rather than
+	# passing.
+	ca_max=$(grep -s '"event":"connection_ready"' "$run_dir/tiproxy-rs-ka.log" |
+		sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p' | sort -n | tail -1)
+	[[ -n $ca_max ]] || ca_max=0
+	ca_target=$((ca_max + 1))
+	# Arm the exact RouteResult{connected} drop for the predicted
+	# connection. assignment_id is unobservable before the frame is sent;
+	# connection_id alone is exact within the lineage (the reviewed
+	# option-1 selector).
+	curl --noproxy '*' --fail --silent --show-error -X POST \
+		--data-binary "{\"kind\":\"route-result-connected\",\"connection_id\":$ca_target}" \
+		"http://127.0.0.1:$ka_drop_admin_port/arm" -o /dev/null
+	CA_FIFO="$run_dir/ca-session.fifo"
+	mkfifo "$CA_FIFO"
+	printf 'CA_FIFO=%q\n' "$CA_FIFO" >>"$run_dir/state.env"
+	ca_rust_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$CA_FIFO" >"$run_dir/ca-session.out" 2>&1 &
+	CA_SESSION_PID=$!
+	printf 'CA_SESSION_PID=%q\n' "$CA_SESSION_PID" >>"$run_dir/state.env"
+	exec 7>"$CA_FIFO"
+	printf "SELECT CONCAT('CA|', CONNECTION_ID(), '|', @@port);\n" >&7
+	ca_line=
+	for _ in {1..40}; do
+		ca_line=$(grep -s '^CA|' "$run_dir/ca-session.out" | tail -1 || true)
+		[[ -n $ca_line ]] && break
+		if ! kill -0 "$CA_SESSION_PID" 2>/dev/null; then
+			echo "chain-a: session died before establishing" >&2
+			tail -5 "$run_dir/ca-session.out" >&2 || true
+			exit 1
+		fi
+		sleep 0.5
+	done
+	[[ -n $ca_line ]] || { echo "chain-a: session never answered" >&2; exit 1; }
+	ca_port=$(cut -d'|' -f3 <<<"$ca_line")
+	if [[ $ca_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-a: session landed on @@port=$ca_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	ca_conn_id= ca_backend_addr=
+	for _ in {1..20}; do
+		ca_ready=$(tail -n "+$((ca_rust_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | tail -1 || true)
+		if [[ -n $ca_ready ]]; then
+			ca_conn_id=$(sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p' <<<"$ca_ready")
+			ca_backend_addr=$(sed -n 's/.*"backend_addr":"\([^"]*\)".*/\1/p' <<<"$ca_ready")
+		fi
+		[[ -n $ca_conn_id && -n $ca_backend_addr ]] && break
+		sleep 0.5
+	done
+	if [[ -z $ca_conn_id || -z $ca_backend_addr ]]; then
+		echo "chain-a: could not capture connection_ready identity" >&2
+		exit 1
+	fi
+	if [[ $ca_conn_id != "$ca_target" ]]; then
+		echo "chain-a: connection-id prediction missed (predicted $ca_target, got $ca_conn_id)" >&2
+		exit 1
+	fi
+	if [[ $ca_backend_addr != "$ka_pinned_addr" ]]; then
+		echo "chain-a: session backend $ca_backend_addr is not the pinned $ka_pinned_addr" >&2
+		exit 1
+	fi
+	echo "chain-a: new session proxy_conn_id=$ca_conn_id addr=$ca_backend_addr port=$ca_port (predicted $ca_target)"
+	# The RouteResult{connected} for this connection must have been dropped
+	# (drop_count advances by exactly one from the chain baseline).
+	ca_want_drops=$((ca_drop_base + 1))
+	ca_dropped=false
+	for _ in {1..40}; do
+		if [[ $(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("drop_count",0))' 2>/dev/null) == "$ca_want_drops" ]]; then
+			ca_dropped=true
+			break
+		fi
+		sleep 0.25
+	done
+	if [[ $ca_dropped != true ]]; then
+		echo "chain-a: the RouteResult{connected} frame was never dropped" >&2
+		ka_drop_state >&2 || true
+		exit 1
+	fi
+	# Oracle 1 (uncounted): the connect was lost, so Go's accounting stays
+	# at the pre-open baseline even though the session is up.
+	ca_lost=$(ka_backend_conn "$ka_pinned_addr")
+	if ((ca_lost != ca_before)); then
+		echo "chain-a: expected accounting to stay short at $ca_before, got $ca_lost" >&2
+		exit 1
+	fi
+	# The session still serves a query through the (data-plane) path: it is
+	# a LIVE but uncounted connection, not a dead one.
+	printf "SELECT CONCAT('CA2|', CONNECTION_ID(), '|', @@port);\n" >&7
+	ca_alive=false
+	for _ in {1..40}; do
+		if grep -qs '^CA2|' "$run_dir/ca-session.out"; then
+			ca_alive=true
+			break
+		fi
+		kill -0 "$CA_SESSION_PID" 2>/dev/null || break
+		sleep 0.25
+	done
+	if [[ $ca_alive != true ]]; then
+		echo "chain-a: the uncounted session is not serving (expected live-but-uncounted)" >&2
+		exit 1
+	fi
+	ka_drop_state >"$run_dir/controldropper-state-chaina-lost.json"
+	if ! python3 - "$run_dir/controldropper-state-chaina-lost.json" "$ca_target" "$ca_want_drops" <<'PYA'
+import json, sys
+s = json.load(open(sys.argv[1]))
+conn_id, want_drops = int(sys.argv[2]), int(sys.argv[3])
+errs = []
+if s.get("drop_count") != want_drops:
+    errs.append(f'drop_count={s.get("drop_count")} (want {want_drops})')
+dropped = s.get("dropped") or []
+if not dropped:
+    errs.append('no dropped records')
+else:
+    d = dropped[-1]  # this chain's drop is the most recent record
+    if d.get("kind") != "route-result-connected":
+        errs.append(f'kind={d.get("kind")}')
+    if d.get("connection_id") != conn_id:
+        errs.append(f'conn_id={d.get("connection_id")}!={conn_id}')
+    if not d.get("assignment_id"):
+        errs.append('missing assignment_id evidence')
+if s.get("held") is not True:
+    errs.append(f'held={s.get("held")}')
+if errs:
+    print("chain-a lost-state oracle failed: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+print(f'chain-a lost: drop conn={conn_id} assignment_id={dropped[-1].get("assignment_id")!r} held=true')
+PYA
+	then
+		echo "chain-a: dropper lost-state oracle failed" >&2
+		exit 1
+	fi
+	echo "chain-a lost: backend $ka_pinned_addr still shows $ca_lost (RouteResult lost, session live but uncounted)"
+	# Release: the reconnect's automatic reconcile reports the live
+	# connection, so Go completes the lost assignment and the gauge rises
+	# to EXACTLY ca_before+1.
+	curl --noproxy '*' --fail --silent --show-error -X POST \
+		"http://127.0.0.1:$ka_drop_admin_port/release" -o /dev/null
+	ca_want=$((ca_before + 1))
+	ca_repaired=false
+	ca_now=$ca_lost
+	for _ in {1..60}; do
+		ca_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((ca_now > ca_want)); then
+			echo "chain-a: accounting over-counted ($ca_now > $ca_want)" >&2
+			exit 1
+		fi
+		if ((ca_now == ca_want)); then
+			ca_repaired=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $ca_repaired != true ]]; then
+		echo "chain-a: reconcile never restored accounting to $ca_want (last $ca_now)" >&2
+		exit 1
+	fi
+	ka_drop_state >"$run_dir/controldropper-state-chaina-repaired.json"
+	if ! python3 - "$run_dir/controldropper-state-chaina-lost.json" "$run_dir/controldropper-state-chaina-repaired.json" "$ca_release_base" <<'PYAR'
+import json, sys
+lost = json.load(open(sys.argv[1]))
+rep = json.load(open(sys.argv[2]))
+release_base = int(sys.argv[3])
+errs = []
+if rep.get("held") is not False:
+    errs.append(f'held={rep.get("held")}')
+if rep.get("release_count") != release_base + 1:
+    errs.append(f'release_count={rep.get("release_count")} (want {release_base + 1})')
+if not (rep.get("connect_count", 0) > lost.get("connect_count", 0)):
+    errs.append(f'connect_count {rep.get("connect_count")} !> lost {lost.get("connect_count")}')
+if not (rep.get("reconnect_count", 0) > lost.get("reconnect_count", 0)):
+    errs.append(f'reconnect_count {rep.get("reconnect_count")} !> lost {lost.get("reconnect_count")}')
+events = rep.get("events") or []
+drop_seq = max((e["seq"] for e in events if e.get("type") == "drop"), default=None)
+if drop_seq is None:
+    errs.append('no drop event')
+else:
+    rel = next((e for e in events if e.get("type") == "release" and e["seq"] > drop_seq), None)
+    if rel is None:
+        errs.append('no release after this chain drop')
+    else:
+        dial = next((e for e in events if e.get("type") == "connect"
+                     and "dialing upstream" in (e.get("detail") or "") and e["seq"] > rel["seq"]), None)
+        if dial is None:
+            errs.append('no dialing-upstream connect after the release')
+if errs:
+    print("chain-a reconnect-causality oracle failed: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+print(f'chain-a reconnect: held=false release_count={rep.get("release_count")} '
+      f'connect {lost.get("connect_count")}->{rep.get("connect_count")} '
+      f'reconnect {lost.get("reconnect_count")}->{rep.get("reconnect_count")}; '
+      f'drop->release->dialing-upstream ordered')
+PYAR
+	then
+		echo "chain-a: reconnect-causality oracle failed" >&2
+		exit 1
+	fi
+	echo "chain-a: reconcile restored the lost connect -> backend $ka_pinned_addr now $ca_now (exactly ca_before+1 = $ca_want)"
+	# Close the now-counted session cleanly and retract its lifecycle vars.
+	exec 7>&-
+	for _ in {1..40}; do
+		kill -0 "$CA_SESSION_PID" 2>/dev/null || break
+		sleep 0.25
+	done
+	kill "$CA_SESSION_PID" 2>/dev/null || true
+	wait "$CA_SESSION_PID" 2>/dev/null || true
+	printf 'CA_SESSION_PID=\n' >>"$run_dir/state.env"
+	rm -f "$CA_FIFO"
+	printf 'CA_FIFO=\n' >>"$run_dir/state.env"
+	echo "control-frame-drop-connected: a lost RouteResult{connected} left the session uncounted; a real reconnect's reconcile restored it exactly"
+fi
 if [[ $mode == rust ]]; then
 	kill -s INT "$KA_RUST_PID" 2>/dev/null || true
 	for _ in {1..100}; do

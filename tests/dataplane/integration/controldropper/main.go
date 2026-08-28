@@ -291,11 +291,20 @@ func (s *selector) validate() (dropKind, int64, error) {
 	case dropNone:
 		return dropNone, 0, errors.New("arm requires a nonempty kind")
 	case dropRouteResultConnected:
+		// connection_id is the mandatory exact identity: it is the
+		// connection's identity within the Rust lineage and alone
+		// discriminates a concurrent same-kind frame for a different
+		// connection. assignment_id is OPTIONAL further narrowing —
+		// it is unobservable before the frame is sent, so a chaos test
+		// that quiesces all other clients and arms count=1 targets the
+		// one new connection by id. When supplied, it is still matched
+		// strictly (matches() checks every set field). A bare kind with
+		// no connection_id stays forbidden.
 		if s.ConnectionID == nil || *s.ConnectionID == 0 {
 			return dropNone, 0, errors.New("route-result-connected requires a nonzero connection_id")
 		}
-		if s.AssignmentID == nil || *s.AssignmentID == "" {
-			return dropNone, 0, errors.New("route-result-connected requires a nonempty assignment_id")
+		if s.AssignmentID != nil && *s.AssignmentID == "" {
+			return dropNone, 0, errors.New("route-result-connected forbids an empty assignment_id")
 		}
 		if s.BackendID != nil {
 			return dropNone, 0, errors.New("route-result-connected forbids backend_id")

@@ -111,9 +111,9 @@ func TestExtractFrameFieldsMatchesWire(t *testing.T) {
 func TestArmRejectsPartialAndIncompatibleSelectors(t *testing.T) {
 	fx := startDropperFixture(t, false)
 	bad := []string{
-		`{"kind":"route-result-connected"}`,                                                         // bare kind
-		`{"kind":"route-result-connected","connection_id":7}`,                                       // missing assignment
+		`{"kind":"route-result-connected"}`,                                                         // bare kind (no connection_id)
 		`{"kind":"route-result-connected","assignment_id":"a"}`,                                     // missing connection
+		`{"kind":"route-result-connected","connection_id":7,"assignment_id":""}`,                    // empty assignment
 		`{"kind":"route-result-connected","connection_id":7,"assignment_id":"a","backend_id":"b"}`,  // forbidden backend
 		`{"kind":"route-result-connected","connection_id":0,"assignment_id":"a"}`,                   // zero connection
 		`{"kind":"connection-event-closed","connection_id":7}`,                                      // missing backend
@@ -151,6 +151,23 @@ func TestArmRejectsPartialAndIncompatibleSelectors(t *testing.T) {
 	if getState(t, fx.adminAddr)["armed"] != true {
 		t.Fatal("an exact selector must arm the dropper")
 	}
+	// A route-result-connected selector with connection_id only (no
+	// assignment_id) is accepted: assignment_id is unobservable before
+	// the frame is sent, and connection_id alone is exact within a Rust
+	// lineage. connection-event-closed keeps requiring backend_id.
+	connOnly := `{"kind":"route-result-connected","connection_id":11}`
+	resp, err = http.Post(fx.adminAddr+"/arm", "application/json", bytes.NewReader([]byte(connOnly)))
+	if err != nil {
+		t.Fatalf("POST /arm: %v", err)
+	}
+	status = resp.StatusCode
+	_ = resp.Body.Close()
+	if status != http.StatusNoContent {
+		t.Fatalf("connection-id-only route-result selector => status %d, want 204", status)
+	}
+	if getState(t, fx.adminAddr)["armed"] != true {
+		t.Fatal("a connection-id-only route-result selector must arm the dropper")
+	}
 }
 
 // TestSelectorMatchesExactIdentity proves an exact selector never matches a
@@ -159,12 +176,34 @@ func TestSelectorMatchesExactIdentity(t *testing.T) {
 	target := extractFrameFields(framed(t, routeResult(1, 1, 1, 7, "a-7", true))[4:])
 	other := extractFrameFields(framed(t, routeResult(1, 1, 1, 8, "a-8", true))[4:])
 
+	// Strict selector (connection_id + assignment_id): matches only the
+	// exact target, never a same-kind frame for another connection.
 	sel := selector{Kind: "route-result-connected", ConnectionID: uint64p(7), AssignmentID: stringp("a-7")}
 	if !sel.matches(dropRouteResultConnected, target) {
-		t.Fatal("selector must match the exact target")
+		t.Fatal("strict selector must match the exact target")
 	}
 	if sel.matches(dropRouteResultConnected, other) {
-		t.Fatal("selector must NOT match a same-kind frame for another connection")
+		t.Fatal("strict selector must NOT match a same-kind frame for another connection")
+	}
+	// Optional selector (connection_id only): connection_id alone still
+	// discriminates, so a same-kind frame for another connection is not
+	// eaten even though assignment_id is unconstrained.
+	connOnly := selector{Kind: "route-result-connected", ConnectionID: uint64p(7)}
+	if !connOnly.matches(dropRouteResultConnected, target) {
+		t.Fatal("connection-id-only selector must match the target connection")
+	}
+	if connOnly.matches(dropRouteResultConnected, other) {
+		t.Fatal("connection-id-only selector must NOT match another connection")
+	}
+	// The same target id with a DIFFERENT assignment (e.g. a later
+	// redirect's RouteResult) is still the target connection: the
+	// connection-id-only selector matches it, the strict one does not.
+	targetRedirect := extractFrameFields(framed(t, routeResult(1, 1, 2, 7, "a-7-redirect", true))[4:])
+	if !connOnly.matches(dropRouteResultConnected, targetRedirect) {
+		t.Fatal("connection-id-only selector must match the same connection under a new assignment")
+	}
+	if sel.matches(dropRouteResultConnected, targetRedirect) {
+		t.Fatal("strict selector must NOT match a different assignment for the same connection")
 	}
 	// Kind mismatch never matches.
 	closed := extractFrameFields(framed(t, connectionEvent(1, 1, 1, 7, "b", controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED))[4:])
