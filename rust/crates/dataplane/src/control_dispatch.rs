@@ -315,6 +315,13 @@ impl ControlCommandHandler {
         peer_started_unix_millis: u64,
     ) {
         self.active_session = Some((serial, epoch, capabilities));
+        // Scope the gate's applied-generation to this Go lineage: a
+        // restarted Go's gate reads back 0, while a same-Go reconnect
+        // keeps the applied generation.
+        self.gate.set_active_origin(Some((
+            Arc::clone(&peer_process_id),
+            peer_started_unix_millis,
+        )));
         self.active_lineage = Some((peer_process_id, peer_started_unix_millis));
         let reconcile = (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
         let rehydration = reconcile
@@ -332,6 +339,7 @@ impl ControlCommandHandler {
     pub fn on_disconnected(&mut self) {
         self.active_session = None;
         self.active_lineage = None;
+        self.gate.set_active_origin(None);
     }
 
     /// Classifies a tagged frame's origin against the live session so
@@ -386,13 +394,13 @@ impl ControlCommandHandler {
 
     /// Records the applied config snapshot generation (drain
     /// provenance).
-    pub fn set_applied_generation(&mut self, generation: u64) {
-        self.gate.set_applied_generation(generation);
+    pub fn set_applied_generation(&mut self, generation: u64, origin: Option<(Arc<str>, u64)>) {
+        self.gate.set_applied_generation(generation, origin);
     }
 
     /// The applied generation (the reconcile known-generation).
     #[must_use]
-    pub const fn applied_generation(&self) -> u64 {
+    pub fn applied_generation(&self) -> u64 {
         self.gate.applied_generation()
     }
 
@@ -1326,14 +1334,17 @@ pub enum DispatchNotice {
     AppliedGeneration {
         /// The committed generation.
         generation: u64,
-        /// The Rust-local serial of the session that produced the
-        /// snapshot. The dispatcher records the generation ONLY when
-        /// this is still the live session — a snapshot whose session
-        /// was superseded (Go restarted) must not stamp its generation
-        /// onto the successor's command gate. The ack fires either way
-        /// so the owner (which no longer holds the session lease here)
-        /// always makes progress.
-        origin_serial: u64,
+        /// The Go lineage (process id, start time) of the session that
+        /// produced the snapshot. The dispatcher records the generation
+        /// ONLY while this lineage is still live — a snapshot whose Go
+        /// process was superseded (a restart) must not stamp its
+        /// generation onto the successor lineage's command gate, while a
+        /// same-Go reconnect keeps it. The ack fires either way so the
+        /// owner (which no longer holds the session lease here) always
+        /// makes progress.
+        origin_process_id: Arc<str>,
+        /// The Go lineage's start time (with `origin_process_id`).
+        origin_started_unix_millis: u64,
         /// Completed when the dispatcher has processed it (recorded, or
         /// dropped as superseded).
         applied: tokio::sync::oneshot::Sender<()>,
@@ -1498,12 +1509,18 @@ impl ControlDispatchHandle {
     /// until the dispatcher recorded it** — the barrier callers (the
     /// snapshot owner) must pass before acknowledging the generation
     /// to Go. Returns false when the dispatch task is gone.
-    pub async fn applied_generation(&self, generation: u64, origin_serial: u64) -> bool {
+    pub async fn applied_generation(
+        &self,
+        generation: u64,
+        origin_process_id: Arc<str>,
+        origin_started_unix_millis: u64,
+    ) -> bool {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
         if !self
             .notify(DispatchNotice::AppliedGeneration {
                 generation,
-                origin_serial,
+                origin_process_id,
+                origin_started_unix_millis,
                 applied: applied_tx,
             })
             .await
@@ -2129,11 +2146,20 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 // transition's automatic reconcile, so its export
                 // already carries them. (Adoptions enqueued after are
                 // covered by the stale-export repair.)
-                drain_pending_notices(&sender, &mut handler, &mut notices).await?;
+                let deferred =
+                    drain_pending_notices(&sender, &mut handler, &mut notices).await?;
                 let applied = apply_state(&sender, &mut handler, snapshot).await;
                 match applied {
                     Ok(()) => {
-                        apply_state_transitions(&sender, &mut handler, &mut state).await
+                        apply_state_transitions(&sender, &mut handler, &mut state).await?;
+                        // Deferred applied-generation notices are
+                        // recorded now, under the session that is live
+                        // AFTER the transition — a superseded origin is
+                        // rejected by the gate's lineage-scoped state.
+                        for notice in deferred {
+                            apply_notice(&sender, &mut handler, notice).await?;
+                        }
+                        Ok(())
                     }
                     Err(fatal) => Err(fatal),
                 }
@@ -2230,21 +2256,31 @@ async fn drain_pending_notices<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
     notices: &mut mpsc::Receiver<DispatchNotice>,
-) -> Result<(), DispatchFatal> {
+) -> Result<Vec<DispatchNotice>, DispatchFatal> {
     // Bounded by the queue length observed at entry. This queue also
     // carries continuous producers (metering, session terminals,
     // redirect results) that can refill freed slots while apply awaits
     // outbound sends — chasing them would let the drain starve the
     // very transition it feeds. A notice arriving during the drain is
     // exactly the case the stale-export repair covers.
+    //
+    // `AppliedGeneration` notices are DEFERRED (returned, not applied
+    // here): their generation must be recorded against the session that
+    // is live AFTER the transition this drain feeds, not the one before
+    // it — otherwise a snapshot from the outgoing session would stamp
+    // its generation just before the incoming session becomes active.
+    // Every other (adoption) notice is applied before the transition so
+    // its automatic reconcile export carries the adoption.
     let budget = notices.len();
+    let mut deferred = Vec::new();
     for _ in 0..budget {
         match notices.try_recv() {
+            Ok(notice @ DispatchNotice::AppliedGeneration { .. }) => deferred.push(notice),
             Ok(notice) => apply_notice(sender, handler, notice).await?,
             Err(_) => break,
         }
     }
-    Ok(())
+    Ok(deferred)
 }
 
 /// Applies one observed connection state to the handler.
@@ -2409,19 +2445,22 @@ async fn apply_notice<S: DispatchSender>(
     match notice {
         DispatchNotice::AppliedGeneration {
             generation,
-            origin_serial,
+            origin_process_id,
+            origin_started_unix_millis,
             applied,
         } => {
-            // Lineage-qualified: record the generation only while the
-            // producing session is still live. If Go restarted while
-            // this snapshot's owner transaction was in flight (the owner
-            // releases the session lease before this barrier, so a
-            // successor CAN be published first), a stale generation must
-            // not stamp the successor's command gate. The ack fires
-            // regardless so the owner always converges.
-            if handler.active_session().map(|(serial, _, _)| serial) == Some(origin_serial) {
-                handler.set_applied_generation(generation);
-            }
+            // Lineage-qualified in the gate's persistent state: the
+            // generation is bound to `origin_serial` and accepted only
+            // while that is the live session, and it reads back as 0 for
+            // any other session. If Go restarted while this snapshot's
+            // owner transaction was in flight (the owner releases the
+            // lease before this barrier, so a successor CAN be published
+            // first), the successor's command gate never inherits it.
+            // The ack fires regardless so the owner always converges.
+            handler.set_applied_generation(
+                generation,
+                Some((origin_process_id, origin_started_unix_millis)),
+            );
             let _ = applied.send(());
         }
         DispatchNotice::RegisterSession {

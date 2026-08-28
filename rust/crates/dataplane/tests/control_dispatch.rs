@@ -220,7 +220,7 @@ async fn close_dispatch_end_to_end() {
 async fn drain_dispatch_runs_graceful_then_force() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let mut a = register(&mut handler, 1, "sql-a", "tidb-a");
     let mut b = register(&mut handler, 2, "sql-a", "tidb-a");
     let mut other = register(&mut handler, 3, "sql-b", "tidb-a");
@@ -338,7 +338,7 @@ async fn drain_dispatch_runs_graceful_then_force() {
 async fn zero_match_drain_answers_terminal_immediately() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let _session = register(&mut handler, 1, "sql-a", "tidb-a");
 
     let command = DrainCommand {
@@ -370,7 +370,7 @@ async fn zero_match_drain_answers_terminal_immediately() {
 async fn malformed_drain_deadlines_rejected() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let now = Instant::now();
 
     let inverted = DrainCommand {
@@ -476,7 +476,7 @@ async fn handler_survives_reconnect_and_replays_lost_terminal() {
 async fn handle_envelope_production_path() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
 
     let now = Instant::now();
@@ -686,7 +686,7 @@ async fn unroutable_bodies_are_answered_not_dropped() {
 async fn force_close_marks_only_on_delivery() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
 
     // Capacity-1 control channel, pre-filled so the force send jams.
     let (tx, mut rx) = mpsc::channel(1);
@@ -899,7 +899,16 @@ async fn wait_for_sent(sender: &Arc<FakeSender>, count: usize) -> Vec<ControlEnv
 #[tokio::test(start_paused = true)]
 async fn connected_transition_reconciles_and_replays_metering() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    // The applied generation belongs to the connecting Go lineage, so a
+    // same-lineage reconnect reports it in the reconcile known-generation.
+    handler.on_connected(
+        1,
+        full_caps(),
+        1,
+        Arc::from("go-fixture"),
+        1_700_000_000_000,
+    );
+    handler.set_applied_generation(7, Some((Arc::from("go-fixture"), 1_700_000_000_000)));
     assert!(
         handler
             .metering()
@@ -1012,7 +1021,7 @@ async fn no_reconcile_capability_skips_request_and_replays_durably() {
 #[tokio::test(start_paused = true)]
 async fn closed_event_ids_feed_reconcile_watermark() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let harness = spawn_loop(handler);
 
     let (control_tx, _control_rx) = mpsc::channel(8);
@@ -1531,7 +1540,7 @@ async fn futures_poll_once<F: Future + Unpin>(future: &mut F) -> Option<F::Outpu
 #[tokio::test(start_paused = true)]
 async fn stale_snapshot_after_coalesced_connect_never_acks() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     assert!(
         handler
             .metering()
@@ -1614,7 +1623,7 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
 #[tokio::test(start_paused = true)]
 async fn pending_connected_applies_before_queued_inbound() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     assert!(
         handler
             .metering()
@@ -1898,7 +1907,8 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
         .notice_tx
         .send(DispatchNotice::AppliedGeneration {
             generation: 7,
-            origin_serial: 1,
+            origin_process_id: Arc::from("go-fixture"),
+            origin_started_unix_millis: 1_700_000_000_000,
             applied: ack_tx,
         })
         .await
@@ -1938,7 +1948,7 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
 async fn directives_carry_exact_command_tokens() {
     let mut handler = ControlCommandHandler::new();
     handler.on_session_negotiated(true);
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
     let now = Instant::now();
 
@@ -2106,7 +2116,7 @@ async fn instant_completion_binds_exact_terminal_id() {
 #[tokio::test(start_paused = true)]
 async fn stale_namespace_export_is_repaired_by_a_fresh_reconcile() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let (tx, _session_rx) = mpsc::channel(8);
     handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
 
@@ -2187,7 +2197,7 @@ async fn stale_namespace_export_is_repaired_by_a_fresh_reconcile() {
 #[tokio::test(start_paused = true)]
 async fn queued_adoption_precedes_the_automatic_reconcile() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let (tx, _session_rx) = mpsc::channel(8);
     handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
 
@@ -2369,7 +2379,7 @@ async fn wait_for_scripted_sent(
 
 fn scripted_stale_export_handler() -> ControlCommandHandler {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     let (tx, rx) = mpsc::channel(8);
     std::mem::forget(rx);
     handler.register_session(identity(1), "default", 7, "sql-a", tx, None);
@@ -2614,7 +2624,7 @@ async fn same_lineage_retained_frame_pumps_once_with_origin_meta() {
 #[tokio::test(start_paused = true)]
 async fn dead_session_snapshot_with_reused_epoch_value_never_acks() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.set_applied_generation(7, None);
     assert!(
         handler
             .metering()
@@ -2774,7 +2784,14 @@ async fn dead_session_snapshot_with_reused_epoch_value_never_acks() {
 #[tokio::test(start_paused = true)]
 async fn inline_request_errors_are_session_scoped_and_terminals_durable() {
     let mut handler = ControlCommandHandler::new();
-    handler.set_applied_generation(7);
+    handler.on_connected(
+        2,
+        full_caps(),
+        2,
+        Arc::from("go-fixture"),
+        1_700_000_000_000,
+    );
+    handler.set_applied_generation(7, Some((Arc::from("go-fixture"), 1_700_000_000_000)));
     let harness = spawn_loop(handler);
     harness
         .state_tx
@@ -3125,7 +3142,8 @@ async fn applied_generation_is_lineage_qualified() {
         .notice_tx
         .send(DispatchNotice::AppliedGeneration {
             generation: 7,
-            origin_serial: 1,
+            origin_process_id: Arc::from("go-a"),
+            origin_started_unix_millis: 1_700_000_000_000,
             applied: ack_tx,
         })
         .await
@@ -3164,7 +3182,8 @@ async fn applied_generation_is_lineage_qualified() {
         .notice_tx
         .send(DispatchNotice::AppliedGeneration {
             generation: 7,
-            origin_serial: 2,
+            origin_process_id: Arc::from("go-b"),
+            origin_started_unix_millis: 1_700_000_000_000,
             applied: ack_tx,
         })
         .await
@@ -3193,6 +3212,111 @@ async fn applied_generation_is_lineage_qualified() {
         error_code(&sent[1]),
         Some(ErrorCode::StaleGeneration),
         "the live session's generation 7 was recorded, so a generation-3 drain is stale"
+    );
+    harness.task.abort();
+}
+
+/// Fix-2 applied-generation auto-isolation across Go lineage: the
+/// generation is bound to its origin lineage in the gate's PERSISTENT
+/// state, so a restarted Go's gate reads 0 regardless of scheduling — a
+/// stale notice from the dead lineage cannot stamp it, and a same-Go
+/// reconnect keeps it. This is the deterministic core that makes the
+/// notice-arm and state-arm handoff races safe.
+#[tokio::test]
+async fn applied_generation_auto_isolates_across_go_lineage() {
+    let mut handler = ControlCommandHandler::new();
+    // Lineage A applies generation 5.
+    handler.on_connected(1, full_caps(), 1, Arc::from("go-a"), 1_000);
+    handler.set_applied_generation(5, Some((Arc::from("go-a"), 1_000)));
+    assert_eq!(handler.applied_generation(), 5);
+
+    // Go restarts as a DIFFERENT lineage B: the applied generation is
+    // isolated — B's gate reads 0.
+    handler.on_connected(1, full_caps(), 2, Arc::from("go-b"), 2_000);
+    assert_eq!(
+        handler.applied_generation(),
+        0,
+        "B never inherits A's applied generation"
+    );
+
+    // A stale notice from the dead lineage A cannot stamp B's gate.
+    handler.set_applied_generation(5, Some((Arc::from("go-a"), 1_000)));
+    assert_eq!(
+        handler.applied_generation(),
+        0,
+        "a stale A notice is rejected while B is live"
+    );
+
+    // A same-Go reconnect (lineage A again, new serial) KEEPS A's
+    // applied generation — generations stay monotonic within a lineage.
+    handler.on_connected(1, full_caps(), 3, Arc::from("go-a"), 1_000);
+    assert_eq!(
+        handler.applied_generation(),
+        5,
+        "a same-Go reconnect keeps the applied generation"
+    );
+}
+
+/// Fix-2 state-arm handoff: a `Connected(B)` transition drives the
+/// dispatch loop's state arm (drain-pending-notices → apply-state →
+/// automatic reconcile). B's reconcile known-generation must be 0, not
+/// the generation A applied — the lineage-scoped gate isolates it even
+/// on this path.
+#[tokio::test(start_paused = true)]
+async fn state_arm_reconcile_does_not_inherit_a_generation() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+
+    // Lineage A connects and applies generation 5 (via the ack path).
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 1,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-a"),
+            peer_started_unix_millis: 1_000,
+        })
+        .ok();
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::AppliedGeneration {
+            generation: 5,
+            origin_process_id: Arc::from("go-a"),
+            origin_started_unix_millis: 1_000,
+            applied: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = ack_rx.await else {
+        unreachable!("A's applied generation is acked")
+    };
+    // Drain A's automatic reconcile so the next one we read is B's.
+    let sent_a = wait_for_sent(&harness.sender, 1).await;
+    let Some(Body::ReconcileRequest(_)) = &sent_a[0].body else {
+        unreachable!("A reconciles on connect")
+    };
+
+    // Go restarts as lineage B. Its automatic reconcile must report
+    // known_generation 0 — B never inherits A's generation 5.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 2_000,
+        })
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    let Some(Body::ReconcileRequest(request)) = &sent[1].body else {
+        unreachable!("B reconciles on connect")
+    };
+    assert_eq!(
+        request.known_generation, 0,
+        "B's reconcile does not inherit A's applied generation"
     );
     harness.task.abort();
 }

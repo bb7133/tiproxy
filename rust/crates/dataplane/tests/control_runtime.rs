@@ -78,7 +78,9 @@ async fn runtime_shutdown_cascades_to_clean_join() {
     let handle = runtime.handle();
     // The session surface is live even while disconnected.
     assert!(
-        handle.applied_generation(7, 0).await,
+        handle
+            .applied_generation(7, Arc::from("go-fixture"), 1_700_000_000_000)
+            .await,
         "the dispatch task accepts notices"
     );
     runtime.shutdown();

@@ -558,7 +558,11 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     drop(guard);
     if let Some(generation) = applied
         && !handle
-            .applied_generation(generation, tagged.origin.serial)
+            .applied_generation(
+                generation,
+                Arc::clone(&tagged.origin.peer_process_id),
+                tagged.origin.peer_started_unix_millis,
+            )
             .await
     {
         if client.is_shutdown() {

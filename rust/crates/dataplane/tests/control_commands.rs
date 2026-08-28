@@ -357,7 +357,7 @@ async fn drain_is_single_flight_with_replayable_progress() {
 
     // Drain provenance: a command minted before the applied snapshot is
     // stale; equal or newer generations pass.
-    gate.set_applied_generation(9);
+    gate.set_applied_generation(9, None);
     assert_eq!(
         gate.admit_drain(
             &drain("d-3", 3, &[], &[]),
