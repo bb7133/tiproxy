@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -103,6 +104,55 @@ func TestExtractFrameFieldsMatchesWire(t *testing.T) {
 	}
 }
 
+// TestArmRejectsPartialAndIncompatibleSelectors proves the exact-selector
+// contract is enforced: a bare kind, a partial identity, an incompatible field,
+// a non-positive count, and an unknown JSON field are all refused with 400,
+// and none of them arms the dropper.
+func TestArmRejectsPartialAndIncompatibleSelectors(t *testing.T) {
+	fx := startDropperFixture(t, false)
+	bad := []string{
+		`{"kind":"route-result-connected"}`,                                                         // bare kind
+		`{"kind":"route-result-connected","connection_id":7}`,                                       // missing assignment
+		`{"kind":"route-result-connected","assignment_id":"a"}`,                                     // missing connection
+		`{"kind":"route-result-connected","connection_id":7,"assignment_id":"a","backend_id":"b"}`,  // forbidden backend
+		`{"kind":"route-result-connected","connection_id":0,"assignment_id":"a"}`,                   // zero connection
+		`{"kind":"connection-event-closed","connection_id":7}`,                                      // missing backend
+		`{"kind":"connection-event-closed","connection_id":7,"backend_id":"b","assignment_id":"a"}`, // forbidden assignment
+		`{"kind":"route-result-connected","connection_id":7,"assignment_id":"a","count":0}`,         // non-positive count
+		`{"kind":"unknown-kind","connection_id":7,"assignment_id":"a"}`,                             // unknown kind
+		`{"kind":"route-result-connected","connection_id":7,"assignment_id":"a","bogus":1}`,         // unknown field
+	}
+	for _, body := range bad {
+		resp, err := http.Post(fx.adminAddr+"/arm", "application/json", bytes.NewReader([]byte(body)))
+		if err != nil {
+			t.Fatalf("POST /arm: %v", err)
+		}
+		status := resp.StatusCode
+		_ = resp.Body.Close()
+		if status != http.StatusBadRequest {
+			t.Fatalf("selector %q => status %d, want 400", body, status)
+		}
+	}
+	// None of the rejected requests armed the dropper.
+	if getState(t, fx.adminAddr)["armed"] != false {
+		t.Fatal("no rejected selector may arm the dropper")
+	}
+	// A complete, exact selector is accepted.
+	ok := `{"kind":"route-result-connected","connection_id":7,"assignment_id":"a-7"}`
+	resp, err := http.Post(fx.adminAddr+"/arm", "application/json", bytes.NewReader([]byte(ok)))
+	if err != nil {
+		t.Fatalf("POST /arm: %v", err)
+	}
+	status := resp.StatusCode
+	_ = resp.Body.Close()
+	if status != http.StatusNoContent {
+		t.Fatalf("exact selector => status %d, want 204", status)
+	}
+	if getState(t, fx.adminAddr)["armed"] != true {
+		t.Fatal("an exact selector must arm the dropper")
+	}
+}
+
 // TestSelectorMatchesExactIdentity proves an exact selector never matches a
 // same-kind frame with a different connection / assignment / backend.
 func TestSelectorMatchesExactIdentity(t *testing.T) {
@@ -149,6 +199,7 @@ func startDropperFixture(t *testing.T, pause bool) *dropperFixture {
 	if err := drop.start("127.0.0.1:0"); err != nil {
 		t.Fatalf("dropper start: %v", err)
 	}
+	assertFrontSocketSecure(t, front)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
@@ -225,21 +276,24 @@ func TestForwardedFramesAreByteIdentical(t *testing.T) {
 	}
 }
 
-// TestNonTargetConcurrentSameKindNotEaten proves the exact selector protects a
-// concurrent, same-kind frame for a different connection from being eaten.
+// TestNonTargetConcurrentSameKindNotEaten proves the exact selector protects
+// concurrent, same-kind frames — for a different connection AND, critically,
+// for the SAME connection under a different assignment — from being eaten.
 func TestNonTargetConcurrentSameKindNotEaten(t *testing.T) {
 	fx := startDropperFixture(t, false)
-	// Arm for connection 7 only.
-	if err := fx.drop.arm(selector{Kind: "route-result-connected", ConnectionID: uint64p(7)}); err != nil {
+	// Arm for the exact (connection 7, assignment a-7).
+	if err := fx.drop.arm(selector{Kind: "route-result-connected", ConnectionID: uint64p(7), AssignmentID: stringp("a-7")}); err != nil {
 		t.Fatalf("arm: %v", err)
 	}
 
-	// A same-kind connected route result for a DIFFERENT connection
-	// arrives first and must be forwarded, then the target.
-	other := framed(t, routeResult(1, 1, 50, 8, "a-8", true))
-	target := framed(t, routeResult(1, 1, 51, 7, "a-7", true))
-	after := framed(t, routeResult(1, 1, 52, 9, "a-9", true))
-	for _, frame := range [][]byte{other, target, after} {
+	// Same-kind connected route results that must all be forwarded: a
+	// different connection, and — the sharp case — the SAME connection 7
+	// under a different assignment (a stale/reissued assignment id).
+	otherConn := framed(t, routeResult(1, 1, 50, 8, "a-8", true))
+	sameConnOtherAssignment := framed(t, routeResult(1, 1, 51, 7, "a-7-stale", true))
+	target := framed(t, routeResult(1, 1, 52, 7, "a-7", true))
+	after := framed(t, routeResult(1, 1, 53, 9, "a-9", true))
+	for _, frame := range [][]byte{otherConn, sameConnOtherAssignment, target, after} {
 		if _, err := fx.client.Write(frame); err != nil {
 			t.Fatalf("client write: %v", err)
 		}
@@ -249,9 +303,9 @@ func TestNonTargetConcurrentSameKindNotEaten(t *testing.T) {
 	}
 
 	got := <-fx.upstream
-	want := bytes.Join([][]byte{other, after}, nil)
+	want := bytes.Join([][]byte{otherConn, sameConnOtherAssignment, after}, nil)
 	if !bytes.Equal(got, want) {
-		t.Fatalf("only connection 7 must be eaten:\n got  %x\n want %x", got, want)
+		t.Fatalf("only (connection 7, assignment a-7) must be eaten:\n got  %x\n want %x", got, want)
 	}
 	if n := len(fx.drop.dropped); n != 1 {
 		t.Fatalf("dropped = %d, want exactly 1 (connection 7)", n)
@@ -306,7 +360,7 @@ func TestDropRecordMatchesWire(t *testing.T) {
 // count as the recovered session dials again.
 func TestPauseAfterDropHoldsUntilReleaseAndReconnect(t *testing.T) {
 	fx := startDropperFixture(t, true)
-	if err := fx.drop.arm(selector{Kind: "route-result-connected", ConnectionID: uint64p(9)}); err != nil {
+	if err := fx.drop.arm(selector{Kind: "route-result-connected", ConnectionID: uint64p(9), AssignmentID: stringp("a-9")}); err != nil {
 		t.Fatalf("arm: %v", err)
 	}
 
@@ -366,6 +420,29 @@ func TestPauseAfterDropHoldsUntilReleaseAndReconnect(t *testing.T) {
 	finalReconnects := getState(t, fx.adminAddr)["reconnect_count"].(float64)
 	if finalReconnects < beforeReconnects+2 {
 		t.Fatalf("reconnect_count = %v, want >= %v", finalReconnects, beforeReconnects+2)
+	}
+}
+
+// assertFrontSocketSecure verifies the frozen front-socket invariant: it is a
+// socket, mode 0600, owned by the current user.
+func assertFrontSocketSecure(t *testing.T, front string) {
+	t.Helper()
+	info, err := os.Lstat(front)
+	if err != nil {
+		t.Fatalf("lstat front socket: %v", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("front path is not a socket: mode %v", info.Mode())
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("front socket mode = %o, want 0600", perm)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("no syscall stat for the front socket")
+	}
+	if int(stat.Uid) != os.Getuid() {
+		t.Fatalf("front socket uid = %d, want %d", stat.Uid, os.Getuid())
 	}
 }
 

@@ -120,10 +120,21 @@ list whose records carry each lost frame's exact wire identity
 `backend_id`). With `--pause-after-drop` the link tears down the instant the
 frame is lost and refuses to dial upstream until `POST /release`, modeling a
 control link wedged until the chain lets it recover (a `release` advances the
-reconnect count as the successor session dials again). Its self-tests run in
+reconnect count as the successor session dials again). The front socket is
+clamped to `0600` and owned by the run's user. Its self-tests run in
 `self-test.sh` (`go test .../controldropper`): byte-equivalence, exact
-single-frame drop, a concurrent same-kind non-target frame left untouched,
-drop-record-matches-wire, and hold-until-release with reconnect accounting.
+single-frame drop, exact-selector enforcement (partial/incompatible/unknown
+selectors are refused), a concurrent same-kind non-target frame — including the
+same connection under a different assignment — left untouched,
+drop-record-matches-wire, the `0600` socket invariant, and hold-until-release
+with reconnect accounting.
+
+The **runtime wiring** — an integration `run.sh` phase that launches and holds
+the dropper's PID, points the Rust dataplane's `--control-socket` at the
+dropper front while the dropper dials the Go control socket, waits on admin
+readiness, drives `/arm` + `/state`, and cleans up the process/socket — lands
+with the one-sided restart helpers and the four chaos chains; the tool and its
+contract above are the building block those chains compose.
 
 ## Diagnostics and safety
 

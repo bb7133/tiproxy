@@ -276,7 +276,49 @@ type selector struct {
 	ConnectionID *uint64 `json:"connection_id,omitempty"`
 	AssignmentID *string `json:"assignment_id,omitempty"`
 	BackendID    *string `json:"backend_id,omitempty"`
-	Count        int64   `json:"count,omitempty"`
+	Count        *int64  `json:"count,omitempty"`
+}
+
+// validate enforces the EXACT-selector contract per kind so a chaos test can
+// never arm a partial selector that would eat the wrong same-kind frame. The
+// returned count is the validated drop budget.
+func (s *selector) validate() (dropKind, int64, error) {
+	kind, err := parseDropKind(s.Kind)
+	if err != nil {
+		return dropNone, 0, err
+	}
+	switch kind {
+	case dropNone:
+		return dropNone, 0, errors.New("arm requires a nonempty kind")
+	case dropRouteResultConnected:
+		if s.ConnectionID == nil || *s.ConnectionID == 0 {
+			return dropNone, 0, errors.New("route-result-connected requires a nonzero connection_id")
+		}
+		if s.AssignmentID == nil || *s.AssignmentID == "" {
+			return dropNone, 0, errors.New("route-result-connected requires a nonempty assignment_id")
+		}
+		if s.BackendID != nil {
+			return dropNone, 0, errors.New("route-result-connected forbids backend_id")
+		}
+	case dropConnectionEventClosed:
+		if s.ConnectionID == nil || *s.ConnectionID == 0 {
+			return dropNone, 0, errors.New("connection-event-closed requires a nonzero connection_id")
+		}
+		if s.BackendID == nil || *s.BackendID == "" {
+			return dropNone, 0, errors.New("connection-event-closed requires a nonempty backend_id")
+		}
+		if s.AssignmentID != nil {
+			return dropNone, 0, errors.New("connection-event-closed forbids assignment_id")
+		}
+	}
+	count := int64(1)
+	if s.Count != nil {
+		if *s.Count <= 0 {
+			return dropNone, 0, errors.New("count must be greater than zero")
+		}
+		count = *s.Count
+	}
+	return kind, count, nil
 }
 
 func (s *selector) matches(kind dropKind, fields frameFields) bool {
@@ -365,16 +407,9 @@ func newDropper(frontPath, target string, pause bool, logger *log.Logger) *dropp
 // arm installs an exact one-shot (or count-bounded) drop selector. It replaces
 // any prior arming and records an "arm" event.
 func (d *dropper) arm(sel selector) error {
-	kind, err := parseDropKind(sel.Kind)
+	kind, count, err := sel.validate()
 	if err != nil {
 		return err
-	}
-	if kind == dropNone {
-		return errors.New("arm requires a nonempty kind")
-	}
-	count := sel.Count
-	if count <= 0 {
-		count = 1
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -427,15 +462,30 @@ func (d *dropper) tryClaimDrop(fields frameFields) (bool, bool) {
 }
 
 func (d *dropper) start(adminAddr string) error {
-	// A stale socket path from a crashed predecessor would make Listen
-	// fail; the caller owns a unique path per run, so removing it here is
-	// safe and keeps bring-up deterministic.
-	if err := os.Remove(d.frontPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("clear stale front socket: %w", err)
+	// A stale path from a crashed predecessor would make Listen fail.
+	// Only a path that is ALREADY a socket is removed here — never a
+	// regular file or directory — so a mistargeted front path fails
+	// loudly instead of being clobbered. (The run helper additionally
+	// asserts PID/lsof ownership before reusing a path.)
+	if info, err := os.Lstat(d.frontPath); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("front path %s exists and is not a socket", d.frontPath)
+		}
+		if err := os.Remove(d.frontPath); err != nil {
+			return fmt.Errorf("clear stale front socket: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat front socket: %w", err)
 	}
 	listener, err := net.Listen("unix", d.frontPath)
 	if err != nil {
 		return fmt.Errorf("listen on front control socket: %w", err)
+	}
+	// The control socket must not be reachable by other local users:
+	// clamp it to owner-only rw regardless of the process umask.
+	if err := os.Chmod(d.frontPath, 0o600); err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("chmod front socket to 0600: %w", err)
 	}
 	d.listener = listener
 
@@ -501,6 +551,14 @@ func (d *dropper) handleConnection(client net.Conn) {
 		d.appendEventLocked("connect", "dialing upstream")
 	}
 	d.mu.Unlock()
+	// Every accepted connection records a matching disconnect, including
+	// the held and dial-failure early returns, so the event timeline
+	// always pairs connect with disconnect.
+	defer func() {
+		d.mu.Lock()
+		d.appendEventLocked("disconnect", "")
+		d.mu.Unlock()
+	}()
 
 	// A held link never dials upstream: the Rust reconnect loop keeps
 	// finding a front socket that accepts and immediately closes, exactly
@@ -539,10 +597,6 @@ func (d *dropper) handleConnection(client net.Conn) {
 	_ = client.Close()
 	_ = upstream.Close()
 	<-done
-
-	d.mu.Lock()
-	d.appendEventLocked("disconnect", "")
-	d.mu.Unlock()
 }
 
 // pumpInspected forwards Rust->Go frames verbatim, swallowing the one armed
@@ -670,7 +724,9 @@ func (d *dropper) handleArm(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	var sel selector
-	if err := json.NewDecoder(request.Body).Decode(&sel); err != nil {
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&sel); err != nil {
 		http.Error(writer, fmt.Sprintf("bad arm request: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -745,7 +801,8 @@ func run() error {
 	logger := log.New(os.Stderr, "controldropper: ", log.LstdFlags|log.Lmicroseconds|log.LUTC)
 	drop := newDropper(*frontPath, *targetPath, *pause, logger)
 	if *dropKindName != "" {
-		sel := selector{Kind: *dropKindName, Count: *armCount}
+		count := *armCount
+		sel := selector{Kind: *dropKindName, Count: &count}
 		if *armConnID >= 0 {
 			id := uint64(*armConnID)
 			sel.ConnectionID = &id
@@ -756,6 +813,8 @@ func run() error {
 		if *armBackend != "" {
 			sel.BackendID = armBackend
 		}
+		// The pre-arm goes through the same exact-selector validation as
+		// POST /arm, so a partial startup selector is rejected too.
 		if err := drop.arm(sel); err != nil {
 			return err
 		}
