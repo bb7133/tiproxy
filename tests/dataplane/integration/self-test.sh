@@ -114,4 +114,90 @@ if find "$temp_dir/tiup/data" -mindepth 1 -print -quit | grep -q .; then
 	exit 1
 fi
 
+# One-sided restart helpers: ownership-checked SIGKILL and the
+# three-condition backend-socket removal, exercised with dummy
+# processes and sockets (no TiUP, no dataplane).
+source "$script_dir/restart-helpers.sh"
+
+# sigkill_owned_process kills a process whose command line matches, and
+# refuses one whose command line does not.
+sleep 30 &
+victim_pid=$!
+if ! sigkill_owned_process "$victim_pid" "sleep"; then
+	echo "sigkill_owned_process should kill a matching process" >&2
+	exit 1
+fi
+if kill -0 "$victim_pid" 2>/dev/null; then
+	echo "sigkill_owned_process left the victim alive" >&2
+	exit 1
+fi
+sleep 30 &
+bystander_pid=$!
+if sigkill_owned_process "$bystander_pid" "this-does-not-match"; then
+	echo "sigkill_owned_process must refuse a command-line mismatch" >&2
+	exit 1
+fi
+if ! kill -0 "$bystander_pid" 2>/dev/null; then
+	echo "a refused sigkill must not touch the bystander" >&2
+	exit 1
+fi
+kill "$bystander_pid" 2>/dev/null || true
+wait "$bystander_pid" 2>/dev/null || true
+
+# remove_dead_backend_socket removes a socket whose owner is dead, and
+# refuses a live owner, a non-socket, and a still-held socket.
+sock="$temp_dir/backend.sock"
+python3 - "$sock" <<'PYSOCK'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PYSOCK
+# The python process has exited, so the socket has no live owner: a made
+# up dead PID plus the socket path must be removed.
+if ! remove_dead_backend_socket "$sock" 999999; then
+	echo "remove_dead_backend_socket should remove a dead-owner socket" >&2
+	exit 1
+fi
+[[ -e $sock ]] && {
+	echo "the dead-owner socket was not removed" >&2
+	exit 1
+}
+# A live owner is refused.
+if remove_dead_backend_socket "$sock" "$$"; then
+	echo "remove_dead_backend_socket must refuse a live owner PID" >&2
+	exit 1
+fi
+# A non-socket regular file is refused.
+regular="$temp_dir/not-a-socket"
+: >"$regular"
+if remove_dead_backend_socket "$regular" 999999; then
+	echo "remove_dead_backend_socket must refuse a non-socket path" >&2
+	exit 1
+fi
+[[ -e $regular ]] || {
+	echo "the refused non-socket must not be removed" >&2
+	exit 1
+}
+# A socket still held open by a live process is refused.
+held="$temp_dir/held.sock"
+python3 - "$held" <<'PYHOLD' &
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+s.listen()
+time.sleep(30)
+PYHOLD
+hold_pid=$!
+for _ in {1..50}; do [[ -S $held ]] && break; sleep 0.1; done
+if remove_dead_backend_socket "$held" 999999; then
+	echo "remove_dead_backend_socket must refuse a still-held socket" >&2
+	exit 1
+fi
+[[ -S $held ]] || {
+	echo "the still-held socket must not be removed" >&2
+	exit 1
+}
+kill "$hold_pid" 2>/dev/null || true
+wait "$hold_pid" 2>/dev/null || true
+
 echo "PASS: integration framework self-tests"

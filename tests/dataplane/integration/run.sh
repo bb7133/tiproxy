@@ -157,6 +157,10 @@ write_state() {
 }
 write_state
 
+# One-sided restart helpers (sigkill_owned_process,
+# remove_dead_backend_socket) for the chaos-E2E chains.
+source "$script_dir/restart-helpers.sh"
+
 for port in $PORTS; do
 	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
 		echo "required port is already in use: $port" >&2
