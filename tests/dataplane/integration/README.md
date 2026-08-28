@@ -90,6 +90,41 @@ variants remain refused by the capability contract until their Rust
 slices exist; a raw TCP relay or the Go dataplane is never reported as
 Rust success.
 
+## Control-frame dropper (chaos-E2E control-loss)
+
+`controldropper/` is a test-only man-in-the-middle for the Go/Rust **control**
+Unix socket, used by the CTL-06 chaos-E2E chains to model a control message the
+Go side accepted-as-sent but never observed. It is inserted between the Rust
+dataplane (`--control-socket <front>`) and the Go control socket
+(`--target-socket <go.sock>`), copies Go→Rust raw, and inspects Rust→Go frames
+by a field-level protowire scan — forwarding every frame **byte-identical**
+except the single frame a chain arms it to lose.
+
+Selection is by an **exact** identity, never a bare kind filter, so a
+concurrent same-kind frame for a different connection/health probe is never
+eaten by mistake:
+
+```sh
+# Arm a one-shot drop of the connected RouteResult for exactly connection 12,
+# assignment a-12 (chain a); or the CLOSED ConnectionEvent for connection 12
+# on backend tidb-b (chain b).
+curl -sf -XPOST "$admin/arm" \
+  -d '{"kind":"route-result-connected","connection_id":12,"assignment_id":"a-12"}'
+```
+
+`GET /state` is the evidence surface: it reports the armed selector, an ordered
+`events` timeline (`arm`/`drop`/`release`/`connect`/`disconnect`), `connect_count`
+/ `reconnect_count` / `release_count`, `forwarded`, `held`, and a `dropped`
+list whose records carry each lost frame's exact wire identity
+(`control_epoch`, `generation`, `request_id`, `connection_id`, `assignment_id`,
+`backend_id`). With `--pause-after-drop` the link tears down the instant the
+frame is lost and refuses to dial upstream until `POST /release`, modeling a
+control link wedged until the chain lets it recover (a `release` advances the
+reconnect count as the successor session dials again). Its self-tests run in
+`self-test.sh` (`go test .../controldropper`): byte-equivalence, exact
+single-frame drop, a concurrent same-kind non-target frame left untouched,
+drop-record-matches-wire, and hold-until-release with reconnect accounting.
+
 ## Diagnostics and safety
 
 Artifacts are retained under `tests/dataplane/integration/artifacts/` (or

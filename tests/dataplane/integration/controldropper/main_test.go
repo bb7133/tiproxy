@@ -30,7 +30,6 @@ import (
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 )
 
-// framed encodes one control envelope exactly as the transport writes it.
 func framed(t *testing.T, envelope *controlpb.ControlEnvelope) []byte {
 	t.Helper()
 	frame, err := controlpb.MarshalFrame(envelope, defaultMaxFrameBytes)
@@ -40,26 +39,31 @@ func framed(t *testing.T, envelope *controlpb.ControlEnvelope) []byte {
 	return frame
 }
 
-func routeResult(connectionID uint64, connected bool) *controlpb.ControlEnvelope {
+func routeResult(epoch, generation, requestID, connectionID uint64, assignmentID string, connected bool) *controlpb.ControlEnvelope {
 	return &controlpb.ControlEnvelope{
-		RequestId: connectionID,
+		ControlEpoch: epoch,
+		Generation:   generation,
+		RequestId:    requestID,
 		Body: &controlpb.ControlEnvelope_RouteResult{
 			RouteResult: &controlpb.RouteResult{
 				ConnectionId: connectionID,
-				AssignmentId: "a-1",
+				AssignmentId: assignmentID,
 				Connected:    connected,
 			},
 		},
 	}
 }
 
-func connectionEvent(kind controlpb.ConnectionEventKind) *controlpb.ControlEnvelope {
+func connectionEvent(epoch, generation, requestID, connectionID uint64, backendID string, kind controlpb.ConnectionEventKind) *controlpb.ControlEnvelope {
 	return &controlpb.ControlEnvelope{
+		ControlEpoch: epoch,
+		Generation:   generation,
+		RequestId:    requestID,
 		Body: &controlpb.ControlEnvelope_ConnectionEvent{
 			ConnectionEvent: &controlpb.ConnectionEvent{
-				Kind:      kind,
-				BackendId: "tidb-a",
-				Namespace: "default",
+				Kind:       kind,
+				Connection: &controlpb.ConnectionIdentity{ConnectionId: connectionID},
+				BackendId:  backendID,
 			},
 		},
 	}
@@ -71,38 +75,54 @@ func heartbeat() *controlpb.ControlEnvelope {
 	}
 }
 
-// TestFrameMatchesClassifiesByField proves the field-level scan matches
-// exactly the targeted kind and nothing adjacent — a connected=false route
-// result and a non-CLOSED event are forwarded, not dropped.
-func TestFrameMatchesClassifiesByField(t *testing.T) {
-	cases := []struct {
-		name     string
-		kind     dropKind
-		envelope *controlpb.ControlEnvelope
-		want     bool
-	}{
-		{"connected route result matches", dropRouteResultConnected, routeResult(9, true), true},
-		{"refused route result does not match", dropRouteResultConnected, routeResult(9, false), false},
-		{"closed event matches", dropConnectionEventClosed, connectionEvent(controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED), true},
-		{"opened event does not match", dropConnectionEventClosed, connectionEvent(controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_OPENED), false},
-		{"heartbeat never matches route kind", dropRouteResultConnected, heartbeat(), false},
-		{"connected result is not an event", dropConnectionEventClosed, routeResult(9, true), false},
+func uint64p(v uint64) *uint64 { return &v }
+func stringp(v string) *string { return &v }
+
+// TestExtractFrameFieldsMatchesWire proves the field-level scan reads the exact
+// identity of a frame without decoding it into a protobuf value.
+func TestExtractFrameFieldsMatchesWire(t *testing.T) {
+	rr := framed(t, routeResult(4, 9, 77, 42, "assign-x", true))
+	got := extractFrameFields(rr[4:])
+	if got.kind != dropRouteResultConnected || got.controlEpoch != 4 || got.generation != 9 ||
+		got.requestID != 77 || got.connectionID != 42 || got.assignmentID != "assign-x" {
+		t.Fatalf("route result fields mismatch: %+v", got)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			body, err := controlpb.MarshalFrame(tc.envelope, defaultMaxFrameBytes)
-			if err != nil {
-				t.Fatalf("marshal: %v", err)
-			}
-			if got := frameMatches(tc.kind, body[4:]); got != tc.want {
-				t.Fatalf("frameMatches = %v, want %v", got, tc.want)
-			}
-		})
+
+	ce := framed(t, connectionEvent(5, 3, 88, 43, "tidb-b", controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED))
+	got = extractFrameFields(ce[4:])
+	if got.kind != dropConnectionEventClosed || got.controlEpoch != 5 || got.generation != 3 ||
+		got.requestID != 88 || got.connectionID != 43 || got.backendID != "tidb-b" {
+		t.Fatalf("connection event fields mismatch: %+v", got)
+	}
+
+	// A connected=false route result and a non-CLOSED event classify as
+	// no drop kind.
+	open := extractFrameFields(framed(t, routeResult(1, 1, 1, 1, "a", false))[4:])
+	if open.kind != dropNone {
+		t.Fatalf("refused route result must not classify as a drop kind: %+v", open)
 	}
 }
 
-// dropperFixture starts a dropper in front of an in-test upstream that records
-// every byte it receives, and returns a client connection plus the recorder.
+// TestSelectorMatchesExactIdentity proves an exact selector never matches a
+// same-kind frame with a different connection / assignment / backend.
+func TestSelectorMatchesExactIdentity(t *testing.T) {
+	target := extractFrameFields(framed(t, routeResult(1, 1, 1, 7, "a-7", true))[4:])
+	other := extractFrameFields(framed(t, routeResult(1, 1, 1, 8, "a-8", true))[4:])
+
+	sel := selector{Kind: "route-result-connected", ConnectionID: uint64p(7), AssignmentID: stringp("a-7")}
+	if !sel.matches(dropRouteResultConnected, target) {
+		t.Fatal("selector must match the exact target")
+	}
+	if sel.matches(dropRouteResultConnected, other) {
+		t.Fatal("selector must NOT match a same-kind frame for another connection")
+	}
+	// Kind mismatch never matches.
+	closed := extractFrameFields(framed(t, connectionEvent(1, 1, 1, 7, "b", controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED))[4:])
+	if sel.matches(dropConnectionEventClosed, closed) {
+		t.Fatal("a route-result selector must not match a connection event")
+	}
+}
+
 type dropperFixture struct {
 	drop      *dropper
 	client    net.Conn
@@ -110,7 +130,7 @@ type dropperFixture struct {
 	adminAddr string
 }
 
-func startDropperFixture(t *testing.T, kind dropKind, pause bool, dropCount int64) *dropperFixture {
+func startDropperFixture(t *testing.T, pause bool) *dropperFixture {
 	t.Helper()
 	// Unix socket paths are bounded (~104 bytes on macOS), so a short
 	// /tmp directory is used instead of the long t.TempDir() path.
@@ -122,30 +142,17 @@ func startDropperFixture(t *testing.T, kind dropKind, pause bool, dropCount int6
 	target := filepath.Join(dir, "u.sock")
 	front := filepath.Join(dir, "f.sock")
 
-	upstreamListener, err := net.Listen("unix", target)
-	if err != nil {
-		t.Fatalf("upstream listen: %v", err)
-	}
-	received := make(chan []byte, 1)
-	go func() {
-		conn, acceptErr := upstreamListener.Accept()
-		if acceptErr != nil {
-			received <- nil
-			return
-		}
-		defer conn.Close()
-		all, _ := io.ReadAll(conn)
-		received <- all
-	}()
+	upstream := listenUpstream(t, target)
 
 	logger := log.New(os.Stderr, "test: ", 0)
-	drop := newDropper(front, target, kind, pause, dropCount, logger)
+	drop := newDropper(front, target, pause, logger)
 	if err := drop.start("127.0.0.1:0"); err != nil {
 		t.Fatalf("dropper start: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = drop.close(contextWithTimeout(t))
-		_ = upstreamListener.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		_ = drop.close(ctx)
 	})
 
 	client, err := net.Dial("unix", front)
@@ -157,29 +164,49 @@ func startDropperFixture(t *testing.T, kind dropKind, pause bool, dropCount int6
 	return &dropperFixture{
 		drop:      drop,
 		client:    client,
-		upstream:  received,
+		upstream:  upstream,
 		adminAddr: "http://" + drop.adminListen.Addr().String(),
 	}
 }
 
-func contextWithTimeout(t *testing.T) context.Context {
+func listenUpstream(t *testing.T, target string) <-chan []byte {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	t.Cleanup(cancel)
-	return ctx
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("clear target: %v", err)
+	}
+	listener, err := net.Listen("unix", target)
+	if err != nil {
+		t.Fatalf("upstream listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	received := make(chan []byte, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			received <- nil
+			return
+		}
+		defer conn.Close()
+		all, _ := io.ReadAll(conn)
+		received <- all
+	}()
+	return received
 }
 
-// TestForwardedFramesAreByteIdentical sends a mix of frames and proves the
-// upstream received exactly the non-dropped ones, byte-for-byte, in order.
+// TestForwardedFramesAreByteIdentical proves that with an exact arm, only the
+// targeted frame is dropped and every other frame is forwarded byte-for-byte.
 func TestForwardedFramesAreByteIdentical(t *testing.T) {
-	fx := startDropperFixture(t, dropRouteResultConnected, false, 1)
+	fx := startDropperFixture(t, false)
+	if err := fx.drop.arm(selector{Kind: "route-result-connected", ConnectionID: uint64p(9), AssignmentID: stringp("a-9")}); err != nil {
+		t.Fatalf("arm: %v", err)
+	}
 
 	keepFirst := framed(t, heartbeat())
-	drop := framed(t, routeResult(9, true))
-	keepSecond := framed(t, connectionEvent(controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_OPENED))
-	keepThird := framed(t, routeResult(10, false))
+	target := framed(t, routeResult(2, 3, 40, 9, "a-9", true))
+	keepEvent := framed(t, connectionEvent(2, 3, 41, 9, "tidb", controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_OPENED))
+	keepRefused := framed(t, routeResult(2, 3, 42, 9, "a-9", false))
 
-	for _, frame := range [][]byte{keepFirst, drop, keepSecond, keepThird} {
+	for _, frame := range [][]byte{keepFirst, target, keepEvent, keepRefused} {
 		if _, err := fx.client.Write(frame); err != nil {
 			t.Fatalf("client write: %v", err)
 		}
@@ -189,26 +216,30 @@ func TestForwardedFramesAreByteIdentical(t *testing.T) {
 	}
 
 	got := <-fx.upstream
-	want := bytes.Join([][]byte{keepFirst, keepSecond, keepThird}, nil)
+	want := bytes.Join([][]byte{keepFirst, keepEvent, keepRefused}, nil)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("upstream bytes mismatch:\n got  %x\n want %x", got, want)
 	}
-	if dropped := fx.drop.dropped.Load(); dropped != 1 {
-		t.Fatalf("dropped = %d, want 1", dropped)
-	}
-	if forwarded := fx.drop.forwarded.Load(); forwarded != 3 {
-		t.Fatalf("forwarded = %d, want 3", forwarded)
+	if n := len(fx.drop.dropped); n != 1 {
+		t.Fatalf("dropped = %d, want 1", n)
 	}
 }
 
-// TestExactlyOneFrameDropped proves the drop budget is respected: with
-// drop-count 1, a second matching frame flows through untouched.
-func TestExactlyOneFrameDropped(t *testing.T) {
-	fx := startDropperFixture(t, dropConnectionEventClosed, false, 1)
+// TestNonTargetConcurrentSameKindNotEaten proves the exact selector protects a
+// concurrent, same-kind frame for a different connection from being eaten.
+func TestNonTargetConcurrentSameKindNotEaten(t *testing.T) {
+	fx := startDropperFixture(t, false)
+	// Arm for connection 7 only.
+	if err := fx.drop.arm(selector{Kind: "route-result-connected", ConnectionID: uint64p(7)}); err != nil {
+		t.Fatalf("arm: %v", err)
+	}
 
-	firstClosed := framed(t, connectionEvent(controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED))
-	secondClosed := framed(t, connectionEvent(controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED))
-	for _, frame := range [][]byte{firstClosed, secondClosed} {
+	// A same-kind connected route result for a DIFFERENT connection
+	// arrives first and must be forwarded, then the target.
+	other := framed(t, routeResult(1, 1, 50, 8, "a-8", true))
+	target := framed(t, routeResult(1, 1, 51, 7, "a-7", true))
+	after := framed(t, routeResult(1, 1, 52, 9, "a-9", true))
+	for _, frame := range [][]byte{other, target, after} {
 		if _, err := fx.client.Write(frame); err != nil {
 			t.Fatalf("client write: %v", err)
 		}
@@ -218,35 +249,77 @@ func TestExactlyOneFrameDropped(t *testing.T) {
 	}
 
 	got := <-fx.upstream
-	if !bytes.Equal(got, secondClosed) {
-		t.Fatalf("upstream received %x, want the second CLOSED frame %x", got, secondClosed)
+	want := bytes.Join([][]byte{other, after}, nil)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("only connection 7 must be eaten:\n got  %x\n want %x", got, want)
 	}
-	if dropped := fx.drop.dropped.Load(); dropped != 1 {
-		t.Fatalf("dropped = %d, want exactly 1", dropped)
+	if n := len(fx.drop.dropped); n != 1 {
+		t.Fatalf("dropped = %d, want exactly 1 (connection 7)", n)
 	}
 }
 
-// TestPauseAfterDropHoldsUntilRelease proves the pause mode tears the pair down
-// on a drop, refuses to dial upstream while held, and dials again after
-// /release. The upstream sees NOTHING while held (the dropped frame is truly
-// lost) and the state endpoint reflects the hold.
-func TestPauseAfterDropHoldsUntilRelease(t *testing.T) {
-	fx := startDropperFixture(t, dropRouteResultConnected, true, 1)
-
-	// One matching frame: dropped, link torn down, hold engaged.
-	if _, err := fx.client.Write(framed(t, routeResult(9, true))); err != nil {
+// TestDropRecordMatchesWire proves the recorded drop carries the offending
+// frame's exact wire identity, and the /state schema exposes it.
+func TestDropRecordMatchesWire(t *testing.T) {
+	fx := startDropperFixture(t, false)
+	if err := fx.drop.arm(selector{Kind: "connection-event-closed", ConnectionID: uint64p(43), BackendID: stringp("tidb-b")}); err != nil {
+		t.Fatalf("arm: %v", err)
+	}
+	target := framed(t, connectionEvent(5, 3, 88, 43, "tidb-b", controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED))
+	if _, err := fx.client.Write(target); err != nil {
 		t.Fatalf("client write: %v", err)
 	}
-	// The upstream copier ends with no bytes (the drop happened before any
-	// forward, then the pair closed).
-	got := <-fx.upstream
-	if len(got) != 0 {
-		t.Fatalf("upstream saw %x while it should have seen nothing", got)
+	if err := fx.client.(*net.UnixConn).CloseWrite(); err != nil {
+		t.Fatalf("close write: %v", err)
+	}
+	<-fx.upstream // drains until EOF (nothing forwarded)
+
+	waitFor(t, fx.adminAddr, func(state map[string]any) bool {
+		return state["drop_count"] == float64(1)
+	})
+	state := getState(t, fx.adminAddr)
+	records, ok := state["dropped"].([]any)
+	if !ok || len(records) != 1 {
+		t.Fatalf("expected one drop record, got %v", state["dropped"])
+	}
+	rec := records[0].(map[string]any)
+	checks := map[string]float64{
+		"control_epoch": 5, "generation": 3, "request_id": 88, "connection_id": 43,
+	}
+	for k, want := range checks {
+		if rec[k] != want {
+			t.Fatalf("drop record %s = %v, want %v", k, rec[k], want)
+		}
+	}
+	if rec["backend_id"] != "tidb-b" || rec["kind"] != "connection-event-closed" {
+		t.Fatalf("drop record identity mismatch: %v", rec)
+	}
+	// The event log records the arm then the drop, in order.
+	events, _ := state["events"].([]any)
+	if len(events) < 2 {
+		t.Fatalf("expected arm+drop events, got %v", events)
+	}
+}
+
+// TestPauseAfterDropHoldsUntilReleaseAndReconnect proves the hold blocks
+// upstream dials until /release, and that a release advances the reconnect
+// count as the recovered session dials again.
+func TestPauseAfterDropHoldsUntilReleaseAndReconnect(t *testing.T) {
+	fx := startDropperFixture(t, true)
+	if err := fx.drop.arm(selector{Kind: "route-result-connected", ConnectionID: uint64p(9)}); err != nil {
+		t.Fatalf("arm: %v", err)
 	}
 
-	waitForState(t, fx.adminAddr, func(state map[string]any) bool {
-		return state["held"] == true && state["dropped"] == float64(1)
+	if _, err := fx.client.Write(framed(t, routeResult(1, 1, 40, 9, "a-9", true))); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	if got := <-fx.upstream; len(got) != 0 {
+		t.Fatalf("upstream saw %x while it should have seen nothing", got)
+	}
+	waitFor(t, fx.adminAddr, func(state map[string]any) bool {
+		return state["held"] == true && state["drop_count"] == float64(1)
 	})
+	beforeReconnects := getState(t, fx.adminAddr)["reconnect_count"].(float64)
 
 	// A reconnect while held is accepted then immediately closed with no
 	// upstream dial.
@@ -260,13 +333,16 @@ func TestPauseAfterDropHoldsUntilRelease(t *testing.T) {
 		t.Fatalf("held connection read = %v, want EOF (accept-then-close)", err)
 	}
 	_ = held.Close()
+	waitFor(t, fx.adminAddr, func(state map[string]any) bool {
+		return state["reconnect_count"].(float64) >= beforeReconnects+1
+	})
 
 	// Release, then a fresh upstream recorder must receive a forwarded
-	// frame — the link recovered.
-	upstreamAfter := replaceUpstream(t, fx.drop.target)
+	// frame — the link recovered — and the release advanced the counters.
+	upstreamAfter := listenUpstream(t, fx.drop.target)
 	post(t, fx.adminAddr+"/release")
-	waitForState(t, fx.adminAddr, func(state map[string]any) bool {
-		return state["held"] == false
+	waitFor(t, fx.adminAddr, func(state map[string]any) bool {
+		return state["held"] == false && state["release_count"].(float64) >= 1
 	})
 
 	recovered, err := net.Dial("unix", fx.drop.frontPath)
@@ -285,40 +361,19 @@ func TestPauseAfterDropHoldsUntilRelease(t *testing.T) {
 	if !bytes.Equal(gotAfter, keep) {
 		t.Fatalf("post-release upstream got %x, want %x", gotAfter, keep)
 	}
+	// The reconnect count advanced across the held dial and the recovered
+	// dial — release let the link move forward.
+	finalReconnects := getState(t, fx.adminAddr)["reconnect_count"].(float64)
+	if finalReconnects < beforeReconnects+2 {
+		t.Fatalf("reconnect_count = %v, want >= %v", finalReconnects, beforeReconnects+2)
+	}
 }
 
-// replaceUpstream binds a fresh recorder on the same target path after the
-// original accepter has consumed its one connection.
-func replaceUpstream(t *testing.T, target string) <-chan []byte {
-	t.Helper()
-	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-		t.Fatalf("clear target: %v", err)
-	}
-	listener, err := net.Listen("unix", target)
-	if err != nil {
-		t.Fatalf("re-listen upstream: %v", err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	received := make(chan []byte, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			received <- nil
-			return
-		}
-		defer conn.Close()
-		all, _ := io.ReadAll(conn)
-		received <- all
-	}()
-	return received
-}
-
-func waitForState(t *testing.T, adminAddr string, predicate func(map[string]any) bool) {
+func waitFor(t *testing.T, adminAddr string, predicate func(map[string]any) bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		state := getState(t, adminAddr)
-		if predicate(state) {
+		if predicate(getState(t, adminAddr)) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

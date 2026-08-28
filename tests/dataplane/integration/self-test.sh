@@ -38,6 +38,7 @@ FAKE_MYSQL
 chmod 0700 "$temp_dir/tools/tiup" "$temp_dir/tools/mysql"
 
 go test "$repo_root/tests/dataplane/integration/faultproxy"
+go test "$repo_root/tests/dataplane/integration/controldropper"
 
 "$script_dir/generate-certs.sh" "$temp_dir/certs" >/dev/null
 openssl verify -CAfile "$temp_dir/certs/ca.pem" \

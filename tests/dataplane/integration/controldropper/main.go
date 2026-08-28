@@ -13,16 +13,23 @@
 // limitations under the License.
 
 // controldropper is a test-only man-in-the-middle for the Go/Rust control
-// Unix-domain socket. It forwards every control frame verbatim EXCEPT the ones
-// a chaos test wants to lose: a chosen kind of Rust->Go frame is swallowed
-// before it reaches the Go control plane, modeling a control message the Go
-// side accepted-as-sent but never observed.
+// Unix-domain socket. It forwards every control frame verbatim EXCEPT the one
+// a chaos test explicitly arms it to lose: a Rust->Go frame that matches an
+// EXACT selector (kind plus connection/assignment/backend identity) is
+// swallowed before it reaches the Go control plane, modeling a control message
+// the Go side accepted-as-sent but never observed.
 //
-// It deliberately implements NO control protocol semantics. It classifies a
-// frame by a FIELD-LEVEL bypass scan (protowire tag walk) over the exact wire
-// bytes and forwards those exact bytes onward untouched — it never re-marshals
-// a protobuf, so a forwarded frame is byte-identical to the one it received.
-// Only the Rust->Go direction is inspected; Go->Rust is a raw copy.
+// It deliberately implements NO control protocol semantics. It classifies and
+// selects a frame by a FIELD-LEVEL bypass scan (protowire tag walk) over the
+// exact wire bytes and forwards those exact bytes onward untouched — it never
+// re-marshals a protobuf, so a forwarded frame is byte-identical to the one it
+// received. Only the Rust->Go direction is inspected; Go->Rust is a raw copy.
+//
+// An exact selector (rather than a bare kind filter) is required so that a
+// concurrent, same-kind frame belonging to a different connection/health probe
+// is never eaten by mistake. Every drop is recorded with the offending frame's
+// exact wire identity, and an ordered event log plus connect/reconnect/release
+// counters give a chaos test the evidence it needs to assert what was lost.
 package main
 
 import (
@@ -56,18 +63,29 @@ const (
 
 // ControlEnvelope top-level field numbers (proto/dataplane/v1/control.proto).
 const (
-	fieldRouteResult     protowire.Number = 29
-	fieldConnectionEvent protowire.Number = 30
+	fieldEnvelopeControlEpoch protowire.Number = 2
+	fieldEnvelopeGeneration   protowire.Number = 3
+	fieldEnvelopeRequestID    protowire.Number = 4
+	fieldRouteResult          protowire.Number = 29
+	fieldConnectionEvent      protowire.Number = 30
 )
 
-// Nested discriminant field numbers.
+// Nested field numbers.
 const (
-	fieldRouteResultConnected protowire.Number = 3 // RouteResult.connected (bool)
-	fieldConnectionEventKind  protowire.Number = 1 // ConnectionEvent.kind (enum)
-	connectionEventKindClosed uint64           = 3 // CONNECTION_EVENT_KIND_CLOSED
+	fieldRouteResultConnectionID protowire.Number = 1
+	fieldRouteResultAssignmentID protowire.Number = 2
+	fieldRouteResultConnected    protowire.Number = 3
+
+	fieldConnectionEventKind       protowire.Number = 1
+	fieldConnectionEventConnection protowire.Number = 2
+	fieldConnectionEventBackendID  protowire.Number = 3
+
+	fieldConnectionIdentityConnectionID protowire.Number = 1
+
+	connectionEventKindClosed uint64 = 3 // CONNECTION_EVENT_KIND_CLOSED
 )
 
-// dropKind is the class of Rust->Go frame the dropper swallows.
+// dropKind is the class of Rust->Go frame the dropper targets.
 type dropKind int
 
 const (
@@ -85,7 +103,7 @@ func parseDropKind(name string) (dropKind, error) {
 	case "connection-event-closed":
 		return dropConnectionEventClosed, nil
 	default:
-		return dropNone, fmt.Errorf("unknown --drop-kind %q", name)
+		return dropNone, fmt.Errorf("unknown drop kind %q", name)
 	}
 }
 
@@ -100,90 +118,205 @@ func (kind dropKind) String() string {
 	}
 }
 
-// frameMatches reports whether the exact wire bytes of one ControlEnvelope are
-// the kind this dropper targets. It walks only the top-level tags and, for a
-// candidate body, the one nested discriminant field it needs — never
-// unmarshaling into a message value, so the caller's bytes stay authoritative.
-func frameMatches(kind dropKind, body []byte) bool {
-	switch kind {
-	case dropRouteResultConnected:
-		nested, ok := lengthDelimitedField(body, fieldRouteResult)
-		if !ok {
-			return false
-		}
-		return boolField(nested, fieldRouteResultConnected)
-	case dropConnectionEventClosed:
-		nested, ok := lengthDelimitedField(body, fieldConnectionEvent)
-		if !ok {
-			return false
-		}
-		return varintField(nested, fieldConnectionEventKind) == connectionEventKindClosed
-	default:
-		return false
-	}
+// frameFields is the exact wire identity extracted from one Rust->Go frame by
+// a single field-level scan. The frame's own bytes remain authoritative; this
+// is a read-only projection used for classification, selection, and evidence.
+type frameFields struct {
+	kind         dropKind
+	controlEpoch uint64
+	generation   uint64
+	requestID    uint64
+	connectionID uint64
+	assignmentID string
+	backendID    string
 }
 
-// lengthDelimitedField returns the value bytes of the first length-delimited
-// field with the given number, scanning tags without decoding values.
-func lengthDelimitedField(message []byte, want protowire.Number) ([]byte, bool) {
+// extractFrameFields walks the top-level envelope tags (and the one nested
+// message it needs) without decoding into a protobuf value.
+func extractFrameFields(body []byte) frameFields {
+	fields := frameFields{kind: dropNone}
+	message := body
 	for len(message) > 0 {
 		number, typ, tagLen := protowire.ConsumeTag(message)
 		if tagLen < 0 {
-			return nil, false
+			return fields
 		}
 		message = message[tagLen:]
-		if number == want && typ == protowire.BytesType {
-			value, valueLen := protowire.ConsumeBytes(message)
-			if valueLen < 0 {
-				return nil, false
+		var consumed int
+		switch {
+		case number == fieldEnvelopeControlEpoch && typ == protowire.VarintType:
+			fields.controlEpoch, consumed = protowire.ConsumeVarint(message)
+		case number == fieldEnvelopeGeneration && typ == protowire.VarintType:
+			fields.generation, consumed = protowire.ConsumeVarint(message)
+		case number == fieldEnvelopeRequestID && typ == protowire.VarintType:
+			fields.requestID, consumed = protowire.ConsumeVarint(message)
+		case number == fieldRouteResult && typ == protowire.BytesType:
+			var nested []byte
+			nested, consumed = protowire.ConsumeBytes(message)
+			if consumed >= 0 {
+				fillRouteResult(&fields, nested)
 			}
-			return value, true
+		case number == fieldConnectionEvent && typ == protowire.BytesType:
+			var nested []byte
+			nested, consumed = protowire.ConsumeBytes(message)
+			if consumed >= 0 {
+				fillConnectionEvent(&fields, nested)
+			}
+		default:
+			consumed = protowire.ConsumeFieldValue(number, typ, message)
 		}
-		skip := protowire.ConsumeFieldValue(number, typ, message)
-		if skip < 0 {
-			return nil, false
+		if consumed < 0 {
+			return fields
 		}
-		message = message[skip:]
+		message = message[consumed:]
 	}
-	return nil, false
+	return fields
 }
 
-// boolField reports whether the first varint field with the given number is a
-// nonzero (true) value.
-func boolField(message []byte, want protowire.Number) bool {
-	return varintField(message, want) != 0
+func fillRouteResult(fields *frameFields, message []byte) {
+	var connected bool
+	for len(message) > 0 {
+		number, typ, tagLen := protowire.ConsumeTag(message)
+		if tagLen < 0 {
+			return
+		}
+		message = message[tagLen:]
+		var consumed int
+		switch {
+		case number == fieldRouteResultConnectionID && typ == protowire.VarintType:
+			fields.connectionID, consumed = protowire.ConsumeVarint(message)
+		case number == fieldRouteResultAssignmentID && typ == protowire.BytesType:
+			var value []byte
+			value, consumed = protowire.ConsumeBytes(message)
+			if consumed >= 0 {
+				fields.assignmentID = string(value)
+			}
+		case number == fieldRouteResultConnected && typ == protowire.VarintType:
+			var value uint64
+			value, consumed = protowire.ConsumeVarint(message)
+			connected = value != 0
+		default:
+			consumed = protowire.ConsumeFieldValue(number, typ, message)
+		}
+		if consumed < 0 {
+			return
+		}
+		message = message[consumed:]
+	}
+	if connected {
+		fields.kind = dropRouteResultConnected
+	}
 }
 
-// varintField returns the first varint field with the given number, or 0 when
-// absent (proto3 scalar default — an omitted field and an explicit zero are
-// indistinguishable on the wire, which is exactly the drop semantics we want).
-func varintField(message []byte, want protowire.Number) uint64 {
+func fillConnectionEvent(fields *frameFields, message []byte) {
+	var eventKind uint64
+	for len(message) > 0 {
+		number, typ, tagLen := protowire.ConsumeTag(message)
+		if tagLen < 0 {
+			return
+		}
+		message = message[tagLen:]
+		var consumed int
+		switch {
+		case number == fieldConnectionEventKind && typ == protowire.VarintType:
+			eventKind, consumed = protowire.ConsumeVarint(message)
+		case number == fieldConnectionEventConnection && typ == protowire.BytesType:
+			var nested []byte
+			nested, consumed = protowire.ConsumeBytes(message)
+			if consumed >= 0 {
+				fields.connectionID = connectionIdentityID(nested)
+			}
+		case number == fieldConnectionEventBackendID && typ == protowire.BytesType:
+			var value []byte
+			value, consumed = protowire.ConsumeBytes(message)
+			if consumed >= 0 {
+				fields.backendID = string(value)
+			}
+		default:
+			consumed = protowire.ConsumeFieldValue(number, typ, message)
+		}
+		if consumed < 0 {
+			return
+		}
+		message = message[consumed:]
+	}
+	if eventKind == connectionEventKindClosed {
+		fields.kind = dropConnectionEventClosed
+	}
+}
+
+func connectionIdentityID(message []byte) uint64 {
 	for len(message) > 0 {
 		number, typ, tagLen := protowire.ConsumeTag(message)
 		if tagLen < 0 {
 			return 0
 		}
 		message = message[tagLen:]
-		if number == want && typ == protowire.VarintType {
-			value, valueLen := protowire.ConsumeVarint(message)
-			if valueLen < 0 {
+		if number == fieldConnectionIdentityConnectionID && typ == protowire.VarintType {
+			value, consumed := protowire.ConsumeVarint(message)
+			if consumed < 0 {
 				return 0
 			}
 			return value
 		}
-		skip := protowire.ConsumeFieldValue(number, typ, message)
-		if skip < 0 {
+		consumed := protowire.ConsumeFieldValue(number, typ, message)
+		if consumed < 0 {
 			return 0
 		}
-		message = message[skip:]
+		message = message[consumed:]
 	}
 	return 0
+}
+
+// selector is an EXACT match target: the kind must match, and every specified
+// identity field must match too. A same-kind frame for a different connection,
+// assignment, or backend is therefore never eaten.
+type selector struct {
+	Kind         string  `json:"kind"`
+	ConnectionID *uint64 `json:"connection_id,omitempty"`
+	AssignmentID *string `json:"assignment_id,omitempty"`
+	BackendID    *string `json:"backend_id,omitempty"`
+	Count        int64   `json:"count,omitempty"`
+}
+
+func (s *selector) matches(kind dropKind, fields frameFields) bool {
+	if fields.kind == dropNone || fields.kind != kind {
+		return false
+	}
+	if s.ConnectionID != nil && *s.ConnectionID != fields.connectionID {
+		return false
+	}
+	if s.AssignmentID != nil && *s.AssignmentID != fields.assignmentID {
+		return false
+	}
+	if s.BackendID != nil && *s.BackendID != fields.backendID {
+		return false
+	}
+	return true
+}
+
+// dropRecord captures the exact wire identity of one dropped frame.
+type dropRecord struct {
+	Seq          uint64 `json:"seq"`
+	Kind         string `json:"kind"`
+	ControlEpoch uint64 `json:"control_epoch"`
+	Generation   uint64 `json:"generation"`
+	RequestID    uint64 `json:"request_id"`
+	ConnectionID uint64 `json:"connection_id"`
+	AssignmentID string `json:"assignment_id"`
+	BackendID    string `json:"backend_id"`
+}
+
+// event is one ordered entry in the observable timeline.
+type event struct {
+	Seq    uint64 `json:"seq"`
+	Type   string `json:"type"` // arm | drop | release | connect | disconnect
+	Detail string `json:"detail,omitempty"`
 }
 
 type dropper struct {
 	frontPath string
 	target    string
-	kind      dropKind
 	pause     bool
 	logger    *log.Logger
 
@@ -195,13 +328,19 @@ type dropper struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	dropRemaining atomic.Int64
-	dropped       atomic.Int64
-	forwarded     atomic.Int64
-	// held is set once a drop happened under --pause-after-drop: new
-	// upstream dials are refused until an admin release, modeling a
-	// control link that stays down until the test lets it recover.
-	held atomic.Bool
+	// Mutable observable state, all under mu.
+	mu             sync.Mutex
+	armedKind      dropKind
+	armedSelector  selector
+	armRemaining   int64
+	dropped        []dropRecord
+	events         []event
+	seq            uint64
+	connectCount   uint64
+	reconnectCount uint64
+	releaseCount   uint64
+	forwarded      uint64
+	held           bool
 
 	activeMu sync.Mutex
 	active   map[net.Conn]struct{}
@@ -209,20 +348,82 @@ type dropper struct {
 	closeOnce sync.Once
 }
 
-func newDropper(frontPath, target string, kind dropKind, pause bool, dropCount int64, logger *log.Logger) *dropper {
+func newDropper(frontPath, target string, pause bool, logger *log.Logger) *dropper {
 	ctx, cancel := context.WithCancel(context.Background())
-	drop := &dropper{
+	return &dropper{
 		frontPath: frontPath,
 		target:    target,
-		kind:      kind,
 		pause:     pause,
 		logger:    logger,
 		ctx:       ctx,
 		cancel:    cancel,
+		armedKind: dropNone,
 		active:    make(map[net.Conn]struct{}),
 	}
-	drop.dropRemaining.Store(dropCount)
-	return drop
+}
+
+// arm installs an exact one-shot (or count-bounded) drop selector. It replaces
+// any prior arming and records an "arm" event.
+func (d *dropper) arm(sel selector) error {
+	kind, err := parseDropKind(sel.Kind)
+	if err != nil {
+		return err
+	}
+	if kind == dropNone {
+		return errors.New("arm requires a nonempty kind")
+	}
+	count := sel.Count
+	if count <= 0 {
+		count = 1
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.armedKind = kind
+	d.armedSelector = sel
+	d.armRemaining = count
+	d.appendEventLocked("arm", fmt.Sprintf("kind=%s count=%d", kind, count))
+	return nil
+}
+
+func (d *dropper) appendEventLocked(kind, detail string) {
+	d.seq++
+	d.events = append(d.events, event{Seq: d.seq, Type: kind, Detail: detail})
+}
+
+// tryClaimDrop atomically decides whether this frame is dropped and, if so,
+// records it — all under the same lock so the selector, budget, records, and
+// events stay consistent.
+func (d *dropper) tryClaimDrop(fields frameFields) (bool, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.armedKind == dropNone || d.armRemaining <= 0 {
+		return false, false
+	}
+	if !d.armedSelector.matches(d.armedKind, fields) {
+		return false, false
+	}
+	d.armRemaining--
+	d.seq++
+	record := dropRecord{
+		Seq:          d.seq,
+		Kind:         fields.kind.String(),
+		ControlEpoch: fields.controlEpoch,
+		Generation:   fields.generation,
+		RequestID:    fields.requestID,
+		ConnectionID: fields.connectionID,
+		AssignmentID: fields.assignmentID,
+		BackendID:    fields.backendID,
+	}
+	d.dropped = append(d.dropped, record)
+	d.events = append(d.events, event{Seq: d.seq, Type: "drop", Detail: fmt.Sprintf(
+		"kind=%s conn=%d assignment=%s backend=%s epoch=%d gen=%d req=%d",
+		record.Kind, record.ConnectionID, record.AssignmentID, record.BackendID,
+		record.ControlEpoch, record.Generation, record.RequestID)})
+	pause := d.pause
+	if pause {
+		d.held = true
+	}
+	return true, pause
 }
 
 func (d *dropper) start(adminAddr string) error {
@@ -248,6 +449,7 @@ func (d *dropper) start(adminAddr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", d.handleHealth)
 	mux.HandleFunc("/state", d.handleState)
+	mux.HandleFunc("/arm", d.handleArm)
 	mux.HandleFunc("/release", d.handleRelease)
 	d.admin = &http.Server{Handler: mux, ReadHeaderTimeout: 2 * time.Second}
 
@@ -286,10 +488,24 @@ func (d *dropper) serve() error {
 
 func (d *dropper) handleConnection(client net.Conn) {
 	defer client.Close()
+
+	d.mu.Lock()
+	d.connectCount++
+	if d.connectCount > 1 {
+		d.reconnectCount++
+	}
+	held := d.held
+	if held {
+		d.appendEventLocked("connect", "held (no upstream dial)")
+	} else {
+		d.appendEventLocked("connect", "dialing upstream")
+	}
+	d.mu.Unlock()
+
 	// A held link never dials upstream: the Rust reconnect loop keeps
 	// finding a front socket that accepts and immediately closes, exactly
 	// like a control plane that is up but wedged.
-	if d.held.Load() {
+	if held {
 		return
 	}
 	dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -323,26 +539,29 @@ func (d *dropper) handleConnection(client net.Conn) {
 	_ = client.Close()
 	_ = upstream.Close()
 	<-done
+
+	d.mu.Lock()
+	d.appendEventLocked("disconnect", "")
+	d.mu.Unlock()
 }
 
-// pumpInspected forwards Rust->Go frames verbatim, swallowing frames of the
-// configured kind while the drop budget lasts. It preserves bytes exactly: the
-// only thing it ever writes upstream is the untouched [prefix|body] it read.
+// pumpInspected forwards Rust->Go frames verbatim, swallowing the one armed
+// frame. It preserves bytes exactly: the only thing it ever writes upstream is
+// the untouched [prefix|body] it read.
 func (d *dropper) pumpInspected(src net.Conn, dst net.Conn) {
 	for {
 		frame, body, err := readFrame(src)
 		if err != nil {
 			return
 		}
-		if d.kind != dropNone && frameMatches(d.kind, body) && d.claimDrop() {
-			d.dropped.Add(1)
-			d.logger.Printf("dropped %s frame (%d bytes)", d.kind, len(frame))
-			if d.pause {
+		fields := extractFrameFields(body)
+		if dropped, pause := d.tryClaimDrop(fields); dropped {
+			d.logger.Printf("dropped %s frame conn=%d assignment=%q backend=%q (%d bytes)",
+				fields.kind, fields.connectionID, fields.assignmentID, fields.backendID, len(frame))
+			if pause {
 				// Model a link that goes down the instant the frame is
 				// lost: tear the pair down and refuse to dial again
-				// until an admin release. The dropped frame is gone;
-				// the Go side must recover it through reconciliation.
-				d.held.Store(true)
+				// until an admin release.
 				_ = src.Close()
 				_ = dst.Close()
 				return
@@ -352,27 +571,13 @@ func (d *dropper) pumpInspected(src net.Conn, dst net.Conn) {
 		if _, err := dst.Write(frame); err != nil {
 			return
 		}
-		d.forwarded.Add(1)
-	}
-}
-
-// claimDrop consumes one unit of the drop budget, returning false once it is
-// exhausted so later matching frames flow normally.
-func (d *dropper) claimDrop() bool {
-	for {
-		remaining := d.dropRemaining.Load()
-		if remaining <= 0 {
-			return false
-		}
-		if d.dropRemaining.CompareAndSwap(remaining, remaining-1) {
-			return true
-		}
+		atomic.AddUint64(&d.forwarded, 1)
 	}
 }
 
 // readFrame reads exactly one length-prefixed control frame and returns both
 // the full [prefix|body] slice (for verbatim forwarding) and the body slice
-// (for classification). The two share no storage the caller mutates.
+// (for classification).
 func readFrame(reader io.Reader) (frame []byte, body []byte, err error) {
 	var prefix [4]byte
 	if _, err = io.ReadFull(reader, prefix[:]); err != nil {
@@ -433,17 +638,47 @@ func (d *dropper) handleState(writer http.ResponseWriter, request *http.Request)
 	d.activeMu.Lock()
 	active := len(d.active) / 2
 	d.activeMu.Unlock()
-	writer.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(writer).Encode(map[string]any{
-		"drop_kind":          d.kind.String(),
-		"dropped":            d.dropped.Load(),
-		"drop_remaining":     d.dropRemaining.Load(),
-		"forwarded":          d.forwarded.Load(),
-		"held":               d.held.Load(),
-		"pause_after_drop":   d.pause,
-		"active_connections": active,
+
+	d.mu.Lock()
+	state := map[string]any{
 		"target":             d.target,
-	})
+		"pause_after_drop":   d.pause,
+		"armed":              d.armedKind != dropNone && d.armRemaining > 0,
+		"arm_kind":           d.armedKind.String(),
+		"arm_selector":       d.armedSelector,
+		"arm_remaining":      d.armRemaining,
+		"dropped":            append([]dropRecord(nil), d.dropped...),
+		"drop_count":         len(d.dropped),
+		"events":             append([]event(nil), d.events...),
+		"connect_count":      d.connectCount,
+		"reconnect_count":    d.reconnectCount,
+		"release_count":      d.releaseCount,
+		"forwarded":          atomic.LoadUint64(&d.forwarded),
+		"held":               d.held,
+		"active_connections": active,
+	}
+	d.mu.Unlock()
+
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(state)
+}
+
+// handleArm installs an exact one-shot drop selector.
+func (d *dropper) handleArm(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(writer, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var sel selector
+	if err := json.NewDecoder(request.Body).Decode(&sel); err != nil {
+		http.Error(writer, fmt.Sprintf("bad arm request: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := d.arm(sel); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 // handleRelease lifts a post-drop hold so the next Rust reconnect dials
@@ -453,9 +688,14 @@ func (d *dropper) handleRelease(writer http.ResponseWriter, request *http.Reques
 		http.Error(writer, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
-	released := d.held.Swap(false)
+	d.mu.Lock()
+	wasHeld := d.held
+	d.held = false
+	d.releaseCount++
+	d.appendEventLocked("release", fmt.Sprintf("was_held=%t", wasHeld))
+	d.mu.Unlock()
 	writer.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(writer).Encode(map[string]bool{"was_held": released})
+	_ = json.NewEncoder(writer).Encode(map[string]bool{"was_held": wasHeld})
 }
 
 func (d *dropper) close(ctx context.Context) error {
@@ -485,9 +725,14 @@ func run() error {
 	frontPath := flag.String("front-socket", "", "Unix socket the Rust dataplane connects to")
 	targetPath := flag.String("target-socket", "", "upstream Go control Unix socket")
 	adminAddr := flag.String("admin", "127.0.0.1:18575", "HTTP fault-control address")
-	dropKindName := flag.String("drop-kind", "", "Rust->Go frame kind to drop: route-result-connected | connection-event-closed")
-	dropCount := flag.Int64("drop-count", 1, "maximum number of matching frames to drop")
 	pause := flag.Bool("pause-after-drop", false, "tear the link down after a drop and hold reconnects until /release")
+	// Optional pre-arming at startup (a chaos test usually arms via POST
+	// /arm once it knows the exact connection/assignment/backend).
+	dropKindName := flag.String("arm-kind", "", "pre-arm a drop of this kind at startup")
+	armConnID := flag.Int64("arm-connection-id", -1, "restrict the pre-armed drop to this connection id")
+	armAssignment := flag.String("arm-assignment-id", "", "restrict the pre-armed drop to this assignment id")
+	armBackend := flag.String("arm-backend-id", "", "restrict the pre-armed drop to this backend id")
+	armCount := flag.Int64("arm-count", 1, "how many matching frames the pre-arm drops")
 	flag.Parse()
 
 	if *frontPath == "" {
@@ -496,18 +741,30 @@ func run() error {
 	if *targetPath == "" {
 		return errors.New("--target-socket is required")
 	}
-	kind, err := parseDropKind(*dropKindName)
-	if err != nil {
-		return err
-	}
 
 	logger := log.New(os.Stderr, "controldropper: ", log.LstdFlags|log.Lmicroseconds|log.LUTC)
-	drop := newDropper(*frontPath, *targetPath, kind, *pause, *dropCount, logger)
+	drop := newDropper(*frontPath, *targetPath, *pause, logger)
+	if *dropKindName != "" {
+		sel := selector{Kind: *dropKindName, Count: *armCount}
+		if *armConnID >= 0 {
+			id := uint64(*armConnID)
+			sel.ConnectionID = &id
+		}
+		if *armAssignment != "" {
+			sel.AssignmentID = armAssignment
+		}
+		if *armBackend != "" {
+			sel.BackendID = armBackend
+		}
+		if err := drop.arm(sel); err != nil {
+			return err
+		}
+	}
 	if err := drop.start(*adminAddr); err != nil {
 		return err
 	}
-	logger.Printf("ready front=%s admin=%s target=%s drop_kind=%s drop_count=%d pause_after_drop=%t",
-		drop.listener.Addr(), drop.adminListen.Addr(), *targetPath, kind, *dropCount, *pause)
+	logger.Printf("ready front=%s admin=%s target=%s pause_after_drop=%t",
+		drop.listener.Addr(), drop.adminListen.Addr(), *targetPath, *pause)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
