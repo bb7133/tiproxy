@@ -807,6 +807,15 @@ fn session_meta(serial: u64, epoch: u64) -> SessionMeta {
     }
 }
 
+fn session_meta_as(process_id: &str, serial: u64, epoch: u64) -> SessionMeta {
+    SessionMeta {
+        serial,
+        epoch,
+        peer_process_id: Arc::from(process_id),
+        peer_started_unix_millis: 1_700_000_000_000,
+    }
+}
+
 fn tagged_on(envelope: ControlEnvelope, serial: u64, epoch: u64) -> TaggedEnvelope {
     TaggedEnvelope {
         envelope,
@@ -2413,5 +2422,366 @@ async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports(
         request.connections[0].namespace, "ns-wired",
         "the next-epoch reconcile exports the adopted namespace"
     );
+    harness.task.abort();
+}
+
+/// Fix-2 lineage regression: a frame retained from lineage A's dead
+/// session must NOT be pumped into a session belonging to a DIFFERENT
+/// Go process — even when the new session negotiated the SAME wire
+/// epoch value. The frame is dropped and counted; its owner (the new
+/// Go) regenerates the desired state itself.
+#[tokio::test(start_paused = true)]
+async fn cross_lineage_retained_frame_is_dropped_not_pumped() {
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
+    let Ok(()) = forwarder.handle(frame(1)).await else {
+        unreachable!("first frame fits")
+    };
+    let blocked = forwarder.handle(frame(2));
+    tokio::pin!(blocked);
+    assert!(futures_pending(&mut blocked).await);
+    state_tx.send(ConnectionState::Disconnected).ok();
+    assert!(blocked.await.is_err());
+    let Ok(true) = forwarder.retains_frame() else {
+        unreachable!("the in-flight frame is retained")
+    };
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
+
+    // The replacement Go negotiates the SAME wire epoch value 1 — but
+    // it is a different process lineage.
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let Ok(()) = forwarder
+        .resume_session(session_meta_as("go-restarted", 2, 1))
+        .await
+    else {
+        unreachable!("resume succeeds with nothing to pump")
+    };
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "the cross-lineage frame is NOT delivered"
+    );
+    let Ok(false) = forwarder.retains_frame() else {
+        unreachable!("the slot is emptied by the drop")
+    };
+    assert_eq!(
+        forwarder.cross_lineage_retained_dropped(),
+        1,
+        "the drop is observable"
+    );
+
+    // The new session's own frames flow normally, tagged with the NEW
+    // origin.
+    let Ok(()) = forwarder.handle(frame(3)).await else {
+        unreachable!("the new session's frame fits")
+    };
+    let Ok(delivered) = inbound_rx.try_recv() else {
+        unreachable!("the new session's frame is delivered")
+    };
+    assert_eq!(delivered.envelope.request_id, 3);
+    assert_eq!(delivered.origin.serial, 2);
+    assert_eq!(delivered.origin.peer_process_id.as_ref(), "go-restarted");
+}
+
+/// Fix-2 lineage regression, same-lineage side: a reconnect WITHIN one
+/// Go process (epoch 1 → 2) keeps the one-shot retained delivery, and
+/// the pumped frame still carries its ORIGIN session meta — it must be
+/// judged against the session it was read on, not the new one.
+#[tokio::test(start_paused = true)]
+async fn same_lineage_retained_frame_pumps_once_with_origin_meta() {
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
+    let Ok(()) = forwarder.handle(frame(1)).await else {
+        unreachable!("first frame fits")
+    };
+    let blocked = forwarder.handle(frame(2));
+    tokio::pin!(blocked);
+    assert!(futures_pending(&mut blocked).await);
+    state_tx.send(ConnectionState::Disconnected).ok();
+    assert!(blocked.await.is_err());
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
+
+    // Same Go process, next epoch.
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
+        unreachable!("the pump delivers the retained frame")
+    };
+    let Ok(delivered) = inbound_rx.try_recv() else {
+        unreachable!("the retained frame arrives")
+    };
+    assert_eq!(delivered.envelope.request_id, 2);
+    assert_eq!(
+        delivered.origin.serial, 1,
+        "the frame keeps the ORIGIN it was read on"
+    );
+    assert_eq!(delivered.origin.epoch, 1);
+    assert_eq!(forwarder.cross_lineage_retained_dropped(), 0);
+    // One-shot semantics unchanged.
+    let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
+        unreachable!("empty pump succeeds")
+    };
+    assert!(inbound_rx.try_recv().is_err(), "no double delivery");
+}
+
+/// Fix-2 dispatch-gate regression: wire epoch VALUES repeat across Go
+/// restarts, so a `ReconcileSnapshot` from a DEAD session that happens
+/// to carry the CURRENT epoch value must still be refused — only the
+/// tagged origin serial tells the sessions apart. The dead session's
+/// metering ack never applies, the batch replays to every successor,
+/// and each new session regenerates its own reconcile exchange.
+#[expect(
+    clippy::too_many_lines,
+    reason = "three full sessions plus an interleaved late ack are one scenario"
+)]
+#[tokio::test(start_paused = true)]
+async fn dead_session_snapshot_with_reused_epoch_value_never_acks() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7);
+    assert!(
+        handler
+            .metering()
+            .record(MeteringDelta {
+                keyspace: "ks-serial".to_owned(),
+                backend_id: "tidb-a".to_owned(),
+                public_endpoint: false,
+                response_bytes: 64,
+                cross_location_bytes: 0,
+            })
+            .is_ok()
+    );
+    let Ok(Some(batch)) = handler.seal_metering() else {
+        unreachable!("one batch seals")
+    };
+    let harness = spawn_loop(handler);
+
+    // Session A (serial 2, epoch 2): replays the unacked batch and
+    // issues its reconcile request.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    let replays = |sent: &[ControlEnvelope]| {
+        sent.iter()
+            .filter(|envelope| {
+                matches!(
+                    &envelope.body,
+                    Some(Body::MeteringBatch(replayed)) if replayed.sequence == batch.sequence
+                )
+            })
+            .count()
+    };
+    assert_eq!(replays(&sent), 1, "session A replays the unacked batch");
+
+    // Go restarts. The replacement session B negotiates the SAME wire
+    // epoch VALUE 2 — a different serial is the only discriminator.
+    harness.state_tx.send(ConnectionState::Disconnected).ok();
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 3,
+            capabilities: full_caps(),
+        })
+        .ok();
+
+    // Session B replays the still-unacked batch too.
+    let mut sent = Vec::new();
+    for _ in 0..100_000 {
+        sent = harness.sender.sent();
+        if replays(&sent) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(replays(&sent), 2, "session B replays the unacked batch");
+
+    // A late ack minted by DEAD session A arrives: control_epoch 2
+    // matches the CURRENT epoch value, so an epoch-only gate would
+    // accept it — the origin serial must refuse it.
+    let late_ack = ControlEnvelope {
+        request_id: 60,
+        generation: 7,
+        control_epoch: 2,
+        body: Some(Body::ReconcileSnapshot(ReconcileSnapshot {
+            applied_generation: 7,
+            connection_event_sequence: 0,
+            metrics_sequence: 0,
+            metering_sequence: batch.sequence,
+            connections: Vec::new(),
+        })),
+        ..ControlEnvelope::default()
+    };
+    harness
+        .inbound_tx
+        .send(tagged_on(late_ack, 2, 2))
+        .await
+        .ok();
+    // A marker command queued BEHIND the ack (FIFO): once its terminal
+    // is out, the ack was judged — while the epoch value is STILL 2.
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            envelope(61, 7, Body::RedirectCommand(redirect(999, "marker-1", 1))),
+            3,
+            2,
+        ))
+        .await
+        .ok();
+    let mut sent = Vec::new();
+    for _ in 0..100_000 {
+        sent = harness.sender.sent();
+        if sent.iter().any(|envelope| envelope.request_id == 61) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        sent.iter().any(|envelope| envelope.request_id == 61),
+        "the marker terminal proves the ack was judged under epoch value 2"
+    );
+
+    // Session C proves the refusal observably: the batch is STILL
+    // unacked and replays a third time.
+    harness.state_tx.send(ConnectionState::Disconnected).ok();
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 3,
+            serial: 4,
+            capabilities: full_caps(),
+        })
+        .ok();
+    let mut final_sent = Vec::new();
+    for _ in 0..100_000 {
+        final_sent = harness.sender.sent();
+        if replays(&final_sent) >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        replays(&final_sent),
+        3,
+        "the dead session's same-epoch-value ack was refused: the batch replays"
+    );
+    // Every session regenerated its own reconcile exchange.
+    assert!(
+        final_sent
+            .iter()
+            .filter(|envelope| matches!(envelope.body, Some(Body::ReconcileRequest(_))))
+            .count()
+            >= 2,
+        "each successor session re-issues its reconcile request"
+    );
+    harness.task.abort();
+}
+
+/// Fix-2 outbound-scoping regression: an INLINE request error (a
+/// `ProtocolError` answering one inbound frame) is bound to the exact
+/// session the offending frame arrived on — if that session dies, the
+/// error dies with it and can never false-resolve a successor's
+/// exchange that reused the same request id. Lifecycle TERMINALS
+/// (drain results and kin) stay durable across reconnects.
+#[tokio::test(start_paused = true)]
+async fn inline_request_errors_are_session_scoped_and_terminals_durable() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7);
+    let harness = spawn_loop(handler);
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: full_caps(),
+        })
+        .ok();
+
+    // A drain minted under a superseded generation draws an inline
+    // ProtocolError: scoped to the offending frame's origin session.
+    let stale = envelope(
+        70,
+        3,
+        Body::DrainCommand(DrainCommand {
+            drain_id: "d-scoped".to_owned(),
+            listener_names: Vec::new(),
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: 1_010_000,
+            force_deadline_unix_millis: 1_020_000,
+            command_sequence: 1,
+        }),
+    );
+    harness.inbound_tx.send(tagged_on(stale, 2, 2)).await.ok();
+    let mut with_scope = Vec::new();
+    for _ in 0..100_000 {
+        with_scope = harness.sender.sent_with_scope();
+        if with_scope
+            .iter()
+            .any(|(envelope, _)| envelope.request_id == 70)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let Some((error, scope)) = with_scope
+        .iter()
+        .find(|(envelope, _)| envelope.request_id == 70)
+    else {
+        unreachable!("the stale drain is answered")
+    };
+    assert_eq!(
+        error_code(error),
+        Some(ErrorCode::StaleGeneration),
+        "the answer is the inline request error"
+    );
+    assert_eq!(
+        *scope,
+        Some(2),
+        "the inline error is bound to the offending frame's origin session"
+    );
+
+    // A legal drain completes with a terminal: durable, never scoped.
+    let valid = envelope(
+        71,
+        7,
+        Body::DrainCommand(DrainCommand {
+            drain_id: "d-durable".to_owned(),
+            listener_names: Vec::new(),
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: 1_010_000,
+            force_deadline_unix_millis: 1_020_000,
+            command_sequence: 2,
+        }),
+    );
+    harness.inbound_tx.send(tagged_on(valid, 2, 2)).await.ok();
+    let mut with_scope = Vec::new();
+    for _ in 0..100_000 {
+        with_scope = harness.sender.sent_with_scope();
+        if with_scope.iter().any(|(envelope, _)| {
+            matches!(&envelope.body, Some(Body::DrainResult(result)) if result.drain_id == "d-durable")
+        }) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let Some((_, scope)) = with_scope.iter().find(|(envelope, _)| {
+        matches!(&envelope.body, Some(Body::DrainResult(result)) if result.drain_id == "d-durable")
+    }) else {
+        unreachable!("the legal drain reaches its terminal")
+    };
+    assert_eq!(*scope, None, "lifecycle terminals stay durable");
     harness.task.abort();
 }

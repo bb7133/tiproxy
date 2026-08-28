@@ -141,6 +141,37 @@ fn tagged(envelope: ControlEnvelope) -> TaggedEnvelope {
     }
 }
 
+fn tagged_as(envelope: ControlEnvelope, process_id: &str, serial: u64) -> TaggedEnvelope {
+    TaggedEnvelope {
+        envelope,
+        origin: SessionMeta {
+            serial,
+            epoch: 1,
+            peer_process_id: Arc::from(process_id),
+            peer_started_unix_millis: 1_700_000_000_000,
+        },
+    }
+}
+
+/// `valid_snapshot` with a different listener port — equal generation,
+/// different content.
+fn variant_snapshot() -> StateSnapshot {
+    let mut snapshot = valid_snapshot();
+    if let Some(config) = snapshot.config.as_mut() {
+        config.listeners[0].port = 6001;
+    }
+    snapshot
+}
+
+fn variant_envelope(request_id: u64, generation: u64) -> ControlEnvelope {
+    ControlEnvelope {
+        request_id,
+        generation,
+        body: Some(Body::StateSnapshot(variant_snapshot())),
+        ..ControlEnvelope::default()
+    }
+}
+
 fn test_now() -> UnixTime {
     UnixTime::since_unix_epoch(Duration::from_secs(1_700_000_000))
 }
@@ -811,4 +842,140 @@ async fn snapshot_clean_first_exit_is_unexpected() {
             .contains("snapshot owner exited without a requested shutdown"),
         "the first-exit task is named: {error}"
     );
+}
+
+/// Fix-2 collision regression: Go restarts and its replacement — a
+/// DIFFERENT lineage on the SAME wire epoch value — re-sends the SAME
+/// {request id, generation} with DIFFERENT content. The old rules
+/// would reject it as a same-generation conflict (or falsely
+/// deduplicate byte-equal content); the lineage-aware store applies it
+/// as a fresh sequence, and the consumer serves the NEW content.
+#[tokio::test]
+async fn restarted_go_same_generation_different_content_applies_fresh() {
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let calls = Arc::new(AtomicU64::new(0));
+    let mut consumer = CountingConsumer {
+        calls: Arc::clone(&calls),
+        reject_first: 0,
+    };
+
+    // Incarnation A commits {request 1, generation 1}.
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &tagged_as(snapshot_envelope(1, 1), "go-a", 1),
+        test_now(),
+    )
+    .await;
+    assert_eq!(applied, Some(1));
+    let Some(Body::SnapshotResult(result)) = &answer.body else {
+        unreachable!("result body")
+    };
+    assert_eq!(result.code(), control_proto::v1::ErrorCode::Ok);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    // Incarnation B (new lineage, same epoch VALUE, same request id,
+    // same generation, different content): fresh sequence, applied,
+    // consumer re-ran with the new content.
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &tagged_as(variant_envelope(1, 1), "go-b", 2),
+        test_now(),
+    )
+    .await;
+    assert_eq!(applied, Some(1), "the new lineage's generation 1 commits");
+    let Some(Body::SnapshotResult(result)) = &answer.body else {
+        unreachable!("result body")
+    };
+    assert_eq!(
+        result.code(),
+        control_proto::v1::ErrorCode::Ok,
+        "no same-generation conflict across lineages"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "the consumer served the replacement content"
+    );
+    let Ok(Some(current)) = store.current() else {
+        unreachable!("store serves the rollover")
+    };
+    let Some(port) = current
+        .raw()
+        .config
+        .as_ref()
+        .and_then(|config| config.listeners.first())
+        .map(|listener| listener.port)
+    else {
+        unreachable!("listener survives the apply")
+    };
+    assert_eq!(port, 6001, "the NEW lineage's content is the one serving");
+
+    // WITHIN incarnation B the ordinary rules are back: the same
+    // generation with different content is a conflict again.
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &tagged_as(snapshot_envelope(2, 1), "go-b", 2),
+        test_now(),
+    )
+    .await;
+    assert_eq!(applied, None);
+    let Some(Body::SnapshotResult(result)) = &answer.body else {
+        unreachable!("result body")
+    };
+    assert_ne!(result.code(), control_proto::v1::ErrorCode::Ok);
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "no consumer run");
+}
+
+/// Fix-2 answer-scoping regression: a snapshot whose ORIGIN session is
+/// no longer the live one still commits (desired state is desired
+/// state), but its `SnapshotResult` must NOT be handed to the next
+/// session — that answer would resolve a DIFFERENT session's exchange.
+/// The owner drops it and continues; Go re-sends on the new session.
+#[tokio::test]
+async fn stale_origin_snapshot_answer_is_dropped_and_owner_continues() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(1);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
+    };
+    // No shutdown requested: the client simply is not on the origin
+    // session any more (a never-connected client has no live session
+    // at all — the strongest form of "the origin is gone").
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &tagged(snapshot_envelope(30, 1)),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("a stale-origin answer is dropped, not fatal: {step:?}")
+    };
+    // The desired state DID commit — only the answer was dropped.
+    let Ok(Some(current)) = store.current() else {
+        unreachable!("the snapshot still committed")
+    };
+    assert_eq!(current.generation(), 1);
+    let Some((generation, _)) = client.last_good_snapshot_age() else {
+        unreachable!("committed snapshot updates transport diagnostics")
+    };
+    assert_eq!(generation, 1);
+    dispatch.abort();
+    client.shutdown();
 }

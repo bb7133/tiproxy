@@ -1739,6 +1739,130 @@ mod tests {
         Ok(())
     }
 
+    /// Fix-2 outbound-binding regression: an envelope enqueued
+    /// session-scoped while its session is already dead must NEVER be
+    /// written to the replacement session — even one that negotiated
+    /// the SAME wire epoch value — while a durable envelope enqueued
+    /// AFTER it (same priority queue, FIFO) still flows. After the
+    /// replacement is live, scoping to the dead serial fails fast.
+    #[tokio::test]
+    async fn session_scoped_queue_never_reaches_the_next_session() -> Result<(), Box<dyn Error>> {
+        let (socket, listener) = TestSocket::bind()?;
+        let client = Arc::new(ControlClient::new(test_config(&socket))?);
+        let mut state = client.subscribe_state();
+        let run_client = Arc::clone(&client);
+        let client_task = tokio::spawn(async move { run_client.run(&|_envelope| Ok(())).await });
+
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let server_task = tokio::spawn(async move {
+            let first = fake_go_handshake(&listener, 1, false).await?;
+            drop(first);
+            // The replacement negotiates the SAME wire epoch value 1.
+            let mut second = fake_go_handshake(&listener, 1, false).await?;
+            loop {
+                let frame = read_frame_async(&mut second, DEFAULT_MAX_FRAME_BYTES).await?;
+                let done = frame.request_id == 888;
+                if seen_tx.send(frame).is_err() || done {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+            Ok::<(), TransportError>(())
+        });
+
+        // Session 1 is live: capture its serial, then wait for the
+        // client to observe its death.
+        let first_serial = loop {
+            if let ConnectionState::Connected { serial, .. } = *state.borrow_and_update() {
+                break serial;
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| TransportError::Configuration("state channel closed".to_owned()))?;
+        };
+        loop {
+            if !matches!(
+                *state.borrow_and_update(),
+                ConnectionState::Connected { .. }
+            ) {
+                break;
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| TransportError::Configuration("state channel closed".to_owned()))?;
+        }
+
+        // Dead-session-bound first, durable second — same critical
+        // queue, FIFO: if the durable arrives, the bound one was
+        // dropped at dequeue, not merely reordered.
+        let scoped = ControlEnvelope {
+            request_id: 777,
+            priority: Priority::Critical.into(),
+            body: Some(Body::Heartbeat(Heartbeat::default())),
+            ..ControlEnvelope::default()
+        };
+        client.send_session_scoped(scoped, first_serial).await?;
+        let durable = ControlEnvelope {
+            request_id: 888,
+            priority: Priority::Critical.into(),
+            body: Some(Body::Heartbeat(Heartbeat::default())),
+            ..ControlEnvelope::default()
+        };
+        client.send(durable).await?;
+
+        // The replacement session delivers the durable envelope and
+        // never the dead-session-bound one.
+        let mut delivered = Vec::new();
+        while let Some(frame) = seen_rx.recv().await {
+            let done = frame.request_id == 888;
+            delivered.push(frame.request_id);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            delivered.contains(&888),
+            "durable outbound survives: {delivered:?}"
+        );
+        assert!(
+            !delivered.contains(&777),
+            "the dead session's scoped outbound must never reach the next session: {delivered:?}"
+        );
+
+        // With the replacement live, the dead serial fails fast.
+        let second_serial = loop {
+            match *state.borrow_and_update() {
+                ConnectionState::Connected { serial, .. } if serial != first_serial => {
+                    break serial;
+                }
+                _ => {}
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| TransportError::Configuration("state channel closed".to_owned()))?;
+        };
+        assert_ne!(second_serial, first_serial);
+        let late = ControlEnvelope {
+            request_id: 779,
+            priority: Priority::Critical.into(),
+            body: Some(Body::Heartbeat(Heartbeat::default())),
+            ..ControlEnvelope::default()
+        };
+        let refused = client.send_session_scoped(late, first_serial).await;
+        assert!(
+            matches!(refused, Err(TransportError::StaleSessionEpoch)),
+            "scoping to a dead serial fails fast: {refused:?}"
+        );
+
+        client.shutdown();
+        timeout(Duration::from_secs(1), client_task).await???;
+        server_task.await??;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn oversized_peer_frame_is_fatal_and_retried() -> Result<(), Box<dyn Error>> {
         let (socket, listener) = TestSocket::bind()?;
