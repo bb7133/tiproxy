@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use control_proto::control_transport::{ConnectionState, Handler, TransportError};
+use control_proto::control_transport::{ConnectionState, Handler, SessionMeta, TransportError};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     CloseCommand, ConnectionIdentity, ControlCapability, ControlEnvelope, DrainCommand, ErrorCode,
@@ -36,7 +36,8 @@ use control_proto::v1::{
 };
 use dataplane::control_dispatch::{
     CommandKind, CommandToken, ControlCommandHandler, DispatchFatal, DispatchNotice,
-    DispatchSender, InboundForwarder, ResponseKind, SessionDirective, run_control_dispatch,
+    DispatchSender, InboundForwarder, ResponseKind, SessionDirective, TaggedEnvelope,
+    run_control_dispatch,
 };
 use dataplane::session::SessionControl;
 use tokio::sync::{mpsc, watch};
@@ -792,9 +793,25 @@ struct LoopHarness {
     sender: Arc<FakeSender>,
     state_tx: watch::Sender<ConnectionState>,
     notice_tx: mpsc::Sender<DispatchNotice>,
-    inbound_tx: mpsc::Sender<ControlEnvelope>,
-    snapshot_rx: mpsc::Receiver<ControlEnvelope>,
+    inbound_tx: mpsc::Sender<TaggedEnvelope>,
+    snapshot_rx: mpsc::Receiver<TaggedEnvelope>,
     task: tokio::task::JoinHandle<Result<(), DispatchFatal>>,
+}
+
+fn session_meta(serial: u64, epoch: u64) -> SessionMeta {
+    SessionMeta {
+        serial,
+        epoch,
+        peer_process_id: Arc::from("go-fixture"),
+        peer_started_unix_millis: 1_700_000_000_000,
+    }
+}
+
+fn tagged_on(envelope: ControlEnvelope, serial: u64, epoch: u64) -> TaggedEnvelope {
+    TaggedEnvelope {
+        envelope,
+        origin: session_meta(serial, epoch),
+    }
 }
 
 fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopHarness {
@@ -875,6 +892,7 @@ async fn connected_transition_reconciles_and_replays_metering() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: full_caps(),
         })
         .ok();
@@ -937,6 +955,7 @@ async fn no_reconcile_capability_skips_request_and_replays_durably() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: 0,
         })
         .ok();
@@ -1001,6 +1020,7 @@ async fn closed_event_ids_feed_reconcile_watermark() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
         })
         .ok();
@@ -1141,7 +1161,7 @@ async fn wrong_direction_bodies_are_violations() {
 #[tokio::test(start_paused = true)]
 async fn reconcile_snapshot_epoch_and_capability_policy() {
     let mut handler = ControlCommandHandler::new();
-    handler.on_connected(5, full_caps());
+    handler.on_connected(5, full_caps(), 5);
     let now = Instant::now();
 
     let snapshot_from = |origin: u64| ControlEnvelope {
@@ -1189,6 +1209,7 @@ async fn reconcile_snapshot_epoch_and_capability_policy() {
     legacy.on_connected(
         6,
         1u64 << (ControlCapability::ReconcileSessionRehydration as u64),
+        6,
     );
     let out = legacy.handle_envelope(&snapshot_from(6), now, 4);
     assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
@@ -1248,12 +1269,17 @@ async fn state_snapshots_forward_to_owner() {
         })),
         ..ControlEnvelope::default()
     };
-    harness.inbound_tx.send(snapshot).await.ok();
+    harness
+        .inbound_tx
+        .send(tagged_on(snapshot, 1, 1))
+        .await
+        .ok();
     let Some(forwarded) = harness.snapshot_rx.recv().await else {
         unreachable!("the snapshot owner receives the envelope")
     };
-    assert_eq!(forwarded.request_id, 77);
-    assert_eq!(forwarded.generation, 9);
+    assert_eq!(forwarded.envelope.request_id, 77);
+    assert_eq!(forwarded.envelope.generation, 9);
+    assert_eq!(forwarded.origin.serial, 1);
     harness.task.abort();
 }
 
@@ -1262,23 +1288,24 @@ async fn state_snapshots_forward_to_owner() {
 // pump (global ≤1, exactly-once, cancel-safe).
 // ---------------------------------------------------------------------
 
-fn forwarder_fixture(
+async fn forwarder_fixture(
     capacity: usize,
 ) -> (
     InboundForwarder,
-    mpsc::Receiver<ControlEnvelope>,
+    mpsc::Receiver<TaggedEnvelope>,
     watch::Sender<ConnectionState>,
 ) {
     let (inbound_tx, inbound_rx) = mpsc::channel(capacity);
     let (state_tx, state_rx) = watch::channel(ConnectionState::Connected {
         epoch: 1,
+        serial: 1,
         capabilities: full_caps(),
     });
-    (
-        InboundForwarder::new(inbound_tx, state_rx),
-        inbound_rx,
-        state_tx,
-    )
+    let forwarder = InboundForwarder::new(inbound_tx, state_rx);
+    let Ok(()) = forwarder.resume_session(session_meta(1, 1)).await else {
+        unreachable!("the first session's resume sets the origin")
+    };
+    (forwarder, inbound_rx, state_tx)
 }
 
 fn frame(request_id: u64) -> ControlEnvelope {
@@ -1290,7 +1317,7 @@ fn frame(request_id: u64) -> ControlEnvelope {
 /// `handle` errors so the read loop joins.
 #[tokio::test(start_paused = true)]
 async fn blocked_handle_retains_frame_on_teardown() {
-    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
     let Ok(()) = forwarder.handle(frame(1)).await else {
         unreachable!("first frame fits the queue")
     };
@@ -1310,7 +1337,7 @@ async fn blocked_handle_retains_frame_on_teardown() {
         unreachable!("exactly the in-flight frame is retained")
     };
     // Nothing was lost or double-delivered into the queue.
-    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
     assert!(inbound_rx.try_recv().is_err());
 }
 
@@ -1319,7 +1346,7 @@ async fn blocked_handle_retains_frame_on_teardown() {
 /// is empty and a new session\'s frames flow normally.
 #[tokio::test(start_paused = true)]
 async fn resume_pumps_retained_frame_exactly_once() {
-    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
     let Ok(()) = forwarder.handle(frame(1)).await else {
         unreachable!("first frame fits")
     };
@@ -1331,18 +1358,19 @@ async fn resume_pumps_retained_frame_exactly_once() {
 
     // Reconnect: drain the queue (the dispatcher made progress), then
     // the transport calls resume before reading any new frame.
-    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
     state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
         })
         .ok();
-    let Ok(()) = forwarder.resume_session(2).await else {
+    let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
         unreachable!("the pump delivers the retained frame")
     };
     assert_eq!(
-        inbound_rx.try_recv().map(|e| e.request_id),
+        inbound_rx.try_recv().map(|e| e.envelope.request_id),
         Ok(2),
         "the retained frame arrives exactly once"
     );
@@ -1350,7 +1378,7 @@ async fn resume_pumps_retained_frame_exactly_once() {
         unreachable!("the slot is empty after the pump")
     };
     // A second resume is a no-op: no duplicate delivery.
-    let Ok(()) = forwarder.resume_session(2).await else {
+    let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
         unreachable!("empty pump succeeds")
     };
     assert!(inbound_rx.try_recv().is_err(), "no double delivery");
@@ -1362,7 +1390,7 @@ async fn resume_pumps_retained_frame_exactly_once() {
 /// started, so no second frame can exist (global ≤ 1).
 #[tokio::test(start_paused = true)]
 async fn teardown_during_resume_keeps_single_frame() {
-    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1);
+    let (forwarder, mut inbound_rx, state_tx) = forwarder_fixture(1).await;
     let Ok(()) = forwarder.handle(frame(1)).await else {
         unreachable!("first frame fits")
     };
@@ -1377,10 +1405,11 @@ async fn teardown_during_resume_keeps_single_frame() {
     state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
         })
         .ok();
-    let resume = forwarder.resume_session(2);
+    let resume = forwarder.resume_session(session_meta(2, 2));
     tokio::pin!(resume);
     assert!(
         futures_pending(&mut resume).await,
@@ -1393,17 +1422,18 @@ async fn teardown_during_resume_keeps_single_frame() {
     };
 
     // Session 3: the queue drains, the pump completes, exactly once.
-    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(1));
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(1));
     state_tx
         .send(ConnectionState::Connected {
             epoch: 3,
+            serial: 3,
             capabilities: full_caps(),
         })
         .ok();
-    let Ok(()) = forwarder.resume_session(3).await else {
+    let Ok(()) = forwarder.resume_session(session_meta(3, 3)).await else {
         unreachable!("the third session\'s pump delivers")
     };
-    assert_eq!(inbound_rx.try_recv().map(|e| e.request_id), Ok(2));
+    assert_eq!(inbound_rx.try_recv().map(|e| e.envelope.request_id), Ok(2));
     assert!(
         inbound_rx.try_recv().is_err(),
         "exactly once across sessions"
@@ -1473,6 +1503,7 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
         })
         .ok();
@@ -1492,7 +1523,11 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
         })),
         ..ControlEnvelope::default()
     };
-    harness.inbound_tx.send(stale_ack).await.ok();
+    harness
+        .inbound_tx
+        .send(tagged_on(stale_ack, 2, 2))
+        .await
+        .ok();
 
     // The next real session replays everything unacknowledged: the
     // batch MUST still be there — the stale ack never applied.
@@ -1500,6 +1535,7 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 3,
+            serial: 3,
             capabilities: full_caps(),
         })
         .ok();
@@ -1544,10 +1580,11 @@ async fn pending_connected_applies_before_queued_inbound() {
     let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let (notice_tx, notice_rx) = mpsc::channel(16);
-    let (snapshot_tx, _snapshot_rx) = mpsc::channel::<ControlEnvelope>(4);
+    let (snapshot_tx, _snapshot_rx) = mpsc::channel::<TaggedEnvelope>(4);
     state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
         })
         .ok();
@@ -1564,7 +1601,7 @@ async fn pending_connected_applies_before_queued_inbound() {
         })),
         ..ControlEnvelope::default()
     };
-    inbound_tx.try_send(old_ack).ok();
+    inbound_tx.try_send(tagged_on(old_ack, 1, 1)).ok();
     let task = tokio::spawn(run_control_dispatch(
         handler,
         Arc::clone(&sender),
@@ -1590,6 +1627,7 @@ async fn pending_connected_applies_before_queued_inbound() {
     state_tx
         .send(ConnectionState::Connected {
             epoch: 3,
+            serial: 3,
             capabilities: full_caps(),
         })
         .ok();
@@ -1668,7 +1706,7 @@ async fn applied_acks_order_arming_before_responses() {
             detail: String::new(),
         }),
     );
-    harness.inbound_tx.send(answer).await.ok();
+    harness.inbound_tx.send(tagged_on(answer, 1, 1)).await.ok();
     let delivered = tokio::time::timeout(Duration::from_secs(1), resp_rx.recv()).await;
     let Ok(Some(delivered)) = delivered else {
         unreachable!("the armed answer is delivered: {delivered:?}")
@@ -1784,7 +1822,7 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
             command_sequence: 1,
         }),
     );
-    harness.inbound_tx.send(early).await.ok();
+    harness.inbound_tx.send(tagged_on(early, 1, 1)).await.ok();
     let sent = wait_for_sent(&harness.sender, 1).await;
     assert!(
         matches!(sent[0].body, Some(Body::DrainResult(_))),
@@ -1820,7 +1858,7 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
             command_sequence: 2,
         }),
     );
-    harness.inbound_tx.send(stale).await.ok();
+    harness.inbound_tx.send(tagged_on(stale, 1, 1)).await.ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
     assert_eq!(
         error_code(&sent[1]),
@@ -1954,10 +1992,10 @@ async fn instant_completion_binds_exact_terminal_id() {
     // carry redirect id "r-fast" AND answer request 40.
     harness
         .inbound_tx
-        .send(envelope(
-            40,
-            7,
-            Body::RedirectCommand(redirect(1, "r-fast", 1)),
+        .send(tagged_on(
+            envelope(40, 7, Body::RedirectCommand(redirect(1, "r-fast", 1))),
+            1,
+            1,
         ))
         .await
         .ok();
@@ -1982,7 +2020,7 @@ async fn instant_completion_binds_exact_terminal_id() {
     };
     harness
         .inbound_tx
-        .send(envelope(41, 7, Body::CloseCommand(close)))
+        .send(tagged_on(envelope(41, 7, Body::CloseCommand(close)), 1, 1))
         .await
         .ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
@@ -2016,6 +2054,7 @@ async fn stale_namespace_export_is_repaired_by_a_fresh_reconcile() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: full_caps(),
         })
         .ok();
@@ -2105,6 +2144,7 @@ async fn queued_adoption_precedes_the_automatic_reconcile() {
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: full_caps(),
         })
         .ok();
@@ -2213,9 +2253,9 @@ struct ScriptedHarness {
     state_tx: watch::Sender<ConnectionState>,
     notice_tx: mpsc::Sender<DispatchNotice>,
     /// Held open so the loop's inbound arm never observes closure.
-    _inbound_tx: mpsc::Sender<ControlEnvelope>,
+    _inbound_tx: mpsc::Sender<TaggedEnvelope>,
     /// Held open so snapshot forwarding never observes closure.
-    _snapshot_rx: mpsc::Receiver<ControlEnvelope>,
+    _snapshot_rx: mpsc::Receiver<TaggedEnvelope>,
     task: tokio::task::JoinHandle<Result<(), DispatchFatal>>,
 }
 
@@ -2288,6 +2328,7 @@ async fn failed_repair_send_withholds_the_namespace_ack() {
             .state_tx
             .send(ConnectionState::Connected {
                 epoch: 1,
+                serial: 1,
                 capabilities: full_caps(),
             })
             .ok();
@@ -2327,6 +2368,7 @@ async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports(
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 1,
+            serial: 1,
             capabilities: full_caps(),
         })
         .ok();
@@ -2359,6 +2401,7 @@ async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports(
         .state_tx
         .send(ConnectionState::Connected {
             epoch: 2,
+            serial: 2,
             capabilities: full_caps(),
         })
         .ok();

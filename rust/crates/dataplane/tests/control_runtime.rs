@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use control_proto::control_transport::{ClientConfig, ControlClient, TransportError};
-use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime};
+use control_proto::control_transport::{ClientConfig, ControlClient, SessionMeta, TransportError};
+use control_proto::snapshot::{SnapshotError, SnapshotLineage, SnapshotStore, UnixTime};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     ConfigSnapshot, ControlEnvelope, Hello, KeepalivePolicy, Listener, ProxyProtocolMode, Role,
@@ -30,7 +30,8 @@ use control_proto::v1::{
 };
 use dataplane::control_dispatch::DispatchFatal;
 use dataplane::control_dispatch::{
-    ExpectResponseError, MeteringRecordError, ResponseKind, spawn_control_dispatch_with_handler,
+    ExpectResponseError, MeteringRecordError, ResponseKind, TaggedEnvelope,
+    spawn_control_dispatch_with_handler,
 };
 use dataplane::control_runtime::{
     ControlRuntime, ControlRuntimeConfig, SnapshotStep, process_state_snapshot,
@@ -124,6 +125,22 @@ fn snapshot_envelope(request_id: u64, generation: u64) -> ControlEnvelope {
     }
 }
 
+fn test_session() -> SessionMeta {
+    SessionMeta {
+        serial: 7,
+        epoch: 1,
+        peer_process_id: Arc::from("go-fixture"),
+        peer_started_unix_millis: 1_700_000_000_000,
+    }
+}
+
+fn tagged(envelope: ControlEnvelope) -> TaggedEnvelope {
+    TaggedEnvelope {
+        envelope,
+        origin: test_session(),
+    }
+}
+
 fn test_now() -> UnixTime {
     UnixTime::since_unix_epoch(Duration::from_secs(1_700_000_000))
 }
@@ -164,8 +181,13 @@ async fn consumer_rejection_never_advances_the_store() {
     };
 
     // First delivery: the consumer rejects generation 1.
-    let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(10, 1), test_now()).await;
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &tagged(snapshot_envelope(10, 1)),
+        test_now(),
+    )
+    .await;
     assert_eq!(applied, None, "no applied generation on rejection");
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("the owner answers a snapshot result")
@@ -190,8 +212,13 @@ async fn consumer_rejection_never_advances_the_store() {
 
     // Replay of the SAME generation: the consumer runs again — no
     // false acknowledgement off an advanced store — and now succeeds.
-    let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(11, 1), test_now()).await;
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &tagged(snapshot_envelope(11, 1)),
+        test_now(),
+    )
+    .await;
     assert_eq!(applied, Some(1), "committed after consumer success");
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("result body")
@@ -206,8 +233,13 @@ async fn consumer_rejection_never_advances_the_store() {
 
     // Post-commit replay: committed implies the consumer succeeded —
     // answered OK without re-running it.
-    let (answer, applied) =
-        process_state_snapshot(&store, &mut consumer, &snapshot_envelope(12, 1), test_now()).await;
+    let (answer, applied) = process_state_snapshot(
+        &store,
+        &mut consumer,
+        &tagged(snapshot_envelope(12, 1)),
+        test_now(),
+    )
+    .await;
     assert_eq!(applied, Some(1));
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("result body")
@@ -230,14 +262,28 @@ async fn staged_token_serializes_concurrent_writers() {
         unreachable!("store constructs")
     };
     let store = Arc::new(store);
-    let Ok(staged) = store.stage(1, valid_snapshot(), test_now()) else {
+    let Ok(staged) = store.stage(
+        1,
+        valid_snapshot(),
+        test_now(),
+        SnapshotLineage::for_tests("go-fixture"),
+    ) else {
         unreachable!("generation 1 stages")
     };
     // A concurrent writer tries to jump to generation 2 while the
     // token is held: it must WAIT, not win.
     let racer = {
         let store = Arc::clone(&store);
-        std::thread::spawn(move || store.apply(2, valid_snapshot(), test_now()).is_ok())
+        std::thread::spawn(move || {
+            store
+                .apply(
+                    2,
+                    valid_snapshot(),
+                    test_now(),
+                    SnapshotLineage::for_tests("go-fixture"),
+                )
+                .is_ok()
+        })
     };
     std::thread::sleep(Duration::from_millis(50));
     // The consumer "succeeded" during the reservation: commit MUST
@@ -265,7 +311,12 @@ async fn dropped_staged_token_releases_concurrent_writer() {
         unreachable!("store constructs")
     };
     let store = Arc::new(store);
-    let Ok(staged) = store.stage(1, valid_snapshot(), test_now()) else {
+    let Ok(staged) = store.stage(
+        1,
+        valid_snapshot(),
+        test_now(),
+        SnapshotLineage::for_tests("go-fixture"),
+    ) else {
         unreachable!("generation 1 stages")
     };
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
@@ -274,7 +325,14 @@ async fn dropped_staged_token_releases_concurrent_writer() {
         let store = Arc::clone(&store);
         std::thread::spawn(move || {
             let _ = started_tx.send(());
-            let applied = store.apply(2, valid_snapshot(), test_now()).is_ok();
+            let applied = store
+                .apply(
+                    2,
+                    valid_snapshot(),
+                    test_now(),
+                    SnapshotLineage::for_tests("go-fixture"),
+                )
+                .is_ok();
             let _ = finished_tx.send(applied);
         })
     };
@@ -635,7 +693,7 @@ async fn snapshot_owner_shutdown_boundary() {
         &handle,
         &store,
         &mut consumer,
-        &snapshot_envelope(20, 1),
+        &tagged(snapshot_envelope(20, 1)),
     )
     .await;
     let Ok(SnapshotStep::CleanExit) = step else {
@@ -667,7 +725,7 @@ async fn snapshot_owner_shutdown_boundary() {
         &handle,
         &store,
         &mut consumer,
-        &snapshot_envelope(21, 1),
+        &tagged(snapshot_envelope(21, 1)),
     )
     .await;
     let Err(error) = step else {

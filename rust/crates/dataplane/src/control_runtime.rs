@@ -55,14 +55,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control_proto::control_transport::{ClientConfig, ControlClient, TransportError};
-use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime, ValidatedSnapshot};
+use control_proto::snapshot::{
+    SnapshotError, SnapshotLineage, SnapshotStore, UnixTime, ValidatedSnapshot,
+};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{ControlEnvelope, Priority};
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::control_dispatch::{
-    ControlDispatchHandle, DispatchFatal, DispatchStats, spawn_control_dispatch, system_unix_millis,
+    ControlDispatchHandle, DispatchFatal, DispatchStats, TaggedEnvelope, spawn_control_dispatch,
+    system_unix_millis,
 };
 
 /// Applies each newly validated snapshot to the serving side (for
@@ -332,13 +335,18 @@ pub fn spawn_control_runtime_with_client<C: SnapshotConsumer>(
 pub async fn process_state_snapshot<C: SnapshotConsumer>(
     store: &SnapshotStore,
     consumer: &mut C,
-    envelope: &ControlEnvelope,
+    tagged: &TaggedEnvelope,
     now: UnixTime,
 ) -> (ControlEnvelope, Option<u64>) {
+    let envelope = &tagged.envelope;
+    let lineage = SnapshotLineage {
+        peer_process_id: Arc::clone(&tagged.origin.peer_process_id),
+        peer_started_unix_millis: tagged.origin.peer_started_unix_millis,
+    };
     let generation = envelope.generation;
     let (result, applied) = match &envelope.body {
         Some(Body::StateSnapshot(snapshot)) => {
-            match store.stage(generation, snapshot.clone(), now) {
+            match store.stage(generation, snapshot.clone(), now, lineage) {
                 Ok(staged) => {
                     let consumer_verdict = if staged.is_changed() {
                         consumer.apply(staged.snapshot()).await
@@ -397,10 +405,10 @@ async fn run_snapshot_owner<C: SnapshotConsumer>(
     handle: ControlDispatchHandle,
     store: SnapshotStore,
     mut consumer: C,
-    mut snapshots: mpsc::Receiver<ControlEnvelope>,
+    mut snapshots: mpsc::Receiver<TaggedEnvelope>,
 ) -> Result<(), TransportError> {
-    while let Some(envelope) = snapshots.recv().await {
-        match snapshot_owner_step(&client, &handle, &store, &mut consumer, &envelope).await? {
+    while let Some(tagged) = snapshots.recv().await {
+        match snapshot_owner_step(&client, &handle, &store, &mut consumer, &tagged).await? {
             SnapshotStep::Continue => {}
             SnapshotStep::CleanExit => return Ok(()),
         }
@@ -433,10 +441,10 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     handle: &ControlDispatchHandle,
     store: &SnapshotStore,
     consumer: &mut C,
-    envelope: &ControlEnvelope,
+    tagged: &TaggedEnvelope,
 ) -> Result<SnapshotStep, TransportError> {
     let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
-    let (answer, applied) = process_state_snapshot(store, consumer, envelope, now).await;
+    let (answer, applied) = process_state_snapshot(store, consumer, tagged, now).await;
     if let Some(generation) = applied {
         client.mark_last_good_snapshot(generation);
         if !handle.applied_generation(generation).await {
@@ -448,9 +456,20 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
             ));
         }
     }
-    match client.send(answer).await {
-        Ok(()) => Ok(SnapshotStep::Continue),
-        Err(TransportError::Closed) if client.is_shutdown() => Ok(SnapshotStep::CleanExit),
+    match client
+        .send_session_scoped(answer, tagged.origin.serial)
+        .await
+    {
+        // Any answer-send failure under a requested shutdown is the
+        // normal cascade.
+        Err(TransportError::StaleSessionEpoch | TransportError::Closed) if client.is_shutdown() => {
+            Ok(SnapshotStep::CleanExit)
+        }
+        // Stale without shutdown: the session that carried this
+        // snapshot is gone, and the answer would false-ack (or
+        // false-nack) a DIFFERENT session's exchange — it is dropped.
+        // Go re-sends the snapshot on the new session.
+        Ok(()) | Err(TransportError::StaleSessionEpoch) => Ok(SnapshotStep::Continue),
         Err(error) => Err(error),
     }
 }

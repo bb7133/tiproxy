@@ -257,6 +257,33 @@ impl ValidatedSnapshot {
     }
 }
 
+/// The Go process lineage a snapshot belongs to. Generation
+/// monotonicity is only defined WITHIN one lineage (the control
+/// protocol requires monotonic generations per Go process, not
+/// globally): a restarted Go starts a fresh sequence, and the store
+/// must recognize the rollover instead of rejecting the new lineage's
+/// generations as stale — while an INVALID candidate from a new
+/// lineage must never switch the store's lineage early, or a same-Go
+/// reconnect would afterwards be misjudged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotLineage {
+    /// The Go peer's process id from its Hello.
+    pub peer_process_id: Arc<str>,
+    /// The Go peer's start time from its Hello.
+    pub peer_started_unix_millis: u64,
+}
+
+impl SnapshotLineage {
+    /// A fixture lineage for tests and single-lineage compositions.
+    #[must_use]
+    pub fn for_tests(process_id: &str) -> Self {
+        Self {
+            peer_process_id: Arc::from(process_id),
+            peer_started_unix_millis: 1_700_000_000_000,
+        }
+    }
+}
+
 /// A validated-but-uncommitted snapshot between the two phases of
 /// [`SnapshotStore::stage`] / [`SnapshotStore::commit`]. The token
 /// holds the store's writer reservation for its whole lifetime:
@@ -268,6 +295,10 @@ impl ValidatedSnapshot {
 pub struct Staged {
     writer: WriterGuard,
     state: StagedState,
+    /// The lineage this snapshot was produced by — committed
+    /// ATOMICALLY with the snapshot, never before validation and the
+    /// downstream apply succeed.
+    lineage: SnapshotLineage,
 }
 
 #[derive(Debug)]
@@ -370,6 +401,10 @@ impl ApplyOutcome {
 pub struct SnapshotStore {
     allowed_tls_roots: Vec<PathBuf>,
     current: RwLock<Option<Arc<ValidatedSnapshot>>>,
+    /// The committed snapshot's lineage. Written only under the writer
+    /// reservation (commit), read only under it (stage), so the pair
+    /// (current, lineage) is writer-consistent.
+    lineage: RwLock<Option<SnapshotLineage>>,
     /// Serializes the whole two-phase apply: a [`Staged`] token holds
     /// this guard, so no other writer — `apply` included — can advance
     /// the committed state between `stage` and `commit`. A downstream
@@ -410,6 +445,7 @@ impl SnapshotStore {
         Ok(Self {
             allowed_tls_roots: roots,
             current: RwLock::new(None),
+            lineage: RwLock::new(None),
             writer: Arc::new(WriterReservation::default()),
         })
     }
@@ -441,8 +477,9 @@ impl SnapshotStore {
         generation: u64,
         snapshot: StateSnapshot,
         now: UnixTime,
+        lineage: SnapshotLineage,
     ) -> Result<ApplyOutcome, SnapshotError> {
-        let staged = self.stage(generation, snapshot, now)?;
+        let staged = self.stage(generation, snapshot, now, lineage)?;
         self.commit(staged)
     }
 
@@ -463,6 +500,7 @@ impl SnapshotStore {
         generation: u64,
         snapshot: StateSnapshot,
         now: UnixTime,
+        lineage: SnapshotLineage,
     ) -> Result<Staged, SnapshotError> {
         let writer = self.writer.acquire()?;
         if generation == 0 {
@@ -470,7 +508,20 @@ impl SnapshotStore {
                 "snapshot generation must be nonzero",
             ));
         }
-        {
+        // Generation monotonicity is a WITHIN-lineage rule: a snapshot
+        // from a different Go lineage starts a fresh sequence and skips
+        // the stale/duplicate comparisons entirely — its candidate must
+        // still fully validate, and the store's lineage only advances
+        // at COMMIT, so an invalid new-lineage candidate leaves the old
+        // last-good state and lineage untouched.
+        let same_lineage = {
+            let committed = self
+                .lineage
+                .read()
+                .map_err(|_| SnapshotError::internal("snapshot store lock poisoned"))?;
+            committed.as_ref().is_none_or(|current| *current == lineage)
+        };
+        if same_lineage {
             let guard = self
                 .current
                 .read()
@@ -490,6 +541,7 @@ impl SnapshotStore {
                         return Ok(Staged {
                             writer,
                             state: StagedState::Unchanged(Arc::clone(current)),
+                            lineage,
                         });
                     }
                     return Err(SnapshotError::invalid(
@@ -502,6 +554,7 @@ impl SnapshotStore {
         Ok(Staged {
             writer,
             state: StagedState::Validated(candidate),
+            lineage,
         })
     }
 
@@ -522,6 +575,7 @@ impl SnapshotStore {
         let Staged {
             writer: _writer,
             state,
+            lineage,
         } = staged;
         let candidate = match state {
             StagedState::Unchanged(current) => {
@@ -535,6 +589,16 @@ impl SnapshotStore {
         // The writer reservation is still held (the token carries it),
         // so the committed state cannot have moved since `stage`: this
         // write is a plain publication, not a re-negotiation.
+        // Lineage and snapshot publish together under the held writer
+        // reservation: readers of `current` never pair a snapshot with
+        // another lineage's rules.
+        {
+            let mut committed = self
+                .lineage
+                .write()
+                .map_err(|_| SnapshotError::internal("snapshot store lock poisoned"))?;
+            *committed = Some(lineage);
+        }
         let mut guard = self
             .current
             .write()

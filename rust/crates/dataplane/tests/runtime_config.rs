@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control_proto::control_transport::{ClientConfig, ControlClient};
-use control_proto::snapshot::{SnapshotErrorKind, SnapshotStore, UnixTime, ValidatedSnapshot};
+use control_proto::snapshot::{
+    SnapshotErrorKind, SnapshotLineage, SnapshotStore, UnixTime, ValidatedSnapshot,
+};
 use control_proto::v1::{
     ConfigSnapshot, Hello, KeepalivePolicy, Listener, ProxyProtocolMode, Role, StateSnapshot,
     TlsPolicy,
@@ -104,6 +106,7 @@ fn snapshot(generation: u64, port: u16) -> Result<Arc<ValidatedSnapshot>, Box<dy
             generation,
             raw,
             UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+            SnapshotLineage::for_tests("go-fixture"),
         )?
         .snapshot)
 }

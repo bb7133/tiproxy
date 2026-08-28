@@ -63,7 +63,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use control_proto::control_transport::{ConnectionState, ControlClient, Handler, TransportError};
+use control_proto::control_transport::{
+    ConnectionState, ControlClient, Handler, SessionMeta, TransportError,
+};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     CloseCommand, CloseResult, ConnectionEvent, ConnectionEventKind, ConnectionIdentity,
@@ -232,7 +234,7 @@ pub struct ControlCommandHandler {
     /// must be modeled, not just an old epoch left behind). Inbound
     /// envelopes carry their origin epoch on the wire, so staleness is
     /// decidable per frame against this.
-    active_session: Option<(u64, u64)>,
+    active_session: Option<(u64, u64, u64)>,
     /// Whether the current session negotiated `RECONCILE_CONNECTIONS`:
     /// gates both sending reconcile requests and accepting snapshots.
     reconcile_capable: bool,
@@ -296,8 +298,8 @@ impl ControlCommandHandler {
     /// closure `RECONCILE_CONNECTIONS && RECONCILE_SESSION_REHYDRATION`
     /// (the handshake already rejects the illegal cap-3-only
     /// combination; this is the defensive derivation).
-    pub fn on_connected(&mut self, epoch: u64, capabilities: u64) {
-        self.active_session = Some((epoch, capabilities));
+    pub fn on_connected(&mut self, epoch: u64, capabilities: u64, serial: u64) {
+        self.active_session = Some((serial, epoch, capabilities));
         let reconcile = (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
         let rehydration = reconcile
             && (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1;
@@ -324,14 +326,15 @@ impl ControlCommandHandler {
     /// The active session's negotiated epoch, if connected.
     #[must_use]
     pub fn active_epoch(&self) -> Option<u64> {
-        self.active_session.map(|(epoch, _)| epoch)
+        self.active_session.map(|(_, epoch, _)| epoch)
     }
 
-    /// The active session's negotiated `(epoch, capabilities)`, if
+    /// The active session's `(serial, epoch, capabilities)`, if
     /// connected (the stale-export repair path re-derives its
-    /// capability gating from this).
+    /// capability gating from this; the SERIAL, not the reusable wire
+    /// epoch value, scopes session-bound sends).
     #[must_use]
-    pub const fn active_session(&self) -> Option<(u64, u64)> {
+    pub const fn active_session(&self) -> Option<(u64, u64, u64)> {
         self.active_session
     }
 
@@ -589,7 +592,7 @@ impl ControlCommandHandler {
                     // gets a fresh snapshot, and applying the stale
                     // view could regress acked metering / ghost state.
                     match self.active_session {
-                        Some((epoch, _)) if epoch == envelope.control_epoch => {}
+                        Some((_, epoch, _)) if epoch == envelope.control_epoch => {}
                         _ => {
                             self.count_stale_dropped();
                             return Vec::new();
@@ -1643,6 +1646,20 @@ impl ControlDispatchHandle {
     }
 }
 
+/// One inbound control frame together with the exact session it
+/// arrived on. The origin travels with the frame everywhere — a frame
+/// retained across a reconnect, or sitting in the dispatch queue while
+/// sessions change, must never be judged (or answered) against a
+/// DIFFERENT session: wire epoch values can repeat across Go restarts,
+/// so only the tagged [`SessionMeta`] tells lineage and session apart.
+#[derive(Debug, Clone)]
+pub struct TaggedEnvelope {
+    /// The control frame.
+    pub envelope: ControlEnvelope,
+    /// The session the frame was read on.
+    pub origin: SessionMeta,
+}
+
 /// The transport receive half with **global single in-flight
 /// ownership**. `handle` awaits a bounded queue reservation (real
 /// backpressure through the read loop and TCP); on session teardown
@@ -1653,9 +1670,13 @@ impl ControlDispatchHandle {
 /// second retained frame can never come into existence: the next
 /// reader starts only once the slot is empty.
 pub struct InboundForwarder {
-    inbound: mpsc::Sender<ControlEnvelope>,
+    inbound: mpsc::Sender<TaggedEnvelope>,
     state: watch::Receiver<ConnectionState>,
-    retained: Arc<StdMutex<Option<ControlEnvelope>>>,
+    retained: Arc<StdMutex<Option<TaggedEnvelope>>>,
+    /// The live session set by `resume_session` before any frame is
+    /// read; `handle` tags every frame with it.
+    current_session: Arc<StdMutex<Option<SessionMeta>>>,
+    cross_lineage_retained_dropped: Arc<AtomicU64>,
 }
 
 /// Construction and observability for the forwarder.
@@ -1665,14 +1686,25 @@ impl InboundForwarder {
     /// production path is [`spawn_control_dispatch`]).
     #[must_use]
     pub fn new(
-        inbound: mpsc::Sender<ControlEnvelope>,
+        inbound: mpsc::Sender<TaggedEnvelope>,
         state: watch::Receiver<ConnectionState>,
     ) -> Self {
         Self {
             inbound,
             state,
             retained: Arc::new(StdMutex::new(None)),
+            current_session: Arc::new(StdMutex::new(None)),
+            cross_lineage_retained_dropped: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Frames retained from a dead session and dropped because the next
+    /// session belongs to a DIFFERENT Go lineage (each such frame is
+    /// regenerated by its owner: Go re-sends desired snapshots and
+    /// commands, Rust re-issues its reconcile request).
+    #[must_use]
+    pub fn cross_lineage_retained_dropped(&self) -> u64 {
+        self.cross_lineage_retained_dropped.load(Ordering::Relaxed)
     }
 
     /// Whether a frame from a torn-down session is currently retained.
@@ -1692,6 +1724,23 @@ impl InboundForwarder {
 
 impl Handler for InboundForwarder {
     async fn handle(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
+        // The transport guarantees resume_session ran before the first
+        // read of this session, so the current session is always set
+        // here — every frame is tagged with its exact origin.
+        let origin = {
+            let Ok(current) = self.current_session.lock() else {
+                return Err(TransportError::Configuration(
+                    "current session slot poisoned".to_owned(),
+                ));
+            };
+            let Some(origin) = current.clone() else {
+                return Err(TransportError::Configuration(
+                    "frame read before resume_session set the session".to_owned(),
+                ));
+            };
+            origin
+        };
+        let tagged = TaggedEnvelope { envelope, origin };
         let mut state = self.state.clone();
         tokio::select! {
             biased;
@@ -1701,26 +1750,52 @@ impl Handler for InboundForwarder {
                         "control dispatch task is gone".to_owned(),
                     ));
                 };
-                permit.send(envelope);
+                permit.send(tagged);
                 Ok(())
             }
             _ = state.wait_for(|s| !matches!(s, ConnectionState::Connected { .. })) => {
                 // Session teardown while the dispatcher is jammed:
                 // retain the one in-flight frame (the slot is empty by
-                // the resume invariant) and end the stream without
-                // depending on outbound drain.
+                // the resume invariant) — WITH its origin — and end the
+                // stream without depending on outbound drain.
                 let Ok(mut slot) = self.retained.lock() else {
                     return Err(TransportError::Configuration(
                         "retained slot poisoned".to_owned(),
                     ));
                 };
-                *slot = Some(envelope);
+                *slot = Some(tagged);
                 Err(TransportError::Closed)
             }
         }
     }
 
-    async fn resume_session(&self, _epoch: u64) -> Result<(), TransportError> {
+    async fn resume_session(&self, session: SessionMeta) -> Result<(), TransportError> {
+        {
+            let Ok(mut current) = self.current_session.lock() else {
+                return Err(TransportError::Configuration(
+                    "current session slot poisoned".to_owned(),
+                ));
+            };
+            *current = Some(session.clone());
+        }
+        // Cross-lineage retained frames are DROPPED, not pumped: the
+        // frame was produced by (and correlated against) a different Go
+        // process; its owner regenerates the work. Only a same-lineage
+        // reconnect keeps the one-shot retained delivery.
+        {
+            let Ok(mut slot) = self.retained.lock() else {
+                return Err(TransportError::Configuration(
+                    "retained slot poisoned".to_owned(),
+                ));
+            };
+            if let Some(retained) = slot.as_ref()
+                && !retained.origin.same_lineage(&session)
+            {
+                *slot = None;
+                self.cross_lineage_retained_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         loop {
             // Clone-then-take keeps this cancel-safe: if the session
             // dies (or this future is dropped) mid-send, the slot still
@@ -1825,8 +1900,9 @@ enum SendScope {
     /// Cross-reconnect retention: results, lifecycle events, metering
     /// batches — the peer dedups by request id / sequence.
     Durable,
-    /// Valid only under exactly this negotiated epoch; regenerated by
-    /// the next `Connected` transition when dropped as stale.
+    /// Valid only under exactly this Rust-local session serial (wire
+    /// epoch VALUES can repeat across Go restarts); regenerated by the
+    /// next `Connected` transition when dropped as stale.
     Session(u64),
 }
 
@@ -1944,9 +2020,9 @@ pub async fn run_control_dispatch<S: DispatchSender>(
     mut handler: ControlCommandHandler,
     sender: Arc<S>,
     mut state: watch::Receiver<ConnectionState>,
-    mut inbound: mpsc::Receiver<ControlEnvelope>,
+    mut inbound: mpsc::Receiver<TaggedEnvelope>,
     mut notices: mpsc::Receiver<DispatchNotice>,
-    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_tx: mpsc::Sender<TaggedEnvelope>,
     tick_interval: Duration,
     unix_now_millis: UnixMillisFn,
 ) -> Result<(), DispatchFatal> {
@@ -2056,7 +2132,8 @@ async fn apply_state<S: DispatchSender>(
         ConnectionState::Connected {
             epoch,
             capabilities,
-        } => on_connected_transition(sender, handler, epoch, capabilities).await,
+            serial,
+        } => on_connected_transition(sender, handler, epoch, capabilities, serial).await,
         ConnectionState::Disconnected | ConnectionState::Connecting | ConnectionState::Shutdown => {
             handler.on_disconnected();
             Ok(())
@@ -2077,10 +2154,11 @@ async fn on_connected_transition<S: DispatchSender>(
     handler: &mut ControlCommandHandler,
     epoch: u64,
     capabilities: u64,
+    serial: u64,
 ) -> Result<(), DispatchFatal> {
-    handler.on_connected(epoch, capabilities);
+    handler.on_connected(epoch, capabilities, serial);
     if handler.reconcile_capable() {
-        let _ = send_reconcile_request(sender, handler, epoch, capabilities).await?;
+        let _ = send_reconcile_request(sender, handler, serial, capabilities).await?;
     }
     // Unacked metering is durable: delivery matters with or without an
     // ack path, and the consumer dedups by contiguous sequence.
@@ -2103,7 +2181,7 @@ async fn on_connected_transition<S: DispatchSender>(
 async fn send_reconcile_request<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
-    epoch: u64,
+    serial: u64,
     capabilities: u64,
 ) -> Result<SendOutcome, DispatchFatal> {
     let request = handler.build_reconcile_request(handler.applied_generation());
@@ -2119,7 +2197,7 @@ async fn send_reconcile_request<S: DispatchSender>(
         body: Some(Body::ReconcileRequest(request)),
         ..ControlEnvelope::default()
     };
-    dispatch_send_outcome(sender, handler, envelope, SendScope::Session(epoch)).await
+    dispatch_send_outcome(sender, handler, envelope, SendScope::Session(serial)).await
 }
 
 /// Explicit repair for a stale export. A namespace/backend adoption
@@ -2147,10 +2225,10 @@ async fn repair_stale_export<S: DispatchSender>(
     if !handler.reconcile_capable() {
         return Ok(SendOutcome::StaleEpoch);
     }
-    let Some((epoch, capabilities)) = handler.active_session() else {
+    let Some((serial, _epoch, capabilities)) = handler.active_session() else {
         return Ok(SendOutcome::StaleEpoch);
     };
-    send_reconcile_request(sender, handler, epoch, capabilities).await
+    send_reconcile_request(sender, handler, serial, capabilities).await
 }
 
 /// Records one metering delta and acks in one await-free step: the
@@ -2303,22 +2381,49 @@ async fn apply_notice<S: DispatchSender>(
 async fn process_inbound<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
-    snapshot_tx: &mpsc::Sender<ControlEnvelope>,
-    envelope: ControlEnvelope,
+    snapshot_tx: &mpsc::Sender<TaggedEnvelope>,
+    tagged: TaggedEnvelope,
     unix_now_millis: UnixMillisFn,
 ) -> Result<(), DispatchFatal> {
-    if matches!(envelope.body, Some(Body::StateSnapshot(_))) {
+    // Session-bound inbound is judged by its tagged ORIGIN, never by
+    // the wire epoch value (which a restarted Go can reuse): a
+    // reconcile snapshot produced by a dead session — retained,
+    // queued, or slow — must not be applied against the current one.
+    if matches!(tagged.envelope.body, Some(Body::ReconcileSnapshot(_)))
+        && handler.active_session().map(|(serial, _, _)| serial) != Some(tagged.origin.serial)
+    {
+        handler.count_stale_dropped();
+        return Ok(());
+    }
+    if matches!(tagged.envelope.body, Some(Body::StateSnapshot(_))) {
         // The CTL-05 snapshot owner is a required dependency: the send
         // is awaited (its backpressure reaches the transport read
-        // loop), and its loss is fatal rather than a silent drop.
+        // loop), and its loss is fatal rather than a silent drop. The
+        // ORIGIN travels with the frame: the owner stages under the
+        // exact lineage that produced the snapshot and answers into
+        // exactly that session.
         return snapshot_tx
-            .send(envelope)
+            .send(tagged)
             .await
             .map_err(|_| DispatchFatal::SnapshotOwnerGone);
     }
-    let outbound = handler.handle_envelope(&envelope, Instant::now(), unix_now_millis());
+    let origin_serial = tagged.origin.serial;
+    let outbound = handler.handle_envelope(&tagged.envelope, Instant::now(), unix_now_millis());
     for out in outbound {
-        dispatch_send(sender, handler, out, SendScope::Durable).await?;
+        // Request-only inline errors carry nothing but the offending
+        // request id — across a Go restart the {epoch, request id}
+        // tuple can repeat, so a stale queued error would falsely
+        // resolve the NEW peer's unrelated operation. They are scoped
+        // to the exact origin session and dropped once it is gone (the
+        // current owner retries/reconciles). Terminals (redirect /
+        // close / drain results) carry incarnation-qualified operation
+        // ids in their bodies and stay durable.
+        let scope = if matches!(out.body, Some(Body::Error(_))) {
+            SendScope::Session(origin_serial)
+        } else {
+            SendScope::Durable
+        };
+        dispatch_send(sender, handler, out, scope).await?;
     }
     Ok(())
 }
@@ -2372,7 +2477,7 @@ const INBOUND_QUEUE_CAPACITY: usize = 256;
 #[must_use]
 pub fn spawn_control_dispatch(
     client: Arc<ControlClient>,
-    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_tx: mpsc::Sender<TaggedEnvelope>,
     tick_interval: Duration,
 ) -> (
     ControlDispatchHandle,
@@ -2394,7 +2499,7 @@ pub fn spawn_control_dispatch(
 pub fn spawn_control_dispatch_with_handler(
     handler: ControlCommandHandler,
     client: Arc<ControlClient>,
-    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_tx: mpsc::Sender<TaggedEnvelope>,
     tick_interval: Duration,
 ) -> (
     ControlDispatchHandle,
@@ -2414,7 +2519,7 @@ pub fn spawn_control_dispatch_parts<S: DispatchSender + 'static>(
     handler: ControlCommandHandler,
     sender: Arc<S>,
     state: watch::Receiver<ConnectionState>,
-    snapshot_tx: mpsc::Sender<ControlEnvelope>,
+    snapshot_tx: mpsc::Sender<TaggedEnvelope>,
     tick_interval: Duration,
 ) -> (
     ControlDispatchHandle,
@@ -2423,11 +2528,7 @@ pub fn spawn_control_dispatch_parts<S: DispatchSender + 'static>(
 ) {
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let (notice_tx, notice_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
-    let forwarder = InboundForwarder {
-        inbound: inbound_tx,
-        state: state.clone(),
-        retained: Arc::new(StdMutex::new(None)),
-    };
+    let forwarder = InboundForwarder::new(inbound_tx, state.clone());
     let handler_stats = handler.stats();
     let task = tokio::spawn(run_control_dispatch(
         handler,

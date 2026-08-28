@@ -22,7 +22,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
@@ -164,6 +164,37 @@ impl ClientConfig {
     }
 }
 
+/// One negotiated control session's non-reusable identity.
+///
+/// The `serial` is minted locally per successful handshake and never
+/// reused within this Rust process, so it distinguishes SESSIONS even
+/// when the wire `epoch` value repeats (a restarted Go assigns epochs
+/// from its own counter). The peer fields identify the Go process
+/// LINEAGE — validated non-empty/non-zero at Hello under the
+/// production capability closure — so consumers can tell a same-Go
+/// reconnect (generation lineage continues) from a new Go process
+/// (generation lineage restarts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMeta {
+    /// Rust-local, strictly increasing per successful handshake.
+    pub serial: u64,
+    /// The wire control epoch frames are stamped with.
+    pub epoch: u64,
+    /// The Go peer's process id from its Hello.
+    pub peer_process_id: Arc<str>,
+    /// The Go peer's start time from its Hello.
+    pub peer_started_unix_millis: u64,
+}
+
+impl SessionMeta {
+    /// Whether `other` belongs to the same Go process lineage.
+    #[must_use]
+    pub fn same_lineage(&self, other: &Self) -> bool {
+        self.peer_process_id == other.peer_process_id
+            && self.peer_started_unix_millis == other.peer_started_unix_millis
+    }
+}
+
 /// Observable connection state from the single mutable transport owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -180,6 +211,10 @@ pub enum ConnectionState {
         epoch: u64,
         /// Bitmask of negotiated capability ids.
         capabilities: u64,
+        /// The Rust-local session serial (see [`SessionMeta`]): unique
+        /// per successful handshake even when the wire epoch value
+        /// repeats across Go restarts.
+        serial: u64,
     },
     /// The transport was explicitly shut down.
     Shutdown,
@@ -299,10 +334,10 @@ pub trait Handler: Send + Sync {
     /// Returning an error ends the session before any frame is read.
     fn resume_session(
         &self,
-        epoch: u64,
+        session: SessionMeta,
     ) -> impl Future<Output = Result<(), TransportError>> + Send {
         async move {
-            let _ = epoch;
+            let _ = session;
             Ok(())
         }
     }
@@ -324,6 +359,9 @@ pub struct ControlClient {
     shutdown_tx: watch::Sender<bool>,
     state_tx: watch::Sender<ConnectionState>,
     epoch: AtomicU64,
+    /// Rust-local session serial: incremented per successful handshake,
+    /// never reused within this process (see [`SessionMeta`]).
+    session_serial: AtomicU64,
     negotiated_frame_limit: AtomicU64,
     /// Bitmask of negotiated control capabilities (bit per capability id
     /// below 64), set on connect and cleared on disconnect.
@@ -359,6 +397,7 @@ impl ControlClient {
             shutdown_tx,
             state_tx,
             epoch: AtomicU64::new(0),
+            session_serial: AtomicU64::new(0),
             negotiated_frame_limit: AtomicU64::new(u64::from(initial_frame_limit)),
             negotiated_caps: AtomicU64::new(0),
             next_request_id: AtomicU64::new(0),
@@ -413,6 +452,7 @@ impl ControlClient {
             match connection {
                 Ok(negotiated) => {
                     backoff = self.config.reconnect_base;
+                    let serial = self.session_serial.fetch_add(1, Ordering::AcqRel) + 1;
                     self.epoch.store(negotiated.epoch, Ordering::Release);
                     self.negotiated_frame_limit
                         .store(u64::from(negotiated.max_frame_bytes), Ordering::Release);
@@ -427,8 +467,9 @@ impl ControlClient {
                     let _ = self.state_tx.send(ConnectionState::Connected {
                         epoch: negotiated.epoch,
                         capabilities: caps_mask,
+                        serial,
                     });
-                    let result = self.run_connected(negotiated, handler).await;
+                    let result = self.run_connected(negotiated, serial, handler).await;
                     if !matches!(result, Err(TransportError::Closed)) {
                         set_string(&self.last_disconnect, Some(result_to_string(&result)));
                     }
@@ -476,7 +517,7 @@ impl ControlClient {
     async fn enqueue(
         &self,
         mut envelope: ControlEnvelope,
-        session_epoch: Option<u64>,
+        session_serial: Option<u64>,
     ) -> Result<(), TransportError> {
         if *self.shutdown_tx.borrow() {
             return Err(TransportError::Closed);
@@ -503,7 +544,7 @@ impl ControlClient {
                 QueuedEnvelope {
                     envelope,
                     size,
-                    session_epoch,
+                    session_serial,
                 },
                 drop_metrics,
                 self.shutdown_tx.subscribe(),
@@ -516,28 +557,31 @@ impl ControlClient {
         result
     }
 
-    /// Queues a **session-scoped** envelope bound to `epoch`: it is
-    /// written only while that exact epoch is negotiated and otherwise
-    /// dropped (counted in
+    /// Queues a **session-scoped** envelope bound to the Rust-local
+    /// session `serial` (see [`SessionMeta`]): it is written only while
+    /// that exact session is live and otherwise dropped (counted in
     /// [`ControlClient::session_scoped_dropped`]) — correct because the
-    /// owner regenerates such work on every `Connected` transition.
-    /// Durable cross-reconnect work (results, lifecycle events,
-    /// metering batches) must use [`ControlClient::send`] instead.
+    /// owner regenerates such work on every `Connected` transition. The
+    /// serial, not the wire epoch, is the binding: a restarted Go can
+    /// negotiate the same epoch VALUE, and epoch-bound work from the
+    /// dead session must never reach it. Durable cross-reconnect work
+    /// (results with incarnation-qualified operation ids, lifecycle
+    /// events, metering batches) must use [`ControlClient::send`].
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::StaleSessionEpoch`] when `epoch` is
-    /// no longer the negotiated epoch at enqueue time, plus every
+    /// Returns [`TransportError::StaleSessionEpoch`] when `serial` is
+    /// no longer the live session at enqueue time, plus every
     /// [`ControlClient::send`] failure mode.
     pub async fn send_session_scoped(
         &self,
         envelope: ControlEnvelope,
-        epoch: u64,
+        serial: u64,
     ) -> Result<(), TransportError> {
-        if epoch == 0 || self.epoch.load(Ordering::Acquire) != epoch {
+        if serial == 0 || self.session_serial.load(Ordering::Acquire) != serial {
             return Err(TransportError::StaleSessionEpoch);
         }
-        self.enqueue(envelope, Some(epoch)).await
+        self.enqueue(envelope, Some(serial)).await
     }
 
     /// Whether shutdown has been requested on this client.
@@ -673,6 +717,16 @@ impl ControlClient {
                 "peer Hello must advertise Go role and protocol v1".to_owned(),
             ));
         }
+        // Lineage identity is fail-closed: generation lineage decisions
+        // depend on these two fields, and two restarted peers both
+        // presenting ("", 0) would be indistinguishable — the
+        // generation-reset acceptance would silently regress.
+        if remote_hello.process_id.is_empty() || remote_hello.process_started_unix_millis == 0 {
+            return Err(TransportError::Protocol(
+                "peer Hello must carry a nonempty process_id and a nonzero process_started_unix_millis"
+                    .to_owned(),
+            ));
+        }
 
         let local_hello = self.config.local_hello.clone();
         write_frame_async(
@@ -712,12 +766,15 @@ impl ControlClient {
             epoch: remote_ack.control_epoch,
             max_frame_bytes: remote_ack.max_frame_bytes,
             capabilities: remote_ack.negotiated_capabilities,
+            peer_process_id: Arc::from(remote_hello.process_id.as_str()),
+            peer_started_unix_millis: remote_hello.process_started_unix_millis,
         })
     }
 
     async fn run_connected<H: Handler>(
         &self,
         negotiated: Negotiated,
+        serial: u64,
         handler: &H,
     ) -> Result<(), TransportError> {
         let Negotiated {
@@ -725,7 +782,15 @@ impl ControlClient {
             epoch,
             max_frame_bytes,
             capabilities,
+            peer_process_id,
+            peer_started_unix_millis,
         } = negotiated;
+        let session = SessionMeta {
+            serial,
+            epoch,
+            peer_process_id,
+            peer_started_unix_millis,
+        };
         let (mut reader, mut writer) = stream.into_split();
         let last_sent = StdMutex::new(Instant::now());
         let mut shutdown = self.shutdown_tx.subscribe();
@@ -742,7 +807,7 @@ impl ControlClient {
             // contract) so the join below always converges.
             let mut resume_stop = session_stop_tx.subscribe();
             tokio::select! {
-                result = handler.resume_session(epoch) => result?,
+                result = handler.resume_session(session.clone()) => result?,
                 changed = resume_stop.changed() => {
                     if changed.is_err() || *resume_stop.borrow() {
                         return Err(TransportError::Closed);
@@ -765,6 +830,7 @@ impl ControlClient {
         let write_loop = self.write_loop(
             &mut writer,
             epoch,
+            serial,
             max_frame_bytes,
             &last_sent,
             session_stop_tx.subscribe(),
@@ -845,12 +911,13 @@ impl ControlClient {
         &self,
         writer: &mut W,
         epoch: u64,
+        serial: u64,
         max_frame_bytes: u32,
         last_sent: &StdMutex<Instant>,
         mut session_stop: watch::Receiver<bool>,
     ) -> Result<(), TransportError> {
         loop {
-            let (mut envelope, session_epoch) = tokio::select! {
+            let (mut envelope, session_serial) = tokio::select! {
                 result = self.queues.next(self.shutdown_tx.subscribe()) => result?,
                 changed = session_stop.changed() => {
                     if changed.is_err() || *session_stop.borrow() {
@@ -859,13 +926,15 @@ impl ControlClient {
                     continue;
                 }
             };
-            if let Some(bound) = session_epoch
-                && bound != epoch
+            if let Some(bound) = session_serial
+                && bound != serial
             {
-                // Session-scoped work bound to a dead epoch: consume it
-                // (freeing lane space for durable work) and count — the
-                // owner regenerated it on this session's `Connected`
-                // transition.
+                // Session-scoped work bound to a dead SESSION (by the
+                // Rust-local serial — a restarted Go may reuse the
+                // epoch value, so the serial is the only safe binding):
+                // consume it (freeing lane space for durable work) and
+                // count — the owner regenerated it on this session's
+                // `Connected` transition.
                 self.queues.commit(&envelope).await?;
                 self.session_scoped_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -936,11 +1005,11 @@ impl ControlClient {
                 })),
                 ..Default::default()
             };
-            let session_epoch = self.epoch.load(Ordering::Acquire);
+            let session_serial = self.session_serial.load(Ordering::Acquire);
             tokio::select! {
                 result = timeout(
                     self.config.peer_timeout,
-                    self.send_session_scoped(heartbeat, session_epoch),
+                    self.send_session_scoped(heartbeat, session_serial),
                 ) => {
                     match result.map_err(|_| TransportError::Timeout("heartbeat queue"))? {
                         // The session ended between the interval firing
@@ -965,6 +1034,8 @@ struct Negotiated {
     epoch: u64,
     max_frame_bytes: u32,
     capabilities: Vec<u64>,
+    peer_process_id: Arc<str>,
+    peer_started_unix_millis: u64,
 }
 
 enum CompletedLoop {
@@ -986,13 +1057,17 @@ impl Drop for RunningGuard<'_> {
 struct QueuedEnvelope {
     envelope: ControlEnvelope,
     size: usize,
-    /// `Some(epoch)` marks a session-scoped envelope: it may only be
-    /// written under exactly this negotiated epoch and is dropped
-    /// (counted) otherwise — the owner regenerates it on the next
-    /// `Connected` transition. `None` marks durable-across-reconnect
-    /// work (results, lifecycle events, metering batches) that must
-    /// never be dropped; the peer dedups it by request id / sequence.
-    session_epoch: Option<u64>,
+    /// `Some(serial)` marks a session-scoped envelope: it may only be
+    /// written under exactly this Rust-local session serial and is
+    /// dropped (counted) otherwise — the owner regenerates it on the
+    /// next `Connected` transition. The serial (not the wire epoch,
+    /// whose VALUE a restarted Go can reuse) is the binding, so work
+    /// queued for a dead session can never be written to a new peer
+    /// that happens to negotiate the same epoch number. `None` marks
+    /// durable-across-reconnect work (results, lifecycle events,
+    /// metering batches) that must never be dropped; the peer dedups
+    /// it by request id / sequence.
+    session_serial: Option<u64>,
 }
 
 struct LaneState {
@@ -1070,9 +1145,9 @@ impl LaneQueue {
         }
         let item = state.items.pop_front()?;
         let envelope = item.envelope.clone();
-        let session_epoch = item.session_epoch;
+        let session_serial = item.session_serial;
         state.in_flight = Some(item);
-        Some((envelope, session_epoch))
+        Some((envelope, session_serial))
     }
 
     async fn commit(&self) -> Result<(), TransportError> {
@@ -1493,6 +1568,9 @@ mod tests {
         Hello {
             role: Role::GoControl as i32,
             process_id: "go-fake-server".to_owned(),
+            // The lineage identity contract requires a nonzero start
+            // time; fixtures model the production fact.
+            process_started_unix_millis: 1_700_000_000_000,
             supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
             capabilities: vec![2, 3, 5],
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
@@ -1930,7 +2008,7 @@ mod tests {
             Ok(())
         }
 
-        async fn resume_session(&self, _epoch: u64) -> Result<(), TransportError> {
+        async fn resume_session(&self, _session: SessionMeta) -> Result<(), TransportError> {
             self.resume_calls.fetch_add(1, Ordering::Relaxed);
             let mut release = self.release.clone();
             loop {

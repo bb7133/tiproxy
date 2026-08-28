@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use control_proto::control_transport::{
-    ClientConfig, ConnectionState, ControlClient, Handler, TransportError,
+    ClientConfig, ConnectionState, ControlClient, Handler, SessionMeta, TransportError,
 };
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
@@ -403,6 +403,17 @@ async fn spawn_stack() -> Stack {
         snapshot_tx,
         Duration::from_millis(20),
     );
+    let Ok(()) = forwarder
+        .resume_session(SessionMeta {
+            serial: 1,
+            epoch: 1,
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .await
+    else {
+        unreachable!("the first session's resume sets the frame origin")
+    };
 
     // The engine owner over a real (never-connecting) control client.
     let client = control_client();
@@ -501,6 +512,7 @@ fn engine_snapshot(port: u16) -> Arc<control_proto::snapshot::ValidatedSnapshot>
         1,
         raw,
         control_proto::snapshot::UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+        control_proto::snapshot::SnapshotLineage::for_tests("go-fixture"),
     ) else {
         unreachable!("snapshot applies")
     };

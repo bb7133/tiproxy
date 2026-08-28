@@ -920,7 +920,7 @@ mod tests {
     use std::error::Error;
     use std::sync::Mutex;
 
-    use control_proto::snapshot::SnapshotStore;
+    use control_proto::snapshot::{SnapshotLineage, SnapshotStore};
     use control_proto::v1::{
         ConfigSnapshot, KeepalivePolicy as SnapshotKeepalive, Listener, ProxyProtocolMode,
         TlsPolicy,
@@ -994,6 +994,7 @@ mod tests {
                 generation,
                 raw,
                 UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+                SnapshotLineage::for_tests("go-fixture"),
             )?
             .snapshot)
     }
