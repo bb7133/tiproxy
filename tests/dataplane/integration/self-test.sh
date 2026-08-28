@@ -231,4 +231,61 @@ fi
 kill "$hold_pid" 2>/dev/null || true
 wait "$hold_pid" 2>/dev/null || true
 
+# cleanup.sh dropper-front-socket fail-closed: the finalize path must
+# never delete a bystander left where the front socket would be (the
+# case where a pre-placed regular file made the dropper Lstat-reject and
+# exit, leaving a now-gone KA_DROP_PID), yet must still remove a genuine
+# leftover socket whose owner is gone.
+cleanup_bystander_dir="$temp_dir/cleanup-bystander"
+mkdir -p "$cleanup_bystander_dir"
+bystander_front="$cleanup_bystander_dir/ka-drop.sock"
+: >"$bystander_front" # a REGULAR file, not a socket
+cat >"$cleanup_bystander_dir/state.env" <<EOF
+KA_DROP_SOCKET=$bystander_front
+KA_DROP_PID=99999999
+EOF
+set +e
+"$script_dir/cleanup.sh" "$cleanup_bystander_dir" tiproxy-dp-rust-selftest \
+	>"$cleanup_bystander_dir/cleanup.out" 2>&1
+bystander_status=$?
+set -e
+if ((bystander_status == 0)); then
+	echo "cleanup must fail when the dropper front path is a bystander regular file" >&2
+	exit 1
+fi
+[[ -f $bystander_front ]] || {
+	echo "cleanup deleted a bystander regular file at the front-socket path" >&2
+	exit 1
+}
+
+cleanup_leftover_dir="$temp_dir/cleanup-leftover"
+mkdir -p "$cleanup_leftover_dir"
+# Bind under a short /tmp path: macOS caps sun_path near 104 bytes, far
+# shorter than the temp_dir the run lives under.
+leftover_front="/tmp/tiproxy-selftest-drop-$$.sock"
+rm -f "$leftover_front"
+python3 - "$leftover_front" <<'PYSOCK3'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PYSOCK3
+cat >"$cleanup_leftover_dir/state.env" <<EOF
+KA_DROP_SOCKET=$leftover_front
+KA_DROP_PID=99999999
+EOF
+set +e
+"$script_dir/cleanup.sh" "$cleanup_leftover_dir" tiproxy-dp-rust-selftest \
+	>"$cleanup_leftover_dir/cleanup.out" 2>&1
+leftover_status=$?
+set -e
+if ((leftover_status != 0)); then
+	echo "cleanup must succeed removing a genuine leftover front socket" >&2
+	cat "$cleanup_leftover_dir/cleanup.out" >&2
+	exit 1
+fi
+[[ -e $leftover_front ]] && {
+	echo "cleanup did not remove a genuine leftover front socket" >&2
+	exit 1
+}
+
 echo "PASS: integration framework self-tests"

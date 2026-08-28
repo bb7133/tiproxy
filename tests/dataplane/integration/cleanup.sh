@@ -63,13 +63,32 @@ if [[ -n ${KA_SOCKET:-} ]]; then
 	rm -f "$KA_SOCKET"
 fi
 if [[ -n ${KA_DROP_SOCKET:-} ]]; then
-	# Unlink the front socket only if the owning dropper is confirmed
-	# stopped; a failed ownership stop keeps the inode and fails cleanup
-	# rather than orphaning a socket a live/foreign process may hold.
+	# stop_owned_process returns 0 for an invalid/already-gone PID, so a
+	# success verdict alone does NOT prove the front path belongs to a
+	# stopped dropper. Discriminate the inode before unlinking so the
+	# fail-closed case (a pre-placed regular file that the dropper's own
+	# Lstat rejected, after which its PID vanished) can never delete a
+	# bystander: absent -> nothing to do; not a socket -> keep and fail;
+	# a socket -> remove only after an owned stop and with no live holder.
+	drop_stopped=0
 	if stop_owned_process "${KA_DROP_PID:-}" "$run_dir/controldropper"; then
-		rm -f "$KA_DROP_SOCKET"
+		drop_stopped=1
 	else
 		cleanup_status=1
+	fi
+	if [[ -e $KA_DROP_SOCKET ]]; then
+		if [[ ! -S $KA_DROP_SOCKET ]]; then
+			echo "refusing to remove $KA_DROP_SOCKET: not a socket" >&2
+			cleanup_status=1
+		elif lsof -- "$KA_DROP_SOCKET" >/dev/null 2>&1; then
+			echo "refusing to remove $KA_DROP_SOCKET: still held open" >&2
+			cleanup_status=1
+		elif ((drop_stopped)); then
+			rm -f "$KA_DROP_SOCKET"
+		else
+			echo "refusing to remove $KA_DROP_SOCKET: owner stop unconfirmed" >&2
+			cleanup_status=1
+		fi
 	fi
 fi
 stop_owned_process "${KA_PID:-}" "$run_dir/tiproxy-ka.toml" || cleanup_status=1
