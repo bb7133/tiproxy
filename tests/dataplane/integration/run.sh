@@ -1120,8 +1120,13 @@ if [[ $ka_use_dropper == true ]]; then
 		curl --noproxy '*' --fail --silent --max-time 5 \
 			"http://127.0.0.1:$ka_drop_admin_port/state" 2>/dev/null
 	}
-	# A fresh persistent connection whose CLOSED we will lose. With the
-	# initial pin restored it lands on the sole routeable backend (ks-old).
+	# The pin is restored to A0 (ks-old): it is the sole routeable
+	# backend, so a new session lands there and its gauge is the one under
+	# test. Read the baseline BEFORE opening so a pre-existing ghost or an
+	# unrelated connection can never masquerade as our +1.
+	ka_pinned_addr="127.0.0.1:$TIDB_PORT_0"
+	kb_before=$(ka_backend_conn "$ka_pinned_addr")
+	# A fresh persistent connection whose CLOSED we will lose.
 	KB_FIFO="$run_dir/kb-session.fifo"
 	mkfifo "$KB_FIFO"
 	printf 'KB_FIFO=%q\n' "$KB_FIFO" >>"$run_dir/state.env"
@@ -1146,6 +1151,11 @@ if [[ $ka_use_dropper == true ]]; then
 		sleep 0.5
 	done
 	[[ -n $kb_line ]] || { echo "chain-b: session never answered" >&2; exit 1; }
+	kb_port=$(cut -d'|' -f3 <<<"$kb_line")
+	if [[ $kb_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-b: session landed on @@port=$kb_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
 	# Capture the proxy-side connection id + backend id from Rust's own
 	# connection_ready record for this new session.
 	kb_conn_id= kb_backend_id= kb_backend_addr=
@@ -1164,13 +1174,24 @@ if [[ $ka_use_dropper == true ]]; then
 		echo "chain-b: could not capture connection_ready identity" >&2
 		exit 1
 	fi
-	echo "chain-b: new session proxy_conn_id=$kb_conn_id backend_id=$kb_backend_id addr=$kb_backend_addr"
-	# The connection must be reflected in Go's accounting before we start.
-	kb_conn_open=$(ka_backend_conn "$kb_backend_addr")
-	if ((kb_conn_open < 1)); then
-		echo "chain-b: backend $kb_backend_addr shows $kb_conn_open conns, expected >=1 with the session open" >&2
+	if [[ $kb_backend_addr != "$ka_pinned_addr" || $kb_backend_id != *"$ka_pinned_addr" ]]; then
+		echo "chain-b: session backend $kb_backend_id/$kb_backend_addr is not the pinned $ka_pinned_addr" >&2
 		exit 1
 	fi
+	echo "chain-b: new session proxy_conn_id=$kb_conn_id backend_id=$kb_backend_id addr=$kb_backend_addr port=$kb_port"
+	# The new session must raise the pinned backend's gauge by EXACTLY one
+	# (its RouteResult{connected} is forwarded normally and counted).
+	kb_open=$kb_before
+	for _ in {1..40}; do
+		kb_open=$(ka_backend_conn "$ka_pinned_addr")
+		((kb_open == kb_before + 1)) && break
+		sleep 0.25
+	done
+	if ((kb_open != kb_before + 1)); then
+		echo "chain-b: opening the session did not raise accounting from $kb_before to $((kb_before + 1)) (got $kb_open)" >&2
+		exit 1
+	fi
+	echo "chain-b: pinned backend $ka_pinned_addr before=$kb_before open=$kb_open (exactly +1)"
 	# Arm the exact CLOSED drop for THIS connection on THIS backend.
 	curl --noproxy '*' --fail --silent --show-error -X POST \
 		--data-binary "{\"kind\":\"connection-event-closed\",\"connection_id\":$kb_conn_id,\"backend_id\":\"$kb_backend_id\"}" \
@@ -1184,6 +1205,9 @@ if [[ $ka_use_dropper == true ]]; then
 	done
 	kill "$KB_SESSION_PID" 2>/dev/null || true
 	wait "$KB_SESSION_PID" 2>/dev/null || true
+	# The session is gone: retract its now-stale PID so the final cleanup
+	# never signals a possibly-reused PID without ownership.
+	printf 'KB_SESSION_PID=\n' >>"$run_dir/state.env"
 	kb_dropped=false
 	for _ in {1..40}; do
 		if [[ $(ka_drop_state | python3 -c 'import json,sys; print(json.load(sys.stdin).get("drop_count"))' 2>/dev/null) == 1 ]]; then
@@ -1198,10 +1222,10 @@ if [[ $ka_use_dropper == true ]]; then
 		exit 1
 	fi
 	# Oracle 1 (ghost): Go never saw the CLOSED and no reconcile has run,
-	# so the accounting still holds the now-dead connection.
-	kb_conn_ghost=$(ka_backend_conn "$kb_backend_addr")
-	if ((kb_conn_ghost != kb_conn_open)); then
-		echo "chain-b: expected ghost accounting to stay $kb_conn_open, got $kb_conn_ghost" >&2
+	# so the accounting still holds the now-dead connection at before+1.
+	kb_ghost=$(ka_backend_conn "$ka_pinned_addr")
+	if ((kb_ghost != kb_before + 1)); then
+		echo "chain-b: expected ghost accounting to stay $((kb_before + 1)), got $kb_ghost" >&2
 		exit 1
 	fi
 	ka_drop_state >"$run_dir/controldropper-state-chainb-ghost.json"
@@ -1236,35 +1260,78 @@ PYB
 		echo "chain-b: dropper ghost-state oracle failed" >&2
 		exit 1
 	fi
-	echo "chain-b ghost: backend $kb_backend_addr still shows $kb_conn_ghost (CLOSED lost, no reconcile yet)"
-	# Release the hold: the next Rust reconnect fires the automatic
-	# reconcile, whose inventory omits the dead connection, so Go clears
-	# the ghost to EXACTLY the live count.
+	echo "chain-b ghost: backend $ka_pinned_addr still shows $kb_ghost (CLOSED lost, no reconcile yet)"
+	# Release the hold: the next Rust reconnect dials upstream again and,
+	# on the fresh Connected session, automatically sends a ReconcileRequest
+	# whose inventory omits the dead connection, so Go clears the ghost to
+	# EXACTLY the pre-open count.
 	curl --noproxy '*' --fail --silent --show-error -X POST \
 		"http://127.0.0.1:$ka_drop_admin_port/release" -o /dev/null
-	kb_expected=$((kb_conn_open - 1))
-	kb_cleared=false
-	kb_now=$kb_conn_ghost
+	kb_reconciled=false
+	kb_now=$kb_ghost
 	for _ in {1..60}; do
-		kb_now=$(ka_backend_conn "$kb_backend_addr")
+		kb_now=$(ka_backend_conn "$ka_pinned_addr")
 		if ((kb_now < 0)); then
 			echo "chain-b: accounting went negative ($kb_now)" >&2
 			exit 1
 		fi
-		if ((kb_now == kb_expected)); then
-			kb_cleared=true
+		if ((kb_now == kb_before)); then
+			kb_reconciled=true
 			break
 		fi
 		sleep 0.5
 	done
-	if [[ $kb_cleared != true ]]; then
-		echo "chain-b: reconcile never cleared the ghost to $kb_expected (last $kb_now)" >&2
+	if [[ $kb_reconciled != true ]]; then
+		echo "chain-b: reconcile never cleared the ghost to the pre-open $kb_before (last $kb_now)" >&2
 		exit 1
 	fi
 	ka_drop_state >"$run_dir/controldropper-state-chainb-reconciled.json"
-	echo "chain-b: reconcile cleared the ghost -> backend $kb_backend_addr now $kb_now (exactly open-1)"
+	# Causal proof: the clear followed a real upstream reconnect
+	# (release -> dialing-upstream connect), not some other clearing path.
+	if ! python3 - "$run_dir/controldropper-state-chainb-ghost.json" "$run_dir/controldropper-state-chainb-reconciled.json" <<'PYR'
+import json, sys
+ghost = json.load(open(sys.argv[1]))
+rec = json.load(open(sys.argv[2]))
+errs = []
+if rec.get("held") is not False:
+    errs.append(f'held={rec.get("held")}')
+if rec.get("release_count") != 1:
+    errs.append(f'release_count={rec.get("release_count")} (want 1)')
+if not (rec.get("connect_count", 0) > ghost.get("connect_count", 0)):
+    errs.append(f'connect_count {rec.get("connect_count")} !> ghost {ghost.get("connect_count")}')
+if not (rec.get("reconnect_count", 0) > ghost.get("reconnect_count", 0)):
+    errs.append(f'reconnect_count {rec.get("reconnect_count")} !> ghost {ghost.get("reconnect_count")}')
+events = rec.get("events") or []
+drop_seq = max((e["seq"] for e in events if e.get("type") == "drop"), default=None)
+if drop_seq is None:
+    errs.append('no drop event')
+else:
+    rel = next((e for e in events if e.get("type") == "release" and e["seq"] > drop_seq), None)
+    if rel is None:
+        errs.append('no release after the drop')
+    else:
+        dial = next((e for e in events if e.get("type") == "connect"
+                     and "dialing upstream" in (e.get("detail") or "") and e["seq"] > rel["seq"]), None)
+        if dial is None:
+            errs.append('no dialing-upstream connect after the release')
+if errs:
+    print("chain-b reconnect-causality oracle failed: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+print(f'chain-b reconnect: held=false release_count=1 '
+      f'connect {ghost.get("connect_count")}->{rec.get("connect_count")} '
+      f'reconnect {ghost.get("reconnect_count")}->{rec.get("reconnect_count")}; '
+      f'drop->release->dialing-upstream ordered')
+PYR
+	then
+		echo "chain-b: reconnect-causality oracle failed" >&2
+		exit 1
+	fi
+	echo "chain-b: reconcile cleared the ghost -> backend $ka_pinned_addr now $kb_now (exactly the pre-open $kb_before)"
 	rm -f "$KB_FIFO"
-	echo "control-frame-drop-closed: a lost ConnectionEvent{CLOSED} left a ghost; the automatic reconcile cleared it exactly"
+	# The FIFO is gone: retract its path so the final cleanup treats it as
+	# already handled.
+	printf 'KB_FIFO=\n' >>"$run_dir/state.env"
+	echo "control-frame-drop-closed: a lost ConnectionEvent{CLOSED} left a ghost; a real reconnect's reconcile cleared it exactly"
 fi
 if [[ $mode == rust ]]; then
 	kill -s INT "$KA_RUST_PID" 2>/dev/null || true
