@@ -118,6 +118,12 @@ fi
 
 make -C "$repo_root" cmd_tiproxy >"$run_dir/go-build.log" 2>&1
 go build -o "$run_dir/faultproxy" "$script_dir/faultproxy"
+# The keyspace-guard phase (rust+plain only) inserts a control-frame
+# dropper between the Rust dataplane and the Go control socket to drive
+# the chaos-E2E chains.
+if [[ $mode == rust && $variant == plain ]]; then
+	go build -o "$run_dir/controldropper" "$script_dir/controldropper"
+fi
 "$script_dir/render-configs.sh" "$run_dir" "$variant" "$port_offset" >"$run_dir/render.log"
 # shellcheck disable=SC1090
 source "$run_dir/variant.env"
@@ -681,7 +687,20 @@ ka_sql_port=$((8097 + port_offset))
 ka_api_port=$((8098 + port_offset))
 ka_health_port=$((8099 + port_offset))
 KA_SOCKET="${TMPDIR:-/tmp}/$tag-ka.sock"
-for port in "$ka_sql_port" "$ka_api_port" "$ka_health_port"; do
+# Control-frame dropper (rust+plain only): Rust dials KA_DROP_SOCKET,
+# the dropper forwards to the Go control KA_SOCKET, and its admin port
+# arms per-chain drops. Transparent (byte-identical) until armed.
+ka_use_dropper=false
+if [[ $mode == rust && $variant == plain ]]; then
+	ka_use_dropper=true
+fi
+KA_DROP_SOCKET="${TMPDIR:-/tmp}/$tag-ka-drop.sock"
+ka_drop_admin_port=$((8100 + port_offset))
+ka_phase_ports=("$ka_sql_port" "$ka_api_port" "$ka_health_port")
+if [[ $ka_use_dropper == true ]]; then
+	ka_phase_ports+=("$ka_drop_admin_port")
+fi
+for port in "${ka_phase_ports[@]}"; do
 	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
 		echo "keyspace-guard phase port is already in use: $port" >&2
 		exit 1
@@ -738,8 +757,46 @@ if [[ $ka_api_up != true ]]; then
 	tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
 	exit 1
 fi
+# The Rust dataplane normally dials the Go control socket directly. In
+# the dropper chains it dials the dropper's front socket instead; the
+# dropper forwards to the Go control socket and stays byte-transparent
+# until an /arm request selects a frame to drop.
+ka_rust_control_socket=$KA_SOCKET
+if [[ $ka_use_dropper == true ]]; then
+	rm -f "$KA_DROP_SOCKET"
+	"$run_dir/controldropper" \
+		--front-socket "$KA_DROP_SOCKET" \
+		--target-socket "$KA_SOCKET" \
+		--admin "127.0.0.1:$ka_drop_admin_port" \
+		>"$run_dir/controldropper.log" 2>&1 &
+	KA_DROP_PID=$!
+	printf 'KA_DROP_PID=%q\n' "$KA_DROP_PID" >>"$run_dir/state.env"
+	printf 'KA_DROP_SOCKET=%q\n' "$KA_DROP_SOCKET" >>"$run_dir/state.env"
+	ka_drop_ready=false
+	for _ in {1..100}; do
+		if ! kill -0 "$KA_DROP_PID" 2>/dev/null; then
+			break
+		fi
+		if [[ -S $KA_DROP_SOCKET ]] &&
+			curl --noproxy '*' --fail --silent --max-time 5 \
+				"http://127.0.0.1:$ka_drop_admin_port/state" -o /dev/null; then
+			ka_drop_ready=true
+			break
+		fi
+		sleep 0.1
+	done
+	if [[ $ka_drop_ready != true ]]; then
+		echo "keyspace-guard phase: control dropper never became ready" >&2
+		tail -20 "$run_dir/controldropper.log" >&2 || true
+		exit 1
+	fi
+	ka_rust_control_socket=$KA_DROP_SOCKET
+fi
+# cleanup.sh reaps the KA Rust process by the control socket it actually
+# binds; under the dropper that is KA_DROP_SOCKET, not KA_SOCKET.
+printf 'KA_RUST_CONTROL_SOCKET=%q\n' "$ka_rust_control_socket" >>"$run_dir/state.env"
 if [[ $mode == rust ]]; then
-	"$rust_binary" --control-socket "$KA_SOCKET" --control-uid "$(id -u)" \
+	"$rust_binary" --control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 		--health-port "$ka_health_port" \
 		>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
 	KA_RUST_PID=$!
@@ -1006,6 +1063,15 @@ if [[ $mode == rust ]]; then
 	done
 	rm -f "$KA_SOCKET"
 fi
+if [[ $ka_use_dropper == true ]]; then
+	kill -s INT "$KA_DROP_PID" 2>/dev/null || true
+	for _ in {1..100}; do
+		kill -0 "$KA_DROP_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	kill "$KA_DROP_PID" 2>/dev/null || true
+	rm -f "$KA_DROP_SOCKET"
+fi
 kill -s INT "$KA_PID" 2>/dev/null || true
 for _ in {1..100}; do
 	kill -0 "$KA_PID" 2>/dev/null || break
@@ -1013,7 +1079,11 @@ for _ in {1..100}; do
 done
 kill "$KA_PID" 2>/dev/null || true
 rm -f "$KA_FIFO"
-printf 'PORTS=%q\n' "$PORTS $ka_sql_port $ka_api_port $ka_health_port" >>"$run_dir/state.env"
+ka_phase_ports_csv="$ka_sql_port $ka_api_port $ka_health_port"
+if [[ $ka_use_dropper == true ]]; then
+	ka_phase_ports_csv="$ka_phase_ports_csv $ka_drop_admin_port"
+fi
+printf 'PORTS=%q\n' "$PORTS $ka_phase_ports_csv" >>"$run_dir/state.env"
 echo "no-keyspace-migration: old session pinned to ks-old under real migration pressure; guard refused ks-new"
 
 # ---- Error parity (DPL-07 #41): the same semantic ERR in both modes.

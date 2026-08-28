@@ -59,8 +59,12 @@ cleanup_status=0
 # Keyspace-guard phase leftovers (present only when that phase started
 # and then failed before its own teardown).
 if [[ -n ${KA_SOCKET:-} ]]; then
-	stop_owned_process "${KA_RUST_PID:-}" "$KA_SOCKET" || cleanup_status=1
+	stop_owned_process "${KA_RUST_PID:-}" "${KA_RUST_CONTROL_SOCKET:-$KA_SOCKET}" || cleanup_status=1
 	rm -f "$KA_SOCKET"
+fi
+if [[ -n ${KA_DROP_SOCKET:-} ]]; then
+	stop_owned_process "${KA_DROP_PID:-}" "$run_dir/controldropper" || cleanup_status=1
+	rm -f "$KA_DROP_SOCKET"
 fi
 stop_owned_process "${KA_PID:-}" "$run_dir/tiproxy-ka.toml" || cleanup_status=1
 if [[ ${KA_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
