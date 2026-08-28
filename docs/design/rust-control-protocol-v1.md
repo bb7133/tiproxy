@@ -398,6 +398,41 @@ Schema field numbers are never reused; removed fields are reserved.
 - Traffic capture/replay enabled in a snapshot is
   `UNSUPPORTED_CONFIGURATION`; Rust mode must fail fast.
 
+## CTL-06 chaos-E2E acceptance
+
+The lost-event repair and one-sided-restart guarantees above are exercised
+end-to-end against a real TiUP playground by four chaos chains in
+`tests/dataplane/integration` (`run.sh --mode rust --variant plain`, the
+keyspace-guard phase). A test-only control-frame dropper
+(`controldropper/`) sits transparently between the Rust dataplane and the Go
+control socket and, when armed, loses exactly one identified Rust→Go frame; the
+Go router's per-backend `tiproxy_balance_b_conn` gauge and the successor
+`/api/dataplane/status` generation are the oracles. Each chain asserts an
+*exact* accounting transition, not merely a direction:
+
+- **(a) lost `RouteResult{connected}`** — the connection is live but Go's
+  accounting is short by one; the automatic reconcile on the next control
+  reconnect completes the lost assignment, restoring the count to exactly `+1`
+  (never double-counted). Proves the exactly-once reconcile repair of a
+  successful RouteResult the Go side accepted-as-sent but never observed.
+- **(b) lost `ConnectionEvent{CLOSED}`** — Go holds a ghost; the reconcile's
+  identification-by-omission closes it to exactly the live count, never negative.
+- **(c) one-sided Go restart** — the Rust data session rides through the
+  control-plane crash unchanged (same `CONNECTION_ID()`, same backend), the new
+  Go incarnation (distinct PID, fresh generation sequence) applies a snapshot,
+  and its accounting rehydrates to exactly the surviving count.
+- **(d) one-sided Rust restart** — the dead session leaves a ghost (no CLOSED
+  was sent); the successor Rust reconnects with an empty inventory, the reconcile
+  omission zeroes the ghost, and a fresh session is admitted and counted under
+  the new incarnation (`connection_ready` carries the applied generation).
+
+The dropper selectors are exact on `connection_id` (mandatory) so a concurrent
+same-kind frame for another connection is never eaten;
+`route-result-connected` leaves `assignment_id` optional because it is
+unobservable before the frame is sent, while `connection-event-closed` also
+pins `backend_id`. See `tests/dataplane/integration/README.md` for the harness
+contract and evidence surface.
+
 ## Review and change control
 
 The schema, this ADR, and generated compatibility fixtures must be reviewed by
