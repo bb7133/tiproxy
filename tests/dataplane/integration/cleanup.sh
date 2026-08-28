@@ -118,6 +118,14 @@ fi
 if [[ -n ${CC_FIFO:-} ]]; then
 	rm -f "$CC_FIFO"
 fi
+for pid_var in CD_SESSION_PID CD2_SESSION_PID; do
+	pid=${!pid_var:-}
+	[[ $pid =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null || true
+done
+for fifo_var in CD_FIFO CD2_FIFO; do
+	fifo=${!fifo_var:-}
+	[[ -n $fifo ]] && rm -f "$fifo"
+done
 stop_owned_process "${HOLDER_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
 stop_owned_process "${CONFLICT_PID:-}" "$run_dir/tiproxy-conflict.toml" || cleanup_status=1
 stop_owned_process "${RUST_CONFLICT_PID:-}" "$run_dir/absent.sock" || cleanup_status=1

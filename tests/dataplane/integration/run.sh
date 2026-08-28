@@ -1715,6 +1715,171 @@ if [[ $ka_use_dropper == true ]]; then
 	printf 'CC_FIFO=\n' >>"$run_dir/state.env"
 	echo "go-one-sided-restart: the Go control plane crashed and restarted; the Rust session survived and the new incarnation rehydrated exactly"
 fi
+if [[ $ka_use_dropper == true ]]; then
+	# ---- CTL-06 chaos chain (d): a one-sided Rust dataplane restart. The
+	# Rust process is SIGKILLed; its client session dies WITHOUT a CLOSED,
+	# so Go keeps it as a ghost. A fresh Rust process reconnects with an
+	# EMPTY inventory, and Go's reconcile omission zeroes that ghost; a new
+	# session then works and is counted under the new incarnation. Oracles:
+	# the dead session's accounting is zeroed to exactly 0, a fresh session
+	# is served + counted, and its connection_ready carries a generation
+	# (the new session applied a snapshot).
+	CD_FIFO="$run_dir/cd-session.fifo"
+	mkfifo "$CD_FIFO"
+	printf 'CD_FIFO=%q\n' "$CD_FIFO" >>"$run_dir/state.env"
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$CD_FIFO" >"$run_dir/cd-session.out" 2>&1 &
+	CD_SESSION_PID=$!
+	printf 'CD_SESSION_PID=%q\n' "$CD_SESSION_PID" >>"$run_dir/state.env"
+	exec 5>"$CD_FIFO"
+	printf "SELECT CONCAT('CD|', CONNECTION_ID(), '|', @@port);\n" >&5
+	cd_line=
+	for _ in {1..40}; do
+		cd_line=$(grep -s '^CD|' "$run_dir/cd-session.out" | tail -1 || true)
+		[[ -n $cd_line ]] && break
+		kill -0 "$CD_SESSION_PID" 2>/dev/null || { echo "chain-d: session died before establishing" >&2; exit 1; }
+		sleep 0.5
+	done
+	[[ -n $cd_line ]] || { echo "chain-d: session never answered" >&2; exit 1; }
+	cd_port=$(cut -d'|' -f3 <<<"$cd_line")
+	if [[ $cd_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-d: session landed on @@port=$cd_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	cd_before_ready=false
+	cd_before=0
+	for _ in {1..60}; do
+		cd_before=$(ka_backend_conn "$ka_pinned_addr")
+		((cd_before == 1)) && { cd_before_ready=true; break; }
+		sleep 0.5
+	done
+	if [[ $cd_before_ready != true ]]; then
+		echo "chain-d: pinned backend did not settle to the 1 live session (got $cd_before)" >&2
+		exit 1
+	fi
+	cd_old_rust=$KA_RUST_PID
+	echo "chain-d: live session backend=127.0.0.1:$cd_port; Rust pid=$cd_old_rust; gauge=$cd_before"
+	# SIGKILL the Rust dataplane; its client session dies without a CLOSED.
+	sigkill_owned_process "$cd_old_rust" "$ka_rust_control_socket" ||
+		{ echo "chain-d: could not SIGKILL Rust $cd_old_rust" >&2; exit 1; }
+	exec 5>&-
+	kill "$CD_SESSION_PID" 2>/dev/null || true
+	wait "$CD_SESSION_PID" 2>/dev/null || true
+	printf 'CD_SESSION_PID=\n' >>"$run_dir/state.env"
+	# Restart Rust on the same control socket (the dropper front) + health
+	# port; it reconnects with an empty inventory.
+	"$rust_binary" --control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
+		--health-port "$ka_health_port" \
+		>>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
+	KA_RUST_PID=$!
+	printf 'KA_RUST_PID=%q\n' "$KA_RUST_PID" >>"$run_dir/state.env"
+	if [[ $KA_RUST_PID == "$cd_old_rust" ]]; then
+		echo "chain-d: restarted Rust reused pid $KA_RUST_PID" >&2
+		exit 1
+	fi
+	echo "chain-d: Rust restarted pid $cd_old_rust -> $KA_RUST_PID"
+	cd_ready=false
+	for _ in {1..150}; do
+		if ! kill -0 "$KA_RUST_PID" 2>/dev/null; then break; fi
+		if curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_health_port/" -o /dev/null; then
+			cd_ready=true
+			break
+		fi
+		sleep 0.2
+	done
+	if [[ $cd_ready != true ]]; then
+		echo "chain-d: restarted Rust never became ready" >&2
+		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
+		exit 1
+	fi
+	# Oracle: the dead session's ghost is zeroed by the new session's
+	# reconcile (empty inventory -> Go omission-closes the ghost).
+	cd_zeroed=false
+	cd_now=$cd_before
+	for _ in {1..60}; do
+		cd_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((cd_now == 0)); then
+			cd_zeroed=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $cd_zeroed != true ]]; then
+		echo "chain-d: the dead session's ghost was never zeroed (gauge stuck at $cd_now)" >&2
+		exit 1
+	fi
+	echo "chain-d: dead session ghost zeroed -> backend $ka_pinned_addr now $cd_now"
+	# Oracle: a fresh session under the new incarnation works, lands on the
+	# pin, IS counted (gauge -> 1), and its connection_ready carries a
+	# generation (a snapshot was applied under the new session).
+	CD2_FIFO="$run_dir/cd2-session.fifo"
+	mkfifo "$CD2_FIFO"
+	printf 'CD2_FIFO=%q\n' "$CD2_FIFO" >>"$run_dir/state.env"
+	cd2_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$CD2_FIFO" >"$run_dir/cd2-session.out" 2>&1 &
+	CD2_SESSION_PID=$!
+	printf 'CD2_SESSION_PID=%q\n' "$CD2_SESSION_PID" >>"$run_dir/state.env"
+	exec 4>"$CD2_FIFO"
+	printf "SELECT CONCAT('CD2|', CONNECTION_ID(), '|', @@port);\n" >&4
+	cd2_line=
+	for _ in {1..40}; do
+		cd2_line=$(grep -s '^CD2|' "$run_dir/cd2-session.out" | tail -1 || true)
+		[[ -n $cd2_line ]] && break
+		kill -0 "$CD2_SESSION_PID" 2>/dev/null || { echo "chain-d: new session died before establishing" >&2; exit 1; }
+		sleep 0.5
+	done
+	[[ -n $cd2_line ]] || { echo "chain-d: new session never answered" >&2; exit 1; }
+	cd2_port=$(cut -d'|' -f3 <<<"$cd2_line")
+	if [[ $cd2_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-d: new session landed on @@port=$cd2_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	cd2_counted=false
+	cd2_now=0
+	for _ in {1..60}; do
+		cd2_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((cd2_now == 1)); then
+			cd2_counted=true
+			break
+		fi
+		if ((cd2_now > 1)); then
+			echo "chain-d: new session over-counted (gauge $cd2_now > 1)" >&2
+			exit 1
+		fi
+		sleep 0.5
+	done
+	if [[ $cd2_counted != true ]]; then
+		echo "chain-d: the new session was not counted to 1 (last $cd2_now)" >&2
+		exit 1
+	fi
+	cd2_gen=
+	for _ in {1..20}; do
+		cd2_gen=$(tail -n "+$((cd2_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | tail -1 |
+			sed -n 's/.*"generation":\([0-9]*\).*/\1/p')
+		[[ -n $cd2_gen ]] && break
+		sleep 0.25
+	done
+	if [[ -z $cd2_gen ]]; then
+		echo "chain-d: the new session logged no connection_ready generation" >&2
+		exit 1
+	fi
+	echo "chain-d: new session counted -> backend $ka_pinned_addr now $cd2_now, connection_ready generation=$cd2_gen"
+	exec 4>&-
+	for _ in {1..40}; do kill -0 "$CD2_SESSION_PID" 2>/dev/null || break; sleep 0.25; done
+	kill "$CD2_SESSION_PID" 2>/dev/null || true
+	wait "$CD2_SESSION_PID" 2>/dev/null || true
+	printf 'CD2_SESSION_PID=\n' >>"$run_dir/state.env"
+	rm -f "$CD_FIFO" "$CD2_FIFO"
+	printf 'CD_FIFO=\nCD2_FIFO=\n' >>"$run_dir/state.env"
+	echo "rust-one-sided-restart: the Rust dataplane crashed; its dead session's ghost was zeroed by the new session's reconcile and a new counted session works"
+fi
 if [[ $mode == rust ]]; then
 	kill -s INT "$KA_RUST_PID" 2>/dev/null || true
 	for _ in {1..100}; do
