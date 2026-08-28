@@ -256,12 +256,14 @@ async fn consumer_rejection_never_advances_the_store() {
         reject_first: 1,
     };
     let owner_state = live_state_for(&test_session());
+    let lease = tokio::sync::Mutex::new(());
 
     // First delivery: the consumer rejects generation 1.
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
         &owner_state,
+        &lease,
         &tagged(snapshot_envelope(10, 1)),
         test_now(),
     )
@@ -294,6 +296,7 @@ async fn consumer_rejection_never_advances_the_store() {
         &store,
         &mut consumer,
         &owner_state,
+        &lease,
         &tagged(snapshot_envelope(11, 1)),
         test_now(),
     )
@@ -316,6 +319,7 @@ async fn consumer_rejection_never_advances_the_store() {
         &store,
         &mut consumer,
         &owner_state,
+        &lease,
         &tagged(snapshot_envelope(12, 1)),
         test_now(),
     )
@@ -916,10 +920,12 @@ async fn restarted_go_same_generation_different_content_applies_fresh() {
 
     // Incarnation A commits {request 1, generation 1}.
     let state_a = live_state_as("go-a", 1);
+    let lease_a = tokio::sync::Mutex::new(());
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
         &state_a,
+        &lease_a,
         &tagged_as(snapshot_envelope(1, 1), "go-a", 1),
         test_now(),
     )
@@ -935,10 +941,12 @@ async fn restarted_go_same_generation_different_content_applies_fresh() {
     // same generation, different content): fresh sequence, applied,
     // consumer re-ran with the new content.
     let state_b = live_state_as("go-b", 2);
+    let lease_b = tokio::sync::Mutex::new(());
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
         &state_b,
+        &lease_b,
         &tagged_as(variant_envelope(1, 1), "go-b", 2),
         test_now(),
     )
@@ -977,6 +985,7 @@ async fn restarted_go_same_generation_different_content_applies_fresh() {
         &store,
         &mut consumer,
         &state_b,
+        &lease_b,
         &tagged_as(snapshot_envelope(2, 1), "go-b", 2),
         test_now(),
     )
@@ -1141,13 +1150,17 @@ impl dataplane::control_runtime::SnapshotConsumer for BarrierConsumer {
     }
 }
 
-/// Fix-2 snapshot-apply TOCTOU (Blocker 2): while the owner is inside
-/// `consumer.apply` for lineage A, Go restarts as lineage B. On
-/// release, A must produce NO serving swap and NO store / last-good /
-/// applied-generation advance — the transaction is bound to the
-/// control-lineage ownership across the whole stage → apply → commit.
+/// Fix-2 snapshot-apply linearization (Blocker 2, atomic seam): the
+/// session-ownership lease serializes a new session's `Connected`
+/// publication against the owner's whole stage → serving swap → store
+/// commit. Even when a B transition is attempted the instant the
+/// consumer is mid-apply for A, the transition — which goes through the
+/// same lease, exactly as the transport does — is forced to wait until
+/// A has fully applied AND committed. The outcome is never a split
+/// (serving = A while the store rejected the commit): A wins entirely
+/// and B is published only afterward.
 #[tokio::test]
-async fn snapshot_apply_aborts_when_lineage_switches_mid_apply() {
+async fn swap_and_commit_are_atomic_against_a_concurrent_session_switch() {
     let Ok(store) = SnapshotStore::new(Vec::new()) else {
         unreachable!("store constructs")
     };
@@ -1159,7 +1172,10 @@ async fn snapshot_apply_aborts_when_lineage_switches_mid_apply() {
         release: Arc::clone(&release),
         served: Arc::clone(&served),
     };
-    // Live session A when the apply begins.
+    // The lease is the shared linearization point: the transport locks
+    // it to publish a session; the owner locks it across the whole
+    // transaction.
+    let lease = Arc::new(tokio::sync::Mutex::new(()));
     let origin = tagged_as(snapshot_envelope(50, 1), "go-a", 1);
     let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connected {
         epoch: 1,
@@ -1169,51 +1185,79 @@ async fn snapshot_apply_aborts_when_lineage_switches_mid_apply() {
         peer_started_unix_millis: 1_700_000_000_000,
     });
 
+    let owner_lease = Arc::clone(&lease);
     let task = tokio::spawn(async move {
-        let out =
-            process_state_snapshot(&store, &mut consumer, &state_rx, &origin, test_now()).await;
+        let out = process_state_snapshot(
+            &store,
+            &mut consumer,
+            &state_rx,
+            &owner_lease,
+            &origin,
+            test_now(),
+        )
+        .await;
         (store, out)
     });
 
-    // Wait until the consumer is blocked inside apply, then switch the
-    // live session to a DIFFERENT Go lineage and release the consumer.
+    // The consumer is now blocked inside apply — the owner holds the
+    // lease. A B publisher that models the transport (locks the lease,
+    // publishes Connected B) must NOT be able to proceed yet.
     entered.notified().await;
-    state_tx
-        .send(ConnectionState::Connected {
-            epoch: 1,
-            capabilities: 0,
-            serial: 2,
-            peer_process_id: Arc::from("go-b"),
-            peer_started_unix_millis: 2_000_000_000_000,
-        })
-        .ok();
+    let b_published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let publisher_lease = Arc::clone(&lease);
+    let publisher_flag = Arc::clone(&b_published);
+    let publisher = tokio::spawn(async move {
+        let _guard = publisher_lease.lock().await;
+        state_tx
+            .send(ConnectionState::Connected {
+                epoch: 1,
+                capabilities: 0,
+                serial: 2,
+                peer_process_id: Arc::from("go-b"),
+                peer_started_unix_millis: 2_000_000_000_000,
+            })
+            .ok();
+        publisher_flag.store(true, Ordering::Relaxed);
+        state_tx
+    });
+
+    // Give the publisher every chance to run: it must still be blocked on
+    // the lease the owner holds — B is not published while A is applying.
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !b_published.load(Ordering::Relaxed),
+        "the B transition is serialized behind the owner's lease"
+    );
+
+    // Release the consumer: A applies its swap and commits, all still
+    // under the lease, before B can be published.
     release.notify_one();
 
     let Ok((store, (answer, applied))) = task.await else {
         unreachable!("the owner step completes")
     };
-    // No applied generation, so the owner never advances the barrier.
-    assert_eq!(applied, None, "the applied generation is not advanced by A");
-    // The serving consumer refused its swap.
-    assert_eq!(
-        served.load(Ordering::Relaxed),
-        0,
-        "A produced no serving swap"
-    );
-    // The store was never committed.
-    let Ok(current) = store.current() else {
-        unreachable!("store readable")
+    let _state_tx = publisher.await;
+
+    // A won atomically: it served AND committed the same generation —
+    // never a serving/store split.
+    assert_eq!(served.load(Ordering::Relaxed), 1, "A performed its swap");
+    assert_eq!(applied, Some(1), "A committed and advanced the generation");
+    let Ok(Some(current)) = store.current() else {
+        unreachable!("the store committed A")
     };
-    assert!(current.is_none(), "the store was not advanced by A");
-    // The answer is a failure, not an OK.
+    assert_eq!(current.generation(), 1);
     let Some(Body::SnapshotResult(result)) = &answer.body else {
         unreachable!("result body")
     };
-    assert_ne!(
+    assert_eq!(
         result.code(),
         control_proto::v1::ErrorCode::Ok,
-        "a lineage-superseded apply is answered as a failure"
+        "A's atomic apply is answered OK"
     );
-    // Keep the sender alive to the end.
-    drop(state_tx);
+    assert!(
+        b_published.load(Ordering::Relaxed),
+        "B is published only after A released the lease"
+    );
 }

@@ -352,9 +352,19 @@ pub async fn process_state_snapshot<C: SnapshotConsumer>(
     store: &SnapshotStore,
     consumer: &mut C,
     state: &watch::Receiver<ConnectionState>,
+    lease: &tokio::sync::Mutex<()>,
     tagged: &TaggedEnvelope,
     now: UnixTime,
 ) -> (ControlEnvelope, Option<u64>) {
+    // Hold the session-ownership lease across the WHOLE transaction —
+    // the lineage check, the serving swap inside the consumer, and the
+    // store commit. The transport publishes a new session's `Connected`
+    // under the same lease, so a Go restart cannot land between the
+    // check and the swap: either it is already visible when we check
+    // (and we do nothing), or it waits until we have fully applied and
+    // committed under the still-live session. This is the linearization
+    // point that prevents a serving/store split.
+    let _lease = lease.lock().await;
     let envelope = &tagged.envelope;
     let lineage = SnapshotLineage {
         peer_process_id: Arc::clone(&tagged.origin.peer_process_id),
@@ -520,7 +530,9 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
         return Ok(SnapshotStep::Continue);
     }
     let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
-    let (answer, applied) = process_state_snapshot(store, consumer, state, tagged, now).await;
+    let lease = client.session_lease();
+    let (answer, applied) =
+        process_state_snapshot(store, consumer, state, &lease, tagged, now).await;
     if let Some(generation) = applied {
         client.mark_last_good_snapshot(generation);
         if !handle.applied_generation(generation).await {

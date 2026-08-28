@@ -388,6 +388,14 @@ pub struct ControlClient {
     foreign_snapshot_dropped: AtomicU64,
     reconnect_attempts: AtomicU64,
     running: AtomicBool,
+    /// Serializes a new session's `Connected` publication against the
+    /// snapshot owner's serving/commit transaction. The owner holds
+    /// this across [check current lineage -> serving swap -> store
+    /// commit] and the transport holds it across publishing a new
+    /// `Connected`, so the two are linearized: a snapshot either
+    /// applies fully under its own live session or observes the
+    /// successor and does nothing — never a serving/store split.
+    session_lease: Arc<Mutex<()>>,
     last_received: StdMutex<Option<Instant>>,
     last_good_snapshot: StdMutex<Option<(u64, Instant)>>,
     last_disconnect: StdMutex<Option<String>>,
@@ -420,6 +428,7 @@ impl ControlClient {
             foreign_snapshot_dropped: AtomicU64::new(0),
             reconnect_attempts: AtomicU64::new(0),
             running: AtomicBool::new(false),
+            session_lease: Arc::new(Mutex::new(())),
             last_received: StdMutex::new(None),
             last_good_snapshot: StdMutex::new(None),
             last_disconnect: StdMutex::new(None),
@@ -489,13 +498,21 @@ impl ControlClient {
                     }
                     self.negotiated_caps.store(caps_mask, Ordering::Release);
                     set_instant(&self.last_received, Some(Instant::now()));
-                    let _ = self.state_tx.send(ConnectionState::Connected {
-                        epoch: negotiated.epoch,
-                        capabilities: caps_mask,
-                        serial,
-                        peer_process_id: Arc::clone(&negotiated.peer_process_id),
-                        peer_started_unix_millis: negotiated.peer_started_unix_millis,
-                    });
+                    {
+                        // Publish the new session under the lease so it
+                        // cannot interleave with an in-flight snapshot
+                        // transaction: the owner either observes this
+                        // session before its check or completes its
+                        // whole serving+commit before this publication.
+                        let _lease = self.session_lease.lock().await;
+                        let _ = self.state_tx.send(ConnectionState::Connected {
+                            epoch: negotiated.epoch,
+                            capabilities: caps_mask,
+                            serial,
+                            peer_process_id: Arc::clone(&negotiated.peer_process_id),
+                            peer_started_unix_millis: negotiated.peer_started_unix_millis,
+                        });
+                    }
                     let result = self.run_connected(negotiated, serial, handler).await;
                     if !matches!(result, Err(TransportError::Closed)) {
                         set_string(&self.last_disconnect, Some(result_to_string(&result)));
@@ -704,6 +721,14 @@ impl ControlClient {
     #[must_use]
     pub fn metrics_dropped(&self) -> u64 {
         self.metrics_dropped.load(Ordering::Relaxed)
+    }
+
+    /// The session-ownership lease (see the field docs): the snapshot
+    /// owner locks it across its whole serving/commit transaction so a
+    /// new session's `Connected` cannot be published mid-transaction.
+    #[must_use]
+    pub fn session_lease(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.session_lease)
     }
 
     /// Returns how many inbound snapshots the owner dropped for
