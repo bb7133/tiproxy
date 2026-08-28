@@ -1,3 +1,6 @@
+# Copyright 2026 PingCAP, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # One-sided restart helpers for the chaos-E2E chains. Sourced by run.sh
 # (and exercised by self-test.sh). Kept deliberately small and aligned
 # with cleanup.sh's stop_owned_process ownership convention.
@@ -13,6 +16,13 @@ sigkill_owned_process() {
 	local pid=$1 expected=$2 command_line process_state
 	[[ $pid =~ ^[0-9]+$ ]] || {
 		echo "sigkill: invalid pid '$pid'" >&2
+		return 1
+	}
+	# A non-empty ownership token is mandatory: an empty token would make
+	# the command-line substring match trivially true and turn this into
+	# an unconditional kill of any PID.
+	[[ -n $expected ]] || {
+		echo "sigkill: refusing to signal PID $pid with an empty ownership token" >&2
 		return 1
 	}
 	command_line=$(ps -p "$pid" -o command= 2>/dev/null || true)
@@ -42,7 +52,14 @@ sigkill_owned_process() {
 # here — only the backend Go control socket a killed Go left behind.
 remove_dead_backend_socket() {
 	local path=$1 dead_pid=$2
-	if [[ $dead_pid =~ ^[0-9]+$ ]] && kill -0 "$dead_pid" 2>/dev/null; then
+	# The owner PID must be a real (positive) PID that is now dead — an
+	# empty or non-numeric value must NOT be treated as "proven dead",
+	# which would drop the owner-liveness condition entirely.
+	[[ $dead_pid =~ ^[0-9]+$ && $dead_pid -gt 0 ]] || {
+		echo "refusing to remove $path: invalid owner pid '$dead_pid'" >&2
+		return 1
+	}
+	if kill -0 "$dead_pid" 2>/dev/null; then
 		echo "refusing to remove $path: owner PID $dead_pid is still alive" >&2
 		return 1
 	fi

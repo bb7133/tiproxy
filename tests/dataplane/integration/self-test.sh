@@ -141,6 +141,16 @@ if ! kill -0 "$bystander_pid" 2>/dev/null; then
 	echo "a refused sigkill must not touch the bystander" >&2
 	exit 1
 fi
+# An empty ownership token must be refused, not treated as "matches
+# everything" — the bystander stays alive.
+if sigkill_owned_process "$bystander_pid" ""; then
+	echo "sigkill_owned_process must refuse an empty ownership token" >&2
+	exit 1
+fi
+if ! kill -0 "$bystander_pid" 2>/dev/null; then
+	echo "a refused empty-token sigkill must not touch the bystander" >&2
+	exit 1
+fi
 kill "$bystander_pid" 2>/dev/null || true
 wait "$bystander_pid" 2>/dev/null || true
 
@@ -162,11 +172,32 @@ fi
 	echo "the dead-owner socket was not removed" >&2
 	exit 1
 }
+# Re-create the socket for the negative cases (the success case removed it).
+python3 - "$sock" <<'PYSOCK2'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PYSOCK2
+# An empty / non-numeric owner PID must be refused — it must not be
+# treated as "proven dead", so the socket stays.
+if remove_dead_backend_socket "$sock" ""; then
+	echo "remove_dead_backend_socket must refuse an empty owner PID" >&2
+	exit 1
+fi
+if remove_dead_backend_socket "$sock" "not-a-pid"; then
+	echo "remove_dead_backend_socket must refuse a non-numeric owner PID" >&2
+	exit 1
+fi
+[[ -S $sock ]] || {
+	echo "a refused invalid-PID removal must leave the socket" >&2
+	exit 1
+}
 # A live owner is refused.
 if remove_dead_backend_socket "$sock" "$$"; then
 	echo "remove_dead_backend_socket must refuse a live owner PID" >&2
 	exit 1
 fi
+rm -f -- "$sock"
 # A non-socket regular file is refused.
 regular="$temp_dir/not-a-socket"
 : >"$regular"
