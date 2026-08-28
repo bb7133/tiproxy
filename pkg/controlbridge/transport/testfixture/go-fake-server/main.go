@@ -50,11 +50,13 @@ func run() error {
 	}
 
 	localHello := &controlpb.Hello{
-		Role:              controlpb.Role_ROLE_GO_CONTROL,
-		ProcessId:         "go-cross-language-fake",
-		SupportedVersions: []uint32{controlpb.ProtocolV1},
-		Capabilities:      []uint64{2, 3, 5, 7},
-		MaxFrameBytes:     controlpb.DefaultMaxFrameBytes,
+		Role:      controlpb.Role_ROLE_GO_CONTROL,
+		ProcessId: "go-cross-language-fake",
+		// The lineage identity contract requires a nonzero start time.
+		ProcessStartedUnixMillis: 1_700_000_000_000,
+		SupportedVersions:        []uint32{controlpb.ProtocolV1},
+		Capabilities:             []uint64{2, 3, 5, 7},
+		MaxFrameBytes:            controlpb.DefaultMaxFrameBytes,
 	}
 	if err := controlpb.WriteFrame(conn, helloEnvelope(localHello), controlpb.DefaultMaxFrameBytes); err != nil {
 		return err

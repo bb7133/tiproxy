@@ -89,6 +89,14 @@ type RouterAdapter struct {
 	// from redirect/drain by construction (no projectedConn exists) and
 	// resolved by bounded retries; past the bound they are closed.
 	orphans map[uint64]*orphanState
+	// divergedClosing holds close obligations for sessions whose
+	// reconcile record diverged from their pending assignment: keyed by
+	// connection id and bound to the exact {identity, generation}, the
+	// obligation blocks re-rehydration and re-issues its CloseCommand
+	// every reconcile round until the Rust side authoritatively omits
+	// the id. Without it, the round after a not-yet-consumed close
+	// would rehydrate the very session that was just condemned.
+	divergedClosing map[uint64]*divergedObligation
 
 	// rehydrating claims a connection id for the duration of one
 	// rehydration attempt so a concurrent reconcile and ResolveOrphans
@@ -164,12 +172,13 @@ func NewRouterAdapter(handler backend.HandshakeHandler) (*RouterAdapter, error) 
 		return nil, fmt.Errorf("router adapter incarnation nonce: %w", err)
 	}
 	return &RouterAdapter{
-		handler:     handler,
-		incarnation: hex.EncodeToString(nonce),
-		connections: make(map[uint64]*connectionState),
-		closedIDs:   make(map[uint64]uint64),
-		orphans:     make(map[uint64]*orphanState),
-		rehydrating: make(map[uint64]struct{}),
+		handler:         handler,
+		incarnation:     hex.EncodeToString(nonce),
+		connections:     make(map[uint64]*connectionState),
+		closedIDs:       make(map[uint64]uint64),
+		orphans:         make(map[uint64]*orphanState),
+		divergedClosing: make(map[uint64]*divergedObligation),
+		rehydrating:     make(map[uint64]struct{}),
 	}, nil
 }
 
@@ -542,21 +551,58 @@ func completeLostAssignment(state *connectionState, remote *controlpb.ReconcileC
 	return lostAssignmentDiverged
 }
 
+// divergedObligation is the surviving record of a divergence close:
+// the local state is already retired, but the Rust side may not have
+// processed (or may have lost) the CloseCommand — until its record
+// authoritatively disappears from a reconcile, the obligation blocks
+// re-rehydration and re-issues the close every round.
+type divergedObligation struct {
+	identity   *controlpb.ConnectionIdentity
+	generation uint64
+}
+
+func (o *divergedObligation) matches(remote *controlpb.ReconcileConnection) bool {
+	return o != nil &&
+		sameIdentity(o.identity, remote.GetIdentity()) &&
+		o.generation == remote.GetGeneration()
+}
+
 // closeDivergedAssignment terminates a session whose reconcile record
 // diverged from its pending assignment: the local state retires
 // exactly once (the unfinished assignment's selector gets its single
-// Finish(false) inside closeStateLocked), and the Rust side receives a
-// precise CloseCommand so the client terminates instead of serving on
-// an unconfirmed backend.
+// Finish(false) inside closeStateLocked), a per-{identity, generation}
+// closing obligation survives the retirement, and the Rust side
+// receives a precise CloseCommand so the client terminates instead of
+// serving on an unconfirmed backend. The obligation stays — and the
+// close re-issues each round — even when the capability is missing or
+// the send fails; only the Rust side's authoritative omission clears
+// it.
 func (adapter *RouterAdapter) closeDivergedAssignment(
 	ctx context.Context,
 	sender EnvelopeSender,
 	state *connectionState,
 	remote *controlpb.ReconcileConnection,
 ) error {
+	adapter.mu.Lock()
+	adapter.divergedClosing[remote.GetConnectionId()] = &divergedObligation{
+		identity:   proto.Clone(remote.GetIdentity()).(*controlpb.ConnectionIdentity),
+		generation: remote.GetGeneration(),
+	}
+	adapter.mu.Unlock()
 	state.mu.Lock()
 	adapter.closeStateLocked(state, backend.SrcProxyErr)
 	state.mu.Unlock()
+	return adapter.sendDivergedClose(ctx, sender, remote)
+}
+
+// sendDivergedClose (re-)issues the divergence CloseCommand with the
+// CURRENT sender. A missing capability or a failed send keeps the
+// obligation for the next round.
+func (adapter *RouterAdapter) sendDivergedClose(
+	ctx context.Context,
+	sender EnvelopeSender,
+	remote *controlpb.ReconcileConnection,
+) error {
 	if !sender.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE)) {
 		return nil
 	}
@@ -735,6 +781,17 @@ func (adapter *RouterAdapter) handleReconcile(
 	// is capability-gated for rolling compatibility: legacy peers keep
 	// the original identification-by-omission behavior with no orphan
 	// closes.
+	// Authoritative omission clears divergence obligations: a Rust
+	// record no longer reported means the condemned session is really
+	// gone.
+	adapter.mu.Lock()
+	for id := range adapter.divergedClosing {
+		if _, still := rust[id]; !still {
+			delete(adapter.divergedClosing, id)
+		}
+	}
+	adapter.mu.Unlock()
+
 	rehydration := sender.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
 	if rehydration {
 		for id, remote := range rust {
@@ -747,6 +804,25 @@ func (adapter *RouterAdapter) handleReconcile(
 				return adapter.sendProtocolError(ctx, sender, requestID,
 					controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION,
 					"reconcile connection requires a nonzero generation and a consistent identity")
+			}
+			// A still-pending divergence close: the SAME condemned
+			// record must never re-rehydrate — re-issue its close with
+			// the current sender and move on. A DIFFERENT
+			// {identity, generation} under the id is a new incarnation:
+			// the old obligation is moot.
+			adapter.mu.Lock()
+			obligation := adapter.divergedClosing[id]
+			adapter.mu.Unlock()
+			if obligation != nil {
+				if obligation.matches(remote) {
+					if err := adapter.sendDivergedClose(ctx, sender, remote); err != nil {
+						return err
+					}
+					continue
+				}
+				adapter.mu.Lock()
+				delete(adapter.divergedClosing, id)
+				adapter.mu.Unlock()
 			}
 			// A known id whose generation or identity differs is a new
 			// incarnation reusing the id after a Rust restart: retire

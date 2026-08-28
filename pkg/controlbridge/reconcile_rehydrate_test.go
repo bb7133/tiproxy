@@ -610,7 +610,10 @@ func TestReconcileCompletesLostSuccessfulAssignment(t *testing.T) {
 	// selector's single Finish(false), a precise force CloseCommand
 	// goes to the Rust side, no ghost remains, and the late original
 	// RouteResult is still a tombstone no-op.
-	rt2 := router.NewStaticRouter([]string{"tidb-a:4000"})
+	// tidb-b is a fully LEGAL router member — the strongest form of the
+	// trap: rehydrating the condemned record would "work" and put
+	// accounting back to 1.
+	rt2 := router.NewStaticRouter([]string{"tidb-a:4000", "tidb-b:4000"})
 	handler2 := &recordingHandler{rt: rt2}
 	adapter2 := newTestAdapter(t, handler2)
 	adapter2.AttachRouterLookup(func(string) (router.Router, error) { return rt2, nil })
@@ -618,6 +621,8 @@ func TestReconcileCompletesLostSuccessfulAssignment(t *testing.T) {
 	sendHandshake(t, adapter2, oldPeer2, 9, "0.0.0.0:6000", "root")
 	sendRoute(t, adapter2, oldPeer2, 9, "0.0.0.0:6000", "root")
 	divergedAssignment := lastAssignment(t, oldPeer2)
+	require.Equal(t, "tidb-a:4000", divergedAssignment.GetBackendAddress(),
+		"the static router assigns its first member; tidb-b diverges from it")
 	mismatched := &controlpb.ReconcileConnection{
 		ConnectionId: 9,
 		BackendId:    "tidb-b:4000",
@@ -644,6 +649,28 @@ func TestReconcileCompletesLostSuccessfulAssignment(t *testing.T) {
 	newPeer2.mu.Unlock()
 	require.NotNil(t, divergedClose, "the Rust side receives a precise CloseCommand")
 	require.True(t, divergedClose.GetForce())
+	// ROUND 2: the CloseCommand was NOT consumed (Rust may have missed
+	// it) and the SAME condemned record is reported again. The closing
+	// obligation must block re-rehydration: accounting stays 0, no live
+	// state reappears, the close retires exactly once locally, and the
+	// close is RE-ISSUED.
+	require.NoError(t, adapter2.HandleEnvelope(context.Background(), newPeer2, reconcileRequestEnvelope(913, mismatched)))
+	require.Equal(t, 0, rt2.ConnCount(), "round 2 must not rehydrate the condemned session")
+	require.Nil(t, adapter2.get(9), "round 2 leaves no live state")
+	require.Equal(t, closesBefore+1, handler2.closeCalls, "OnConnClose ran exactly once across rounds")
+	closeCommands := 0
+	newPeer2.mu.Lock()
+	for _, envelope := range newPeer2.messages {
+		if cc := envelope.GetCloseCommand(); cc != nil && cc.GetConnectionId() == 9 {
+			closeCommands++
+		}
+	}
+	newPeer2.mu.Unlock()
+	require.Equal(t, 2, closeCommands, "the close obligation re-issues every round")
+	adapter2.mu.Lock()
+	require.NotNil(t, adapter2.divergedClosing[9], "the obligation survives until authoritative omission")
+	adapter2.mu.Unlock()
+
 	// The late original RouteResult stays a tombstone/unknown no-op.
 	sendRouteResultRaw := &controlpb.ControlEnvelope{
 		RequestId: 912,
@@ -655,4 +682,12 @@ func TestReconcileCompletesLostSuccessfulAssignment(t *testing.T) {
 	}
 	require.NoError(t, adapter2.HandleEnvelope(context.Background(), newPeer2, sendRouteResultRaw))
 	require.Equal(t, 0, rt2.ConnCount(), "late RouteResult after divergence never resurrects accounting")
+
+	// ROUND 3: the Rust side authoritatively OMITS the id — the
+	// obligation clears and nothing is rehydrated.
+	require.NoError(t, adapter2.HandleEnvelope(context.Background(), newPeer2, reconcileRequestEnvelope(914)))
+	adapter2.mu.Lock()
+	require.Nil(t, adapter2.divergedClosing[9], "authoritative omission clears the obligation")
+	adapter2.mu.Unlock()
+	require.Equal(t, 0, rt2.ConnCount())
 }
