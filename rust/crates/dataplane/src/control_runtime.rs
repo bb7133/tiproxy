@@ -356,9 +356,11 @@ pub async fn process_state_snapshot<C: SnapshotConsumer>(
     now: UnixTime,
 ) -> (ControlEnvelope, Option<u64>) {
     // The caller ([`snapshot_owner_step`]) holds the session-ownership
-    // lease across this whole call AND the subsequent last-good and
-    // applied-generation barrier, so the stage → serving swap → commit
-    // here is linearized against every session-state publication.
+    // lease across this whole call and the following last-good move (but
+    // releases it BEFORE the applied-generation barrier, which is made
+    // safe by lineage-qualifying that barrier instead), so the stage →
+    // serving swap → commit here is linearized against every
+    // session-state publication.
     let envelope = &tagged.envelope;
     let lineage = SnapshotLineage {
         peer_process_id: Arc::clone(&tagged.origin.peer_process_id),
@@ -528,8 +530,8 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     // draining; holding the lease across it would deadlock the transport
     // teardown/reconnect that is the only thing that drains the lane.
     // The barrier is instead made safe by LINEAGE-QUALIFYING it: it
-    // carries the origin serial and the dispatcher records the
-    // generation only while that session is still live, so a successor
+    // carries the origin Go lineage and the dispatcher records the
+    // generation only while that lineage is still live, so a successor
     // published during the barrier rejects this generation rather than
     // taking it onto its command gate. The session-scoped answer is sent
     // after the barrier; a stale send is dropped by the existing rules.

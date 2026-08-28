@@ -759,17 +759,24 @@ impl ControlClient {
         lock_std(&self.last_received).map(|received| received.elapsed())
     }
 
-    /// Records an atomically applied last-good snapshot generation.
+    /// Records the generation the authoritative [`SnapshotStore`] just
+    /// committed as last-good, with the current time.
     ///
-    /// Lower generations never move the clock or generation backwards.
+    /// There is deliberately NO generation-monotonic guard here: the
+    /// store is the single authority on what may commit, and it is
+    /// lineage-aware. A same-lineage stale or conflicting generation is
+    /// rejected by the store and never reaches this call; a restarted Go
+    /// is a NEW lineage whose generations reset to 1, and its first
+    /// committed generation must replace the dead lineage's — exactly as
+    /// the Go publisher's status follows this process's applied result.
+    /// Guarding on `generation >= current` here would wrongly pin the
+    /// diagnostics (and the heartbeat's reported generation) to the dead
+    /// lineage's higher number.
     pub fn mark_last_good_snapshot(&self, generation: u64) {
         if generation == 0 {
             return;
         }
-        let mut last_good = lock_std(&self.last_good_snapshot);
-        if last_good.is_none_or(|(current, _)| generation >= current) {
-            *last_good = Some((generation, Instant::now()));
-        }
+        *lock_std(&self.last_good_snapshot) = Some((generation, Instant::now()));
     }
 
     /// Returns the last-good snapshot generation and its current age.
@@ -2189,16 +2196,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_good_generation_is_monotonic_and_jitter_is_capped() -> Result<(), Box<dyn Error>>
-    {
+    async fn last_good_generation_follows_the_store_and_jitter_is_capped()
+    -> Result<(), Box<dyn Error>> {
         let (socket, _listener) = TestSocket::bind()?;
         let client = ControlClient::new(test_config(&socket))?;
+        // last-good follows the authoritative store, not a local
+        // monotonic guard: a restarted Go is a new lineage whose
+        // generation resets, so its committed generation replaces the
+        // dead lineage's higher one.
         client.mark_last_good_snapshot(9);
         client.mark_last_good_snapshot(8);
         let (generation, _) = client
             .last_good_snapshot_age()
             .ok_or("missing last-good snapshot")?;
-        assert_eq!(generation, 9);
+        assert_eq!(generation, 8);
 
         let mut first = FullJitter::new(42);
         let mut second = FullJitter::new(42);

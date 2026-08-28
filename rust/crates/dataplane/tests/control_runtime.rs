@@ -1270,3 +1270,97 @@ async fn owner_releases_lease_before_the_dispatcher_barrier() {
     dispatch.abort();
     client.shutdown();
 }
+
+/// Fix-2 last-good rollover across Go lineage (through the real owner +
+/// client): a restarted Go is a new lineage whose generation resets, so
+/// its committed generation must become the client's last-good even
+/// though it is LOWER than the dead lineage's. A same-lineage stale
+/// generation is still rejected by the authoritative store and leaves
+/// last-good untouched.
+#[tokio::test]
+async fn last_good_rolls_over_to_a_restarted_go_lower_generation() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(4);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
+    };
+
+    // Lineage A commits generation 2.
+    let state_a = live_state_as("go-a", 1);
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &state_a,
+        &tagged_as(snapshot_envelope(60, 2), "go-a", 1),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("A's snapshot applies: {step:?}")
+    };
+    assert_eq!(
+        client
+            .last_good_snapshot_age()
+            .map(|(generation, _)| generation),
+        Some(2),
+        "A's generation 2 is last-good"
+    );
+
+    // A same-lineage stale generation (1 < 2) is rejected by the store;
+    // last-good does not move.
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &state_a,
+        &tagged_as(snapshot_envelope(61, 1), "go-a", 1),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("the stale snapshot is answered, not fatal: {step:?}")
+    };
+    assert_eq!(
+        client
+            .last_good_snapshot_age()
+            .map(|(generation, _)| generation),
+        Some(2),
+        "a same-lineage stale generation leaves last-good at 2"
+    );
+
+    // Go restarts as lineage B, generation 1: the store commits it as a
+    // fresh lineage sequence, and last-good rolls over to 1.
+    let state_b = live_state_as("go-b", 2);
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &state_b,
+        &tagged_as(snapshot_envelope(62, 1), "go-b", 2),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("B's fresh-lineage snapshot applies: {step:?}")
+    };
+    assert_eq!(
+        client
+            .last_good_snapshot_age()
+            .map(|(generation, _)| generation),
+        Some(1),
+        "the restarted Go's generation 1 becomes last-good, replacing A's 2"
+    );
+    dispatch.abort();
+    client.shutdown();
+}

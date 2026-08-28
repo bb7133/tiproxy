@@ -1505,10 +1505,14 @@ impl ControlDispatchHandle {
         Arc::clone(&self.stats)
     }
 
-    /// Records the applied config snapshot generation and **waits
-    /// until the dispatcher recorded it** — the barrier callers (the
-    /// snapshot owner) must pass before acknowledging the generation
-    /// to Go. Returns false when the dispatch task is gone.
+    /// Hands the applied config snapshot generation to the dispatcher,
+    /// tagged with its Go lineage, and **waits until the dispatcher has
+    /// processed it** — the barrier callers (the snapshot owner) must
+    /// pass before acknowledging the generation to Go. The dispatcher
+    /// RECORDS it only while that lineage is still live; a superseded
+    /// lineage's generation is dropped. The ack fires either way, so
+    /// this returns true once processed and false only when the dispatch
+    /// task is gone.
     pub async fn applied_generation(
         &self,
         generation: u64,
@@ -2450,9 +2454,9 @@ async fn apply_notice<S: DispatchSender>(
             applied,
         } => {
             // Lineage-qualified in the gate's persistent state: the
-            // generation is bound to `origin_serial` and accepted only
-            // while that is the live session, and it reads back as 0 for
-            // any other session. If Go restarted while this snapshot's
+            // generation is bound to its origin Go lineage and accepted
+            // only while that lineage is live, and it reads back as 0 for
+            // any other lineage. If Go restarted while this snapshot's
             // owner transaction was in flight (the owner releases the
             // lease before this barrier, so a successor CAN be published
             // first), the successor's command gate never inherits it.
