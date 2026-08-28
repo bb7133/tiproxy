@@ -157,7 +157,8 @@ automatic reconcile restores to exactly +1; (b) a lost `ConnectionEvent{CLOSED}`
 leaves a ghost that the reconcile clears to exactly the live count; (c) a
 one-sided Go restart the surviving Rust session rides through and the new
 incarnation rehydrates; (d) a one-sided Rust restart whose dead-session ghost
-the new session's reconcile zeroes before a fresh session is counted.
+the successor Rust control session's empty reconcile zeroes before a fresh
+session is counted.
 
 ## Diagnostics and safety
 
@@ -169,10 +170,13 @@ lines and URL user-info. Rust dataplane runtime logs (the proxy log, the
 keyspace-guard-phase `tiproxy-rs-ka.log`, and the dropper `/state` snapshots the
 chains persist) land in the same run directory alongside the Go output.
 
-Cleanup only signals PIDs whose command lines contain this run's unique path or
-tag, asks TiUP to clean that exact validated tag, removes generated keys, and
-probes every reserved port. It never kills by process name or deletes TiUP's
-shared data directory.
+Cleanup signals long-lived service/daemon PIDs (TiProxy, the Rust dataplane,
+the dropper, TiUP) only when their command lines contain this run's unique path
+or tag; the FIFO-driven transient `mysql` clients a chain spawns are reaped
+best-effort by the exact PID this script just spawned and persisted to
+`state.env`, not by an ownership scan. Cleanup asks TiUP to clean that exact
+validated tag, removes generated keys, and probes every reserved port. It never
+kills by process name or deletes TiUP's shared data directory.
 
 Run framework-only checks without provisioning TiDB:
 
