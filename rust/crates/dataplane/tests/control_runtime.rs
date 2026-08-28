@@ -78,7 +78,7 @@ async fn runtime_shutdown_cascades_to_clean_join() {
     let handle = runtime.handle();
     // The session surface is live even while disconnected.
     assert!(
-        handle.applied_generation(7).await,
+        handle.applied_generation(7, 0).await,
         "the dispatch task accepts notices"
     );
     runtime.shutdown();
@@ -1103,166 +1103,168 @@ async fn live_lineage_snapshot_applies_even_across_epoch_bump() {
     client.shutdown();
 }
 
-/// A consumer that blocks inside `apply` on a release signal, then
-/// consults `still_current` exactly as a real serving consumer would
-/// immediately before its swap — recording a "serve" only when the
-/// session is still current.
-struct BarrierConsumer {
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-    served: Arc<AtomicU64>,
+/// Fix-2 deadlock-avoidance + applied-generation lineage qualification
+/// (the cross-await blocker): the owner must NOT hold the session lease
+/// while awaiting the single-threaded dispatcher's applied-generation
+/// ack, because the dispatcher can be blocked enqueuing outbound on a
+/// lane that only drains after a transport teardown/reconnect — which
+/// itself needs the lease. Here the dispatcher is wedged in a blocked
+/// send; the owner commits A under the lease, releases it, and enters
+/// the barrier. A teardown publisher that models the transport (locks
+/// the SAME production lease and publishes Disconnected + Connected B)
+/// must converge promptly — proving the lease is free during the
+/// barrier. Once the send unblocks, the dispatcher applies the
+/// successor and, under session B, REJECTS A's generation; the owner
+/// converges. Everything is deadline-bounded.
+struct BlockingSender {
+    release: tokio::sync::watch::Receiver<bool>,
+    next: AtomicU64,
 }
 
-impl dataplane::control_runtime::SnapshotConsumer for BarrierConsumer {
-    fn apply(
-        &mut self,
-        _snapshot: &Arc<control_proto::snapshot::ValidatedSnapshot>,
-        still_current: &(dyn Fn() -> bool + Send + Sync),
-    ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
-        let entered = Arc::clone(&self.entered);
-        let release = Arc::clone(&self.release);
-        let served = Arc::clone(&self.served);
+impl dataplane::control_dispatch::DispatchSender for BlockingSender {
+    fn allocate_request_id(&self) -> Option<u64> {
+        Some(self.next.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    fn send_envelope(
+        &self,
+        _envelope: ControlEnvelope,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send {
+        let mut release = self.release.clone();
         async move {
-            // Signal we are inside apply, then block — modeling a
-            // serving apply whose await points span a Go restart.
-            entered.notify_one();
-            release.notified().await;
-            // The serving swap is gated on liveness, checked with no
-            // await between the check and the (would-be) swap.
-            if still_current() {
-                served.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            } else {
-                Err(SnapshotError::unsupported(
-                    "control session superseded before swap",
-                ))
+            // Block until released — models a full outbound lane that
+            // does not drain until a reconnect.
+            while !*release.borrow() {
+                if release.changed().await.is_err() {
+                    break;
+                }
             }
+            Ok(())
         }
+    }
+
+    fn send_session_scoped(
+        &self,
+        envelope: ControlEnvelope,
+        _epoch: u64,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send {
+        self.send_envelope(envelope)
     }
 }
 
-/// Fix-2 snapshot-apply linearization (Blocker 2, atomic seam): the
-/// session-ownership lease serializes a new session's `Connected`
-/// publication against the owner's whole stage → serving swap → store
-/// commit. Even when a B transition is attempted the instant the
-/// consumer is mid-apply for A, the transition — which goes through the
-/// same lease, exactly as the transport does — is forced to wait until
-/// A has fully applied AND committed. The outcome is never a split
-/// (serving = A while the store rejected the commit): A wins entirely
-/// and B is published only afterward.
 #[tokio::test]
-async fn swap_and_commit_are_atomic_against_a_concurrent_session_switch() {
-    // A REAL client + live dispatcher: the owner step runs its whole
-    // transaction — serving swap, store commit, last-good, AND the
-    // dispatcher applied-generation barrier — under the client's actual
-    // session lease. The successor publisher contends on that SAME
-    // production lease (`client.session_lease()`), modeling the
-    // transport's `publish_state`.
+async fn owner_releases_lease_before_the_dispatcher_barrier() {
     let client = supervised_client();
-    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel(1);
-    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let sender = Arc::new(BlockingSender {
+        release: release_rx,
+        next: AtomicU64::new(0),
+    });
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(4);
+    // One shared state watch drives the dispatcher's active session AND
+    // the owner's lineage check.
+    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Disconnected);
+    let caps = 1u64 << 2; // RECONCILE_CONNECTIONS: on_connected sends a reconcile.
+    let (handle, _forwarder, dispatch) = dataplane::control_dispatch::spawn_control_dispatch_parts(
         dataplane::control_dispatch::ControlCommandHandler::new(),
-        Arc::clone(&client),
+        Arc::clone(&sender),
+        state_rx.clone(),
         snapshot_tx,
         Duration::from_secs(3600),
     );
+
+    // Publish Connected A: on_connected sends a reconcile request, which
+    // blocks on the sender — the dispatcher is now wedged.
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            capabilities: caps,
+            serial: 1,
+            peer_process_id: Arc::from("go-a"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+
     let Ok(store) = SnapshotStore::new(Vec::new()) else {
         unreachable!("store constructs")
     };
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let served = Arc::new(AtomicU64::new(0));
-    let mut consumer = BarrierConsumer {
-        entered: Arc::clone(&entered),
-        release: Arc::clone(&release),
-        served: Arc::clone(&served),
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
     };
-    let origin = tagged_as(snapshot_envelope(50, 1), "go-a", 1);
-    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connected {
-        epoch: 1,
-        capabilities: 0,
-        serial: 1,
-        peer_process_id: Arc::from("go-a"),
-        peer_started_unix_millis: 1_700_000_000_000,
-    });
 
+    // Owner for A: commits + last-good under the lease, releases the
+    // lease, then blocks in the applied-generation barrier (dispatcher
+    // wedged).
     let owner_client = Arc::clone(&client);
-    let task = tokio::spawn(async move {
+    let owner_state = state_rx.clone();
+    let owner = tokio::spawn(async move {
         let step = snapshot_owner_step(
             &owner_client,
             &handle,
             &store,
             &mut consumer,
-            &state_rx,
-            &origin,
+            &owner_state,
+            &tagged_as(snapshot_envelope(50, 1), "go-a", 1),
         )
         .await;
         (owner_client, store, step)
     });
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
 
-    // The consumer is blocked inside apply — the owner holds the lease.
-    // The B publisher models the transport: it locks the client's own
-    // session lease and publishes Connected B. It must NOT proceed until
-    // the owner has finished commit + last-good + the applied-generation
-    // barrier and released the lease.
-    entered.notified().await;
-    let b_published = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let publisher_client = Arc::clone(&client);
-    let publisher_flag = Arc::clone(&b_published);
-    let publisher = tokio::spawn(async move {
-        let publisher_lease = publisher_client.session_lease();
-        let _guard = publisher_lease.lock().await;
-        state_tx
+    // The teardown publisher models the transport: it locks the SAME
+    // production lease and publishes teardown + successor. If the owner
+    // held the lease across the barrier (the deadlock), this would hang;
+    // it must converge well within the deadline.
+    let teardown_client = Arc::clone(&client);
+    let teardown_state = state_tx.clone();
+    let teardown = tokio::time::timeout(Duration::from_secs(5), async move {
+        let lease = teardown_client.session_lease();
+        let _guard = lease.lock().await;
+        teardown_state.send(ConnectionState::Disconnected).ok();
+        teardown_state
             .send(ConnectionState::Connected {
                 epoch: 1,
-                capabilities: 0,
+                capabilities: caps,
                 serial: 2,
                 peer_process_id: Arc::from("go-b"),
                 peer_started_unix_millis: 2_000_000_000_000,
             })
             .ok();
-        publisher_flag.store(true, Ordering::Relaxed);
-        state_tx
-    });
-
-    // The B transition is serialized behind the owner's lease for the
-    // ENTIRE transaction — commit, last-good, and the applied-generation
-    // barrier all land before B can be published.
-    for _ in 0..1_000 {
-        tokio::task::yield_now().await;
-    }
+    })
+    .await;
     assert!(
-        !b_published.load(Ordering::Relaxed),
-        "B is blocked on the lease through the whole transaction"
+        teardown.is_ok(),
+        "teardown through the lease converges — the owner does not hold the lease across the barrier"
     );
 
-    release.notify_one();
-
-    let Ok((client, store, step)) = task.await else {
-        unreachable!("the owner step completes")
+    // Unblock the dispatcher: it drains the wedged send, applies the
+    // successor transition, then processes the applied-generation notice
+    // under session B — rejecting A's generation — and acks. The owner
+    // converges within the deadline.
+    release_tx.send(true).ok();
+    let joined = tokio::time::timeout(Duration::from_secs(5), owner).await;
+    let Ok(Ok((client, store, step))) = joined else {
+        unreachable!("the owner converges after the dispatcher drains")
     };
-    let _state_tx = publisher.await;
-
-    // A won atomically. Its serving swap, store commit, last-good, and
-    // applied-generation barrier all belong to the same live session;
-    // the barrier succeeded (Continue, not a fatal), and B was published
-    // only after the lease was released.
     let Ok(SnapshotStep::Continue) = step else {
-        unreachable!("the owner step continues after an atomic apply: {step:?}")
+        unreachable!("the owner step continues: {step:?}")
     };
-    assert_eq!(served.load(Ordering::Relaxed), 1, "A performed its swap");
+    // A's serving/store/last-good landed under its own session.
     let Ok(Some(current)) = store.current() else {
         unreachable!("the store committed A")
     };
-    assert_eq!(current.generation(), 1, "the store holds A's generation");
+    assert_eq!(current.generation(), 1);
     let Some((generation, _)) = client.last_good_snapshot_age() else {
         unreachable!("last-good advanced to A's generation")
     };
-    assert_eq!(generation, 1, "last-good is A's generation");
-    assert!(
-        b_published.load(Ordering::Relaxed),
-        "B is published only after A released the lease"
-    );
+    assert_eq!(generation, 1);
+    let _ = release_tx;
     dispatch.abort();
     client.shutdown();
 }

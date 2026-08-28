@@ -512,19 +512,27 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     state: &watch::Receiver<ConnectionState>,
     tagged: &TaggedEnvelope,
 ) -> Result<SnapshotStep, TransportError> {
-    // The session-ownership lease is held across the ENTIRE ownership
-    // transaction: the lineage check, the serving swap, the store
-    // commit, the last-good move, AND the dispatcher applied-generation
-    // barrier ack. Every session-state publication (a successor
-    // `Connected`, a teardown `Disconnected`, `Connecting`, `Shutdown`)
-    // goes through the transport's lease-guarded `publish_state`, so
-    // none of them can land in the middle of this transaction. A
-    // snapshot therefore either observes the successor before its check
-    // (and does nothing) or completes — serving, store, last-good, and
-    // applied-generation all belonging to the same live session — before
-    // the successor becomes visible. The exact-session answer is sent
-    // AFTER the lease is released: it is session-scoped, so a stale send
-    // is dropped by the existing rules and Go re-sends.
+    // The session-ownership lease is held across the lineage check, the
+    // serving swap, the store commit, and the last-good move — every
+    // session-state publication (a successor `Connected`, a teardown
+    // `Disconnected`, `Connecting`, `Shutdown`) goes through the
+    // transport's lease-guarded `publish_state`, so none of them can
+    // land in the middle of the serving/store transaction. A snapshot
+    // therefore either observes the successor before its check (and does
+    // nothing) or completes serving + store + last-good under its own
+    // live session before the successor becomes visible.
+    //
+    // The lease is RELEASED before the applied-generation barrier. That
+    // barrier awaits the single-threaded dispatcher, which can itself be
+    // blocked enqueuing outbound while a dead session's lane is not yet
+    // draining; holding the lease across it would deadlock the transport
+    // teardown/reconnect that is the only thing that drains the lane.
+    // The barrier is instead made safe by LINEAGE-QUALIFYING it: it
+    // carries the origin serial and the dispatcher records the
+    // generation only while that session is still live, so a successor
+    // published during the barrier rejects this generation rather than
+    // taking it onto its command gate. The session-scoped answer is sent
+    // after the barrier; a stale send is dropped by the existing rules.
     let lease = client.session_lease();
     let guard = lease.lock().await;
     // Lineage gate BEFORE the transaction: a snapshot whose origin Go
@@ -543,19 +551,23 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     let (answer, applied) = process_state_snapshot(store, consumer, state, tagged, now).await;
     if let Some(generation) = applied {
         client.mark_last_good_snapshot(generation);
-        if !handle.applied_generation(generation).await {
-            drop(guard);
-            if client.is_shutdown() {
-                return Ok(SnapshotStep::CleanExit);
-            }
-            return Err(TransportError::Configuration(
-                "dispatch task gone before the applied-generation barrier".to_owned(),
-            ));
-        }
     }
-    // The transaction is complete and durable under the live session;
-    // release the lease before the (session-scoped) answer send.
+    // Serving, store, and last-good are durable under the live session;
+    // release the lease BEFORE the (possibly transport-dependent)
+    // applied-generation barrier and the session-scoped answer.
     drop(guard);
+    if let Some(generation) = applied
+        && !handle
+            .applied_generation(generation, tagged.origin.serial)
+            .await
+    {
+        if client.is_shutdown() {
+            return Ok(SnapshotStep::CleanExit);
+        }
+        return Err(TransportError::Configuration(
+            "dispatch task gone before the applied-generation barrier".to_owned(),
+        ));
+    }
     match client
         .send_session_scoped(answer, tagged.origin.serial)
         .await

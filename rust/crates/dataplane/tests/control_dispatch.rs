@@ -1898,6 +1898,7 @@ async fn applied_generation_ack_orders_before_inbound_commands() {
         .notice_tx
         .send(DispatchNotice::AppliedGeneration {
             generation: 7,
+            origin_serial: 1,
             applied: ack_tx,
         })
         .await
@@ -3089,6 +3090,109 @@ async fn no_live_session_frame_is_deferred_then_classified() {
         harness.stats.unrouted.load(Ordering::Relaxed),
         1,
         "the successor lineage's own frame reaches the gate"
+    );
+    harness.task.abort();
+}
+
+/// Fix-2 applied-generation lineage qualification: a
+/// `DispatchNotice::AppliedGeneration` from a SUPERSEDED session (Go
+/// restarted while its snapshot owner was mid-transaction — the owner
+/// releases the session lease before this barrier, so a successor is
+/// already live) must not stamp its generation onto the successor's
+/// command gate; a notice from the live session does.
+#[tokio::test(start_paused = true)]
+async fn applied_generation_is_lineage_qualified() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+    // Live session B (serial 2, lineage go-b). Capability-less so no
+    // automatic ReconcileRequest pollutes the sender.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: 0,
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+
+    // A stale applied-generation from the dead session (serial 1): the
+    // barrier still acks so the owner converges, but B's gate must NOT
+    // record generation 7.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::AppliedGeneration {
+            generation: 7,
+            origin_serial: 1,
+            applied: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = ack_rx.await else {
+        unreachable!("the barrier acks even when it rejects the generation")
+    };
+
+    // A drain at generation 3 is admitted — the gate's applied
+    // generation did not advance to A's 7.
+    let drain_a = DrainCommand {
+        drain_id: "d-a".to_owned(),
+        listener_names: Vec::new(),
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: 1_010_000,
+        force_deadline_unix_millis: 1_020_000,
+        command_sequence: 1,
+    };
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: envelope(30, 3, Body::DrainCommand(drain_a)),
+            origin: session_meta_as("go-b", 2, 1),
+        })
+        .await
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    assert!(
+        matches!(sent[0].body, Some(Body::DrainResult(_))),
+        "the dead session's generation was rejected, so an older drain is still admitted"
+    );
+
+    // The LIVE session's applied-generation IS recorded.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::AppliedGeneration {
+            generation: 7,
+            origin_serial: 2,
+            applied: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(()) = ack_rx.await else {
+        unreachable!("the live-session barrier acks")
+    };
+    let drain_b = DrainCommand {
+        drain_id: "d-b".to_owned(),
+        listener_names: Vec::new(),
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: 1_010_000,
+        force_deadline_unix_millis: 1_020_000,
+        command_sequence: 2,
+    };
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: envelope(31, 3, Body::DrainCommand(drain_b)),
+            origin: session_meta_as("go-b", 2, 1),
+        })
+        .await
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 2).await;
+    assert_eq!(
+        error_code(&sent[1]),
+        Some(ErrorCode::StaleGeneration),
+        "the live session's generation 7 was recorded, so a generation-3 drain is stale"
     );
     harness.task.abort();
 }

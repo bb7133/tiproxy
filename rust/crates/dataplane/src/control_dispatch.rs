@@ -1326,7 +1326,16 @@ pub enum DispatchNotice {
     AppliedGeneration {
         /// The committed generation.
         generation: u64,
-        /// Completed when the dispatcher recorded it.
+        /// The Rust-local serial of the session that produced the
+        /// snapshot. The dispatcher records the generation ONLY when
+        /// this is still the live session — a snapshot whose session
+        /// was superseded (Go restarted) must not stamp its generation
+        /// onto the successor's command gate. The ack fires either way
+        /// so the owner (which no longer holds the session lease here)
+        /// always makes progress.
+        origin_serial: u64,
+        /// Completed when the dispatcher has processed it (recorded, or
+        /// dropped as superseded).
         applied: tokio::sync::oneshot::Sender<()>,
     },
     /// An admitted session registers its channels. `applied` is the
@@ -1489,11 +1498,12 @@ impl ControlDispatchHandle {
     /// until the dispatcher recorded it** — the barrier callers (the
     /// snapshot owner) must pass before acknowledging the generation
     /// to Go. Returns false when the dispatch task is gone.
-    pub async fn applied_generation(&self, generation: u64) -> bool {
+    pub async fn applied_generation(&self, generation: u64, origin_serial: u64) -> bool {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
         if !self
             .notify(DispatchNotice::AppliedGeneration {
                 generation,
+                origin_serial,
                 applied: applied_tx,
             })
             .await
@@ -2130,6 +2140,18 @@ pub async fn run_control_dispatch<S: DispatchSender>(
             }
             notice = notices.recv() => {
                 let Some(notice) = notice else { return Ok(()) };
+                // The applied-generation ack must be judged against the
+                // CURRENT session: apply any pending connection
+                // transition first for it (only), so a successor
+                // published while the ack waited is visible and a
+                // superseded generation is rejected rather than stamped
+                // onto the new session. Every OTHER notice (adoption
+                // registrations) intentionally applies BEFORE the
+                // pending transition, so that transition's automatic
+                // reconcile export carries the adoption.
+                if matches!(notice, DispatchNotice::AppliedGeneration { .. }) {
+                    apply_state_transitions(&sender, &mut handler, &mut state).await?;
+                }
                 apply_notice(&sender, &mut handler, notice).await
             }
             // Inbound is processed ONLY while a live session exists.
@@ -2375,6 +2397,10 @@ fn apply_metering_notice(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over every dispatch notice variant reads best in one place"
+)]
 async fn apply_notice<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
@@ -2383,9 +2409,19 @@ async fn apply_notice<S: DispatchSender>(
     match notice {
         DispatchNotice::AppliedGeneration {
             generation,
+            origin_serial,
             applied,
         } => {
-            handler.set_applied_generation(generation);
+            // Lineage-qualified: record the generation only while the
+            // producing session is still live. If Go restarted while
+            // this snapshot's owner transaction was in flight (the owner
+            // releases the session lease before this barrier, so a
+            // successor CAN be published first), a stale generation must
+            // not stamp the successor's command gate. The ack fires
+            // regardless so the owner always converges.
+            if handler.active_session().map(|(serial, _, _)| serial) == Some(origin_serial) {
+                handler.set_applied_generation(generation);
+            }
             let _ = applied.send(());
         }
         DispatchNotice::RegisterSession {
