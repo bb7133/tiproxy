@@ -1562,6 +1562,159 @@ PYAR
 	printf 'CA_FIFO=\n' >>"$run_dir/state.env"
 	echo "control-frame-drop-connected: a lost RouteResult{connected} left the session uncounted; a real reconnect's reconcile restored it exactly"
 fi
+if [[ $ka_use_dropper == true ]]; then
+	# ---- CTL-06 chaos chain (c): a one-sided Go control-plane restart.
+	# The Go process is SIGKILLed (unclean crash) and restarted on the
+	# same control socket + config; the Rust dataplane keeps serving its
+	# established session throughout, reconnects to the NEW Go incarnation
+	# through the dropper, and rehydrates. Oracles: the old session
+	# survives with an unchanged identity+backend, the new incarnation
+	# applies a snapshot, its per-backend accounting rehydrates to the
+	# exact live count, and a fresh connection works.
+	CC_FIFO="$run_dir/cc-session.fifo"
+	mkfifo "$CC_FIFO"
+	printf 'CC_FIFO=%q\n' "$CC_FIFO" >>"$run_dir/state.env"
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$CC_FIFO" >"$run_dir/cc-session.out" 2>&1 &
+	CC_SESSION_PID=$!
+	printf 'CC_SESSION_PID=%q\n' "$CC_SESSION_PID" >>"$run_dir/state.env"
+	exec 6>"$CC_FIFO"
+	cc_query() {
+		local marker=$1 sql=$2 line=
+		printf '%s\n' "$sql" >&6
+		for _ in {1..40}; do
+			line=$(grep -s "^$marker|" "$run_dir/cc-session.out" | tail -1 || true)
+			if [[ -n $line ]]; then
+				printf '%s\n' "$line"
+				return 0
+			fi
+			kill -0 "$CC_SESSION_PID" 2>/dev/null || { echo "chain-c: session died" >&2; return 1; }
+			sleep 0.5
+		done
+		echo "chain-c: session never answered $marker" >&2
+		return 1
+	}
+	cc_baseline=$(cc_query CC1 "SELECT CONCAT('CC1|', CONNECTION_ID(), '|', @@port);") || exit 1
+	cc_conn_id=$(cut -d'|' -f2 <<<"$cc_baseline")
+	cc_port=$(cut -d'|' -f3 <<<"$cc_baseline")
+	if [[ $cc_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-c: old session landed on @@port=$cc_port, expected the pinned $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	# Clean baseline: this new session must be the ONLY live connection on
+	# the pin (poll until the gauge settles to exactly 1, which also
+	# confirms the previous chain fully drained). rehydrate is checked
+	# against this exact value.
+	cc_before=0
+	cc_baseline_ready=false
+	for _ in {1..60}; do
+		cc_before=$(ka_backend_conn "$ka_pinned_addr")
+		((cc_before == 1)) && { cc_baseline_ready=true; break; }
+		sleep 0.5
+	done
+	if [[ $cc_baseline_ready != true ]]; then
+		echo "chain-c: pinned backend did not settle to exactly the 1 old session (got $cc_before)" >&2
+		exit 1
+	fi
+	cc_old_pid=$KA_PID
+	echo "chain-c: old session CONNECTION_ID=$cc_conn_id backend=127.0.0.1:$cc_port; Go pid=$cc_old_pid; gauge=$cc_before"
+	# SIGKILL the Go control plane and clear its dead control socket, then
+	# restart it on the same socket + config (ownership-checked helpers).
+	sigkill_owned_process "$cc_old_pid" "tiproxy-ka.toml" ||
+		{ echo "chain-c: could not SIGKILL Go $cc_old_pid" >&2; exit 1; }
+	remove_dead_backend_socket "$KA_SOCKET" "$cc_old_pid" ||
+		{ echo "chain-c: could not clear the dead Go control socket" >&2; exit 1; }
+	"$repo_root/bin/tiproxy" --config "$run_dir/tiproxy-ka.toml" \
+		>>"$run_dir/tiproxy-ka.out" 2>&1 &
+	KA_PID=$!
+	printf 'KA_PID=%q\n' "$KA_PID" >>"$run_dir/state.env"
+	if [[ $KA_PID == "$cc_old_pid" ]]; then
+		echo "chain-c: restarted Go reused pid $KA_PID (cannot distinguish incarnations)" >&2
+		exit 1
+	fi
+	echo "chain-c: Go restarted pid $cc_old_pid -> $KA_PID"
+	cc_api_up=false
+	for _ in {1..100}; do
+		if ! kill -0 "$KA_PID" 2>/dev/null; then break; fi
+		if curl --noproxy '*' --fail --silent \
+			"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+			cc_api_up=true
+			break
+		fi
+		sleep 0.2
+	done
+	if [[ $cc_api_up != true ]]; then
+		echo "chain-c: restarted Go API never came up" >&2
+		tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
+		exit 1
+	fi
+	# The dataplane must re-sync with the NEW incarnation: it applies a
+	# snapshot from the fresh generation sequence.
+	cc_synced=false
+	cc_applied=0
+	for _ in {1..100}; do
+		cc_applied=$(curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_api_port/api/dataplane/status" 2>/dev/null |
+			python3 -c 'import json,sys; print(json.load(sys.stdin).get("applied_generation",0))' 2>/dev/null || echo 0)
+		if [[ ${cc_applied:-0} =~ ^[0-9]+$ ]] && ((cc_applied > 0)); then
+			cc_synced=true
+			break
+		fi
+		sleep 0.2
+	done
+	if [[ $cc_synced != true ]]; then
+		echo "chain-c: dataplane never re-synced with the restarted Go (applied_generation stayed 0)" >&2
+		exit 1
+	fi
+	echo "chain-c: dataplane re-synced with the new Go incarnation (applied_generation=$cc_applied)"
+	# Oracle: the OLD session survived with an unchanged identity+backend.
+	cc_check=$(cc_query CC2 "SELECT CONCAT('CC2|', CONNECTION_ID(), '|', @@port);") || exit 1
+	cc_conn_id2=$(cut -d'|' -f2 <<<"$cc_check")
+	cc_port2=$(cut -d'|' -f3 <<<"$cc_check")
+	if [[ $cc_conn_id2 != "$cc_conn_id" || $cc_port2 != "$cc_port" ]]; then
+		echo "chain-c: old session changed across the restart: $cc_check (baseline $cc_baseline)" >&2
+		exit 1
+	fi
+	echo "chain-c: old session intact across Go restart: CONNECTION_ID=$cc_conn_id2 backend=127.0.0.1:$cc_port2"
+	# Oracle: the new Go rehydrated its per-backend accounting to EXACTLY
+	# the live count (the surviving session), never over.
+	cc_rehydrated=false
+	cc_now=0
+	for _ in {1..60}; do
+		cc_now=$(ka_backend_conn "$ka_pinned_addr")
+		if ((cc_now > cc_before)); then
+			echo "chain-c: rehydrated accounting over-counted ($cc_now > $cc_before)" >&2
+			exit 1
+		fi
+		if ((cc_now == cc_before)); then
+			cc_rehydrated=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $cc_rehydrated != true ]]; then
+		echo "chain-c: new Go never rehydrated accounting to $cc_before (last $cc_now)" >&2
+		exit 1
+	fi
+	echo "chain-c: new Go rehydrated accounting -> backend $ka_pinned_addr now $cc_now (exact live count)"
+	# Oracle: a fresh connection through the restarted control plane works.
+	cc_new_port=$(mysql_ka_root 'SELECT @@port' 2>/dev/null || true)
+	if [[ $cc_new_port != "$TIDB_PORT_0" ]]; then
+		echo "chain-c: a new connection after restart landed on '$cc_new_port', expected $TIDB_PORT_0" >&2
+		exit 1
+	fi
+	echo "chain-c: new connection after restart served by 127.0.0.1:$cc_new_port"
+	exec 6>&-
+	for _ in {1..40}; do kill -0 "$CC_SESSION_PID" 2>/dev/null || break; sleep 0.25; done
+	kill "$CC_SESSION_PID" 2>/dev/null || true
+	wait "$CC_SESSION_PID" 2>/dev/null || true
+	printf 'CC_SESSION_PID=\n' >>"$run_dir/state.env"
+	rm -f "$CC_FIFO"
+	printf 'CC_FIFO=\n' >>"$run_dir/state.env"
+	echo "go-one-sided-restart: the Go control plane crashed and restarted; the Rust session survived and the new incarnation rehydrated exactly"
+fi
 if [[ $mode == rust ]]; then
 	kill -s INT "$KA_RUST_PID" 2>/dev/null || true
 	for _ in {1..100}; do
