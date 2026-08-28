@@ -79,12 +79,25 @@ use crate::control_dispatch::{
 pub trait SnapshotConsumer: Send + 'static {
     /// Applies one validated snapshot.
     ///
+    /// `still_current` is a cheap synchronous check of whether the
+    /// control session that produced this snapshot is still the live
+    /// one. A consumer that performs an externally visible serving
+    /// swap **must** call it immediately before that swap, inside
+    /// whatever lock guards the swap and with no `.await` between the
+    /// check and the swap, and reject (return an error, applying
+    /// nothing) when it returns `false`. The snapshot owner can span a
+    /// Go restart at any `.await` inside `apply`; without this check a
+    /// dead lineage's config could become the served generation after
+    /// its process is gone. Consumers with no serving side effect may
+    /// ignore it.
+    ///
     /// # Errors
     ///
     /// Returns the rejection reported to the peer.
     fn apply(
         &mut self,
         snapshot: &Arc<ValidatedSnapshot>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> impl Future<Output = Result<(), SnapshotError>> + Send;
 }
 
@@ -96,6 +109,7 @@ where
     fn apply(
         &mut self,
         snapshot: &Arc<ValidatedSnapshot>,
+        _still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
         self(snapshot)
     }
@@ -337,6 +351,7 @@ pub fn spawn_control_runtime_with_client<C: SnapshotConsumer>(
 pub async fn process_state_snapshot<C: SnapshotConsumer>(
     store: &SnapshotStore,
     consumer: &mut C,
+    state: &watch::Receiver<ConnectionState>,
     tagged: &TaggedEnvelope,
     now: UnixTime,
 ) -> (ControlEnvelope, Option<u64>) {
@@ -351,7 +366,11 @@ pub async fn process_state_snapshot<C: SnapshotConsumer>(
             match store.stage(generation, snapshot.clone(), now, lineage) {
                 Ok(staged) => {
                     let consumer_verdict = if staged.is_changed() {
-                        consumer.apply(staged.snapshot()).await
+                        // The consumer calls this immediately before any
+                        // serving swap so a lineage superseded mid-apply
+                        // never becomes the served generation.
+                        let still_current = || origin_matches_live_session(state, &tagged.origin);
+                        consumer.apply(staged.snapshot(), &still_current).await
                     } else {
                         // Already committed — which implies the whole
                         // two-phase apply (consumer included) succeeded
@@ -359,6 +378,24 @@ pub async fn process_state_snapshot<C: SnapshotConsumer>(
                         Ok(())
                     };
                     match consumer_verdict {
+                        // Re-check lineage AFTER the consumer's apply
+                        // (its await points can span a Go restart): if
+                        // the live session is no longer this snapshot's
+                        // lineage, the staged token is dropped
+                        // uncommitted — the store, last-good, and the
+                        // applied-generation barrier never advance under
+                        // a dead lineage. (The serving consumer may have
+                        // already swapped its generation; the live Go's
+                        // own desired snapshot re-applies its config, and
+                        // the dispatch loop's applied-generation barrier
+                        // never binds commands to this uncommitted view.)
+                        Ok(()) if !origin_matches_live_session(state, &tagged.origin) => (
+                            SnapshotError::unsupported(
+                                "control session changed lineage during snapshot apply",
+                            )
+                            .to_result(store_generation(store)),
+                            None,
+                        ),
                         Ok(()) => match store.commit(staged) {
                             Ok(outcome) => {
                                 let applied = outcome.snapshot.generation();
@@ -479,10 +516,11 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     // Its desired state belongs to a process that no longer owns the
     // control plane; the current Go re-sends on its own session.
     if !origin_matches_live_session(state, &tagged.origin) {
+        client.count_foreign_snapshot_dropped();
         return Ok(SnapshotStep::Continue);
     }
     let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
-    let (answer, applied) = process_state_snapshot(store, consumer, tagged, now).await;
+    let (answer, applied) = process_state_snapshot(store, consumer, state, tagged, now).await;
     if let Some(generation) = applied {
         client.mark_last_good_snapshot(generation);
         if !handle.applied_generation(generation).await {

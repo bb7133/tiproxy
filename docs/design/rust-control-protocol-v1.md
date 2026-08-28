@@ -95,7 +95,7 @@ The v1 capability registry is append-only:
 | ---: | --- | --- |
 | 1 | `PER_CONNECTION_CLOSE` | `CloseCommand` / `CloseResult` |
 | 2 | `RECONCILE_CONNECTIONS` | the `ReconcileRequest.connections` field |
-| 3 | `RECONCILE_SESSION_REHYDRATION` | connection rehydration under `RECONCILE_CONNECTIONS` (identification by omission, no orphan closes) |
+| 3 | `RECONCILE_SESSION_REHYDRATION` | connection rehydration under `RECONCILE_CONNECTIONS`: the reconcile carries per-connection identity, applied generation, and pending-command watermarks so Rust re-adopts surviving sessions across a control reconnect and Go resumes their redirect/drain/close lifecycle without re-issuing terminals or orphaning in-flight commands |
 
 The mandatory Go `Hello` process lineage (above) is deliberately **not** gated
 on any of these capabilities: it is required whenever a Go control plane speaks

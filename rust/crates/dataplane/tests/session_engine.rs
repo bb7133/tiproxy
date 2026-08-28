@@ -403,6 +403,18 @@ async fn spawn_stack() -> Stack {
         snapshot_tx,
         Duration::from_millis(20),
     );
+    // The dispatch loop processes inbound frames only while a session is
+    // live; publish the matching `Connected` (same lineage as the
+    // forwarder resume below) so routed control answers are not deferred.
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 1,
+            capabilities: 0,
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
     let Ok(()) = forwarder
         .resume_session(SessionMeta {
             serial: 1,

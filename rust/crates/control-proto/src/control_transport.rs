@@ -381,6 +381,11 @@ pub struct ControlClient {
     /// no longer negotiated at write (or enqueue) time; the owner
     /// regenerates that work on the next `Connected` transition.
     session_scoped_dropped: AtomicU64,
+    /// Inbound `StateSnapshot`s the snapshot owner dropped because their
+    /// origin Go lineage was not the live session's (a queued snapshot
+    /// the owner outran across a Go restart) — never staged, applied,
+    /// committed, or allowed to move last-good / applied-generation.
+    foreign_snapshot_dropped: AtomicU64,
     reconnect_attempts: AtomicU64,
     running: AtomicBool,
     last_received: StdMutex<Option<Instant>>,
@@ -412,6 +417,7 @@ impl ControlClient {
             next_request_id: AtomicU64::new(0),
             metrics_dropped: AtomicU64::new(0),
             session_scoped_dropped: AtomicU64::new(0),
+            foreign_snapshot_dropped: AtomicU64::new(0),
             reconnect_attempts: AtomicU64::new(0),
             running: AtomicBool::new(false),
             last_received: StdMutex::new(None),
@@ -698,6 +704,20 @@ impl ControlClient {
     #[must_use]
     pub fn metrics_dropped(&self) -> u64 {
         self.metrics_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Returns how many inbound snapshots the owner dropped for
+    /// belonging to a foreign Go lineage (observable evidence that the
+    /// owner-side lineage gate fired).
+    #[must_use]
+    pub fn foreign_snapshot_dropped(&self) -> u64 {
+        self.foreign_snapshot_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Records one owner-side foreign-lineage snapshot drop.
+    pub fn count_foreign_snapshot_dropped(&self) {
+        self.foreign_snapshot_dropped
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns the age of the last complete, validated peer frame.

@@ -2074,7 +2074,29 @@ pub async fn run_control_dispatch<S: DispatchSender>(
 ) -> Result<(), DispatchFatal> {
     let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A frame dequeued in the narrow race where a session teardown was
+    // observed AFTER the inbound arm was enabled but BEFORE the state
+    // barrier ran: it cannot be classified without a live lineage, so
+    // it is held here and processed on the next `Connected` transition
+    // (same-lineage → processed, foreign → dropped). At most one such
+    // frame can exist because the inbound arm is disabled while it is
+    // pending.
+    let mut deferred: Option<TaggedEnvelope> = None;
     loop {
+        // A deferred frame is retried the moment a live session exists;
+        // until then it waits (the select below blocks on a transition).
+        if let Some(frame) = deferred.take() {
+            if handler.active_session().is_some() {
+                apply_state_transitions(&sender, &mut handler, &mut state).await?;
+                if handler.active_session().is_some() {
+                    process_inbound(&sender, &mut handler, &snapshot_tx, frame, unix_now_millis)
+                        .await?;
+                    continue;
+                }
+            }
+            // Still no live session: keep holding it.
+            deferred = Some(frame);
+        }
         let step = tokio::select! {
             changed = state.changed() => {
                 if changed.is_err() {
@@ -2084,6 +2106,14 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 // `changed()` marked the newest value seen: apply it
                 // directly, then drain anything that raced in after.
                 let snapshot = state.borrow().clone();
+                // A shutdown transition ends the loop even while a frame
+                // is deferred (its origin session is gone; no successor
+                // is coming). Without this the deferred-frame guard
+                // would keep the inbound arm disabled and the loop would
+                // never observe the inbound close.
+                if matches!(snapshot, ConnectionState::Shutdown) {
+                    return Ok(());
+                }
                 // Causal barrier: adoptions enqueued before this
                 // transition was observed apply BEFORE the
                 // transition's automatic reconcile, so its export
@@ -2102,7 +2132,24 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 let Some(notice) = notice else { return Ok(()) };
                 apply_notice(&sender, &mut handler, notice).await
             }
-            envelope = inbound.recv() => {
+            // Inbound is processed ONLY while a live session exists.
+            // Between a session teardown and the next `Connected` there
+            // is no lineage to judge a frame against: processing it then
+            // would let a dead lineage's Redirect/Close/Drain reach the
+            // gate (its `origin_is_foreign_lineage` is vacuously false
+            // with no live lineage) and would let the owner drop a
+            // queued snapshot a same-lineage reconnect should still get.
+            // With the arm gated, such frames wait in the bounded queue
+            // until the next `Connected` transition applies a live
+            // lineage, and are then classified same-lineage (processed)
+            // or foreign (dropped) deterministically. A pending
+            // `Connected` still in the watch re-enables this arm on the
+            // next loop turn (the state arm applies it first).
+            // The arm stays enabled while no frame is deferred, so an
+            // `inbound` close (transport gone / shutdown) still
+            // terminates the loop. A frame dequeued with no live session
+            // is deferred below rather than processed.
+            envelope = inbound.recv(), if deferred.is_none() => {
                 let Some(envelope) = envelope else { return Ok(()) };
                 // Deterministic state barrier: whatever order the
                 // select observed things in, any pending connection
@@ -2110,14 +2157,24 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 // pumped from a previous session can never be judged
                 // against a session snapshot that predates it.
                 apply_state_transitions(&sender, &mut handler, &mut state).await?;
-                process_inbound(
-                    &sender,
-                    &mut handler,
-                    &snapshot_tx,
-                    envelope,
-                    unix_now_millis,
-                )
-                .await
+                if handler.active_session().is_some() {
+                    process_inbound(
+                        &sender,
+                        &mut handler,
+                        &snapshot_tx,
+                        envelope,
+                        unix_now_millis,
+                    )
+                    .await
+                } else {
+                    // The barrier just applied a teardown: there is no
+                    // live lineage to judge this frame against. Hold it
+                    // until the next `Connected` rather than processing
+                    // it under an absent lineage (which would let a dead
+                    // session's command reach the gate).
+                    deferred = Some(envelope);
+                    Ok(())
+                }
             }
             _ = ticker.tick() => {
                 run_tick(&sender, &mut handler).await

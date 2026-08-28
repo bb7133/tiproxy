@@ -155,6 +155,19 @@ fn tagged_as(envelope: ControlEnvelope, process_id: &str, serial: u64) -> Tagged
     }
 }
 
+/// A live-session state watch matching a `tagged_as` origin lineage.
+fn live_state_as(process_id: &str, serial: u64) -> tokio::sync::watch::Receiver<ConnectionState> {
+    let (keep_tx, rx) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: 1,
+        capabilities: 0,
+        serial,
+        peer_process_id: Arc::from(process_id),
+        peer_started_unix_millis: 1_700_000_000_000,
+    });
+    std::mem::forget(keep_tx);
+    rx
+}
+
 /// A watch receiver whose live session matches a given origin's Go
 /// lineage — the owner's lineage gate passes for that origin.
 fn live_state_for(origin: &SessionMeta) -> tokio::sync::watch::Receiver<ConnectionState> {
@@ -218,6 +231,7 @@ impl dataplane::control_runtime::SnapshotConsumer for CountingConsumer {
     fn apply(
         &mut self,
         _snapshot: &Arc<control_proto::snapshot::ValidatedSnapshot>,
+        _still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if call <= self.reject_first {
@@ -241,11 +255,13 @@ async fn consumer_rejection_never_advances_the_store() {
         calls: Arc::clone(&calls),
         reject_first: 1,
     };
+    let owner_state = live_state_for(&test_session());
 
     // First delivery: the consumer rejects generation 1.
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
+        &owner_state,
         &tagged(snapshot_envelope(10, 1)),
         test_now(),
     )
@@ -277,6 +293,7 @@ async fn consumer_rejection_never_advances_the_store() {
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
+        &owner_state,
         &tagged(snapshot_envelope(11, 1)),
         test_now(),
     )
@@ -298,6 +315,7 @@ async fn consumer_rejection_never_advances_the_store() {
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
+        &owner_state,
         &tagged(snapshot_envelope(12, 1)),
         test_now(),
     )
@@ -897,9 +915,11 @@ async fn restarted_go_same_generation_different_content_applies_fresh() {
     };
 
     // Incarnation A commits {request 1, generation 1}.
+    let state_a = live_state_as("go-a", 1);
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
+        &state_a,
         &tagged_as(snapshot_envelope(1, 1), "go-a", 1),
         test_now(),
     )
@@ -914,9 +934,11 @@ async fn restarted_go_same_generation_different_content_applies_fresh() {
     // Incarnation B (new lineage, same epoch VALUE, same request id,
     // same generation, different content): fresh sequence, applied,
     // consumer re-ran with the new content.
+    let state_b = live_state_as("go-b", 2);
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
+        &state_b,
         &tagged_as(variant_envelope(1, 1), "go-b", 2),
         test_now(),
     )
@@ -954,6 +976,7 @@ async fn restarted_go_same_generation_different_content_applies_fresh() {
     let (answer, applied) = process_state_snapshot(
         &store,
         &mut consumer,
+        &state_b,
         &tagged_as(snapshot_envelope(2, 1), "go-b", 2),
         test_now(),
     )
@@ -1078,4 +1101,119 @@ async fn live_lineage_snapshot_applies_even_across_epoch_bump() {
     assert_eq!(current.generation(), 1);
     dispatch.abort();
     client.shutdown();
+}
+
+/// A consumer that blocks inside `apply` on a release signal, then
+/// consults `still_current` exactly as a real serving consumer would
+/// immediately before its swap — recording a "serve" only when the
+/// session is still current.
+struct BarrierConsumer {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    served: Arc<AtomicU64>,
+}
+
+impl dataplane::control_runtime::SnapshotConsumer for BarrierConsumer {
+    fn apply(
+        &mut self,
+        _snapshot: &Arc<control_proto::snapshot::ValidatedSnapshot>,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> impl Future<Output = Result<(), SnapshotError>> + Send {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        let served = Arc::clone(&self.served);
+        async move {
+            // Signal we are inside apply, then block — modeling a
+            // serving apply whose await points span a Go restart.
+            entered.notify_one();
+            release.notified().await;
+            // The serving swap is gated on liveness, checked with no
+            // await between the check and the (would-be) swap.
+            if still_current() {
+                served.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            } else {
+                Err(SnapshotError::unsupported(
+                    "control session superseded before swap",
+                ))
+            }
+        }
+    }
+}
+
+/// Fix-2 snapshot-apply TOCTOU (Blocker 2): while the owner is inside
+/// `consumer.apply` for lineage A, Go restarts as lineage B. On
+/// release, A must produce NO serving swap and NO store / last-good /
+/// applied-generation advance — the transaction is bound to the
+/// control-lineage ownership across the whole stage → apply → commit.
+#[tokio::test]
+async fn snapshot_apply_aborts_when_lineage_switches_mid_apply() {
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let served = Arc::new(AtomicU64::new(0));
+    let mut consumer = BarrierConsumer {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        served: Arc::clone(&served),
+    };
+    // Live session A when the apply begins.
+    let origin = tagged_as(snapshot_envelope(50, 1), "go-a", 1);
+    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: 1,
+        capabilities: 0,
+        serial: 1,
+        peer_process_id: Arc::from("go-a"),
+        peer_started_unix_millis: 1_700_000_000_000,
+    });
+
+    let task = tokio::spawn(async move {
+        let out =
+            process_state_snapshot(&store, &mut consumer, &state_rx, &origin, test_now()).await;
+        (store, out)
+    });
+
+    // Wait until the consumer is blocked inside apply, then switch the
+    // live session to a DIFFERENT Go lineage and release the consumer.
+    entered.notified().await;
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            capabilities: 0,
+            serial: 2,
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 2_000_000_000_000,
+        })
+        .ok();
+    release.notify_one();
+
+    let Ok((store, (answer, applied))) = task.await else {
+        unreachable!("the owner step completes")
+    };
+    // No applied generation, so the owner never advances the barrier.
+    assert_eq!(applied, None, "the applied generation is not advanced by A");
+    // The serving consumer refused its swap.
+    assert_eq!(
+        served.load(Ordering::Relaxed),
+        0,
+        "A produced no serving swap"
+    );
+    // The store was never committed.
+    let Ok(current) = store.current() else {
+        unreachable!("store readable")
+    };
+    assert!(current.is_none(), "the store was not advanced by A");
+    // The answer is a failure, not an OK.
+    let Some(Body::SnapshotResult(result)) = &answer.body else {
+        unreachable!("result body")
+    };
+    assert_ne!(
+        result.code(),
+        control_proto::v1::ErrorCode::Ok,
+        "a lineage-superseded apply is answered as a failure"
+    );
+    // Keep the sender alive to the end.
+    drop(state_tx);
 }

@@ -852,6 +852,23 @@ fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopH
     }
 }
 
+/// Sends a minimal (capability-less, so no automatic `ReconcileRequest`)
+/// `Connected` for the go-fixture lineage so a harness has a live
+/// session — the dispatch loop only processes inbound frames while a
+/// session is live (a frame with no live lineage is deferred).
+fn connect_go_fixture(harness: &LoopHarness, serial: u64) {
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: serial,
+            serial,
+            capabilities: 0,
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+}
+
 fn spawn_loop(handler: ControlCommandHandler) -> LoopHarness {
     spawn_loop_with_tick(handler, Duration::from_secs(3600))
 }
@@ -1285,6 +1302,7 @@ async fn metering_notices_seal_and_send_on_tick() {
 async fn state_snapshots_forward_to_owner() {
     let handler = ControlCommandHandler::new();
     let mut harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
     let snapshot = ControlEnvelope {
         request_id: 77,
         generation: 9,
@@ -1695,6 +1713,7 @@ async fn pending_connected_applies_before_queued_inbound() {
 async fn applied_acks_order_arming_before_responses() {
     let handler = ControlCommandHandler::new();
     let harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
 
     let (control_tx, _control_rx) = mpsc::channel(8);
     let (resp_tx, mut resp_rx) = mpsc::channel(1);
@@ -1850,6 +1869,7 @@ async fn metering_saturation_rejects_producer_instead_of_dropping() {
 async fn applied_generation_ack_orders_before_inbound_commands() {
     let handler = ControlCommandHandler::new();
     let harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
 
     // Before any applied generation, old-provenance drains are legal.
     let early = envelope(
@@ -1985,6 +2005,7 @@ async fn directives_carry_exact_command_tokens() {
 async fn instant_completion_binds_exact_terminal_id() {
     let handler = ControlCommandHandler::new();
     let harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
 
     // The instant session: every directive is answered with its
     // completion notice immediately, using only the carried token.
@@ -2959,4 +2980,115 @@ async fn wait_for_drop(harness: &LoopHarness) {
         }
         tokio::task::yield_now().await;
     }
+}
+
+/// Fix-2 no-live-session deferral (Blocker 1): a frame that arrives
+/// while there is NO live session (a teardown was observed before the
+/// frame was classified) must not be processed under an absent lineage
+/// — it is held until the next `Connected` and only then classified
+/// same-lineage (processed) or foreign (dropped). Here the deferred
+/// frame is from a lineage the successor does not share, so once the
+/// successor is live it is dropped, never reaching the gate; a frame
+/// from the successor's own lineage is answered, proving the successor
+/// is otherwise healthy.
+#[tokio::test(start_paused = true)]
+async fn no_live_session_frame_is_deferred_then_classified() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+    // The loop starts Disconnected: send a frame with NO live session.
+    let orphan = envelope(
+        70,
+        0,
+        Body::MeteringBatch(control_proto::v1::MeteringBatch {
+            sequence: 1,
+            deltas: Vec::new(),
+        }),
+    );
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: orphan,
+            origin: session_meta_as("go-a", 1, 1),
+        })
+        .await
+        .ok();
+
+    // While no session is live the frame is held: it neither reaches
+    // the gate (no unrouted answer) nor is counted as dropped.
+    for _ in 0..2_000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.stats.unrouted.load(Ordering::Relaxed),
+        0,
+        "a frame with no live session is not processed"
+    );
+    assert_eq!(
+        harness.stats.stale_dropped.load(Ordering::Relaxed),
+        0,
+        "and not yet dropped — it is deferred"
+    );
+    assert!(
+        harness.sender.sent().is_empty(),
+        "the deferred frame produced nothing"
+    );
+
+    // A DIFFERENT lineage becomes live: the deferred frame is now
+    // classified foreign and dropped before the gate.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    for _ in 0..100_000 {
+        if harness.stats.stale_dropped.load(Ordering::Relaxed) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.stats.stale_dropped.load(Ordering::Relaxed),
+        1,
+        "the deferred frame is dropped once the foreign successor is live"
+    );
+    assert_eq!(
+        harness.stats.unrouted.load(Ordering::Relaxed),
+        0,
+        "the deferred foreign frame never reached the gate"
+    );
+
+    // The live successor's own frame is answered — it is healthy.
+    let native = envelope(
+        71,
+        0,
+        Body::MeteringBatch(control_proto::v1::MeteringBatch {
+            sequence: 2,
+            deltas: Vec::new(),
+        }),
+    );
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: native,
+            origin: session_meta_as("go-b", 2, 1),
+        })
+        .await
+        .ok();
+    for _ in 0..100_000 {
+        if harness.stats.unrouted.load(Ordering::Relaxed) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.stats.unrouted.load(Ordering::Relaxed),
+        1,
+        "the successor lineage's own frame reaches the gate"
+    );
+    harness.task.abort();
 }
