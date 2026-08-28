@@ -352,19 +352,13 @@ pub async fn process_state_snapshot<C: SnapshotConsumer>(
     store: &SnapshotStore,
     consumer: &mut C,
     state: &watch::Receiver<ConnectionState>,
-    lease: &tokio::sync::Mutex<()>,
     tagged: &TaggedEnvelope,
     now: UnixTime,
 ) -> (ControlEnvelope, Option<u64>) {
-    // Hold the session-ownership lease across the WHOLE transaction —
-    // the lineage check, the serving swap inside the consumer, and the
-    // store commit. The transport publishes a new session's `Connected`
-    // under the same lease, so a Go restart cannot land between the
-    // check and the swap: either it is already visible when we check
-    // (and we do nothing), or it waits until we have fully applied and
-    // committed under the still-live session. This is the linearization
-    // point that prevents a serving/store split.
-    let _lease = lease.lock().await;
+    // The caller ([`snapshot_owner_step`]) holds the session-ownership
+    // lease across this whole call AND the subsequent last-good and
+    // applied-generation barrier, so the stage → serving swap → commit
+    // here is linearized against every session-state publication.
     let envelope = &tagged.envelope;
     let lineage = SnapshotLineage {
         peer_process_id: Arc::clone(&tagged.origin.peer_process_id),
@@ -518,6 +512,21 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     state: &watch::Receiver<ConnectionState>,
     tagged: &TaggedEnvelope,
 ) -> Result<SnapshotStep, TransportError> {
+    // The session-ownership lease is held across the ENTIRE ownership
+    // transaction: the lineage check, the serving swap, the store
+    // commit, the last-good move, AND the dispatcher applied-generation
+    // barrier ack. Every session-state publication (a successor
+    // `Connected`, a teardown `Disconnected`, `Connecting`, `Shutdown`)
+    // goes through the transport's lease-guarded `publish_state`, so
+    // none of them can land in the middle of this transaction. A
+    // snapshot therefore either observes the successor before its check
+    // (and does nothing) or completes — serving, store, last-good, and
+    // applied-generation all belonging to the same live session — before
+    // the successor becomes visible. The exact-session answer is sent
+    // AFTER the lease is released: it is session-scoped, so a stale send
+    // is dropped by the existing rules and Go re-sends.
+    let lease = client.session_lease();
+    let guard = lease.lock().await;
     // Lineage gate BEFORE the transaction: a snapshot whose origin Go
     // lineage is not the live session's — because Go restarted while
     // this snapshot waited in the owner queue, or because there is no
@@ -527,15 +536,15 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     // control plane; the current Go re-sends on its own session.
     if !origin_matches_live_session(state, &tagged.origin) {
         client.count_foreign_snapshot_dropped();
+        drop(guard);
         return Ok(SnapshotStep::Continue);
     }
     let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
-    let lease = client.session_lease();
-    let (answer, applied) =
-        process_state_snapshot(store, consumer, state, &lease, tagged, now).await;
+    let (answer, applied) = process_state_snapshot(store, consumer, state, tagged, now).await;
     if let Some(generation) = applied {
         client.mark_last_good_snapshot(generation);
         if !handle.applied_generation(generation).await {
+            drop(guard);
             if client.is_shutdown() {
                 return Ok(SnapshotStep::CleanExit);
             }
@@ -544,6 +553,9 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
             ));
         }
     }
+    // The transaction is complete and durable under the live session;
+    // release the lease before the (session-scoped) answer send.
+    drop(guard);
     match client
         .send_session_scoped(answer, tagged.origin.serial)
         .await

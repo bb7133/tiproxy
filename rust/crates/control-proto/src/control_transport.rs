@@ -435,6 +435,21 @@ impl ControlClient {
         })
     }
 
+    /// Publishes a connection-state transition under the session
+    /// ownership lease. EVERY publication that establishes, changes, or
+    /// clears the active session goes through here, so a snapshot
+    /// owner's whole transaction (which also holds the lease) is
+    /// linearized against all of them: the owner either observes the
+    /// transition before its lineage check or completes its entire
+    /// transaction before the transition is visible. Nothing that
+    /// revokes A's ownership — a teardown `Disconnected`, `Connecting`,
+    /// `Shutdown`, or a successor `Connected` — can land in the middle
+    /// of A's serving swap / store commit / applied-generation barrier.
+    async fn publish_state(&self, state: ConnectionState) {
+        let _lease = self.session_lease.lock().await;
+        let _ = self.state_tx.send(state);
+    }
+
     /// Runs connect, Hello, the active session, and capped full-jitter reconnect.
     ///
     /// This future owns all socket I/O. Dropping it drops every reader, writer,
@@ -459,15 +474,15 @@ impl ControlClient {
         let mut jitter = FullJitter::new(self.config.reconnect_jitter_seed);
         loop {
             if *shutdown.borrow() {
-                let _ = self.state_tx.send(ConnectionState::Shutdown);
+                self.publish_state(ConnectionState::Shutdown).await;
                 return Ok(());
             }
-            let _ = self.state_tx.send(ConnectionState::Connecting);
+            self.publish_state(ConnectionState::Connecting).await;
             let connection = tokio::select! {
                 result = self.connect_and_handshake() => result,
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        let _ = self.state_tx.send(ConnectionState::Shutdown);
+                        self.publish_state(ConnectionState::Shutdown).await;
                         return Ok(());
                     }
                     Err(TransportError::Protocol("shutdown state regressed".to_owned()))
@@ -482,7 +497,7 @@ impl ControlClient {
                         // rather than publish a wrapped serial 0 that
                         // would break every session-scoped send. The
                         // supervisor surfaces this terminal condition.
-                        let _ = self.state_tx.send(ConnectionState::Disconnected);
+                        self.publish_state(ConnectionState::Disconnected).await;
                         return Err(TransportError::Protocol(
                             "session serial space exhausted".to_owned(),
                         ));
@@ -498,21 +513,14 @@ impl ControlClient {
                     }
                     self.negotiated_caps.store(caps_mask, Ordering::Release);
                     set_instant(&self.last_received, Some(Instant::now()));
-                    {
-                        // Publish the new session under the lease so it
-                        // cannot interleave with an in-flight snapshot
-                        // transaction: the owner either observes this
-                        // session before its check or completes its
-                        // whole serving+commit before this publication.
-                        let _lease = self.session_lease.lock().await;
-                        let _ = self.state_tx.send(ConnectionState::Connected {
-                            epoch: negotiated.epoch,
-                            capabilities: caps_mask,
-                            serial,
-                            peer_process_id: Arc::clone(&negotiated.peer_process_id),
-                            peer_started_unix_millis: negotiated.peer_started_unix_millis,
-                        });
-                    }
+                    self.publish_state(ConnectionState::Connected {
+                        epoch: negotiated.epoch,
+                        capabilities: caps_mask,
+                        serial,
+                        peer_process_id: Arc::clone(&negotiated.peer_process_id),
+                        peer_started_unix_millis: negotiated.peer_started_unix_millis,
+                    })
+                    .await;
                     let result = self.run_connected(negotiated, serial, handler).await;
                     if !matches!(result, Err(TransportError::Closed)) {
                         set_string(&self.last_disconnect, Some(result_to_string(&result)));
@@ -526,7 +534,7 @@ impl ControlClient {
             self.negotiated_caps.store(0, Ordering::Release);
             self.negotiated_frame_limit
                 .store(u64::from(self.config.max_frame_bytes), Ordering::Release);
-            let _ = self.state_tx.send(ConnectionState::Disconnected);
+            self.publish_state(ConnectionState::Disconnected).await;
             if *shutdown.borrow() {
                 continue;
             }
@@ -537,7 +545,7 @@ impl ControlClient {
                 () = sleep(reconnect_wait) => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        let _ = self.state_tx.send(ConnectionState::Shutdown);
+                        self.publish_state(ConnectionState::Shutdown).await;
                         return Ok(());
                     }
                 }
@@ -945,7 +953,7 @@ impl ControlClient {
         // lanes only a future session can drain.
         self.epoch.store(0, Ordering::Release);
         self.negotiated_caps.store(0, Ordering::Release);
-        let _ = self.state_tx.send(ConnectionState::Disconnected);
+        self.publish_state(ConnectionState::Disconnected).await;
         match first {
             CompletedLoop::Read(result) => {
                 let _ = tokio::join!(&mut write_loop, &mut heartbeat_loop);
