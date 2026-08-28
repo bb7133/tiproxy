@@ -55,10 +55,12 @@
 //! protocol violation and closes the session. `COM_CHANGE_USER` and
 //! `COM_STMT_PREPARE` (the prepared special response flow) are
 //! answered with a fixed unsupported error and the session closes. A
-//! control redirect reports `NotifyRedirectFailed` fail-closed (the
-//! gate terminal is exact and the session keeps its backend — Go's
-//! refused-migration behavior); safe-boundary migration via
-//! session-state transfer is the follow-up slice.
+//! control redirect executes the bounded `SHOW SESSION_STATES` exchange at
+//! the FSM safe boundary, validates the signed token/session JSON, and
+//! synchronizes the authoritative current database. Until MIG-01 installs a
+//! candidate connection, the exact gate terminal remains a fail-closed
+//! refusal: a complete validation/backend-ERR response keeps the old backend,
+//! while a disconnect or incomplete response closes the poisoned session.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,6 +88,10 @@ use session_core::error_source::FailureKind;
 use session_core::fsm::{SessionEffect, SessionEvent};
 use session_core::handshake::{
     ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend, verify_backend,
+};
+use session_core::internal_client::{
+    InternalLimits, InternalParserState, InternalProgress, InternalQuery, InternalResult,
+    SessionStateSnapshot,
 };
 use session_core::prepared::PreparedRegistry;
 use session_core::response::{
@@ -777,6 +783,23 @@ enum Awaited {
     Got,
     /// Teardown began (or the loop is gone); abandon the wire phase.
     Closing,
+}
+
+/// Whether a failed migration-snapshot attempt can safely return to the old
+/// backend. Payload-bearing parser errors are deliberately collapsed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotFailure {
+    /// A complete response (including backend ERR) was consumed, so the old
+    /// command stream remains aligned and reusable.
+    OldBackendUsable,
+    /// The backend disconnected while the internal exchange was in flight.
+    BackendNetwork,
+    /// The response ended before the parser could consume a complete result;
+    /// keeping the connection would risk treating unread internal bytes as a
+    /// user-command response.
+    Desynchronized,
+    /// Fixed allowlist construction failed, which is a proxy invariant.
+    ProxyInvariant,
 }
 
 impl Engine {
@@ -1621,9 +1644,7 @@ impl Engine {
         match effect {
             SessionEffect::BeginDrainTimer => Awaited::Got,
             SessionEffect::StartRedirectHandshake => {
-                // Fail-closed slice: refuse the migration; the session
-                // keeps its backend (Go's refused-migration path).
-                let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+                self.handle_redirect_snapshot().await;
                 Awaited::Got
             }
             SessionEffect::NotifyRedirectSucceeded => {
@@ -1694,6 +1715,90 @@ impl Engine {
                 self.closing = true;
                 self.wire_end = Some(WireErrorSource::Proxy);
                 Awaited::Closing
+            }
+        }
+    }
+
+    async fn handle_redirect_snapshot(&mut self) {
+        // MIG-00 binds the bounded snapshot query to the production socket
+        // owner at the FSM safe boundary. MIG-01 (#43) will consume the
+        // validated token/state to build a candidate; until then this slice
+        // still reports a refused redirect and keeps the old backend when the
+        // response is wire-complete.
+        match self.capture_migration_snapshot().await {
+            Ok(snapshot) => {
+                if let Some(state) = self.cmd_state.as_mut() {
+                    state.replace_current_database_from_snapshot(snapshot.current_database());
+                }
+                let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+            }
+            Err(SnapshotFailure::OldBackendUsable) => {
+                let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+            }
+            Err(SnapshotFailure::BackendNetwork) => {
+                self.wire_end = Some(WireErrorSource::BackendNetwork);
+                self.quit_source = QuitSource::BackendNetwork;
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+            }
+            Err(SnapshotFailure::Desynchronized) => {
+                self.wire_end = Some(WireErrorSource::Proxy);
+                self.quit_source = QuitSource::ProxyMalformed;
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+            }
+            Err(SnapshotFailure::ProxyInvariant) => {
+                self.wire_end = Some(WireErrorSource::Proxy);
+                self.quit_source = QuitSource::ProxyError;
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+            }
+        }
+    }
+
+    /// Runs the single allowlisted MIG-00 query on the attached old backend.
+    ///
+    /// The engine owns both backend halves, and the FSM emits this effect only
+    /// in `RedirectPending`, so no user command can share the exchange. A
+    /// parser error after a complete terminator is recoverable; any earlier
+    /// error poisons the connection instead of risking sequence confusion.
+    async fn capture_migration_snapshot(
+        &mut self,
+    ) -> Result<SessionStateSnapshot, SnapshotFailure> {
+        let limits = InternalLimits::default();
+        let query = InternalQuery::ShowSessionStates;
+        let request = query
+            .encode(limits)
+            .map_err(|_| SnapshotFailure::ProxyInvariant)?;
+        let mut parser = query
+            .parser(self.negotiated, limits)
+            .map_err(|_| SnapshotFailure::ProxyInvariant)?;
+        let Some(backend) = self.backend.as_mut() else {
+            return Err(SnapshotFailure::ProxyInvariant);
+        };
+
+        backend.writer.reset_sequence(0);
+        backend.reader.reset_sequence(1);
+        if backend.writer.write_logical(&request, true).await.is_err() {
+            return Err(SnapshotFailure::BackendNetwork);
+        }
+
+        loop {
+            let payload = backend
+                .reader
+                .read_logical(limits.max_result_bytes)
+                .await
+                .map_err(|_| SnapshotFailure::BackendNetwork)?
+                .payload;
+            match parser.consume(&payload) {
+                Ok(InternalProgress::Continue) => {}
+                Ok(InternalProgress::Complete(InternalResult::SessionStates(snapshot))) => {
+                    return Ok(snapshot);
+                }
+                Ok(InternalProgress::Complete(InternalResult::Ok(_))) => {
+                    return Err(SnapshotFailure::Desynchronized);
+                }
+                Err(_) if parser.state() == InternalParserState::Complete => {
+                    return Err(SnapshotFailure::OldBackendUsable);
+                }
+                Err(_) => return Err(SnapshotFailure::Desynchronized),
             }
         }
     }

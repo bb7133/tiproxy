@@ -41,8 +41,9 @@ use dataplane::{
     BoundSessionHandler, DataplaneServer, DispatchConnectionHandler, SystemMemoryProbe,
 };
 use mysql_wire::{
-    CapabilityFlags, HandshakeResponseParams, ResponseHeader, StatusFlags, encode_error_packet,
-    encode_handshake_response, encode_initial_handshake, encode_ok_packet,
+    CapabilityFlags, HandshakeResponseParams, ResponseHeader, StatusFlags, encode_eof_packet,
+    encode_error_packet, encode_handshake_response, encode_initial_handshake,
+    encode_length_encoded_bytes, encode_length_encoded_int, encode_ok_packet,
     parse_handshake_response, parse_initial_handshake,
 };
 use proxy_io::{PacketReader, PacketWriter};
@@ -290,7 +291,101 @@ async fn fake_backend_auth(
     writer.write_logical(&auth_ok, true).await.is_ok()
 }
 
-async fn run_fake_backend(listener: TcpListener) {
+fn result_column(name: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for field in [b"def".as_slice(), b"db", b"t", b"t", name, name] {
+        assert!(encode_length_encoded_bytes(Some(field), &mut payload).is_ok());
+    }
+    encode_length_encoded_int(12, &mut payload);
+    payload.extend_from_slice(&[45, 0, 11, 0, 0, 0, 0x03, 0, 0, 0, 0, 0]);
+    payload
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SnapshotReply {
+    Valid,
+    SigningCertificateError,
+    NullToken,
+    EmptyToken,
+    MalformedJson,
+    OversizedJson,
+    Disconnect,
+}
+
+async fn write_session_snapshot(
+    reader: &PacketReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: &mut PacketWriter<tokio::net::tcp::OwnedWriteHalf>,
+    session_states: &[u8],
+    session_token: Option<&[u8]>,
+) -> bool {
+    writer.reset_sequence(reader.expected_sequence());
+    let mut row = Vec::new();
+    assert!(encode_length_encoded_bytes(Some(session_states), &mut row).is_ok());
+    assert!(encode_length_encoded_bytes(session_token, &mut row).is_ok());
+    for payload in [
+        vec![2],
+        result_column(b"Session_states"),
+        result_column(b"Session_token"),
+        encode_eof_packet(0, StatusFlags::AUTOCOMMIT).to_vec(),
+        row,
+    ] {
+        if writer.write_logical(&payload, false).await.is_err() {
+            return false;
+        }
+    }
+    writer
+        .write_logical(&encode_eof_packet(0, StatusFlags::AUTOCOMMIT), true)
+        .await
+        .is_ok()
+}
+
+async fn respond_to_snapshot_query(
+    reader: &PacketReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: &mut PacketWriter<tokio::net::tcp::OwnedWriteHalf>,
+    snapshot_reply: SnapshotReply,
+    capabilities: CapabilityFlags,
+) -> bool {
+    if matches!(snapshot_reply, SnapshotReply::Disconnect) {
+        return false;
+    }
+    if matches!(snapshot_reply, SnapshotReply::SigningCertificateError) {
+        writer.reset_sequence(reader.expected_sequence());
+        let Ok(error) = encode_error_packet(
+            1105,
+            Some(*b"HY000"),
+            b"session token signing certificate unavailable",
+            capabilities,
+        ) else {
+            return false;
+        };
+        return writer.write_logical(&error, true).await.is_ok();
+    }
+
+    let oversized;
+    let (session_states, session_token): (&[u8], Option<&[u8]>) = match snapshot_reply {
+        SnapshotReply::Valid => (
+            br#"{"current-db":"snapshot_db","marker":"all-bytes-preserved"}"#,
+            Some(b"signed-token-private"),
+        ),
+        SnapshotReply::NullToken => (br#"{"current-db":"snapshot_db"}"#, None),
+        SnapshotReply::EmptyToken => (br#"{"current-db":"snapshot_db"}"#, Some(b"")),
+        SnapshotReply::MalformedJson => (b"{", Some(b"signed-token-private")),
+        SnapshotReply::OversizedJson => {
+            oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+            (&oversized, Some(b"signed-token-private"))
+        }
+        SnapshotReply::SigningCertificateError | SnapshotReply::Disconnect => {
+            unreachable!("handled above")
+        }
+    };
+    write_session_snapshot(reader, writer, session_states, session_token).await
+}
+
+async fn run_fake_backend(
+    listener: TcpListener,
+    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    snapshot_reply: SnapshotReply,
+) {
     let broad = CapabilityFlags::PROTOCOL_41
         | CapabilityFlags::LONG_PASSWORD
         | CapabilityFlags::SECURE_CONNECTION
@@ -324,8 +419,17 @@ async fn run_fake_backend(listener: TcpListener) {
             let Ok(packet) = reader.read_logical(1024 * 1024).await else {
                 break;
             };
+            if let Ok(mut commands) = transcript.lock() {
+                commands.push(packet.payload.clone());
+            }
             if packet.payload.first() == Some(&0x01) {
                 break; // COM_QUIT
+            }
+            if packet.payload == b"\x03SHOW SESSION_STATES" {
+                if !respond_to_snapshot_query(&reader, &mut writer, snapshot_reply, broad).await {
+                    break;
+                }
+                continue;
             }
             if packet.payload.first() == Some(&0x18) {
                 // COM_STMT_SEND_LONG_DATA has no response.
@@ -380,9 +484,14 @@ struct Stack {
     dispatch_task: tokio::task::JoinHandle<Result<(), dataplane::control_dispatch::DispatchFatal>>,
     backend_port: u16,
     metrics_rx: mpsc::Receiver<Observation>,
+    backend_transcript: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 async fn spawn_stack() -> Stack {
+    spawn_stack_with_snapshot(SnapshotReply::Valid).await
+}
+
+async fn spawn_stack_with_snapshot(snapshot_reply: SnapshotReply) -> Stack {
     // Fake backend.
     let Ok(backend_listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
         unreachable!("backend bind")
@@ -390,7 +499,12 @@ async fn spawn_stack() -> Stack {
     let Ok(backend_addr) = backend_listener.local_addr() else {
         unreachable!("backend addr")
     };
-    tokio::spawn(run_fake_backend(backend_listener));
+    let backend_transcript = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(run_fake_backend(
+        backend_listener,
+        Arc::clone(&backend_transcript),
+        snapshot_reply,
+    ));
 
     // Dispatch loop with an observable sender and a driven state watch.
     let sender = FakeSender::new();
@@ -483,6 +597,7 @@ async fn spawn_stack() -> Stack {
         dispatch_task,
         backend_port: backend_addr.port(),
         metrics_rx,
+        backend_transcript,
     }
 }
 
@@ -1021,11 +1136,167 @@ async fn redirect_refusal_is_exact_and_session_survives() {
     };
     assert!(!result.succeeded, "fail-closed refusal in this slice");
     assert!(
-        client.query_ok("SELECT 4").await,
+        client.query_ok("SELECT after_snapshot").await,
         "the session keeps its backend and keeps serving"
+    );
+    let transcript = stack
+        .backend_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES")
+            .count(),
+        1,
+        "MIG-00 captures one snapshot at the redirect safe boundary"
+    );
+    assert!(
+        transcript.iter().all(|payload| !payload
+            .windows(b"signed-token-private".len())
+            .any(|window| window == b"signed-token-private")),
+        "the signed token is backend-to-proxy only"
+    );
+    let before = transcript
+        .iter()
+        .position(|payload| payload.as_slice() == b"\x03SELECT 1");
+    let snapshot = transcript
+        .iter()
+        .position(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES");
+    let after = transcript
+        .iter()
+        .position(|payload| payload.as_slice() == b"\x03SELECT after_snapshot");
+    assert!(
+        matches!((before, snapshot, after), (Some(before), Some(snapshot), Some(after)) if before < snapshot && snapshot < after),
+        "the internal query is serialized between user commands: {transcript:?}"
     );
     client.quit().await;
     stack.dispatch_task.abort();
+}
+
+/// A backend ERR (pre-v9 missing signing certificate), a NULL/empty token,
+/// and malformed but bounded JSON are complete internal responses. The
+/// redirect fails, but the old backend stays aligned and serves the next user
+/// command.
+#[tokio::test]
+async fn complete_snapshot_validation_failures_preserve_old_backend() {
+    for behavior in [
+        SnapshotReply::SigningCertificateError,
+        SnapshotReply::NullToken,
+        SnapshotReply::EmptyToken,
+        SnapshotReply::MalformedJson,
+    ] {
+        let stack = spawn_stack_with_snapshot(behavior).await;
+        spawn_route_answer(&stack, 1, 2);
+        let Some(mut client) =
+            timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+                .await
+                .ok()
+                .flatten()
+        else {
+            unreachable!("session established for {behavior:?}")
+        };
+        assert!(client.query_ok("SELECT before_snapshot_failure").await);
+
+        let redirect = command_envelope(
+            6100,
+            Body::RedirectCommand(RedirectCommand {
+                connection_id: 1,
+                redirect_id: format!("r-{behavior:?}"),
+                backend_id: "tidb-other".to_owned(),
+                backend_address: "127.0.0.1:1".to_owned(),
+                cluster_name: String::new(),
+                deadline_unix_millis: 0,
+                command_sequence: 1,
+            }),
+        );
+        let _ = stack.forwarder.handle(redirect).await;
+        let result = wait_sent(&stack.sender, |envelope| {
+            matches!(&envelope.body, Some(Body::RedirectResult(_)))
+        })
+        .await;
+        let Some(ControlEnvelope {
+            body: Some(Body::RedirectResult(result)),
+            ..
+        }) = result
+        else {
+            unreachable!("redirect terminal for {behavior:?}")
+        };
+        assert!(!result.succeeded);
+        assert!(
+            client.query_ok("SELECT after_snapshot_failure").await,
+            "wire-complete {behavior:?} failure must preserve the old backend"
+        );
+        let snapshot_queries = stack.backend_transcript.lock().map_or(0, |commands| {
+            commands
+                .iter()
+                .filter(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES")
+                .count()
+        });
+        assert_eq!(snapshot_queries, 1);
+        client.quit().await;
+        stack.dispatch_task.abort();
+    }
+}
+
+/// A backend disconnect or an oversized row leaves the internal response
+/// incomplete. The engine reports the redirect terminal exactly once and
+/// closes instead of reusing a poisoned old command stream.
+#[tokio::test]
+async fn incomplete_snapshot_failures_close_the_session() {
+    for behavior in [SnapshotReply::Disconnect, SnapshotReply::OversizedJson] {
+        let stack = spawn_stack_with_snapshot(behavior).await;
+        spawn_route_answer(&stack, 1, 2);
+        let Some(mut client) =
+            timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+                .await
+                .ok()
+                .flatten()
+        else {
+            unreachable!("session established for {behavior:?}")
+        };
+        assert!(client.query_ok("SELECT before_snapshot_disconnect").await);
+
+        let redirect = command_envelope(
+            6200,
+            Body::RedirectCommand(RedirectCommand {
+                connection_id: 1,
+                redirect_id: format!("r-{behavior:?}"),
+                backend_id: "tidb-other".to_owned(),
+                backend_address: "127.0.0.1:1".to_owned(),
+                cluster_name: String::new(),
+                deadline_unix_millis: 0,
+                command_sequence: 1,
+            }),
+        );
+        let _ = stack.forwarder.handle(redirect).await;
+        let result = wait_sent(&stack.sender, |envelope| {
+            matches!(&envelope.body, Some(Body::RedirectResult(_)))
+        })
+        .await;
+        let Some(ControlEnvelope {
+            body: Some(Body::RedirectResult(result)),
+            ..
+        }) = result
+        else {
+            unreachable!("redirect terminal for {behavior:?}")
+        };
+        assert!(!result.succeeded);
+        assert!(
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    if !client.query_ok("SELECT must_not_reuse_poisoned_wire").await {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok(),
+            "incomplete {behavior:?} response must close the session"
+        );
+        stack.dispatch_task.abort();
+    }
 }
 
 /// Contract #1 cancel-safety: control activity racing a fragmented

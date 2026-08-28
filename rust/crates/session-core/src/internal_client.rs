@@ -260,6 +260,7 @@ pub struct InternalOk {
 pub struct SessionStateSnapshot {
     session_states: String,
     session_token: String,
+    current_database: Option<String>,
     status: StatusFlags,
     warnings: u16,
 }
@@ -275,6 +276,16 @@ impl SessionStateSnapshot {
     #[must_use]
     pub fn session_token(&self) -> &str {
         &self.session_token
+    }
+
+    /// Authoritative current database decoded from the session JSON.
+    ///
+    /// `TiDB` omits `current-db` when no database is selected. An empty
+    /// string is normalized to the same state so callers never preserve a
+    /// stale locally tracked database across migration.
+    #[must_use]
+    pub fn current_database(&self) -> Option<&str> {
+        self.current_database.as_deref()
     }
 
     /// Terminal result-set status.
@@ -296,6 +307,10 @@ impl fmt::Debug for SessionStateSnapshot {
             .debug_struct("SessionStateSnapshot")
             .field("session_states_bytes", &self.session_states.len())
             .field("session_token_bytes", &self.session_token.len())
+            .field(
+                "current_database_bytes",
+                &self.current_database.as_ref().map_or(0, String::len),
+            )
             .field("status", &self.status)
             .field("warnings", &self.warnings)
             .finish()
@@ -659,6 +674,10 @@ impl InternalResultParser {
         warnings: u16,
     ) -> Result<InternalProgress, InternalClientError> {
         reject_more_results(status)?;
+        // The complete terminator is consumed and no following result exists.
+        // Validation failures below therefore leave the old connection wire
+        // aligned and reusable, unlike failures while rows are still unread.
+        self.state = InternalParserState::Complete;
         if self.result.rows.len() != 1 {
             return Err(InternalClientError::UnexpectedRowCount {
                 actual: self.result.rows.len(),
@@ -690,11 +709,12 @@ impl InternalResultParser {
         if session_token.is_empty() {
             return Err(InternalClientError::EmptySessionToken);
         }
-        self.state = InternalParserState::Complete;
+        let current_database = validate_session_states(&session_states)?;
         Ok(InternalProgress::Complete(InternalResult::SessionStates(
             SessionStateSnapshot {
                 session_states,
                 session_token,
+                current_database,
                 status,
                 warnings,
             },
@@ -709,6 +729,20 @@ impl InternalResultParser {
             sql_state: packet.sql_state,
             message_bytes: packet.message.len(),
         })
+    }
+}
+
+fn validate_session_states(session_states: &str) -> Result<Option<String>, InternalClientError> {
+    let value: serde_json::Value = serde_json::from_str(session_states)
+        .map_err(|_| InternalClientError::MalformedSessionStates)?;
+    let Some(object) = value.as_object() else {
+        return Err(InternalClientError::MalformedSessionStates);
+    };
+    match object.get("current-db") {
+        None => Ok(None),
+        Some(serde_json::Value::String(database)) if database.is_empty() => Ok(None),
+        Some(serde_json::Value::String(database)) => Ok(Some(database.clone())),
+        Some(_) => Err(InternalClientError::MalformedSessionStates),
     }
 }
 
@@ -921,6 +955,9 @@ pub enum InternalClientError {
     },
     /// `TiDB` returned an empty signed session token.
     EmptySessionToken,
+    /// Session state is not a JSON object with the expected `current-db`
+    /// shape. Parser diagnostics never retain the state text.
+    MalformedSessionStates,
     /// Allowlisted internal queries must return exactly one result.
     MoreResultsRejected,
     /// A payload followed success, backend ERR, or a previous parser failure.
@@ -1006,6 +1043,9 @@ impl fmt::Display for InternalClientError {
                 write!(formatter, "internal result column {name} is not UTF-8")
             }
             Self::EmptySessionToken => formatter.write_str("internal session token is empty"),
+            Self::MalformedSessionStates => {
+                formatter.write_str("internal session state JSON is malformed")
+            }
             Self::MoreResultsRejected => {
                 formatter.write_str("multiple internal results are forbidden")
             }
@@ -1171,6 +1211,7 @@ mod tests {
             };
             assert_eq!(snapshot.session_states(), r#"{"current-db":"test"}"#);
             assert_eq!(snapshot.session_token(), "token-1");
+            assert_eq!(snapshot.current_database(), Some("test"));
             assert_eq!(snapshot.status(), StatusFlags::AUTOCOMMIT);
             assert_eq!(snapshot.warnings(), 0);
             let debug = format!("{snapshot:?}");
@@ -1241,6 +1282,78 @@ mod tests {
                 Err(expected)
             );
         }
+    }
+
+    #[test]
+    fn validates_session_json_and_extracts_authoritative_database() {
+        for (state, expected) in [
+            (br"{}".as_slice(), None),
+            (br#"{"current-db":""}"#.as_slice(), None),
+            (
+                br#"{"current-db":"db_after_use"}"#.as_slice(),
+                Some("db_after_use"),
+            ),
+        ] {
+            let packets = result_packets(
+                true,
+                &[SESSION_STATES_COLUMN, SESSION_TOKEN_COLUMN],
+                &[row(&[Some(state), Some(b"signed-token")])],
+            );
+            let Ok(InternalResult::SessionStates(snapshot)) =
+                parse_all(MODERN_CAPS, &packets, InternalLimits::default())
+            else {
+                unreachable!("valid state must produce a snapshot")
+            };
+            assert_eq!(snapshot.current_database(), expected);
+        }
+
+        for state in [
+            b"{".as_slice(),
+            br"[]".as_slice(),
+            br#"{"current-db":7}"#.as_slice(),
+            br#"{"current-db":null}"#.as_slice(),
+        ] {
+            let packets = result_packets(
+                true,
+                &[SESSION_STATES_COLUMN, SESSION_TOKEN_COLUMN],
+                &[row(&[Some(state), Some(b"signed-token")])],
+            );
+            assert_eq!(
+                parse_all(MODERN_CAPS, &packets, InternalLimits::default()),
+                Err(InternalClientError::MalformedSessionStates)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_validation_failures_leave_the_old_wire_aligned()
+    -> Result<(), InternalClientError> {
+        for values in [
+            vec![Some(b"{".as_slice()), Some(b"token".as_slice())],
+            vec![Some(b"{}".as_slice()), None],
+            vec![Some(b"{}".as_slice()), Some(b"".as_slice())],
+        ] {
+            let packets = result_packets(
+                true,
+                &[SESSION_STATES_COLUMN, SESSION_TOKEN_COLUMN],
+                &[row(&values)],
+            );
+            let mut parser =
+                InternalQuery::ShowSessionStates.parser(MODERN_CAPS, InternalLimits::default())?;
+            let mut terminal_error = None;
+            for packet in packets {
+                match parser.consume(&packet) {
+                    Ok(InternalProgress::Continue) => {}
+                    Ok(InternalProgress::Complete(_)) => {
+                        unreachable!("invalid snapshot cannot complete successfully")
+                    }
+                    Err(error) => terminal_error = Some(error),
+                }
+            }
+            assert!(terminal_error.is_some());
+            assert_eq!(parser.state(), InternalParserState::Complete);
+        }
+        Ok(())
     }
 
     #[test]

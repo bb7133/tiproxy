@@ -196,10 +196,21 @@ type-level allowlist has exactly three members: `SHOW SESSION_STATES`, escaped
 constructor. The parser consumes complete logical payloads and bounds aggregate
 result bytes, rows, columns, column names, and individual cells. It supports
 classic EOF and `CLIENT_DEPRECATE_EOF`, extracts `Session_states` and the
-required nonempty `Session_token` by exact column name, and rejects duplicate or
-missing columns, NULL/invalid UTF-8 values, LOCAL INFILE, multiple results,
-malformed metadata/rows, and oversized responses. Backend ERR text is parsed
-but never retained or exposed through `Debug`.
+required nonempty `Session_token` by exact column name, validates that the
+bounded state is a top-level JSON object, and extracts its authoritative
+`current-db` (omitted/empty means no selected database). It rejects duplicate
+or missing columns, NULL/invalid UTF-8 values, malformed JSON/`current-db`,
+LOCAL INFILE, multiple results, malformed metadata/rows, and oversized
+responses. Backend ERR text, state JSON, tokens, and database names are never
+retained in errors or exposed through `Debug`.
+
+The production engine invokes this client only after the session FSM enters
+`RedirectPending`. A complete result terminator marks validation errors as
+wire-aligned and recoverable on the old backend; a disconnect or earlier
+parser/limit failure closes the session rather than risking unread internal
+packets being mistaken for the next user response. MIG-01 owns candidate
+authentication/restoration and will consume the validated snapshot after this
+boundary.
 
 The module dependency graph preserves the hot-path boundary:
 

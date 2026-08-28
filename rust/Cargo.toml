@@ -27,6 +27,7 @@ flate2 = { version = "=1.1.2", default-features = false, features = ["rust_backe
 libc = { version = "=0.2.189", default-features = false }
 mysql-wire = { path = "crates/mysql-wire", version = "0.1.0" }
 proxy-io = { path = "crates/proxy-io", version = "0.1.0" }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
 session-core = { path = "crates/session-core", version = "0.1.0" }
 prost = { version = "=0.14.1", default-features = false, features = ["derive", "std"] }
 rcgen = { version = "=0.14.9", default-features = false, features = ["pem", "ring"] }

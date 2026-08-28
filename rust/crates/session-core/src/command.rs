@@ -359,6 +359,17 @@ impl CommandSessionState {
         &self.current_database
     }
 
+    /// Replaces local command-derived database tracking with the
+    /// authoritative value decoded from `SHOW SESSION_STATES`.
+    ///
+    /// Absence means no database is selected, not unknown: `TiDB` omits the
+    /// `current-db` field for that state.
+    pub fn replace_current_database_from_snapshot(&mut self, database: Option<&str>) {
+        self.current_database = database.map_or(CurrentDatabaseState::None, |database| {
+            CurrentDatabaseState::Selected(database.as_bytes().to_vec())
+        });
+    }
+
     /// Whether `COM_QUIT` was forwarded.
     #[must_use]
     pub const fn quit(&self) -> bool {
@@ -696,6 +707,13 @@ mod tests {
         );
         state.apply(reset.after_success.session.ok_or("missing RESET effect")?);
         assert_eq!(state.current_database(), &CurrentDatabaseState::Unknown);
+        state.replace_current_database_from_snapshot(Some("authoritative_db"));
+        assert_eq!(
+            state.current_database(),
+            &CurrentDatabaseState::Selected(b"authoritative_db".to_vec())
+        );
+        state.replace_current_database_from_snapshot(None);
+        assert_eq!(state.current_database(), &CurrentDatabaseState::None);
         assert!(
             state
                 .capabilities()
