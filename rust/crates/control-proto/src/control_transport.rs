@@ -196,7 +196,7 @@ impl SessionMeta {
 }
 
 /// Observable connection state from the single mutable transport owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     /// No negotiated Go owner is available.
     Disconnected,
@@ -215,6 +215,15 @@ pub enum ConnectionState {
         /// per successful handshake even when the wire epoch value
         /// repeats across Go restarts.
         serial: u64,
+        /// The Go peer's process id from its Hello — the lineage half
+        /// of the session identity. Frames tagged with a DIFFERENT
+        /// lineage than the live session must be dropped before any
+        /// serving/store/gate side effect (wire epoch values repeat
+        /// across Go restarts, so lineage is the only safe test).
+        peer_process_id: Arc<str>,
+        /// The Go peer's start time from its Hello (lineage, with
+        /// `peer_process_id`).
+        peer_started_unix_millis: u64,
     },
     /// The transport was explicitly shut down.
     Shutdown,
@@ -452,7 +461,17 @@ impl ControlClient {
             match connection {
                 Ok(negotiated) => {
                     backoff = self.config.reconnect_base;
-                    let serial = self.session_serial.fetch_add(1, Ordering::AcqRel) + 1;
+                    let Some(serial) = self.allocate_session_serial() else {
+                        // The Rust-local session serial space is
+                        // exhausted (2^64 handshakes): fail closed
+                        // rather than publish a wrapped serial 0 that
+                        // would break every session-scoped send. The
+                        // supervisor surfaces this terminal condition.
+                        let _ = self.state_tx.send(ConnectionState::Disconnected);
+                        return Err(TransportError::Protocol(
+                            "session serial space exhausted".to_owned(),
+                        ));
+                    };
                     self.epoch.store(negotiated.epoch, Ordering::Release);
                     self.negotiated_frame_limit
                         .store(u64::from(negotiated.max_frame_bytes), Ordering::Release);
@@ -468,6 +487,8 @@ impl ControlClient {
                         epoch: negotiated.epoch,
                         capabilities: caps_mask,
                         serial,
+                        peer_process_id: Arc::clone(&negotiated.peer_process_id),
+                        peer_started_unix_millis: negotiated.peer_started_unix_millis,
                     });
                     let result = self.run_connected(negotiated, serial, handler).await;
                     if !matches!(result, Err(TransportError::Closed)) {
@@ -622,6 +643,27 @@ impl ControlClient {
         // duplicate id 1).
         self.next_request_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current == u64::MAX {
+                    None
+                } else {
+                    Some(current + 1)
+                }
+            })
+            .ok()
+            .map(|previous| previous + 1)
+    }
+
+    /// Mints the next Rust-local session serial (strictly increasing,
+    /// starting at 1, never reused). Like [`Self::allocate_request_id`]
+    /// it refuses at [`u64::MAX`] via compare-and-swap rather than
+    /// wrapping: a plain `fetch_add` would publish serial 0 (which
+    /// [`Self::send_session_scoped`] treats as permanently stale) and
+    /// then hand a second session the duplicate serial 1. Exhaustion
+    /// fails the handshake closed instead of ever publishing a
+    /// `Connected { serial: 0 }`.
+    fn allocate_session_serial(&self) -> Option<u64> {
+        self.session_serial
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current == u64::MAX {
                     None
                 } else {
@@ -1773,7 +1815,8 @@ mod tests {
         // Session 1 is live: capture its serial, then wait for the
         // client to observe its death.
         let first_serial = loop {
-            if let ConnectionState::Connected { serial, .. } = *state.borrow_and_update() {
+            if let ConnectionState::Connected { serial, .. } = &*state.borrow_and_update() {
+                let serial = *serial;
                 break serial;
             }
             state
@@ -1833,9 +1876,9 @@ mod tests {
 
         // With the replacement live, the dead serial fails fast.
         let second_serial = loop {
-            match *state.borrow_and_update() {
-                ConnectionState::Connected { serial, .. } if serial != first_serial => {
-                    break serial;
+            match &*state.borrow_and_update() {
+                ConnectionState::Connected { serial, .. } if *serial != first_serial => {
+                    break *serial;
                 }
                 _ => {}
             }
@@ -2149,6 +2192,85 @@ mod tests {
     /// Two-phase reconnect: no frame is read (the handler is not
     /// invoked) until `resume_session` completes, even when the peer
     /// already wrote one — and releasing the gate delivers it.
+    /// A Go Hello with an empty `process_id` is rejected at handshake —
+    /// the lineage identity contract is fail-closed and unconditional.
+    #[tokio::test]
+    async fn handshake_rejects_hello_missing_process_id() -> Result<(), Box<dyn Error>> {
+        let (socket, listener) = TestSocket::bind()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut hello = go_hello();
+            hello.process_id = String::new();
+            write_frame_async(&mut stream, &hello_envelope(hello), DEFAULT_MAX_FRAME_BYTES).await?;
+            // The client rejects before answering; give it a beat.
+            sleep(Duration::from_millis(50)).await;
+            Ok::<(), TransportError>(())
+        });
+        let client = ControlClient::new(test_config(&socket))?;
+        let result = client.connect_and_handshake().await;
+        let Err(TransportError::Protocol(message)) = result else {
+            unreachable!("a missing process_id must fail the handshake")
+        };
+        assert!(
+            message.contains("nonempty process_id"),
+            "the rejection names the identity contract: {message}"
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// A Go Hello with a zero `process_started_unix_millis` is rejected
+    /// at handshake for the same lineage-identity reason.
+    #[tokio::test]
+    async fn handshake_rejects_hello_zero_started() -> Result<(), Box<dyn Error>> {
+        let (socket, listener) = TestSocket::bind()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut hello = go_hello();
+            hello.process_started_unix_millis = 0;
+            write_frame_async(&mut stream, &hello_envelope(hello), DEFAULT_MAX_FRAME_BYTES).await?;
+            sleep(Duration::from_millis(50)).await;
+            Ok::<(), TransportError>(())
+        });
+        let client = ControlClient::new(test_config(&socket))?;
+        let result = client.connect_and_handshake().await;
+        let Err(TransportError::Protocol(message)) = result else {
+            unreachable!("a zero start time must fail the handshake")
+        };
+        assert!(
+            message.contains("nonzero process_started_unix_millis"),
+            "the rejection names the identity contract: {message}"
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_serial_refuses_to_wrap_at_max() -> Result<(), Box<dyn Error>> {
+        let (socket, _listener) = TestSocket::bind()?;
+        let client = ControlClient::new(test_config(&socket))?;
+        // One handshake before exhaustion: the last legal serial is
+        // u64::MAX, minted from the pre-MAX counter value.
+        client.session_serial.store(u64::MAX - 1, Ordering::Release);
+        assert_eq!(
+            client.allocate_session_serial(),
+            Some(u64::MAX),
+            "the last serial before exhaustion is u64::MAX, never a wrap to 0"
+        );
+        // Now exhausted: the allocator refuses instead of publishing 0.
+        assert_eq!(
+            client.allocate_session_serial(),
+            None,
+            "an exhausted serial space fails closed, never reissues 0 or 1"
+        );
+        assert_eq!(
+            client.allocate_session_serial(),
+            None,
+            "exhaustion is stable"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reader_waits_for_resume_session() -> Result<(), Box<dyn Error>> {
         let (socket, listener) = TestSocket::bind()?;

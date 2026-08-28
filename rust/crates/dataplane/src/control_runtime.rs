@@ -54,13 +54,15 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_proto::control_transport::{ClientConfig, ControlClient, TransportError};
+use control_proto::control_transport::{
+    ClientConfig, ConnectionState, ControlClient, SessionMeta, TransportError,
+};
 use control_proto::snapshot::{
     SnapshotError, SnapshotLineage, SnapshotStore, UnixTime, ValidatedSnapshot,
 };
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{ControlEnvelope, Priority};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::control_dispatch::{
@@ -407,13 +409,38 @@ async fn run_snapshot_owner<C: SnapshotConsumer>(
     mut consumer: C,
     mut snapshots: mpsc::Receiver<TaggedEnvelope>,
 ) -> Result<(), TransportError> {
+    let state = client.subscribe_state();
     while let Some(tagged) = snapshots.recv().await {
-        match snapshot_owner_step(&client, &handle, &store, &mut consumer, &tagged).await? {
+        match snapshot_owner_step(&client, &handle, &store, &mut consumer, &state, &tagged).await? {
             SnapshotStep::Continue => {}
             SnapshotStep::CleanExit => return Ok(()),
         }
     }
     Ok(())
+}
+
+/// Whether the current live control session belongs to the SAME Go
+/// lineage that produced `origin`. A snapshot can sit in the owner
+/// queue across a session switch: wire epoch VALUES repeat across Go
+/// restarts, so a snapshot from a dead lineage must be recognized by
+/// its peer identity — never staged, applied, committed, or allowed to
+/// move last-good / applied-generation against the current session's
+/// desired state.
+fn origin_matches_live_session(
+    state: &watch::Receiver<ConnectionState>,
+    origin: &SessionMeta,
+) -> bool {
+    match &*state.borrow() {
+        ConnectionState::Connected {
+            peer_process_id,
+            peer_started_unix_millis,
+            ..
+        } => {
+            peer_process_id.as_ref() == origin.peer_process_id.as_ref()
+                && *peer_started_unix_millis == origin.peer_started_unix_millis
+        }
+        _ => false,
+    }
 }
 
 /// Outcome of one snapshot-owner step.
@@ -441,8 +468,19 @@ pub async fn snapshot_owner_step<C: SnapshotConsumer>(
     handle: &ControlDispatchHandle,
     store: &SnapshotStore,
     consumer: &mut C,
+    state: &watch::Receiver<ConnectionState>,
     tagged: &TaggedEnvelope,
 ) -> Result<SnapshotStep, TransportError> {
+    // Lineage gate BEFORE the transaction: a snapshot whose origin Go
+    // lineage is not the live session's — because Go restarted while
+    // this snapshot waited in the owner queue, or because there is no
+    // live session at all — must not be staged, applied, committed, or
+    // allowed to advance last-good / the applied-generation barrier.
+    // Its desired state belongs to a process that no longer owns the
+    // control plane; the current Go re-sends on its own session.
+    if !origin_matches_live_session(state, &tagged.origin) {
+        return Ok(SnapshotStep::Continue);
+    }
     let now = UnixTime::since_unix_epoch(Duration::from_millis(system_unix_millis()));
     let (answer, applied) = process_state_snapshot(store, consumer, tagged, now).await;
     if let Some(generation) = applied {

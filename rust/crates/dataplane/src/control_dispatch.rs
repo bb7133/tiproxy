@@ -235,6 +235,13 @@ pub struct ControlCommandHandler {
     /// envelopes carry their origin epoch on the wire, so staleness is
     /// decidable per frame against this.
     active_session: Option<(u64, u64, u64)>,
+    /// The live session's Go lineage (peer process id + start time).
+    /// `None` whenever `active_session` is `None`. A tagged frame whose
+    /// origin lineage differs from this belongs to a DIFFERENT Go
+    /// process — it must be dropped before ANY serving/store/gate side
+    /// effect, because wire epoch VALUES repeat across Go restarts and
+    /// only the lineage tells the processes apart.
+    active_lineage: Option<(Arc<str>, u64)>,
     /// Whether the current session negotiated `RECONCILE_CONNECTIONS`:
     /// gates both sending reconcile requests and accepting snapshots.
     reconcile_capable: bool,
@@ -271,6 +278,7 @@ impl ControlCommandHandler {
         Self {
             gate: CommandGate::new(),
             active_session: None,
+            active_lineage: None,
             reconcile_capable: true,
             metering: MeteringLedger::new(),
             sessions: HashMap::new(),
@@ -298,8 +306,16 @@ impl ControlCommandHandler {
     /// closure `RECONCILE_CONNECTIONS && RECONCILE_SESSION_REHYDRATION`
     /// (the handshake already rejects the illegal cap-3-only
     /// combination; this is the defensive derivation).
-    pub fn on_connected(&mut self, epoch: u64, capabilities: u64, serial: u64) {
+    pub fn on_connected(
+        &mut self,
+        epoch: u64,
+        capabilities: u64,
+        serial: u64,
+        peer_process_id: Arc<str>,
+        peer_started_unix_millis: u64,
+    ) {
         self.active_session = Some((serial, epoch, capabilities));
+        self.active_lineage = Some((peer_process_id, peer_started_unix_millis));
         let reconcile = (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
         let rehydration = reconcile
             && (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1;
@@ -315,6 +331,36 @@ impl ControlCommandHandler {
     /// accepted as current.
     pub fn on_disconnected(&mut self) {
         self.active_session = None;
+        self.active_lineage = None;
+    }
+
+    /// Classifies a tagged frame's origin against the live session so
+    /// the dispatch loop can enforce the lineage policy before any
+    /// side effect. A frame from a DIFFERENT Go lineage than the live
+    /// session (or any frame while a live session exists whose lineage
+    /// the origin does not match) must be dropped; same-lineage and
+    /// exact-session frames keep their existing semantics.
+    #[must_use]
+    pub fn origin_is_foreign_lineage(&self, origin: &SessionMeta) -> bool {
+        match &self.active_lineage {
+            // A live session exists: any frame from a different Go
+            // process is foreign and must not touch serving/store/gate.
+            Some((process_id, started)) => {
+                process_id.as_ref() != origin.peer_process_id.as_ref()
+                    || *started != origin.peer_started_unix_millis
+            }
+            // No live session: nothing to contradict the origin here.
+            // Snapshots are still re-checked against live state by the
+            // owner; commands fall through to the gate's own invariants.
+            None => false,
+        }
+    }
+
+    /// Counts a frame dropped because its origin belongs to a foreign
+    /// Go lineage (shares the stale-drop counter — both are
+    /// "superseded by a newer session" drops).
+    pub fn count_cross_lineage_dropped(&self) {
+        self.stats.stale_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether the current session can reconcile (`RECONCILE_CONNECTIONS`).
@@ -2037,7 +2083,7 @@ pub async fn run_control_dispatch<S: DispatchSender>(
                 }
                 // `changed()` marked the newest value seen: apply it
                 // directly, then drain anything that raced in after.
-                let snapshot = *state.borrow();
+                let snapshot = state.borrow().clone();
                 // Causal barrier: adoptions enqueued before this
                 // transition was observed apply BEFORE the
                 // transition's automatic reconcile, so its export
@@ -2094,7 +2140,7 @@ async fn apply_state_transitions<S: DispatchSender>(
     state: &mut watch::Receiver<ConnectionState>,
 ) -> Result<(), DispatchFatal> {
     while state.has_changed().unwrap_or(false) {
-        let snapshot = *state.borrow_and_update();
+        let snapshot = state.borrow_and_update().clone();
         apply_state(sender, handler, snapshot).await?;
     }
     Ok(())
@@ -2133,7 +2179,20 @@ async fn apply_state<S: DispatchSender>(
             epoch,
             capabilities,
             serial,
-        } => on_connected_transition(sender, handler, epoch, capabilities, serial).await,
+            peer_process_id,
+            peer_started_unix_millis,
+        } => {
+            on_connected_transition(
+                sender,
+                handler,
+                epoch,
+                capabilities,
+                serial,
+                peer_process_id,
+                peer_started_unix_millis,
+            )
+            .await
+        }
         ConnectionState::Disconnected | ConnectionState::Connecting | ConnectionState::Shutdown => {
             handler.on_disconnected();
             Ok(())
@@ -2155,8 +2214,16 @@ async fn on_connected_transition<S: DispatchSender>(
     epoch: u64,
     capabilities: u64,
     serial: u64,
+    peer_process_id: Arc<str>,
+    peer_started_unix_millis: u64,
 ) -> Result<(), DispatchFatal> {
-    handler.on_connected(epoch, capabilities, serial);
+    handler.on_connected(
+        epoch,
+        capabilities,
+        serial,
+        peer_process_id,
+        peer_started_unix_millis,
+    );
     if handler.reconcile_capable() {
         let _ = send_reconcile_request(sender, handler, serial, capabilities).await?;
     }
@@ -2385,6 +2452,23 @@ async fn process_inbound<S: DispatchSender>(
     tagged: TaggedEnvelope,
     unix_now_millis: UnixMillisFn,
 ) -> Result<(), DispatchFatal> {
+    // General lineage policy, enforced before ANY handler/owner side
+    // effect: a frame whose origin belongs to a DIFFERENT Go lineage
+    // than the live session was produced by a process that no longer
+    // owns the control plane. It was already tagged and queued when its
+    // session was live; by the time it is dequeued a different Go may
+    // be connected (wire epoch VALUES repeat across restarts, so only
+    // the lineage separates them). Such a frame must never reach the
+    // serving consumer, the snapshot store, or the command gate — its
+    // owner regenerates the work on its own session. (Same-lineage
+    // reconnect and exact-session frames fall through to their existing
+    // per-body rules; a frame arriving with no live session at all is
+    // re-checked by the snapshot owner and, for commands, judged by the
+    // gate's own cross-epoch invariants.)
+    if handler.origin_is_foreign_lineage(&tagged.origin) {
+        handler.count_cross_lineage_dropped();
+        return Ok(());
+    }
     // Session-bound inbound is judged by its tagged ORIGIN, never by
     // the wire epoch value (which a restarted Go can reuse): a
     // reconcile snapshot produced by a dead session — retained,

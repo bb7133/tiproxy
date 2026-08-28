@@ -67,6 +67,22 @@ greater epoch. Rust closes an older connection after accepting a newer epoch;
 Go rejects a simultaneous second connection for the same Rust process ID.
 Messages from an old epoch are stale and must not mutate state.
 
+The Go `Hello` **must** carry a nonempty `process_id` and a nonzero
+`process_started_unix_millis`. Together these two fields are the Go **process
+lineage**: the identity generation-application, snapshot rollover, and
+session-scoped work are all judged against (see "Envelope identity and
+ordering" and "Snapshots and generation application"). This requirement is
+**v1-global and unconditional** — it does not depend on any negotiated
+capability, because the wire `control_epoch` VALUE is reused across Go restarts
+(a fresh Go process starts its generation sequence at 1 and can be assigned an
+epoch value a previous process already used), so the lineage pair is the only
+field that safely distinguishes one Go process from its own restart. Two
+restarted peers both presenting `("", 0)` would be indistinguishable and the
+generation-reset acceptance would silently regress to serving a dead process's
+desired state. Rust therefore rejects a Go `Hello` missing either field at
+handshake, before `HelloAck`, with a `PROTOCOL_VIOLATION`-class transport
+error; the connection is not established and Rust reconnects.
+
 `required_capabilities` is an envelope-level guard. A receiver that lacks any
 listed capability rejects that request with `MISSING_CAPABILITY`; it must not
 silently approximate the operation. Unknown optional protobuf fields and
@@ -79,6 +95,12 @@ The v1 capability registry is append-only:
 | ---: | --- | --- |
 | 1 | `PER_CONNECTION_CLOSE` | `CloseCommand` / `CloseResult` |
 | 2 | `RECONCILE_CONNECTIONS` | the `ReconcileRequest.connections` field |
+| 3 | `RECONCILE_SESSION_REHYDRATION` | connection rehydration under `RECONCILE_CONNECTIONS` (identification by omission, no orphan closes) |
+
+The mandatory Go `Hello` process lineage (above) is deliberately **not** gated
+on any of these capabilities: it is required whenever a Go control plane speaks
+v1 at all, so lineage safety holds even for a peer that negotiates none of the
+optional capabilities.
 
 A sender sets the corresponding value in `required_capabilities` whenever it
 uses one of these additions. An older peer therefore rejects the guarded

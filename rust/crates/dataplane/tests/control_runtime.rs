@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use control_proto::control_transport::{ClientConfig, ControlClient, SessionMeta, TransportError};
+use control_proto::control_transport::{
+    ClientConfig, ConnectionState, ControlClient, SessionMeta, TransportError,
+};
 use control_proto::snapshot::{SnapshotError, SnapshotLineage, SnapshotStore, UnixTime};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
@@ -151,6 +153,35 @@ fn tagged_as(envelope: ControlEnvelope, process_id: &str, serial: u64) -> Tagged
             peer_started_unix_millis: 1_700_000_000_000,
         },
     }
+}
+
+/// A watch receiver whose live session matches a given origin's Go
+/// lineage — the owner's lineage gate passes for that origin.
+fn live_state_for(origin: &SessionMeta) -> tokio::sync::watch::Receiver<ConnectionState> {
+    let (keep_tx, rx) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: origin.epoch,
+        capabilities: 0,
+        serial: origin.serial,
+        peer_process_id: Arc::clone(&origin.peer_process_id),
+        peer_started_unix_millis: origin.peer_started_unix_millis,
+    });
+    // Keep the sender alive so borrow() never sees a closed channel.
+    std::mem::forget(keep_tx);
+    rx
+}
+
+/// A watch receiver whose live session is a DIFFERENT Go lineage than
+/// `origin` — the owner's lineage gate drops that origin.
+fn foreign_state_for(origin: &SessionMeta) -> tokio::sync::watch::Receiver<ConnectionState> {
+    let (tx, rx) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: origin.epoch,
+        capabilities: 0,
+        serial: origin.serial + 1,
+        peer_process_id: Arc::from("go-successor"),
+        peer_started_unix_millis: origin.peer_started_unix_millis + 1,
+    });
+    std::mem::forget(tx);
+    rx
 }
 
 /// `valid_snapshot` with a different listener port — equal generation,
@@ -719,11 +750,13 @@ async fn snapshot_owner_shutdown_boundary() {
         calls: Arc::new(AtomicU64::new(0)),
         reject_first: 0,
     };
+    let owner_state = live_state_for(&test_session());
     let step = snapshot_owner_step(
         &client,
         &handle,
         &store,
         &mut consumer,
+        &owner_state,
         &tagged(snapshot_envelope(20, 1)),
     )
     .await;
@@ -751,11 +784,13 @@ async fn snapshot_owner_shutdown_boundary() {
     let Ok(store) = SnapshotStore::new(Vec::new()) else {
         unreachable!("store constructs")
     };
+    let owner_state = live_state_for(&test_session());
     let step = snapshot_owner_step(
         &client,
         &handle,
         &store,
         &mut consumer,
+        &owner_state,
         &tagged(snapshot_envelope(21, 1)),
     )
     .await;
@@ -931,13 +966,14 @@ async fn restarted_go_same_generation_different_content_applies_fresh() {
     assert_eq!(calls.load(Ordering::Relaxed), 2, "no consumer run");
 }
 
-/// Fix-2 answer-scoping regression: a snapshot whose ORIGIN session is
-/// no longer the live one still commits (desired state is desired
-/// state), but its `SnapshotResult` must NOT be handed to the next
-/// session — that answer would resolve a DIFFERENT session's exchange.
-/// The owner drops it and continues; Go re-sends on the new session.
+/// Fix-2 lineage-gate regression: a snapshot whose ORIGIN belongs to a
+/// DIFFERENT Go lineage than the live session must be dropped BEFORE
+/// any transaction side effect — not staged, not consumed, not
+/// committed, and never allowed to move last-good or the applied
+/// generation. Its desired state belongs to a process that no longer
+/// owns the control plane; the live Go re-sends on its own session.
 #[tokio::test]
-async fn stale_origin_snapshot_answer_is_dropped_and_owner_continues() {
+async fn foreign_lineage_snapshot_never_stages_or_advances_state() {
     let client = supervised_client();
     let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(1);
     let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
@@ -953,29 +989,93 @@ async fn stale_origin_snapshot_answer_is_dropped_and_owner_continues() {
         calls: Arc::new(AtomicU64::new(0)),
         reject_first: 0,
     };
-    // No shutdown requested: the client simply is not on the origin
-    // session any more (a never-connected client has no live session
-    // at all — the strongest form of "the origin is gone").
+    // The live session is a DIFFERENT Go lineage than the snapshot's
+    // origin: the gate must fire before any transaction step.
+    let origin = test_session();
+    let owner_state = foreign_state_for(&origin);
     let step = snapshot_owner_step(
         &client,
         &handle,
         &store,
         &mut consumer,
+        &owner_state,
         &tagged(snapshot_envelope(30, 1)),
     )
     .await;
     let Ok(SnapshotStep::Continue) = step else {
-        unreachable!("a stale-origin answer is dropped, not fatal: {step:?}")
+        unreachable!("a foreign-lineage snapshot is dropped, not fatal: {step:?}")
     };
-    // The desired state DID commit — only the answer was dropped.
+    // NOTHING advanced: no consumer run, no store commit, no last-good.
+    assert_eq!(
+        consumer.calls.load(Ordering::Relaxed),
+        0,
+        "the serving consumer never ran"
+    );
+    let Ok(current) = store.current() else {
+        unreachable!("store readable")
+    };
+    assert!(current.is_none(), "the store was never advanced");
+    assert!(
+        client.last_good_snapshot_age().is_none(),
+        "last-good was never moved by a foreign lineage"
+    );
+    dispatch.abort();
+    client.shutdown();
+}
+
+/// Fix-2 companion: a snapshot from the LIVE lineage — including a
+/// same-lineage reconnect at a new serial/epoch — still applies once,
+/// so the gate is lineage-specific and never blocks the current Go's
+/// desired state.
+#[tokio::test]
+async fn live_lineage_snapshot_applies_even_across_epoch_bump() {
+    let client = supervised_client();
+    let (snapshot_tx, _snapshot_rx) = tokio::sync::mpsc::channel::<TaggedEnvelope>(1);
+    let (handle, _forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        dataplane::control_dispatch::ControlCommandHandler::new(),
+        Arc::clone(&client),
+        snapshot_tx,
+        Duration::from_secs(3600),
+    );
+    let Ok(store) = SnapshotStore::new(Vec::new()) else {
+        unreachable!("store constructs")
+    };
+    let mut consumer = CountingConsumer {
+        calls: Arc::new(AtomicU64::new(0)),
+        reject_first: 0,
+    };
+    // Same Go lineage as the origin, but a later serial/epoch (a
+    // reconnect): the gate passes on lineage, and the snapshot applies.
+    let origin = test_session();
+    let (keep_tx, owner_state) = tokio::sync::watch::channel(ConnectionState::Connected {
+        epoch: origin.epoch + 5,
+        capabilities: 0,
+        serial: origin.serial + 5,
+        peer_process_id: Arc::clone(&origin.peer_process_id),
+        peer_started_unix_millis: origin.peer_started_unix_millis,
+    });
+    std::mem::forget(keep_tx);
+    let step = snapshot_owner_step(
+        &client,
+        &handle,
+        &store,
+        &mut consumer,
+        &owner_state,
+        &tagged(snapshot_envelope(31, 1)),
+    )
+    .await;
+    let Ok(SnapshotStep::Continue) = step else {
+        unreachable!("the live lineage's snapshot applies: {step:?}")
+    };
+    assert_eq!(
+        consumer.calls.load(Ordering::Relaxed),
+        1,
+        "consumer ran once"
+    );
     let Ok(Some(current)) = store.current() else {
-        unreachable!("the snapshot still committed")
+        unreachable!("the snapshot committed")
     };
     assert_eq!(current.generation(), 1);
-    let Some((generation, _)) = client.last_good_snapshot_age() else {
-        unreachable!("committed snapshot updates transport diagnostics")
-    };
-    assert_eq!(generation, 1);
     dispatch.abort();
     client.shutdown();
 }

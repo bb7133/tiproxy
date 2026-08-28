@@ -795,6 +795,7 @@ struct LoopHarness {
     notice_tx: mpsc::Sender<DispatchNotice>,
     inbound_tx: mpsc::Sender<TaggedEnvelope>,
     snapshot_rx: mpsc::Receiver<TaggedEnvelope>,
+    stats: Arc<dataplane::control_dispatch::DispatchStats>,
     task: tokio::task::JoinHandle<Result<(), DispatchFatal>>,
 }
 
@@ -829,6 +830,7 @@ fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopH
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let (notice_tx, notice_rx) = mpsc::channel(16);
     let (snapshot_tx, snapshot_rx) = mpsc::channel(4);
+    let stats = handler.stats();
     let task = tokio::spawn(run_control_dispatch(
         handler,
         Arc::clone(&sender),
@@ -845,6 +847,7 @@ fn spawn_loop_with_tick(handler: ControlCommandHandler, tick: Duration) -> LoopH
         notice_tx,
         inbound_tx,
         snapshot_rx,
+        stats,
         task,
     }
 }
@@ -903,6 +906,8 @@ async fn connected_transition_reconciles_and_replays_metering() {
             epoch: 1,
             serial: 1,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
 
@@ -966,6 +971,8 @@ async fn no_reconcile_capability_skips_request_and_replays_durably() {
             epoch: 1,
             serial: 1,
             capabilities: 0,
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 1).await;
@@ -1031,6 +1038,8 @@ async fn closed_event_ids_feed_reconcile_watermark() {
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
@@ -1170,7 +1179,13 @@ async fn wrong_direction_bodies_are_violations() {
 #[tokio::test(start_paused = true)]
 async fn reconcile_snapshot_epoch_and_capability_policy() {
     let mut handler = ControlCommandHandler::new();
-    handler.on_connected(5, full_caps(), 5);
+    handler.on_connected(
+        5,
+        full_caps(),
+        5,
+        Arc::from("go-fixture"),
+        1_700_000_000_000,
+    );
     let now = Instant::now();
 
     let snapshot_from = |origin: u64| ControlEnvelope {
@@ -1219,6 +1234,8 @@ async fn reconcile_snapshot_epoch_and_capability_policy() {
         6,
         1u64 << (ControlCapability::ReconcileSessionRehydration as u64),
         6,
+        Arc::from("go-fixture"),
+        1_700_000_000_000,
     );
     let out = legacy.handle_envelope(&snapshot_from(6), now, 4);
     assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
@@ -1309,6 +1326,8 @@ async fn forwarder_fixture(
         epoch: 1,
         serial: 1,
         capabilities: full_caps(),
+        peer_process_id: Arc::from("go-fixture"),
+        peer_started_unix_millis: 1_700_000_000_000,
     });
     let forwarder = InboundForwarder::new(inbound_tx, state_rx);
     let Ok(()) = forwarder.resume_session(session_meta(1, 1)).await else {
@@ -1373,6 +1392,8 @@ async fn resume_pumps_retained_frame_exactly_once() {
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
@@ -1416,6 +1437,8 @@ async fn teardown_during_resume_keeps_single_frame() {
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let resume = forwarder.resume_session(session_meta(2, 2));
@@ -1437,6 +1460,8 @@ async fn teardown_during_resume_keeps_single_frame() {
             epoch: 3,
             serial: 3,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let Ok(()) = forwarder.resume_session(session_meta(3, 3)).await else {
@@ -1514,6 +1539,8 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     harness.state_tx.send(ConnectionState::Disconnected).ok();
@@ -1546,6 +1573,8 @@ async fn stale_snapshot_after_coalesced_connect_never_acks() {
             epoch: 3,
             serial: 3,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
@@ -1595,6 +1624,8 @@ async fn pending_connected_applies_before_queued_inbound() {
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let old_ack = ControlEnvelope {
@@ -1638,6 +1669,8 @@ async fn pending_connected_applies_before_queued_inbound() {
             epoch: 3,
             serial: 3,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&sender, 4).await;
@@ -2065,6 +2098,8 @@ async fn stale_namespace_export_is_repaired_by_a_fresh_reconcile() {
             epoch: 1,
             serial: 1,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 1).await;
@@ -2155,6 +2190,8 @@ async fn queued_adoption_precedes_the_automatic_reconcile() {
             epoch: 1,
             serial: 1,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     assert!(applied_rx.await.is_ok());
@@ -2339,6 +2376,8 @@ async fn failed_repair_send_withholds_the_namespace_ack() {
                 epoch: 1,
                 serial: 1,
                 capabilities: full_caps(),
+                peer_process_id: Arc::from("go-fixture"),
+                peer_started_unix_millis: 1_700_000_000_000,
             })
             .ok();
         // The automatic reconcile succeeds and exports the seed.
@@ -2379,6 +2418,8 @@ async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports(
             epoch: 1,
             serial: 1,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let _ = wait_for_scripted_sent(&harness.sender, 1).await;
@@ -2412,6 +2453,8 @@ async fn stale_epoch_repair_withholds_the_ack_and_the_next_reconcile_re_exports(
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_scripted_sent(&harness.sender, 2).await;
@@ -2453,6 +2496,8 @@ async fn cross_lineage_retained_frame_is_dropped_not_pumped() {
             epoch: 1,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let Ok(()) = forwarder
@@ -2510,6 +2555,8 @@ async fn same_lineage_retained_frame_pumps_once_with_origin_meta() {
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let Ok(()) = forwarder.resume_session(session_meta(2, 2)).await else {
@@ -2571,6 +2618,8 @@ async fn dead_session_snapshot_with_reused_epoch_value_never_acks() {
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let sent = wait_for_sent(&harness.sender, 2).await;
@@ -2595,6 +2644,8 @@ async fn dead_session_snapshot_with_reused_epoch_value_never_acks() {
             epoch: 2,
             serial: 3,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
 
@@ -2663,6 +2714,8 @@ async fn dead_session_snapshot_with_reused_epoch_value_never_acks() {
             epoch: 3,
             serial: 4,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
     let mut final_sent = Vec::new();
@@ -2707,6 +2760,8 @@ async fn inline_request_errors_are_session_scoped_and_terminals_durable() {
             epoch: 2,
             serial: 2,
             capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
         })
         .ok();
 
@@ -2784,4 +2839,124 @@ async fn inline_request_errors_are_session_scoped_and_terminals_durable() {
     };
     assert_eq!(*scope, None, "lifecycle terminals stay durable");
     harness.task.abort();
+}
+
+/// Fix-2 queued-frame lineage regression (the "queued", not "retained",
+/// seam): a frame from Go lineage A already sitting in the dispatch
+/// inbound queue when Go restarts as lineage B must NOT reach the
+/// `CommandGate` once B is the live session — it is dropped before any
+/// handler side effect and answers nothing. An identical frame from the
+/// LIVE lineage B does reach the gate (its unroutable body is answered),
+/// proving the drop is lineage-specific rather than a blanket refusal.
+#[tokio::test(start_paused = true)]
+async fn queued_cross_lineage_frame_never_reaches_the_gate() {
+    let handler = ControlCommandHandler::new();
+    let harness = spawn_loop(handler);
+
+    // Lineage B becomes the live session (wire epoch value 1). Its
+    // start time matches `session_meta_as`, so a go-b origin is
+    // exact-lineage and a go-a origin is foreign purely by process id.
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-b"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+
+    // An unroutable body (a MeteringBatch is never inbound-legal)
+    // tagged with the DEAD lineage A, same wire epoch value 1: the gate
+    // would answer it with a ProtocolViolation — but the lineage drop
+    // must fire first, so it is swallowed with no answer.
+    let a_frame = envelope(
+        80,
+        0,
+        Body::MeteringBatch(control_proto::v1::MeteringBatch {
+            sequence: 1,
+            deltas: Vec::new(),
+        }),
+    );
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: a_frame,
+            origin: session_meta_as("go-a", 1, 1),
+        })
+        .await
+        .ok();
+
+    // The SAME unroutable body from the LIVE lineage B does reach the
+    // gate: it is answered (proving the drop above was lineage-specific,
+    // not a blanket refusal of unroutable bodies).
+    let b_frame = envelope(
+        81,
+        0,
+        Body::MeteringBatch(control_proto::v1::MeteringBatch {
+            sequence: 2,
+            deltas: Vec::new(),
+        }),
+    );
+    harness
+        .inbound_tx
+        .send(TaggedEnvelope {
+            envelope: b_frame,
+            origin: session_meta_as("go-b", 2, 1),
+        })
+        .await
+        .ok();
+
+    // Both frames carry the same unroutable body, so each one that
+    // reaches the gate yields one ProtocolViolation answer. Wait for
+    // the drop and the answer, then confirm exactly one such answer
+    // exists (B's), exactly one frame was lineage dropped (A's), and
+    // exactly one frame was unrouted (B's). (B's connect also emits a
+    // ReconcileRequest, which is not a ProtocolViolation answer.)
+    let count_violations = |harness: &LoopHarness| {
+        harness
+            .sender
+            .sent()
+            .iter()
+            .filter(|envelope| error_code(envelope) == Some(ErrorCode::ProtocolViolation))
+            .count()
+    };
+    for _ in 0..100_000 {
+        if count_violations(&harness) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    wait_for_drop(&harness).await;
+    // Let any erroneously-forwarded A answer race in, then assert the
+    // totals.
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        count_violations(&harness),
+        1,
+        "only the live lineage's frame reached the gate and was answered"
+    );
+    assert_eq!(
+        harness.stats.stale_dropped.load(Ordering::Relaxed),
+        1,
+        "exactly the dead lineage's frame was lineage dropped"
+    );
+    assert_eq!(
+        harness.stats.unrouted.load(Ordering::Relaxed),
+        1,
+        "exactly the live lineage's frame was unrouted"
+    );
+    harness.task.abort();
+}
+
+async fn wait_for_drop(harness: &LoopHarness) {
+    for _ in 0..100_000 {
+        if harness.stats.stale_dropped.load(Ordering::Relaxed) >= 1 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
 }
