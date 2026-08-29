@@ -1442,7 +1442,19 @@ impl Engine {
                 database: parsed.database,
                 auth_plugin_name: Some(UNKNOWN_AUTH_PLUGIN),
                 attributes: attributes.as_deref(),
-                zstd_level: parsed.zstd_level,
+                // The zstd level is meaningful only when the BACKEND leg
+                // negotiated zstd (its caps may differ from the client's). If
+                // the backend did not advertise ZSTD, sending a level would
+                // make `encode_handshake_response` reject the packet, so drop
+                // it — matching Go, which carries the level per negotiated leg.
+                zstd_level: if plan
+                    .capabilities
+                    .contains(CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM)
+                {
+                    parsed.zstd_level
+                } else {
+                    None
+                },
             }) else {
                 self.quit_source = QuitSource::ProxyMalformed;
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
@@ -1474,7 +1486,13 @@ impl Engine {
 
         // Engine-internal authentication relay; the FSM sees only the
         // terminal outcome.
-        let mut relay = AuthRelay::new(self.negotiated, backend_caps, 0);
+        // Carry the client's negotiated zstd level into the relay so the
+        // auth-OK compression effects select the right codec level (0 = absent).
+        let mut relay = AuthRelay::new(
+            self.negotiated,
+            backend_caps,
+            parsed.zstd_level.unwrap_or(0),
+        );
         let auth_outcome = loop {
             match relay.turn() {
                 AuthTurn::AwaitingBackend => {
