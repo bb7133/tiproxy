@@ -76,7 +76,7 @@ use mysql_wire::{
     CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags, encode_error_packet,
     encode_handshake_response, encode_initial_handshake, parse_handshake_response,
 };
-use proxy_io::{PacketReader, PacketWriter};
+use proxy_io::PacketIo;
 use session_core::auth::{
     AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, UNKNOWN_AUTH_PLUGIN,
     classify_backend_auth_packet, plan_backend_handshake,
@@ -98,7 +98,7 @@ use session_core::response::{
     DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseObserver,
     ResponsePacket,
 };
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
@@ -457,12 +457,10 @@ async fn run_bound_session_observed(
     let (report_tx, mut report_rx) = mpsc::channel(ENGINE_REPORT_CAPACITY);
     let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
 
-    let (read_half, write_half) = stream.into_split();
     let engine = Engine {
         connection_id: identity.connection_id,
         endpoints,
-        client_r: PacketReader::new(read_half),
-        client_w: PacketWriter::new(write_half),
+        client_io: PacketIo::new(stream),
         backend: None,
         events: event_tx,
         cmds: cmd_rx,
@@ -723,8 +721,8 @@ struct RouteSeed {
 
 /// The dialed backend's I/O and identity.
 struct BackendIo {
-    reader: PacketReader<OwnedReadHalf>,
-    writer: PacketWriter<OwnedWriteHalf>,
+    #[allow(clippy::struct_field_names)]
+    backend_io: PacketIo<TcpStream>,
     id: String,
     address: String,
     cluster: String,
@@ -746,8 +744,7 @@ struct PendingCommand {
 struct Engine {
     connection_id: u64,
     endpoints: ConnectionEndpoints,
-    client_r: PacketReader<OwnedReadHalf>,
-    client_w: PacketWriter<OwnedWriteHalf>,
+    client_io: PacketIo<TcpStream>,
     backend: Option<BackendIo>,
     events: mpsc::Sender<SessionEvent>,
     cmds: mpsc::Receiver<EngineCmd>,
@@ -866,7 +863,7 @@ impl Engine {
 
         // Client handshake response (no TLS negotiated: an SSLRequest
         // is a protocol violation against our greeting).
-        let payload = match self.client_r.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
+        let payload = match self.client_io.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
             Ok(packet) => packet.payload,
             Err(error) => return Some(self.client_read_end(&error).await),
         };
@@ -880,8 +877,8 @@ impl Engine {
             Err(missing) => {
                 self.quit_source = QuitSource::ClientHandshake;
                 let (code, state, message) = missing.client_response();
-                self.client_w
-                    .reset_sequence(self.client_r.expected_sequence());
+                let seq = self.client_io.expected_read_sequence();
+                self.client_io.reset_write_sequence(seq);
                 let _ = self.write_client_error(code, state, message).await;
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::ClientNetwork);
@@ -974,8 +971,8 @@ impl Engine {
             } else {
                 decision.client_message.as_str()
             };
-            self.client_w
-                .reset_sequence(self.client_r.expected_sequence());
+            let seq = self.client_io.expected_read_sequence();
+            self.client_io.reset_write_sequence(seq);
             let _ = self.write_client_error(1105, *b"HY000", message).await;
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Some(WireErrorSource::Proxy);
@@ -1038,8 +1035,8 @@ impl Engine {
                 // ErrToClient); other acquire failures keep Go's
                 // behavior of closing without a client error packet.
                 if matches!(error, AcquireError::NoBackend { .. }) {
-                    self.client_w
-                        .reset_sequence(self.client_r.expected_sequence());
+                    let seq = self.client_io.expected_read_sequence();
+                    self.client_io.reset_write_sequence(seq);
                     let _ = self
                         .write_client_error(
                             1105,
@@ -1074,16 +1071,18 @@ impl Engine {
                 );
             }
         }
-        let (backend_read, backend_write) = acquired.conn.into_split();
         let mut backend = BackendIo {
-            reader: PacketReader::new(backend_read),
-            writer: PacketWriter::new(backend_write),
+            backend_io: PacketIo::new(acquired.conn),
             id: backend_id.clone(),
             address: backend_address,
             cluster: backend_cluster,
             local: backend_local,
         };
-        let Ok(greeting_packet) = backend.reader.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await else {
+        let Ok(greeting_packet) = backend
+            .backend_io
+            .read_logical(HANDSHAKE_PAYLOAD_LIMIT)
+            .await
+        else {
             self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
@@ -1159,10 +1158,10 @@ impl Engine {
         if let Some(backend) = self.backend.as_mut() {
             // Continue the backend channel's connection-phase counter
             // after its greeting.
-            let next = backend.reader.expected_sequence();
-            backend.writer.reset_sequence(next);
+            let next = backend.backend_io.expected_read_sequence();
+            backend.backend_io.reset_write_sequence(next);
             if backend
-                .writer
+                .backend_io
                 .write_logical(&forwarded, true)
                 .await
                 .is_err()
@@ -1213,7 +1212,7 @@ impl Engine {
                     }
                 }
                 AuthTurn::AwaitingClient => {
-                    let payload = match self.client_r.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
+                    let payload = match self.client_io.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
                         Ok(packet) => packet.payload,
                         Err(error) => return Some(self.client_read_end(&error).await),
                     };
@@ -1301,7 +1300,7 @@ impl Engine {
             }
             // Every client command starts a fresh wire exchange at
             // sequence zero, and its response lineage answers at one.
-            self.client_r.reset_sequence(0);
+            self.client_io.reset_read_sequence(0);
             // Between commands: serve control effects and probes while
             // waiting for the next client command. Only the peek is
             // raced — it retains consumed bytes inside the reader, so a
@@ -1317,7 +1316,7 @@ impl Engine {
                         Awaited::Got => continue,
                     }
                 }
-                peeked = self.client_r.peek_packet() => {
+                peeked = self.client_io.peek_packet() => {
                     if let Err(error) = peeked {
                         let source = self.client_read_end(&error).await;
                         return Some(source);
@@ -1326,7 +1325,7 @@ impl Engine {
                     // visible. Match Go's ExecuteCmd timer: include packet
                     // read/dispatch/response work, never connection idle time.
                     let started = tokio::time::Instant::now();
-                    match self.client_r.read_logical(COMMAND_PAYLOAD_LIMIT).await {
+                    match self.client_io.read_logical(COMMAND_PAYLOAD_LIMIT).await {
                         Ok(packet) => (packet.payload, started),
                         Err(error) => {
                             let source = self.client_read_end(&error).await;
@@ -1335,7 +1334,7 @@ impl Engine {
                     }
                 }
             };
-            self.client_w.reset_sequence(1);
+            self.client_io.reset_write_sequence(1);
             // Extract the plan's owned facts before the payload moves:
             // CommandPlan borrows the packet bytes.
             let planned = {
@@ -1458,10 +1457,10 @@ impl Engine {
         let Some(backend) = self.backend.as_mut() else {
             return Some(WireErrorSource::Proxy);
         };
-        backend.writer.reset_sequence(0);
-        backend.reader.reset_sequence(1);
+        backend.backend_io.reset_write_sequence(0);
+        backend.backend_io.reset_read_sequence(1);
         if backend
-            .writer
+            .backend_io
             .write_logical(&pending.payload, true)
             .await
             .is_err()
@@ -1487,10 +1486,12 @@ impl Engine {
                 let Some(backend) = self.backend.as_mut() else {
                     return Some(WireErrorSource::Proxy);
                 };
-                let forwarded = backend
-                    .reader
-                    .forward_packet_to(&mut self.client_w, RESPONSE_CAPTURE)
-                    .await;
+                let forwarded = PacketIo::forward_packet_to(
+                    &mut backend.backend_io,
+                    &mut self.client_io,
+                    RESPONSE_CAPTURE,
+                )
+                .await;
                 let Ok(progress) = forwarded else {
                     let _ = self.events.send(SessionEvent::BackendIoError).await;
                     return Some(WireErrorSource::BackendNetwork);
@@ -1511,7 +1512,7 @@ impl Engine {
                 return Some(WireErrorSource::BackendNetwork);
             };
             self.in_transaction = effect.in_transaction;
-            if !matches!(effect.flush, FlushAction::None) && self.client_w.flush().await.is_err() {
+            if !matches!(effect.flush, FlushAction::None) && self.client_io.flush().await.is_err() {
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::ClientNetwork);
             }
@@ -1560,14 +1561,14 @@ impl Engine {
         // The upload continues each side's exchange in lockstep: the
         // client's next chunk follows the forwarded infile request, and
         // the chunks forwarded to the backend follow its request packet.
-        self.client_r.reset_sequence(self.client_w.next_sequence());
+        let seq = self.client_io.next_write_sequence();
+        self.client_io.reset_read_sequence(seq);
         if let Some(backend) = self.backend.as_mut() {
-            backend
-                .writer
-                .reset_sequence(backend.reader.expected_sequence());
+            let seq = backend.backend_io.expected_read_sequence();
+            backend.backend_io.reset_write_sequence(seq);
         }
         loop {
-            let payload = match self.client_r.read_logical(COMMAND_PAYLOAD_LIMIT).await {
+            let payload = match self.client_io.read_logical(COMMAND_PAYLOAD_LIMIT).await {
                 Ok(packet) => packet.payload,
                 Err(error) => {
                     let source = self.client_read_end(&error).await;
@@ -1594,18 +1595,22 @@ impl Engine {
             let Some(backend) = self.backend.as_mut() else {
                 return Some(WireErrorSource::Proxy);
             };
-            if backend.writer.write_logical(&payload, done).await.is_err() {
+            if backend
+                .backend_io
+                .write_logical(&payload, done)
+                .await
+                .is_err()
+            {
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
                 return Some(WireErrorSource::BackendNetwork);
             }
             if done {
                 // The final backend response continues after the last
                 // uploaded chunk on both sides of the relay.
-                backend
-                    .reader
-                    .reset_sequence(backend.writer.next_sequence());
-                self.client_w
-                    .reset_sequence(self.client_r.expected_sequence());
+                let seq = backend.backend_io.next_write_sequence();
+                backend.backend_io.reset_read_sequence(seq);
+                let client_seq = self.client_io.expected_read_sequence();
+                self.client_io.reset_write_sequence(client_seq);
                 return None;
             }
         }
@@ -1684,13 +1689,13 @@ impl Engine {
             SessionEffect::CloseBackend => {
                 self.closing = true;
                 if let Some(backend) = self.backend.as_mut() {
-                    let _ = backend.writer.flush().await;
+                    let _ = backend.backend_io.flush().await;
                 }
                 Awaited::Closing
             }
             SessionEffect::CloseClient => {
                 self.closing = true;
-                let _ = self.client_w.flush().await;
+                let _ = self.client_io.flush().await;
                 Awaited::Closing
             }
             SessionEffect::ClassifySessionEnd => {
@@ -1774,15 +1779,20 @@ impl Engine {
             return Err(SnapshotFailure::ProxyInvariant);
         };
 
-        backend.writer.reset_sequence(0);
-        backend.reader.reset_sequence(1);
-        if backend.writer.write_logical(&request, true).await.is_err() {
+        backend.backend_io.reset_write_sequence(0);
+        backend.backend_io.reset_read_sequence(1);
+        if backend
+            .backend_io
+            .write_logical(&request, true)
+            .await
+            .is_err()
+        {
             return Err(SnapshotFailure::BackendNetwork);
         }
 
         loop {
             let payload = backend
-                .reader
+                .backend_io
                 .read_logical(limits.max_result_bytes)
                 .await
                 .map_err(|_| SnapshotFailure::BackendNetwork)?
@@ -1849,9 +1859,9 @@ impl Engine {
                     };
                     // Connection-phase relay: both directions continue
                     // the one counter per channel in lockstep.
-                    self.client_w
-                        .reset_sequence(self.client_r.expected_sequence());
-                    if self.client_w.write_logical(&payload, true).await.is_err() {
+                    let seq = self.client_io.expected_read_sequence();
+                    self.client_io.reset_write_sequence(seq);
+                    if self.client_io.write_logical(&payload, true).await.is_err() {
                         let _ = self.events.send(SessionEvent::ClientIoError).await;
                         return Err(WireErrorSource::ClientNetwork);
                     }
@@ -1863,10 +1873,14 @@ impl Engine {
                     let Some(backend) = self.backend.as_mut() else {
                         return Err(WireErrorSource::Proxy);
                     };
-                    backend
-                        .writer
-                        .reset_sequence(backend.reader.expected_sequence());
-                    if backend.writer.write_logical(&payload, true).await.is_err() {
+                    let seq = backend.backend_io.expected_read_sequence();
+                    backend.backend_io.reset_write_sequence(seq);
+                    if backend
+                        .backend_io
+                        .write_logical(&payload, true)
+                        .await
+                        .is_err()
+                    {
                         let _ = self.events.send(SessionEvent::BackendIoError).await;
                         return Err(WireErrorSource::BackendNetwork);
                     }
@@ -1903,7 +1917,7 @@ impl Engine {
         let Ok(encoded) = encode_initial_handshake(params) else {
             return Err(WireErrorSource::Proxy);
         };
-        if self.client_w.write_logical(&encoded, true).await.is_err() {
+        if self.client_io.write_logical(&encoded, true).await.is_err() {
             return Err(WireErrorSource::ClientNetwork);
         }
         Ok(())
@@ -1920,7 +1934,7 @@ impl Engine {
         else {
             return Err(WireErrorSource::Proxy);
         };
-        if self.client_w.write_logical(&encoded, true).await.is_err() {
+        if self.client_io.write_logical(&encoded, true).await.is_err() {
             return Err(WireErrorSource::ClientNetwork);
         }
         Ok(())
@@ -1940,7 +1954,7 @@ impl Engine {
         let Some(backend) = self.backend.as_mut() else {
             return Err(WireErrorSource::Proxy);
         };
-        match backend.reader.read_logical(limit).await {
+        match backend.backend_io.read_logical(limit).await {
             Ok(packet) => Ok(packet.payload),
             Err(_) => Err(WireErrorSource::BackendNetwork),
         }
@@ -1951,7 +1965,7 @@ impl Engine {
             return false;
         };
         let mut probe = [0_u8; 1];
-        match backend.reader.get_mut().try_read(&mut probe) {
+        match backend.backend_io.get_mut().try_read(&mut probe) {
             // Data outside a command or a clean EOF both mean the
             // backend is not idle-healthy.
             Ok(_) => false,
@@ -1960,24 +1974,24 @@ impl Engine {
     }
 
     async fn shutdown_io(&mut self) {
-        let _ = self.client_w.flush().await;
+        let _ = self.client_io.flush().await;
         if let Some(backend) = self.backend.as_mut() {
-            let _ = backend.writer.flush().await;
+            let _ = backend.backend_io.flush().await;
         }
     }
 
     fn totals(&self) -> TrafficTotals {
         TrafficTotals {
-            client_in: self.client_r.in_bytes(),
-            client_out: self.client_w.out_bytes(),
+            client_in: self.client_io.in_bytes(),
+            client_out: self.client_io.out_bytes(),
             backend_in: self
                 .backend
                 .as_ref()
-                .map_or(0, |backend| backend.reader.in_bytes()),
+                .map_or(0, |backend| backend.backend_io.in_bytes()),
             backend_out: self
                 .backend
                 .as_ref()
-                .map_or(0, |backend| backend.writer.out_bytes()),
+                .map_or(0, |backend| backend.backend_io.out_bytes()),
         }
     }
 
@@ -1985,10 +1999,10 @@ impl Engine {
         self.backend
             .as_ref()
             .map_or(BackendTraffic::default(), |backend| BackendTraffic {
-                inbound_bytes: backend.reader.in_bytes(),
-                inbound_packets: backend.reader.in_packets(),
-                outbound_bytes: backend.writer.out_bytes(),
-                outbound_packets: backend.writer.out_packets(),
+                inbound_bytes: backend.backend_io.in_bytes(),
+                inbound_packets: backend.backend_io.in_packets(),
+                outbound_bytes: backend.backend_io.out_bytes(),
+                outbound_packets: backend.backend_io.out_packets(),
             })
     }
 
