@@ -773,6 +773,42 @@ mod tests {
         relay
     }
 
+    #[test]
+    fn pass_through_plugins_have_no_fast_path() {
+        // caching_sha2_password is the only plugin with a fast path; every
+        // other named plugin — and any unknown `Other` — is a plain
+        // pass-through in Go's loop (see the module doc, frozen from
+        // pkg/proxy/backend/authenticator.go). A `0x01 0x03`-shaped
+        // FastAuthSuccess packet is therefore NOT a short-circuit for them: it
+        // is forwarded untouched and the exchange keeps its ordinary client
+        // turn, so the whole handshake is relayed. This is the live matrix's
+        // stand-in for the plugins a stock mysql client cannot exercise
+        // against a bare TiUP playground (sm3/clear/socket/token/LDAP).
+        for plugin in [
+            AuthPluginName::TidbSm3Password,
+            AuthPluginName::MysqlClearPassword,
+            AuthPluginName::AuthSocket,
+            AuthPluginName::TidbSessionToken,
+            AuthPluginName::TidbAuthToken,
+            AuthPluginName::LdapSimple,
+            AuthPluginName::LdapSasl,
+            AuthPluginName::Other,
+        ] {
+            let mut relay = relay_with_plugin(plugin);
+            let data = step(&mut relay, AuthEvent::FastAuthSuccess);
+            assert_eq!(
+                data.effects,
+                vec![AuthEffect::ForwardBackendToClient],
+                "{plugin:?}: the packet is relayed untouched, not consumed as a fast path"
+            );
+            assert_eq!(
+                relay.turn(),
+                AuthTurn::AwaitingClient,
+                "{plugin:?}: no fast-path short-circuit — ordinary pass-through turn"
+            );
+        }
+    }
+
     /// First-packet PROXY-protocol suspects route to `BackendProxyProtocol`;
     /// later errors and non-suspects route to `AuthenticationFailed`. The
     /// error packet is forwarded either way (Go forwards before

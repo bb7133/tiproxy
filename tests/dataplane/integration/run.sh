@@ -480,6 +480,126 @@ attribution_row bob ns-beta || exit 1
 attribution_row root default || exit 1
 echo "namespace matrix: alice->ns-alpha bob->ns-beta root->default (per-connection route attribution)"
 
+# ---- SES-02 live authentication-plugin matrix (#27) ----
+# The dataplane relays each backend auth plugin's REAL handshake end to
+# end (Rust: session-core AuthRelay, frozen from Go
+# pkg/proxy/backend/authenticator.go). Provision users with distinct
+# plugins on the real cluster and prove, THROUGH the proxy, that each
+# authenticates (or is explicitly rejected) — identically in Go and Rust
+# modes. caching_sha2_password is the discriminating case: it is the only
+# plugin with a fast path, and its full-auth exchange (RSA public key over
+# a non-TLS link, cleartext inside TLS) must be relayed intact. Rows that
+# require a TLS frontend run only when the variant provides one.
+auth_pw_native="Nat1vePw9"
+auth_pw_sha2="Caching2Sha9"
+: >"$run_dir/auth-matrix.err"
+mysql_backend_admin "
+	CREATE USER IF NOT EXISTS 'auth_native'@'%' IDENTIFIED WITH mysql_native_password BY '$auth_pw_native';
+	CREATE USER IF NOT EXISTS 'auth_sha2'@'%' IDENTIFIED WITH caching_sha2_password BY '$auth_pw_sha2';
+	CREATE USER IF NOT EXISTS 'auth_reqssl'@'%' IDENTIFIED WITH mysql_native_password BY '$auth_pw_native' REQUIRE SSL;
+	GRANT ALL PRIVILEGES ON *.* TO 'auth_native'@'%';
+	GRANT ALL PRIVILEGES ON *.* TO 'auth_sha2'@'%';
+	GRANT ALL PRIVILEGES ON *.* TO 'auth_reqssl'@'%';
+"
+# auth_probe connects THROUGH the proxy as $1/$2 with the extra client
+# args $3.. and echoes the CURRENT_USER() marker; a nonzero exit means
+# the handshake was rejected (its diagnostics land in auth-matrix.err).
+auth_probe() {
+	local user=$1 pass=$2
+	shift 2
+	mysql --batch --skip-column-names --connect-timeout=6 \
+		-h 127.0.0.1 -P "$FAULT_PORT" -u "$user" -p"$pass" "$@" \
+		-e "SELECT CONCAT('AUTHOK|', CURRENT_USER());" 2>>"$run_dir/auth-matrix.err"
+}
+auth_transport=()
+[[ ${#mysql_tls_args[@]} -gt 0 ]] && auth_transport+=("${mysql_tls_args[@]}")
+[[ -n $mysql_compression_arg ]] && auth_transport+=("$mysql_compression_arg")
+
+# Row 1: mysql_native_password over the variant's own transport.
+auth_native_out=$(auth_probe auth_native "$auth_pw_native" "${auth_transport[@]}") || true
+if [[ $auth_native_out != AUTHOK\|auth_native@* ]]; then
+	echo "auth matrix: mysql_native_password did not authenticate through the proxy (got '$auth_native_out')" >&2
+	tail -5 "$run_dir/auth-matrix.err" >&2 || true
+	exit 1
+fi
+
+# Row 2: caching_sha2_password full-auth relay. The discriminating case
+# runs inside TLS, where the client sends the password in the clear and
+# the proxy must carry the whole switch + full-auth exchange to the
+# backend (the only plugin with a fast path in the relay). The non-TLS
+# RSA-public-key variant depends on the backend serving a key and is left
+# to the session-core unit matrix; here caching_sha2 success is asserted
+# only when the frontend has TLS.
+auth_sha2_note="caching_sha2: (skipped; needs a TLS frontend)"
+if [[ $TLS_ENABLED == true ]]; then
+	auth_sha2_out=$(auth_probe auth_sha2 "$auth_pw_sha2" "${auth_transport[@]}") || true
+	if [[ $auth_sha2_out != AUTHOK\|auth_sha2@* ]]; then
+		echo "auth matrix: caching_sha2_password full-auth was not relayed over TLS (got '$auth_sha2_out')" >&2
+		tail -8 "$run_dir/auth-matrix.err" >&2 || true
+		exit 1
+	fi
+	auth_sha2_note="caching_sha2: full-auth relayed over TLS"
+fi
+
+# Row 3: a wrong password is rejected end to end with an explicit
+# access-denied error, not a silent hang or a spurious success.
+if auth_probe auth_native "Wr0ngPw0" "${auth_transport[@]}" >/dev/null 2>&1; then
+	echo "auth matrix: a wrong password unexpectedly authenticated" >&2
+	exit 1
+fi
+if ! grep -qiE "Access denied|error 1045|ERROR 1045" "$run_dir/auth-matrix.err"; then
+	echo "auth matrix: wrong-password rejection did not surface an access-denied error" >&2
+	tail -5 "$run_dir/auth-matrix.err" >&2 || true
+	exit 1
+fi
+
+# Row 4: REQUIRE SSL enforcement through the proxy is decided by the
+# proxy->backend link, not the client link — verified identical in Go and
+# Rust modes. TiDB checks REQUIRE SSL against the connection it actually
+# terminates, which is the proxy's backend dial:
+#   - Without backend TLS (require_backend_tls=false, the plain/proxy/
+#     compress variants) the backend link is plaintext, so a REQUIRE SSL user
+#     is refused end to end regardless of the client's own transport.
+#   - With backend TLS (require_backend_tls=true, the tls variants) the
+#     backend link is always TLS, so the same user authenticates — even from
+#     a --ssl-mode=DISABLED client — because the secure requirement is met at
+#     the backend hop. This matches Go TiProxy (a non-TLS client reaching a
+#     REQUIRE SSL user over a TLS backend link is accepted in both modes), so
+#     the non-TLS-refusal assertion only applies when the backend link is
+#     itself plaintext.
+if [[ $TLS_ENABLED == true ]]; then
+	# Prove the backend-link semantic with a PLAINTEXT client
+	# (--ssl-mode=DISABLED, no client TLS): the REQUIRE SSL user still
+	# authenticates, because the requirement is satisfied at the forced-TLS
+	# proxy->backend link, not the client link. Using the TLS client transport
+	# here would not distinguish the two.
+	auth_reqssl_out=$(auth_probe auth_reqssl "$auth_pw_native" --ssl-mode=DISABLED) || true
+	if [[ $auth_reqssl_out != AUTHOK\|auth_reqssl@* ]]; then
+		echo "auth matrix: REQUIRE SSL user failed from a plaintext client over the forced TLS backend link (got '$auth_reqssl_out')" >&2
+		tail -5 "$run_dir/auth-matrix.err" >&2 || true
+		exit 1
+	fi
+	auth_reqssl_note="require-secure: enforced at backend link (plaintext client accepted over forced TLS backend)"
+else
+	if auth_probe auth_reqssl "$auth_pw_native" --ssl-mode=DISABLED >/dev/null 2>&1; then
+		echo "auth matrix: a REQUIRE SSL user authenticated over a plaintext backend link" >&2
+		exit 1
+	fi
+	auth_reqssl_note="require-secure: plaintext backend link refused"
+fi
+
+mysql_backend_admin "DROP USER IF EXISTS 'auth_native'@'%'; DROP USER IF EXISTS 'auth_sha2'@'%'; DROP USER IF EXISTS 'auth_reqssl'@'%';" || true
+# tidb_sm3_password / mysql_clear_password / auth_socket / tidb_session_token
+# / tidb_auth_token / authentication_ldap_simple / authentication_ldap_sasl
+# / unknown "Other" are pass-through in the relay with no fast path; a stock
+# mysql client against a bare TiUP playground cannot exercise them without
+# extra client plugins or an LDAP/JWKS backend, so their relay behavior is
+# covered by the session-core handshake unit matrix rather than this live
+# phase: classification (plugin_classification_matches_go_list), fast-path
+# gating to caching_sha2_password only (sha2_fast_path_is_plugin_gated), and
+# a per-plugin pass-through matrix (pass_through_plugins_have_no_fast_path).
+echo "auth matrix: mysql_native_password relayed; $auth_sha2_note; wrong password rejected (1045); $auth_reqssl_note (mode=$mode, tls=$TLS_ENABLED)"
+
 # ---- Cluster x listener matrix (DPL-07 #41 cluster dimension) ----
 # Deterministic construction: routing-rule = "port" groups backends by
 # their `tiproxy-port` topology label, so listener A can ONLY select
