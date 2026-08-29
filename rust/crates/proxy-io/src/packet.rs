@@ -1315,8 +1315,10 @@ impl<T> PacketIo<T> {
             write,
         } = self;
         let unread_prefix = read.prefetched_slice().to_vec();
-        // Exactly-once: the prefix now lives solely in `unread_prefix`. Clear the
-        // reader's prefetch window so the token retains no second copy.
+        // Exactly-once: the prefix now lives solely in `unread_prefix`. Physically
+        // zero the reader's prefetch backing array (not just the window offsets)
+        // so the token retains no second copy of any prefetched byte.
+        read.prefetched.fill(0);
         read.prefetch_start = 0;
         read.prefetch_end = 0;
         (inner, PacketIoUpgradeState { read, write }, unread_prefix)
@@ -2119,6 +2121,24 @@ mod tests {
         assert_eq!(logical.payload, b"abc");
         assert_eq!(reattached.in_packets(), 1);
         assert_eq!(reattached.expected_read_sequence(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_token_backing_prefetch_array_is_zeroed() -> Result<(), Box<dyn Error>> {
+        // Prefetch some bytes into the reader's backing array, then split.
+        let wire = encoded_physical_packet(b"secret", 0)?;
+        let mut io = PacketIo::new(Cursor::new(wire));
+        io.peek_packet().await?;
+        let (_inner, state, unread_prefix) = io.into_upgrade_parts();
+
+        // Exactly-once / zero-source: the token must not retain any prefetched
+        // byte — the whole backing array is physically zeroed, not merely the
+        // window offsets — so the prefix exists solely in `unread_prefix`.
+        assert!(!unread_prefix.is_empty());
+        assert_eq!(state.read.prefetched, [0_u8; PEEK_BYTES]);
+        assert_eq!(state.read.prefetch_start, 0);
+        assert_eq!(state.read.prefetch_end, 0);
         Ok(())
     }
 

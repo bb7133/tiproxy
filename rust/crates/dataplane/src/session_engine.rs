@@ -91,8 +91,7 @@ use session_core::command::{
 use session_core::error_source::FailureKind;
 use session_core::fsm::{SessionEffect, SessionEvent};
 use session_core::handshake::{
-    ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend,
-    reconcile_tls_capabilities, verify_backend,
+    ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend, verify_backend,
 };
 use session_core::internal_client::{
     InternalLimits, InternalParserState, InternalProgress, InternalQuery, InternalResult,
@@ -124,13 +123,11 @@ use crate::session_control::{
 };
 use crate::transport::{BackendTransport, ClientTransport};
 
-/// The proxy's advertised capability mask for this slice: Go's
-/// handshake set without SSL (frontend TLS disabled here) and without
-/// compression bits (never negotiated, so the relay's compression
-/// effects are unreachable).
 /// The proxy's full advertised capability set, including `SSL`. `SSL` is
 /// retained or stripped per session by [`proxy_capabilities`] according to
 /// whether that session's snapshot carries a frontend TLS server config.
+/// Compression bits are still not advertised (never negotiated, so the relay's
+/// compression effects are unreachable) until the WIRE-activation C slice.
 fn proxy_capability_base() -> CapabilityFlags {
     CapabilityFlags::LONG_PASSWORD
         | CapabilityFlags::FOUND_ROWS
@@ -173,6 +170,18 @@ fn leading_capabilities(payload: &[u8]) -> CapabilityFlags {
     }
     let bits = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     CapabilityFlags::from_bits_retain(bits)
+}
+
+/// Overwrites the leading capability flags of a handshake-response payload with
+/// the trusted pre-TLS `SSLRequest` mask (Go `handshakeFirstTime`: the mask sent
+/// before the encrypted response is authoritative, so it — not the in-TLS
+/// response's own bytes — governs the response's field layout and negotiation).
+/// A payload shorter than four bytes is left unchanged; it fails the subsequent
+/// parse fail-closed.
+fn normalize_leading_capabilities(payload: &mut [u8], trusted: CapabilityFlags) {
+    if payload.len() >= 4 {
+        payload[0..4].copy_from_slice(&trusted.bits().to_le_bytes());
+    }
 }
 
 /// The SNI/server name for a backend TLS handshake: the host of a `host:port`
@@ -940,7 +949,7 @@ impl Engine {
                 None
             };
 
-        let payload = if ssl_request_capabilities.is_some() {
+        let mut payload = if ssl_request_capabilities.is_some() {
             // FSM: Greeting --ClientSslRequest--> SslRequest (ActivateFrontendTls).
             if self
                 .events
@@ -973,23 +982,27 @@ impl Engine {
             payload
         };
 
+        // Go parity: when TLS was negotiated, the pre-TLS `SSLRequest` mask is
+        // authoritative, so overwrite the in-TLS response's leading capability
+        // bytes with it BEFORE parsing. This makes layout-affecting bits
+        // (CONNECT_WITH_DB / CONNECT_ATTRS / PLUGIN_AUTH_LENENC / ZSTD) — which
+        // decide the response's field layout — come from the trusted mask, not
+        // the untrusted second packet, and keeps the stored raw (re-parsed for
+        // backend forwarding) consistent with what we negotiated.
+        if let Some(ssl_capabilities) = ssl_request_capabilities {
+            normalize_leading_capabilities(&mut payload, ssl_capabilities);
+        }
+
         let Ok(parsed) = parse_handshake_response(&payload) else {
             self.quit_source = QuitSource::ProxyMalformed;
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Some(WireErrorSource::ClientNetwork);
         };
-        // When TLS was negotiated, the SSLRequest capability mask (sent before
-        // the encrypted response) is the trusted set; reconcile the in-TLS
-        // response against it so a mid-flight capability change cannot widen
-        // what the pre-TLS client asked for.
-        let client_capabilities = match ssl_request_capabilities {
-            Some(ssl_capabilities) => {
-                reconcile_tls_capabilities(ssl_capabilities, parsed.capabilities).trusted
-            }
-            None => parsed.capabilities,
-        };
+        // After normalization `parsed.capabilities` is the trusted mask under
+        // TLS (and the plaintext client mask otherwise), so it governs both the
+        // parsed field layout and the negotiation.
         let negotiation = match negotiate_frontend(
-            client_capabilities,
+            parsed.capabilities,
             proxy_capabilities(frontend_tls_available),
         ) {
             Ok(negotiation) => negotiation,
@@ -2438,8 +2451,14 @@ fn fill_salt(salt: &mut [u8; 20]) {
 
 #[cfg(test)]
 mod tls_wiring_tests {
-    use super::{backend_server_name, leading_capabilities, proxy_capabilities};
-    use mysql_wire::{CapabilityFlags, encode_ssl_request, parse_ssl_request};
+    use super::{
+        backend_server_name, leading_capabilities, normalize_leading_capabilities,
+        proxy_capabilities,
+    };
+    use mysql_wire::{
+        CapabilityFlags, HandshakeResponseParams, encode_handshake_response, encode_ssl_request,
+        parse_handshake_response, parse_ssl_request,
+    };
 
     #[test]
     fn proxy_capabilities_advertise_ssl_only_when_available() {
@@ -2478,6 +2497,65 @@ mod tls_wiring_tests {
         // the (fail-closed) handshake parser.
         assert!(!leading_capabilities(&[0xff, 0xff]).contains(CapabilityFlags::SSL));
         assert!(!leading_capabilities(&[]).contains(CapabilityFlags::SSL));
+    }
+
+    #[test]
+    fn normalize_leading_capabilities_governs_layout_affecting_parse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The real (trusted) client asked for CONNECT_WITH_DB, so the response
+        // is laid out with a database field, encoded here per the trusted mask.
+        let trusted = CapabilityFlags::PROTOCOL_41
+            | CapabilityFlags::SECURE_CONNECTION
+            | CapabilityFlags::CONNECT_WITH_DB
+            | CapabilityFlags::PLUGIN_AUTH;
+        let encoded = encode_handshake_response(HandshakeResponseParams {
+            capabilities: trusted,
+            max_packet_size: 0x0100_0000,
+            collation: 45,
+            username: b"alice",
+            auth_response: b"\x01\x02\x03",
+            database: Some(b"shop"),
+            auth_plugin_name: Some(b"mysql_native_password"),
+            attributes: None,
+            zstd_level: None,
+        })?;
+
+        // Simulate a hostile in-TLS second packet whose leading mask drops
+        // CONNECT_WITH_DB — a layout-affecting mismatch. Parsing the SAME bytes
+        // under that untrusted mask misreads the layout: no database, and the
+        // "shop" bytes are consumed as the auth plugin name.
+        let untrusted = trusted.without(CapabilityFlags::CONNECT_WITH_DB);
+        let mut hostile = encoded.clone();
+        hostile[0..4].copy_from_slice(&untrusted.bits().to_le_bytes());
+        assert_eq!(leading_capabilities(&hostile), untrusted);
+        let misread = parse_handshake_response(&hostile)?;
+        assert_eq!(
+            misread.database, None,
+            "untrusted layout drops the database"
+        );
+        assert_eq!(
+            misread.auth_plugin_name,
+            Some(b"shop".as_ref()),
+            "untrusted layout misreads the database bytes as the plugin name"
+        );
+
+        // Normalizing the leading bytes back to the trusted mask restores the
+        // real layout: the database and plugin parse correctly.
+        normalize_leading_capabilities(&mut hostile, trusted);
+        assert_eq!(leading_capabilities(&hostile), trusted);
+        let fixed = parse_handshake_response(&hostile)?;
+        assert_eq!(fixed.capabilities, trusted);
+        assert_eq!(fixed.database, Some(b"shop".as_ref()));
+        assert_eq!(
+            fixed.auth_plugin_name,
+            Some(b"mysql_native_password".as_ref())
+        );
+        assert_eq!(fixed.username, b"alice");
+        // A short payload is left untouched (it fails the subsequent parse).
+        let mut short = [1_u8, 2, 3];
+        normalize_leading_capabilities(&mut short, trusted);
+        assert_eq!(short, [1, 2, 3]);
+        Ok(())
     }
 
     #[test]

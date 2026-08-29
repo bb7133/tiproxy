@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Session transport variants (A1 TLS activation, step 2a).
+//! Session transport variants (A1 TLS activation).
 //!
 //! The engine owns its client and backend byte streams through
-//! [`proxy_io::PacketIo`]. To let a later step upgrade a plaintext
-//! socket to TLS without changing every wire call site, the concrete
-//! transport is an enum that implements [`AsyncRead`]/[`AsyncWrite`] by
-//! delegating to whichever variant is active. This step wires only the
-//! `Plain` variant, so the behavior is byte-identical to a bare
-//! `TcpStream`; the `Tls` variants are defined but not constructed until
-//! the TLS-upgrade step.
+//! [`proxy_io::PacketIo`]. To let the engine upgrade a plaintext socket to
+//! TLS without changing every wire call site, the concrete transport is an
+//! enum that implements [`AsyncRead`]/[`AsyncWrite`] by delegating to whichever
+//! variant is active. A session begins on the `Plain` variant (byte-identical
+//! to a bare `TcpStream`) and, when a client `SSLRequest` or a backend TLS plan
+//! activates TLS, the engine swaps in the `Tls` variant in place via the
+//! state-preserving [`proxy_io::PacketIo`] upgrade seam. `Detached` is a
+//! transient placeholder held only across the upgrade `await` and is never
+//! polled.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
