@@ -98,7 +98,6 @@ use session_core::response::{
     DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseObserver,
     ResponsePacket,
 };
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
@@ -118,6 +117,7 @@ use crate::session::{
 use crate::session_control::{
     BoundSessionHandler, ResponseStream, SessionCommander, SessionControlBinding,
 };
+use crate::transport::{BackendTransport, ClientTransport};
 
 /// The proxy's advertised capability mask for this slice: Go's
 /// handshake set without SSL (frontend TLS disabled here) and without
@@ -460,7 +460,7 @@ async fn run_bound_session_observed(
     let engine = Engine {
         connection_id: identity.connection_id,
         endpoints,
-        client_io: PacketIo::new(stream),
+        client_io: PacketIo::new(ClientTransport::Plain(stream)),
         backend: None,
         events: event_tx,
         cmds: cmd_rx,
@@ -722,7 +722,7 @@ struct RouteSeed {
 /// The dialed backend's I/O and identity.
 struct BackendIo {
     #[allow(clippy::struct_field_names)]
-    backend_io: PacketIo<TcpStream>,
+    backend_io: PacketIo<BackendTransport>,
     id: String,
     address: String,
     cluster: String,
@@ -744,7 +744,7 @@ struct PendingCommand {
 struct Engine {
     connection_id: u64,
     endpoints: ConnectionEndpoints,
-    client_io: PacketIo<TcpStream>,
+    client_io: PacketIo<ClientTransport>,
     backend: Option<BackendIo>,
     events: mpsc::Sender<SessionEvent>,
     cmds: mpsc::Receiver<EngineCmd>,
@@ -1072,7 +1072,7 @@ impl Engine {
             }
         }
         let mut backend = BackendIo {
-            backend_io: PacketIo::new(acquired.conn),
+            backend_io: PacketIo::new(BackendTransport::Plain(acquired.conn)),
             id: backend_id.clone(),
             address: backend_address,
             cluster: backend_cluster,
@@ -1965,7 +1965,12 @@ impl Engine {
             return false;
         };
         let mut probe = [0_u8; 1];
-        match backend.backend_io.get_mut().try_read(&mut probe) {
+        match backend
+            .backend_io
+            .get_ref()
+            .as_tcp_stream()
+            .try_read(&mut probe)
+        {
             // Data outside a command or a clean EOF both mean the
             // backend is not idle-healthy.
             Ok(_) => false,
