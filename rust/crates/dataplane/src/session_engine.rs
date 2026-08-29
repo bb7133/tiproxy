@@ -1045,6 +1045,35 @@ impl Drop for SensitiveBytes {
     }
 }
 
+/// Applies Go's second-handshake capability rules after the normal negotiated
+/// intersection. The session token's encoding is payload-length driven:
+/// `MakeHandshakeResponse` forces LENENC above 250 bytes even though real `TiDB`
+/// greetings omit that bit.
+fn migration_auth_capabilities(
+    planned: CapabilityFlags,
+    backend: CapabilityFlags,
+    has_database: bool,
+    token_length: usize,
+) -> Result<CapabilityFlags, CandidateFailure> {
+    let mut capabilities = planned.union(CapabilityFlags::PLUGIN_AUTH);
+    capabilities = if has_database {
+        if !backend.contains(CapabilityFlags::CONNECT_WITH_DB) {
+            return Err(CandidateFailure::Handshake);
+        }
+        capabilities.union(CapabilityFlags::CONNECT_WITH_DB)
+    } else {
+        capabilities.without(CapabilityFlags::CONNECT_WITH_DB)
+    };
+    capabilities = if token_length > 250 {
+        // Go's `MakeHandshakeResponse` forces the length-encoded auth form
+        // for long payloads independently of the backend's advertised mask.
+        capabilities.union(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA)
+    } else {
+        capabilities.without(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA)
+    };
+    Ok(capabilities)
+}
+
 impl Engine {
     async fn run(mut self) -> EngineExit {
         let end = self.lifecycle().await;
@@ -2473,23 +2502,12 @@ impl Engine {
                 .collect::<Vec<_>>()
         });
         let database = snapshot.current_database().map(str::as_bytes);
-        let mut capabilities = planned_capabilities.union(CapabilityFlags::PLUGIN_AUTH);
-        capabilities = if database.is_some() {
-            if !backend_caps.contains(CapabilityFlags::CONNECT_WITH_DB) {
-                return Err(CandidateFailure::Handshake);
-            }
-            capabilities.union(CapabilityFlags::CONNECT_WITH_DB)
-        } else {
-            capabilities.without(CapabilityFlags::CONNECT_WITH_DB)
-        };
-        capabilities = if snapshot.session_token().len() > 250 {
-            if !backend_caps.contains(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA) {
-                return Err(CandidateFailure::Handshake);
-            }
-            capabilities.union(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA)
-        } else {
-            capabilities.without(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA)
-        };
+        let capabilities = migration_auth_capabilities(
+            planned_capabilities,
+            backend_caps,
+            database.is_some(),
+            snapshot.session_token().len(),
+        )?;
         let response = encode_handshake_response(HandshakeResponseParams {
             capabilities,
             max_packet_size: parsed.max_packet_size,
@@ -3207,7 +3225,7 @@ fn fill_salt(salt: &mut [u8; 20]) {
 #[cfg(test)]
 mod tls_wiring_tests {
     use super::{
-        backend_server_name, candidate_budget, leading_capabilities,
+        backend_server_name, candidate_budget, leading_capabilities, migration_auth_capabilities,
         normalize_leading_capabilities, proxy_capabilities,
     };
     use mysql_wire::{
@@ -3332,5 +3350,53 @@ mod tls_wiring_tests {
             candidate_budget(1).is_zero(),
             "an already-expired absolute deadline cannot start candidate I/O"
         );
+    }
+
+    #[test]
+    fn migration_token_length_governs_lenenc_independent_of_backend_advertisement()
+    -> Result<(), super::CandidateFailure> {
+        let planned = CapabilityFlags::PROTOCOL_41
+            | CapabilityFlags::CONNECT_WITH_DB
+            | CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA;
+        let backend = CapabilityFlags::PROTOCOL_41 | CapabilityFlags::CONNECT_WITH_DB;
+
+        let short = migration_auth_capabilities(planned, backend, true, 250)?;
+        assert!(short.contains(CapabilityFlags::PLUGIN_AUTH));
+        assert!(short.contains(CapabilityFlags::CONNECT_WITH_DB));
+        assert!(
+            !short.contains(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA),
+            "the Go-compatible boundary uses secure-connection encoding at 250 bytes"
+        );
+
+        let long = migration_auth_capabilities(planned, backend, true, 251)?;
+        assert!(long.contains(CapabilityFlags::PLUGIN_AUTH));
+        assert!(long.contains(CapabilityFlags::CONNECT_WITH_DB));
+        assert!(
+            long.contains(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA),
+            "Go forces length-encoded auth data above 250 bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_database_capability_follows_the_authoritative_snapshot()
+    -> Result<(), super::CandidateFailure> {
+        let planned = CapabilityFlags::PROTOCOL_41 | CapabilityFlags::CONNECT_WITH_DB;
+        let backend = CapabilityFlags::PROTOCOL_41 | CapabilityFlags::CONNECT_WITH_DB;
+
+        let cleared = migration_auth_capabilities(planned, backend, false, 32)?;
+        assert!(!cleared.contains(CapabilityFlags::CONNECT_WITH_DB));
+
+        let unsupported = migration_auth_capabilities(
+            planned,
+            backend.without(CapabilityFlags::CONNECT_WITH_DB),
+            true,
+            32,
+        );
+        assert!(
+            unsupported.is_err(),
+            "a restored database fails closed when the candidate cannot encode it"
+        );
+        Ok(())
     }
 }

@@ -92,6 +92,15 @@ if [[ -n ${KA_DROP_SOCKET:-} ]]; then
 	fi
 fi
 stop_owned_process "${KA_PID:-}" "$run_dir/tiproxy-ka.toml" || cleanup_status=1
+# MIG-01 live migration session (Rust plain/TLS only). The exact PID and
+# FIFO are persisted before the dynamic fail-list swap so a mid-phase failure
+# cannot strand the client or its writer endpoint.
+if [[ ${MIG_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
+	kill "${MIG_SESSION_PID}" 2>/dev/null || true
+fi
+if [[ -n ${MIG_FIFO:-} ]]; then
+	rm -f "$MIG_FIFO"
+fi
 if [[ ${KA_SESSION_PID:-} =~ ^[0-9]+$ ]]; then
 	kill "${KA_SESSION_PID}" 2>/dev/null || true
 fi
