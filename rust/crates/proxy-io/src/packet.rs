@@ -244,14 +244,15 @@ pub struct LogicalPacket {
     pub progress: ForwardProgress,
 }
 
-/// Async physical/logical packet reader over an arbitrary transport layer.
+/// Inner-independent read state: sequence tracking, prefetch buffer, accounting.
 ///
-/// The reader owns only five prefetch bytes. Streaming methods allocate one
-/// fixed-size copy buffer and an explicitly bounded capture prefix; memory does
-/// not scale with the logical message length.
+/// All physical/logical read logic lives here as methods that borrow the
+/// transport for the duration of a call, so the same state drives both the
+/// read-only [`PacketReader`] and the duplex [`PacketIo`]. The state owns only
+/// the fixed prefetch window; streaming methods allocate one bounded copy
+/// buffer and never scale memory with the logical message length.
 #[derive(Debug)]
-pub struct PacketReader<R> {
-    inner: R,
+struct ReaderState {
     sequence: SequenceTracker,
     prefetched: [u8; PEEK_BYTES],
     prefetch_start: usize,
@@ -261,12 +262,9 @@ pub struct PacketReader<R> {
     in_packets: u64,
 }
 
-impl<R> PacketReader<R> {
-    /// Creates a reader with sequence zero and a 32-KiB streaming buffer.
-    #[must_use]
-    pub fn new(inner: R) -> Self {
+impl ReaderState {
+    fn new() -> Self {
         Self {
-            inner,
             sequence: SequenceTracker::default(),
             prefetched: [0; PEEK_BYTES],
             prefetch_start: 0,
@@ -278,81 +276,24 @@ impl<R> PacketReader<R> {
         }
     }
 
-    /// Creates a reader with a caller-selected nonzero streaming buffer size.
-    #[must_use]
-    pub fn with_stream_buffer_size(inner: R, stream_buffer_size: NonZeroUsize) -> Self {
+    fn with_stream_buffer_size(stream_buffer_size: NonZeroUsize) -> Self {
         Self {
             stream_buffer_size,
-            ..Self::new(inner)
+            ..Self::new()
         }
     }
 
-    /// Returns a shared reference to the underlying transport.
-    #[must_use]
-    pub const fn get_ref(&self) -> &R {
-        &self.inner
-    }
-
-    /// Returns a mutable reference to the underlying transport.
-    #[must_use]
-    pub fn get_mut(&mut self) -> &mut R {
-        &mut self.inner
-    }
-
-    /// Consumes the packet reader and returns the underlying transport.
-    #[must_use]
-    pub fn into_inner(self) -> R {
-        self.inner
-    }
-
-    /// Returns the next expected incoming physical sequence.
-    #[must_use]
-    pub const fn expected_sequence(&self) -> u8 {
-        self.sequence.expected()
-    }
-
-    /// Resets the expected incoming sequence, normally at a command boundary.
-    pub const fn reset_sequence(&mut self, expected: u8) {
-        self.sequence.reset(expected);
-    }
-
-    /// Returns consumed physical wire bytes, including headers.
-    #[must_use]
-    pub const fn in_bytes(&self) -> u64 {
-        self.in_bytes
-    }
-
-    /// Returns completely consumed physical packets.
-    #[must_use]
-    pub const fn in_packets(&self) -> u64 {
-        self.in_packets
-    }
-
-    /// Returns the fixed payload-copy buffer size used by streaming methods.
-    #[must_use]
-    pub const fn stream_buffer_size(&self) -> usize {
-        self.stream_buffer_size.get()
-    }
-}
-
-impl<R> PacketReader<R>
-where
-    R: AsyncRead + Unpin,
-{
-    /// Peeks at the next physical header and optional first payload byte.
-    ///
-    /// The method consumes neither sequence state nor accounting counters.
-    ///
-    /// # Errors
-    ///
-    /// Returns a source I/O or header decode error for incomplete input.
-    pub async fn peek_packet(&mut self) -> Result<PacketPreview, PacketIoError> {
-        self.ensure_prefetched(PHYSICAL_PACKET_HEADER_LEN).await?;
+    async fn peek_packet(
+        &mut self,
+        inner: &mut (impl AsyncRead + Unpin),
+    ) -> Result<PacketPreview, PacketIoError> {
+        self.ensure_prefetched(inner, PHYSICAL_PACKET_HEADER_LEN)
+            .await?;
         let header = PacketHeader::decode(&self.prefetched_slice()[..PHYSICAL_PACKET_HEADER_LEN])?;
         let first_byte = if header.payload_length() == 0 {
             None
         } else {
-            self.ensure_prefetched(PEEK_BYTES).await?;
+            self.ensure_prefetched(inner, PEEK_BYTES).await?;
             self.prefetched_slice()
                 .get(PHYSICAL_PACKET_HEADER_LEN)
                 .copied()
@@ -364,27 +305,23 @@ where
         })
     }
 
-    /// Reads and materializes one logical packet up to `payload_limit` bytes.
-    ///
-    /// An oversized logical packet is fully drained with constant scratch space
-    /// before [`PacketIoError::LogicalPayloadTooLarge`] is returned, leaving the
-    /// reader at the next logical-packet boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed framing/I/O error, or a size error after draining an
-    /// oversized message.
-    pub async fn read_logical(
+    async fn read_logical(
         &mut self,
+        inner: &mut (impl AsyncRead + Unpin),
         payload_limit: usize,
     ) -> Result<LogicalPacket, PacketIoError> {
         let mut progress = ForwardProgress::new(payload_limit);
         let mut scratch = vec![0_u8; self.stream_buffer_size.get()];
         loop {
-            let (header, sequence) = self.read_header().await?;
+            let (header, sequence) = self.read_header(inner).await?;
             progress.observe_header(header, sequence)?;
-            self.read_payload_into_progress(header.payload_length(), &mut scratch, &mut progress)
-                .await?;
+            self.read_payload_into_progress(
+                inner,
+                header.payload_length(),
+                &mut scratch,
+                &mut progress,
+            )
+            .await?;
             self.finish_physical_packet()?;
             progress.finish_physical_packet(header.payload_length())?;
             if progress.is_complete() {
@@ -403,202 +340,9 @@ where
         })
     }
 
-    /// Streams one logical packet to `destination` and flushes it.
-    ///
-    /// Source headers are decoded and destination headers are regenerated with
-    /// the destination's independent sequence. At most `capture_limit` payload
-    /// bytes are retained.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed source/destination I/O, framing, or accounting error.
-    pub async fn forward_packet_to<W>(
-        &mut self,
-        destination: &mut PacketWriter<W>,
-        capture_limit: usize,
-    ) -> Result<ForwardProgress, PacketIoError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut progress = ForwardProgress::new(capture_limit);
-        self.forward_inner(destination, &mut progress, false, &mut || false, true)
-            .await?;
-        Ok(progress)
-    }
-
-    /// Advances a resumable logical-packet forward until completion or a safe boundary.
-    ///
-    /// `is_cancelled` is checked only before a physical header is consumed. It
-    /// is never checked while a header or payload is partially transferred.
-    /// Callers must request cancellation through this probe rather than dropping
-    /// the future mid-I/O. When cancelled after a maximum-size fragment, pass the
-    /// same `progress` back to resume at the next physical header.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed source/destination I/O, framing, or accounting error.
-    pub async fn forward_packet_to_cancellable<W, C>(
-        &mut self,
-        destination: &mut PacketWriter<W>,
-        progress: &mut ForwardProgress,
-        mut is_cancelled: C,
-    ) -> Result<ForwardStatus, PacketIoError>
-    where
-        W: AsyncWrite + Unpin,
-        C: FnMut() -> bool,
-    {
-        self.forward_inner(destination, progress, true, &mut is_cancelled, true)
-            .await
-    }
-
-    /// Forwards logical packets until `decide` selects a terminating packet.
-    ///
-    /// The first byte and physical length are peeked without consumption.
-    /// Intermediate packets are not captured, and the destination is flushed
-    /// once after the terminating logical packet.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed source/destination I/O, framing, or accounting error.
-    pub async fn forward_until<W, F>(
-        &mut self,
-        destination: &mut PacketWriter<W>,
-        mut decide: F,
-    ) -> Result<ForwardUntilResult, PacketIoError>
-    where
-        W: AsyncWrite + Unpin,
-        F: FnMut(PacketPreview) -> ForwardUntilDecision,
-    {
-        let mut logical_packets = 0_u64;
-        loop {
-            let preview = self.peek_packet().await?;
-            let decision = decide(preview);
-            let (stop, capture_limit) = match decision {
-                ForwardUntilDecision::Continue => (false, 0),
-                ForwardUntilDecision::Stop { capture_limit } => (true, capture_limit),
-            };
-            let mut progress = ForwardProgress::new(capture_limit);
-            self.forward_inner(destination, &mut progress, false, &mut || false, false)
-                .await?;
-            logical_packets =
-                logical_packets
-                    .checked_add(1)
-                    .ok_or(PacketIoError::CounterOverflow {
-                        field: "forwarded logical packets",
-                    })?;
-            if stop {
-                destination.flush().await?;
-                return Ok(ForwardUntilResult {
-                    logical_packets,
-                    final_packet: progress,
-                });
-            }
-        }
-    }
-
-    /// Cancellation-aware [`Self::forward_until`] checked at logical boundaries.
-    ///
-    /// A cancellation return flushes all preceding complete logical packets.
-    /// No partial logical packet is started after the probe reports cancellation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed source/destination I/O, framing, or accounting error.
-    pub async fn forward_until_cancellable<W, F, C>(
-        &mut self,
-        destination: &mut PacketWriter<W>,
-        mut decide: F,
-        mut is_cancelled: C,
-    ) -> Result<ForwardUntilStatus, PacketIoError>
-    where
-        W: AsyncWrite + Unpin,
-        F: FnMut(PacketPreview) -> ForwardUntilDecision,
-        C: FnMut() -> bool,
-    {
-        let mut logical_packets = 0_u64;
-        loop {
-            if is_cancelled() {
-                destination.flush().await?;
-                return Ok(ForwardUntilStatus::CancelledAtLogicalBoundary { logical_packets });
-            }
-            let preview = self.peek_packet().await?;
-            let decision = decide(preview);
-            let (stop, capture_limit) = match decision {
-                ForwardUntilDecision::Continue => (false, 0),
-                ForwardUntilDecision::Stop { capture_limit } => (true, capture_limit),
-            };
-            let mut progress = ForwardProgress::new(capture_limit);
-            self.forward_inner(destination, &mut progress, false, &mut || false, false)
-                .await?;
-            logical_packets =
-                logical_packets
-                    .checked_add(1)
-                    .ok_or(PacketIoError::CounterOverflow {
-                        field: "forwarded logical packets",
-                    })?;
-            if stop {
-                destination.flush().await?;
-                return Ok(ForwardUntilStatus::Complete(ForwardUntilResult {
-                    logical_packets,
-                    final_packet: progress,
-                }));
-            }
-        }
-    }
-
-    async fn forward_inner<W, C>(
-        &mut self,
-        destination: &mut PacketWriter<W>,
-        progress: &mut ForwardProgress,
-        allow_cancel: bool,
-        is_cancelled: &mut C,
-        flush_on_complete: bool,
-    ) -> Result<ForwardStatus, PacketIoError>
-    where
-        W: AsyncWrite + Unpin,
-        C: FnMut() -> bool,
-    {
-        if progress.is_complete() {
-            return Err(PacketIoError::ForwardAlreadyComplete);
-        }
-        let mut scratch = vec![0_u8; self.stream_buffer_size.get()];
-        loop {
-            if allow_cancel && is_cancelled() {
-                return Ok(ForwardStatus::CancelledAtPacketBoundary);
-            }
-            let (header, sequence) = self.read_header().await?;
-            progress.observe_header(header, sequence)?;
-            destination
-                .start_physical_packet(header.payload_length())
-                .await?;
-
-            let mut remaining = usize::try_from(header.payload_length()).map_err(|_| {
-                PacketIoError::CounterOverflow {
-                    field: "physical payload length",
-                }
-            })?;
-            while remaining > 0 {
-                let chunk_length = remaining.min(scratch.len());
-                self.read_exact(&mut scratch[..chunk_length], "physical packet payload")
-                    .await?;
-                progress.observe_payload(&scratch[..chunk_length])?;
-                destination.write_payload(&scratch[..chunk_length]).await?;
-                remaining -= chunk_length;
-            }
-            self.finish_physical_packet()?;
-            destination.finish_physical_packet()?;
-            progress.finish_physical_packet(header.payload_length())?;
-            if progress.is_complete() {
-                if flush_on_complete {
-                    destination.flush().await?;
-                }
-                return Ok(ForwardStatus::Complete);
-            }
-        }
-    }
-
     async fn read_payload_into_progress(
         &mut self,
+        inner: &mut (impl AsyncRead + Unpin),
         payload_length: u32,
         scratch: &mut [u8],
         progress: &mut ForwardProgress,
@@ -609,24 +353,35 @@ where
             })?;
         while remaining > 0 {
             let chunk_length = remaining.min(scratch.len());
-            self.read_exact(&mut scratch[..chunk_length], "physical packet payload")
-                .await?;
+            self.read_exact(
+                inner,
+                &mut scratch[..chunk_length],
+                "physical packet payload",
+            )
+            .await?;
             progress.observe_payload(&scratch[..chunk_length])?;
             remaining -= chunk_length;
         }
         Ok(())
     }
 
-    async fn read_header(&mut self) -> Result<(PacketHeader, SequenceObservation), PacketIoError> {
+    async fn read_header(
+        &mut self,
+        inner: &mut (impl AsyncRead + Unpin),
+    ) -> Result<(PacketHeader, SequenceObservation), PacketIoError> {
         let mut bytes = [0_u8; PHYSICAL_PACKET_HEADER_LEN];
-        self.read_exact(&mut bytes, "physical packet header")
+        self.read_exact(inner, &mut bytes, "physical packet header")
             .await?;
         let header = PacketHeader::decode(&bytes)?;
         let sequence = self.sequence.observe(header.sequence_id());
         Ok((header, sequence))
     }
 
-    async fn ensure_prefetched(&mut self, needed: usize) -> Result<(), PacketIoError> {
+    async fn ensure_prefetched(
+        &mut self,
+        inner: &mut (impl AsyncRead + Unpin),
+        needed: usize,
+    ) -> Result<(), PacketIoError> {
         while self.prefetched_len() < needed {
             if self.prefetch_start > 0 {
                 self.prefetched
@@ -634,8 +389,7 @@ where
                 self.prefetch_end -= self.prefetch_start;
                 self.prefetch_start = 0;
             }
-            let read = self
-                .inner
+            let read = inner
                 .read(&mut self.prefetched[self.prefetch_end..])
                 .await
                 .map_err(|error| PacketIoError::io(IoSide::Source, "prefetching packet", error))?;
@@ -653,6 +407,7 @@ where
 
     async fn read_exact(
         &mut self,
+        inner: &mut (impl AsyncRead + Unpin),
         output: &mut [u8],
         operation: &'static str,
     ) -> Result<(), PacketIoError> {
@@ -668,8 +423,7 @@ where
         }
         let mut position = prefetched;
         while position < output.len() {
-            let read = self
-                .inner
+            let read = inner
                 .read(&mut output[position..])
                 .await
                 .map_err(|error| PacketIoError::io(IoSide::Source, operation, error))?;
@@ -719,22 +473,22 @@ where
     }
 }
 
-/// Async physical/logical packet writer over an arbitrary transport layer.
+/// Inner-independent write state: sequence tracking and accounting.
+///
+/// All physical/logical write logic lives here as methods that borrow the
+/// destination transport, so the same state drives both the write-only
+/// [`PacketWriter`] and the duplex [`PacketIo`].
 #[derive(Debug)]
-pub struct PacketWriter<W> {
-    inner: W,
+struct WriterState {
     sequence: SequenceTracker,
     stream_buffer_size: NonZeroUsize,
     out_bytes: u64,
     out_packets: u64,
 }
 
-impl<W> PacketWriter<W> {
-    /// Creates a writer with sequence zero and a 32-KiB streaming buffer.
-    #[must_use]
-    pub fn new(inner: W) -> Self {
+impl WriterState {
+    fn new() -> Self {
         Self {
-            inner,
             sequence: SequenceTracker::default(),
             stream_buffer_size: NonZeroUsize::new(DEFAULT_STREAM_BUFFER_SIZE)
                 .unwrap_or(NonZeroUsize::MIN),
@@ -743,90 +497,31 @@ impl<W> PacketWriter<W> {
         }
     }
 
-    /// Creates a writer with a caller-selected nonzero streaming buffer size.
-    #[must_use]
-    pub fn with_stream_buffer_size(inner: W, stream_buffer_size: NonZeroUsize) -> Self {
+    fn with_stream_buffer_size(stream_buffer_size: NonZeroUsize) -> Self {
         Self {
             stream_buffer_size,
-            ..Self::new(inner)
+            ..Self::new()
         }
     }
 
-    /// Returns a shared reference to the underlying transport.
-    #[must_use]
-    pub const fn get_ref(&self) -> &W {
-        &self.inner
-    }
-
-    /// Returns a mutable reference to the underlying transport.
-    #[must_use]
-    pub fn get_mut(&mut self) -> &mut W {
-        &mut self.inner
-    }
-
-    /// Consumes the packet writer and returns the underlying transport.
-    #[must_use]
-    pub fn into_inner(self) -> W {
-        self.inner
-    }
-
-    /// Returns the next outgoing physical sequence.
-    #[must_use]
-    pub const fn next_sequence(&self) -> u8 {
-        self.sequence.expected()
-    }
-
-    /// Resets the outgoing sequence, normally at a command boundary.
-    pub const fn reset_sequence(&mut self, sequence: u8) {
-        self.sequence.reset(sequence);
-    }
-
-    /// Returns physical wire bytes accepted by the destination transport.
-    #[must_use]
-    pub const fn out_bytes(&self) -> u64 {
-        self.out_bytes
-    }
-
-    /// Returns completely emitted physical packets.
-    #[must_use]
-    pub const fn out_packets(&self) -> u64 {
-        self.out_packets
-    }
-
-    /// Returns the fixed payload-copy buffer size used by streaming writes.
-    #[must_use]
-    pub const fn stream_buffer_size(&self) -> usize {
-        self.stream_buffer_size.get()
-    }
-}
-
-impl<W> PacketWriter<W>
-where
-    W: AsyncWrite + Unpin,
-{
-    /// Writes one complete physical packet without flushing.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed header encode or destination I/O error.
-    pub async fn write_physical(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
+    async fn write_physical(
+        &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
+        payload: &[u8],
+    ) -> Result<(), PacketIoError> {
         let payload_length =
             u32::try_from(payload.len()).map_err(|_| EncodeError::LengthOverflow {
                 field: "physical packet payload",
                 length: payload.len(),
             })?;
-        self.start_physical_packet(payload_length).await?;
-        self.write_payload(payload).await?;
+        self.start_physical_packet(inner, payload_length).await?;
+        self.write_payload(inner, payload).await?;
         self.finish_physical_packet()
     }
 
-    /// Writes one logical packet from a caller-owned payload slice.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed length, framing, or destination I/O error.
-    pub async fn write_logical(
+    async fn write_logical(
         &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
         payload: &[u8],
         flush: bool,
     ) -> Result<(), PacketIoError> {
@@ -837,7 +532,7 @@ where
             })?;
         let mut position = 0_usize;
         for fragment_length in LogicalPacketFragments::new(logical_length) {
-            self.start_physical_packet(fragment_length).await?;
+            self.start_physical_packet(inner, fragment_length).await?;
             let fragment_length =
                 usize::try_from(fragment_length).map_err(|_| PacketIoError::CounterOverflow {
                     field: "physical payload length",
@@ -848,27 +543,19 @@ where
                     .ok_or(PacketIoError::CounterOverflow {
                         field: "logical payload offset",
                     })?;
-            self.write_payload(&payload[position..end]).await?;
+            self.write_payload(inner, &payload[position..end]).await?;
             self.finish_physical_packet()?;
             position = end;
         }
         if flush {
-            self.flush().await?;
+            self.flush(inner).await?;
         }
         Ok(())
     }
 
-    /// Streams exactly `logical_length` payload bytes into one logical packet.
-    ///
-    /// The source and destination are copied through one fixed-size buffer; the
-    /// payload is never materialized as a whole.
-    ///
-    /// # Errors
-    ///
-    /// Returns a source I/O error if fewer bytes are available, or a typed
-    /// framing/destination error after any bytes already emitted.
-    pub async fn write_logical_from<S>(
+    async fn write_logical_from<S>(
         &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
         source: &mut S,
         logical_length: u64,
         flush: bool,
@@ -878,7 +565,7 @@ where
     {
         let mut scratch = vec![0_u8; self.stream_buffer_size.get()];
         for fragment_length in LogicalPacketFragments::new(logical_length) {
-            self.start_physical_packet(fragment_length).await?;
+            self.start_physical_packet(inner, fragment_length).await?;
             let mut remaining =
                 usize::try_from(fragment_length).map_err(|_| PacketIoError::CounterOverflow {
                     field: "physical payload length",
@@ -886,50 +573,53 @@ where
             while remaining > 0 {
                 let chunk_length = remaining.min(scratch.len());
                 read_source_exact(source, &mut scratch[..chunk_length]).await?;
-                self.write_payload(&scratch[..chunk_length]).await?;
+                self.write_payload(inner, &scratch[..chunk_length]).await?;
                 remaining -= chunk_length;
             }
             self.finish_physical_packet()?;
         }
         if flush {
-            self.flush().await?;
+            self.flush(inner).await?;
         }
         Ok(())
     }
 
-    /// Flushes the underlying destination transport.
-    ///
-    /// # Errors
-    ///
-    /// Returns a destination I/O error.
-    pub async fn flush(&mut self) -> Result<(), PacketIoError> {
-        self.inner
+    async fn flush(&mut self, inner: &mut (impl AsyncWrite + Unpin)) -> Result<(), PacketIoError> {
+        inner
             .flush()
             .await
             .map_err(|error| PacketIoError::io(IoSide::Destination, "flushing packets", error))
     }
 
-    async fn start_physical_packet(&mut self, payload_length: u32) -> Result<(), PacketIoError> {
+    async fn start_physical_packet(
+        &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
+        payload_length: u32,
+    ) -> Result<(), PacketIoError> {
         let sequence = self.sequence.take_next();
         let header = PacketHeader::new(payload_length, sequence)?.encode();
-        self.write_all(&header, "writing physical packet header")
+        self.write_all(inner, &header, "writing physical packet header")
             .await
     }
 
-    async fn write_payload(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
-        self.write_all(payload, "writing physical packet payload")
+    async fn write_payload(
+        &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
+        payload: &[u8],
+    ) -> Result<(), PacketIoError> {
+        self.write_all(inner, payload, "writing physical packet payload")
             .await
     }
 
     async fn write_all(
         &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
         input: &[u8],
         operation: &'static str,
     ) -> Result<(), PacketIoError> {
         let mut position = 0_usize;
         while position < input.len() {
-            let written = self
-                .inner
+            let written = inner
                 .write(&input[position..])
                 .await
                 .map_err(|error| PacketIoError::io(IoSide::Destination, operation, error))?;
@@ -966,6 +656,76 @@ where
     }
 }
 
+/// Core single-logical-packet forward across independent read and write halves.
+///
+/// The read half (`src_state`/`src_inner`) and write half
+/// (`dst_state`/`dst_inner`) are borrowed disjointly, so the same routine drives
+/// both the read/write-object pair ([`PacketReader`]/[`PacketWriter`]) and the
+/// two-endpoint duplex ([`PacketIo`]) case.
+///
+/// Cancellation contract: `is_cancelled` is consulted only at a physical-packet
+/// boundary, immediately before the next header is consumed, and never while a
+/// header or payload is partially transferred. When `allow_cancel` is observed
+/// after a maximum-size fragment, the same `progress` resumes at the next
+/// physical header without duplicating bytes. The regenerated wire output is
+/// byte-identical to sequential per-object framing.
+#[allow(clippy::too_many_arguments)]
+async fn forward_inner(
+    src_state: &mut ReaderState,
+    src_inner: &mut (impl AsyncRead + Unpin),
+    dst_state: &mut WriterState,
+    dst_inner: &mut (impl AsyncWrite + Unpin),
+    progress: &mut ForwardProgress,
+    allow_cancel: bool,
+    is_cancelled: &mut impl FnMut() -> bool,
+    flush_on_complete: bool,
+) -> Result<ForwardStatus, PacketIoError> {
+    if progress.is_complete() {
+        return Err(PacketIoError::ForwardAlreadyComplete);
+    }
+    let mut scratch = vec![0_u8; src_state.stream_buffer_size.get()];
+    loop {
+        if allow_cancel && is_cancelled() {
+            return Ok(ForwardStatus::CancelledAtPacketBoundary);
+        }
+        let (header, sequence) = src_state.read_header(src_inner).await?;
+        progress.observe_header(header, sequence)?;
+        dst_state
+            .start_physical_packet(dst_inner, header.payload_length())
+            .await?;
+
+        let mut remaining = usize::try_from(header.payload_length()).map_err(|_| {
+            PacketIoError::CounterOverflow {
+                field: "physical payload length",
+            }
+        })?;
+        while remaining > 0 {
+            let chunk_length = remaining.min(scratch.len());
+            src_state
+                .read_exact(
+                    src_inner,
+                    &mut scratch[..chunk_length],
+                    "physical packet payload",
+                )
+                .await?;
+            progress.observe_payload(&scratch[..chunk_length])?;
+            dst_state
+                .write_payload(dst_inner, &scratch[..chunk_length])
+                .await?;
+            remaining -= chunk_length;
+        }
+        src_state.finish_physical_packet()?;
+        dst_state.finish_physical_packet()?;
+        progress.finish_physical_packet(header.payload_length())?;
+        if progress.is_complete() {
+            if flush_on_complete {
+                dst_state.flush(dst_inner).await?;
+            }
+            return Ok(ForwardStatus::Complete);
+        }
+    }
+}
+
 async fn read_source_exact<S>(source: &mut S, output: &mut [u8]) -> Result<(), PacketIoError>
 where
     S: AsyncRead + Unpin,
@@ -988,10 +748,749 @@ where
     Ok(())
 }
 
+/// Async physical/logical packet reader over an arbitrary transport layer.
+///
+/// The reader owns only five prefetch bytes. Streaming methods allocate one
+/// fixed-size copy buffer and an explicitly bounded capture prefix; memory does
+/// not scale with the logical message length.
+#[derive(Debug)]
+pub struct PacketReader<R> {
+    inner: R,
+    state: ReaderState,
+}
+
+impl<R> PacketReader<R> {
+    /// Creates a reader with sequence zero and a 32-KiB streaming buffer.
+    #[must_use]
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            state: ReaderState::new(),
+        }
+    }
+
+    /// Creates a reader with a caller-selected nonzero streaming buffer size.
+    #[must_use]
+    pub fn with_stream_buffer_size(inner: R, stream_buffer_size: NonZeroUsize) -> Self {
+        Self {
+            inner,
+            state: ReaderState::with_stream_buffer_size(stream_buffer_size),
+        }
+    }
+
+    /// Returns a shared reference to the underlying transport.
+    #[must_use]
+    pub const fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the underlying transport.
+    #[must_use]
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Consumes the packet reader and returns the underlying transport.
+    #[must_use]
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Returns the next expected incoming physical sequence.
+    #[must_use]
+    pub const fn expected_sequence(&self) -> u8 {
+        self.state.sequence.expected()
+    }
+
+    /// Resets the expected incoming sequence, normally at a command boundary.
+    pub const fn reset_sequence(&mut self, expected: u8) {
+        self.state.sequence.reset(expected);
+    }
+
+    /// Returns consumed physical wire bytes, including headers.
+    #[must_use]
+    pub const fn in_bytes(&self) -> u64 {
+        self.state.in_bytes
+    }
+
+    /// Returns completely consumed physical packets.
+    #[must_use]
+    pub const fn in_packets(&self) -> u64 {
+        self.state.in_packets
+    }
+
+    /// Returns the fixed payload-copy buffer size used by streaming methods.
+    #[must_use]
+    pub const fn stream_buffer_size(&self) -> usize {
+        self.state.stream_buffer_size.get()
+    }
+}
+
+impl<R> PacketReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    /// Peeks at the next physical header and optional first payload byte.
+    ///
+    /// The method consumes neither sequence state nor accounting counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source I/O or header decode error for incomplete input.
+    pub async fn peek_packet(&mut self) -> Result<PacketPreview, PacketIoError> {
+        self.state.peek_packet(&mut self.inner).await
+    }
+
+    /// Reads and materializes one logical packet up to `payload_limit` bytes.
+    ///
+    /// An oversized logical packet is fully drained with constant scratch space
+    /// before [`PacketIoError::LogicalPayloadTooLarge`] is returned, leaving the
+    /// reader at the next logical-packet boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed framing/I/O error, or a size error after draining an
+    /// oversized message.
+    pub async fn read_logical(
+        &mut self,
+        payload_limit: usize,
+    ) -> Result<LogicalPacket, PacketIoError> {
+        self.state
+            .read_logical(&mut self.inner, payload_limit)
+            .await
+    }
+
+    /// Streams one logical packet to `destination` and flushes it.
+    ///
+    /// Source headers are decoded and destination headers are regenerated with
+    /// the destination's independent sequence. At most `capture_limit` payload
+    /// bytes are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source/destination I/O, framing, or accounting error.
+    pub async fn forward_packet_to<W>(
+        &mut self,
+        destination: &mut PacketWriter<W>,
+        capture_limit: usize,
+    ) -> Result<ForwardProgress, PacketIoError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut progress = ForwardProgress::new(capture_limit);
+        forward_inner(
+            &mut self.state,
+            &mut self.inner,
+            &mut destination.state,
+            &mut destination.inner,
+            &mut progress,
+            false,
+            &mut || false,
+            true,
+        )
+        .await?;
+        Ok(progress)
+    }
+
+    /// Advances a resumable logical-packet forward until completion or a safe boundary.
+    ///
+    /// `is_cancelled` is checked only before a physical header is consumed. It
+    /// is never checked while a header or payload is partially transferred.
+    /// Callers must request cancellation through this probe rather than dropping
+    /// the future mid-I/O. When cancelled after a maximum-size fragment, pass the
+    /// same `progress` back to resume at the next physical header.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source/destination I/O, framing, or accounting error.
+    pub async fn forward_packet_to_cancellable<W, C>(
+        &mut self,
+        destination: &mut PacketWriter<W>,
+        progress: &mut ForwardProgress,
+        mut is_cancelled: C,
+    ) -> Result<ForwardStatus, PacketIoError>
+    where
+        W: AsyncWrite + Unpin,
+        C: FnMut() -> bool,
+    {
+        forward_inner(
+            &mut self.state,
+            &mut self.inner,
+            &mut destination.state,
+            &mut destination.inner,
+            progress,
+            true,
+            &mut is_cancelled,
+            true,
+        )
+        .await
+    }
+
+    /// Forwards logical packets until `decide` selects a terminating packet.
+    ///
+    /// The first byte and physical length are peeked without consumption.
+    /// Intermediate packets are not captured, and the destination is flushed
+    /// once after the terminating logical packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source/destination I/O, framing, or accounting error.
+    pub async fn forward_until<W, F>(
+        &mut self,
+        destination: &mut PacketWriter<W>,
+        mut decide: F,
+    ) -> Result<ForwardUntilResult, PacketIoError>
+    where
+        W: AsyncWrite + Unpin,
+        F: FnMut(PacketPreview) -> ForwardUntilDecision,
+    {
+        let mut logical_packets = 0_u64;
+        loop {
+            let preview = self.peek_packet().await?;
+            let decision = decide(preview);
+            let (stop, capture_limit) = match decision {
+                ForwardUntilDecision::Continue => (false, 0),
+                ForwardUntilDecision::Stop { capture_limit } => (true, capture_limit),
+            };
+            let mut progress = ForwardProgress::new(capture_limit);
+            forward_inner(
+                &mut self.state,
+                &mut self.inner,
+                &mut destination.state,
+                &mut destination.inner,
+                &mut progress,
+                false,
+                &mut || false,
+                false,
+            )
+            .await?;
+            logical_packets =
+                logical_packets
+                    .checked_add(1)
+                    .ok_or(PacketIoError::CounterOverflow {
+                        field: "forwarded logical packets",
+                    })?;
+            if stop {
+                destination.flush().await?;
+                return Ok(ForwardUntilResult {
+                    logical_packets,
+                    final_packet: progress,
+                });
+            }
+        }
+    }
+
+    /// Cancellation-aware [`Self::forward_until`] checked at logical boundaries.
+    ///
+    /// A cancellation return flushes all preceding complete logical packets.
+    /// No partial logical packet is started after the probe reports cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source/destination I/O, framing, or accounting error.
+    pub async fn forward_until_cancellable<W, F, C>(
+        &mut self,
+        destination: &mut PacketWriter<W>,
+        mut decide: F,
+        mut is_cancelled: C,
+    ) -> Result<ForwardUntilStatus, PacketIoError>
+    where
+        W: AsyncWrite + Unpin,
+        F: FnMut(PacketPreview) -> ForwardUntilDecision,
+        C: FnMut() -> bool,
+    {
+        let mut logical_packets = 0_u64;
+        loop {
+            if is_cancelled() {
+                destination.flush().await?;
+                return Ok(ForwardUntilStatus::CancelledAtLogicalBoundary { logical_packets });
+            }
+            let preview = self.peek_packet().await?;
+            let decision = decide(preview);
+            let (stop, capture_limit) = match decision {
+                ForwardUntilDecision::Continue => (false, 0),
+                ForwardUntilDecision::Stop { capture_limit } => (true, capture_limit),
+            };
+            let mut progress = ForwardProgress::new(capture_limit);
+            forward_inner(
+                &mut self.state,
+                &mut self.inner,
+                &mut destination.state,
+                &mut destination.inner,
+                &mut progress,
+                false,
+                &mut || false,
+                false,
+            )
+            .await?;
+            logical_packets =
+                logical_packets
+                    .checked_add(1)
+                    .ok_or(PacketIoError::CounterOverflow {
+                        field: "forwarded logical packets",
+                    })?;
+            if stop {
+                destination.flush().await?;
+                return Ok(ForwardUntilStatus::Complete(ForwardUntilResult {
+                    logical_packets,
+                    final_packet: progress,
+                }));
+            }
+        }
+    }
+}
+
+/// Async physical/logical packet writer over an arbitrary transport layer.
+#[derive(Debug)]
+pub struct PacketWriter<W> {
+    inner: W,
+    state: WriterState,
+}
+
+impl<W> PacketWriter<W> {
+    /// Creates a writer with sequence zero and a 32-KiB streaming buffer.
+    #[must_use]
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            state: WriterState::new(),
+        }
+    }
+
+    /// Creates a writer with a caller-selected nonzero streaming buffer size.
+    #[must_use]
+    pub fn with_stream_buffer_size(inner: W, stream_buffer_size: NonZeroUsize) -> Self {
+        Self {
+            inner,
+            state: WriterState::with_stream_buffer_size(stream_buffer_size),
+        }
+    }
+
+    /// Returns a shared reference to the underlying transport.
+    #[must_use]
+    pub const fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the underlying transport.
+    #[must_use]
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Consumes the packet writer and returns the underlying transport.
+    #[must_use]
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Returns the next outgoing physical sequence.
+    #[must_use]
+    pub const fn next_sequence(&self) -> u8 {
+        self.state.sequence.expected()
+    }
+
+    /// Resets the outgoing sequence, normally at a command boundary.
+    pub const fn reset_sequence(&mut self, sequence: u8) {
+        self.state.sequence.reset(sequence);
+    }
+
+    /// Returns physical wire bytes accepted by the destination transport.
+    #[must_use]
+    pub const fn out_bytes(&self) -> u64 {
+        self.state.out_bytes
+    }
+
+    /// Returns completely emitted physical packets.
+    #[must_use]
+    pub const fn out_packets(&self) -> u64 {
+        self.state.out_packets
+    }
+
+    /// Returns the fixed payload-copy buffer size used by streaming writes.
+    #[must_use]
+    pub const fn stream_buffer_size(&self) -> usize {
+        self.state.stream_buffer_size.get()
+    }
+}
+
+impl<W> PacketWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    /// Writes one complete physical packet without flushing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed header encode or destination I/O error.
+    pub async fn write_physical(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
+        self.state.write_physical(&mut self.inner, payload).await
+    }
+
+    /// Writes one logical packet from a caller-owned payload slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed length, framing, or destination I/O error.
+    pub async fn write_logical(
+        &mut self,
+        payload: &[u8],
+        flush: bool,
+    ) -> Result<(), PacketIoError> {
+        self.state
+            .write_logical(&mut self.inner, payload, flush)
+            .await
+    }
+
+    /// Streams exactly `logical_length` payload bytes into one logical packet.
+    ///
+    /// The source and destination are copied through one fixed-size buffer; the
+    /// payload is never materialized as a whole.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source I/O error if fewer bytes are available, or a typed
+    /// framing/destination error after any bytes already emitted.
+    pub async fn write_logical_from<S>(
+        &mut self,
+        source: &mut S,
+        logical_length: u64,
+        flush: bool,
+    ) -> Result<(), PacketIoError>
+    where
+        S: AsyncRead + Unpin,
+    {
+        self.state
+            .write_logical_from(&mut self.inner, source, logical_length, flush)
+            .await
+    }
+
+    /// Flushes the underlying destination transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns a destination I/O error.
+    pub async fn flush(&mut self) -> Result<(), PacketIoError> {
+        self.state.flush(&mut self.inner).await
+    }
+}
+
+/// Single-owner duplex packet endpoint over one bidirectional transport.
+///
+/// `PacketIo` co-locates the independent [`ReaderState`] and [`WriterState`]
+/// halves alongside one owned transport, giving the session engine a single
+/// object per connection whose read and write sequences advance independently.
+/// The read and write state fields are disjoint from `inner`, so cross-object
+/// forwarding can borrow one endpoint's read half and another endpoint's write
+/// half simultaneously.
+///
+/// Compression splice point (slice C): TODO — a future change will interpose a
+/// compression codec between `read`/`write` and `inner` here. The
+/// state-versus-transport separation established above is the seam that change
+/// will use; no compression behavior is introduced in this change.
+#[derive(Debug)]
+pub struct PacketIo<T> {
+    inner: T,
+    read: ReaderState,
+    write: WriterState,
+}
+
+impl<T> PacketIo<T> {
+    /// Creates a duplex endpoint with zeroed sequences and 32-KiB buffers.
+    #[must_use]
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            read: ReaderState::new(),
+            write: WriterState::new(),
+        }
+    }
+
+    /// Creates a duplex endpoint with a caller-selected nonzero buffer size.
+    #[must_use]
+    pub fn with_stream_buffer_size(inner: T, stream_buffer_size: NonZeroUsize) -> Self {
+        Self {
+            inner,
+            read: ReaderState::with_stream_buffer_size(stream_buffer_size),
+            write: WriterState::with_stream_buffer_size(stream_buffer_size),
+        }
+    }
+
+    /// Returns a shared reference to the underlying transport.
+    #[must_use]
+    pub const fn get_ref(&self) -> &T {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the underlying transport.
+    #[must_use]
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    /// Consumes the endpoint and returns the underlying transport.
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+
+    /// Returns the next expected incoming physical sequence.
+    #[must_use]
+    pub const fn expected_read_sequence(&self) -> u8 {
+        self.read.sequence.expected()
+    }
+
+    /// Resets the expected incoming sequence, normally at a command boundary.
+    pub const fn reset_read_sequence(&mut self, expected: u8) {
+        self.read.sequence.reset(expected);
+    }
+
+    /// Returns consumed physical wire bytes, including headers.
+    #[must_use]
+    pub const fn in_bytes(&self) -> u64 {
+        self.read.in_bytes
+    }
+
+    /// Returns completely consumed physical packets.
+    #[must_use]
+    pub const fn in_packets(&self) -> u64 {
+        self.read.in_packets
+    }
+
+    /// Returns the next outgoing physical sequence.
+    #[must_use]
+    pub const fn next_write_sequence(&self) -> u8 {
+        self.write.sequence.expected()
+    }
+
+    /// Resets the outgoing sequence, normally at a command boundary.
+    pub const fn reset_write_sequence(&mut self, sequence: u8) {
+        self.write.sequence.reset(sequence);
+    }
+
+    /// Returns physical wire bytes accepted by the destination transport.
+    #[must_use]
+    pub const fn out_bytes(&self) -> u64 {
+        self.write.out_bytes
+    }
+
+    /// Returns completely emitted physical packets.
+    #[must_use]
+    pub const fn out_packets(&self) -> u64 {
+        self.write.out_packets
+    }
+}
+
+impl<T> PacketIo<T>
+where
+    T: AsyncRead + Unpin,
+{
+    /// Peeks at the next physical header and optional first payload byte.
+    ///
+    /// The method consumes neither sequence state nor accounting counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source I/O or header decode error for incomplete input.
+    pub async fn peek_packet(&mut self) -> Result<PacketPreview, PacketIoError> {
+        self.read.peek_packet(&mut self.inner).await
+    }
+
+    /// Reads and materializes one logical packet up to `payload_limit` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed framing/I/O error, or a size error after draining an
+    /// oversized message.
+    pub async fn read_logical(
+        &mut self,
+        payload_limit: usize,
+    ) -> Result<LogicalPacket, PacketIoError> {
+        self.read.read_logical(&mut self.inner, payload_limit).await
+    }
+
+    /// Streams one logical packet from `src` into `dst` and flushes it.
+    ///
+    /// The source read half and destination write half are borrowed disjointly.
+    /// Destination headers are regenerated with the destination's independent
+    /// sequence; at most `capture_limit` payload bytes are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source/destination I/O, framing, or accounting error.
+    pub async fn forward_packet_to<B>(
+        src: &mut Self,
+        dst: &mut PacketIo<B>,
+        capture_limit: usize,
+    ) -> Result<ForwardProgress, PacketIoError>
+    where
+        B: AsyncWrite + Unpin,
+    {
+        let mut progress = ForwardProgress::new(capture_limit);
+        forward_inner(
+            &mut src.read,
+            &mut src.inner,
+            &mut dst.write,
+            &mut dst.inner,
+            &mut progress,
+            false,
+            &mut || false,
+            true,
+        )
+        .await?;
+        Ok(progress)
+    }
+
+    /// Cross-object resumable forward checked only at physical boundaries.
+    ///
+    /// `is_cancelled` is consulted only before a physical header is consumed,
+    /// never mid-header/payload. When cancelled after a maximum-size fragment,
+    /// pass the same `progress` back to resume at the next physical header.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source/destination I/O, framing, or accounting error.
+    pub async fn forward_packet_to_cancellable<B, C>(
+        src: &mut Self,
+        dst: &mut PacketIo<B>,
+        progress: &mut ForwardProgress,
+        mut is_cancelled: C,
+    ) -> Result<ForwardStatus, PacketIoError>
+    where
+        B: AsyncWrite + Unpin,
+        C: FnMut() -> bool,
+    {
+        forward_inner(
+            &mut src.read,
+            &mut src.inner,
+            &mut dst.write,
+            &mut dst.inner,
+            progress,
+            true,
+            &mut is_cancelled,
+            true,
+        )
+        .await
+    }
+
+    /// Cross-object forward of logical packets until `decide` selects an end.
+    ///
+    /// The first byte and physical length are peeked without consumption.
+    /// Intermediate packets are not captured, and the destination is flushed
+    /// once after the terminating logical packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source/destination I/O, framing, or accounting error.
+    pub async fn forward_until<B, F>(
+        src: &mut Self,
+        dst: &mut PacketIo<B>,
+        mut decide: F,
+    ) -> Result<ForwardUntilResult, PacketIoError>
+    where
+        B: AsyncWrite + Unpin,
+        F: FnMut(PacketPreview) -> ForwardUntilDecision,
+    {
+        let mut logical_packets = 0_u64;
+        loop {
+            let preview = src.read.peek_packet(&mut src.inner).await?;
+            let decision = decide(preview);
+            let (stop, capture_limit) = match decision {
+                ForwardUntilDecision::Continue => (false, 0),
+                ForwardUntilDecision::Stop { capture_limit } => (true, capture_limit),
+            };
+            let mut progress = ForwardProgress::new(capture_limit);
+            forward_inner(
+                &mut src.read,
+                &mut src.inner,
+                &mut dst.write,
+                &mut dst.inner,
+                &mut progress,
+                false,
+                &mut || false,
+                false,
+            )
+            .await?;
+            logical_packets =
+                logical_packets
+                    .checked_add(1)
+                    .ok_or(PacketIoError::CounterOverflow {
+                        field: "forwarded logical packets",
+                    })?;
+            if stop {
+                dst.write.flush(&mut dst.inner).await?;
+                return Ok(ForwardUntilResult {
+                    logical_packets,
+                    final_packet: progress,
+                });
+            }
+        }
+    }
+}
+
+impl<T> PacketIo<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    /// Writes one complete physical packet without flushing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed header encode or destination I/O error.
+    pub async fn write_physical(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
+        self.write.write_physical(&mut self.inner, payload).await
+    }
+
+    /// Writes one logical packet from a caller-owned payload slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed length, framing, or destination I/O error.
+    pub async fn write_logical(
+        &mut self,
+        payload: &[u8],
+        flush: bool,
+    ) -> Result<(), PacketIoError> {
+        self.write
+            .write_logical(&mut self.inner, payload, flush)
+            .await
+    }
+
+    /// Streams exactly `logical_length` payload bytes into one logical packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source I/O error if fewer bytes are available, or a typed
+    /// framing/destination error after any bytes already emitted.
+    pub async fn write_logical_from<S>(
+        &mut self,
+        source: &mut S,
+        logical_length: u64,
+        flush: bool,
+    ) -> Result<(), PacketIoError>
+    where
+        S: AsyncRead + Unpin,
+    {
+        self.write
+            .write_logical_from(&mut self.inner, source, logical_length, flush)
+            .await
+    }
+
+    /// Flushes the underlying destination transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns a destination I/O error.
+    pub async fn flush(&mut self) -> Result<(), PacketIoError> {
+        self.write.flush(&mut self.inner).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
     use std::io;
+    use std::io::Cursor;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -1404,6 +1903,125 @@ mod tests {
             writer.out_bytes(),
             logical_length + physical_packets * PHYSICAL_PACKET_HEADER_LEN as u64
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_io_write_matches_packet_writer_for_small_logical() -> Result<(), Box<dyn Error>>
+    {
+        let payload = b"hello packetio";
+
+        let mut writer = PacketWriter::new(Vec::new());
+        writer.write_logical(payload, true).await?;
+        let expected = writer.into_inner();
+
+        // `Cursor<Vec<u8>>` is an in-memory duplex transport: both AsyncRead and
+        // AsyncWrite, so one `PacketIo` covers the write and read halves.
+        let mut io = PacketIo::new(Cursor::new(Vec::new()));
+        io.write_logical(payload, true).await?;
+        let out_packets = io.out_packets();
+        let produced = io.into_inner().into_inner();
+        assert_eq!(produced, expected);
+        assert_eq!(out_packets, 1);
+
+        let mut reader = PacketReader::new(expected.as_slice());
+        let via_reader = reader.read_logical(payload.len()).await?;
+        let mut io_reader = PacketIo::new(Cursor::new(expected.clone()));
+        let via_io = io_reader.read_logical(payload.len()).await?;
+        assert_eq!(via_io.payload, via_reader.payload);
+        assert_eq!(via_io.payload, payload);
+        assert_eq!(io_reader.in_packets(), reader.in_packets());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_io_write_matches_packet_writer_across_fragment_boundary()
+    -> Result<(), Box<dyn Error>> {
+        let logical_length = u64::from(MAX_PAYLOAD_LEN) + 1;
+
+        let mut writer = PacketWriter::new(Vec::new());
+        writer
+            .write_logical_from(
+                &mut SyntheticPayload::new(logical_length),
+                logical_length,
+                true,
+            )
+            .await?;
+        let expected = writer.into_inner();
+
+        let mut io = PacketIo::new(Cursor::new(Vec::new()));
+        io.write_logical_from(
+            &mut SyntheticPayload::new(logical_length),
+            logical_length,
+            true,
+        )
+        .await?;
+        let out_packets = io.out_packets();
+        let produced = io.into_inner().into_inner();
+
+        assert_eq!(produced, expected);
+        assert_eq!(out_packets, physical_packet_count(logical_length));
+        validate_logical_wire(&produced, logical_length)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_io_peek_is_non_consuming() -> Result<(), Box<dyn Error>> {
+        let wire = encoded_physical_packet(b"abc", 9)?;
+        let mut io = PacketIo::new(Cursor::new(wire));
+        let preview = io.peek_packet().await?;
+        assert_eq!(
+            preview,
+            PacketPreview {
+                first_byte: Some(b'a'),
+                first_packet_length: 3,
+                sequence_id: 9,
+            }
+        );
+        assert_eq!(io.in_bytes(), 0);
+        assert_eq!(io.expected_read_sequence(), 0);
+        let logical = io.read_logical(3).await?;
+        assert_eq!(logical.payload, b"abc");
+        assert_eq!(io.in_packets(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_io_forward_matches_reader_writer_pair() -> Result<(), Box<dyn Error>> {
+        let wire = encoded_physical_packet(b"abc", 9)?;
+
+        let mut reference_reader = PacketReader::new(wire.as_slice());
+        let mut reference_writer = PacketWriter::new(Vec::new());
+        reference_writer.reset_sequence(3);
+        let reference_progress = reference_reader
+            .forward_packet_to(&mut reference_writer, 2)
+            .await?;
+        let reference_out_packets = reference_writer.out_packets();
+        let reference_wire = reference_writer.into_inner();
+
+        // Two `PacketIo` endpoints over in-memory duplex transports.
+        let mut src = PacketIo::new(Cursor::new(wire.clone()));
+        let mut dst = PacketIo::new(Cursor::new(Vec::new()));
+        dst.reset_write_sequence(3);
+        let progress = PacketIo::forward_packet_to(&mut src, &mut dst, 2).await?;
+        let dst_out_packets = dst.out_packets();
+        let produced_wire = dst.into_inner().into_inner();
+
+        assert_eq!(produced_wire, reference_wire);
+        assert_eq!(
+            progress.captured_prefix(),
+            reference_progress.captured_prefix()
+        );
+        assert_eq!(
+            progress.first_packet_length(),
+            reference_progress.first_packet_length()
+        );
+        assert_eq!(
+            progress.sequence_mismatches(),
+            reference_progress.sequence_mismatches()
+        );
+        assert_eq!(src.in_packets(), reference_reader.in_packets());
+        assert_eq!(dst_out_packets, reference_out_packets);
         Ok(())
     }
 }

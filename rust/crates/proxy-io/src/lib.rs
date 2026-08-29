@@ -34,7 +34,7 @@ pub mod tls;
 pub use error::{IoSide, PacketIoError};
 pub use packet::{
     DEFAULT_STREAM_BUFFER_SIZE, ForwardProgress, ForwardStatus, ForwardUntilDecision,
-    ForwardUntilResult, ForwardUntilStatus, LogicalPacket, PacketPreview, PacketReader,
+    ForwardUntilResult, ForwardUntilStatus, LogicalPacket, PacketIo, PacketPreview, PacketReader,
     PacketWriter,
 };
 pub use pump::{
