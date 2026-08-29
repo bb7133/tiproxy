@@ -27,15 +27,18 @@ released. Run one variant with:
 tests/dataplane/integration/run.sh --mode go --variant plain
 ```
 
-The Rust dataplane runs the same plain-variant topology for real:
+The Rust dataplane runs the plain and TLS variant topologies for real:
 
 ```sh
 tests/dataplane/integration/run.sh --mode rust --variant plain
+tests/dataplane/integration/run.sh --mode rust --variant tls
 ```
 
 `preflight.sh` demands the capability contract from
 `tiproxy-rs --integration-capabilities` — currently
-`control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown`.
+`control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls`
+(the `tls` capability is wired by WIRE-activation A1; `proxy-v2`/`zlib`/`zstd`
+stay absent until their slices exist, so their variants are still refused).
 The launcher enables the Go config's `rust-dataplane` gate (the Go
 process cedes the SQL listeners and serves only the control plane and
 API), waits for the control socket (created under `/tmp` with the run's
@@ -85,10 +88,56 @@ available TiDB instances" vocabulary; the unknown-namespace refusal is
 documented as unreachable under the current public bootstrap/admin
 semantics (in-memory namespace store + default auto-create + upsert-only
 commit) with the vocabulary contract pinned by a session-engine e2e. Cleanup stops the Rust process with SIGINT — the
-coordinated-shutdown path. TLS, PROXY protocol, and compression
-variants remain refused by the capability contract until their Rust
-slices exist; a raw TCP relay or the Go dataplane is never reported as
-Rust success.
+coordinated-shutdown path. The PROXY protocol and compression variants
+remain refused by the capability contract until their Rust slices exist;
+a raw TCP relay or the Go dataplane is never reported as Rust success.
+
+### SES-02 live authentication matrix (#27)
+
+Both modes additionally run a live authentication matrix that provisions
+users on the real cluster and proves, THROUGH the proxy, that the
+dataplane relays the real handshake end to end (Rust `session-core`
+`AuthRelay`, frozen from Go `pkg/proxy/backend/authenticator.go`). The
+live rows below exercise the two plugins a stock `mysql` client can drive
+against a bare TiUP playground — `mysql_native_password` and
+`caching_sha2_password` — plus wrong-password and `REQUIRE SSL`
+enforcement, identically in Go and Rust modes; the remaining plugins are
+pass-throughs covered by the `session-core` unit matrix (below), not by a
+live row:
+
+- **`mysql_native_password`** authenticates over the variant's own
+  transport.
+- **`caching_sha2_password`** full-auth is relayed intact over TLS
+  (the client sends the password in the clear inside TLS and the proxy
+  carries the whole auth-switch + full-auth exchange to the backend —
+  the only plugin with a fast path in the relay). The non-TLS
+  RSA-public-key path depends on the backend serving a key and is left
+  to the `session-core` handshake unit matrix, so this row asserts
+  success only on a TLS-frontend variant.
+- **A wrong password** is rejected end to end with an explicit
+  access-denied (1045) error, never a silent hang or spurious success.
+- **`REQUIRE SSL`** enforcement is decided by the proxy→backend link,
+  not the client link (TiDB checks the connection it actually
+  terminates, which is the proxy's backend dial). Without backend TLS
+  (`require_backend_tls=false`) the backend link is plaintext, so a
+  `REQUIRE SSL` user is refused regardless of the client's transport;
+  with backend TLS (the `tls` variants) the backend link is always TLS,
+  so the same user authenticates even from a `--ssl-mode=DISABLED`
+  client. This backend-link semantic is identical in Go and Rust modes
+  (verified with `--mode go --variant tls`).
+
+Plugins without a fast path in the relay (`tidb_sm3_password`,
+`mysql_clear_password`, `auth_socket`, `tidb_session_token`,
+`tidb_auth_token`, `authentication_ldap_simple`,
+`authentication_ldap_sasl`, and any unknown `Other`) are straight
+pass-throughs; a stock `mysql` client against a bare TiUP playground
+cannot exercise them without extra client plugins or an LDAP/JWKS
+backend, so their relay behavior is covered by the `session-core`
+handshake unit matrix rather than this live phase — name classification
+(`plugin_classification_matches_go_list`), fast-path gating to
+`caching_sha2_password` only (`sha2_fast_path_is_plugin_gated`), and a
+per-plugin pass-through matrix proving none of them short-circuits the
+relay (`pass_through_plugins_have_no_fast_path`).
 
 ## Control-frame dropper (chaos-E2E control-loss)
 
