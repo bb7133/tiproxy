@@ -33,6 +33,7 @@ pub mod server;
 pub mod session;
 pub mod session_control;
 pub mod session_engine;
+mod transport;
 
 pub use admission::{
     AdmissionController, AdmissionMetricsSnapshot, AdmissionPolicy, AdmissionPolicyError,

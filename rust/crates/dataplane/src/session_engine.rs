@@ -49,10 +49,14 @@
 //!
 //! # Slice scope (recorded for review)
 //!
-//! This slice serves the TLS-disabled, uncompressed path: the greeting
-//! advertises neither SSL nor compression, so a compliant client never
-//! negotiates them; an `SSLRequest` against a no-SSL greeting is a
-//! protocol violation and closes the session. `COM_CHANGE_USER` and
+//! This slice serves the TLS-capable, uncompressed path. The greeting
+//! advertises `SSL` iff this session's snapshot carries a frontend TLS server
+//! config; when the client sends a strict `SSLRequest`, TLS is activated in
+//! place on the client leg (and, per the backend TLS plan, on the backend leg
+//! before any credential leaves) with the `MySQL` sequence continuing across
+//! the upgrade. An `SSLRequest` against a greeting that withheld `SSL`, or a
+//! malformed one, fails closed with no plaintext fallback. Compression is still
+//! neither advertised nor negotiated (WIRE-activation C). `COM_CHANGE_USER` and
 //! `COM_STMT_PREPARE` (the prepared special response flow) are
 //! answered with a fixed unsupported error and the session closes. A
 //! control redirect executes the bounded `SHOW SESSION_STATES` exchange at
@@ -74,11 +78,15 @@ use control_proto::v1::{
 };
 use mysql_wire::{
     CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags, encode_error_packet,
-    encode_handshake_response, encode_initial_handshake, parse_handshake_response,
+    encode_handshake_response, encode_initial_handshake, encode_ssl_request,
+    parse_handshake_response, parse_ssl_request,
 };
 use proxy_io::PacketIo;
+use proxy_io::tls::{
+    DEFAULT_CONN_BUFFER_SIZE, accept_frontend, build_backend_config, connect_backend,
+};
 use session_core::auth::{
-    AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, UNKNOWN_AUTH_PLUGIN,
+    AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, BackendTlsMode, UNKNOWN_AUTH_PLUGIN,
     classify_backend_auth_packet, plan_backend_handshake,
 };
 use session_core::command::{
@@ -98,7 +106,6 @@ use session_core::response::{
     DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseObserver,
     ResponsePacket,
 };
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
@@ -118,13 +125,15 @@ use crate::session::{
 use crate::session_control::{
     BoundSessionHandler, ResponseStream, SessionCommander, SessionControlBinding,
 };
+use crate::transport::{BackendTransport, ClientTransport};
 
-/// The proxy's advertised capability mask for this slice: Go's
-/// handshake set without SSL (frontend TLS disabled here) and without
-/// compression bits (never negotiated, so the relay's compression
-/// effects are unreachable).
-fn proxy_capabilities() -> CapabilityFlags {
-    let base = CapabilityFlags::LONG_PASSWORD
+/// The proxy's full advertised capability set, including `SSL`. `SSL` is
+/// retained or stripped per session by [`proxy_capabilities`] according to
+/// whether that session's snapshot carries a frontend TLS server config.
+/// Compression bits are still not advertised (never negotiated, so the relay's
+/// compression effects are unreachable) until the WIRE-activation C slice.
+fn proxy_capability_base() -> CapabilityFlags {
+    CapabilityFlags::LONG_PASSWORD
         | CapabilityFlags::FOUND_ROWS
         | CapabilityFlags::LONG_FLAG
         | CapabilityFlags::CONNECT_WITH_DB
@@ -134,6 +143,7 @@ fn proxy_capabilities() -> CapabilityFlags {
         | CapabilityFlags::IGNORE_SPACE
         | CapabilityFlags::PROTOCOL_41
         | CapabilityFlags::INTERACTIVE
+        | CapabilityFlags::SSL
         | CapabilityFlags::IGNORE_SIGPIPE
         | CapabilityFlags::TRANSACTIONS
         | CapabilityFlags::RESERVED
@@ -144,8 +154,48 @@ fn proxy_capabilities() -> CapabilityFlags {
         | CapabilityFlags::PLUGIN_AUTH
         | CapabilityFlags::CONNECT_ATTRS
         | CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA
-        | CapabilityFlags::DEPRECATE_EOF;
-    greeting_capability(base, false)
+        | CapabilityFlags::DEPRECATE_EOF
+}
+
+/// The proxy capabilities for one session: the full base with `SSL`
+/// advertised only when this session's snapshot has a frontend TLS server
+/// config, so the advertised capability always matches the live capability.
+fn proxy_capabilities(frontend_tls_available: bool) -> CapabilityFlags {
+    greeting_capability(proxy_capability_base(), frontend_tls_available)
+}
+
+/// The client's leading capability flags — the first four little-endian bytes
+/// that begin both an `SSLRequest` and a full handshake response. Used only to
+/// classify the first client packet; a payload shorter than four bytes carries
+/// no `SSL` bit and falls through to the (fail-closed) handshake parser.
+fn leading_capabilities(payload: &[u8]) -> CapabilityFlags {
+    if payload.len() < 4 {
+        return CapabilityFlags::from_bits_retain(0);
+    }
+    let bits = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    CapabilityFlags::from_bits_retain(bits)
+}
+
+/// Overwrites the leading capability flags of a handshake-response payload with
+/// the trusted pre-TLS `SSLRequest` mask (Go `handshakeFirstTime`: the mask sent
+/// before the encrypted response is authoritative, so it — not the in-TLS
+/// response's own bytes — governs the response's field layout and negotiation).
+/// A payload shorter than four bytes is left unchanged; it fails the subsequent
+/// parse fail-closed.
+fn normalize_leading_capabilities(payload: &mut [u8], trusted: CapabilityFlags) {
+    if payload.len() >= 4 {
+        payload[0..4].copy_from_slice(&trusted.bits().to_le_bytes());
+    }
+}
+
+/// The SNI/server name for a backend TLS handshake: the host of a `host:port`
+/// routing address, with any IPv6 brackets stripped (Go: "use the DNS name as
+/// much as possible"; both DNS names and IP literals parse as a server name).
+fn backend_server_name(address: &str) -> String {
+    let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned()
 }
 
 /// Handshake-phase logical payload bound.
@@ -460,7 +510,7 @@ async fn run_bound_session_observed(
     let engine = Engine {
         connection_id: identity.connection_id,
         endpoints,
-        client_io: PacketIo::new(stream),
+        client_io: PacketIo::new(ClientTransport::Plain(stream)),
         backend: None,
         events: event_tx,
         cmds: cmd_rx,
@@ -484,6 +534,8 @@ async fn run_bound_session_observed(
         quit_source: QuitSource::None,
         closing: false,
         accepted_at,
+        handshake_deadline: loop_config.handshake_deadline,
+        frontend_tls_active: false,
         metrics: metrics.clone(),
         log_context: log_context.clone(),
         seat,
@@ -722,7 +774,7 @@ struct RouteSeed {
 /// The dialed backend's I/O and identity.
 struct BackendIo {
     #[allow(clippy::struct_field_names)]
-    backend_io: PacketIo<TcpStream>,
+    backend_io: PacketIo<BackendTransport>,
     id: String,
     address: String,
     cluster: String,
@@ -744,7 +796,7 @@ struct PendingCommand {
 struct Engine {
     connection_id: u64,
     endpoints: ConnectionEndpoints,
-    client_io: PacketIo<TcpStream>,
+    client_io: PacketIo<ClientTransport>,
     backend: Option<BackendIo>,
     events: mpsc::Sender<SessionEvent>,
     cmds: mpsc::Receiver<EngineCmd>,
@@ -769,6 +821,14 @@ struct Engine {
     quit_source: QuitSource,
     closing: bool,
     accepted_at: tokio::time::Instant,
+    /// Absolute handshake budget (Go parity, `handshake_deadline`), measured
+    /// from `accepted_at`. TLS accept/connect consume the *remaining* budget
+    /// rather than a fresh timer, so the whole handshake — plaintext greeting,
+    /// `SSLRequest`, TLS, auth — shares one deadline.
+    handshake_deadline: Duration,
+    /// Whether the client upgraded this connection to TLS via `SSLRequest`.
+    /// Drives the greeting-response `tls` metadata and capability trust.
+    frontend_tls_active: bool,
     metrics: MetricsRecorder,
     log_context: SessionLogContext,
     seat: SessionSeat,
@@ -861,18 +921,94 @@ impl Engine {
             return Some(source);
         }
 
-        // Client handshake response (no TLS negotiated: an SSLRequest
-        // is a protocol violation against our greeting).
+        // First client packet after the greeting. A client that sets `SSL`
+        // must send a strict 32-byte `SSLRequest` (Go: the pre-TLS capability
+        // mask is authoritative); we then upgrade to TLS and read the real
+        // handshake response inside the encrypted session. Otherwise the first
+        // packet already is the plaintext handshake response.
+        let frontend_tls_available = self.frontend_tls_available();
         let payload = match self.client_io.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
             Ok(packet) => packet.payload,
             Err(error) => return Some(self.client_read_end(&error).await),
         };
+        let ssl_request_capabilities =
+            if leading_capabilities(&payload).contains(CapabilityFlags::SSL) {
+                let Ok(ssl_request) = parse_ssl_request(&payload) else {
+                    // SSL bit set but not a strict 32-byte SSLRequest: fail closed
+                    // rather than falling back to a plaintext handshake response.
+                    self.quit_source = QuitSource::ProxyMalformed;
+                    let _ = self.events.send(SessionEvent::ClientIoError).await;
+                    return Some(WireErrorSource::ClientNetwork);
+                };
+                if !frontend_tls_available {
+                    // We only advertise SSL when a frontend config exists; a client
+                    // asking to upgrade against a greeting that withheld SSL is a
+                    // protocol violation.
+                    self.quit_source = QuitSource::ProxyMalformed;
+                    let _ = self.events.send(SessionEvent::ClientIoError).await;
+                    return Some(WireErrorSource::ClientNetwork);
+                }
+                Some(ssl_request.capabilities)
+            } else {
+                None
+            };
+
+        let mut payload = if ssl_request_capabilities.is_some() {
+            // FSM: Greeting --ClientSslRequest--> SslRequest (ActivateFrontendTls).
+            if self
+                .events
+                .send(SessionEvent::ClientSslRequest)
+                .await
+                .is_err()
+            {
+                return Some(WireErrorSource::Proxy);
+            }
+            if !matches!(
+                self.await_effect(SessionEffect::ActivateFrontendTls).await,
+                Awaited::Got
+            ) {
+                return None;
+            }
+            if let Err(source) = self.activate_frontend_tls().await {
+                return Some(source);
+            }
+            // FSM: SslRequest --TlsActivated--> Greeting (no effect). The real
+            // handshake response arrives inside TLS; its MySQL sequence
+            // continues (SSLRequest was seq 1, this is seq 2).
+            if self.events.send(SessionEvent::TlsActivated).await.is_err() {
+                return Some(WireErrorSource::Proxy);
+            }
+            match self.client_io.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
+                Ok(packet) => packet.payload,
+                Err(error) => return Some(self.client_read_end(&error).await),
+            }
+        } else {
+            payload
+        };
+
+        // Go parity: when TLS was negotiated, the pre-TLS `SSLRequest` mask is
+        // authoritative, so overwrite the in-TLS response's leading capability
+        // bytes with it BEFORE parsing. This makes layout-affecting bits
+        // (CONNECT_WITH_DB / CONNECT_ATTRS / PLUGIN_AUTH_LENENC / ZSTD) — which
+        // decide the response's field layout — come from the trusted mask, not
+        // the untrusted second packet, and keeps the stored raw (re-parsed for
+        // backend forwarding) consistent with what we negotiated.
+        if let Some(ssl_capabilities) = ssl_request_capabilities {
+            normalize_leading_capabilities(&mut payload, ssl_capabilities);
+        }
+
         let Ok(parsed) = parse_handshake_response(&payload) else {
             self.quit_source = QuitSource::ProxyMalformed;
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Some(WireErrorSource::ClientNetwork);
         };
-        let negotiation = match negotiate_frontend(parsed.capabilities, proxy_capabilities()) {
+        // After normalization `parsed.capabilities` is the trusted mask under
+        // TLS (and the plaintext client mask otherwise), so it governs both the
+        // parsed field layout and the negotiation.
+        let negotiation = match negotiate_frontend(
+            parsed.capabilities,
+            proxy_capabilities(frontend_tls_available),
+        ) {
             Ok(negotiation) => negotiation,
             Err(missing) => {
                 self.quit_source = QuitSource::ClientHandshake;
@@ -900,7 +1036,7 @@ impl Engine {
             collation: u32::from(parsed.collation),
             zstd_level: u32::from(parsed.zstd_level.unwrap_or(0)),
             connection_attributes: std::collections::BTreeMap::default(),
-            tls: false,
+            tls: self.frontend_tls_active,
         };
         self.cmd_state = Some(CommandSessionState::new(self.negotiated, parsed.database));
         let routing = negotiation.routing_handshake(&parsed, self.endpoints);
@@ -1072,7 +1208,7 @@ impl Engine {
             }
         }
         let mut backend = BackendIo {
-            backend_io: PacketIo::new(acquired.conn),
+            backend_io: PacketIo::new(BackendTransport::Plain(acquired.conn)),
             id: backend_id.clone(),
             address: backend_address,
             cluster: backend_cluster,
@@ -1094,16 +1230,43 @@ impl Engine {
             return Some(WireErrorSource::BackendNetwork);
         };
         let backend_caps = backend_greeting.capabilities;
-        if verify_backend(backend_caps, self.negotiated, proxy_capabilities(), false).is_err() {
+        let (require_backend_tls, backend_tls_available) = self.backend_tls_policy();
+        if verify_backend(
+            backend_caps,
+            self.negotiated,
+            proxy_capabilities(self.frontend_tls_available()),
+            require_backend_tls,
+        )
+        .is_err()
+        {
             self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
         }
-        let Ok(plan) = plan_backend_handshake(&routing, backend_caps, false, false) else {
+        let Ok(plan) = plan_backend_handshake(
+            &routing,
+            backend_caps,
+            require_backend_tls,
+            backend_tls_available,
+        ) else {
             self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::Proxy);
         };
+        // Backend TLS activates before any credential leaves the proxy: send a
+        // plaintext SSLRequest, upgrade the backend transport, then the full
+        // handshake response travels inside TLS.
+        let backend_tls_result = if matches!(plan.tls, BackendTlsMode::Enabled) {
+            self.upgrade_backend_tls(&mut backend, plan.capabilities)
+                .await
+        } else {
+            Ok(())
+        };
+        if let Err(source) = backend_tls_result {
+            self.quit_source = QuitSource::BackendHandshake;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(source);
+        }
         self.backend = Some(backend);
         if self
             .events
@@ -1156,10 +1319,15 @@ impl Engine {
             forwarded
         };
         if let Some(backend) = self.backend.as_mut() {
-            // Continue the backend channel's connection-phase counter
-            // after its greeting.
-            let next = backend.backend_io.expected_read_sequence();
-            backend.backend_io.reset_write_sequence(next);
+            // Continue the backend channel's connection-phase counter after its
+            // greeting. Under backend TLS the writer already advanced past the
+            // plaintext SSLRequest (seq 1) to seq 2, so it continues as-is;
+            // otherwise the plaintext response is the first write and aligns to
+            // the greeting (reader observed seq 0 -> expects 1).
+            if !matches!(backend.backend_io.get_ref(), BackendTransport::Tls(_)) {
+                let next = backend.backend_io.expected_read_sequence();
+                backend.backend_io.reset_write_sequence(next);
+            }
             if backend
                 .backend_io
                 .write_logical(&forwarded, true)
@@ -1904,10 +2072,156 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether this session's snapshot carries a frontend TLS server config.
+    /// Governs both the greeting `SSL` advertisement and the strict
+    /// SSLRequest-vs-plaintext classification: a client may only upgrade if we
+    /// actually advertised (and can serve) TLS.
+    fn frontend_tls_available(&self) -> bool {
+        self.seat.snapshot().frontend_server_config.is_some()
+    }
+
+    /// Remaining handshake budget from the absolute deadline (`accepted_at +
+    /// handshake_deadline`), for TLS accept/connect. Saturates at zero so a
+    /// blown budget fails closed immediately instead of granting a fresh wait.
+    fn handshake_budget_remaining(&self) -> Duration {
+        (self.accepted_at + self.handshake_deadline)
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+
+    /// Upgrades the client transport to server-side TLS in place, preserving
+    /// the `MySQL` sequence trackers and wire counters across the swap (the raw
+    /// TLS handshake bytes are not `MySQL` packets and never enter the counters).
+    ///
+    /// The `SSLRequest`'s prefetched-but-unread bytes, if any, replay ahead of
+    /// the TLS stream so no `ClientHello` byte is lost. Any failure — missing
+    /// config, timeout, or handshake error — fails closed: the owner drops the
+    /// socket (moved into `accept_frontend`, dropped on error), there is no
+    /// plaintext fallback and no detached task.
+    async fn activate_frontend_tls(&mut self) -> Result<(), WireErrorSource> {
+        let Some(config) = self.seat.snapshot().frontend_server_config.clone() else {
+            // Reached only if the snapshot lost its config between advertisement
+            // and here; a client SSLRequest we cannot serve fails closed.
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::Proxy);
+        };
+        let timeout = self.handshake_budget_remaining();
+        // Move the endpoint out to perform the value-consuming upgrade; the
+        // sequence/counter state travels in the token, the raw socket in the
+        // transport. `Detached` holds the field meanwhile and is never polled.
+        let endpoint = std::mem::replace(
+            &mut self.client_io,
+            PacketIo::new(ClientTransport::Detached),
+        );
+        let (transport, upgrade_state, prefix) = endpoint.into_upgrade_parts();
+        let ClientTransport::Plain(stream) = transport else {
+            // A second activation on an already-upgraded transport is a proxy
+            // invariant violation.
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::Proxy);
+        };
+        // `stream` was moved into `accept_frontend`; on error it is dropped —
+        // the owner drops the socket. No plaintext fallback, no detached task.
+        let Ok(frontend) =
+            accept_frontend(stream, prefix, config, timeout, DEFAULT_CONN_BUFFER_SIZE).await
+        else {
+            self.quit_source = QuitSource::ClientHandshake;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::ClientNetwork);
+        };
+        self.client_io =
+            PacketIo::from_upgrade_parts(ClientTransport::Tls(frontend), upgrade_state);
+        self.frontend_tls_active = true;
+        Ok(())
+    }
+
+    /// The backend TLS policy for this session as `(require, available)`. A
+    /// validated snapshot always carries a default backend policy object, so
+    /// presence is read from the raw config's `backend_tls` rather than the
+    /// validated policy's emptiness.
+    fn backend_tls_policy(&self) -> (bool, bool) {
+        let snapshot = self.seat.snapshot();
+        let config = snapshot.raw().config.as_ref();
+        let require = config.is_some_and(|config| config.require_backend_tls);
+        let available = config.is_some_and(|config| config.backend_tls.is_some());
+        (require, available)
+    }
+
+    /// Upgrades the backend transport to client-side TLS in place. Sends the
+    /// plaintext `SSLRequest` (seq 1, continuing after the backend greeting),
+    /// runs the backend TLS handshake, then reattaches preserving the sequence
+    /// trackers and wire counters (the raw TLS handshake bytes are not `MySQL`
+    /// packets); the full handshake response then travels inside TLS at seq 2.
+    ///
+    /// Any failure — config build, handshake, timeout, or the backend speaking
+    /// before TLS — fails closed: the owner drops the socket (moved into
+    /// `connect_backend`), no plaintext fallback, no detached task.
+    async fn upgrade_backend_tls(
+        &self,
+        backend: &mut BackendIo,
+        capabilities: CapabilityFlags,
+    ) -> Result<(), WireErrorSource> {
+        // The SSLRequest mirrors the client's max packet size and collation —
+        // the same values the forwarded handshake response carries.
+        let Ok(client) = parse_handshake_response(&self.client_handshake_raw) else {
+            return Err(WireErrorSource::Proxy);
+        };
+        // Align the writer to continue after the greeting (reader observed seq
+        // 0 -> expects 1) and send the plaintext SSLRequest at seq 1.
+        let next = backend.backend_io.expected_read_sequence();
+        backend.backend_io.reset_write_sequence(next);
+        let ssl_request =
+            encode_ssl_request(capabilities, client.max_packet_size, client.collation);
+        if backend
+            .backend_io
+            .write_logical(&ssl_request, true)
+            .await
+            .is_err()
+        {
+            return Err(WireErrorSource::BackendNetwork);
+        }
+        let Ok(config) = build_backend_config(&self.seat.snapshot().backend_tls) else {
+            return Err(WireErrorSource::Proxy);
+        };
+        let server_name = backend_server_name(&backend.address);
+        let timeout = self.handshake_budget_remaining();
+        // Move the endpoint out for the value-consuming upgrade; the
+        // sequence/counter state travels in the token, the raw socket in the
+        // transport. `Detached` holds the field meanwhile and is never polled.
+        let io = std::mem::replace(
+            &mut backend.backend_io,
+            PacketIo::new(BackendTransport::Detached),
+        );
+        let (transport, upgrade_state, prefix) = io.into_upgrade_parts();
+        let BackendTransport::Plain(stream) = transport else {
+            return Err(WireErrorSource::Proxy);
+        };
+        if !prefix.is_empty() {
+            // The backend sent bytes before TLS started (it must not); fail
+            // closed rather than dropping them or feeding them into TLS.
+            return Err(WireErrorSource::BackendNetwork);
+        }
+        let Ok(backend_tls) = connect_backend(
+            stream,
+            &server_name,
+            config,
+            timeout,
+            DEFAULT_CONN_BUFFER_SIZE,
+        )
+        .await
+        else {
+            return Err(WireErrorSource::BackendNetwork);
+        };
+        backend.backend_io =
+            PacketIo::from_upgrade_parts(BackendTransport::Tls(backend_tls), upgrade_state);
+        Ok(())
+    }
+
     async fn send_greeting(&mut self) -> Result<(), WireErrorSource> {
         fill_salt(&mut self.salt);
         let params = build_greeting(
-            proxy_capabilities(),
+            proxy_capabilities(self.frontend_tls_available()),
             &self.salt,
             SERVER_VERSION,
             self.connection_id,
@@ -1964,8 +2278,13 @@ impl Engine {
         let Some(backend) = self.backend.as_mut() else {
             return false;
         };
+        let Some(tcp) = backend.backend_io.get_ref().as_tcp_stream() else {
+            // Detached only during an in-progress TLS upgrade, before the
+            // backend is exposed to probes; treat as alive rather than dead.
+            return true;
+        };
         let mut probe = [0_u8; 1];
-        match backend.backend_io.get_mut().try_read(&mut probe) {
+        match tcp.try_read(&mut probe) {
             // Data outside a command or a clean EOF both mean the
             // backend is not idle-healthy.
             Ok(_) => false,
@@ -2131,5 +2450,127 @@ fn fill_salt(salt: &mut [u8; 20]) {
                 *byte = 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tls_wiring_tests {
+    use super::{
+        backend_server_name, leading_capabilities, normalize_leading_capabilities,
+        proxy_capabilities,
+    };
+    use mysql_wire::{
+        CapabilityFlags, HandshakeResponseParams, encode_handshake_response, encode_ssl_request,
+        parse_handshake_response, parse_ssl_request,
+    };
+
+    #[test]
+    fn proxy_capabilities_advertise_ssl_only_when_available() {
+        assert!(
+            proxy_capabilities(true).contains(CapabilityFlags::SSL),
+            "a frontend TLS config advertises SSL"
+        );
+        assert!(
+            !proxy_capabilities(false).contains(CapabilityFlags::SSL),
+            "no frontend TLS config strips SSL so advertisement matches capability"
+        );
+        // Everything except SSL is identical across the two, so only the SSL
+        // bit is governed per snapshot.
+        assert_eq!(
+            proxy_capabilities(true).without(CapabilityFlags::SSL),
+            proxy_capabilities(false),
+        );
+    }
+
+    #[test]
+    fn leading_capabilities_reads_the_ssl_bit() {
+        // A strict 32-byte SSLRequest with SSL set classifies as SSL.
+        let ssl_request = encode_ssl_request(
+            CapabilityFlags::PROTOCOL_41 | CapabilityFlags::SSL,
+            0x0100_0000,
+            45,
+        );
+        assert!(leading_capabilities(&ssl_request).contains(CapabilityFlags::SSL));
+        assert!(parse_ssl_request(&ssl_request).is_ok());
+
+        // A plaintext-first packet without the SSL bit does not.
+        let plain = encode_ssl_request(CapabilityFlags::PROTOCOL_41, 0x0100_0000, 45);
+        assert!(!leading_capabilities(&plain).contains(CapabilityFlags::SSL));
+
+        // A truncated leading window carries no SSL bit and falls through to
+        // the (fail-closed) handshake parser.
+        assert!(!leading_capabilities(&[0xff, 0xff]).contains(CapabilityFlags::SSL));
+        assert!(!leading_capabilities(&[]).contains(CapabilityFlags::SSL));
+    }
+
+    #[test]
+    fn normalize_leading_capabilities_governs_layout_affecting_parse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The real (trusted) client asked for CONNECT_WITH_DB, so the response
+        // is laid out with a database field, encoded here per the trusted mask.
+        let trusted = CapabilityFlags::PROTOCOL_41
+            | CapabilityFlags::SECURE_CONNECTION
+            | CapabilityFlags::CONNECT_WITH_DB
+            | CapabilityFlags::PLUGIN_AUTH;
+        let encoded = encode_handshake_response(HandshakeResponseParams {
+            capabilities: trusted,
+            max_packet_size: 0x0100_0000,
+            collation: 45,
+            username: b"alice",
+            auth_response: b"\x01\x02\x03",
+            database: Some(b"shop"),
+            auth_plugin_name: Some(b"mysql_native_password"),
+            attributes: None,
+            zstd_level: None,
+        })?;
+
+        // Simulate a hostile in-TLS second packet whose leading mask drops
+        // CONNECT_WITH_DB — a layout-affecting mismatch. Parsing the SAME bytes
+        // under that untrusted mask misreads the layout: no database, and the
+        // "shop" bytes are consumed as the auth plugin name.
+        let untrusted = trusted.without(CapabilityFlags::CONNECT_WITH_DB);
+        let mut hostile = encoded.clone();
+        hostile[0..4].copy_from_slice(&untrusted.bits().to_le_bytes());
+        assert_eq!(leading_capabilities(&hostile), untrusted);
+        let misread = parse_handshake_response(&hostile)?;
+        assert_eq!(
+            misread.database, None,
+            "untrusted layout drops the database"
+        );
+        assert_eq!(
+            misread.auth_plugin_name,
+            Some(b"shop".as_ref()),
+            "untrusted layout misreads the database bytes as the plugin name"
+        );
+
+        // Normalizing the leading bytes back to the trusted mask restores the
+        // real layout: the database and plugin parse correctly.
+        normalize_leading_capabilities(&mut hostile, trusted);
+        assert_eq!(leading_capabilities(&hostile), trusted);
+        let fixed = parse_handshake_response(&hostile)?;
+        assert_eq!(fixed.capabilities, trusted);
+        assert_eq!(fixed.database, Some(b"shop".as_ref()));
+        assert_eq!(
+            fixed.auth_plugin_name,
+            Some(b"mysql_native_password".as_ref())
+        );
+        assert_eq!(fixed.username, b"alice");
+        // A short payload is left untouched (it fails the subsequent parse).
+        let mut short = [1_u8, 2, 3];
+        normalize_leading_capabilities(&mut short, trusted);
+        assert_eq!(short, [1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn backend_server_name_is_the_host_without_port_or_brackets() {
+        assert_eq!(
+            backend_server_name("tidb.example.com:4000"),
+            "tidb.example.com"
+        );
+        assert_eq!(backend_server_name("127.0.0.1:4000"), "127.0.0.1");
+        assert_eq!(backend_server_name("[::1]:4000"), "::1");
+        // A bare host with no port is used verbatim.
+        assert_eq!(backend_server_name("localhost"), "localhost");
     }
 }

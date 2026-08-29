@@ -43,9 +43,10 @@ pub use constants::{CapabilityFlags, CommandCode, ResponseHeader, StatusFlags};
 pub use error::{DecodeError, EncodeError};
 pub use handshake::{
     ChangeUser, ChangeUserParams, ClientHandshake, HandshakeResponse, HandshakeResponseParams,
-    InitialHandshake, InitialHandshakeParams, SslRequest, decode_client_handshake,
-    encode_change_user, encode_handshake_response, encode_initial_handshake, parse_change_user,
-    parse_handshake_response, parse_initial_handshake, parse_ssl_request,
+    InitialHandshake, InitialHandshakeParams, SSL_REQUEST_BYTES, SslRequest,
+    decode_client_handshake, encode_change_user, encode_handshake_response,
+    encode_initial_handshake, encode_ssl_request, parse_change_user, parse_handshake_response,
+    parse_initial_handshake, parse_ssl_request,
 };
 pub use packet::{
     CommandPacket, LogicalPacketFragments, PHYSICAL_PACKET_HEADER_LEN, PacketHeader,

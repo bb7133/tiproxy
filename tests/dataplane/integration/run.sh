@@ -142,6 +142,12 @@ if [[ $mode == rust ]]; then
 	# 104 bytes, far shorter than the artifact directory path.
 	printf '\n[rust-dataplane]\nenabled = true\ncontrol-socket = "%s"\n' \
 		"$RUST_SOCKET" >>"$run_dir/tiproxy.toml"
+	if [[ $TLS_ENABLED == true ]]; then
+		# The control plane refuses to build a snapshot whose TLS cert paths
+		# fall outside an explicit allowlist of roots; admit the generated
+		# certs so the tls variants can activate frontend/backend TLS.
+		printf 'tls-allowed-roots = ["%s"]\n' "$run_dir/certs" >>"$run_dir/tiproxy.toml"
+	fi
 	PORTS="$PORTS $RUST_HEALTH_PORT"
 fi
 FAULT_PROXY_BIN="$run_dir/faultproxy"
@@ -234,8 +240,15 @@ if [[ $mode == rust ]]; then
 		echo "Rust control socket did not appear: $control_socket" >&2
 		exit 1
 	fi
+	rust_tls_args=()
+	if [[ $TLS_ENABLED == true ]]; then
+		# The Rust dataplane validates the snapshot's TLS cert paths against
+		# its own allowlist of roots, mirroring the control plane's check.
+		rust_tls_args=(--tls-root "$run_dir/certs")
+	fi
 	"$rust_binary" --control-socket "$control_socket" --control-uid "$(id -u)" \
 		--health-port "$RUST_HEALTH_PORT" \
+		${rust_tls_args[@]+"${rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs.log" 2>&1 &
 	RUST_PID=$!
 	write_state
@@ -741,6 +754,12 @@ PYKA
 if [[ $mode == rust ]]; then
 	printf '\n[rust-dataplane]\nenabled = true\ncontrol-socket = "%s"\n' \
 		"$KA_SOCKET" >>"$run_dir/tiproxy-ka.toml"
+	if [[ $TLS_ENABLED == true ]]; then
+		# The keyspace-guard config strips the whole [rust-dataplane] block
+		# (and its tls-allowed-roots) when it is regenerated, so re-admit the
+		# generated certs here too for the tls variants.
+		printf 'tls-allowed-roots = ["%s"]\n' "$run_dir/certs" >>"$run_dir/tiproxy-ka.toml"
+	fi
 	printf 'KA_SOCKET=%q\n' "$KA_SOCKET" >>"$run_dir/state.env"
 fi
 "$repo_root/bin/tiproxy" --config "$run_dir/tiproxy-ka.toml" \
@@ -811,8 +830,13 @@ fi
 # binds; under the dropper that is KA_DROP_SOCKET, not KA_SOCKET.
 printf 'KA_RUST_CONTROL_SOCKET=%q\n' "$ka_rust_control_socket" >>"$run_dir/state.env"
 if [[ $mode == rust ]]; then
+	ka_rust_tls_args=()
+	if [[ $TLS_ENABLED == true ]]; then
+		ka_rust_tls_args=(--tls-root "$run_dir/certs")
+	fi
 	"$rust_binary" --control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 		--health-port "$ka_health_port" \
+		${ka_rust_tls_args[@]+"${ka_rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
 	KA_RUST_PID=$!
 	printf 'KA_RUST_PID=%q\n' "$KA_RUST_PID" >>"$run_dir/state.env"

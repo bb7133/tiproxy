@@ -69,11 +69,12 @@ enum Command {
 }
 
 /// The integration harness's capability contract (DPL-07): only what
-/// this binary truthfully provides today. The TLS-off/uncompressed
-/// slice deliberately does NOT advertise tls/proxy-v2/zlib/zstd, so
-/// the topology preflight admits only the plain variant.
+/// this binary truthfully provides today. TLS (frontend `SSLRequest` +
+/// backend TLS) is wired (WIRE-activation A1), so `tls` is advertised;
+/// PROXY v2 and compression are still not wired, so `proxy-v2`/`zlib`/`zstd`
+/// remain absent and the topology preflight admits only plain and tls.
 const INTEGRATION_CAPABILITIES: &str =
-    "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown";
+    "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -430,10 +431,14 @@ mod tests {
         };
         assert_eq!(
             INTEGRATION_CAPABILITIES,
-            "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown",
-            "only what the TLS-off/uncompressed slice truthfully provides"
+            "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls",
+            "only what the binary truthfully provides: the plain slice plus wired TLS"
         );
-        for absent in ["tls", "proxy-v2", "zlib", "zstd"] {
+        assert!(
+            INTEGRATION_CAPABILITIES.contains("tls"),
+            "TLS is wired (WIRE-activation A1), so it must be advertised"
+        );
+        for absent in ["proxy-v2", "zlib", "zstd"] {
             assert!(
                 !INTEGRATION_CAPABILITIES.contains(absent),
                 "unimplemented variant capability {absent:?} must not be advertised"

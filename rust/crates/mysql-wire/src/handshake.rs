@@ -21,6 +21,9 @@ use crate::{
 
 const HANDSHAKE_PROTOCOL_VERSION: u8 = 10;
 const HANDSHAKE_RESPONSE_FIXED_BYTES: usize = 32;
+/// The exact size of an `SSLRequest` packet (the fixed handshake-response
+/// prefix sent before a TLS handshake).
+pub const SSL_REQUEST_BYTES: usize = 32;
 const INITIAL_AUTH_PART_ONE_BYTES: usize = 8;
 const INITIAL_AUTH_PART_TWO_WIRE_BYTES: usize = 13;
 
@@ -251,6 +254,25 @@ pub fn parse_ssl_request(payload: &[u8]) -> Result<SslRequest<'_>, DecodeError> 
         collation,
         raw: payload,
     })
+}
+
+/// Encodes the exact 32-byte `SSLRequest` sent before a TLS handshake: the
+/// capability mask (which must carry `CLIENT_SSL`), the maximum packet size,
+/// the collation byte, and 23 reserved zero bytes. This is the leading prefix
+/// of a full handshake response, sent alone so the peer starts TLS before the
+/// credentials follow inside the encrypted channel.
+#[must_use]
+pub fn encode_ssl_request(
+    capabilities: CapabilityFlags,
+    max_packet_size: u32,
+    collation: u8,
+) -> [u8; SSL_REQUEST_BYTES] {
+    let mut output = [0_u8; SSL_REQUEST_BYTES];
+    output[0..4].copy_from_slice(&capabilities.bits().to_le_bytes());
+    output[4..8].copy_from_slice(&max_packet_size.to_le_bytes());
+    output[8] = collation;
+    // output[9..32] stays zero: the 23 reserved bytes.
+    output
 }
 
 /// A decoded full client handshake response borrowing all variable-width fields.
@@ -844,6 +866,21 @@ mod tests {
             parse_ssl_request(&extra),
             Err(DecodeError::TrailingBytes { .. })
         ));
+    }
+
+    #[test]
+    fn ssl_request_encode_round_trips_through_parse() -> Result<(), Box<dyn std::error::Error>> {
+        let capabilities = CLIENT_CAPS | CapabilityFlags::SSL;
+        let encoded = encode_ssl_request(capabilities, 0x0100_0000, 45);
+        assert_eq!(encoded.len(), SSL_REQUEST_BYTES);
+        // The 23 reserved bytes are zero.
+        assert_eq!(encoded[9..], [0_u8; 23]);
+        let parsed = parse_ssl_request(&encoded)?;
+        assert_eq!(parsed.capabilities, capabilities);
+        assert_eq!(parsed.max_packet_size, 0x0100_0000);
+        assert_eq!(parsed.collation, 45);
+        assert!(parsed.capabilities.contains(CapabilityFlags::SSL));
+        Ok(())
     }
 
     #[test]
