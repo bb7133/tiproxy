@@ -75,8 +75,10 @@ use control_proto::v1::{
 use mysql_wire::{
     CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags, encode_error_packet,
     encode_handshake_response, encode_initial_handshake, parse_handshake_response,
+    parse_ssl_request,
 };
 use proxy_io::PacketIo;
+use proxy_io::tls::{DEFAULT_CONN_BUFFER_SIZE, accept_frontend};
 use session_core::auth::{
     AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, UNKNOWN_AUTH_PLUGIN,
     classify_backend_auth_packet, plan_backend_handshake,
@@ -87,7 +89,8 @@ use session_core::command::{
 use session_core::error_source::FailureKind;
 use session_core::fsm::{SessionEffect, SessionEvent};
 use session_core::handshake::{
-    ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend, verify_backend,
+    ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend,
+    reconcile_tls_capabilities, verify_backend,
 };
 use session_core::internal_client::{
     InternalLimits, InternalParserState, InternalProgress, InternalQuery, InternalResult,
@@ -123,8 +126,11 @@ use crate::transport::{BackendTransport, ClientTransport};
 /// handshake set without SSL (frontend TLS disabled here) and without
 /// compression bits (never negotiated, so the relay's compression
 /// effects are unreachable).
-fn proxy_capabilities() -> CapabilityFlags {
-    let base = CapabilityFlags::LONG_PASSWORD
+/// The proxy's full advertised capability set, including `SSL`. `SSL` is
+/// retained or stripped per session by [`proxy_capabilities`] according to
+/// whether that session's snapshot carries a frontend TLS server config.
+fn proxy_capability_base() -> CapabilityFlags {
+    CapabilityFlags::LONG_PASSWORD
         | CapabilityFlags::FOUND_ROWS
         | CapabilityFlags::LONG_FLAG
         | CapabilityFlags::CONNECT_WITH_DB
@@ -134,6 +140,7 @@ fn proxy_capabilities() -> CapabilityFlags {
         | CapabilityFlags::IGNORE_SPACE
         | CapabilityFlags::PROTOCOL_41
         | CapabilityFlags::INTERACTIVE
+        | CapabilityFlags::SSL
         | CapabilityFlags::IGNORE_SIGPIPE
         | CapabilityFlags::TRANSACTIONS
         | CapabilityFlags::RESERVED
@@ -144,8 +151,26 @@ fn proxy_capabilities() -> CapabilityFlags {
         | CapabilityFlags::PLUGIN_AUTH
         | CapabilityFlags::CONNECT_ATTRS
         | CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA
-        | CapabilityFlags::DEPRECATE_EOF;
-    greeting_capability(base, false)
+        | CapabilityFlags::DEPRECATE_EOF
+}
+
+/// The proxy capabilities for one session: the full base with `SSL`
+/// advertised only when this session's snapshot has a frontend TLS server
+/// config, so the advertised capability always matches the live capability.
+fn proxy_capabilities(frontend_tls_available: bool) -> CapabilityFlags {
+    greeting_capability(proxy_capability_base(), frontend_tls_available)
+}
+
+/// The client's leading capability flags — the first four little-endian bytes
+/// that begin both an `SSLRequest` and a full handshake response. Used only to
+/// classify the first client packet; a payload shorter than four bytes carries
+/// no `SSL` bit and falls through to the (fail-closed) handshake parser.
+fn leading_capabilities(payload: &[u8]) -> CapabilityFlags {
+    if payload.len() < 4 {
+        return CapabilityFlags::from_bits_retain(0);
+    }
+    let bits = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    CapabilityFlags::from_bits_retain(bits)
 }
 
 /// Handshake-phase logical payload bound.
@@ -484,6 +509,8 @@ async fn run_bound_session_observed(
         quit_source: QuitSource::None,
         closing: false,
         accepted_at,
+        handshake_deadline: loop_config.handshake_deadline,
+        frontend_tls_active: false,
         metrics: metrics.clone(),
         log_context: log_context.clone(),
         seat,
@@ -769,6 +796,14 @@ struct Engine {
     quit_source: QuitSource,
     closing: bool,
     accepted_at: tokio::time::Instant,
+    /// Absolute handshake budget (Go parity, `handshake_deadline`), measured
+    /// from `accepted_at`. TLS accept/connect consume the *remaining* budget
+    /// rather than a fresh timer, so the whole handshake — plaintext greeting,
+    /// `SSLRequest`, TLS, auth — shares one deadline.
+    handshake_deadline: Duration,
+    /// Whether the client upgraded this connection to TLS via `SSLRequest`.
+    /// Drives the greeting-response `tls` metadata and capability trust.
+    frontend_tls_active: bool,
     metrics: MetricsRecorder,
     log_context: SessionLogContext,
     seat: SessionSeat,
@@ -861,18 +896,90 @@ impl Engine {
             return Some(source);
         }
 
-        // Client handshake response (no TLS negotiated: an SSLRequest
-        // is a protocol violation against our greeting).
+        // First client packet after the greeting. A client that sets `SSL`
+        // must send a strict 32-byte `SSLRequest` (Go: the pre-TLS capability
+        // mask is authoritative); we then upgrade to TLS and read the real
+        // handshake response inside the encrypted session. Otherwise the first
+        // packet already is the plaintext handshake response.
+        let frontend_tls_available = self.frontend_tls_available();
         let payload = match self.client_io.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
             Ok(packet) => packet.payload,
             Err(error) => return Some(self.client_read_end(&error).await),
         };
+        let ssl_request_capabilities =
+            if leading_capabilities(&payload).contains(CapabilityFlags::SSL) {
+                let Ok(ssl_request) = parse_ssl_request(&payload) else {
+                    // SSL bit set but not a strict 32-byte SSLRequest: fail closed
+                    // rather than falling back to a plaintext handshake response.
+                    self.quit_source = QuitSource::ProxyMalformed;
+                    let _ = self.events.send(SessionEvent::ClientIoError).await;
+                    return Some(WireErrorSource::ClientNetwork);
+                };
+                if !frontend_tls_available {
+                    // We only advertise SSL when a frontend config exists; a client
+                    // asking to upgrade against a greeting that withheld SSL is a
+                    // protocol violation.
+                    self.quit_source = QuitSource::ProxyMalformed;
+                    let _ = self.events.send(SessionEvent::ClientIoError).await;
+                    return Some(WireErrorSource::ClientNetwork);
+                }
+                Some(ssl_request.capabilities)
+            } else {
+                None
+            };
+
+        let payload = if ssl_request_capabilities.is_some() {
+            // FSM: Greeting --ClientSslRequest--> SslRequest (ActivateFrontendTls).
+            if self
+                .events
+                .send(SessionEvent::ClientSslRequest)
+                .await
+                .is_err()
+            {
+                return Some(WireErrorSource::Proxy);
+            }
+            if !matches!(
+                self.await_effect(SessionEffect::ActivateFrontendTls).await,
+                Awaited::Got
+            ) {
+                return None;
+            }
+            if let Err(source) = self.activate_frontend_tls().await {
+                return Some(source);
+            }
+            // FSM: SslRequest --TlsActivated--> Greeting (no effect). The real
+            // handshake response arrives inside TLS; its MySQL sequence
+            // continues (SSLRequest was seq 1, this is seq 2).
+            if self.events.send(SessionEvent::TlsActivated).await.is_err() {
+                return Some(WireErrorSource::Proxy);
+            }
+            match self.client_io.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
+                Ok(packet) => packet.payload,
+                Err(error) => return Some(self.client_read_end(&error).await),
+            }
+        } else {
+            payload
+        };
+
         let Ok(parsed) = parse_handshake_response(&payload) else {
             self.quit_source = QuitSource::ProxyMalformed;
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Some(WireErrorSource::ClientNetwork);
         };
-        let negotiation = match negotiate_frontend(parsed.capabilities, proxy_capabilities()) {
+        // When TLS was negotiated, the SSLRequest capability mask (sent before
+        // the encrypted response) is the trusted set; reconcile the in-TLS
+        // response against it so a mid-flight capability change cannot widen
+        // what the pre-TLS client asked for.
+        let client_capabilities = match ssl_request_capabilities {
+            Some(ssl_capabilities) => {
+                reconcile_tls_capabilities(ssl_capabilities, parsed.capabilities).trusted
+            }
+            None => parsed.capabilities,
+        };
+        let negotiation = match negotiate_frontend(
+            client_capabilities,
+            proxy_capabilities(frontend_tls_available),
+        ) {
             Ok(negotiation) => negotiation,
             Err(missing) => {
                 self.quit_source = QuitSource::ClientHandshake;
@@ -900,7 +1007,7 @@ impl Engine {
             collation: u32::from(parsed.collation),
             zstd_level: u32::from(parsed.zstd_level.unwrap_or(0)),
             connection_attributes: std::collections::BTreeMap::default(),
-            tls: false,
+            tls: self.frontend_tls_active,
         };
         self.cmd_state = Some(CommandSessionState::new(self.negotiated, parsed.database));
         let routing = negotiation.routing_handshake(&parsed, self.endpoints);
@@ -1094,7 +1201,14 @@ impl Engine {
             return Some(WireErrorSource::BackendNetwork);
         };
         let backend_caps = backend_greeting.capabilities;
-        if verify_backend(backend_caps, self.negotiated, proxy_capabilities(), false).is_err() {
+        if verify_backend(
+            backend_caps,
+            self.negotiated,
+            proxy_capabilities(self.frontend_tls_available()),
+            false,
+        )
+        .is_err()
+        {
             self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
@@ -1904,10 +2018,74 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether this session's snapshot carries a frontend TLS server config.
+    /// Governs both the greeting `SSL` advertisement and the strict
+    /// SSLRequest-vs-plaintext classification: a client may only upgrade if we
+    /// actually advertised (and can serve) TLS.
+    fn frontend_tls_available(&self) -> bool {
+        self.seat.snapshot().frontend_server_config.is_some()
+    }
+
+    /// Remaining handshake budget from the absolute deadline (`accepted_at +
+    /// handshake_deadline`), for TLS accept/connect. Saturates at zero so a
+    /// blown budget fails closed immediately instead of granting a fresh wait.
+    fn handshake_budget_remaining(&self) -> Duration {
+        (self.accepted_at + self.handshake_deadline)
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+
+    /// Upgrades the client transport to server-side TLS in place, preserving
+    /// the `MySQL` sequence trackers and wire counters across the swap (the raw
+    /// TLS handshake bytes are not `MySQL` packets and never enter the counters).
+    ///
+    /// The `SSLRequest`'s prefetched-but-unread bytes, if any, replay ahead of
+    /// the TLS stream so no `ClientHello` byte is lost. Any failure — missing
+    /// config, timeout, or handshake error — fails closed: the owner drops the
+    /// socket (moved into `accept_frontend`, dropped on error), there is no
+    /// plaintext fallback and no detached task.
+    async fn activate_frontend_tls(&mut self) -> Result<(), WireErrorSource> {
+        let Some(config) = self.seat.snapshot().frontend_server_config.clone() else {
+            // Reached only if the snapshot lost its config between advertisement
+            // and here; a client SSLRequest we cannot serve fails closed.
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::Proxy);
+        };
+        let timeout = self.handshake_budget_remaining();
+        // Move the endpoint out to perform the value-consuming upgrade; the
+        // sequence/counter state travels in the token, the raw socket in the
+        // transport. `Detached` holds the field meanwhile and is never polled.
+        let endpoint = std::mem::replace(
+            &mut self.client_io,
+            PacketIo::new(ClientTransport::Detached),
+        );
+        let (transport, upgrade_state, prefix) = endpoint.into_upgrade_parts();
+        let ClientTransport::Plain(stream) = transport else {
+            // A second activation on an already-upgraded transport is a proxy
+            // invariant violation.
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::Proxy);
+        };
+        // `stream` was moved into `accept_frontend`; on error it is dropped —
+        // the owner drops the socket. No plaintext fallback, no detached task.
+        let Ok(frontend) =
+            accept_frontend(stream, prefix, config, timeout, DEFAULT_CONN_BUFFER_SIZE).await
+        else {
+            self.quit_source = QuitSource::ClientHandshake;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::ClientNetwork);
+        };
+        self.client_io =
+            PacketIo::from_upgrade_parts(ClientTransport::Tls(frontend), upgrade_state);
+        self.frontend_tls_active = true;
+        Ok(())
+    }
+
     async fn send_greeting(&mut self) -> Result<(), WireErrorSource> {
         fill_salt(&mut self.salt);
         let params = build_greeting(
-            proxy_capabilities(),
+            proxy_capabilities(self.frontend_tls_available()),
             &self.salt,
             SERVER_VERSION,
             self.connection_id,

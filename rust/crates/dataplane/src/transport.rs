@@ -38,12 +38,25 @@ use tokio::net::TcpStream;
 /// server TLS stream implementing `AsyncRead`/`AsyncWrite`.
 #[allow(clippy::large_enum_variant)]
 pub enum ClientTransport {
-    /// Plaintext client socket (the only variant wired in step 2a).
+    /// Plaintext client socket.
     Plain(TcpStream),
     /// Server-side TLS over the client socket.
-    // constructed in A1 step 2b (TLS upgrade)
-    #[allow(dead_code)]
     Tls(FrontendTls<TcpStream>),
+    /// Transient placeholder installed only while a TLS upgrade moves the
+    /// concrete socket out of the endpoint (across the `accept` await). The
+    /// engine never reads or writes the endpoint in this window — it either
+    /// reattaches the upgraded transport or fails the session closed — so the
+    /// I/O arms below fail closed rather than pretending to carry a socket.
+    Detached,
+}
+
+/// A fail-closed error for the transient `Detached` transport, which is never
+/// polled during the upgrade window.
+fn detached_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "transport detached for TLS upgrade",
+    )
 }
 
 impl AsyncRead for ClientTransport {
@@ -55,6 +68,7 @@ impl AsyncRead for ClientTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_read(context, buf),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_read(context, buf),
+            Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
 }
@@ -68,6 +82,7 @@ impl AsyncWrite for ClientTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_write(context, data),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_write(context, data),
+            Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
 
@@ -75,6 +90,7 @@ impl AsyncWrite for ClientTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_flush(context),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_flush(context),
+            Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
 
@@ -82,6 +98,7 @@ impl AsyncWrite for ClientTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_shutdown(context),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_shutdown(context),
+            Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
 }
