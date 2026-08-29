@@ -1308,7 +1308,13 @@ impl<T> PacketIo<T> {
         self.read.sequence.reset(expected);
     }
 
-    /// Returns consumed physical wire bytes, including headers.
+    /// Returns consumed framing-layer `MySQL` bytes (physical packet headers +
+    /// payloads) as seen ABOVE any TLS/compression layer.
+    ///
+    /// This is NOT the raw wire-traffic metric: under TLS or compression the
+    /// real socket I/O differs from these framed bytes. Traffic totals
+    /// (MTR-001) come from the innermost [`crate::counted::CountedIo`]; keep
+    /// this counter for framing-layer accounting only.
     #[must_use]
     pub const fn in_bytes(&self) -> u64 {
         self.read.in_bytes
@@ -1331,7 +1337,11 @@ impl<T> PacketIo<T> {
         self.write.sequence.reset(sequence);
     }
 
-    /// Returns physical wire bytes accepted by the destination transport.
+    /// Returns emitted framing-layer `MySQL` bytes (physical packet headers +
+    /// payloads) as written ABOVE any TLS/compression layer.
+    ///
+    /// This is NOT the raw wire-traffic metric (see [`Self::in_bytes`]): traffic
+    /// totals (MTR-001) come from the innermost [`crate::counted::CountedIo`].
     #[must_use]
     pub const fn out_bytes(&self) -> u64 {
         self.write.out_bytes

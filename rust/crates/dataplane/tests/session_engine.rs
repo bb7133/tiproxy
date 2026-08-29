@@ -43,12 +43,12 @@ use dataplane::{
 use mysql_wire::{
     CapabilityFlags, HandshakeResponseParams, ResponseHeader, StatusFlags, encode_eof_packet,
     encode_error_packet, encode_handshake_response, encode_initial_handshake,
-    encode_length_encoded_bytes, encode_length_encoded_int, encode_ok_packet,
+    encode_length_encoded_bytes, encode_length_encoded_int, encode_ok_packet, encode_ssl_request,
     parse_handshake_response, parse_initial_handshake,
 };
 use proxy_io::{PacketReader, PacketWriter};
 use session_core::handshake::build_greeting;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
@@ -381,10 +381,42 @@ async fn respond_to_snapshot_query(
     write_session_snapshot(reader, writer, session_states, session_token).await
 }
 
+/// Reads and discards an inbound PROXY v2 header from a raw backend stream,
+/// returning false on a short/malformed header. Framing mirrors the proxy's own
+/// probe (12-byte magic, 4-byte fixed header, sized body).
+async fn strip_inbound_proxy_v2(read: &mut tokio::net::tcp::OwnedReadHalf) -> bool {
+    use proxy_io::proxy_protocol::{FIXED_HEADER_LEN, MAGIC_V2, ProxyV2Decode, decode_after_magic};
+    let mut magic = [0_u8; MAGIC_V2.len()];
+    if read.read_exact(&mut magic).await.is_err() || magic != MAGIC_V2 {
+        return false;
+    }
+    let mut wire = vec![0_u8; FIXED_HEADER_LEN];
+    if read.read_exact(&mut wire).await.is_err() {
+        return false;
+    }
+    let body_len = match decode_after_magic(&wire) {
+        ProxyV2Decode::Incomplete { needed_total } => needed_total.saturating_sub(FIXED_HEADER_LEN),
+        ProxyV2Decode::Done { .. } => 0,
+    };
+    if body_len > 0 {
+        wire.resize(FIXED_HEADER_LEN + body_len, 0);
+        if read
+            .read_exact(&mut wire[FIXED_HEADER_LEN..])
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 async fn run_fake_backend(
     listener: TcpListener,
     transcript: Arc<Mutex<Vec<Vec<u8>>>>,
     snapshot_reply: SnapshotReply,
+    proxy_v2: bool,
+    send_idle_byte: bool,
 ) {
     let broad = CapabilityFlags::PROTOCOL_41
         | CapabilityFlags::LONG_PASSWORD
@@ -400,11 +432,27 @@ async fn run_fake_backend(
         | CapabilityFlags::DEPRECATE_EOF
         | CapabilityFlags::LOCAL_FILES;
     while let Ok((stream, _)) = listener.accept().await {
-        let (read, write) = stream.into_split();
+        let (mut read, write) = stream.into_split();
+        // When the proxy prepends an outbound PROXY v2 header, strip it off the
+        // raw stream before MySQL framing begins — mirroring a real backend that
+        // terminates the PROXY preamble. The header bytes still crossed the wire,
+        // so they remain in the proxy's raw out-byte count (verified separately).
+        if proxy_v2 && !strip_inbound_proxy_v2(&mut read).await {
+            continue;
+        }
         let mut reader = PacketReader::new(read);
         let mut writer = PacketWriter::new(write);
         if !fake_backend_auth(&mut reader, &mut writer, broad).await {
             continue;
+        }
+        // WIRE-MTR (idle-liveness probe): optionally push ONE unsolicited raw
+        // byte on the backend->proxy direction right after auth, before the
+        // command loop's peek. It is not a MySQL packet; the proxy consumes it
+        // via the idle-liveness probe's raw `try_read` beneath the framing
+        // layer, and (Go parity) must count it on the raw backend-in counter.
+        if send_idle_byte {
+            let _ = writer.get_mut().write_all(&[0xFF]).await;
+            let _ = writer.get_mut().flush().await;
         }
         // Command loop: OK for everything until quit/EOF.
         let mut in_transaction = false;
@@ -492,13 +540,32 @@ async fn spawn_stack() -> Stack {
 }
 
 async fn spawn_stack_with_snapshot(snapshot_reply: SnapshotReply) -> Stack {
-    spawn_stack_full(snapshot_reply, false, Duration::from_secs(5)).await
+    spawn_stack_full(
+        snapshot_reply,
+        false,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+    )
+    .await
+}
+
+/// A real frontend-TLS certificate written to disk, plus the CA the test client
+/// trusts. `SnapshotStore` builds the served `ServerConfig` from the PEM files at
+/// apply time, so the fixture only needs to survive that call.
+struct FrontendTlsFixture {
+    policy: control_proto::v1::TlsPolicy,
+    cert_dir: std::path::PathBuf,
 }
 
 async fn spawn_stack_full(
     snapshot_reply: SnapshotReply,
     proxy_v2: bool,
     handshake_deadline: Duration,
+    backend_check_interval: Duration,
+    send_idle_byte: bool,
+    frontend_tls: Option<FrontendTlsFixture>,
 ) -> Stack {
     // Fake backend.
     let Ok(backend_listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
@@ -512,6 +579,8 @@ async fn spawn_stack_full(
         backend_listener,
         Arc::clone(&backend_transcript),
         snapshot_reply,
+        proxy_v2,
+        send_idle_byte,
     ));
 
     // Dispatch loop with an observable sender and a driven state watch.
@@ -563,7 +632,7 @@ async fn spawn_stack_full(
             SessionLoopConfig {
                 handshake_deadline,
                 drain_deadline: Duration::from_millis(400),
-                backend_check_interval: Duration::from_secs(60),
+                backend_check_interval,
                 cleanup_deadline: Duration::from_secs(2),
             },
         )
@@ -580,7 +649,7 @@ async fn spawn_stack_full(
         unreachable!("sql addr")
     };
     drop(sql_listener);
-    let snapshot = engine_snapshot(sql_addr.port(), proxy_v2);
+    let snapshot = engine_snapshot(sql_addr.port(), proxy_v2, frontend_tls.as_ref());
     let Ok(server) = DataplaneServer::bind(snapshot, Arc::new(SystemMemoryProbe::new())).await
     else {
         unreachable!("dataplane bind")
@@ -609,7 +678,11 @@ async fn spawn_stack_full(
     }
 }
 
-fn engine_snapshot(port: u16, proxy_v2: bool) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
+fn engine_snapshot(
+    port: u16,
+    proxy_v2: bool,
+    frontend_tls: Option<&FrontendTlsFixture>,
+) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
     use control_proto::v1::{
         ConfigSnapshot, KeepalivePolicy, Listener, ProxyProtocolMode, StateSnapshot, TlsPolicy,
     };
@@ -618,6 +691,13 @@ fn engine_snapshot(port: u16, proxy_v2: bool) -> Arc<control_proto::snapshot::Va
     } else {
         ProxyProtocolMode::Disabled
     };
+    // Without a fixture the frontend policy is empty (no cert -> SSL is not
+    // advertised); a fixture supplies a real cert/key on disk that the store
+    // compiles into a served `ServerConfig`.
+    let (frontend_policy, store_dirs) = frontend_tls.map_or_else(
+        || (TlsPolicy::default(), Vec::new()),
+        |fixture| (fixture.policy.clone(), vec![fixture.cert_dir.clone()]),
+    );
     let keepalive = KeepalivePolicy {
         enabled: true,
         idle_millis: 60_000,
@@ -639,13 +719,13 @@ fn engine_snapshot(port: u16, proxy_v2: bool) -> Arc<control_proto::snapshot::Va
                 name: "sql-0".to_owned(),
             }],
             server_version: "TiProxy-test".to_owned(),
-            frontend_tls: Some(TlsPolicy::default()),
+            frontend_tls: Some(frontend_policy),
             backend_tls: Some(TlsPolicy::default()),
             ..ConfigSnapshot::default()
         }),
         ..StateSnapshot::default()
     };
-    let Ok(store) = control_proto::snapshot::SnapshotStore::new(Vec::new()) else {
+    let Ok(store) = control_proto::snapshot::SnapshotStore::new(store_dirs) else {
         unreachable!("store")
     };
     let Ok(outcome) = store.apply(
@@ -943,9 +1023,69 @@ async fn select_one_roundtrip_end_to_end() {
     let Some(Body::ConnectionEvent(event)) = closed.body else {
         unreachable!()
     };
+    // All four raw-socket byte directions register real wire traffic (WIRE-MTR:
+    // these come from the innermost `CountedIo`, not the framing layer).
     assert!(event.client_in_bytes > 0, "totals captured: {event:?}");
-    assert!(event.backend_in_bytes > 0);
+    assert!(event.client_out_bytes > 0, "totals captured: {event:?}");
+    assert!(event.backend_in_bytes > 0, "totals captured: {event:?}");
+    assert!(event.backend_out_bytes > 0, "totals captured: {event:?}");
     stack.dispatch_task.abort();
+}
+
+/// Runs one full `SELECT 1` session and returns the raw backend out-byte total
+/// from the CLOSED lifecycle event, with or without the outbound PROXY v2 header.
+async fn session_backend_out_bytes(proxy_v2: bool) -> u64 {
+    let stack = spawn_stack_full(
+        SnapshotReply::Valid,
+        proxy_v2,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+    )
+    .await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("handshake+auth completes end to end")
+    };
+    assert!(client.query_ok("SELECT 1").await, "query round-trips");
+    client.quit().await;
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(closed) = closed else {
+        unreachable!("session close emits the CLOSED event")
+    };
+    let Some(Body::ConnectionEvent(event)) = closed.body else {
+        unreachable!()
+    };
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
+    event.backend_out_bytes
+}
+
+/// WIRE-MTR: the outbound PROXY v2 header the proxy writes to the backend is
+/// counted exactly once at the raw layer. The two sessions are byte-identical on
+/// the wire except for that header (a salt only changes scramble *content*, not
+/// length), so the raw backend out-byte delta is precisely the 28-byte IPv4
+/// PROXY v2 header — neither zero (missed) nor doubled.
+#[tokio::test]
+async fn outbound_proxy_v2_header_counts_once_in_raw_backend_out() {
+    // 12-byte magic + 4-byte fixed header + 12-byte IPv4 address/port block.
+    const PROXY_V2_IPV4_HEADER_LEN: u64 = 28;
+    let plain = session_backend_out_bytes(false).await;
+    let proxied = session_backend_out_bytes(true).await;
+    assert_eq!(
+        proxied.saturating_sub(plain),
+        PROXY_V2_IPV4_HEADER_LEN,
+        "raw backend out must grow by exactly the PROXY header (plain={plain}, proxied={proxied})"
+    );
 }
 
 /// The real session path emits payload-free metrics with the legacy command
@@ -2079,10 +2219,16 @@ async fn forced_shutdown_still_emits_session_closed() {
 /// the wrapper regresses.
 #[tokio::test]
 async fn stalled_partial_proxy_header_fails_closed_at_the_handshake_deadline() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let handshake_deadline = Duration::from_millis(300);
-    let stack = spawn_stack_full(SnapshotReply::Valid, true, handshake_deadline).await;
+    let stack = spawn_stack_full(
+        SnapshotReply::Valid,
+        true,
+        handshake_deadline,
+        Duration::from_secs(60),
+        false,
+        None,
+    )
+    .await;
 
     let Ok(mut client) = TcpStream::connect(("127.0.0.1", stack.sql_port)).await else {
         unreachable!("connect to the proxy listener")
@@ -2125,6 +2271,362 @@ async fn stalled_partial_proxy_header_fails_closed_at_the_handshake_deadline() {
     );
     drop(transcript);
 
+    stack.shutdown_tx.send(true).ok();
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
+}
+
+// ---------------------------------------------------------------------
+// WIRE-MTR Regression 1: idle-liveness probe byte counts on raw backend-in
+// ---------------------------------------------------------------------
+
+/// Runs one idle session (client authenticates but never sends a query) with a
+/// short `backend_check_interval` so the liveness probe fires, and returns the
+/// raw `backend_in_bytes` from the CLOSED lifecycle event.
+///
+/// With `send_idle_byte = false` the probe finds `WouldBlock` (alive) and the
+/// session is closed from the outside; with `true` the backend pushes one
+/// unsolicited raw byte after auth, which the probe consumes (reporting the
+/// backend unhealthy) and — the property under test — counts on the raw
+/// backend-in counter before the session tears down.
+async fn idle_session_backend_in_bytes(send_idle_byte: bool) -> u64 {
+    let stack = spawn_stack_full(
+        SnapshotReply::Valid,
+        false,
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+        send_idle_byte,
+        None,
+    )
+    .await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("handshake+auth completes end to end")
+    };
+    // The client stays idle in a probe-safe (Ready) state; the connect/auth
+    // exchange is byte-identical between the two runs, so the non-probe
+    // backend-in total is deterministic.
+    if !send_idle_byte {
+        // Baseline: nothing closes the healthy idle session on its own, so
+        // close it deterministically once it has settled.
+        stack.shutdown_tx.send(true).ok();
+    }
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(closed) = closed else {
+        unreachable!("session close emits the CLOSED event")
+    };
+    let Some(Body::ConnectionEvent(event)) = closed.body else {
+        unreachable!()
+    };
+    drop(client);
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
+    event.backend_in_bytes
+}
+
+/// WIRE-MTR: the idle-liveness probe reads the raw backend socket beneath
+/// `CountedIo` via `try_read`; when it consumes a real byte it records it on the
+/// raw backend-in counter (Go parity: Go's liveness `Peek(1)` reads through the
+/// counting `basicReadWriter`). A single consumed probe byte must therefore show
+/// up as exactly one extra byte in the CLOSED event's `backend_in_bytes` — never
+/// zero (missed) nor doubled.
+#[tokio::test]
+async fn idle_probe_consumed_byte_is_counted_in_raw_backend_in() {
+    let baseline = idle_session_backend_in_bytes(false).await;
+    let with_probe_byte = idle_session_backend_in_bytes(true).await;
+    assert_eq!(
+        with_probe_byte,
+        baseline + 1,
+        "the consumed probe byte is counted exactly once on the raw backend-in \
+         counter (baseline={baseline}, probe={with_probe_byte})"
+    );
+}
+
+// ---------------------------------------------------------------------
+// WIRE-MTR Regression 2: production frontend-TLS totals come from the raw seam
+// ---------------------------------------------------------------------
+
+/// A CA that signs the frontend leaf and that the test client trusts.
+struct TestCa {
+    ca_cert_pem: String,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+/// A leaf cert/key PEM pair for the served frontend name.
+struct LeafPair {
+    cert_pem: String,
+    key_pem: String,
+}
+
+fn make_ca() -> Option<TestCa> {
+    let Ok(ca_key) = rcgen::KeyPair::generate() else {
+        return None;
+    };
+    let Ok(mut params) = rcgen::CertificateParams::new(Vec::new()) else {
+        return None;
+    };
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let Ok(ca_cert) = params.self_signed(&ca_key) else {
+        return None;
+    };
+    let ca_cert_pem = ca_cert.pem();
+    let issuer = rcgen::Issuer::new(params, ca_key);
+    Some(TestCa {
+        ca_cert_pem,
+        issuer,
+    })
+}
+
+fn make_leaf(ca: &TestCa, name: &str) -> Option<LeafPair> {
+    let Ok(key) = rcgen::KeyPair::generate() else {
+        return None;
+    };
+    let Ok(params) = rcgen::CertificateParams::new(vec![name.to_owned()]) else {
+        return None;
+    };
+    let Ok(cert) = params.signed_by(&key, &ca.issuer) else {
+        return None;
+    };
+    Some(LeafPair {
+        cert_pem: cert.pem(),
+        key_pem: key.serialize_pem(),
+    })
+}
+
+/// Writes a real frontend cert/key to a unique temp directory and returns the
+/// `spawn_stack_full` fixture plus the CA PEM the test client must trust. The
+/// snapshot store compiles the served `ServerConfig` from these files at apply
+/// time, so the files only need to exist for that call.
+fn write_frontend_tls_fixture() -> Option<(FrontendTlsFixture, String)> {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+    let ca = make_ca()?;
+    let leaf = make_leaf(&ca, "frontend.local")?;
+    let identifier = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "tiproxy-dpl-frontend-tls-{}-{identifier}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).ok()?;
+    let certificate_path = dir.join("frontend.crt");
+    let private_key_path = dir.join("frontend.key");
+    std::fs::write(&certificate_path, &leaf.cert_pem).ok()?;
+    std::fs::write(&private_key_path, &leaf.key_pem).ok()?;
+    let policy = control_proto::v1::TlsPolicy {
+        certificate_path: certificate_path.to_str()?.to_owned(),
+        private_key_path: private_key_path.to_str()?.to_owned(),
+        minimum_version: "1.2".to_owned(),
+        ..Default::default()
+    };
+    Some((
+        FrontendTlsFixture {
+            policy,
+            cert_dir: dir,
+        },
+        ca.ca_cert_pem,
+    ))
+}
+
+/// A rustls client config whose only trust root is the test CA.
+fn client_config_trusting(ca_pem: &str) -> Option<Arc<rustls::ClientConfig>> {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    let Ok(cert) = rustls::pki_types::CertificateDer::from_pem_slice(ca_pem.as_bytes()) else {
+        return None;
+    };
+    if roots.add(cert).is_err() {
+        return None;
+    }
+    Some(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+/// Drives a raw `rustls::ClientConnection` by hand against the proxy listener:
+/// reads the greeting, coalesces `[SSLRequest packet || ClientHello]` into ONE
+/// `write_all` (deterministically forcing the proxy to prefetch `ClientHello`
+/// bytes past the `SSLRequest` packet), then pumps the handshake to completion.
+/// Returns whether the TLS handshake finished.
+async fn drive_frontend_tls_handshake(port: u16, ca_pem: &str) -> bool {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)).await else {
+        return false;
+    };
+    // Read the proxy greeting (a MySQL packet: 3-byte LE length + seq +
+    // payload). It is written BY the proxy, so it does not count toward the
+    // client-in total under test.
+    let mut header = [0_u8; 4];
+    if stream.read_exact(&mut header).await.is_err() {
+        return false;
+    }
+    let greeting_len =
+        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+    let mut greeting = vec![0_u8; greeting_len];
+    if stream.read_exact(&mut greeting).await.is_err() {
+        return false;
+    }
+
+    // Build the `SSLRequest` packet at sequence 1 (the greeting was seq 0).
+    let capabilities = CapabilityFlags::PROTOCOL_41
+        | CapabilityFlags::SECURE_CONNECTION
+        | CapabilityFlags::PLUGIN_AUTH
+        | CapabilityFlags::SSL;
+    let ssl_request = encode_ssl_request(capabilities, 16 * 1024 * 1024, 45);
+    let mut ssl_packet = vec![u8::try_from(ssl_request.len()).unwrap_or(0), 0, 0, 1];
+    ssl_packet.extend_from_slice(&ssl_request);
+
+    // Drive rustls by hand: extract the `ClientHello` without any socket I/O.
+    let Some(config) = client_config_trusting(ca_pem) else {
+        return false;
+    };
+    let Ok(server_name) = rustls::pki_types::ServerName::try_from("frontend.local".to_owned())
+    else {
+        return false;
+    };
+    let Ok(mut conn) = rustls::ClientConnection::new(config, server_name) else {
+        return false;
+    };
+    let mut client_hello = Vec::new();
+    while conn.wants_write() {
+        if conn.write_tls(&mut client_hello).is_err() {
+            return false;
+        }
+    }
+
+    // Send the `SSLRequest` packet and the `ClientHello` together as the client's
+    // opening flight. This does NOT force the proxy to prefetch — the exact-read
+    // `SSLRequest` path leaves an empty prefix — it is just one fewer write.
+    let mut coalesced = ssl_packet;
+    coalesced.extend_from_slice(&client_hello);
+    if stream.write_all(&coalesced).await.is_err() {
+        return false;
+    }
+    if stream.flush().await.is_err() {
+        return false;
+    }
+
+    // Pump the handshake to completion: read the proxy's TLS flight, process it,
+    // and write the client's response records back, until rustls reports done.
+    let mut scratch = [0_u8; 8192];
+    for _ in 0..64 {
+        if !conn.is_handshaking() {
+            return true;
+        }
+        let Ok(read) = stream.read(&mut scratch).await else {
+            return false;
+        };
+        if read == 0 {
+            break;
+        }
+        let mut cursor = std::io::Cursor::new(&scratch[..read]);
+        if conn.read_tls(&mut cursor).is_err() {
+            return false;
+        }
+        if conn.process_new_packets().is_err() {
+            return false;
+        }
+        let mut out = Vec::new();
+        while conn.wants_write() {
+            if conn.write_tls(&mut out).is_err() {
+                return false;
+            }
+        }
+        if !out.is_empty() {
+            if stream.write_all(&out).await.is_err() {
+                return false;
+            }
+            if stream.flush().await.is_err() {
+                return false;
+            }
+        }
+    }
+    !conn.is_handshaking()
+}
+
+/// WIRE-MTR (production TLS path): under a REAL engine frontend-TLS session,
+/// `Engine::totals()` / CLOSED client bytes come from the innermost raw
+/// `CountedIo` (reflecting TLS record + handshake bytes), NOT the `PacketIo`
+/// framing layer.
+///
+/// The client sends a plaintext `SSLRequest`, then completes a real TLS
+/// handshake against the proxy's served certificate — driving `rustls` by hand
+/// so the test needs no `TlsConnector` dependency — and drops; the proxy's next
+/// in-TLS read hits EOF and the session closes, emitting CLOSED with the totals.
+///
+/// This row is discriminating for the totals SOURCE: rewiring client totals back
+/// to `PacketIo::in_bytes`, or resetting the raw counter handle across the
+/// upgrade, collapses `client_in_bytes` to the tiny framing count (only the
+/// ~36-byte `SSLRequest` is framed before the upgrade), so the `> 150` bound
+/// fails.
+///
+/// It does NOT (and cannot) exercise prefix replay: the production `SSLRequest`
+/// path reads exactly (4-byte header + 32-byte payload), so `into_upgrade_parts`
+/// hands the upgrade an EMPTY prefix regardless of how the client coalesces its
+/// bytes on the wire. Prefix-replay exactly-once accounting is proven separately
+/// and deterministically by `proxy-io`'s
+/// `tls_matrix::raw_counter_is_not_double_counted_by_prefix_replay`.
+#[tokio::test]
+async fn frontend_tls_session_totals_come_from_the_raw_seam_not_framing() {
+    let Some((fixture, ca_pem)) = write_frontend_tls_fixture() else {
+        unreachable!("frontend TLS fixture is written to disk")
+    };
+    let stack = spawn_stack_full(
+        SnapshotReply::Valid,
+        false,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        Some(fixture),
+    )
+    .await;
+
+    // The session fails during the TLS handshake phase (before routing), so no
+    // route answer or backend contact is needed; the CLOSED event still carries
+    // the raw totals captured at engine exit.
+    let handshake_ok = timeout(
+        Duration::from_secs(10),
+        drive_frontend_tls_handshake(stack.sql_port, &ca_pem),
+    )
+    .await;
+    // A completed handshake proves the proxy served real TLS over the counted
+    // socket, so the raw counter observed the full TLS flight.
+    assert!(
+        matches!(handshake_ok, Ok(true)),
+        "the frontend TLS handshake completes against the proxy's served cert: \
+         {handshake_ok:?}"
+    );
+
+    // Drop the client: the proxy's subsequent in-TLS handshake-response read
+    // observes EOF and tears the session down, emitting CLOSED with the raw
+    // totals.
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(closed) = closed else {
+        unreachable!("the frontend-TLS session reports CLOSED")
+    };
+    let Some(Body::ConnectionEvent(event)) = closed.body else {
+        unreachable!()
+    };
+    // Raw client-in carries the full TLS ClientHello + handshake records
+    // (hundreds of bytes). A framing-layer count (`PacketIo::in_bytes`) would
+    // have seen only the ~36-byte SSLRequest packet, so this wide lower bound is
+    // exactly what fails if client totals are misrouted to the framing layer.
+    assert!(
+        event.client_in_bytes > 150,
+        "raw client-in must reflect the TLS ClientHello + handshake records, not \
+         the ~36-byte SSLRequest a framing count would see: {event:?}"
+    );
     stack.shutdown_tx.send(true).ok();
     stack.dispatch_task.abort();
     stack.server_task.abort();

@@ -18,16 +18,24 @@
 //! [`proxy_io::PacketIo`]. To let the engine upgrade a plaintext socket to
 //! TLS without changing every wire call site, the concrete transport is an
 //! enum that implements [`AsyncRead`]/[`AsyncWrite`] by delegating to whichever
-//! variant is active. A session begins on the `Plain` variant (byte-identical
-//! to a bare `TcpStream`) and, when a client `SSLRequest` or a backend TLS plan
-//! activates TLS, the engine swaps in the `Tls` variant in place via the
-//! state-preserving [`proxy_io::PacketIo`] upgrade seam. `Detached` is a
-//! transient placeholder held only across the upgrade `await` and is never
-//! polled.
+//! variant is active. A session begins on the `Plain` variant and, when a
+//! client `SSLRequest` or a backend TLS plan activates TLS, the engine swaps in
+//! the `Tls` variant in place via the state-preserving [`proxy_io::PacketIo`]
+//! upgrade seam. `Detached` is a transient placeholder held only across the
+//! upgrade `await` and is never polled.
+//!
+//! The innermost layer of every non-detached variant is a
+//! [`proxy_io::counted::CountedIo`] wrapping the raw `TcpStream`, installed at
+//! accept/dial before any PROXY/TLS/compression layer. It counts real wire
+//! bytes exactly once at the bottom of the stack, mirroring Go `TiProxy`'s
+//! innermost `basicReadWriter` accounting (WIRE-MTR); the session reads the
+//! traffic totals through the shared [`proxy_io::counted::ByteCounters`] handle
+//! rather than from the framing layer above.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use proxy_io::counted::CountedIo;
 use proxy_io::tls::{BackendTls, FrontendTls};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -40,10 +48,10 @@ use tokio::net::TcpStream;
 /// server TLS stream implementing `AsyncRead`/`AsyncWrite`.
 #[allow(clippy::large_enum_variant)]
 pub enum ClientTransport {
-    /// Plaintext client socket.
-    Plain(TcpStream),
-    /// Server-side TLS over the client socket.
-    Tls(FrontendTls<TcpStream>),
+    /// Plaintext client socket, byte-counted at the raw layer.
+    Plain(CountedIo<TcpStream>),
+    /// Server-side TLS over the byte-counted client socket.
+    Tls(FrontendTls<CountedIo<TcpStream>>),
     /// Transient placeholder installed only while a TLS upgrade moves the
     /// concrete socket out of the endpoint (across the `accept` await). The
     /// engine never reads or writes the endpoint in this window — it either
@@ -113,10 +121,10 @@ impl AsyncWrite for ClientTransport {
 /// client TLS stream implementing `AsyncRead`/`AsyncWrite`.
 #[allow(clippy::large_enum_variant)]
 pub enum BackendTransport {
-    /// Plaintext backend socket.
-    Plain(TcpStream),
-    /// Client-side TLS over the backend socket.
-    Tls(BackendTls<TcpStream>),
+    /// Plaintext backend socket, byte-counted at the raw layer.
+    Plain(CountedIo<TcpStream>),
+    /// Client-side TLS over the byte-counted backend socket.
+    Tls(BackendTls<CountedIo<TcpStream>>),
     /// Transient placeholder installed only while a TLS upgrade moves the
     /// concrete socket out of the endpoint (across the `connect` await). The
     /// engine never reads or writes the endpoint in this window — it either
@@ -125,13 +133,15 @@ pub enum BackendTransport {
 }
 
 impl BackendTransport {
-    /// Returns the underlying backend `TcpStream`, reaching through the
-    /// TLS session when one is active, or `None` while the transport is
-    /// detached for an in-progress upgrade.
+    /// Returns the innermost byte-counting wrapper over the backend socket,
+    /// reaching through the TLS session when active, or `None` while the
+    /// transport is detached for an in-progress upgrade.
     ///
-    /// The idle-liveness probe issues a non-blocking `try_read` directly
-    /// on the socket, so it must bypass the TLS record layer.
-    pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
+    /// The idle-liveness probe issues a non-blocking read directly on the raw
+    /// socket (bypassing the TLS record layer), but does so through
+    /// [`CountedIo::probe_try_read`] so any byte it consumes is still counted on
+    /// the same seam as the framed I/O — no separate counter mutator is exposed.
+    pub fn as_counted_stream(&self) -> Option<&CountedIo<TcpStream>> {
         match self {
             Self::Plain(inner) => Some(inner),
             Self::Tls(inner) => Some(inner.stream.get_ref().0),
