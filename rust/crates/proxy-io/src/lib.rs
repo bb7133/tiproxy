@@ -27,6 +27,7 @@ mod packet;
 mod pump;
 
 pub mod compression;
+pub mod counted;
 pub mod proxy_protocol;
 pub mod socket;
 pub mod tls;

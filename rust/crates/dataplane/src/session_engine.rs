@@ -82,6 +82,7 @@ use mysql_wire::{
     parse_handshake_response, parse_ssl_request,
 };
 use proxy_io::PacketIo;
+use proxy_io::counted::{ByteCounters, CountedIo};
 use proxy_io::proxy_protocol::{
     EncodeAddresses, ProxyCommand, ProxyVersion, TransportProtocol, encode_proxy_v2,
 };
@@ -211,10 +212,13 @@ fn backend_server_name(address: &str) -> String {
 /// backend-network error — the preamble must reach the backend intact before
 /// the handshake, so a partial or absent header is never tolerated.
 async fn write_backend_proxy_v2_header(
-    conn: &mut tokio::net::TcpStream,
+    conn: &mut CountedIo<tokio::net::TcpStream>,
     client_addr: std::net::SocketAddr,
 ) -> Result<(), WireErrorSource> {
-    let Ok(backend_addr) = conn.peer_addr() else {
+    // The header is written THROUGH the raw byte counter (this `CountedIo`
+    // wraps the socket before the header is emitted), so its wire bytes count
+    // once at the innermost layer just like Go's dial path.
+    let Ok(backend_addr) = conn.get_ref().peer_addr() else {
         return Err(WireErrorSource::BackendNetwork);
     };
     let Ok(header) = encode_proxy_v2(
@@ -545,11 +549,16 @@ async fn run_bound_session_observed(
     let (report_tx, mut report_rx) = mpsc::channel(ENGINE_REPORT_CAPACITY);
     let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
 
+    // Wrap the raw client socket in the innermost byte counter before any
+    // framing/TLS/compression layer; the handle survives in-place upgrades.
+    let client_socket = CountedIo::new(stream);
+    let client_counters = client_socket.counters();
     let engine = Engine {
         connection_id: identity.connection_id,
         endpoints,
         inbound_proxy_client: None,
-        client_io: PacketIo::new(ClientTransport::Plain(stream)),
+        client_io: PacketIo::new(ClientTransport::Plain(client_socket)),
+        client_counters,
         backend: None,
         events: event_tx,
         cmds: cmd_rx,
@@ -814,6 +823,10 @@ struct RouteSeed {
 struct BackendIo {
     #[allow(clippy::struct_field_names)]
     backend_io: PacketIo<BackendTransport>,
+    /// Raw-socket byte counters for THIS backend socket. A redirected backend
+    /// gets a fresh `BackendIo` with its own counters, so a swap snapshots and
+    /// closes out the old leg's totals rather than smearing them across sockets.
+    counters: Arc<ByteCounters>,
     id: String,
     address: String,
     cluster: String,
@@ -840,6 +853,10 @@ struct Engine {
     /// PROXY header, never for routing/admission/identity.
     inbound_proxy_client: Option<std::net::SocketAddr>,
     client_io: PacketIo<ClientTransport>,
+    /// Raw-socket byte counters for the client socket. Created once at accept
+    /// and kept for the session: TLS/compression upgrades wrap the same
+    /// `CountedIo` in place, so this handle keeps counting the same socket.
+    client_counters: Arc<ByteCounters>,
     backend: Option<BackendIo>,
     events: mpsc::Sender<SessionEvent>,
     cmds: mpsc::Receiver<EngineCmd>,
@@ -1217,7 +1234,7 @@ impl Engine {
             self.connection_id,
         );
         let acquisition_started = tokio::time::Instant::now();
-        let mut acquired = match route_engine.acquire(Vec::new()).await {
+        let acquired = match route_engine.acquire(Vec::new()).await {
             Ok(acquired) => {
                 self.metrics.try_record(Observation::GetBackend {
                     duration: acquisition_started.elapsed(),
@@ -1273,6 +1290,13 @@ impl Engine {
                 );
             }
         }
+        // Wrap the raw backend socket in the innermost byte counter now — before
+        // the PROXY header, any backend TLS upgrade, and MySQL framing — so the
+        // PROXY preamble, TLS records, compressed frames, and plain packets all
+        // count once at the bottom of the stack. Keepalive above still ran on
+        // the bare `TcpStream`.
+        let mut backend_socket = CountedIo::new(acquired.conn);
+        let backend_counters = backend_socket.counters();
         // PROXY protocol v2 (WIRE-activation B): when the snapshot enables it,
         // announce the ORIGINAL client address to the backend as a raw preamble
         // that precedes every MySQL byte. Written straight to the socket before
@@ -1285,7 +1309,7 @@ impl Engine {
             let client_src = self
                 .inbound_proxy_client
                 .unwrap_or(self.endpoints.client_addr);
-            write_backend_proxy_v2_header(&mut acquired.conn, client_src).await
+            write_backend_proxy_v2_header(&mut backend_socket, client_src).await
         } else {
             Ok(())
         };
@@ -1295,7 +1319,8 @@ impl Engine {
             return Some(source);
         }
         let mut backend = BackendIo {
-            backend_io: PacketIo::new(BackendTransport::Plain(acquired.conn)),
+            backend_io: PacketIo::new(BackendTransport::Plain(backend_socket)),
+            counters: backend_counters,
             id: backend_id.clone(),
             address: backend_address,
             cluster: backend_cluster,
@@ -2175,9 +2200,12 @@ impl Engine {
             .saturating_duration_since(tokio::time::Instant::now())
     }
 
-    /// Upgrades the client transport to server-side TLS in place, preserving
-    /// the `MySQL` sequence trackers and wire counters across the swap (the raw
-    /// TLS handshake bytes are not `MySQL` packets and never enter the counters).
+    /// Upgrades the client transport to server-side TLS in place, preserving the
+    /// `MySQL` sequence trackers and framing counters across the swap. The raw
+    /// TLS handshake bytes are not `MySQL` packets, so they never enter the
+    /// `PacketIo` framing counters — but they DO cross the wire through the
+    /// innermost `CountedIo`, so they count toward the raw traffic totals, since
+    /// the upgrade wraps that same counted socket rather than replacing it.
     ///
     /// The `SSLRequest`'s prefetched-but-unread bytes, if any, replay ahead of
     /// the TLS stream so no `ClientHello` byte is lost. Any failure — missing
@@ -2255,8 +2283,10 @@ impl Engine {
     /// Upgrades the backend transport to client-side TLS in place. Sends the
     /// plaintext `SSLRequest` (seq 1, continuing after the backend greeting),
     /// runs the backend TLS handshake, then reattaches preserving the sequence
-    /// trackers and wire counters (the raw TLS handshake bytes are not `MySQL`
-    /// packets); the full handshake response then travels inside TLS at seq 2.
+    /// trackers and framing counters (the raw TLS handshake bytes are not
+    /// `MySQL` packets, so they skip the `PacketIo` framing counters, but they
+    /// still count on the innermost `CountedIo` raw traffic totals); the full
+    /// handshake response then travels inside TLS at seq 2.
     ///
     /// Any failure — config build, handshake, timeout, or the backend speaking
     /// before TLS — fails closed: the owner drops the socket (moved into
@@ -2382,15 +2412,19 @@ impl Engine {
         let Some(backend) = self.backend.as_mut() else {
             return false;
         };
-        let Some(tcp) = backend.backend_io.get_ref().as_tcp_stream() else {
+        let Some(counted) = backend.backend_io.get_ref().as_counted_stream() else {
             // Detached only during an in-progress TLS upgrade, before the
             // backend is exposed to probes; treat as alive rather than dead.
             return true;
         };
+        // The probe reads the raw socket beneath `CountedIo`, but through its
+        // count-aware `probe_try_read`, so any consumed byte is accounted on the
+        // same seam before the session tears the connection down — Go counts it
+        // too, since its liveness `Peek(1)` reads through `basicReadWriter`.
         let mut probe = [0_u8; 1];
-        match tcp.try_read(&mut probe) {
-            // Data outside a command or a clean EOF both mean the
-            // backend is not idle-healthy.
+        match counted.probe_try_read(&mut probe) {
+            // Data outside a command or a clean EOF both mean the backend is not
+            // idle-healthy (a consumed byte was already counted).
             Ok(_) => false,
             Err(error) => error.kind() == std::io::ErrorKind::WouldBlock,
         }
@@ -2404,27 +2438,33 @@ impl Engine {
     }
 
     fn totals(&self) -> TrafficTotals {
+        // Bytes come from the innermost raw counters (real wire I/O, Go's
+        // `basicReadWriter` accounting); the framing-layer `PacketIo` byte
+        // counters deliberately do not feed this metric.
         TrafficTotals {
-            client_in: self.client_io.in_bytes(),
-            client_out: self.client_io.out_bytes(),
+            client_in: self.client_counters.inbound(),
+            client_out: self.client_counters.outbound(),
             backend_in: self
                 .backend
                 .as_ref()
-                .map_or(0, |backend| backend.backend_io.in_bytes()),
+                .map_or(0, |backend| backend.counters.inbound()),
             backend_out: self
                 .backend
                 .as_ref()
-                .map_or(0, |backend| backend.backend_io.out_bytes()),
+                .map_or(0, |backend| backend.counters.outbound()),
         }
     }
 
     fn backend_traffic(&self) -> BackendTraffic {
+        // Bytes from the raw socket counters; packet counts stay from the
+        // `PacketIo` framing layer — mirroring Go's split of raw wire bytes vs
+        // MySQL physical-packet counts.
         self.backend
             .as_ref()
             .map_or(BackendTraffic::default(), |backend| BackendTraffic {
-                inbound_bytes: backend.backend_io.in_bytes(),
+                inbound_bytes: backend.counters.inbound(),
                 inbound_packets: backend.backend_io.in_packets(),
-                outbound_bytes: backend.backend_io.out_bytes(),
+                outbound_bytes: backend.counters.outbound(),
                 outbound_packets: backend.backend_io.out_packets(),
             })
     }

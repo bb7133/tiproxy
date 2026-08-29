@@ -26,6 +26,7 @@ use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{
     ConfigSnapshot, KeepalivePolicy, Listener, ProxyProtocolMode, StateSnapshot, TlsPolicy,
 };
+use proxy_io::counted::CountedIo;
 use proxy_io::tls::{
     TlsSetupError, accept_frontend, build_backend_config, connect_backend, tls_buffer_sizes,
 };
@@ -34,6 +35,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -396,6 +398,190 @@ async fn frontend_echo_exchange(
         .await?
         .map_err(|error| -> Box<dyn Error> { error.to_string().into() })?;
     assert_eq!(echoed, reply);
+    Ok(())
+}
+
+/// WIRE-MTR: the innermost [`CountedIo`] under a frontend TLS session counts the
+/// real TLS record + handshake bytes, not the tiny plaintext payload framed
+/// above it — mirroring Go's `basicReadWriter` accounting under the TLS layer.
+/// This is the property A1's TLS byte-accounting tests missed (they only checked
+/// `> 0`), and is why the traffic metric must read the raw seam, not the framing
+/// layer.
+#[tokio::test]
+async fn raw_counter_below_tls_counts_record_bytes_not_plaintext() -> Result<(), Box<dyn Error>> {
+    const REQUEST: &[u8] = b"tiny-plaintext-request";
+    const REPLY: &[u8] = b"tiny-plaintext-reply";
+
+    let ca = make_ca()?;
+    let leaf = make_leaf(&ca, "frontend.local", false)?;
+    let config = server_config(&leaf)?;
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+
+    // The server socket is wrapped in the innermost byte counter, exactly as the
+    // engine wraps a real accepted socket before the TLS upgrade.
+    let counted = CountedIo::new(server_end);
+    let counters = counted.counters();
+
+    let client_roots = client_config_with_roots(Some(&ca.ca_cert_pem))?;
+    let client = tokio::spawn(async move {
+        let connector = TlsConnector::from(client_roots);
+        let name = ServerName::try_from("frontend.local".to_owned())?;
+        let mut stream = connector.connect(name, client_end).await?;
+        stream.write_all(REQUEST).await?;
+        stream.flush().await?;
+        let mut received = vec![0_u8; REPLY.len()];
+        stream.read_exact(&mut received).await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(received)
+    });
+
+    let mut accepted =
+        match accept_frontend(counted, Vec::new(), config, HANDSHAKE_TIMEOUT, 0).await {
+            Ok(accepted) => accepted,
+            Err(accept_error) => {
+                let client_side = client.await?;
+                return Err(
+                    format!("accept failed: {accept_error}; client side: {client_side:?}").into(),
+                );
+            }
+        };
+    let mut received = vec![0_u8; REQUEST.len()];
+    accepted.stream.read_exact(&mut received).await?;
+    assert_eq!(received, REQUEST);
+    accepted.stream.write_all(REPLY).await?;
+    accepted.stream.flush().await?;
+    let echoed = client
+        .await?
+        .map_err(|error| -> Box<dyn Error> { error.to_string().into() })?;
+    assert_eq!(echoed, REPLY);
+
+    let inbound = counters.inbound();
+    let outbound = counters.outbound();
+    // Each direction carries a full TLS handshake plus record framing, so the
+    // raw counts must exceed the plaintext payloads by a wide margin. A framing
+    // layer above TLS would have seen only the ~20-byte payloads.
+    assert!(
+        inbound > REQUEST.len() as u64,
+        "raw inbound {inbound} must exceed the {}-byte plaintext request (TLS records + handshake)",
+        REQUEST.len()
+    );
+    assert!(
+        outbound > REPLY.len() as u64,
+        "raw outbound {outbound} must exceed the {}-byte plaintext reply",
+        REPLY.len()
+    );
+    // Each leg carries a full TLS handshake, so both counts are many times the
+    // total plaintext exchanged. A framing-layer counter above TLS would have
+    // seen only the ~42 plaintext bytes; this margin is what distinguishes the
+    // raw seam from that framing accounting.
+    let plaintext_total = (REQUEST.len() + REPLY.len()) as u64;
+    assert!(
+        inbound > plaintext_total * 4 && outbound > plaintext_total * 4,
+        "raw counts (in={inbound}, out={outbound}) must dwarf the {plaintext_total}-byte plaintext \
+         total, reflecting real TLS wire bytes"
+    );
+    Ok(())
+}
+
+/// Runs one frontend-TLS handshake + echo over a byte-counted server socket,
+/// optionally pre-reading `prefetch` bytes off the socket first and handing them
+/// to `accept_frontend` as a buffered prefix — exactly what the packet layer
+/// does when it has prefetched bytes past a plaintext `SSLRequest`. Returns the
+/// total raw inbound bytes the innermost `CountedIo` counted.
+async fn counted_frontend_inbound(prefetch: usize) -> Result<u64, Box<dyn Error>> {
+    let ca = make_ca()?;
+    let leaf = make_leaf(&ca, "frontend.local", false)?;
+    let config = server_config(&leaf)?;
+    // A real loopback `TcpStream` pair so the counter wraps the production type
+    // `CountedIo<TcpStream>`, not an in-memory duplex.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let (client_end, accepted_end) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let client_end = client_end?;
+    let (server_end, _) = accepted_end?;
+    let mut counted = CountedIo::new(server_end);
+    let counters = counted.counters();
+
+    let client_roots = client_config_with_roots(Some(&ca.ca_cert_pem))?;
+    let client = tokio::spawn(async move {
+        let connector = TlsConnector::from(client_roots);
+        let name = ServerName::try_from("frontend.local".to_owned())?;
+        let mut stream = connector.connect(name, client_end).await?;
+        stream.write_all(b"ping").await?;
+        stream.flush().await?;
+        let mut reply = [0_u8; 4];
+        stream.read_exact(&mut reply).await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(reply)
+    });
+
+    // Pre-read the prefix off the counted socket (counted exactly once here);
+    // `accept_frontend` replays it through `PrefixedIo`, which sits ABOVE the
+    // counter, so the replay must not touch the counter again.
+    let mut buffered = vec![0_u8; prefetch];
+    if prefetch > 0 {
+        counted.read_exact(&mut buffered).await?;
+    }
+    let mut accepted = match accept_frontend(counted, buffered, config, HANDSHAKE_TIMEOUT, 0).await
+    {
+        Ok(accepted) => accepted,
+        Err(accept_error) => {
+            let client_side = client.await?;
+            return Err(
+                format!("accept failed: {accept_error}; client side: {client_side:?}").into(),
+            );
+        }
+    };
+    let mut request = [0_u8; 4];
+    accepted.stream.read_exact(&mut request).await?;
+    assert_eq!(&request, b"ping");
+    accepted.stream.write_all(b"pong").await?;
+    accepted.stream.flush().await?;
+    let echoed = client
+        .await?
+        .map_err(|error| -> Box<dyn Error> { error.to_string().into() })?;
+    assert_eq!(&echoed, b"pong");
+    Ok(counters.inbound())
+}
+
+/// WIRE-MTR: prefix replay does not double-count on the raw seam. The same
+/// frontend-TLS handshake runs twice — once reading the whole `ClientHello` off
+/// the socket, once pre-reading its first bytes and replaying them as a buffered
+/// prefix. Because `CountedIo` is the innermost layer and `PrefixedIo` sits above
+/// it, the replayed bytes are counted once (when first read) and never again, so
+/// the two raw inbound totals are identical.
+///
+/// This is the deterministic, discriminating prefix-replay evidence (a coalesced
+/// TCP write can NOT force the exact-read `SSLRequest` production path to
+/// prefetch, so that path is not prefix evidence): deleting prefix replay drops
+/// the prefetched bytes and the handshake fails here; moving `CountedIo` above
+/// `PrefixedIo` (wrong layering) re-counts the prefix and the totals diverge;
+/// resetting the counter handle on the wrap loses the pre-read bytes.
+#[tokio::test]
+async fn raw_counter_is_not_double_counted_by_prefix_replay() -> Result<(), Box<dyn Error>> {
+    // A non-empty prefix is essential. The production `SSLRequest` upgrade path
+    // reads exactly (4-byte header + 32-byte payload) and leaves an EMPTY prefix,
+    // so it cannot exercise replay; this lower-level row deterministically does,
+    // by pre-reading `K > 0` real `ClientHello` bytes and replaying them.
+    // `black_box` keeps the `K > 0` assertion from being const-folded away.
+    let prefetch = std::hint::black_box(5_usize);
+    assert!(
+        prefetch > 0,
+        "the replay row must inject a non-empty prefix"
+    );
+
+    // Both calls run a full TLS handshake to a successful `ping`/`pong` echo, so
+    // returning `Ok` proves each handshake completed. Deleting prefix replay
+    // drops the pre-read `ClientHello` bytes and the prefetch run fails here.
+    let without_prefetch = counted_frontend_inbound(0).await?;
+    let with_prefetch = counted_frontend_inbound(prefetch).await?;
+    assert_eq!(
+        with_prefetch, without_prefetch,
+        "a replayed prefix must be counted once, not doubled \
+         (with_prefetch={with_prefetch}, without={without_prefetch})"
+    );
+    assert!(
+        without_prefetch > 100,
+        "both handshakes moved real TLS bytes through the counter: {without_prefetch}"
+    );
     Ok(())
 }
 

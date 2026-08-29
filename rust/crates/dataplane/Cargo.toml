@@ -20,7 +20,9 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 rustls.workspace = true
+rustls-pki-types.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
