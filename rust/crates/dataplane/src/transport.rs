@@ -237,9 +237,10 @@ impl DirectionSync for ClientTransport {
         }
     }
 
-    fn reset_layer_sequence(&mut self) {
-        if let Self::Compressed(inner) = self {
-            inner.reset_sequence();
+    fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Compressed(inner) => inner.reset_sequence().map_err(compression_io_error),
+            _ => Ok(()),
         }
     }
 }
@@ -259,9 +260,10 @@ impl DirectionSync for BackendTransport {
         }
     }
 
-    fn reset_layer_sequence(&mut self) {
-        if let Self::Compressed(inner) = self {
-            inner.reset_sequence();
+    fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Compressed(inner) => inner.reset_sequence().map_err(compression_io_error),
+            _ => Ok(()),
         }
     }
 }

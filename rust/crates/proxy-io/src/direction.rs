@@ -55,8 +55,16 @@ pub trait DirectionSync {
 
     /// Resets the layered sequence at a clean command boundary. Called once per
     /// new command/exchange by the session owner — never bound to a per-reader
-    /// or per-writer sequence reset.
-    fn reset_layer_sequence(&mut self) {}
+    /// or per-writer sequence reset, and never while a frame is in flight.
+    ///
+    /// # Errors
+    ///
+    /// A compression layer fails closed if a frame is still buffered (a partial
+    /// header/body, unread decoded bytes, or pending output), so the reset can
+    /// never silently rewind the shared sequence over live command bytes.
+    fn reset_layer_sequence(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A byte cursor carries no layered sequence; the test transports built on it

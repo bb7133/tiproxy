@@ -55,8 +55,11 @@
 //! place on the client leg (and, per the backend TLS plan, on the backend leg
 //! before any credential leaves) with the `MySQL` sequence continuing across
 //! the upgrade. An `SSLRequest` against a greeting that withheld `SSL`, or a
-//! malformed one, fails closed with no plaintext fallback. Compression is still
-//! neither advertised nor negotiated (WIRE-activation C). `COM_CHANGE_USER` and
+//! malformed one, fails closed with no plaintext fallback. Compression is
+//! advertised (`COMPRESS` + `ZSTD`) and, when a client negotiates it, activated
+//! at the auth-OK boundary on each leg independently (WIRE-activation C); the
+//! compressed sequence is slaved to the packet sequence and reset once per
+//! command. `COM_CHANGE_USER` and
 //! `COM_STMT_PREPARE` (the prepared special response flow) are
 //! answered with a fixed unsupported error and the session closes. A
 //! control redirect executes the bounded `SHOW SESSION_STATES` exchange at
@@ -1612,17 +1615,29 @@ impl Engine {
     /// Ready/command/response/infile phases.
     #[allow(clippy::too_many_lines)]
     async fn command_phase(&mut self) -> Option<WireErrorSource> {
+        // The compressed command-boundary reset must fire exactly once per
+        // command. Control/probe activity loops via `continue` without a new
+        // command boundary, so it must NOT re-reset the next command — whose
+        // compressed frame `peek_packet` may already have decoded and staged
+        // (advancing the shared sequence) when the control arm won the select.
+        let mut just_served_control = false;
         loop {
             if self.closing {
                 return None;
             }
-            // Every client command starts a fresh wire exchange at
-            // sequence zero, and its response lineage answers at one. On a
-            // compressed leg the compressed sequence also resets once per
-            // command (Go's `ResetSequence`); the first read/write then slaves
-            // the uncompressed sequence to it via the direction hooks. A no-op
-            // for a plaintext/TLS client leg.
-            self.client_io.get_mut().reset_layer_sequence();
+            // Every client command starts a fresh wire exchange at sequence
+            // zero, and its response answers at one. On a compressed leg the
+            // compressed sequence also resets once per command (Go's
+            // `ResetSequence`); the first read/write then slaves the uncompressed
+            // sequence to it via the direction hooks. Skip the compressed reset
+            // when merely re-entering after control activity, so a staged next
+            // command is not rewound; the reset fails closed on in-flight data.
+            if !just_served_control && self.client_io.get_mut().reset_layer_sequence().is_err() {
+                self.quit_source = QuitSource::ProxyError;
+                let _ = self.events.send(SessionEvent::ClientIoError).await;
+                return Some(WireErrorSource::Proxy);
+            }
+            just_served_control = false;
             self.client_io.reset_read_sequence(0);
             // Between commands: serve control effects and probes while
             // waiting for the next client command. Only the peek is
@@ -1636,7 +1651,12 @@ impl Engine {
                     let cmd = cmd?;
                     match self.handle_cmd(cmd).await {
                         Awaited::Closing => return None,
-                        Awaited::Got => continue,
+                        // Control/probe served — not a new command boundary, so
+                        // the next iteration must not reset the compressed layer.
+                        Awaited::Got => {
+                            just_served_control = true;
+                            continue;
+                        }
                     }
                 }
                 peeked = self.client_io.peek_packet() => {
@@ -1782,8 +1802,16 @@ impl Engine {
         };
         // Reset the backend compressed sequence once for this command (no-op on
         // a plaintext/TLS backend leg); the direction hooks re-slave the
-        // uncompressed sequence on the next write/read.
-        backend.backend_io.get_mut().reset_layer_sequence();
+        // uncompressed sequence on the next write/read. Fails closed on
+        // in-flight data.
+        if backend.backend_io.get_mut().reset_layer_sequence().is_err() {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(WireErrorSource::Proxy);
+        }
+        let Some(backend) = self.backend.as_mut() else {
+            return Some(WireErrorSource::Proxy);
+        };
         backend.backend_io.reset_write_sequence(0);
         backend.backend_io.reset_read_sequence(1);
         if backend
@@ -2106,6 +2134,14 @@ impl Engine {
             return Err(SnapshotFailure::ProxyInvariant);
         };
 
+        // This proxy-owned `SHOW SESSION_STATES` is a fresh command exchange, so
+        // on a compressed backend it must start from compressed sequence zero —
+        // Go's `cmd_processor_query.go` calls `ResetSequence()` before every
+        // proxy-owned query. Without this the backend compressed sequence would
+        // carry over from the last user command. Fails closed on in-flight data.
+        if backend.backend_io.get_mut().reset_layer_sequence().is_err() {
+            return Err(SnapshotFailure::ProxyInvariant);
+        }
         backend.backend_io.reset_write_sequence(0);
         backend.backend_io.reset_read_sequence(1);
         if backend

@@ -428,6 +428,15 @@ pub enum CompressionError {
         /// Decoded bytes not consumed by the packet layer.
         buffered: usize,
     },
+    /// A command-boundary reset was attempted while a frame is still in flight —
+    /// a partial header/body, unread decoded bytes, or pending output. Resetting
+    /// there would silently rewind the shared sequence over live command bytes,
+    /// so it fails closed instead.
+    #[error("cannot reset the compressed sequence with {buffered} in-flight byte(s) buffered")]
+    ResetWithBufferedData {
+        /// Bytes still buffered across the read/write frame state.
+        buffered: usize,
+    },
 }
 
 /// Sans-I/O frame codec and shared read/write compressed sequence.
@@ -755,12 +764,32 @@ impl<T> CompressedIo<T> {
         Ok(self.codec.begin(CompressionDirection::Write))
     }
 
-    /// Resets compressed sequence and direction at a clean command boundary.
+    /// Resets the compressed sequence and direction at a clean command boundary.
     ///
-    /// Call this only after the packet layer consumed the response and flushed
-    /// the request; it does not discard or reinterpret buffered frame bytes.
-    pub const fn reset_sequence(&mut self) {
+    /// Fails closed if a frame is still in flight — a partially read header or
+    /// body, unread decoded bytes, or pending output — rather than silently
+    /// rewinding the shared sequence over live command bytes. Callers reset once
+    /// per command boundary, after the response was consumed and the request
+    /// flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompressionError::ResetWithBufferedData`] when any read/write
+    /// frame state remains buffered.
+    pub fn reset_sequence(&mut self) -> Result<(), CompressionError> {
+        let in_flight = self
+            .read_header_filled
+            .saturating_add(self.read_body_filled)
+            .saturating_add(usize::from(self.read_frame_header.is_some()))
+            .saturating_add(self.buffered_read_len())
+            .saturating_add(self.buffered_write_len());
+        if in_flight != 0 {
+            return Err(CompressionError::ResetWithBufferedData {
+                buffered: in_flight,
+            });
+        }
         self.codec.reset_sequence();
+        Ok(())
     }
 
     /// Returns currently buffered uncompressed output bytes.
@@ -1036,6 +1065,12 @@ where
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // An empty flush carries no compressed output and needs no write
+        // direction — e.g. a flush after a read, or the flush at shutdown. Push
+        // the inner transport straight through (Go's empty flush is a no-op).
+        if this.buffered_write_len() == 0 {
+            return Pin::new(&mut this.inner).poll_flush(cx);
+        }
         if let Err(error) = this.codec.require_direction(CompressionDirection::Write) {
             return Poll::Ready(Err(invalid_data(error)));
         }

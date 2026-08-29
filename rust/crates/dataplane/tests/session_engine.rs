@@ -48,7 +48,9 @@ use mysql_wire::{
     encode_length_encoded_bytes, encode_length_encoded_int, encode_ok_packet, encode_ssl_request,
     parse_handshake_response, parse_initial_handshake,
 };
-use proxy_io::compression::{CompressedIo, CompressionAlgorithm, CompressionLimits};
+use proxy_io::compression::{
+    CompressedFrameHeader, CompressedIo, CompressionAlgorithm, CompressionError, CompressionLimits,
+};
 use proxy_io::counted::CountedIo;
 use proxy_io::direction::DirectionSync;
 use proxy_io::{PacketIo, PacketReader, PacketWriter};
@@ -2644,7 +2646,7 @@ async fn frontend_tls_session_totals_come_from_the_raw_seam_not_framing() {
 /// Maps a compression codec error into a transport `io::Error`, mirroring
 /// `dataplane::transport`'s private helper so the packet layer's direction hooks
 /// can fail closed.
-fn compression_io_error(error: proxy_io::compression::CompressionError) -> std::io::Error {
+fn compression_io_error(error: CompressionError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error)
 }
 
@@ -2700,8 +2702,8 @@ impl DirectionSync for CompressedClientTransport {
         self.inner.begin_write().map_err(compression_io_error)
     }
 
-    fn reset_layer_sequence(&mut self) {
-        self.inner.reset_sequence();
+    fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
+        self.inner.reset_sequence().map_err(compression_io_error)
     }
 }
 
@@ -2811,7 +2813,9 @@ impl CompressedClient {
     async fn query_ok(&mut self, sql: &str) -> bool {
         let mut payload = vec![0x03_u8];
         payload.extend_from_slice(sql.as_bytes());
-        self.io.get_mut().reset_layer_sequence();
+        if self.io.get_mut().reset_layer_sequence().is_err() {
+            return false;
+        }
         self.io.reset_read_sequence(0);
         if self.io.write_logical(&payload, true).await.is_err() {
             return false;
@@ -2823,7 +2827,7 @@ impl CompressedClient {
     }
 
     async fn quit(mut self) {
-        self.io.get_mut().reset_layer_sequence();
+        let _ = self.io.get_mut().reset_layer_sequence();
         self.io.reset_read_sequence(0);
         let _ = self.io.write_logical(&[0x01], true).await;
     }
@@ -2899,4 +2903,275 @@ async fn compressed_client_zlib_roundtrips_end_to_end() {
 #[tokio::test]
 async fn compressed_client_zstd_roundtrips_end_to_end() {
     compressed_client_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
+}
+
+// ---------------------------------------------------------------------
+// WIRE-C: compressed-BACKEND redirect/snapshot sequence regression (D)
+// ---------------------------------------------------------------------
+//
+// FALLBACK MODEL (clearly labeled). This is NOT a full real-socket session.
+// Wiring compression into the fake backend deterministically was too large to be
+// safe: the fake backend (`run_fake_backend`, `fake_backend_auth`,
+// `respond_to_snapshot_query`, `write_session_snapshot`) drives SPLIT
+// `PacketReader<OwnedReadHalf>` / `PacketWriter<OwnedWriteHalf>` halves across
+// auth, the command loop, and every snapshot helper. `CompressedIo` shares ONE
+// compressed sequence across reads and writes and so cannot be split; a
+// compressed backend would require reuniting the socket and rewriting all of
+// those helpers onto a single `PacketIo<compressed>` while staying in exact
+// sequence lockstep with the proxy's frozen backend-leg reset/direction cadence
+// — high flake risk with no ability to adjust `src`. Per the task's guidance,
+// this instead models the snapshot reset at the `PacketIo<compressed>` level:
+// the backend compressed layer is reset before the proxy-owned `SHOW
+// SESSION_STATES`, so the internal query starts a FRESH compressed seq-0
+// exchange (mirroring `capture_migration_snapshot`), and the old session stays
+// aligned for the next user command (mirroring `command_phase`).
+
+/// In-memory duplex byte transport modeling the backend leg's socket: reads
+/// drain `input` (the backend's scripted compressed responses), writes append to
+/// `output` (the proxy's compressed requests), over one shared sequence.
+struct BackendDuplex {
+    input: Vec<u8>,
+    input_pos: usize,
+    output: Vec<u8>,
+}
+
+impl AsyncRead for BackendDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let available = self.input.len().saturating_sub(self.input_pos);
+        let take = available.min(buf.remaining());
+        let end = self.input_pos + take;
+        let chunk = self.input[self.input_pos..end].to_vec();
+        buf.put_slice(&chunk);
+        self.input_pos = end;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for BackendDuplex {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.output.extend_from_slice(data);
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Test-only `DirectionSync` newtype over `CompressedIo<BackendDuplex>`, matching
+/// the production `BackendTransport::Compressed` variant's hook delegation.
+struct BackendLegTransport {
+    inner: CompressedIo<BackendDuplex>,
+}
+
+impl AsyncRead for BackendLegTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(context, buf)
+    }
+}
+
+impl AsyncWrite for BackendLegTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(context, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
+impl DirectionSync for BackendLegTransport {
+    fn begin_read(&mut self) -> std::io::Result<Option<u8>> {
+        self.inner.begin_read().map_err(compression_io_error)
+    }
+
+    fn begin_write(&mut self) -> std::io::Result<Option<u8>> {
+        self.inner.begin_write().map_err(compression_io_error)
+    }
+
+    fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
+        self.inner.reset_sequence().map_err(compression_io_error)
+    }
+}
+
+/// One `MySQL` physical packet carrying `payload` at physical sequence `seq`.
+fn model_mysql_packet(payload: &[u8], seq: u8) -> Vec<u8> {
+    let length = u32::try_from(payload.len()).unwrap_or(0).to_le_bytes();
+    let mut packet = Vec::with_capacity(4 + payload.len());
+    packet.extend_from_slice(&length[..3]);
+    packet.push(seq);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// A raw (uncompressed-body) compressed frame at compressed `sequence` carrying
+/// one `MySQL` physical packet — the backend's scripted response wire.
+fn model_raw_frame(packet: &[u8], sequence: u8) -> Vec<u8> {
+    let Ok(header) = CompressedFrameHeader::new(packet.len(), sequence, 0) else {
+        unreachable!("a small model frame fits the 24-bit compressed field")
+    };
+    let mut frame = header.encode().to_vec();
+    frame.extend_from_slice(packet);
+    frame
+}
+
+/// Builds a `PacketIo` over a compressed backend leg whose socket replays the
+/// given raw response bytes.
+fn backend_leg(input: Vec<u8>) -> Option<PacketIo<BackendLegTransport>> {
+    let compressed = CompressedIo::new(
+        BackendDuplex {
+            input,
+            input_pos: 0,
+            output: Vec::new(),
+        },
+        CompressionAlgorithm::Zlib,
+        CompressionLimits::default(),
+    )
+    .ok()?;
+    Some(PacketIo::new(BackendLegTransport { inner: compressed }))
+}
+
+/// The compressed sequence byte of the frame starting at `offset` in the proxy's
+/// captured backend-leg output.
+fn output_frame_sequence(io: &PacketIo<BackendLegTransport>, offset: usize) -> Option<u8> {
+    let output = &io.get_ref().inner.get_ref().output;
+    let frame = output.get(offset..)?;
+    CompressedFrameHeader::decode(frame)
+        .ok()
+        .map(CompressedFrameHeader::sequence)
+}
+
+/// PacketIo-level model of fix #3 on the BACKEND leg: the proxy-owned `SHOW
+/// SESSION_STATES` captured for a redirect resets the backend compressed layer
+/// first, so it starts a fresh compressed seq-0 exchange rather than carrying
+/// the sequence over from the last user command; the old session then stays
+/// aligned (also seq 0) for its next user command. A staged/in-flight backend
+/// layer fails that reset closed instead of rewinding over live bytes.
+#[tokio::test]
+async fn compressed_backend_snapshot_reset_starts_fresh_and_keeps_session_aligned() {
+    // OK and snapshot responses both answer at compressed sequence 1 (the shared
+    // sequence continues from the request's seq 0 -> read at 1).
+    let ok = model_mysql_packet(b"\x00\x00\x00\x02\x00\x00\x00", 1);
+    let snapshot = model_mysql_packet(b"\x00row-bytes-preserved", 1);
+    let mut input = model_raw_frame(&ok, 1);
+    input.extend_from_slice(&model_raw_frame(&snapshot, 1));
+    let Some(mut io) = backend_leg(input) else {
+        unreachable!("the compressed backend leg builds")
+    };
+
+    // --- User command (command_phase parity): reset once, request at seq 0. ---
+    let Ok(()) = io.get_mut().reset_layer_sequence() else {
+        unreachable!("the clean per-command reset succeeds")
+    };
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    let user_start = io.get_ref().inner.get_ref().output.len();
+    let Ok(()) = io.write_logical(b"\x03SELECT user_cmd", true).await else {
+        unreachable!("the user command writes")
+    };
+    assert_eq!(
+        output_frame_sequence(&io, user_start),
+        Some(0),
+        "the user command opens the exchange at compressed sequence 0"
+    );
+    let Ok(response) = io.read_logical(64 * 1024).await else {
+        unreachable!("the user command's OK response reads back")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+
+    // --- Snapshot capture (capture_migration_snapshot parity): reset the ---
+    // backend layer, then the internal query starts a FRESH seq-0 exchange.
+    let Ok(()) = io.get_mut().reset_layer_sequence() else {
+        unreachable!("the snapshot boundary is clean, so its reset succeeds")
+    };
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    let snapshot_start = io.get_ref().inner.get_ref().output.len();
+    let Ok(()) = io.write_logical(b"\x03SHOW SESSION_STATES", true).await else {
+        unreachable!("the internal snapshot query writes")
+    };
+    // Without the pre-query reset the shared sequence would still be 2 here; the
+    // reset is what makes the proxy-owned query a fresh compressed seq-0 frame.
+    assert_eq!(
+        output_frame_sequence(&io, snapshot_start),
+        Some(0),
+        "the proxy-owned SHOW SESSION_STATES opens at a fresh compressed sequence 0"
+    );
+    let Ok(snapshot_response) = io.read_logical(64 * 1024).await else {
+        unreachable!("the snapshot response reads back")
+    };
+    assert_eq!(snapshot_response.payload.first(), Some(&0x00));
+
+    // --- Old session stays aligned: the next user command resets to seq 0. ---
+    let Ok(()) = io.get_mut().reset_layer_sequence() else {
+        unreachable!("the post-snapshot per-command reset succeeds")
+    };
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    let next_start = io.get_ref().inner.get_ref().output.len();
+    let Ok(()) = io.write_logical(b"\x03SELECT after_snapshot", true).await else {
+        unreachable!("the next user command writes")
+    };
+    assert_eq!(
+        output_frame_sequence(&io, next_start),
+        Some(0),
+        "the old session's next command stays aligned at compressed sequence 0"
+    );
+}
+
+/// PacketIo-level model of the fail-closed guard at the snapshot boundary: if the
+/// backend compressed layer still holds an in-flight (peeked/staged) frame, the
+/// snapshot's `reset_layer_sequence` fails closed rather than silently rewinding
+/// the shared sequence over live command bytes.
+#[tokio::test]
+async fn compressed_backend_snapshot_reset_fails_closed_on_staged_frame() {
+    // A next command's frame is present at compressed sequence 0.
+    let staged = model_mysql_packet(b"\x03SELECT staged", 0);
+    let Some(mut io) = backend_leg(model_raw_frame(&staged, 0)) else {
+        unreachable!("the compressed backend leg builds")
+    };
+    // The idle peek decodes and stages that frame (codec sequence -> 1).
+    let Ok(preview) = io.peek_packet().await else {
+        unreachable!("the staged frame peeks")
+    };
+    assert_eq!(preview.first_byte, Some(0x03));
+    // The snapshot boundary reset now fails closed on the staged decoded bytes.
+    let error = io.get_mut().reset_layer_sequence();
+    let Some(error) = error.err() else {
+        unreachable!("the reset must fail closed on staged data")
+    };
+    let wrapped = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<CompressionError>());
+    assert!(matches!(
+        wrapped,
+        Some(CompressionError::ResetWithBufferedData { .. })
+    ));
 }
