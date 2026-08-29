@@ -405,6 +405,16 @@ pub struct RedirectCommand {
     /// RECONCILE_SESSION_REHYDRATION.
     #[prost(uint64, tag="7")]
     pub command_sequence: u64,
+    /// Backward-compatible negative form: peers predating this field encode
+    /// false, which retains the historical assumption that router-issued
+    /// redirect targets are healthy. A current peer sets true when the target
+    /// has become unhealthy so the dataplane rejects the candidate before dial.
+    #[prost(bool, tag="8")]
+    pub backend_unhealthy: bool,
+    /// Router-observed locality for post-swap lifecycle/traffic attribution.
+    /// Older peers default to the conservative non-local value.
+    #[prost(bool, tag="9")]
+    pub backend_local: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RedirectResult {

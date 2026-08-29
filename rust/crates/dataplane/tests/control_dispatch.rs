@@ -60,6 +60,8 @@ fn redirect(connection_id: u64, redirect_id: &str, sequence: u64) -> RedirectCom
         backend_id: "tidb-b".to_owned(),
         backend_address: "10.0.0.2:4000".to_owned(),
         cluster_name: String::new(),
+        backend_unhealthy: false,
+        backend_local: false,
         deadline_unix_millis: 0,
         command_sequence: sequence,
     }
@@ -1969,6 +1971,15 @@ async fn directives_carry_exact_command_tokens() {
         }),
         "the exact admitted id travels with the command"
     );
+    let Some(target) = directive.redirect_target else {
+        unreachable!("redirect target travels with the admitted command")
+    };
+    assert_eq!(target.backend_id, "tidb-b");
+    assert_eq!(target.backend_address, "10.0.0.2:4000");
+    assert_eq!(target.cluster_name, "");
+    assert!(target.backend_healthy);
+    assert!(!target.backend_local);
+    assert_eq!(target.deadline_unix_millis, 0);
 
     let close = CloseCommand {
         connection_id: 1,
@@ -1988,6 +1999,7 @@ async fn directives_carry_exact_command_tokens() {
             .map(|token| (&*token.id, token.kind)),
         Some(("c-tok", CommandKind::Close))
     );
+    assert_eq!(directive.redirect_target, None);
 
     // Drain-driven graceful close: no per-command token.
     let drain = DrainCommand {
@@ -2004,6 +2016,7 @@ async fn directives_carry_exact_command_tokens() {
     };
     assert_eq!(directive.control, SessionControl::GracefulClose);
     assert_eq!(directive.command, None, "drain closes carry no token");
+    assert_eq!(directive.redirect_target, None);
 }
 
 /// The pinned instant-completion regression: a session that completes

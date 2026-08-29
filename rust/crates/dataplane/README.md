@@ -124,6 +124,33 @@ classifier under select-arm noise delivering every event exactly once.
 The no-detached-task property is structural: handlers only ever receive
 `&mut JoinSet`, and the pump task is owned and stopped by the loop.
 
+### Session migration (`MIG-00` / `MIG-01`)
+
+An admitted redirect carries its exact backend id, address, cluster, and
+absolute deadline into the socket-owner FIFO before the FSM can start the
+migration. At the next safe boundary, the engine runs bounded
+`SHOW SESSION_STATES` on the old owner, validates a nonempty signed token and
+top-level JSON, and synchronizes the authoritative `current-db`. It then builds
+an invisible candidate in this order: dial the exact target, read and verify
+its greeting, optionally send `SSLRequest` and upgrade to backend TLS, send a
+second handshake using `tidb_session_token`, consume the sole auth OK, send the
+escaped `SET SESSION_STATES`, and consume its OK. Only the FSM's subsequent
+`SwapBackend` effect can atomically install that fully restored candidate;
+old-backend traffic is retained in the connection-lifetime totals before the
+previous sole owner is dropped.
+
+Candidate-only failures (dial/deadline, malformed greeting, invalid or expired
+token, restore ERR or disconnect) drop the candidate and leave the aligned old
+backend usable. An incomplete or disconnected old-backend snapshot still
+closes the poisoned session. Session-state and token strings, plus the two
+wire buffers that carry them, are overwritten on drop and never enter logs or
+control messages. The current executable base supports this path for plain and
+TLS transports; WIRE-B and WIRE-C provide the shared PROXY-v2 and post-auth
+compression activation points before those combined variants can be claimed.
+The plain and backend-TLS candidate paths are exercised by
+`redirect_restores_candidate_and_swaps_atomically` and
+`redirect_restores_candidate_over_backend_tls`, respectively.
+
 ## Route client and dial retry (`route` / `route_control`, DPL-02)
 
 Rust never duplicates balance policy: backend choice stays on the Go

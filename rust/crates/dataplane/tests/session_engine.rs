@@ -46,14 +46,18 @@ use mysql_wire::{
     CapabilityFlags, HandshakeResponseParams, ResponseHeader, StatusFlags, encode_eof_packet,
     encode_error_packet, encode_handshake_response, encode_initial_handshake,
     encode_length_encoded_bytes, encode_length_encoded_int, encode_ok_packet, encode_ssl_request,
-    parse_handshake_response, parse_initial_handshake,
+    parse_handshake_response, parse_initial_handshake, parse_ssl_request,
 };
 use proxy_io::compression::{
     CompressedFrameHeader, CompressedIo, CompressionAlgorithm, CompressionError, CompressionLimits,
 };
 use proxy_io::counted::CountedIo;
 use proxy_io::direction::DirectionSync;
+use proxy_io::tls::accept_frontend;
 use proxy_io::{PacketIo, PacketReader, PacketWriter};
+use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use session_core::handshake::build_greeting;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -210,8 +214,8 @@ fn native_scramble(password: &str, salt: &[u8]) -> Vec<u8> {
 }
 
 /// Go's authentication failure with the `using password` semantics.
-async fn write_access_denied(
-    writer: &mut PacketWriter<tokio::net::tcp::OwnedWriteHalf>,
+async fn write_access_denied<W: AsyncWrite + Unpin>(
+    writer: &mut PacketWriter<W>,
     capabilities: CapabilityFlags,
 ) -> bool {
     let Ok(denied) = encode_error_packet(
@@ -225,13 +229,16 @@ async fn write_access_denied(
     writer.write_logical(&denied, true).await.is_ok()
 }
 
-/// The fake backend's connection phase: greeting with its own salt,
-/// Go-oracle unknown-plugin assertion (a `TiDB` verifying the mis-salted
-/// scramble directly fails as access-denied), auth-switch challenge,
-/// and strict scramble verification.
-async fn fake_backend_auth(
-    reader: &mut PacketReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: &mut PacketWriter<tokio::net::tcp::OwnedWriteHalf>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FakeAuth {
+    Initial,
+    Migration,
+}
+
+/// The fake backend's connection phase: either the initial Go-oracle
+/// unknown-plugin/auth-switch relay or MIG-01's direct session-token login.
+async fn write_fake_backend_greeting<W: AsyncWrite + Unpin>(
+    writer: &mut PacketWriter<W>,
     broad: CapabilityFlags,
 ) -> bool {
     let salt = [7_u8; 20];
@@ -246,43 +253,76 @@ async fn fake_backend_auth(
     let Ok(greeting) = encode_initial_handshake(params) else {
         return false;
     };
-    if writer.write_logical(&greeting, true).await.is_err() {
-        return false;
-    }
-    // Handshake response: strict wire sequence — it must continue the
-    // greeting exchange at one, no silent resync.
+    writer.write_logical(&greeting, true).await.is_ok()
+}
+
+async fn finish_fake_backend_auth<R, W>(
+    reader: &mut PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    broad: CapabilityFlags,
+) -> Option<FakeAuth>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let salt = [7_u8; 20];
+    let expected_sequence = reader.expected_sequence();
     match reader.peek_packet().await {
-        Ok(preview) if preview.sequence_id == 1 => {}
-        _ => return false,
+        Ok(preview) if preview.sequence_id == expected_sequence => {}
+        _ => return None,
     }
     let Ok(response) = reader.read_logical(64 * 1024).await else {
-        return false;
+        return None;
     };
     let Ok(parsed) = parse_handshake_response(&response.payload) else {
-        return false;
+        return None;
     };
+    if parsed.auth_plugin_name == Some(b"tidb_session_token".as_slice()) {
+        writer.reset_sequence(reader.expected_sequence());
+        if parsed.auth_response != b"signed-token-private"
+            || parsed.database != Some(b"snapshot_db".as_slice())
+        {
+            let _ = write_access_denied(writer, broad).await;
+            return None;
+        }
+        let Ok(auth_ok) = encode_ok_packet(
+            ResponseHeader::OK,
+            0,
+            0,
+            StatusFlags::from_bits_retain(0x0002),
+            0,
+            b"",
+            broad,
+        ) else {
+            return None;
+        };
+        return writer
+            .write_logical(&auth_ok, true)
+            .await
+            .is_ok()
+            .then_some(FakeAuth::Migration);
+    }
     if parsed.auth_plugin_name != Some(b"auth_unknown_plugin".as_slice()) {
         writer.reset_sequence(reader.expected_sequence());
         let _ = write_access_denied(writer, broad).await;
-        return false;
+        return None;
     }
-    // Re-request authentication against this backend's own salt.
     let mut switch = vec![0xFE_u8];
     switch.extend_from_slice(b"mysql_native_password\0");
     switch.extend_from_slice(&salt);
     switch.push(0);
     writer.reset_sequence(reader.expected_sequence());
     if writer.write_logical(&switch, true).await.is_err() {
-        return false;
+        return None;
     }
     reader.reset_sequence(writer.next_sequence());
     let Ok(rescrambled) = reader.read_logical(64 * 1024).await else {
-        return false;
+        return None;
     };
     writer.reset_sequence(reader.expected_sequence());
     if rescrambled.payload != native_scramble(FAKE_BACKEND_PASSWORD, &salt) {
         let _ = write_access_denied(writer, broad).await;
-        return false;
+        return None;
     }
     let Ok(auth_ok) = encode_ok_packet(
         ResponseHeader::OK,
@@ -293,9 +333,31 @@ async fn fake_backend_auth(
         b"",
         broad,
     ) else {
-        return false;
+        return None;
     };
-    writer.write_logical(&auth_ok, true).await.is_ok()
+    writer
+        .write_logical(&auth_ok, true)
+        .await
+        .is_ok()
+        .then_some(FakeAuth::Initial)
+}
+
+/// The fake backend's connection phase: either the initial Go-oracle
+/// unknown-plugin/auth-switch relay or MIG-01's direct session-token login.
+async fn fake_backend_auth<R, W>(
+    reader: &mut PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    broad: CapabilityFlags,
+) -> Option<FakeAuth>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if !write_fake_backend_greeting(writer, broad).await {
+        return None;
+    }
+    reader.reset_sequence(writer.next_sequence());
+    finish_fake_backend_auth(reader, writer, broad).await
 }
 
 fn result_column(name: &[u8]) -> Vec<u8> {
@@ -311,6 +373,10 @@ fn result_column(name: &[u8]) -> Vec<u8> {
 #[derive(Debug, Clone, Copy)]
 enum SnapshotReply {
     Valid,
+    InvalidToken,
+    ExpiredToken,
+    RestoreError,
+    RestoreDisconnect,
     SigningCertificateError,
     NullToken,
     EmptyToken,
@@ -319,12 +385,15 @@ enum SnapshotReply {
     Disconnect,
 }
 
-async fn write_session_snapshot(
-    reader: &PacketReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: &mut PacketWriter<tokio::net::tcp::OwnedWriteHalf>,
+async fn write_session_snapshot<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
     session_states: &[u8],
     session_token: Option<&[u8]>,
-) -> bool {
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
     writer.reset_sequence(reader.expected_sequence());
     let mut row = Vec::new();
     assert!(encode_length_encoded_bytes(Some(session_states), &mut row).is_ok());
@@ -346,12 +415,15 @@ async fn write_session_snapshot(
         .is_ok()
 }
 
-async fn respond_to_snapshot_query(
-    reader: &PacketReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: &mut PacketWriter<tokio::net::tcp::OwnedWriteHalf>,
+async fn respond_to_snapshot_query<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
     snapshot_reply: SnapshotReply,
     capabilities: CapabilityFlags,
-) -> bool {
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
     if matches!(snapshot_reply, SnapshotReply::Disconnect) {
         return false;
     }
@@ -370,9 +442,17 @@ async fn respond_to_snapshot_query(
 
     let oversized;
     let (session_states, session_token): (&[u8], Option<&[u8]>) = match snapshot_reply {
-        SnapshotReply::Valid => (
+        SnapshotReply::Valid | SnapshotReply::RestoreError | SnapshotReply::RestoreDisconnect => (
             br#"{"current-db":"snapshot_db","marker":"all-bytes-preserved"}"#,
             Some(b"signed-token-private"),
+        ),
+        SnapshotReply::InvalidToken => (
+            br#"{"current-db":"snapshot_db"}"#,
+            Some(b"invalid-token-private"),
+        ),
+        SnapshotReply::ExpiredToken => (
+            br#"{"current-db":"snapshot_db"}"#,
+            Some(b"expired-token-private"),
         ),
         SnapshotReply::NullToken => (br#"{"current-db":"snapshot_db"}"#, None),
         SnapshotReply::EmptyToken => (br#"{"current-db":"snapshot_db"}"#, Some(b"")),
@@ -418,14 +498,42 @@ async fn strip_inbound_proxy_v2(read: &mut tokio::net::tcp::OwnedReadHalf) -> bo
     true
 }
 
-async fn run_fake_backend(
-    listener: TcpListener,
-    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+async fn respond_to_restore_query<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
     snapshot_reply: SnapshotReply,
-    proxy_v2: bool,
-    send_idle_byte: bool,
-) {
-    let broad = CapabilityFlags::PROTOCOL_41
+    broad: CapabilityFlags,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    if matches!(snapshot_reply, SnapshotReply::RestoreDisconnect) {
+        return false;
+    }
+    writer.reset_sequence(reader.expected_sequence());
+    if matches!(snapshot_reply, SnapshotReply::RestoreError) {
+        let Ok(error) = encode_error_packet(1105, Some(*b"HY000"), b"restore rejected", broad)
+        else {
+            return false;
+        };
+        return writer.write_logical(&error, true).await.is_ok();
+    }
+    let Ok(ok) = encode_ok_packet(
+        ResponseHeader::OK,
+        0,
+        0,
+        StatusFlags::AUTOCOMMIT,
+        0,
+        b"",
+        broad,
+    ) else {
+        return false;
+    };
+    writer.write_logical(&ok, true).await.is_ok()
+}
+
+fn fake_backend_capabilities(tls: bool) -> CapabilityFlags {
+    let mut broad = CapabilityFlags::PROTOCOL_41
         | CapabilityFlags::LONG_PASSWORD
         | CapabilityFlags::SECURE_CONNECTION
         | CapabilityFlags::PLUGIN_AUTH
@@ -438,92 +546,281 @@ async fn run_fake_backend(
         | CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA
         | CapabilityFlags::DEPRECATE_EOF
         | CapabilityFlags::LOCAL_FILES;
-    while let Ok((stream, _)) = listener.accept().await {
-        let (mut read, write) = stream.into_split();
-        // When the proxy prepends an outbound PROXY v2 header, strip it off the
-        // raw stream before MySQL framing begins — mirroring a real backend that
-        // terminates the PROXY preamble. The header bytes still crossed the wire,
-        // so they remain in the proxy's raw out-byte count (verified separately).
-        if proxy_v2 && !strip_inbound_proxy_v2(&mut read).await {
+    if tls {
+        broad |= CapabilityFlags::SSL;
+    }
+    broad
+}
+
+async fn run_fake_backend_commands<R, W>(
+    mut reader: PacketReader<R>,
+    mut writer: PacketWriter<W>,
+    auth: FakeAuth,
+    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    snapshot_reply: SnapshotReply,
+    broad: CapabilityFlags,
+    send_idle_byte: bool,
+) -> u64
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // WIRE-MTR (idle-liveness probe): optionally push ONE unsolicited raw
+    // byte on the backend->proxy direction right after auth, before the
+    // command loop's peek. It is not a MySQL packet; the proxy consumes it
+    // through the count-aware raw liveness probe.
+    if send_idle_byte {
+        let _ = writer.get_mut().write_all(&[0xFF]).await;
+        let _ = writer.get_mut().flush().await;
+    }
+    // Command loop: OK for everything until quit/EOF.
+    let mut in_transaction = false;
+    loop {
+        reader.reset_sequence(0);
+        // Strict wire sequence: every proxied command must restart
+        // its exchange at zero, exactly like the Go oracle.
+        match reader.peek_packet().await {
+            Ok(preview) if preview.sequence_id == 0 => {}
+            _ => break,
+        }
+        let Ok(packet) = reader.read_logical(1024 * 1024).await else {
+            break;
+        };
+        if let Ok(mut commands) = transcript.lock() {
+            commands.push(packet.payload.clone());
+        }
+        if packet.payload.first() == Some(&0x01) {
+            break; // COM_QUIT
+        }
+        if packet.payload == b"\x03SHOW SESSION_STATES" {
+            if !respond_to_snapshot_query(&reader, &mut writer, snapshot_reply, broad).await {
+                break;
+            }
             continue;
         }
-        let mut reader = PacketReader::new(read);
-        let mut writer = PacketWriter::new(write);
-        if !fake_backend_auth(&mut reader, &mut writer, broad).await {
+        if packet.payload.starts_with(b"\x03SET SESSION_STATES '") {
+            if auth != FakeAuth::Migration {
+                break;
+            }
+            if !respond_to_restore_query(&reader, &mut writer, snapshot_reply, broad).await {
+                break;
+            }
             continue;
         }
-        // WIRE-MTR (idle-liveness probe): optionally push ONE unsolicited raw
-        // byte on the backend->proxy direction right after auth, before the
-        // command loop's peek. It is not a MySQL packet; the proxy consumes it
-        // via the idle-liveness probe's raw `try_read` beneath the framing
-        // layer, and (Go parity) must count it on the raw backend-in counter.
-        if send_idle_byte {
-            let _ = writer.get_mut().write_all(&[0xFF]).await;
-            let _ = writer.get_mut().flush().await;
+        if packet.payload.first() == Some(&0x18) {
+            // COM_STMT_SEND_LONG_DATA has no response.
+            continue;
         }
-        // Command loop: OK for everything until quit/EOF.
-        let mut in_transaction = false;
-        loop {
-            reader.reset_sequence(0);
-            // Strict wire sequence: every proxied command must restart
-            // its exchange at zero, exactly like the Go oracle.
-            match reader.peek_packet().await {
-                Ok(preview) if preview.sequence_id == 0 => {}
-                _ => break,
-            }
-            let Ok(packet) = reader.read_logical(1024 * 1024).await else {
-                break;
-            };
-            if let Ok(mut commands) = transcript.lock() {
-                commands.push(packet.payload.clone());
-            }
-            if packet.payload.first() == Some(&0x01) {
-                break; // COM_QUIT
-            }
-            if packet.payload == b"\x03SHOW SESSION_STATES" {
-                if !respond_to_snapshot_query(&reader, &mut writer, snapshot_reply, broad).await {
-                    break;
-                }
-                continue;
-            }
-            if packet.payload.first() == Some(&0x18) {
-                // COM_STMT_SEND_LONG_DATA has no response.
-                continue;
-            }
-            if packet.payload.windows(5).any(|window| window == b"BEGIN") {
-                in_transaction = true;
-            }
-            if packet.payload.windows(6).any(|window| window == b"COMMIT") {
-                in_transaction = false;
-            }
-            if packet.payload.windows(5).any(|window| window == b"SLEEP") {
-                // Simulates a long-running statement so a force
-                // deadline can preempt an in-flight command.
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            if packet.payload.windows(4).any(|window| window == b"HANG") {
-                // A permanently stuck backend: only a force close ever
-                // ends this command.
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-            writer.reset_sequence(reader.expected_sequence());
-            let status = 0x0002 | u16::from(in_transaction);
-            let Ok(ok) = encode_ok_packet(
-                ResponseHeader::OK,
-                1,
-                0,
-                StatusFlags::from_bits_retain(status),
-                0,
-                b"",
-                broad,
-            ) else {
-                break;
-            };
-            if writer.write_logical(&ok, true).await.is_err() {
-                break;
-            }
+        if packet.payload.windows(5).any(|window| window == b"BEGIN") {
+            in_transaction = true;
+        }
+        if packet.payload.windows(6).any(|window| window == b"COMMIT") {
+            in_transaction = false;
+        }
+        if packet.payload.windows(5).any(|window| window == b"SLEEP") {
+            // Simulates a long-running statement so a force
+            // deadline can preempt an in-flight command.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        if packet.payload.windows(4).any(|window| window == b"HANG") {
+            // A permanently stuck backend: only a force close ever
+            // ends this command.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        writer.reset_sequence(reader.expected_sequence());
+        let status = 0x0002 | u16::from(in_transaction);
+        let Ok(ok) = encode_ok_packet(
+            ResponseHeader::OK,
+            1,
+            0,
+            StatusFlags::from_bits_retain(status),
+            0,
+            b"",
+            broad,
+        ) else {
+            break;
+        };
+        if writer.write_logical(&ok, true).await.is_err() {
+            break;
         }
     }
+    writer.out_bytes()
+}
+
+fn fake_backend_tls_config() -> Arc<ServerConfig> {
+    let Ok(CertifiedKey { cert, signing_key }) =
+        generate_simple_self_signed(["127.0.0.1".to_owned()])
+    else {
+        unreachable!("generate fake backend certificate")
+    };
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+    let Ok(config) = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![CertificateDer::from(cert.der().to_vec())], key)
+    else {
+        unreachable!("fake backend TLS identity")
+    };
+    Arc::new(config)
+}
+
+async fn run_fake_tls_backend_connection(
+    stream: TcpStream,
+    tls_config: Arc<ServerConfig>,
+    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    snapshot_reply: SnapshotReply,
+    send_idle_byte: bool,
+) -> u64 {
+    let broad = fake_backend_capabilities(true);
+    let (read, write) = stream.into_split();
+    let mut reader = PacketReader::new(read);
+    let mut writer = PacketWriter::new(write);
+    if !write_fake_backend_greeting(&mut writer, broad).await {
+        return writer.out_bytes();
+    }
+    let Ok(ssl_request) = reader.read_logical(64 * 1024).await else {
+        return writer.out_bytes();
+    };
+    if parse_ssl_request(&ssl_request.payload).is_err() {
+        return writer.out_bytes();
+    }
+    let next_sequence = reader.expected_sequence();
+    let greeting_bytes = writer.out_bytes();
+    let read = reader.into_inner();
+    let write = writer.into_inner();
+    let Ok(stream) = read.reunite(write) else {
+        return greeting_bytes;
+    };
+    let Ok(tls) = accept_frontend(
+        stream,
+        Vec::new(),
+        tls_config,
+        Duration::from_secs(5),
+        32 * 1024,
+    )
+    .await
+    else {
+        return greeting_bytes;
+    };
+    let (read, write) = tokio::io::split(tls.stream);
+    let mut reader = PacketReader::new(read);
+    reader.reset_sequence(next_sequence);
+    let mut writer = PacketWriter::new(write);
+    writer.reset_sequence(next_sequence);
+    let Some(auth) = finish_fake_backend_auth(&mut reader, &mut writer, broad).await else {
+        return greeting_bytes.saturating_add(writer.out_bytes());
+    };
+    greeting_bytes.saturating_add(
+        run_fake_backend_commands(
+            reader,
+            writer,
+            auth,
+            transcript,
+            snapshot_reply,
+            broad,
+            send_idle_byte,
+        )
+        .await,
+    )
+}
+
+async fn run_fake_backend(
+    listener: TcpListener,
+    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    written_bytes: Arc<AtomicU64>,
+    snapshot_reply: SnapshotReply,
+    proxy_v2: bool,
+    send_idle_byte: bool,
+    tls_config: Option<Arc<ServerConfig>>,
+) {
+    while let Ok((stream, _)) = listener.accept().await {
+        let stream = if proxy_v2 {
+            let (mut read, write) = stream.into_split();
+            if !strip_inbound_proxy_v2(&mut read).await {
+                continue;
+            }
+            let Ok(stream) = read.reunite(write) else {
+                continue;
+            };
+            stream
+        } else {
+            stream
+        };
+        let written = if let Some(tls_config) = tls_config.clone() {
+            run_fake_tls_backend_connection(
+                stream,
+                tls_config,
+                Arc::clone(&transcript),
+                snapshot_reply,
+                send_idle_byte,
+            )
+            .await
+        } else {
+            let broad = fake_backend_capabilities(false);
+            let (read, write) = stream.into_split();
+            let mut reader = PacketReader::new(read);
+            let mut writer = PacketWriter::new(write);
+            let Some(auth) = fake_backend_auth(&mut reader, &mut writer, broad).await else {
+                written_bytes.fetch_add(writer.out_bytes(), Ordering::Relaxed);
+                continue;
+            };
+            run_fake_backend_commands(
+                reader,
+                writer,
+                auth,
+                Arc::clone(&transcript),
+                snapshot_reply,
+                broad,
+                send_idle_byte,
+            )
+            .await
+        };
+        written_bytes.fetch_add(written, Ordering::Relaxed);
+    }
+}
+async fn spawn_fake_backend_server(
+    snapshot_reply: SnapshotReply,
+) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicU64>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let written_bytes = Arc::new(AtomicU64::new(0));
+    tokio::spawn(run_fake_backend(
+        listener,
+        Arc::clone(&transcript),
+        Arc::clone(&written_bytes),
+        snapshot_reply,
+        false,
+        false,
+        None,
+    ));
+    (address.port(), transcript, written_bytes)
+}
+
+async fn spawn_fake_tls_backend_server(
+    snapshot_reply: SnapshotReply,
+) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicU64>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let written_bytes = Arc::new(AtomicU64::new(0));
+    tokio::spawn(run_fake_backend(
+        listener,
+        Arc::clone(&transcript),
+        Arc::clone(&written_bytes),
+        snapshot_reply,
+        false,
+        false,
+        Some(fake_backend_tls_config()),
+    ));
+    (address.port(), transcript, written_bytes)
 }
 
 /// The whole stack under test.
@@ -540,6 +837,7 @@ struct Stack {
     backend_port: u16,
     metrics_rx: mpsc::Receiver<Observation>,
     backend_transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    backend_written_bytes: Arc<AtomicU64>,
 }
 
 async fn spawn_stack() -> Stack {
@@ -574,6 +872,40 @@ async fn spawn_stack_full(
     send_idle_byte: bool,
     frontend_tls: Option<FrontendTlsFixture>,
 ) -> Stack {
+    spawn_stack_configured(
+        snapshot_reply,
+        proxy_v2,
+        handshake_deadline,
+        backend_check_interval,
+        send_idle_byte,
+        frontend_tls,
+        None,
+    )
+    .await
+}
+
+async fn spawn_tls_stack(snapshot_reply: SnapshotReply) -> Stack {
+    spawn_stack_configured(
+        snapshot_reply,
+        false,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+        Some(fake_backend_tls_config()),
+    )
+    .await
+}
+
+async fn spawn_stack_configured(
+    snapshot_reply: SnapshotReply,
+    proxy_v2: bool,
+    handshake_deadline: Duration,
+    backend_check_interval: Duration,
+    send_idle_byte: bool,
+    frontend_tls: Option<FrontendTlsFixture>,
+    tls_config: Option<Arc<ServerConfig>>,
+) -> Stack {
     // Fake backend.
     let Ok(backend_listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
         unreachable!("backend bind")
@@ -582,12 +914,15 @@ async fn spawn_stack_full(
         unreachable!("backend addr")
     };
     let backend_transcript = Arc::new(Mutex::new(Vec::new()));
+    let backend_written_bytes = Arc::new(AtomicU64::new(0));
     tokio::spawn(run_fake_backend(
         backend_listener,
         Arc::clone(&backend_transcript),
+        Arc::clone(&backend_written_bytes),
         snapshot_reply,
         proxy_v2,
         send_idle_byte,
+        tls_config.clone(),
     ));
 
     // Dispatch loop with an observable sender and a driven state watch.
@@ -656,7 +991,12 @@ async fn spawn_stack_full(
         unreachable!("sql addr")
     };
     drop(sql_listener);
-    let snapshot = engine_snapshot(sql_addr.port(), proxy_v2, frontend_tls.as_ref());
+    let snapshot = engine_snapshot(
+        sql_addr.port(),
+        proxy_v2,
+        frontend_tls.as_ref(),
+        tls_config.is_some(),
+    );
     let Ok(server) = DataplaneServer::bind(snapshot, Arc::new(SystemMemoryProbe::new())).await
     else {
         unreachable!("dataplane bind")
@@ -682,6 +1022,7 @@ async fn spawn_stack_full(
         backend_port: backend_addr.port(),
         metrics_rx,
         backend_transcript,
+        backend_written_bytes,
     }
 }
 
@@ -689,6 +1030,7 @@ fn engine_snapshot(
     port: u16,
     proxy_v2: bool,
     frontend_tls: Option<&FrontendTlsFixture>,
+    require_backend_tls: bool,
 ) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
     use control_proto::v1::{
         ConfigSnapshot, KeepalivePolicy, Listener, ProxyProtocolMode, StateSnapshot, TlsPolicy,
@@ -727,7 +1069,11 @@ fn engine_snapshot(
             }],
             server_version: "TiProxy-test".to_owned(),
             frontend_tls: Some(frontend_policy),
-            backend_tls: Some(TlsPolicy::default()),
+            backend_tls: Some(TlsPolicy {
+                skip_ca_verification: require_backend_tls,
+                ..TlsPolicy::default()
+            }),
+            require_backend_tls,
             ..ConfigSnapshot::default()
         }),
         ..StateSnapshot::default()
@@ -995,6 +1341,40 @@ async fn wait_sent<F: Fn(&ControlEnvelope) -> bool>(
     None
 }
 
+async fn assert_closed_backend_bytes_include_retired(
+    stack: &Stack,
+    target_written_bytes: &AtomicU64,
+) {
+    let closed = wait_sent(
+        &stack.sender,
+        |envelope| matches!(&envelope.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(ControlEnvelope {
+        body: Some(Body::ConnectionEvent(closed)),
+        ..
+    }) = closed
+    else {
+        unreachable!("successful migration emits CLOSED totals")
+    };
+    for _ in 0..100 {
+        if stack.backend_written_bytes.load(Ordering::Relaxed) > 0
+            && target_written_bytes.load(Ordering::Relaxed) > 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let old_written = stack.backend_written_bytes.load(Ordering::Relaxed);
+    let target_written = target_written_bytes.load(Ordering::Relaxed);
+    assert!(old_written > 0 && target_written > 0);
+    assert_eq!(
+        closed.backend_in_bytes,
+        old_written.saturating_add(target_written),
+        "CLOSED totals retain the retired owner and add the new owner exactly once"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -1254,12 +1634,14 @@ async fn drain_closes_idle_session_and_completes() {
     stack.dispatch_task.abort();
 }
 
-/// A control redirect is refused fail-closed under its exact id (this
-/// slice keeps the backend; Go's refused-migration behavior) and the
-/// session keeps serving.
+/// A control redirect snapshots the old owner, authenticates the target with
+/// the private token, restores the exact escaped state, then atomically swaps
+/// under the exact admitted id. The client connection keeps serving.
 #[tokio::test]
-async fn redirect_refusal_is_exact_and_session_survives() {
+async fn redirect_restores_candidate_and_swaps_atomically() {
     let stack = spawn_stack().await;
+    let (target_port, target_transcript, target_written_bytes) =
+        spawn_fake_backend_server(SnapshotReply::Valid).await;
     spawn_route_answer(&stack, 1, 2);
     let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
         .await
@@ -1276,8 +1658,10 @@ async fn redirect_refusal_is_exact_and_session_survives() {
             connection_id: 1,
             redirect_id: "r-e2e".to_owned(),
             backend_id: "tidb-other".to_owned(),
-            backend_address: "127.0.0.1:1".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
             cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
             deadline_unix_millis: 0,
             command_sequence: 1,
         }),
@@ -1289,48 +1673,121 @@ async fn redirect_refusal_is_exact_and_session_survives() {
     )
     .await;
     let Some(result) = result else {
-        unreachable!("the refused redirect resolves under its exact id")
+        let transcript = stack
+            .backend_transcript
+            .lock()
+            .map_or_else(|_| Vec::new(), |commands| commands.clone());
+        unreachable!("redirect terminal missing; transcript={transcript:?}")
     };
     let Some(Body::RedirectResult(result)) = result.body else {
         unreachable!()
     };
-    assert!(!result.succeeded, "fail-closed refusal in this slice");
+    assert!(result.succeeded, "the restored candidate takes ownership");
+    assert_eq!(result.backend_id, "tidb-other");
     assert!(
         client.query_ok("SELECT after_snapshot").await,
         "the session keeps its backend and keeps serving"
     );
-    let transcript = stack
+    let old_transcript = stack
         .backend_transcript
         .lock()
         .map_or_else(|_| Vec::new(), |commands| commands.clone());
     assert_eq!(
-        transcript
+        old_transcript
             .iter()
             .filter(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES")
             .count(),
         1,
         "MIG-00 captures one snapshot at the redirect safe boundary"
     );
+    let target_transcript = target_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert_eq!(
+        target_transcript
+            .iter()
+            .filter(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"))
+            .count(),
+        1,
+        "MIG-01 restores the candidate exactly once before swap"
+    );
     assert!(
-        transcript.iter().all(|payload| !payload
+        old_transcript.iter().all(|payload| !payload
             .windows(b"signed-token-private".len())
             .any(|window| window == b"signed-token-private")),
         "the signed token is backend-to-proxy only"
     );
-    let before = transcript
+    let before = old_transcript
         .iter()
         .position(|payload| payload.as_slice() == b"\x03SELECT 1");
-    let snapshot = transcript
+    let snapshot = old_transcript
         .iter()
         .position(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES");
-    let after = transcript
+    let restore = target_transcript
+        .iter()
+        .position(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"));
+    let after = target_transcript
         .iter()
         .position(|payload| payload.as_slice() == b"\x03SELECT after_snapshot");
     assert!(
-        matches!((before, snapshot, after), (Some(before), Some(snapshot), Some(after)) if before < snapshot && snapshot < after),
-        "the internal query is serialized between user commands: {transcript:?}"
+        matches!((before, snapshot, restore, after), (Some(before), Some(snapshot), Some(restore), Some(after)) if before < snapshot && restore < after),
+        "snapshot is on the old owner and restore precedes target traffic: old={old_transcript:?} target={target_transcript:?}"
     );
     client.quit().await;
+    assert_closed_backend_bytes_include_retired(&stack, &target_written_bytes).await;
+    stack.dispatch_task.abort();
+}
+
+/// Backend TLS is renegotiated independently for both the original owner and
+/// the migration candidate. The target accepts the token handshake and state
+/// restore only after the plaintext `SSLRequest` has upgraded the socket.
+#[tokio::test]
+async fn redirect_restores_candidate_over_backend_tls() {
+    let stack = spawn_tls_stack(SnapshotReply::Valid).await;
+    let (target_port, target_transcript, target_written_bytes) =
+        spawn_fake_tls_backend_server(SnapshotReply::Valid).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established through backend TLS")
+    };
+    assert!(client.query_ok("SELECT before_tls_redirect").await);
+    let redirect = command_envelope(
+        6149,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-tls".to_owned(),
+            backend_id: "tidb-tls-target".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-tls")
+    })
+    .await;
+    assert!(matches!(
+        result.and_then(|envelope| envelope.body),
+        Some(Body::RedirectResult(result))
+            if result.succeeded && result.backend_id == "tidb-tls-target"
+    ));
+    assert!(client.query_ok("SELECT after_tls_redirect").await);
+    assert!(
+        target_transcript.lock().is_ok_and(|commands| commands
+            .iter()
+            .any(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"))),
+        "the state restore is visible only after the target TLS accept and token auth"
+    );
+    client.quit().await;
+    assert_closed_backend_bytes_include_retired(&stack, &target_written_bytes).await;
     stack.dispatch_task.abort();
 }
 
@@ -1366,6 +1823,8 @@ async fn complete_snapshot_validation_failures_preserve_old_backend() {
                 backend_id: "tidb-other".to_owned(),
                 backend_address: "127.0.0.1:1".to_owned(),
                 cluster_name: String::new(),
+                backend_unhealthy: false,
+                backend_local: true,
                 deadline_unix_millis: 0,
                 command_sequence: 1,
             }),
@@ -1399,6 +1858,205 @@ async fn complete_snapshot_validation_failures_preserve_old_backend() {
     }
 }
 
+/// Candidate-only failures never disturb the aligned old owner: invalid or
+/// expired tokens, restore ERR/disconnect, and an unreachable target all
+/// resolve the exact redirect as failed while the next user command succeeds.
+#[tokio::test]
+async fn candidate_failures_preserve_old_backend() {
+    for behavior in [
+        SnapshotReply::InvalidToken,
+        SnapshotReply::ExpiredToken,
+        SnapshotReply::RestoreError,
+        SnapshotReply::RestoreDisconnect,
+    ] {
+        let stack = spawn_stack_with_snapshot(behavior).await;
+        let (target_port, _, _) = spawn_fake_backend_server(behavior).await;
+        spawn_route_answer(&stack, 1, 2);
+        let Some(mut client) =
+            timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+                .await
+                .ok()
+                .flatten()
+        else {
+            unreachable!("session established for {behavior:?}")
+        };
+        assert!(client.query_ok("SELECT before_candidate_failure").await);
+        let redirect = command_envelope(
+            6150,
+            Body::RedirectCommand(RedirectCommand {
+                connection_id: 1,
+                redirect_id: format!("r-{behavior:?}"),
+                backend_id: "tidb-other".to_owned(),
+                backend_address: format!("127.0.0.1:{target_port}"),
+                cluster_name: String::new(),
+                backend_unhealthy: false,
+                backend_local: true,
+                deadline_unix_millis: 0,
+                command_sequence: 1,
+            }),
+        );
+        let _ = stack.forwarder.handle(redirect).await;
+        let result = wait_sent(&stack.sender, |envelope| {
+            matches!(&envelope.body, Some(Body::RedirectResult(_)))
+        })
+        .await;
+        let Some(ControlEnvelope {
+            body: Some(Body::RedirectResult(result)),
+            ..
+        }) = result
+        else {
+            unreachable!("redirect terminal for {behavior:?}")
+        };
+        assert!(!result.succeeded);
+        assert!(
+            client.query_ok("SELECT after_candidate_failure").await,
+            "candidate-only {behavior:?} failure must preserve the old backend"
+        );
+        client.quit().await;
+        stack.dispatch_task.abort();
+    }
+
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established for unreachable target")
+    };
+    let redirect = command_envelope(
+        6151,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-unreachable".to_owned(),
+            backend_id: "tidb-unreachable".to_owned(),
+            backend_address: "127.0.0.1:1".to_owned(),
+            cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-unreachable")
+    })
+    .await;
+    assert!(matches!(
+        result.and_then(|envelope| envelope.body),
+        Some(Body::RedirectResult(result)) if !result.succeeded
+    ));
+    assert!(client.query_ok("SELECT after_unreachable_target").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+/// An absolute deadline that has already expired prevents candidate I/O and
+/// resolves as one ordinary failed redirect without disturbing the old owner.
+#[tokio::test]
+async fn expired_redirect_deadline_preserves_old_backend() {
+    let stack = spawn_stack().await;
+    let (target_port, target_transcript, target_written_bytes) =
+        spawn_fake_backend_server(SnapshotReply::Valid).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established for expired redirect")
+    };
+    let redirect = command_envelope(
+        6152,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-expired".to_owned(),
+            backend_id: "tidb-expired".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
+            deadline_unix_millis: 1,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-expired")
+    })
+    .await;
+    assert!(matches!(
+        result.and_then(|envelope| envelope.body),
+        Some(Body::RedirectResult(result)) if !result.succeeded
+    ));
+    assert!(
+        target_transcript
+            .lock()
+            .is_ok_and(|commands| commands.is_empty()),
+        "an expired deadline cannot send a candidate handshake"
+    );
+    assert_eq!(
+        target_written_bytes.load(Ordering::Relaxed),
+        0,
+        "the expired attempt never reaches the target socket"
+    );
+    assert!(client.query_ok("SELECT after_expired_redirect").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+/// The router's current health bit is part of the exact target snapshot. A
+/// target already marked unhealthy is rejected before dial and the old owner
+/// remains usable.
+#[tokio::test]
+async fn unhealthy_redirect_target_preserves_old_backend() {
+    let stack = spawn_stack().await;
+    let (target_port, target_transcript, target_written_bytes) =
+        spawn_fake_backend_server(SnapshotReply::Valid).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established for unhealthy redirect")
+    };
+    let redirect = command_envelope(
+        6153,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-unhealthy".to_owned(),
+            backend_id: "tidb-unhealthy".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            backend_unhealthy: true,
+            backend_local: true,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-unhealthy")
+    })
+    .await;
+    assert!(matches!(
+        result.and_then(|envelope| envelope.body),
+        Some(Body::RedirectResult(result)) if !result.succeeded
+    ));
+    assert!(
+        target_transcript
+            .lock()
+            .is_ok_and(|commands| commands.is_empty())
+    );
+    assert_eq!(target_written_bytes.load(Ordering::Relaxed), 0);
+    assert!(client.query_ok("SELECT after_unhealthy_redirect").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
 /// A backend disconnect or an oversized row leaves the internal response
 /// incomplete. The engine reports the redirect terminal exactly once and
 /// closes instead of reusing a poisoned old command stream.
@@ -1425,6 +2083,8 @@ async fn incomplete_snapshot_failures_close_the_session() {
                 backend_id: "tidb-other".to_owned(),
                 backend_address: "127.0.0.1:1".to_owned(),
                 cluster_name: String::new(),
+                backend_unhealthy: false,
+                backend_local: true,
                 deadline_unix_millis: 0,
                 command_sequence: 1,
             }),
@@ -1491,6 +2151,8 @@ async fn control_activity_during_fragmented_command_keeps_wire_intact() {
             backend_id: "tidb-other".to_owned(),
             backend_address: "127.0.0.1:1".to_owned(),
             cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
             deadline_unix_millis: 0,
             command_sequence: 1,
         }),
@@ -2445,7 +3107,7 @@ fn write_frontend_tls_fixture() -> Option<(FrontendTlsFixture, String)> {
 fn client_config_trusting(ca_pem: &str) -> Option<Arc<rustls::ClientConfig>> {
     use rustls::pki_types::pem::PemObject;
     let mut roots = rustls::RootCertStore::empty();
-    let Ok(cert) = rustls::pki_types::CertificateDer::from_pem_slice(ca_pem.as_bytes()) else {
+    let Ok(cert) = CertificateDer::from_pem_slice(ca_pem.as_bytes()) else {
         return None;
     };
     if roots.add(cert).is_err() {
@@ -2982,6 +3644,8 @@ async fn compressed_control_interleave_during_staged_command_keeps_wire_intact()
             backend_id: "tidb-other".to_owned(),
             backend_address: "127.0.0.1:1".to_owned(),
             cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: false,
             deadline_unix_millis: 0,
             command_sequence: 1,
         }),

@@ -173,6 +173,31 @@ pub enum CommandKind {
     Close,
 }
 
+/// Payload-free redirect target delivered with the exact admitted command.
+///
+/// Authentication material and `MySQL` payloads never cross the control
+/// boundary: the target is only the router-selected backend identity and the
+/// issuer's optional deadline. The session engine obtains the signed token and
+/// session state directly from its current backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedirectTarget {
+    /// Stable router accounting id.
+    pub backend_id: String,
+    /// Address selected by the Go router.
+    pub backend_address: String,
+    /// Router-selected cluster scope retained for identity and attribution;
+    /// the candidate still dials the exact `backend_address` above.
+    pub cluster_name: String,
+    /// Router-observed health at issuance. Unhealthy targets are rejected
+    /// before candidate I/O; the negative wire field keeps old peers healthy.
+    pub backend_healthy: bool,
+    /// Router-observed locality for post-swap traffic attribution.
+    pub backend_local: bool,
+    /// Absolute Unix-millisecond deadline; zero uses the bounded dataplane
+    /// per-dial default.
+    pub deadline_unix_millis: u64,
+}
+
 /// One unit on a session's control channel: the control signal plus —
 /// for gate-admitted per-session commands — the token whose id the
 /// completion notice must return. Drain-driven closes carry no token:
@@ -184,6 +209,8 @@ pub struct SessionDirective {
     pub control: SessionControl,
     /// The admitted command identity, when one exists.
     pub command: Option<CommandToken>,
+    /// Exact candidate metadata for a redirect; absent for close/drain.
+    pub redirect_target: Option<RedirectTarget>,
 }
 
 impl SessionDirective {
@@ -193,6 +220,7 @@ impl SessionDirective {
         Self {
             control,
             command: None,
+            redirect_target: None,
         }
     }
 }
@@ -805,6 +833,14 @@ impl ControlCommandHandler {
                         kind: CommandKind::Redirect,
                         id: Arc::from(command.redirect_id.as_str()),
                     }),
+                    redirect_target: Some(RedirectTarget {
+                        backend_id: command.backend_id.clone(),
+                        backend_address: command.backend_address.clone(),
+                        cluster_name: command.cluster_name.clone(),
+                        backend_healthy: !command.backend_unhealthy,
+                        backend_local: command.backend_local,
+                        deadline_unix_millis: command.deadline_unix_millis,
+                    }),
                 };
                 match self.forward(command.connection_id, directive) {
                     ForwardOutcome::Sent => Vec::new(),
@@ -902,6 +938,7 @@ impl ControlCommandHandler {
                         kind: CommandKind::Close,
                         id: Arc::from(command.close_id.as_str()),
                     }),
+                    redirect_target: None,
                 };
                 match self.forward(command.connection_id, directive) {
                     ForwardOutcome::Sent => Vec::new(),

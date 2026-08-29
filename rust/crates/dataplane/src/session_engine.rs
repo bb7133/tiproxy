@@ -63,14 +63,15 @@
 //! `COM_STMT_PREPARE` (the prepared special response flow) are
 //! answered with a fixed unsupported error and the session closes. A
 //! control redirect executes the bounded `SHOW SESSION_STATES` exchange at
-//! the FSM safe boundary, validates the signed token/session JSON, and
-//! synchronizes the authoritative current database. Until MIG-01 installs a
-//! candidate connection, the exact gate terminal remains a fail-closed
-//! refusal: a complete validation/backend-ERR response keeps the old backend,
-//! while a disconnect or incomplete response closes the poisoned session.
+//! the FSM safe boundary, validates the signed token/session JSON, dials and
+//! authenticates the exact gate-admitted target with `tidb_session_token`,
+//! restores the escaped state, and only then atomically replaces the backend
+//! owner. Candidate-side failures drop the candidate while preserving the
+//! aligned old backend; an old-backend disconnect or incomplete snapshot
+//! response closes the poisoned session.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_proto::control_transport::ControlClient;
 use control_proto::v1::control_envelope::Body;
@@ -95,8 +96,9 @@ use proxy_io::tls::{
     DEFAULT_CONN_BUFFER_SIZE, accept_frontend, build_backend_config, connect_backend,
 };
 use session_core::auth::{
-    AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, BackendTlsMode, UNKNOWN_AUTH_PLUGIN,
-    classify_backend_auth_packet, plan_backend_handshake,
+    AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, BackendTlsMode, CompressionSelection,
+    UNKNOWN_AUTH_PLUGIN, classify_backend_auth_packet, compression_selection,
+    plan_backend_handshake, plan_backend_migration_handshake,
 };
 use session_core::command::{
     Command, CommandSessionState, CommandStateEffects, ExpectedResponse, SessionMutation, dispatch,
@@ -119,7 +121,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
-use crate::control_dispatch::{CommandKind, CommandToken, ResponseKind};
+use crate::control_dispatch::{CommandKind, CommandToken, RedirectTarget, ResponseKind};
 use crate::observability::{
     BackendTraffic, MetricsRecorder, Observation, QuitSource, SessionLogContext, log_session,
 };
@@ -250,9 +252,8 @@ async fn write_backend_proxy_v2_header(
 /// Maps a per-leg [`CompressionSelection`] to the codec algorithm, or `None`
 /// when the leg negotiated no compression.
 fn selection_to_compression_algorithm(
-    selection: session_core::auth::CompressionSelection,
+    selection: CompressionSelection,
 ) -> Option<CompressionAlgorithm> {
-    use session_core::auth::CompressionSelection;
     match selection {
         CompressionSelection::None => None,
         CompressionSelection::Zlib => Some(CompressionAlgorithm::Zlib),
@@ -326,12 +327,31 @@ const ER_STMT_PREPARE_UNSUPPORTED: (u16, [u8; 5], &str) = (
     "TiProxy-rs: COM_STMT_PREPARE is not supported yet",
 );
 
+/// Bounds one candidate attempt by both the issuer's absolute deadline and
+/// the dataplane acquisition budget. Zero is the legacy/control default and
+/// still receives a finite bound.
+fn candidate_budget(deadline_unix_millis: u64) -> Duration {
+    let local = DialSchedule::default().total;
+    if deadline_unix_millis == 0 {
+        return local;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let deadline = Duration::from_millis(deadline_unix_millis);
+    deadline.saturating_sub(now).min(local)
+}
+
 /// Commands into the engine task.
 enum EngineCmd {
     /// Execute one FSM effect in order.
     Effect(SessionEffect),
     /// Idle-safe backend liveness probe (KA-003).
     Probe(oneshot::Sender<bool>),
+    /// Bind the exact gate-admitted redirect target before the FSM can emit
+    /// `StartRedirectHandshake`. This command shares the effect FIFO, so the
+    /// target cannot race or be inferred from mutable control state.
+    PrepareRedirect(RedirectTarget),
 }
 
 /// Reports from the engine to the session owner.
@@ -339,7 +359,7 @@ enum EngineCmd {
 enum EngineReport {
     /// A redirect attempt finished.
     RedirectFinished {
-        /// Whether the migration succeeded (always false this slice).
+        /// Whether the migration succeeded.
         succeeded: bool,
         /// The owning backend after the attempt.
         backend_id: String,
@@ -622,6 +642,10 @@ async fn run_bound_session_observed(
         client_io: PacketIo::new(ClientTransport::Plain(client_socket)),
         client_counters,
         backend: None,
+        candidate: None,
+        redirect_target: None,
+        retired_backend_in: 0,
+        retired_backend_out: 0,
         events: event_tx,
         cmds: cmd_rx,
         reports: report_tx,
@@ -724,6 +748,9 @@ async fn run_bound_session_observed(
                         close_token = Some(token.clone());
                     }
                     None => {}
+                }
+                if let Some(target) = directive.redirect_target {
+                    let _ = cmd_tx.send(EngineCmd::PrepareRedirect(target)).await;
                 }
                 if directive.control == SessionControl::CloseImmediate {
                     forced_by_control = true;
@@ -920,6 +947,15 @@ struct Engine {
     /// `CountedIo` in place, so this handle keeps counting the same socket.
     client_counters: Arc<ByteCounters>,
     backend: Option<BackendIo>,
+    /// Fully authenticated/restored redirect target, invisible to command I/O
+    /// until the FSM authorizes the atomic swap.
+    candidate: Option<BackendIo>,
+    /// Exact target carried by the one admitted redirect command.
+    redirect_target: Option<RedirectTarget>,
+    /// Traffic from successfully retired backend owners, retained for the
+    /// connection-lifetime CLOSED event after an atomic swap.
+    retired_backend_in: u64,
+    retired_backend_out: u64,
     events: mpsc::Sender<SessionEvent>,
     cmds: mpsc::Receiver<EngineCmd>,
     reports: mpsc::Sender<EngineReport>,
@@ -979,6 +1015,34 @@ enum SnapshotFailure {
     Desynchronized,
     /// Fixed allowlist construction failed, which is a proxy invariant.
     ProxyInvariant,
+}
+
+/// Secret-free failure class for candidate construction. No variant carries
+/// token, session-state, SQL, or backend payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateFailure {
+    InvalidTarget,
+    Dial,
+    Handshake,
+    Authentication,
+    Restore,
+}
+
+/// Short-lived wire payload containing token or session-state bytes. Its
+/// backing allocation is overwritten on every return path before release;
+/// `Debug` is intentionally unavailable so diagnostics cannot print it.
+struct SensitiveBytes(Vec<u8>);
+
+impl SensitiveBytes {
+    const fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl Drop for SensitiveBytes {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
 }
 
 impl Engine {
@@ -1431,8 +1495,12 @@ impl Engine {
         // plaintext SSLRequest, upgrade the backend transport, then the full
         // handshake response travels inside TLS.
         let backend_tls_result = if matches!(plan.tls, BackendTlsMode::Enabled) {
-            self.upgrade_backend_tls(&mut backend, plan.capabilities)
-                .await
+            self.upgrade_backend_tls(
+                &mut backend,
+                plan.capabilities,
+                self.handshake_budget_remaining(),
+            )
+            .await
         } else {
             Ok(())
         };
@@ -2035,6 +2103,16 @@ impl Engine {
                 let _ = reply.send(self.backend_alive());
                 Awaited::Got
             }
+            EngineCmd::PrepareRedirect(target) => {
+                // The redirect gate admits at most one pending command. Any
+                // second preparation would violate that serialization
+                // contract; retain the first exact target and let the normal
+                // terminal path fail closed if the invariant is ever broken.
+                if self.redirect_target.is_none() && self.candidate.is_none() {
+                    self.redirect_target = Some(target);
+                }
+                Awaited::Got
+            }
             EngineCmd::Effect(effect) => self.handle_effect(effect).await,
         }
     }
@@ -2062,6 +2140,8 @@ impl Engine {
                 Awaited::Got
             }
             SessionEffect::NotifyRedirectFailed => {
+                self.candidate = None;
+                self.redirect_target = None;
                 let _ = self
                     .reports
                     .send(EngineReport::RedirectFinished {
@@ -2097,8 +2177,30 @@ impl Engine {
                 self.wire_end.get_or_insert(WireErrorSource::Proxy);
                 Awaited::Closing
             }
-            SessionEffect::SwapBackend
-            | SessionEffect::ActivateFrontendTls
+            SessionEffect::SwapBackend => {
+                let Some(candidate) = self.candidate.take() else {
+                    self.closing = true;
+                    self.wire_end = Some(WireErrorSource::Proxy);
+                    return Awaited::Closing;
+                };
+                let Some(previous) = self.backend.replace(candidate) else {
+                    self.closing = true;
+                    self.wire_end = Some(WireErrorSource::Proxy);
+                    return Awaited::Closing;
+                };
+                self.retired_backend_in = self
+                    .retired_backend_in
+                    .saturating_add(previous.counters.inbound());
+                self.retired_backend_out = self
+                    .retired_backend_out
+                    .saturating_add(previous.counters.outbound());
+                self.redirect_target = None;
+                // Dropping the previous sole owner closes it only after the
+                // restored candidate has been installed atomically.
+                drop(previous);
+                Awaited::Got
+            }
+            SessionEffect::ActivateFrontendTls
             | SessionEffect::SendProxyGreeting
             | SessionEffect::DialBackend
             | SessionEffect::ForwardHandshakeToBackend
@@ -2120,16 +2222,43 @@ impl Engine {
 
     async fn handle_redirect_snapshot(&mut self) {
         // MIG-00 binds the bounded snapshot query to the production socket
-        // owner at the FSM safe boundary. MIG-01 (#43) will consume the
-        // validated token/state to build a candidate; until then this slice
-        // still reports a refused redirect and keeps the old backend when the
-        // response is wire-complete.
+        // owner at the FSM safe boundary. MIG-01 consumes the validated
+        // token/state only inside this task, builds a fully restored candidate,
+        // and exposes it to the FSM only after the restore OK is consumed.
         match self.capture_migration_snapshot().await {
             Ok(snapshot) => {
                 if let Some(state) = self.cmd_state.as_mut() {
                     state.replace_current_database_from_snapshot(snapshot.current_database());
                 }
-                let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+                let Some(target) = self.redirect_target.clone() else {
+                    let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+                    return;
+                };
+                let budget = candidate_budget(target.deadline_unix_millis);
+                if budget.is_zero() {
+                    // Do not poll the connect future even once after an
+                    // absolute deadline has expired: polling may already
+                    // initiate target-side I/O before `timeout(0, ..)` wins.
+                    let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+                    return;
+                }
+                let candidate = tokio::time::timeout(
+                    budget,
+                    self.establish_migration_candidate(&target, &snapshot),
+                )
+                .await;
+                match candidate {
+                    Ok(Ok(candidate)) => {
+                        self.candidate = Some(candidate);
+                        let _ = self.events.send(SessionEvent::RedirectBackendReady).await;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // The candidate is local to the future and is dropped
+                        // on every error/cancellation. The old backend remains
+                        // the sole visible owner and stays sequence-aligned.
+                        let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+                    }
+                }
             }
             Err(SnapshotFailure::OldBackendUsable) => {
                 let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
@@ -2205,6 +2334,279 @@ impl Engine {
                     return Err(SnapshotFailure::OldBackendUsable);
                 }
                 Err(_) => return Err(SnapshotFailure::Desynchronized),
+            }
+        }
+    }
+
+    /// Dials, authenticates, and restores one redirect target without making
+    /// it visible to the command path. The caller owns the overall timeout;
+    /// cancellation drops the local socket and every secret-bearing buffer.
+    async fn establish_migration_candidate(
+        &mut self,
+        target: &RedirectTarget,
+        snapshot: &SessionStateSnapshot,
+    ) -> Result<BackendIo, CandidateFailure> {
+        if target.backend_id.is_empty()
+            || target.backend_address.is_empty()
+            || !target.backend_healthy
+        {
+            return Err(CandidateFailure::InvalidTarget);
+        }
+        let stream = tokio::net::TcpStream::connect(&target.backend_address)
+            .await
+            .map_err(|_| {
+                self.metrics.try_record(Observation::DialBackendFailed {
+                    backend: target.backend_address.clone(),
+                });
+                CandidateFailure::Dial
+            })?;
+        let mut backend_socket = CountedIo::new(stream);
+        let counters = backend_socket.counters();
+        if self.proxy_protocol_v2_enabled() {
+            let client_src = self
+                .inbound_proxy_client
+                .unwrap_or(self.endpoints.client_addr);
+            write_backend_proxy_v2_header(&mut backend_socket, client_src)
+                .await
+                .map_err(|_| CandidateFailure::Dial)?;
+        }
+        let mut candidate = BackendIo {
+            backend_io: PacketIo::new(BackendTransport::Plain(backend_socket)),
+            counters,
+            id: target.backend_id.clone(),
+            address: target.backend_address.clone(),
+            cluster: target.cluster_name.clone(),
+            local: target.backend_local,
+        };
+        let greeting = candidate
+            .backend_io
+            .read_logical(HANDSHAKE_PAYLOAD_LIMIT)
+            .await
+            .map_err(|_| CandidateFailure::Handshake)?;
+        let backend_greeting = mysql_wire::parse_initial_handshake(&greeting.payload)
+            .map_err(|_| CandidateFailure::Handshake)?;
+        let backend_caps = backend_greeting.capabilities;
+        let (require_backend_tls, backend_tls_available) = self.backend_tls_policy();
+        verify_backend(
+            backend_caps,
+            self.negotiated,
+            proxy_capabilities(self.frontend_tls_available()),
+            require_backend_tls,
+        )
+        .map_err(|_| CandidateFailure::Handshake)?;
+
+        let parsed = parse_handshake_response(&self.client_handshake_raw)
+            .map_err(|_| CandidateFailure::Handshake)?;
+        let attributes = parsed.attributes.map(|attributes| {
+            attributes
+                .into_iter()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        });
+        let plan = plan_backend_migration_handshake(
+            self.negotiated,
+            attributes.is_some(),
+            backend_caps,
+            require_backend_tls,
+            backend_tls_available,
+        )
+        .map_err(|_| CandidateFailure::Handshake)?;
+
+        if matches!(plan.tls, BackendTlsMode::Enabled) {
+            self.upgrade_backend_tls(
+                &mut candidate,
+                plan.capabilities,
+                candidate_budget(target.deadline_unix_millis),
+            )
+            .await
+            .map_err(|_| CandidateFailure::Handshake)?;
+        }
+
+        let capabilities = self
+            .authenticate_migration_candidate(
+                &mut candidate,
+                snapshot,
+                plan.capabilities,
+                backend_caps,
+            )
+            .await?;
+        self.restore_candidate_state(&mut candidate, snapshot.session_states(), capabilities)
+            .await?;
+        if let Some(policy) = self
+            .seat
+            .snapshot()
+            .raw()
+            .config
+            .as_ref()
+            .and_then(|config| config.healthy_backend_keepalive)
+        {
+            let Some(counted) = candidate.backend_io.get_ref().as_counted_stream() else {
+                return Err(CandidateFailure::Handshake);
+            };
+            let _ = proxy_io::socket::apply_keepalive(
+                counted.get_ref(),
+                crate::server::snapshot_keepalive(&policy),
+            );
+        }
+        Ok(candidate)
+    }
+
+    /// Sends the fixed session-token handshake and consumes its sole terminal
+    /// response. Returns the exact capability mask governing the restored
+    /// command channel.
+    async fn authenticate_migration_candidate(
+        &self,
+        candidate: &mut BackendIo,
+        snapshot: &SessionStateSnapshot,
+        planned_capabilities: CapabilityFlags,
+        backend_caps: CapabilityFlags,
+    ) -> Result<CapabilityFlags, CandidateFailure> {
+        // Go's second handshake uses the signed token as auth data under the
+        // fixed `tidb_session_token` plugin. The authoritative current-db from
+        // SHOW SESSION_STATES replaces (and may clear) the original database.
+        let parsed = parse_handshake_response(&self.client_handshake_raw)
+            .map_err(|_| CandidateFailure::Handshake)?;
+        let attributes = parsed.attributes.map(|attributes| {
+            attributes
+                .into_iter()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        });
+        let database = snapshot.current_database().map(str::as_bytes);
+        let mut capabilities = planned_capabilities.union(CapabilityFlags::PLUGIN_AUTH);
+        capabilities = if database.is_some() {
+            if !backend_caps.contains(CapabilityFlags::CONNECT_WITH_DB) {
+                return Err(CandidateFailure::Handshake);
+            }
+            capabilities.union(CapabilityFlags::CONNECT_WITH_DB)
+        } else {
+            capabilities.without(CapabilityFlags::CONNECT_WITH_DB)
+        };
+        capabilities = if snapshot.session_token().len() > 250 {
+            if !backend_caps.contains(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA) {
+                return Err(CandidateFailure::Handshake);
+            }
+            capabilities.union(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA)
+        } else {
+            capabilities.without(CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA)
+        };
+        let response = encode_handshake_response(HandshakeResponseParams {
+            capabilities,
+            max_packet_size: parsed.max_packet_size,
+            collation: parsed.collation,
+            username: parsed.username,
+            auth_response: snapshot.session_token().as_bytes(),
+            database,
+            auth_plugin_name: Some(b"tidb_session_token"),
+            attributes: attributes.as_deref(),
+            zstd_level: parsed.zstd_level,
+        })
+        .map_err(|_| CandidateFailure::Handshake)?;
+        let response = SensitiveBytes::new(response);
+        if !matches!(candidate.backend_io.get_ref(), BackendTransport::Tls(_)) {
+            let next = candidate.backend_io.expected_read_sequence();
+            candidate.backend_io.reset_write_sequence(next);
+        }
+        candidate
+            .backend_io
+            .write_logical(&response.0, true)
+            .await
+            .map_err(|_| CandidateFailure::Handshake)?;
+        candidate
+            .backend_io
+            .reset_read_sequence(candidate.backend_io.next_write_sequence());
+        let auth_result = candidate
+            .backend_io
+            .read_logical(HANDSHAKE_PAYLOAD_LIMIT)
+            .await
+            .map_err(|_| CandidateFailure::Handshake)?;
+        match classify_backend_auth_packet(&auth_result.payload, capabilities) {
+            Ok(AuthEvent::BackendOk) => {}
+            Ok(AuthEvent::BackendError { .. }) => {
+                return Err(CandidateFailure::Authentication);
+            }
+            Ok(_) | Err(_) => return Err(CandidateFailure::Handshake),
+        }
+
+        // The auth OK is the exact MySQL boundary where the backend leg switches
+        // to compressed framing. The restore query that follows must therefore
+        // run through the negotiated codec, independently of the client leg.
+        if let Some(algorithm) = selection_to_compression_algorithm(compression_selection(
+            capabilities,
+            parsed.zstd_level.unwrap_or(0),
+        )) {
+            Self::activate_candidate_backend_compression(candidate, algorithm)?;
+        }
+        Ok(capabilities)
+    }
+
+    /// Activates compression on a fully authenticated migration candidate
+    /// without exposing it to the command path. This mirrors the normal backend
+    /// auth-OK activation seam, but maps invariant failures to the candidate-only
+    /// rollback path so the old backend remains usable.
+    fn activate_candidate_backend_compression(
+        candidate: &mut BackendIo,
+        algorithm: CompressionAlgorithm,
+    ) -> Result<(), CandidateFailure> {
+        let endpoint = std::mem::replace(
+            &mut candidate.backend_io,
+            PacketIo::new(BackendTransport::Detached),
+        );
+        let (transport, upgrade_state, prefix) = endpoint.into_upgrade_parts();
+        if !prefix.is_empty()
+            || matches!(
+                &transport,
+                BackendTransport::Detached | BackendTransport::Compressed(_)
+            )
+        {
+            return Err(CandidateFailure::Handshake);
+        }
+        let compressed = CompressedIo::new(transport, algorithm, CompressionLimits::default())
+            .map_err(|_| CandidateFailure::Handshake)?;
+        candidate.backend_io = PacketIo::from_upgrade_parts(
+            BackendTransport::Compressed(Box::new(compressed)),
+            upgrade_state,
+        );
+        Ok(())
+    }
+
+    /// Restores the exact escaped state and consumes a complete OK before the
+    /// candidate can become visible. Any error drops only the candidate.
+    async fn restore_candidate_state(
+        &self,
+        candidate: &mut BackendIo,
+        session_states: &str,
+        capabilities: CapabilityFlags,
+    ) -> Result<(), CandidateFailure> {
+        let limits = InternalLimits::default();
+        let query = InternalQuery::SetSessionStates(session_states);
+        let request = SensitiveBytes::new(
+            query
+                .encode(limits)
+                .map_err(|_| CandidateFailure::Restore)?,
+        );
+        let mut parser = query
+            .parser(capabilities, limits)
+            .map_err(|_| CandidateFailure::Restore)?;
+        send_proxy_owned_query(&mut candidate.backend_io, &request.0)
+            .await
+            .map_err(|_| CandidateFailure::Restore)?;
+        loop {
+            let payload = candidate
+                .backend_io
+                .read_logical(limits.max_result_bytes)
+                .await
+                .map_err(|_| CandidateFailure::Restore)?
+                .payload;
+            match parser
+                .consume(&payload)
+                .map_err(|_| CandidateFailure::Restore)?
+            {
+                InternalProgress::Continue => {}
+                InternalProgress::Complete(InternalResult::Ok(_)) => return Ok(()),
+                InternalProgress::Complete(InternalResult::SessionStates(_)) => {
+                    return Err(CandidateFailure::Restore);
+                }
             }
         }
     }
@@ -2498,6 +2900,7 @@ impl Engine {
         &self,
         backend: &mut BackendIo,
         capabilities: CapabilityFlags,
+        timeout: Duration,
     ) -> Result<(), WireErrorSource> {
         // The SSLRequest mirrors the client's max packet size and collation —
         // the same values the forwarded handshake response carries.
@@ -2522,7 +2925,6 @@ impl Engine {
             return Err(WireErrorSource::Proxy);
         };
         let server_name = backend_server_name(&backend.address);
-        let timeout = self.handshake_budget_remaining();
         // Move the endpoint out for the value-consuming upgrade; the
         // sequence/counter state travels in the token, the raw socket in the
         // transport. `Detached` holds the field meanwhile and is never polled.
@@ -2647,14 +3049,16 @@ impl Engine {
         TrafficTotals {
             client_in: self.client_counters.inbound(),
             client_out: self.client_counters.outbound(),
-            backend_in: self
-                .backend
-                .as_ref()
-                .map_or(0, |backend| backend.counters.inbound()),
-            backend_out: self
-                .backend
-                .as_ref()
-                .map_or(0, |backend| backend.counters.outbound()),
+            backend_in: self.retired_backend_in.saturating_add(
+                self.backend
+                    .as_ref()
+                    .map_or(0, |backend| backend.counters.inbound()),
+            ),
+            backend_out: self.retired_backend_out.saturating_add(
+                self.backend
+                    .as_ref()
+                    .map_or(0, |backend| backend.counters.outbound()),
+            ),
         }
     }
 
@@ -2785,8 +3189,8 @@ fn fill_salt(salt: &mut [u8; 20]) {
     } else {
         // Entropy failure: derive a non-constant fallback rather than a
         // fixed salt.
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
         for (index, byte) in salt.iter_mut().enumerate() {
             *byte = (seed
@@ -2803,8 +3207,8 @@ fn fill_salt(salt: &mut [u8; 20]) {
 #[cfg(test)]
 mod tls_wiring_tests {
     use super::{
-        backend_server_name, leading_capabilities, normalize_leading_capabilities,
-        proxy_capabilities,
+        backend_server_name, candidate_budget, leading_capabilities,
+        normalize_leading_capabilities, proxy_capabilities,
     };
     use mysql_wire::{
         CapabilityFlags, HandshakeResponseParams, encode_handshake_response, encode_ssl_request,
@@ -2919,5 +3323,14 @@ mod tls_wiring_tests {
         assert_eq!(backend_server_name("[::1]:4000"), "::1");
         // A bare host with no port is used verbatim.
         assert_eq!(backend_server_name("localhost"), "localhost");
+    }
+
+    #[test]
+    fn migration_candidate_deadline_is_always_bounded() {
+        assert_eq!(candidate_budget(0), super::DialSchedule::default().total);
+        assert!(
+            candidate_budget(1).is_zero(),
+            "an already-expired absolute deadline cannot start candidate I/O"
+        );
     }
 }

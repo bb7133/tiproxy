@@ -283,6 +283,14 @@ message RedirectCommand {
   // acts). Additive; zero only for peers predating
   // RECONCILE_SESSION_REHYDRATION.
   uint64 command_sequence = 7;
+  // Backward-compatible negative form: peers predating this field encode
+  // false, which retains the historical assumption that router-issued
+  // redirect targets are healthy. A current peer sets true when the target
+  // has become unhealthy so the dataplane rejects the candidate before dial.
+  bool backend_unhealthy = 8;
+  // Router-observed locality for post-swap lifecycle/traffic attribution.
+  // Older peers default to the conservative non-local value.
+  bool backend_local = 9;
 }
 
 message RedirectResult {

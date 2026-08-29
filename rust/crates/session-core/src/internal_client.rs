@@ -31,6 +31,7 @@ use mysql_wire::{
     ResponseKind, StatusFlags, classify_response, encode_command_packet, parse_eof_packet,
     parse_error_packet, parse_ok_packet,
 };
+use zeroize::Zeroize;
 
 const SHOW_SESSION_STATES: &[u8] = b"SHOW SESSION_STATES";
 const SET_SESSION_STATES_PREFIX: &[u8] = b"SET SESSION_STATES '";
@@ -314,6 +315,16 @@ impl fmt::Debug for SessionStateSnapshot {
             .field("status", &self.status)
             .field("warnings", &self.warnings)
             .finish()
+    }
+}
+
+impl Drop for SessionStateSnapshot {
+    fn drop(&mut self) {
+        self.session_states.zeroize();
+        self.session_token.zeroize();
+        if let Some(current_database) = self.current_database.as_mut() {
+            current_database.zeroize();
+        }
     }
 }
 
