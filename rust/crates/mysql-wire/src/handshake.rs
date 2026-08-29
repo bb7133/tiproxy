@@ -869,17 +869,18 @@ mod tests {
     }
 
     #[test]
-    fn ssl_request_encode_round_trips_through_parse() {
+    fn ssl_request_encode_round_trips_through_parse() -> Result<(), Box<dyn std::error::Error>> {
         let capabilities = CLIENT_CAPS | CapabilityFlags::SSL;
         let encoded = encode_ssl_request(capabilities, 0x0100_0000, 45);
         assert_eq!(encoded.len(), SSL_REQUEST_BYTES);
         // The 23 reserved bytes are zero.
         assert_eq!(encoded[9..], [0_u8; 23]);
-        let parsed = parse_ssl_request(&encoded).expect("round-trips");
+        let parsed = parse_ssl_request(&encoded)?;
         assert_eq!(parsed.capabilities, capabilities);
         assert_eq!(parsed.max_packet_size, 0x0100_0000);
         assert_eq!(parsed.collation, 45);
         assert!(parsed.capabilities.contains(CapabilityFlags::SSL));
+        Ok(())
     }
 
     #[test]

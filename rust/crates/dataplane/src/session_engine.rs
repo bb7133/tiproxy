@@ -2435,3 +2435,60 @@ fn fill_salt(salt: &mut [u8; 20]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tls_wiring_tests {
+    use super::{backend_server_name, leading_capabilities, proxy_capabilities};
+    use mysql_wire::{CapabilityFlags, encode_ssl_request, parse_ssl_request};
+
+    #[test]
+    fn proxy_capabilities_advertise_ssl_only_when_available() {
+        assert!(
+            proxy_capabilities(true).contains(CapabilityFlags::SSL),
+            "a frontend TLS config advertises SSL"
+        );
+        assert!(
+            !proxy_capabilities(false).contains(CapabilityFlags::SSL),
+            "no frontend TLS config strips SSL so advertisement matches capability"
+        );
+        // Everything except SSL is identical across the two, so only the SSL
+        // bit is governed per snapshot.
+        assert_eq!(
+            proxy_capabilities(true).without(CapabilityFlags::SSL),
+            proxy_capabilities(false),
+        );
+    }
+
+    #[test]
+    fn leading_capabilities_reads_the_ssl_bit() {
+        // A strict 32-byte SSLRequest with SSL set classifies as SSL.
+        let ssl_request = encode_ssl_request(
+            CapabilityFlags::PROTOCOL_41 | CapabilityFlags::SSL,
+            0x0100_0000,
+            45,
+        );
+        assert!(leading_capabilities(&ssl_request).contains(CapabilityFlags::SSL));
+        assert!(parse_ssl_request(&ssl_request).is_ok());
+
+        // A plaintext-first packet without the SSL bit does not.
+        let plain = encode_ssl_request(CapabilityFlags::PROTOCOL_41, 0x0100_0000, 45);
+        assert!(!leading_capabilities(&plain).contains(CapabilityFlags::SSL));
+
+        // A truncated leading window carries no SSL bit and falls through to
+        // the (fail-closed) handshake parser.
+        assert!(!leading_capabilities(&[0xff, 0xff]).contains(CapabilityFlags::SSL));
+        assert!(!leading_capabilities(&[]).contains(CapabilityFlags::SSL));
+    }
+
+    #[test]
+    fn backend_server_name_is_the_host_without_port_or_brackets() {
+        assert_eq!(
+            backend_server_name("tidb.example.com:4000"),
+            "tidb.example.com"
+        );
+        assert_eq!(backend_server_name("127.0.0.1:4000"), "127.0.0.1");
+        assert_eq!(backend_server_name("[::1]:4000"), "::1");
+        // A bare host with no port is used verbatim.
+        assert_eq!(backend_server_name("localhost"), "localhost");
+    }
+}
