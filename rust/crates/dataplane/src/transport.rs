@@ -35,6 +35,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use proxy_io::compression::CompressedIo;
 use proxy_io::counted::CountedIo;
 use proxy_io::tls::{BackendTls, FrontendTls};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -52,6 +53,12 @@ pub enum ClientTransport {
     Plain(CountedIo<TcpStream>),
     /// Server-side TLS over the byte-counted client socket.
     Tls(FrontendTls<CountedIo<TcpStream>>),
+    /// `MySQL` compressed framing over the client transport, itself either
+    /// plaintext or TLS (compression is the OUTERMOST transport layer, above
+    /// TLS, mirroring Go's `compressedReadWriter -> tlsReadWriter ->
+    /// basicReadWriter`). Activated after authentication when the client
+    /// negotiated `COMPRESS`/`ZSTD` (slice C); boxed to keep this enum sized.
+    Compressed(Box<CompressedIo<ClientTransport>>),
     /// Transient placeholder installed only while a TLS upgrade moves the
     /// concrete socket out of the endpoint (across the `accept` await). The
     /// engine never reads or writes the endpoint in this window — it either
@@ -78,6 +85,7 @@ impl AsyncRead for ClientTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_read(context, buf),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_read(context, buf),
+            Self::Compressed(inner) => Pin::new(&mut **inner).poll_read(context, buf),
             Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
@@ -92,6 +100,7 @@ impl AsyncWrite for ClientTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_write(context, data),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_write(context, data),
+            Self::Compressed(inner) => Pin::new(&mut **inner).poll_write(context, data),
             Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
@@ -100,6 +109,7 @@ impl AsyncWrite for ClientTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_flush(context),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_flush(context),
+            Self::Compressed(inner) => Pin::new(&mut **inner).poll_flush(context),
             Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
@@ -108,6 +118,7 @@ impl AsyncWrite for ClientTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_shutdown(context),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_shutdown(context),
+            Self::Compressed(inner) => Pin::new(&mut **inner).poll_shutdown(context),
             Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
@@ -125,6 +136,11 @@ pub enum BackendTransport {
     Plain(CountedIo<TcpStream>),
     /// Client-side TLS over the byte-counted backend socket.
     Tls(BackendTls<CountedIo<TcpStream>>),
+    /// `MySQL` compressed framing over the backend transport, itself either
+    /// plaintext or TLS (compression is the OUTERMOST transport layer, above
+    /// TLS). Activated after authentication when the backend negotiated
+    /// `COMPRESS`/`ZSTD` (slice C); boxed to keep this enum sized.
+    Compressed(Box<CompressedIo<BackendTransport>>),
     /// Transient placeholder installed only while a TLS upgrade moves the
     /// concrete socket out of the endpoint (across the `connect` await). The
     /// engine never reads or writes the endpoint in this window — it either
@@ -145,6 +161,7 @@ impl BackendTransport {
         match self {
             Self::Plain(inner) => Some(inner),
             Self::Tls(inner) => Some(inner.stream.get_ref().0),
+            Self::Compressed(inner) => inner.get_ref().as_counted_stream(),
             Self::Detached => None,
         }
     }
@@ -159,6 +176,7 @@ impl AsyncRead for BackendTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_read(context, buf),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_read(context, buf),
+            Self::Compressed(inner) => Pin::new(&mut **inner).poll_read(context, buf),
             Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
@@ -173,6 +191,7 @@ impl AsyncWrite for BackendTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_write(context, data),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_write(context, data),
+            Self::Compressed(inner) => Pin::new(&mut **inner).poll_write(context, data),
             Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
@@ -181,6 +200,7 @@ impl AsyncWrite for BackendTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_flush(context),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_flush(context),
+            Self::Compressed(inner) => Pin::new(&mut **inner).poll_flush(context),
             Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
@@ -189,6 +209,7 @@ impl AsyncWrite for BackendTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_shutdown(context),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_shutdown(context),
+            Self::Compressed(inner) => Pin::new(&mut **inner).poll_shutdown(context),
             Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
