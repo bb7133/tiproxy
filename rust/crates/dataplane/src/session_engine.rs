@@ -73,8 +73,8 @@ use control_proto::control_transport::ControlClient;
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     ConnectionIdentity, ControlEnvelope, ErrorCode, ErrorSource as WireErrorSource,
-    HandshakeMetadata, HandshakeResponseEvent, Priority, RouteAssignment, RouteRequest,
-    RouteResult,
+    HandshakeMetadata, HandshakeResponseEvent, Priority, ProxyProtocolMode, RouteAssignment,
+    RouteRequest, RouteResult,
 };
 use mysql_wire::{
     CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags, encode_error_packet,
@@ -82,6 +82,9 @@ use mysql_wire::{
     parse_handshake_response, parse_ssl_request,
 };
 use proxy_io::PacketIo;
+use proxy_io::proxy_protocol::{
+    EncodeAddresses, ProxyCommand, ProxyVersion, TransportProtocol, encode_proxy_v2,
+};
 use proxy_io::tls::{
     DEFAULT_CONN_BUFFER_SIZE, accept_frontend, build_backend_config, connect_backend,
 };
@@ -106,6 +109,7 @@ use session_core::response::{
     DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseObserver,
     ResponsePacket,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
@@ -196,6 +200,39 @@ fn backend_server_name(address: &str) -> String {
     host.trim_start_matches('[')
         .trim_end_matches(']')
         .to_owned()
+}
+
+/// Writes a PROXY protocol v2 header announcing the original client as the
+/// source and the dialed backend as the destination, straight to the raw
+/// backend socket before any `MySQL` byte. The family is unified across a
+/// mixed client/backend IP pair exactly like Go's `unifyIPFamily`.
+///
+/// Any failure (unresolvable backend peer, encode, or write) fails closed as a
+/// backend-network error — the preamble must reach the backend intact before
+/// the handshake, so a partial or absent header is never tolerated.
+async fn write_backend_proxy_v2_header(
+    conn: &mut tokio::net::TcpStream,
+    client_addr: std::net::SocketAddr,
+) -> Result<(), WireErrorSource> {
+    let Ok(backend_addr) = conn.peer_addr() else {
+        return Err(WireErrorSource::BackendNetwork);
+    };
+    let Ok(header) = encode_proxy_v2(
+        ProxyVersion::V2,
+        ProxyCommand::PROXY,
+        TransportProtocol::STREAM,
+        EncodeAddresses::Ip {
+            src: (client_addr.ip(), client_addr.port()),
+            dst: (backend_addr.ip(), backend_addr.port()),
+        },
+        &[],
+    ) else {
+        return Err(WireErrorSource::Proxy);
+    };
+    if conn.write_all(&header).await.is_err() {
+        return Err(WireErrorSource::BackendNetwork);
+    }
+    Ok(())
 }
 
 /// Handshake-phase logical payload bound.
@@ -500,6 +537,7 @@ async fn run_bound_session_observed(
         namespace: namespace.clone(),
         generation: seat.snapshot().generation(),
     };
+
     let (mut directives, responses, commander) = binding.split();
 
     let (event_tx, event_rx) = mpsc::channel(1);
@@ -510,6 +548,7 @@ async fn run_bound_session_observed(
     let engine = Engine {
         connection_id: identity.connection_id,
         endpoints,
+        inbound_proxy_client: None,
         client_io: PacketIo::new(ClientTransport::Plain(stream)),
         backend: None,
         events: event_tx,
@@ -796,6 +835,10 @@ struct PendingCommand {
 struct Engine {
     connection_id: u64,
     endpoints: ConnectionEndpoints,
+    /// The real client address from an inbound PROXY v2 header, when the
+    /// listener consumed one — used ONLY as the source of the outbound backend
+    /// PROXY header, never for routing/admission/identity.
+    inbound_proxy_client: Option<std::net::SocketAddr>,
     client_io: PacketIo<ClientTransport>,
     backend: Option<BackendIo>,
     events: mpsc::Sender<SessionEvent>,
@@ -919,6 +962,29 @@ impl Engine {
         }
         if let Err(source) = self.send_greeting().await {
             return Some(source);
+        }
+
+        // PROXY protocol v2 inbound (WIRE-activation B): once the greeting is
+        // flushed, run a one-shot probe before the first client packet. A LB's
+        // header is already buffered (sent before the greeting) and is consumed
+        // here — its source becomes the outbound header's source; a direct
+        // client, woken by the greeting, sends its handshake response, whose
+        // leading bytes are peeked as non-magic and left intact (so it is never
+        // blocked). The header wire bytes are not a MySQL packet and never
+        // advance the sequence; a malformed header fails closed.
+        if self.proxy_protocol_v2_enabled() {
+            // The probe consumes the remaining absolute handshake budget (not a
+            // fresh timer): a truncated header, or a client that opens the
+            // connection but sends nothing, fails closed at the deadline with no
+            // fallback, matching the frozen partial-header contract.
+            let budget = self.handshake_budget_remaining();
+            let probe = tokio::time::timeout(budget, self.client_io.probe_inbound_proxy_v2());
+            let Ok(Ok(source)) = probe.await else {
+                self.quit_source = QuitSource::ProxyMalformed;
+                let _ = self.events.send(SessionEvent::ClientIoError).await;
+                return Some(WireErrorSource::ClientNetwork);
+            };
+            self.inbound_proxy_client = source;
         }
 
         // First client packet after the greeting. A client that sets `SSL`
@@ -1151,7 +1217,7 @@ impl Engine {
             self.connection_id,
         );
         let acquisition_started = tokio::time::Instant::now();
-        let acquired = match route_engine.acquire(Vec::new()).await {
+        let mut acquired = match route_engine.acquire(Vec::new()).await {
             Ok(acquired) => {
                 self.metrics.try_record(Observation::GetBackend {
                     duration: acquisition_started.elapsed(),
@@ -1206,6 +1272,27 @@ impl Engine {
                     crate::server::snapshot_keepalive(&policy),
                 );
             }
+        }
+        // PROXY protocol v2 (WIRE-activation B): when the snapshot enables it,
+        // announce the ORIGINAL client address to the backend as a raw preamble
+        // that precedes every MySQL byte. Written straight to the socket before
+        // it is wrapped in MySQL framing (and before any backend TLS upgrade),
+        // matching Go's dial path — the header is a transport preamble, not a
+        // MySQL packet, so it must bypass the PacketIo sequence framing.
+        let proxy_v2_result = if self.proxy_protocol_v2_enabled() {
+            // Source is the original client: the inbound PROXY header's address
+            // when the listener consumed one, else this connection's own peer.
+            let client_src = self
+                .inbound_proxy_client
+                .unwrap_or(self.endpoints.client_addr);
+            write_backend_proxy_v2_header(&mut acquired.conn, client_src).await
+        } else {
+            Ok(())
+        };
+        if let Err(source) = proxy_v2_result {
+            self.quit_source = QuitSource::BackendHandshake;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(source);
         }
         let mut backend = BackendIo {
             backend_io: PacketIo::new(BackendTransport::Plain(acquired.conn)),
@@ -2146,6 +2233,23 @@ impl Engine {
         let require = config.is_some_and(|config| config.require_backend_tls);
         let available = config.is_some_and(|config| config.backend_tls.is_some());
         (require, available)
+    }
+
+    /// Whether this session's snapshot enables the PROXY protocol v2 preamble
+    /// on the backend dial (Go `proxy-protocol = "v2"`). The snapshot validator
+    /// only admits `disabled`/`v2`, so any other value is treated as disabled.
+    fn proxy_protocol_v2_enabled(&self) -> bool {
+        self.seat
+            .snapshot()
+            .raw()
+            .config
+            .as_ref()
+            .is_some_and(|config| {
+                matches!(
+                    ProxyProtocolMode::try_from(config.proxy_protocol),
+                    Ok(ProxyProtocolMode::V2)
+                )
+            })
     }
 
     /// Upgrades the backend transport to client-side TLS in place. Sends the

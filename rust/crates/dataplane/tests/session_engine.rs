@@ -492,6 +492,14 @@ async fn spawn_stack() -> Stack {
 }
 
 async fn spawn_stack_with_snapshot(snapshot_reply: SnapshotReply) -> Stack {
+    spawn_stack_full(snapshot_reply, false, Duration::from_secs(5)).await
+}
+
+async fn spawn_stack_full(
+    snapshot_reply: SnapshotReply,
+    proxy_v2: bool,
+    handshake_deadline: Duration,
+) -> Stack {
     // Fake backend.
     let Ok(backend_listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
         unreachable!("backend bind")
@@ -553,7 +561,7 @@ async fn spawn_stack_with_snapshot(snapshot_reply: SnapshotReply) -> Stack {
             shutdown_rx,
             drain_rx,
             SessionLoopConfig {
-                handshake_deadline: Duration::from_secs(5),
+                handshake_deadline,
                 drain_deadline: Duration::from_millis(400),
                 backend_check_interval: Duration::from_secs(60),
                 cleanup_deadline: Duration::from_secs(2),
@@ -572,7 +580,7 @@ async fn spawn_stack_with_snapshot(snapshot_reply: SnapshotReply) -> Stack {
         unreachable!("sql addr")
     };
     drop(sql_listener);
-    let snapshot = engine_snapshot(sql_addr.port());
+    let snapshot = engine_snapshot(sql_addr.port(), proxy_v2);
     let Ok(server) = DataplaneServer::bind(snapshot, Arc::new(SystemMemoryProbe::new())).await
     else {
         unreachable!("dataplane bind")
@@ -601,9 +609,14 @@ async fn spawn_stack_with_snapshot(snapshot_reply: SnapshotReply) -> Stack {
     }
 }
 
-fn engine_snapshot(port: u16) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
+fn engine_snapshot(port: u16, proxy_v2: bool) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
     use control_proto::v1::{
         ConfigSnapshot, KeepalivePolicy, Listener, ProxyProtocolMode, StateSnapshot, TlsPolicy,
+    };
+    let proxy_protocol = if proxy_v2 {
+        ProxyProtocolMode::V2
+    } else {
+        ProxyProtocolMode::Disabled
     };
     let keepalive = KeepalivePolicy {
         enabled: true,
@@ -619,7 +632,7 @@ fn engine_snapshot(port: u16) -> Arc<control_proto::snapshot::ValidatedSnapshot>
             frontend_keepalive: Some(keepalive),
             healthy_backend_keepalive: Some(keepalive),
             unhealthy_backend_keepalive: Some(keepalive),
-            proxy_protocol: ProxyProtocolMode::Disabled as i32,
+            proxy_protocol: proxy_protocol as i32,
             listeners: vec![Listener {
                 address: "127.0.0.1".to_owned(),
                 port: u32::from(port),
@@ -2055,4 +2068,64 @@ async fn forced_shutdown_still_emits_session_closed() {
     );
     let _ = slow.await;
     stack.dispatch_task.abort();
+}
+
+/// WIRE-activation B (stalled partial inbound PROXY v2): with `proxy_protocol =
+/// v2`, the client-leg probe runs after the greeting and consumes the remaining
+/// absolute handshake budget. A client that opens the connection and sends only
+/// a partial magic prefix, then stalls, must be closed fail-closed at the
+/// handshake deadline — never routing, never dialing a backend, and never
+/// hanging past the budget. This locks the production timeout seam so removing
+/// the wrapper regresses.
+#[tokio::test]
+async fn stalled_partial_proxy_header_fails_closed_at_the_handshake_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let handshake_deadline = Duration::from_millis(300);
+    let stack = spawn_stack_full(SnapshotReply::Valid, true, handshake_deadline).await;
+
+    let Ok(mut client) = TcpStream::connect(("127.0.0.1", stack.sql_port)).await else {
+        unreachable!("connect to the proxy listener")
+    };
+    // Send only two of the four magic bytes and then stall: the probe's first
+    // raw read can never complete, so it must block until the handshake budget
+    // expires.
+    let Ok(()) = client
+        .write_all(&proxy_io::proxy_protocol::MAGIC_V2[..2])
+        .await
+    else {
+        unreachable!("send a partial PROXY magic")
+    };
+    client.flush().await.ok();
+
+    // Bounded well above the deadline: the proxy must close the socket (drain
+    // the greeting bytes, then observe EOF/reset) within the handshake budget.
+    let closed = timeout(handshake_deadline + Duration::from_secs(3), async {
+        let mut scratch = [0_u8; 512];
+        loop {
+            match client.read(&mut scratch).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "a stalled partial PROXY header must close within the handshake budget, not hang"
+    );
+
+    // The probe fails before any routing or dial, so no backend was contacted.
+    let Ok(transcript) = stack.backend_transcript.lock() else {
+        unreachable!("transcript lock")
+    };
+    assert!(
+        transcript.is_empty(),
+        "a stalled partial PROXY header must never reach a backend"
+    );
+    drop(transcript);
+
+    stack.shutdown_tx.send(true).ok();
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
 }
