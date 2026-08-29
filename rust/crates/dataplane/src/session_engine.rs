@@ -82,7 +82,9 @@ use mysql_wire::{
     parse_handshake_response, parse_ssl_request,
 };
 use proxy_io::PacketIo;
+use proxy_io::compression::{CompressedIo, CompressionAlgorithm, CompressionLimits};
 use proxy_io::counted::{ByteCounters, CountedIo};
+use proxy_io::direction::DirectionSync;
 use proxy_io::proxy_protocol::{
     EncodeAddresses, ProxyCommand, ProxyVersion, TransportProtocol, encode_proxy_v2,
 };
@@ -135,8 +137,9 @@ use crate::transport::{BackendTransport, ClientTransport};
 /// The proxy's full advertised capability set, including `SSL`. `SSL` is
 /// retained or stripped per session by [`proxy_capabilities`] according to
 /// whether that session's snapshot carries a frontend TLS server config.
-/// Compression bits are still not advertised (never negotiated, so the relay's
-/// compression effects are unreachable) until the WIRE-activation C slice.
+/// `COMPRESS` and `ZSTD_COMPRESSION_ALGORITHM` are advertised (WIRE-activation
+/// C): a client that negotiates either activates compressed framing at the
+/// auth-OK boundary.
 fn proxy_capability_base() -> CapabilityFlags {
     CapabilityFlags::LONG_PASSWORD
         | CapabilityFlags::FOUND_ROWS
@@ -160,6 +163,8 @@ fn proxy_capability_base() -> CapabilityFlags {
         | CapabilityFlags::CONNECT_ATTRS
         | CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA
         | CapabilityFlags::DEPRECATE_EOF
+        | CapabilityFlags::COMPRESS
+        | CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM
 }
 
 /// The proxy capabilities for one session: the full base with `SSL`
@@ -237,6 +242,21 @@ async fn write_backend_proxy_v2_header(
         return Err(WireErrorSource::BackendNetwork);
     }
     Ok(())
+}
+
+/// Maps a per-leg [`CompressionSelection`] to the codec algorithm, or `None`
+/// when the leg negotiated no compression.
+fn selection_to_compression_algorithm(
+    selection: session_core::auth::CompressionSelection,
+) -> Option<CompressionAlgorithm> {
+    use session_core::auth::CompressionSelection;
+    match selection {
+        CompressionSelection::None => None,
+        CompressionSelection::Zlib => Some(CompressionAlgorithm::Zlib),
+        CompressionSelection::Zstd { level } => Some(CompressionAlgorithm::Zstd {
+            level: i32::from(level),
+        }),
+    }
 }
 
 /// Handshake-phase logical payload bound.
@@ -1579,7 +1599,12 @@ impl Engine {
                 return None;
             }
             // Every client command starts a fresh wire exchange at
-            // sequence zero, and its response lineage answers at one.
+            // sequence zero, and its response lineage answers at one. On a
+            // compressed leg the compressed sequence also resets once per
+            // command (Go's `ResetSequence`); the first read/write then slaves
+            // the uncompressed sequence to it via the direction hooks. A no-op
+            // for a plaintext/TLS client leg.
+            self.client_io.get_mut().reset_layer_sequence();
             self.client_io.reset_read_sequence(0);
             // Between commands: serve control effects and probes while
             // waiting for the next client command. Only the peek is
@@ -1737,6 +1762,10 @@ impl Engine {
         let Some(backend) = self.backend.as_mut() else {
             return Some(WireErrorSource::Proxy);
         };
+        // Reset the backend compressed sequence once for this command (no-op on
+        // a plaintext/TLS backend leg); the direction hooks re-slave the
+        // uncompressed sequence on the next write/read.
+        backend.backend_io.get_mut().reset_layer_sequence();
         backend.backend_io.reset_write_sequence(0);
         backend.backend_io.reset_read_sequence(1);
         if backend
@@ -2165,18 +2194,25 @@ impl Engine {
                         return Err(WireErrorSource::BackendNetwork);
                     }
                 }
-                AuthEffect::ActivateClientCompression(
-                    session_core::auth::CompressionSelection::None,
-                )
-                | AuthEffect::ActivateBackendCompression(
-                    session_core::auth::CompressionSelection::None,
-                ) => {}
-                AuthEffect::ActivateClientCompression(_)
-                | AuthEffect::ActivateBackendCompression(_)
-                | AuthEffect::ReconnectBackend => {
-                    // Compression is never negotiated (the greeting
-                    // withholds it) and reconnect is never approved in
-                    // this slice.
+                AuthEffect::ActivateClientCompression(selection) => {
+                    // At the auth-OK boundary Go calls setCompress on the client
+                    // leg; a `None` selection is a no-op, otherwise wrap the
+                    // client transport in compressed framing (WIRE-C).
+                    if let Some(algorithm) = selection_to_compression_algorithm(*selection) {
+                        self.activate_client_compression(algorithm).await?;
+                    }
+                }
+                AuthEffect::ActivateBackendCompression(selection) => {
+                    // The backend leg negotiates independently (client caps
+                    // masked by backend caps), so it may pick a different
+                    // algorithm or none.
+                    if let Some(algorithm) = selection_to_compression_algorithm(*selection) {
+                        self.activate_backend_compression(algorithm).await?;
+                    }
+                }
+                AuthEffect::ReconnectBackend => {
+                    // Reconnect (session migration) is never approved in this
+                    // slice.
                     return Err(WireErrorSource::Proxy);
                 }
             }
@@ -2248,6 +2284,86 @@ impl Engine {
         self.client_io =
             PacketIo::from_upgrade_parts(ClientTransport::Tls(frontend), upgrade_state);
         self.frontend_tls_active = true;
+        Ok(())
+    }
+
+    /// Wraps the client transport in `MySQL` compressed framing in place after
+    /// authentication. Compression is the OUTERMOST transport layer (above any
+    /// TLS), so it wraps the whole client transport, preserving the packet
+    /// sequence trackers and framing counters across the swap. Activation lands
+    /// at a clean command boundary (the auth-OK packet was just forwarded), so
+    /// the prefetch prefix must be empty; a non-empty prefix, an already-wrapped
+    /// transport, or a codec/config error fails closed.
+    async fn activate_client_compression(
+        &mut self,
+        algorithm: CompressionAlgorithm,
+    ) -> Result<(), WireErrorSource> {
+        let endpoint = std::mem::replace(
+            &mut self.client_io,
+            PacketIo::new(ClientTransport::Detached),
+        );
+        let (transport, upgrade_state, prefix) = endpoint.into_upgrade_parts();
+        if !prefix.is_empty()
+            || matches!(
+                &transport,
+                ClientTransport::Detached | ClientTransport::Compressed(_)
+            )
+        {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::Proxy);
+        }
+        let Ok(compressed) = CompressedIo::new(transport, algorithm, CompressionLimits::default())
+        else {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::Proxy);
+        };
+        self.client_io = PacketIo::from_upgrade_parts(
+            ClientTransport::Compressed(Box::new(compressed)),
+            upgrade_state,
+        );
+        Ok(())
+    }
+
+    /// Wraps the backend transport in `MySQL` compressed framing in place, as
+    /// [`Self::activate_client_compression`] does for the client leg. The
+    /// backend leg negotiates independently, so its algorithm may differ.
+    async fn activate_backend_compression(
+        &mut self,
+        algorithm: CompressionAlgorithm,
+    ) -> Result<(), WireErrorSource> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Err(WireErrorSource::Proxy);
+        };
+        let endpoint = std::mem::replace(
+            &mut backend.backend_io,
+            PacketIo::new(BackendTransport::Detached),
+        );
+        let (transport, upgrade_state, prefix) = endpoint.into_upgrade_parts();
+        if !prefix.is_empty()
+            || matches!(
+                &transport,
+                BackendTransport::Detached | BackendTransport::Compressed(_)
+            )
+        {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Err(WireErrorSource::Proxy);
+        }
+        let Ok(compressed) = CompressedIo::new(transport, algorithm, CompressionLimits::default())
+        else {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Err(WireErrorSource::Proxy);
+        };
+        let Some(backend) = self.backend.as_mut() else {
+            return Err(WireErrorSource::Proxy);
+        };
+        backend.backend_io = PacketIo::from_upgrade_parts(
+            BackendTransport::Compressed(Box::new(compressed)),
+            upgrade_state,
+        );
         Ok(())
     }
 

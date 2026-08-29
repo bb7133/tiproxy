@@ -70,12 +70,13 @@ enum Command {
 
 /// The integration harness's capability contract (DPL-07): only what
 /// this binary truthfully provides today. TLS (frontend `SSLRequest` +
-/// backend TLS, WIRE-activation A1) and the PROXY v2 backend preamble
-/// (WIRE-activation B) are wired, so `tls` and `proxy-v2` are advertised;
-/// compression is still not wired, so `zlib`/`zstd` remain absent and the
-/// topology preflight admits plain, tls, and proxy.
+/// backend TLS, WIRE-activation A1), the PROXY v2 backend preamble
+/// (WIRE-activation B), and `MySQL` compression (zlib + zstd, WIRE-activation
+/// C) are all wired, so `tls`, `proxy-v2`, `zlib`, and `zstd` are advertised
+/// and the topology preflight admits plain, tls, proxy, and compressed
+/// variants.
 const INTEGRATION_CAPABILITIES: &str =
-    "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2";
+    "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -432,19 +433,13 @@ mod tests {
         };
         assert_eq!(
             INTEGRATION_CAPABILITIES,
-            "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2",
-            "only what the binary truthfully provides: the plain slice plus wired TLS and PROXY v2"
+            "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
+            "only what the binary truthfully provides: the plain slice plus wired TLS, PROXY v2, and compression"
         );
-        for wired in ["tls", "proxy-v2"] {
+        for wired in ["tls", "proxy-v2", "zlib", "zstd"] {
             assert!(
                 INTEGRATION_CAPABILITIES.contains(wired),
-                "{wired:?} is wired (WIRE-activation A1/B), so it must be advertised"
-            );
-        }
-        for absent in ["zlib", "zstd"] {
-            assert!(
-                !INTEGRATION_CAPABILITIES.contains(absent),
-                "unimplemented variant capability {absent:?} must not be advertised"
+                "{wired:?} is wired (WIRE-activation A1/B/C), so it must be advertised"
             );
         }
     }
