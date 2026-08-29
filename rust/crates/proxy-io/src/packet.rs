@@ -324,6 +324,14 @@ impl ReaderState {
         &self.raw_prefix[self.raw_prefix_start..]
     }
 
+    /// Whether any peeked-but-unconsumed bytes remain above the transport — in
+    /// the `MySQL` prefetch window or the staged raw prefix. A small command a
+    /// `peek_packet` decoded can sit entirely here while the compression layer's
+    /// own read buffer looks empty, so a layered-sequence reset must see it.
+    const fn has_buffered_read(&self) -> bool {
+        self.prefetch_end > self.prefetch_start || self.raw_prefix_start < self.raw_prefix.len()
+    }
+
     async fn peek_packet(
         &mut self,
         inner: &mut (impl AsyncRead + Unpin),
@@ -1410,6 +1418,35 @@ impl<T> PacketIo<T> {
             read: state.read,
             write: state.write,
         }
+    }
+}
+
+impl<T> PacketIo<T>
+where
+    T: DirectionSync,
+{
+    /// Resets the layered (compression) sequence at a clean command boundary,
+    /// the once-per-command reset the session owner calls.
+    ///
+    /// Fails closed if a command is still staged ABOVE the transport — in the
+    /// read prefetch or raw-prefix window — or buffered INSIDE the transport
+    /// layer. A small command a `peek_packet` decoded can sit entirely in the
+    /// packet prefetch while the compression layer's own read buffer is empty,
+    /// so both must be clean before the shared sequence is reset; otherwise the
+    /// reset would silently rewind the sequence over live command bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a framing error when unread prefetch/raw-prefix bytes remain, or
+    /// propagates the transport layer's in-flight rejection.
+    pub fn reset_layer_sequence(&mut self) -> io::Result<()> {
+        if self.read.has_buffered_read() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot reset the layered sequence with a staged command in the read prefetch",
+            ));
+        }
+        self.inner.reset_layer_sequence()
     }
 }
 

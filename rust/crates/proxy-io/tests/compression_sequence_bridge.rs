@@ -317,10 +317,14 @@ async fn ready_peek_interleave_does_not_rewind_and_unguarded_reset_fails_closed(
     assert_eq!(preview.first_byte, Some(0x03));
 
     // The unguarded reset (what a naive re-entry after control activity would
-    // do) now fails closed instead of rewinding the staged command to 0.
-    let reset = io.get_mut().reset_layer_sequence();
+    // do) now fails closed instead of rewinding the staged command to 0. This
+    // exercises the PRODUCTION `PacketIo::reset_layer_sequence` the engine calls
+    // (not the transport-level `get_mut().reset_layer_sequence()`): it sees the
+    // staged command — here in the packet prefetch AND in the compression layer's
+    // decoded remainder — and refuses to rewind over live command bytes.
+    let reset = io.reset_layer_sequence();
     let error = reset.err().ok_or("the unguarded reset must fail closed")?;
-    assert!(is_reset_with_buffered(&error));
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
     // The guarded path takes over: read the staged command, then answer.
     let command = io.read_logical(64 * 1024).await?;
@@ -337,6 +341,43 @@ async fn ready_peek_interleave_does_not_rewind_and_unguarded_reset_fails_closed(
         1,
         "the guarded response is emitted at compressed sequence 1, not 0"
     );
+    Ok(())
+}
+
+/// The prefetch blind spot the `PacketIo`-level reset closes. `COM_PING` has a
+/// 1-byte payload, so its whole 5-byte `MySQL` packet (`[0x01,0x00,0x00,0x00,
+/// 0x0e]`) is exactly the packet prefetch window: after `peek_packet` ALL five
+/// bytes sit in `PacketIo`'s prefetch and `CompressedIo`'s own read buffer is
+/// empty. The transport-level reset only inspects the codec's buffer, so it
+/// WRONGLY reports a clean boundary — the blind spot — while the production
+/// `PacketIo::reset_layer_sequence` also inspects the prefetch and fails closed.
+///
+/// Unlike `ready_peek_interleave_...` (a multi-byte command that leaves a decoded
+/// remainder INSIDE `CompressedIo`, so even the transport reset fails), here the
+/// codec buffer is genuinely empty; only the `PacketIo`-level check catches it.
+#[tokio::test]
+async fn small_command_in_prefetch_only_packet_level_reset_fails_closed() -> TestResult {
+    let algorithm = CompressionAlgorithm::Zlib;
+    let mut io = compressed_packet_io(command_frame(algorithm, &[0x0e])?, algorithm)?;
+
+    // The idle peek drains the whole COM_PING frame into the packet prefetch; the
+    // compression layer's read buffer is now empty.
+    let preview = io.peek_packet().await?;
+    assert_eq!(preview.first_byte, Some(0x0e));
+
+    // The transport-level reset sees only the (empty) codec buffer, so it wrongly
+    // returns Ok — the silent rewind the PacketIo-level check exists to prevent.
+    io.get_mut()
+        .reset_layer_sequence()
+        .map_err(|_| "the transport-level reset sees a clean codec here (the blind spot)")?;
+
+    // The production PacketIo-level reset also inspects the packet prefetch, sees
+    // the staged COM_PING, and fails closed.
+    let reset = io.reset_layer_sequence();
+    let error = reset
+        .err()
+        .ok_or("the PacketIo-level reset must fail closed on the staged prefetch")?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     Ok(())
 }
 

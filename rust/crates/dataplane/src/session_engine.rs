@@ -262,6 +262,45 @@ fn selection_to_compression_algorithm(
     }
 }
 
+/// Failure of the fresh-exchange send for a proxy-owned query.
+pub enum ProxyOwnedQueryError {
+    /// The layered (compression) sequence could not be reset to a clean command
+    /// boundary because a frame is still in flight.
+    LayeredReset,
+    /// The request could not be written to the backend.
+    Send,
+}
+
+/// Starts a fresh proxy-owned command exchange on a backend [`PacketIo`]:
+/// resets the compression layer to sequence zero (Go `cmd_processor_query`
+/// parity), resets the packet write/read sequences, then sends `request`.
+///
+/// This is the single production seam for a proxy-owned query's reset+send, so
+/// the migration snapshot and its regression exercise the same code. Deleting
+/// the layered reset makes the sent frame carry the previous exchange's stale
+/// compressed sequence, which the regression catches.
+///
+/// # Errors
+///
+/// [`ProxyOwnedQueryError::LayeredReset`] if the compressed layer is not at a
+/// clean boundary; [`ProxyOwnedQueryError::Send`] if the write fails.
+pub async fn send_proxy_owned_query<T>(
+    io: &mut PacketIo<T>,
+    request: &[u8],
+) -> Result<(), ProxyOwnedQueryError>
+where
+    T: tokio::io::AsyncWrite + Unpin + DirectionSync,
+{
+    io.reset_layer_sequence()
+        .map_err(|_| ProxyOwnedQueryError::LayeredReset)?;
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    io.write_logical(request, true)
+        .await
+        .map_err(|_| ProxyOwnedQueryError::Send)?;
+    Ok(())
+}
+
 /// Handshake-phase logical payload bound.
 const HANDSHAKE_PAYLOAD_LIMIT: usize = 64 * 1024;
 /// Client command / infile chunk payload bound for this slice.
@@ -1632,7 +1671,7 @@ impl Engine {
             // sequence to it via the direction hooks. Skip the compressed reset
             // when merely re-entering after control activity, so a staged next
             // command is not rewound; the reset fails closed on in-flight data.
-            if !just_served_control && self.client_io.get_mut().reset_layer_sequence().is_err() {
+            if !just_served_control && self.client_io.reset_layer_sequence().is_err() {
                 self.quit_source = QuitSource::ProxyError;
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::Proxy);
@@ -1804,7 +1843,7 @@ impl Engine {
         // a plaintext/TLS backend leg); the direction hooks re-slave the
         // uncompressed sequence on the next write/read. Fails closed on
         // in-flight data.
-        if backend.backend_io.get_mut().reset_layer_sequence().is_err() {
+        if backend.backend_io.reset_layer_sequence().is_err() {
             self.quit_source = QuitSource::ProxyError;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::Proxy);
@@ -2137,21 +2176,15 @@ impl Engine {
         // This proxy-owned `SHOW SESSION_STATES` is a fresh command exchange, so
         // on a compressed backend it must start from compressed sequence zero —
         // Go's `cmd_processor_query.go` calls `ResetSequence()` before every
-        // proxy-owned query. Without this the backend compressed sequence would
-        // carry over from the last user command. Fails closed on in-flight data.
-        if backend.backend_io.get_mut().reset_layer_sequence().is_err() {
-            return Err(SnapshotFailure::ProxyInvariant);
-        }
-        backend.backend_io.reset_write_sequence(0);
-        backend.backend_io.reset_read_sequence(1);
-        if backend
-            .backend_io
-            .write_logical(&request, true)
+        // proxy-owned query. The shared `send_proxy_owned_query` seam performs
+        // that layered + packet reset and the send; the migration-snapshot
+        // regression exercises the same helper.
+        send_proxy_owned_query(&mut backend.backend_io, &request)
             .await
-            .is_err()
-        {
-            return Err(SnapshotFailure::BackendNetwork);
-        }
+            .map_err(|error| match error {
+                ProxyOwnedQueryError::LayeredReset => SnapshotFailure::ProxyInvariant,
+                ProxyOwnedQueryError::Send => SnapshotFailure::BackendNetwork,
+            })?;
 
         loop {
             let payload = backend

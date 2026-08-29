@@ -38,7 +38,7 @@ use dataplane::control_dispatch::{
 };
 use dataplane::observability::{MetricsRecorder, Observation, QuitSource};
 use dataplane::session::SessionLoopConfig;
-use dataplane::session_engine::EngineSessionOwner;
+use dataplane::session_engine::{EngineSessionOwner, send_proxy_owned_query};
 use dataplane::{
     BoundSessionHandler, DataplaneServer, DispatchConnectionHandler, SystemMemoryProbe,
 };
@@ -2826,6 +2826,26 @@ impl CompressedClient {
         }
     }
 
+    /// Stages `bytes` as ONE complete compressed frame and flushes, writing raw
+    /// bytes straight to the compressed transport (bypassing `write_logical`) so a
+    /// single frame can carry only PART of the next `MySQL` command packet — the
+    /// deterministic trigger for the proxy's idle `peek_packet` to decode-and-stage
+    /// a partial command. `fresh` resets the shared compressed sequence to zero
+    /// first (a new command boundary); a continuation frame passes `fresh = false`.
+    async fn stage_raw_frame(&mut self, bytes: &[u8], fresh: bool) -> bool {
+        let transport = self.io.get_mut();
+        if fresh && transport.reset_layer_sequence().is_err() {
+            return false;
+        }
+        if transport.begin_write().is_err() {
+            return false;
+        }
+        if transport.write_all(bytes).await.is_err() {
+            return false;
+        }
+        transport.flush().await.is_ok()
+    }
+
     async fn quit(mut self) {
         let _ = self.io.get_mut().reset_layer_sequence();
         self.io.reset_read_sequence(0);
@@ -2903,6 +2923,93 @@ async fn compressed_client_zlib_roundtrips_end_to_end() {
 #[tokio::test]
 async fn compressed_client_zstd_roundtrips_end_to_end() {
     compressed_client_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
+}
+
+/// Contract #1 cancel-safety over COMPRESSION, exercising the real
+/// `Engine::command_phase` (the compressed sibling of
+/// `control_activity_during_fragmented_command_keeps_wire_intact`): a control
+/// command winning the engine's idle select while a compressed frame carrying
+/// only PART of the next command is already peeked-and-staged must NOT rewind the
+/// shared compressed sequence. The engine's `just_served_control` guard skips the
+/// once-per-command compressed reset on control re-entry, so the staged bytes
+/// survive and the command still round-trips.
+///
+/// DETERMINISTIC trigger: the client sends a complete compressed frame carrying
+/// only the first 2 bytes of the next command's `MySQL` packet. The proxy's
+/// `peek_packet` decodes that frame (compressed sequence -> 1; 2 decoded bytes
+/// staged in the packet prefetch) yet returns Pending (it needs the 5-byte
+/// header), then the redirect control command wins the idle select.
+///
+/// DISCRIMINABILITY (verified manually by deleting the guard): without
+/// `just_served_control`, the control re-entry calls `PacketIo::reset_layer_sequence`
+/// while the 2 staged bytes sit in the read prefetch -> it fails closed -> the
+/// session tears down -> the deadline-bounded response read below never completes.
+#[tokio::test]
+async fn compressed_control_interleave_during_staged_command_keeps_wire_intact() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        CompressedClient::connect(stack.sql_port, CompressionAlgorithm::Zlib),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("compressed session established")
+    };
+    // One normal compressed query reaches a clean command boundary.
+    assert!(client.query_ok("SELECT 1").await);
+
+    // Build the next command and send ONLY its first 2 bytes as one complete
+    // compressed frame: the proxy peeks + stages a partial command (2 decoded
+    // bytes in the packet prefetch) yet cannot form the 5-byte header.
+    let payload = b"\x03SELECT 6";
+    let mut packet = vec![u8::try_from(payload.len()).unwrap_or(0), 0, 0, 0];
+    packet.extend_from_slice(payload);
+    assert!(
+        client.stage_raw_frame(&packet[..2], true).await,
+        "the partial-command compressed frame is staged"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A redirect control command wins the engine's idle select while the frame
+    // is staged; control is served (RedirectResult emitted) mid-command.
+    let redirect = command_envelope(
+        6002,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-cfrag".to_owned(),
+            backend_id: "tidb-other".to_owned(),
+            backend_address: "127.0.0.1:1".to_owned(),
+            cluster_name: String::new(),
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let refused = wait_sent(&stack.sender, |e| {
+        matches!(&e.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-cfrag")
+    })
+    .await;
+    assert!(
+        refused.is_some(),
+        "control served while the frame is staged"
+    );
+
+    // Complete the command as a second compressed frame: the staged bytes must
+    // not have been rewound. A desynced engine never answers, so the response
+    // read is deadline-bounded.
+    assert!(
+        client.stage_raw_frame(&packet[2..], false).await,
+        "the command completes as a continuation compressed frame"
+    );
+    let Ok(Ok(response)) = timeout(Duration::from_secs(5), client.io.read_logical(64 * 1024)).await
+    else {
+        unreachable!("the staged compressed command still round-trips at the correct sequence")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+    client.quit().await;
+    stack.dispatch_task.abort();
 }
 
 // ---------------------------------------------------------------------
@@ -3174,4 +3281,54 @@ async fn compressed_backend_snapshot_reset_fails_closed_on_staged_frame() {
         wrapped,
         Some(CompressionError::ResetWithBufferedData { .. })
     ));
+}
+
+/// The production `send_proxy_owned_query` seam resets the compressed layer to
+/// sequence zero before sending, so a proxy-owned query starts a FRESH exchange
+/// even when the shared compressed sequence carried over non-zero from the last
+/// user command. Production `capture_migration_snapshot` calls this exact helper,
+/// so this locks the migration snapshot's fresh-exchange invariant.
+///
+/// DISCRIMINABILITY: deleting the `io.reset_layer_sequence()` line inside
+/// `send_proxy_owned_query` would leave the sent frame at the stale non-zero
+/// compressed sequence, and the `Some(0)` assertion below would fail.
+#[tokio::test]
+async fn send_proxy_owned_query_opens_at_fresh_compressed_sequence_zero() {
+    // A prior user command's response, so we can run one real exchange first and
+    // advance the shared compressed sequence off zero.
+    let prior_ok = model_mysql_packet(b"\x00\x00\x00\x02\x00\x00\x00", 1);
+    let Some(mut io) = backend_leg(model_raw_frame(&prior_ok, 1)) else {
+        unreachable!("the compressed backend leg builds")
+    };
+
+    // --- Prior user command: advances the shared compressed sequence off zero.
+    let Ok(()) = io.get_mut().reset_layer_sequence() else {
+        unreachable!("the clean per-command reset succeeds")
+    };
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    let Ok(()) = io.write_logical(b"\x03SELECT prior_cmd", true).await else {
+        unreachable!("the prior user command writes")
+    };
+    let Ok(response) = io.read_logical(64 * 1024).await else {
+        unreachable!("the prior command's OK response reads back")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+    assert_ne!(
+        io.get_ref().inner.codec().sequence(),
+        0,
+        "the prior exchange left the shared compressed sequence non-zero"
+    );
+
+    // --- Proxy-owned query via the production seam: it resets the layered +
+    // packet sequence to zero, then sends — mirroring capture_migration_snapshot.
+    let owned_start = io.get_ref().inner.get_ref().output.len();
+    let Ok(()) = send_proxy_owned_query(&mut io, b"\x03SHOW SESSION_STATES").await else {
+        unreachable!("the proxy-owned query resets and sends on a clean boundary")
+    };
+    assert_eq!(
+        output_frame_sequence(&io, owned_start),
+        Some(0),
+        "send_proxy_owned_query opens the exchange at a fresh compressed sequence 0"
+    );
 }
