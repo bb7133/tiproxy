@@ -37,6 +37,7 @@ use std::task::{Context, Poll};
 
 use proxy_io::compression::CompressedIo;
 use proxy_io::counted::CountedIo;
+use proxy_io::direction::DirectionSync;
 use proxy_io::tls::{BackendTls, FrontendTls};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -211,6 +212,56 @@ impl AsyncWrite for BackendTransport {
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_shutdown(context),
             Self::Compressed(inner) => Pin::new(&mut **inner).poll_shutdown(context),
             Self::Detached => Poll::Ready(Err(detached_error())),
+        }
+    }
+}
+
+/// Maps a compression codec error into a transport `io::Error` so the packet
+/// layer's direction hooks can fail closed.
+fn compression_io_error(error: proxy_io::compression::CompressionError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
+impl DirectionSync for ClientTransport {
+    fn begin_read(&mut self) -> std::io::Result<Option<u8>> {
+        match self {
+            Self::Compressed(inner) => inner.begin_read().map_err(compression_io_error),
+            _ => Ok(None),
+        }
+    }
+
+    fn begin_write(&mut self) -> std::io::Result<Option<u8>> {
+        match self {
+            Self::Compressed(inner) => inner.begin_write().map_err(compression_io_error),
+            _ => Ok(None),
+        }
+    }
+
+    fn reset_layer_sequence(&mut self) {
+        if let Self::Compressed(inner) = self {
+            inner.reset_sequence();
+        }
+    }
+}
+
+impl DirectionSync for BackendTransport {
+    fn begin_read(&mut self) -> std::io::Result<Option<u8>> {
+        match self {
+            Self::Compressed(inner) => inner.begin_read().map_err(compression_io_error),
+            _ => Ok(None),
+        }
+    }
+
+    fn begin_write(&mut self) -> std::io::Result<Option<u8>> {
+        match self {
+            Self::Compressed(inner) => inner.begin_write().map_err(compression_io_error),
+            _ => Ok(None),
+        }
+    }
+
+    fn reset_layer_sequence(&mut self) {
+        if let Self::Compressed(inner) = self {
+            inner.reset_sequence();
         }
     }
 }
