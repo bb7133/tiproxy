@@ -74,13 +74,15 @@ use control_proto::v1::{
 };
 use mysql_wire::{
     CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags, encode_error_packet,
-    encode_handshake_response, encode_initial_handshake, parse_handshake_response,
-    parse_ssl_request,
+    encode_handshake_response, encode_initial_handshake, encode_ssl_request,
+    parse_handshake_response, parse_ssl_request,
 };
 use proxy_io::PacketIo;
-use proxy_io::tls::{DEFAULT_CONN_BUFFER_SIZE, accept_frontend};
+use proxy_io::tls::{
+    DEFAULT_CONN_BUFFER_SIZE, accept_frontend, build_backend_config, connect_backend,
+};
 use session_core::auth::{
-    AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, UNKNOWN_AUTH_PLUGIN,
+    AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, BackendTlsMode, UNKNOWN_AUTH_PLUGIN,
     classify_backend_auth_packet, plan_backend_handshake,
 };
 use session_core::command::{
@@ -171,6 +173,16 @@ fn leading_capabilities(payload: &[u8]) -> CapabilityFlags {
     }
     let bits = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     CapabilityFlags::from_bits_retain(bits)
+}
+
+/// The SNI/server name for a backend TLS handshake: the host of a `host:port`
+/// routing address, with any IPv6 brackets stripped (Go: "use the DNS name as
+/// much as possible"; both DNS names and IP literals parse as a server name).
+fn backend_server_name(address: &str) -> String {
+    let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned()
 }
 
 /// Handshake-phase logical payload bound.
@@ -1201,11 +1213,12 @@ impl Engine {
             return Some(WireErrorSource::BackendNetwork);
         };
         let backend_caps = backend_greeting.capabilities;
+        let (require_backend_tls, backend_tls_available) = self.backend_tls_policy();
         if verify_backend(
             backend_caps,
             self.negotiated,
             proxy_capabilities(self.frontend_tls_available()),
-            false,
+            require_backend_tls,
         )
         .is_err()
         {
@@ -1213,11 +1226,30 @@ impl Engine {
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
         }
-        let Ok(plan) = plan_backend_handshake(&routing, backend_caps, false, false) else {
+        let Ok(plan) = plan_backend_handshake(
+            &routing,
+            backend_caps,
+            require_backend_tls,
+            backend_tls_available,
+        ) else {
             self.quit_source = QuitSource::BackendHandshake;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::Proxy);
         };
+        // Backend TLS activates before any credential leaves the proxy: send a
+        // plaintext SSLRequest, upgrade the backend transport, then the full
+        // handshake response travels inside TLS.
+        let backend_tls_result = if matches!(plan.tls, BackendTlsMode::Enabled) {
+            self.upgrade_backend_tls(&mut backend, plan.capabilities)
+                .await
+        } else {
+            Ok(())
+        };
+        if let Err(source) = backend_tls_result {
+            self.quit_source = QuitSource::BackendHandshake;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(source);
+        }
         self.backend = Some(backend);
         if self
             .events
@@ -1270,10 +1302,15 @@ impl Engine {
             forwarded
         };
         if let Some(backend) = self.backend.as_mut() {
-            // Continue the backend channel's connection-phase counter
-            // after its greeting.
-            let next = backend.backend_io.expected_read_sequence();
-            backend.backend_io.reset_write_sequence(next);
+            // Continue the backend channel's connection-phase counter after its
+            // greeting. Under backend TLS the writer already advanced past the
+            // plaintext SSLRequest (seq 1) to seq 2, so it continues as-is;
+            // otherwise the plaintext response is the first write and aligns to
+            // the greeting (reader observed seq 0 -> expects 1).
+            if !matches!(backend.backend_io.get_ref(), BackendTransport::Tls(_)) {
+                let next = backend.backend_io.expected_read_sequence();
+                backend.backend_io.reset_write_sequence(next);
+            }
             if backend
                 .backend_io
                 .write_logical(&forwarded, true)
@@ -2082,6 +2119,88 @@ impl Engine {
         Ok(())
     }
 
+    /// The backend TLS policy for this session as `(require, available)`. A
+    /// validated snapshot always carries a default backend policy object, so
+    /// presence is read from the raw config's `backend_tls` rather than the
+    /// validated policy's emptiness.
+    fn backend_tls_policy(&self) -> (bool, bool) {
+        let snapshot = self.seat.snapshot();
+        let config = snapshot.raw().config.as_ref();
+        let require = config.is_some_and(|config| config.require_backend_tls);
+        let available = config.is_some_and(|config| config.backend_tls.is_some());
+        (require, available)
+    }
+
+    /// Upgrades the backend transport to client-side TLS in place. Sends the
+    /// plaintext `SSLRequest` (seq 1, continuing after the backend greeting),
+    /// runs the backend TLS handshake, then reattaches preserving the sequence
+    /// trackers and wire counters (the raw TLS handshake bytes are not `MySQL`
+    /// packets); the full handshake response then travels inside TLS at seq 2.
+    ///
+    /// Any failure — config build, handshake, timeout, or the backend speaking
+    /// before TLS — fails closed: the owner drops the socket (moved into
+    /// `connect_backend`), no plaintext fallback, no detached task.
+    async fn upgrade_backend_tls(
+        &self,
+        backend: &mut BackendIo,
+        capabilities: CapabilityFlags,
+    ) -> Result<(), WireErrorSource> {
+        // The SSLRequest mirrors the client's max packet size and collation —
+        // the same values the forwarded handshake response carries.
+        let Ok(client) = parse_handshake_response(&self.client_handshake_raw) else {
+            return Err(WireErrorSource::Proxy);
+        };
+        // Align the writer to continue after the greeting (reader observed seq
+        // 0 -> expects 1) and send the plaintext SSLRequest at seq 1.
+        let next = backend.backend_io.expected_read_sequence();
+        backend.backend_io.reset_write_sequence(next);
+        let ssl_request =
+            encode_ssl_request(capabilities, client.max_packet_size, client.collation);
+        if backend
+            .backend_io
+            .write_logical(&ssl_request, true)
+            .await
+            .is_err()
+        {
+            return Err(WireErrorSource::BackendNetwork);
+        }
+        let Ok(config) = build_backend_config(&self.seat.snapshot().backend_tls) else {
+            return Err(WireErrorSource::Proxy);
+        };
+        let server_name = backend_server_name(&backend.address);
+        let timeout = self.handshake_budget_remaining();
+        // Move the endpoint out for the value-consuming upgrade; the
+        // sequence/counter state travels in the token, the raw socket in the
+        // transport. `Detached` holds the field meanwhile and is never polled.
+        let io = std::mem::replace(
+            &mut backend.backend_io,
+            PacketIo::new(BackendTransport::Detached),
+        );
+        let (transport, upgrade_state, prefix) = io.into_upgrade_parts();
+        let BackendTransport::Plain(stream) = transport else {
+            return Err(WireErrorSource::Proxy);
+        };
+        if !prefix.is_empty() {
+            // The backend sent bytes before TLS started (it must not); fail
+            // closed rather than dropping them or feeding them into TLS.
+            return Err(WireErrorSource::BackendNetwork);
+        }
+        let Ok(backend_tls) = connect_backend(
+            stream,
+            &server_name,
+            config,
+            timeout,
+            DEFAULT_CONN_BUFFER_SIZE,
+        )
+        .await
+        else {
+            return Err(WireErrorSource::BackendNetwork);
+        };
+        backend.backend_io =
+            PacketIo::from_upgrade_parts(BackendTransport::Tls(backend_tls), upgrade_state);
+        Ok(())
+    }
+
     async fn send_greeting(&mut self) -> Result<(), WireErrorSource> {
         fill_salt(&mut self.salt);
         let params = build_greeting(
@@ -2142,13 +2261,13 @@ impl Engine {
         let Some(backend) = self.backend.as_mut() else {
             return false;
         };
+        let Some(tcp) = backend.backend_io.get_ref().as_tcp_stream() else {
+            // Detached only during an in-progress TLS upgrade, before the
+            // backend is exposed to probes; treat as alive rather than dead.
+            return true;
+        };
         let mut probe = [0_u8; 1];
-        match backend
-            .backend_io
-            .get_ref()
-            .as_tcp_stream()
-            .try_read(&mut probe)
-        {
+        match tcp.try_read(&mut probe) {
             // Data outside a command or a clean EOF both mean the
             // backend is not idle-healthy.
             Ok(_) => false,

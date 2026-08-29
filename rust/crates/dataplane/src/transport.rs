@@ -111,24 +111,29 @@ impl AsyncWrite for ClientTransport {
 /// client TLS stream implementing `AsyncRead`/`AsyncWrite`.
 #[allow(clippy::large_enum_variant)]
 pub enum BackendTransport {
-    /// Plaintext backend socket (the only variant wired in step 2a).
+    /// Plaintext backend socket.
     Plain(TcpStream),
     /// Client-side TLS over the backend socket.
-    // constructed in A1 step 2b (TLS upgrade)
-    #[allow(dead_code)]
     Tls(BackendTls<TcpStream>),
+    /// Transient placeholder installed only while a TLS upgrade moves the
+    /// concrete socket out of the endpoint (across the `connect` await). The
+    /// engine never reads or writes the endpoint in this window — it either
+    /// reattaches the upgraded transport or fails the session closed.
+    Detached,
 }
 
 impl BackendTransport {
     /// Returns the underlying backend `TcpStream`, reaching through the
-    /// TLS session when one is active.
+    /// TLS session when one is active, or `None` while the transport is
+    /// detached for an in-progress upgrade.
     ///
     /// The idle-liveness probe issues a non-blocking `try_read` directly
     /// on the socket, so it must bypass the TLS record layer.
-    pub fn as_tcp_stream(&self) -> &TcpStream {
+    pub fn as_tcp_stream(&self) -> Option<&TcpStream> {
         match self {
-            Self::Plain(inner) => inner,
-            Self::Tls(inner) => inner.stream.get_ref().0,
+            Self::Plain(inner) => Some(inner),
+            Self::Tls(inner) => Some(inner.stream.get_ref().0),
+            Self::Detached => None,
         }
     }
 }
@@ -142,6 +147,7 @@ impl AsyncRead for BackendTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_read(context, buf),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_read(context, buf),
+            Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
 }
@@ -155,6 +161,7 @@ impl AsyncWrite for BackendTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_write(context, data),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_write(context, data),
+            Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
 
@@ -162,6 +169,7 @@ impl AsyncWrite for BackendTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_flush(context),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_flush(context),
+            Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
 
@@ -169,6 +177,7 @@ impl AsyncWrite for BackendTransport {
         match self.get_mut() {
             Self::Plain(inner) => Pin::new(inner).poll_shutdown(context),
             Self::Tls(inner) => Pin::new(&mut inner.stream).poll_shutdown(context),
+            Self::Detached => Poll::Ready(Err(detached_error())),
         }
     }
 }
