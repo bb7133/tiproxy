@@ -18,9 +18,11 @@
 //! against a scripted fake backend, serves commands, and resolves
 //! every control command to its exact gate terminal.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use control_proto::control_transport::{
@@ -36,7 +38,7 @@ use dataplane::control_dispatch::{
 };
 use dataplane::observability::{MetricsRecorder, Observation, QuitSource};
 use dataplane::session::SessionLoopConfig;
-use dataplane::session_engine::EngineSessionOwner;
+use dataplane::session_engine::{EngineSessionOwner, send_proxy_owned_query};
 use dataplane::{
     BoundSessionHandler, DataplaneServer, DispatchConnectionHandler, SystemMemoryProbe,
 };
@@ -46,9 +48,14 @@ use mysql_wire::{
     encode_length_encoded_bytes, encode_length_encoded_int, encode_ok_packet, encode_ssl_request,
     parse_handshake_response, parse_initial_handshake,
 };
-use proxy_io::{PacketReader, PacketWriter};
+use proxy_io::compression::{
+    CompressedFrameHeader, CompressedIo, CompressionAlgorithm, CompressionError, CompressionLimits,
+};
+use proxy_io::counted::CountedIo;
+use proxy_io::direction::DirectionSync;
+use proxy_io::{PacketIo, PacketReader, PacketWriter};
 use session_core::handshake::build_greeting;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
@@ -2630,4 +2637,698 @@ async fn frontend_tls_session_totals_come_from_the_raw_seam_not_framing() {
     stack.shutdown_tx.send(true).ok();
     stack.dispatch_task.abort();
     stack.server_task.abort();
+}
+
+// ---------------------------------------------------------------------
+// WIRE-C: compressed-client end-to-end regression
+// ---------------------------------------------------------------------
+
+/// Maps a compression codec error into a transport `io::Error`, mirroring
+/// `dataplane::transport`'s private helper so the packet layer's direction hooks
+/// can fail closed.
+fn compression_io_error(error: CompressionError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
+/// Test-only client transport that reproduces the production
+/// `ClientTransport::Compressed` variant's [`DirectionSync`] delegation.
+///
+/// `PacketIo<T>` requires `T: DirectionSync`, but `CompressedIo`'s inherent
+/// `begin_read`/`begin_write` SHADOW (rather than implement) that trait, so a
+/// bare `PacketIo<CompressedIo<_>>` cannot compile. The production
+/// `dataplane::transport::ClientTransport` enum — which does the same forwarding
+/// — lives in a private module, so this integration test cannot name it; this
+/// wrapper forwards to the SAME `CompressedIo` codec and `PacketIo` direction
+/// hooks the proxy drives, without touching `src/`. It layers compression over
+/// the same innermost `CountedIo` the production client leg uses.
+struct CompressedClientTransport {
+    inner: CompressedIo<CountedIo<TcpStream>>,
+}
+
+impl AsyncRead for CompressedClientTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(context, buf)
+    }
+}
+
+impl AsyncWrite for CompressedClientTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(context, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
+impl DirectionSync for CompressedClientTransport {
+    fn begin_read(&mut self) -> std::io::Result<Option<u8>> {
+        self.inner.begin_read().map_err(compression_io_error)
+    }
+
+    fn begin_write(&mut self) -> std::io::Result<Option<u8>> {
+        self.inner.begin_write().map_err(compression_io_error)
+    }
+
+    fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
+        self.inner.reset_sequence().map_err(compression_io_error)
+    }
+}
+
+/// A compressed `MySQL` client: negotiates `COMPRESS`/`ZSTD` during the plaintext
+/// connection phase, then — at the clean auth-OK boundary — reunites the socket
+/// and activates `MySQL` compressed framing, exactly the client leg the proxy
+/// switches to at that same boundary.
+struct CompressedClient {
+    io: PacketIo<CompressedClientTransport>,
+}
+
+impl CompressedClient {
+    /// Runs the full connection phase (identical to [`MysqlClient::login`] but
+    /// advertising the compression capability, plus the zstd level byte for the
+    /// zstd case), then wraps the reunited socket in compressed framing matching
+    /// the negotiated `algorithm`.
+    async fn connect(port: u16, algorithm: CompressionAlgorithm) -> Option<Self> {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        let (read, write) = stream.into_split();
+        let mut reader = PacketReader::new(read);
+        let mut writer = PacketWriter::new(write);
+        // Greeting at sequence zero, then the strict lockstep of the connection
+        // phase, exactly like the plaintext client.
+        let preview = reader.peek_packet().await.ok()?;
+        assert_eq!(preview.sequence_id, 0);
+        let greeting = reader.read_logical(64 * 1024).await.ok()?;
+        let parsed = parse_initial_handshake(&greeting.payload).ok()?;
+        let mut proxy_salt = parsed.auth_plugin_data_part_1.to_vec();
+        proxy_salt.extend_from_slice(parsed.auth_plugin_data_part_2);
+        // Negotiate compression on top of the base client capabilities; the proxy
+        // advertises both COMPRESS and ZSTD, so either bit negotiates.
+        let (compress_capability, zstd_level) = match algorithm {
+            CompressionAlgorithm::Zlib => (CapabilityFlags::COMPRESS, None),
+            CompressionAlgorithm::Zstd { level } => (
+                CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM,
+                Some(u8::try_from(level).ok()?),
+            ),
+        };
+        let capabilities = CapabilityFlags::PROTOCOL_41
+            | CapabilityFlags::LONG_PASSWORD
+            | CapabilityFlags::SECURE_CONNECTION
+            | CapabilityFlags::PLUGIN_AUTH
+            | CapabilityFlags::DEPRECATE_EOF
+            | compress_capability;
+        let first_scramble = native_scramble(FAKE_BACKEND_PASSWORD, &proxy_salt);
+        let response = encode_handshake_response(HandshakeResponseParams {
+            capabilities,
+            max_packet_size: 16 * 1024 * 1024,
+            collation: 45,
+            username: b"root",
+            auth_response: &first_scramble,
+            database: None,
+            auth_plugin_name: Some(b"mysql_native_password"),
+            attributes: None,
+            zstd_level,
+        })
+        .ok()?;
+        writer.reset_sequence(reader.expected_sequence());
+        writer.write_logical(&response, true).await.ok()?;
+        let expected_switch_sequence = writer.next_sequence();
+        reader.reset_sequence(expected_switch_sequence);
+        let switch = reader.read_logical(64 * 1024).await.ok()?;
+        // The backend re-requests authentication against its own salt.
+        if switch.payload.first() != Some(&0xFE) {
+            return None;
+        }
+        let data = &switch.payload[1..];
+        let nul = data.iter().position(|&byte| byte == 0)?;
+        assert_eq!(&data[..nul], b"mysql_native_password");
+        let mut backend_salt = &data[nul + 1..];
+        if backend_salt.last() == Some(&0) {
+            backend_salt = &backend_salt[..backend_salt.len() - 1];
+        }
+        writer.reset_sequence(reader.expected_sequence());
+        writer
+            .write_logical(&native_scramble(FAKE_BACKEND_PASSWORD, backend_salt), true)
+            .await
+            .ok()?;
+        let expected_result_sequence = writer.next_sequence();
+        reader.reset_sequence(expected_result_sequence);
+        let outcome = reader.read_logical(64 * 1024).await.ok()?;
+        if outcome.payload.first() != Some(&0x00) {
+            return None;
+        }
+        // The auth-OK packet is fully read at a clean command boundary — the
+        // reader holds no prefetched bytes — so the split halves reunite into a
+        // whole socket that we wrap in compressed framing, mirroring the proxy's
+        // in-place activation of its client leg at this exact boundary.
+        let read_half = reader.into_inner();
+        let write_half = writer.into_inner();
+        let stream = read_half.reunite(write_half).ok()?;
+        let compressed = CompressedIo::new(
+            CountedIo::new(stream),
+            algorithm,
+            CompressionLimits::default(),
+        )
+        .ok()?;
+        Some(Self {
+            io: PacketIo::new(CompressedClientTransport { inner: compressed }),
+        })
+    }
+
+    /// Runs one compressed `COM_QUERY` and reports whether the response is a
+    /// successful (non-error) result, mirroring [`MysqlClient::query_ok`] but
+    /// over compressed framing: the compressed sequence resets once per command
+    /// and the `DirectionSync` hooks slave the uncompressed sequence to it.
+    async fn query_ok(&mut self, sql: &str) -> bool {
+        let mut payload = vec![0x03_u8];
+        payload.extend_from_slice(sql.as_bytes());
+        if self.io.get_mut().reset_layer_sequence().is_err() {
+            return false;
+        }
+        self.io.reset_read_sequence(0);
+        if self.io.write_logical(&payload, true).await.is_err() {
+            return false;
+        }
+        match self.io.read_logical(64 * 1024).await {
+            Ok(response) => response.payload.first() == Some(&0x00),
+            Err(_) => false,
+        }
+    }
+
+    /// Stages `bytes` as ONE complete compressed frame and flushes, writing raw
+    /// bytes straight to the compressed transport (bypassing `write_logical`) so a
+    /// single frame can carry only PART of the next `MySQL` command packet — the
+    /// deterministic trigger for the proxy's idle `peek_packet` to decode-and-stage
+    /// a partial command. `fresh` resets the shared compressed sequence to zero
+    /// first (a new command boundary); a continuation frame passes `fresh = false`.
+    async fn stage_raw_frame(&mut self, bytes: &[u8], fresh: bool) -> bool {
+        let transport = self.io.get_mut();
+        if fresh && transport.reset_layer_sequence().is_err() {
+            return false;
+        }
+        if transport.begin_write().is_err() {
+            return false;
+        }
+        if transport.write_all(bytes).await.is_err() {
+            return false;
+        }
+        transport.flush().await.is_ok()
+    }
+
+    async fn quit(mut self) {
+        let _ = self.io.get_mut().reset_layer_sequence();
+        self.io.reset_read_sequence(0);
+        let _ = self.io.write_logical(&[0x01], true).await;
+    }
+}
+
+/// Full compressed-client lifecycle over real sockets: negotiate compression,
+/// authenticate, run two compressed queries on the same session (proving the
+/// per-command compressed-sequence reset), then quit. The fake backend never
+/// advertises COMPRESS, so the proxy<->backend leg stays plaintext — a valid
+/// mixed scenario — and the CLOSED event still shows real backend traffic.
+async fn compressed_client_roundtrips(algorithm: CompressionAlgorithm) {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        CompressedClient::connect(stack.sql_port, algorithm),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("compressed handshake+auth completes end to end for {algorithm:?}")
+    };
+    assert!(
+        client.query_ok("SELECT 1").await,
+        "first compressed query round-trips ({algorithm:?})"
+    );
+    assert!(
+        client.query_ok("SELECT 2").await,
+        "second compressed query reuses the session and resets the compressed \
+         sequence ({algorithm:?})"
+    );
+    client.quit().await;
+
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(closed) = closed else {
+        unreachable!("the compressed session close emits the CLOSED event ({algorithm:?})")
+    };
+    let Some(Body::ConnectionEvent(event)) = closed.body else {
+        unreachable!()
+    };
+    // The proxy<->backend leg carried real plaintext bytes in both directions.
+    assert!(
+        event.backend_in_bytes > 0,
+        "the plaintext backend leg moved bytes ({algorithm:?}): {event:?}"
+    );
+    assert!(
+        event.backend_out_bytes > 0,
+        "the plaintext backend leg moved bytes ({algorithm:?}): {event:?}"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// A client that negotiates classic zlib `COMPRESS` round-trips two compressed
+/// commands end to end. This exercises the full production sequence bridge
+/// (`CompressedIo` codec + `PacketIo` `DirectionSync` hooks) over real sockets.
+#[tokio::test]
+async fn compressed_client_zlib_roundtrips_end_to_end() {
+    compressed_client_roundtrips(CompressionAlgorithm::Zlib).await;
+}
+
+/// A client that negotiates `ZSTD` at a concrete level round-trips two
+/// compressed commands end to end.
+///
+/// This is the mixed-leg scenario: the client negotiates ZSTD while the fake
+/// backend advertises no compression, so the client<->proxy leg is zstd and the
+/// proxy<->backend leg is plaintext. It also guards a fixed regression — the
+/// backend handshake-forward must carry `zstd_level` only when the backend leg
+/// negotiated ZSTD, otherwise `encode_handshake_response` rejects the packet.
+#[tokio::test]
+async fn compressed_client_zstd_roundtrips_end_to_end() {
+    compressed_client_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
+}
+
+/// Contract #1 cancel-safety over COMPRESSION, exercising the real
+/// `Engine::command_phase` (the compressed sibling of
+/// `control_activity_during_fragmented_command_keeps_wire_intact`): a control
+/// command winning the engine's idle select while a compressed frame carrying
+/// only PART of the next command is already peeked-and-staged must NOT rewind the
+/// shared compressed sequence. The engine's `just_served_control` guard skips the
+/// once-per-command compressed reset on control re-entry, so the staged bytes
+/// survive and the command still round-trips.
+///
+/// DETERMINISTIC trigger: the client sends a complete compressed frame carrying
+/// only the first 2 bytes of the next command's `MySQL` packet. The proxy's
+/// `peek_packet` decodes that frame (compressed sequence -> 1; 2 decoded bytes
+/// staged in the packet prefetch) yet returns Pending (it needs the 5-byte
+/// header), then the redirect control command wins the idle select.
+///
+/// DISCRIMINABILITY (verified manually by deleting the guard): without
+/// `just_served_control`, the control re-entry calls `PacketIo::reset_layer_sequence`
+/// while the 2 staged bytes sit in the read prefetch -> it fails closed -> the
+/// session tears down -> the deadline-bounded response read below never completes.
+#[tokio::test]
+async fn compressed_control_interleave_during_staged_command_keeps_wire_intact() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        CompressedClient::connect(stack.sql_port, CompressionAlgorithm::Zlib),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("compressed session established")
+    };
+    // One normal compressed query reaches a clean command boundary.
+    assert!(client.query_ok("SELECT 1").await);
+
+    // Build the next command and send ONLY its first 2 bytes as one complete
+    // compressed frame: the proxy peeks + stages a partial command (2 decoded
+    // bytes in the packet prefetch) yet cannot form the 5-byte header.
+    let payload = b"\x03SELECT 6";
+    let mut packet = vec![u8::try_from(payload.len()).unwrap_or(0), 0, 0, 0];
+    packet.extend_from_slice(payload);
+    assert!(
+        client.stage_raw_frame(&packet[..2], true).await,
+        "the partial-command compressed frame is staged"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A redirect control command wins the engine's idle select while the frame
+    // is staged; control is served (RedirectResult emitted) mid-command.
+    let redirect = command_envelope(
+        6002,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-cfrag".to_owned(),
+            backend_id: "tidb-other".to_owned(),
+            backend_address: "127.0.0.1:1".to_owned(),
+            cluster_name: String::new(),
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let refused = wait_sent(&stack.sender, |e| {
+        matches!(&e.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-cfrag")
+    })
+    .await;
+    assert!(
+        refused.is_some(),
+        "control served while the frame is staged"
+    );
+
+    // Complete the command as a second compressed frame: the staged bytes must
+    // not have been rewound. A desynced engine never answers, so the response
+    // read is deadline-bounded.
+    assert!(
+        client.stage_raw_frame(&packet[2..], false).await,
+        "the command completes as a continuation compressed frame"
+    );
+    let Ok(Ok(response)) = timeout(Duration::from_secs(5), client.io.read_logical(64 * 1024)).await
+    else {
+        unreachable!("the staged compressed command still round-trips at the correct sequence")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+// ---------------------------------------------------------------------
+// WIRE-C: compressed-BACKEND redirect/snapshot sequence regression (D)
+// ---------------------------------------------------------------------
+//
+// FALLBACK MODEL (clearly labeled). This is NOT a full real-socket session.
+// Wiring compression into the fake backend deterministically was too large to be
+// safe: the fake backend (`run_fake_backend`, `fake_backend_auth`,
+// `respond_to_snapshot_query`, `write_session_snapshot`) drives SPLIT
+// `PacketReader<OwnedReadHalf>` / `PacketWriter<OwnedWriteHalf>` halves across
+// auth, the command loop, and every snapshot helper. `CompressedIo` shares ONE
+// compressed sequence across reads and writes and so cannot be split; a
+// compressed backend would require reuniting the socket and rewriting all of
+// those helpers onto a single `PacketIo<compressed>` while staying in exact
+// sequence lockstep with the proxy's frozen backend-leg reset/direction cadence
+// — high flake risk with no ability to adjust `src`. Per the task's guidance,
+// this instead models the snapshot reset at the `PacketIo<compressed>` level:
+// the backend compressed layer is reset before the proxy-owned `SHOW
+// SESSION_STATES`, so the internal query starts a FRESH compressed seq-0
+// exchange (mirroring `capture_migration_snapshot`), and the old session stays
+// aligned for the next user command (mirroring `command_phase`).
+
+/// In-memory duplex byte transport modeling the backend leg's socket: reads
+/// drain `input` (the backend's scripted compressed responses), writes append to
+/// `output` (the proxy's compressed requests), over one shared sequence.
+struct BackendDuplex {
+    input: Vec<u8>,
+    input_pos: usize,
+    output: Vec<u8>,
+}
+
+impl AsyncRead for BackendDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let available = self.input.len().saturating_sub(self.input_pos);
+        let take = available.min(buf.remaining());
+        let end = self.input_pos + take;
+        let chunk = self.input[self.input_pos..end].to_vec();
+        buf.put_slice(&chunk);
+        self.input_pos = end;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for BackendDuplex {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.output.extend_from_slice(data);
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Test-only `DirectionSync` newtype over `CompressedIo<BackendDuplex>`, matching
+/// the production `BackendTransport::Compressed` variant's hook delegation.
+struct BackendLegTransport {
+    inner: CompressedIo<BackendDuplex>,
+}
+
+impl AsyncRead for BackendLegTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(context, buf)
+    }
+}
+
+impl AsyncWrite for BackendLegTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(context, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
+impl DirectionSync for BackendLegTransport {
+    fn begin_read(&mut self) -> std::io::Result<Option<u8>> {
+        self.inner.begin_read().map_err(compression_io_error)
+    }
+
+    fn begin_write(&mut self) -> std::io::Result<Option<u8>> {
+        self.inner.begin_write().map_err(compression_io_error)
+    }
+
+    fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
+        self.inner.reset_sequence().map_err(compression_io_error)
+    }
+}
+
+/// One `MySQL` physical packet carrying `payload` at physical sequence `seq`.
+fn model_mysql_packet(payload: &[u8], seq: u8) -> Vec<u8> {
+    let length = u32::try_from(payload.len()).unwrap_or(0).to_le_bytes();
+    let mut packet = Vec::with_capacity(4 + payload.len());
+    packet.extend_from_slice(&length[..3]);
+    packet.push(seq);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// A raw (uncompressed-body) compressed frame at compressed `sequence` carrying
+/// one `MySQL` physical packet — the backend's scripted response wire.
+fn model_raw_frame(packet: &[u8], sequence: u8) -> Vec<u8> {
+    let Ok(header) = CompressedFrameHeader::new(packet.len(), sequence, 0) else {
+        unreachable!("a small model frame fits the 24-bit compressed field")
+    };
+    let mut frame = header.encode().to_vec();
+    frame.extend_from_slice(packet);
+    frame
+}
+
+/// Builds a `PacketIo` over a compressed backend leg whose socket replays the
+/// given raw response bytes.
+fn backend_leg(input: Vec<u8>) -> Option<PacketIo<BackendLegTransport>> {
+    let compressed = CompressedIo::new(
+        BackendDuplex {
+            input,
+            input_pos: 0,
+            output: Vec::new(),
+        },
+        CompressionAlgorithm::Zlib,
+        CompressionLimits::default(),
+    )
+    .ok()?;
+    Some(PacketIo::new(BackendLegTransport { inner: compressed }))
+}
+
+/// The compressed sequence byte of the frame starting at `offset` in the proxy's
+/// captured backend-leg output.
+fn output_frame_sequence(io: &PacketIo<BackendLegTransport>, offset: usize) -> Option<u8> {
+    let output = &io.get_ref().inner.get_ref().output;
+    let frame = output.get(offset..)?;
+    CompressedFrameHeader::decode(frame)
+        .ok()
+        .map(CompressedFrameHeader::sequence)
+}
+
+/// PacketIo-level model of fix #3 on the BACKEND leg: the proxy-owned `SHOW
+/// SESSION_STATES` captured for a redirect resets the backend compressed layer
+/// first, so it starts a fresh compressed seq-0 exchange rather than carrying
+/// the sequence over from the last user command; the old session then stays
+/// aligned (also seq 0) for its next user command. A staged/in-flight backend
+/// layer fails that reset closed instead of rewinding over live bytes.
+#[tokio::test]
+async fn compressed_backend_snapshot_reset_starts_fresh_and_keeps_session_aligned() {
+    // OK and snapshot responses both answer at compressed sequence 1 (the shared
+    // sequence continues from the request's seq 0 -> read at 1).
+    let ok = model_mysql_packet(b"\x00\x00\x00\x02\x00\x00\x00", 1);
+    let snapshot = model_mysql_packet(b"\x00row-bytes-preserved", 1);
+    let mut input = model_raw_frame(&ok, 1);
+    input.extend_from_slice(&model_raw_frame(&snapshot, 1));
+    let Some(mut io) = backend_leg(input) else {
+        unreachable!("the compressed backend leg builds")
+    };
+
+    // --- User command (command_phase parity): reset once, request at seq 0. ---
+    let Ok(()) = io.get_mut().reset_layer_sequence() else {
+        unreachable!("the clean per-command reset succeeds")
+    };
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    let user_start = io.get_ref().inner.get_ref().output.len();
+    let Ok(()) = io.write_logical(b"\x03SELECT user_cmd", true).await else {
+        unreachable!("the user command writes")
+    };
+    assert_eq!(
+        output_frame_sequence(&io, user_start),
+        Some(0),
+        "the user command opens the exchange at compressed sequence 0"
+    );
+    let Ok(response) = io.read_logical(64 * 1024).await else {
+        unreachable!("the user command's OK response reads back")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+
+    // --- Snapshot capture (capture_migration_snapshot parity): reset the ---
+    // backend layer, then the internal query starts a FRESH seq-0 exchange.
+    let Ok(()) = io.get_mut().reset_layer_sequence() else {
+        unreachable!("the snapshot boundary is clean, so its reset succeeds")
+    };
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    let snapshot_start = io.get_ref().inner.get_ref().output.len();
+    let Ok(()) = io.write_logical(b"\x03SHOW SESSION_STATES", true).await else {
+        unreachable!("the internal snapshot query writes")
+    };
+    // Without the pre-query reset the shared sequence would still be 2 here; the
+    // reset is what makes the proxy-owned query a fresh compressed seq-0 frame.
+    assert_eq!(
+        output_frame_sequence(&io, snapshot_start),
+        Some(0),
+        "the proxy-owned SHOW SESSION_STATES opens at a fresh compressed sequence 0"
+    );
+    let Ok(snapshot_response) = io.read_logical(64 * 1024).await else {
+        unreachable!("the snapshot response reads back")
+    };
+    assert_eq!(snapshot_response.payload.first(), Some(&0x00));
+
+    // --- Old session stays aligned: the next user command resets to seq 0. ---
+    let Ok(()) = io.get_mut().reset_layer_sequence() else {
+        unreachable!("the post-snapshot per-command reset succeeds")
+    };
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    let next_start = io.get_ref().inner.get_ref().output.len();
+    let Ok(()) = io.write_logical(b"\x03SELECT after_snapshot", true).await else {
+        unreachable!("the next user command writes")
+    };
+    assert_eq!(
+        output_frame_sequence(&io, next_start),
+        Some(0),
+        "the old session's next command stays aligned at compressed sequence 0"
+    );
+}
+
+/// PacketIo-level model of the fail-closed guard at the snapshot boundary: if the
+/// backend compressed layer still holds an in-flight (peeked/staged) frame, the
+/// snapshot's `reset_layer_sequence` fails closed rather than silently rewinding
+/// the shared sequence over live command bytes.
+#[tokio::test]
+async fn compressed_backend_snapshot_reset_fails_closed_on_staged_frame() {
+    // A next command's frame is present at compressed sequence 0.
+    let staged = model_mysql_packet(b"\x03SELECT staged", 0);
+    let Some(mut io) = backend_leg(model_raw_frame(&staged, 0)) else {
+        unreachable!("the compressed backend leg builds")
+    };
+    // The idle peek decodes and stages that frame (codec sequence -> 1).
+    let Ok(preview) = io.peek_packet().await else {
+        unreachable!("the staged frame peeks")
+    };
+    assert_eq!(preview.first_byte, Some(0x03));
+    // The snapshot boundary reset now fails closed on the staged decoded bytes.
+    let error = io.get_mut().reset_layer_sequence();
+    let Some(error) = error.err() else {
+        unreachable!("the reset must fail closed on staged data")
+    };
+    let wrapped = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<CompressionError>());
+    assert!(matches!(
+        wrapped,
+        Some(CompressionError::ResetWithBufferedData { .. })
+    ));
+}
+
+/// The production `send_proxy_owned_query` seam resets the compressed layer to
+/// sequence zero before sending, so a proxy-owned query starts a FRESH exchange
+/// even when the shared compressed sequence carried over non-zero from the last
+/// user command. Production `capture_migration_snapshot` calls this exact helper,
+/// so this locks the migration snapshot's fresh-exchange invariant.
+///
+/// DISCRIMINABILITY: deleting the `io.reset_layer_sequence()` line inside
+/// `send_proxy_owned_query` would leave the sent frame at the stale non-zero
+/// compressed sequence, and the `Some(0)` assertion below would fail.
+#[tokio::test]
+async fn send_proxy_owned_query_opens_at_fresh_compressed_sequence_zero() {
+    // A prior user command's response, so we can run one real exchange first and
+    // advance the shared compressed sequence off zero.
+    let prior_ok = model_mysql_packet(b"\x00\x00\x00\x02\x00\x00\x00", 1);
+    let Some(mut io) = backend_leg(model_raw_frame(&prior_ok, 1)) else {
+        unreachable!("the compressed backend leg builds")
+    };
+
+    // --- Prior user command: advances the shared compressed sequence off zero.
+    let Ok(()) = io.get_mut().reset_layer_sequence() else {
+        unreachable!("the clean per-command reset succeeds")
+    };
+    io.reset_write_sequence(0);
+    io.reset_read_sequence(1);
+    let Ok(()) = io.write_logical(b"\x03SELECT prior_cmd", true).await else {
+        unreachable!("the prior user command writes")
+    };
+    let Ok(response) = io.read_logical(64 * 1024).await else {
+        unreachable!("the prior command's OK response reads back")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+    assert_ne!(
+        io.get_ref().inner.codec().sequence(),
+        0,
+        "the prior exchange left the shared compressed sequence non-zero"
+    );
+
+    // --- Proxy-owned query via the production seam: it resets the layered +
+    // packet sequence to zero, then sends — mirroring capture_migration_snapshot.
+    let owned_start = io.get_ref().inner.get_ref().output.len();
+    let Ok(()) = send_proxy_owned_query(&mut io, b"\x03SHOW SESSION_STATES").await else {
+        unreachable!("the proxy-owned query resets and sends on a clean boundary")
+    };
+    assert_eq!(
+        output_frame_sequence(&io, owned_start),
+        Some(0),
+        "send_proxy_owned_query opens the exchange at a fresh compressed sequence 0"
+    );
 }

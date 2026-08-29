@@ -21,6 +21,7 @@ use mysql_wire::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::direction::DirectionSync;
 use crate::{IoSide, PacketIoError};
 
 const PEEK_BYTES: usize = PHYSICAL_PACKET_HEADER_LEN + 1;
@@ -321,6 +322,14 @@ impl ReaderState {
     /// Unconsumed staged raw-prefix bytes, in order.
     fn raw_prefix_slice(&self) -> &[u8] {
         &self.raw_prefix[self.raw_prefix_start..]
+    }
+
+    /// Whether any peeked-but-unconsumed bytes remain above the transport — in
+    /// the `MySQL` prefetch window or the staged raw prefix. A small command a
+    /// `peek_packet` decoded can sit entirely here while the compression layer's
+    /// own read buffer looks empty, so a layered-sequence reset must see it.
+    const fn has_buffered_read(&self) -> bool {
+        self.prefetch_end > self.prefetch_start || self.raw_prefix_start < self.raw_prefix.len()
     }
 
     async fn peek_packet(
@@ -1414,16 +1423,61 @@ impl<T> PacketIo<T> {
 
 impl<T> PacketIo<T>
 where
-    T: AsyncRead + Unpin,
+    T: DirectionSync,
 {
+    /// Resets the layered (compression) sequence at a clean command boundary,
+    /// the once-per-command reset the session owner calls.
+    ///
+    /// Fails closed if a command is still staged ABOVE the transport — in the
+    /// read prefetch or raw-prefix window — or buffered INSIDE the transport
+    /// layer. A small command a `peek_packet` decoded can sit entirely in the
+    /// packet prefetch while the compression layer's own read buffer is empty,
+    /// so both must be clean before the shared sequence is reset; otherwise the
+    /// reset would silently rewind the sequence over live command bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a framing error when unread prefetch/raw-prefix bytes remain, or
+    /// propagates the transport layer's in-flight rejection.
+    pub fn reset_layer_sequence(&mut self) -> io::Result<()> {
+        if self.read.has_buffered_read() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot reset the layered sequence with a staged command in the read prefetch",
+            ));
+        }
+        self.inner.reset_layer_sequence()
+    }
+}
+
+impl<T> PacketIo<T>
+where
+    T: AsyncRead + Unpin + DirectionSync,
+{
+    /// Coordinates a read-direction change with the layered transport before a
+    /// read. A compression layer returns the compressed sequence the packet
+    /// read sequence must adopt on the first read after a write; a plaintext or
+    /// TLS transport is a no-op. Repeated reads in the same direction return
+    /// `None`, so a `peek` followed by a `read` never shifts the sequence twice.
+    fn begin_read_direction(&mut self) -> Result<(), PacketIoError> {
+        if let Some(sequence) = self.inner.begin_read().map_err(|error| {
+            PacketIoError::io(IoSide::Source, "beginning a read direction", error)
+        })? {
+            self.read.sequence.reset(sequence);
+        }
+        Ok(())
+    }
+
     /// Peeks at the next physical header and optional first payload byte.
     ///
-    /// The method consumes neither sequence state nor accounting counters.
+    /// Consumes no packet bytes or accounting counters; it may adopt the layered
+    /// read sequence on a direction change (a no-op without compression).
     ///
     /// # Errors
     ///
     /// Returns a source I/O or header decode error for incomplete input.
     pub async fn peek_packet(&mut self) -> Result<PacketPreview, PacketIoError> {
+        self.begin_read_direction()?;
         self.read.peek_packet(&mut self.inner).await
     }
 
@@ -1437,6 +1491,7 @@ where
         &mut self,
         payload_limit: usize,
     ) -> Result<LogicalPacket, PacketIoError> {
+        self.begin_read_direction()?;
         self.read.read_logical(&mut self.inner, payload_limit).await
     }
 
@@ -1550,8 +1605,12 @@ where
         capture_limit: usize,
     ) -> Result<ForwardProgress, PacketIoError>
     where
-        B: AsyncWrite + Unpin,
+        B: AsyncWrite + Unpin + DirectionSync,
     {
+        // Coordinate the layered direction on both legs before the streaming
+        // forward, which reads `src` and writes `dst` below the packet methods.
+        src.begin_read_direction()?;
+        dst.begin_write_direction()?;
         let mut progress = ForwardProgress::new(capture_limit);
         forward_inner(
             &mut src.read,
@@ -1583,9 +1642,11 @@ where
         mut is_cancelled: C,
     ) -> Result<ForwardStatus, PacketIoError>
     where
-        B: AsyncWrite + Unpin,
+        B: AsyncWrite + Unpin + DirectionSync,
         C: FnMut() -> bool,
     {
+        src.begin_read_direction()?;
+        dst.begin_write_direction()?;
         forward_inner(
             &mut src.read,
             &mut src.inner,
@@ -1614,9 +1675,13 @@ where
         mut decide: F,
     ) -> Result<ForwardUntilResult, PacketIoError>
     where
-        B: AsyncWrite + Unpin,
+        B: AsyncWrite + Unpin + DirectionSync,
         F: FnMut(PacketPreview) -> ForwardUntilDecision,
     {
+        // One read direction on `src` and one write direction on `dst` for the
+        // whole run; the inner loop reads/writes below the packet methods.
+        src.begin_read_direction()?;
+        dst.begin_write_direction()?;
         let mut logical_packets = 0_u64;
         loop {
             let preview = src.read.peek_packet(&mut src.inner).await?;
@@ -1656,14 +1721,29 @@ where
 
 impl<T> PacketIo<T>
 where
-    T: AsyncWrite + Unpin,
+    T: AsyncWrite + Unpin + DirectionSync,
 {
+    /// Coordinates a write-direction change with the layered transport before a
+    /// write. A compression layer returns the compressed sequence the packet
+    /// write sequence must adopt on the first write after a read; a plaintext or
+    /// TLS transport is a no-op. Repeated writes in the same direction return
+    /// `None`.
+    fn begin_write_direction(&mut self) -> Result<(), PacketIoError> {
+        if let Some(sequence) = self.inner.begin_write().map_err(|error| {
+            PacketIoError::io(IoSide::Destination, "beginning a write direction", error)
+        })? {
+            self.write.sequence.reset(sequence);
+        }
+        Ok(())
+    }
+
     /// Writes one complete physical packet without flushing.
     ///
     /// # Errors
     ///
     /// Returns a typed header encode or destination I/O error.
     pub async fn write_physical(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
+        self.begin_write_direction()?;
         self.write.write_physical(&mut self.inner, payload).await
     }
 
@@ -1677,6 +1757,7 @@ where
         payload: &[u8],
         flush: bool,
     ) -> Result<(), PacketIoError> {
+        self.begin_write_direction()?;
         self.write
             .write_logical(&mut self.inner, payload, flush)
             .await
@@ -1697,6 +1778,7 @@ where
     where
         S: AsyncRead + Unpin,
     {
+        self.begin_write_direction()?;
         self.write
             .write_logical_from(&mut self.inner, source, logical_length, flush)
             .await
