@@ -1188,10 +1188,6 @@ where
 /// compression codec between `read`/`write` and `inner` here. The
 /// state-versus-transport separation established above is the seam that change
 /// will use; no compression behavior is introduced in this change.
-///
-/// The type is not yet re-exported from the crate root or wired into the
-/// session engine, so `dead_code` is allowed on its surface until a later slice
-/// adopts it. Its behavior is exercised by this module's unit tests.
 #[derive(Debug)]
 pub struct PacketIo<T> {
     inner: T,
