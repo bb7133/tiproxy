@@ -49,10 +49,14 @@
 //!
 //! # Slice scope (recorded for review)
 //!
-//! This slice serves the TLS-disabled, uncompressed path: the greeting
-//! advertises neither SSL nor compression, so a compliant client never
-//! negotiates them; an `SSLRequest` against a no-SSL greeting is a
-//! protocol violation and closes the session. `COM_CHANGE_USER` and
+//! This slice serves the TLS-capable, uncompressed path. The greeting
+//! advertises `SSL` iff this session's snapshot carries a frontend TLS server
+//! config; when the client sends a strict `SSLRequest`, TLS is activated in
+//! place on the client leg (and, per the backend TLS plan, on the backend leg
+//! before any credential leaves) with the `MySQL` sequence continuing across
+//! the upgrade. An `SSLRequest` against a greeting that withheld `SSL`, or a
+//! malformed one, fails closed with no plaintext fallback. Compression is still
+//! neither advertised nor negotiated (WIRE-activation C). `COM_CHANGE_USER` and
 //! `COM_STMT_PREPARE` (the prepared special response flow) are
 //! answered with a fixed unsupported error and the session closes. A
 //! control redirect executes the bounded `SHOW SESSION_STATES` exchange at
