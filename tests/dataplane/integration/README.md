@@ -27,18 +27,20 @@ released. Run one variant with:
 tests/dataplane/integration/run.sh --mode go --variant plain
 ```
 
-The Rust dataplane runs the plain and TLS variant topologies for real:
+The Rust dataplane runs the plain, TLS, and PROXY variant topologies for real:
 
 ```sh
 tests/dataplane/integration/run.sh --mode rust --variant plain
 tests/dataplane/integration/run.sh --mode rust --variant tls
+tests/dataplane/integration/run.sh --mode rust --variant proxy
 ```
 
 `preflight.sh` demands the capability contract from
 `tiproxy-rs --integration-capabilities` — currently
-`control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls`
-(the `tls` capability is wired by WIRE-activation A1; `proxy-v2`/`zlib`/`zstd`
-stay absent until their slices exist, so their variants are still refused).
+`control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2`
+(`tls` is wired by WIRE-activation A1 and `proxy-v2` by WIRE-activation B;
+`zlib`/`zstd` stay absent until their slice exists, so those variants are
+still refused).
 The launcher enables the Go config's `rust-dataplane` gate (the Go
 process cedes the SQL listeners and serves only the control plane and
 API), waits for the control socket (created under `/tmp` with the run's
@@ -88,9 +90,14 @@ available TiDB instances" vocabulary; the unknown-namespace refusal is
 documented as unreachable under the current public bootstrap/admin
 semantics (in-memory namespace store + default auto-create + upsert-only
 commit) with the vocabulary contract pinned by a session-engine e2e. Cleanup stops the Rust process with SIGINT — the
-coordinated-shutdown path. The PROXY protocol and compression variants
-remain refused by the capability contract until their Rust slices exist;
-a raw TCP relay or the Go dataplane is never reported as Rust success.
+coordinated-shutdown path. The PROXY protocol variant additionally exercises
+WIRE-activation B: the fault proxy prepends an inbound PROXY v2 header on the
+client leg (consumed by a greeting-first probe), the dataplane emits an
+outbound PROXY v2 header on the backend dial, and the direct listener-B
+connection — which carries no inbound header — is served without blocking. The
+compression variants remain refused by the capability contract until their
+Rust slice exists; a raw TCP relay or the Go dataplane is never reported as
+Rust success.
 
 ### SES-02 live authentication matrix (#27)
 

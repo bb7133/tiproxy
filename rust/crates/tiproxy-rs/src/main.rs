@@ -70,11 +70,12 @@ enum Command {
 
 /// The integration harness's capability contract (DPL-07): only what
 /// this binary truthfully provides today. TLS (frontend `SSLRequest` +
-/// backend TLS) is wired (WIRE-activation A1), so `tls` is advertised;
-/// PROXY v2 and compression are still not wired, so `proxy-v2`/`zlib`/`zstd`
-/// remain absent and the topology preflight admits only plain and tls.
+/// backend TLS, WIRE-activation A1) and the PROXY v2 backend preamble
+/// (WIRE-activation B) are wired, so `tls` and `proxy-v2` are advertised;
+/// compression is still not wired, so `zlib`/`zstd` remain absent and the
+/// topology preflight admits plain, tls, and proxy.
 const INTEGRATION_CAPABILITIES: &str =
-    "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls";
+    "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -431,14 +432,16 @@ mod tests {
         };
         assert_eq!(
             INTEGRATION_CAPABILITIES,
-            "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls",
-            "only what the binary truthfully provides: the plain slice plus wired TLS"
+            "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2",
+            "only what the binary truthfully provides: the plain slice plus wired TLS and PROXY v2"
         );
-        assert!(
-            INTEGRATION_CAPABILITIES.contains("tls"),
-            "TLS is wired (WIRE-activation A1), so it must be advertised"
-        );
-        for absent in ["proxy-v2", "zlib", "zstd"] {
+        for wired in ["tls", "proxy-v2"] {
+            assert!(
+                INTEGRATION_CAPABILITIES.contains(wired),
+                "{wired:?} is wired (WIRE-activation A1/B), so it must be advertised"
+            );
+        }
+        for absent in ["zlib", "zstd"] {
             assert!(
                 !INTEGRATION_CAPABILITIES.contains(absent),
                 "unimplemented variant capability {absent:?} must not be advertised"

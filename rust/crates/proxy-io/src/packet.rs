@@ -244,6 +244,31 @@ pub struct LogicalPacket {
     pub progress: ForwardProgress,
 }
 
+/// Reads into `buf`, draining any staged raw-prefix bytes first (replayed
+/// verbatim below `MySQL` framing) and only then the transport. Returns the byte
+/// count. Draining never counts `in_bytes` itself: the drained bytes are
+/// counted exactly once by the caller when they are consumed, identically to a
+/// direct transport read.
+async fn drain_or_read(
+    raw_prefix: &mut Vec<u8>,
+    raw_prefix_start: &mut usize,
+    inner: &mut (impl AsyncRead + Unpin),
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    if *raw_prefix_start < raw_prefix.len() {
+        let available = raw_prefix.len() - *raw_prefix_start;
+        let count = available.min(buf.len());
+        buf[..count].copy_from_slice(&raw_prefix[*raw_prefix_start..*raw_prefix_start + count]);
+        *raw_prefix_start += count;
+        if *raw_prefix_start >= raw_prefix.len() {
+            raw_prefix.clear();
+            *raw_prefix_start = 0;
+        }
+        return Ok(count);
+    }
+    inner.read(buf).await
+}
+
 /// Inner-independent read state: sequence tracking, prefetch buffer, accounting.
 ///
 /// All physical/logical read logic lives here as methods that borrow the
@@ -257,6 +282,14 @@ struct ReaderState {
     prefetched: [u8; PEEK_BYTES],
     prefetch_start: usize,
     prefetch_end: usize,
+    /// Raw bytes staged ahead of the transport, replayed before any transport
+    /// read at the byte level (below `MySQL` framing). Used by the inbound
+    /// PROXY-protocol probe to return non-magic / magic-collision bytes to the
+    /// stream verbatim without perturbing the `MySQL` prefetch or sequence. These
+    /// bytes are counted into `in_bytes` only when the reader actually consumes
+    /// them (exactly once), never at probe time.
+    raw_prefix: Vec<u8>,
+    raw_prefix_start: usize,
     stream_buffer_size: NonZeroUsize,
     in_bytes: u64,
     in_packets: u64,
@@ -269,6 +302,8 @@ impl ReaderState {
             prefetched: [0; PEEK_BYTES],
             prefetch_start: 0,
             prefetch_end: 0,
+            raw_prefix: Vec::new(),
+            raw_prefix_start: 0,
             stream_buffer_size: NonZeroUsize::new(DEFAULT_STREAM_BUFFER_SIZE)
                 .unwrap_or(NonZeroUsize::MIN),
             in_bytes: 0,
@@ -281,6 +316,11 @@ impl ReaderState {
             stream_buffer_size,
             ..Self::new()
         }
+    }
+
+    /// Unconsumed staged raw-prefix bytes, in order.
+    fn raw_prefix_slice(&self) -> &[u8] {
+        &self.raw_prefix[self.raw_prefix_start..]
     }
 
     async fn peek_packet(
@@ -389,10 +429,14 @@ impl ReaderState {
                 self.prefetch_end -= self.prefetch_start;
                 self.prefetch_start = 0;
             }
-            let read = inner
-                .read(&mut self.prefetched[self.prefetch_end..])
-                .await
-                .map_err(|error| PacketIoError::io(IoSide::Source, "prefetching packet", error))?;
+            let read = drain_or_read(
+                &mut self.raw_prefix,
+                &mut self.raw_prefix_start,
+                inner,
+                &mut self.prefetched[self.prefetch_end..],
+            )
+            .await
+            .map_err(|error| PacketIoError::io(IoSide::Source, "prefetching packet", error))?;
             if read == 0 {
                 return Err(PacketIoError::io(
                     IoSide::Source,
@@ -423,10 +467,14 @@ impl ReaderState {
         }
         let mut position = prefetched;
         while position < output.len() {
-            let read = inner
-                .read(&mut output[position..])
-                .await
-                .map_err(|error| PacketIoError::io(IoSide::Source, operation, error))?;
+            let read = drain_or_read(
+                &mut self.raw_prefix,
+                &mut self.raw_prefix_start,
+                inner,
+                &mut output[position..],
+            )
+            .await
+            .map_err(|error| PacketIoError::io(IoSide::Source, operation, error))?;
             if read == 0 {
                 return Err(PacketIoError::io(
                     IoSide::Source,
@@ -1314,13 +1362,22 @@ impl<T> PacketIo<T> {
             mut read,
             write,
         } = self;
-        let unread_prefix = read.prefetched_slice().to_vec();
+        // The unread prefix replays in stream order. The prefetch window holds
+        // the earliest unconsumed bytes (already drained from the raw prefix or
+        // read from the transport), so it comes first; the still-undrained
+        // raw-prefix remainder is later in the stream and comes after.
+        let mut unread_prefix = read.prefetched_slice().to_vec();
+        unread_prefix.extend_from_slice(read.raw_prefix_slice());
         // Exactly-once: the prefix now lives solely in `unread_prefix`. Physically
-        // zero the reader's prefetch backing array (not just the window offsets)
-        // so the token retains no second copy of any prefetched byte.
+        // zero both the prefetch backing array and the whole raw-prefix buffer
+        // (including its already-drained region) before releasing it, so the
+        // token — and the freed allocation — retain no second copy of any byte.
         read.prefetched.fill(0);
         read.prefetch_start = 0;
         read.prefetch_end = 0;
+        read.raw_prefix.fill(0);
+        read.raw_prefix = Vec::new();
+        read.raw_prefix_start = 0;
         (inner, PacketIoUpgradeState { read, write }, unread_prefix)
     }
 
@@ -1371,6 +1428,101 @@ where
         payload_limit: usize,
     ) -> Result<LogicalPacket, PacketIoError> {
         self.read.read_logical(&mut self.inner, payload_limit).await
+    }
+
+    /// Reads exactly `buf.len()` raw bytes directly from the transport,
+    /// bypassing `MySQL` framing (used for a transport-level preamble such as a
+    /// PROXY v2 header). The raw prefix is empty at probe time, so this reads
+    /// straight from the transport.
+    async fn read_raw_exact(&mut self, buf: &mut [u8]) -> Result<(), PacketIoError> {
+        let mut position = 0;
+        while position < buf.len() {
+            let read = self
+                .inner
+                .read(&mut buf[position..])
+                .await
+                .map_err(|error| {
+                    PacketIoError::io(IoSide::Source, "reading PROXY preamble", error)
+                })?;
+            if read == 0 {
+                return Err(PacketIoError::io(
+                    IoSide::Source,
+                    "reading PROXY preamble",
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete PROXY preamble"),
+                ));
+            }
+            position += read;
+        }
+        Ok(())
+    }
+
+    /// One-shot inbound PROXY v2 probe, run AFTER the greeting and BEFORE the
+    /// first `MySQL` read (mirrors Go `proxyReadWriter.readProxy`: peek 4, then
+    /// the full 12-byte magic; non-magic leading bytes are left verbatim).
+    ///
+    /// - `Ok(Some(src))`: a complete PROXY v2 header was present and consumed —
+    ///   its wire bytes count into `in_bytes` but never advance the `MySQL`
+    ///   sequence — and its source address is returned.
+    /// - `Ok(None)`: the leading bytes are not a PROXY header (or the first four
+    ///   match the magic but the full twelve do not); those bytes are staged as
+    ///   a raw prefix so the `MySQL` reader consumes them unchanged, exactly
+    ///   once.
+    ///
+    /// # Errors
+    ///
+    /// A truncated or undecodable declared header fails closed.
+    pub async fn probe_inbound_proxy_v2(
+        &mut self,
+    ) -> Result<Option<std::net::SocketAddr>, PacketIoError> {
+        use crate::proxy_protocol::{
+            FIXED_HEADER_LEN, MAGIC_V2, ProxyAddresses, ProxyV2Decode, decode_after_magic,
+        };
+        // Peek the first four bytes; a non-match is the common non-PROXY case.
+        let mut head = [0_u8; 4];
+        self.read_raw_exact(&mut head).await?;
+        if head[..] != MAGIC_V2[..4] {
+            self.read.raw_prefix.extend_from_slice(&head);
+            return Ok(None);
+        }
+        // Confirm the full 12-byte magic; a collision leaves all twelve verbatim.
+        let mut magic = [0_u8; MAGIC_V2.len()];
+        magic[..4].copy_from_slice(&head);
+        self.read_raw_exact(&mut magic[4..]).await?;
+        if magic != MAGIC_V2 {
+            self.read.raw_prefix.extend_from_slice(&magic);
+            return Ok(None);
+        }
+        // A real PROXY v2 header: read the fixed header, size the body, read it.
+        let mut wire = vec![0_u8; FIXED_HEADER_LEN];
+        self.read_raw_exact(&mut wire).await?;
+        let body_len = match decode_after_magic(&wire) {
+            ProxyV2Decode::Incomplete { needed_total } => {
+                needed_total.saturating_sub(FIXED_HEADER_LEN)
+            }
+            ProxyV2Decode::Done { .. } => 0,
+        };
+        if body_len > 0 {
+            wire.resize(FIXED_HEADER_LEN + body_len, 0);
+            self.read_raw_exact(&mut wire[FIXED_HEADER_LEN..]).await?;
+        }
+        let source = match decode_after_magic(&wire) {
+            ProxyV2Decode::Done { header, .. } => match header.addresses {
+                ProxyAddresses::Inet { src, .. } => Some(std::net::SocketAddr::from(src)),
+                ProxyAddresses::Inet6 { src, .. } => Some(std::net::SocketAddr::from(src)),
+                ProxyAddresses::Unix { .. } | ProxyAddresses::None => None,
+            },
+            ProxyV2Decode::Incomplete { .. } => {
+                return Err(PacketIoError::io(
+                    IoSide::Source,
+                    "decoding PROXY v2 header",
+                    io::Error::new(io::ErrorKind::InvalidData, "truncated PROXY v2 header"),
+                ));
+            }
+        };
+        // The header's wire bytes are consumed input but not a MySQL packet, so
+        // they never advance the packet sequence.
+        self.read.add_in_bytes(MAGIC_V2.len() + wire.len())?;
+        Ok(source)
     }
 
     /// Streams one logical packet from `src` into `dst` and flushes it.
@@ -2121,6 +2273,113 @@ mod tests {
         assert_eq!(logical.payload, b"abc");
         assert_eq!(reattached.in_packets(), 1);
         assert_eq!(reattached.expected_read_sequence(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_proxy_v2_probe_matrix() -> Result<(), Box<dyn Error>> {
+        use crate::proxy_protocol::{
+            EncodeAddresses, MAGIC_V2, ProxyCommand, ProxyVersion, TransportProtocol,
+            encode_proxy_v2,
+        };
+        use std::net::SocketAddr;
+
+        // (b) complete v2 header: consumed, src returned, MySQL stream clean and
+        // the header bytes count into in_bytes without advancing the sequence.
+        let header = encode_proxy_v2(
+            ProxyVersion::V2,
+            ProxyCommand::PROXY,
+            TransportProtocol::STREAM,
+            EncodeAddresses::Ip {
+                src: ("127.0.0.1".parse()?, 5000),
+                dst: ("127.0.0.1".parse()?, 4000),
+            },
+            &[],
+        )?;
+        let packet = encoded_physical_packet(b"hello", 0)?;
+        let mut wire = header.clone();
+        wire.extend_from_slice(&packet);
+        let mut io = PacketIo::new(Cursor::new(wire));
+        let src = io.probe_inbound_proxy_v2().await?;
+        assert_eq!(src, Some("127.0.0.1:5000".parse::<SocketAddr>()?));
+        assert_eq!(io.in_bytes(), header.len() as u64, "header counted once");
+        assert_eq!(
+            io.expected_read_sequence(),
+            0,
+            "header does not advance seq"
+        );
+        assert_eq!(io.read_logical(16).await?.payload, b"hello");
+        assert_eq!(
+            io.expected_read_sequence(),
+            1,
+            "only the MySQL packet advanced"
+        );
+        assert_eq!(io.in_bytes(), (header.len() + packet.len()) as u64);
+
+        // (a) headerless direct client: the first four bytes (a MySQL header) are
+        // not the magic, so they are staged and the packet parses unchanged;
+        // nothing is counted at probe time, everything once on consume.
+        let packet = encoded_physical_packet(b"world", 0)?;
+        let mut io = PacketIo::new(Cursor::new(packet.clone()));
+        assert_eq!(io.probe_inbound_proxy_v2().await?, None);
+        assert_eq!(io.in_bytes(), 0, "nothing consumed at probe");
+        assert_eq!(io.read_logical(16).await?.payload, b"world");
+        assert_eq!(io.expected_read_sequence(), 1);
+        assert_eq!(
+            io.in_bytes(),
+            packet.len() as u64,
+            "staged bytes counted once"
+        );
+
+        // (c) first four match the magic but the full twelve do not: all twelve
+        // are staged verbatim (carried out by the upgrade token here).
+        let mut wire = MAGIC_V2[..4].to_vec();
+        wire.extend_from_slice(&[0xff; 8]);
+        wire.extend_from_slice(b"tail");
+        let mut io = PacketIo::new(Cursor::new(wire.clone()));
+        assert_eq!(io.probe_inbound_proxy_v2().await?, None);
+        assert_eq!(io.in_bytes(), 0);
+        let (_inner, _state, unread) = io.into_upgrade_parts();
+        assert_eq!(
+            &unread[..12],
+            &wire[..12],
+            "all twelve collision bytes staged"
+        );
+
+        // (d) magic + fixed header declaring a body that never arrives: fail closed.
+        let mut wire = MAGIC_V2.to_vec();
+        wire.push(0x21); // v2 / PROXY
+        wire.push(0x11); // INET / STREAM
+        wire.extend_from_slice(&[0x00, 0x0c]); // declares a 12-byte body
+        // no body bytes follow
+        let mut io = PacketIo::new(Cursor::new(wire));
+        assert!(io.probe_inbound_proxy_v2().await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_after_peek_replays_raw_prefix_in_stream_order() -> Result<(), Box<dyn Error>> {
+        use crate::proxy_protocol::MAGIC_V2;
+        // A twelve-byte magic collision is staged verbatim, then a peek drains
+        // the first few bytes into the MySQL prefetch, leaving BOTH the prefetch
+        // and the raw-prefix remainder non-empty. The upgrade token must return
+        // them in stream order (prefetch first, then the raw remainder), not the
+        // other way round.
+        let mut wire = MAGIC_V2[..4].to_vec();
+        wire.extend_from_slice(&[0xab; 8]);
+        let original = wire.clone();
+        let mut io = PacketIo::new(Cursor::new(wire));
+        assert_eq!(io.probe_inbound_proxy_v2().await?, None);
+        io.peek_packet().await?;
+        let (_inner, state, unread) = io.into_upgrade_parts();
+        assert_eq!(
+            unread, original,
+            "unread replays in stream order: prefetch then raw remainder"
+        );
+        // Exactly-once / zero-source: the token retains no copy of the staged
+        // bytes — the raw-prefix buffer is emptied and its offset reset.
+        assert!(state.read.raw_prefix.is_empty());
+        assert_eq!(state.read.raw_prefix_start, 0);
         Ok(())
     }
 
