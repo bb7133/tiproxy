@@ -1195,6 +1195,21 @@ pub struct PacketIo<T> {
     write: WriterState,
 }
 
+/// Opaque carrier for a [`PacketIo`]'s read/write state across a transport swap.
+///
+/// Produced by [`PacketIo::into_upgrade_parts`] and consumed by
+/// [`PacketIo::from_upgrade_parts`], this token moves both sequence trackers,
+/// wire/packet counters, and stream-buffer sizes between transports without
+/// exposing or perturbing any internal invariant. Its fields are private: the
+/// carried prefetch window is always empty (any unread prefetched bytes are
+/// handed back separately as a replayable prefix), so reattaching the state onto
+/// a new transport never duplicates bytes and never resets sequences.
+#[derive(Debug)]
+pub struct PacketIoUpgradeState {
+    read: ReaderState,
+    write: WriterState,
+}
+
 impl<T> PacketIo<T> {
     /// Creates a duplex endpoint with zeroed sequences and 32-KiB buffers.
     #[must_use]
@@ -1278,6 +1293,53 @@ impl<T> PacketIo<T> {
     #[must_use]
     pub const fn out_packets(&self) -> u64 {
         self.write.out_packets
+    }
+
+    /// Splits the endpoint into its transport, an opaque state token, and the
+    /// currently-prefetched-but-unread bytes, for a state-preserving transport
+    /// upgrade (e.g. wrapping the raw transport in TLS).
+    ///
+    /// The returned `Vec<u8>` is a copy of the reader's unconsumed prefetch
+    /// window. That window is cleared inside the returned
+    /// [`PacketIoUpgradeState`] so the bytes exist in exactly one place: the
+    /// caller must replay the returned prefix ahead of the upgraded transport's
+    /// stream. Every other piece of state — both sequence trackers,
+    /// `in_bytes`/`in_packets`/`out_bytes`/`out_packets`, and both stream-buffer
+    /// sizes — is moved into the token unchanged. Reattach with
+    /// [`PacketIo::from_upgrade_parts`].
+    #[must_use]
+    pub fn into_upgrade_parts(self) -> (T, PacketIoUpgradeState, Vec<u8>) {
+        let Self {
+            inner,
+            mut read,
+            write,
+        } = self;
+        let unread_prefix = read.prefetched_slice().to_vec();
+        // Exactly-once: the prefix now lives solely in `unread_prefix`. Clear the
+        // reader's prefetch window so the token retains no second copy.
+        read.prefetch_start = 0;
+        read.prefetch_end = 0;
+        (inner, PacketIoUpgradeState { read, write }, unread_prefix)
+    }
+
+    /// Reattaches carried read/write state onto a new transport after an upgrade.
+    ///
+    /// The token's prefetch window is already empty (cleared by
+    /// [`PacketIo::into_upgrade_parts`]), so the new endpoint starts with no
+    /// prefetched bytes while preserving both sequence trackers, all wire/packet
+    /// counters, and both stream-buffer sizes. No sequence or counter is reset;
+    /// the caller is responsible for having replayed the unread prefix ahead of
+    /// `inner`'s stream.
+    ///
+    /// The new transport type is inferred from `inner`, so it may differ from the
+    /// type the state was split out of (e.g. a TLS-wrapped stream).
+    #[must_use]
+    pub fn from_upgrade_parts(inner: T, state: PacketIoUpgradeState) -> Self {
+        Self {
+            inner,
+            read: state.read,
+            write: state.write,
+        }
     }
 }
 
@@ -2022,6 +2084,122 @@ mod tests {
         );
         assert_eq!(src.in_packets(), reference_reader.in_packets());
         assert_eq!(dst_out_packets, reference_out_packets);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_prefix_equals_prefetched_unread_bytes() -> Result<(), Box<dyn Error>> {
+        let wire = encoded_physical_packet(b"abc", 0)?;
+        let mut io = PacketIo::new(Cursor::new(wire.clone()));
+        // `peek_packet` prefetches exactly the header plus the first payload byte.
+        io.peek_packet().await?;
+        assert_eq!(io.get_ref().position(), u64::try_from(PEEK_BYTES)?);
+
+        let (_inner, _state, unread_prefix) = io.into_upgrade_parts();
+        assert_eq!(unread_prefix.as_slice(), &wire[..PEEK_BYTES]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_token_carries_no_prefetch_after_split() -> Result<(), Box<dyn Error>> {
+        let wire = encoded_physical_packet(b"abc", 0)?;
+        let mut io = PacketIo::new(Cursor::new(wire.clone()));
+        io.peek_packet().await?;
+        let (_inner, state, unread_prefix) = io.into_upgrade_parts();
+
+        // Replay the returned prefix ahead of the not-yet-prefetched continuation;
+        // together they reconstruct the original stream exactly once.
+        let mut replayed = unread_prefix.clone();
+        replayed.extend_from_slice(&wire[unread_prefix.len()..]);
+        assert_eq!(replayed, wire);
+
+        let mut reattached = PacketIo::from_upgrade_parts(Cursor::new(replayed), state);
+        let logical = reattached.read_logical(3).await?;
+        // No duplicated prefix: the packet materializes exactly once.
+        assert_eq!(logical.payload, b"abc");
+        assert_eq!(reattached.in_packets(), 1);
+        assert_eq!(reattached.expected_read_sequence(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_round_trip_conserves_sequences_and_counters() -> Result<(), Box<dyn Error>> {
+        let buffer_size =
+            NonZeroUsize::new(4_096).ok_or_else(|| io::Error::other("buffer size"))?;
+        let mut io = PacketIo::with_stream_buffer_size(Cursor::new(Vec::new()), buffer_size);
+        // Advance the write half: three physical packets, sequences 0, 1, 2.
+        io.write_logical(b"p0", false).await?;
+        io.write_logical(b"p1", false).await?;
+        io.write_logical(b"next-payload", false).await?;
+        // Rewind and advance the read half over the first two packets.
+        io.get_mut().set_position(0);
+        assert_eq!(io.read_logical(2).await?.payload, b"p0");
+        assert_eq!(io.read_logical(2).await?.payload, b"p1");
+        // Force a prefetch of the third packet without consuming it.
+        io.peek_packet().await?;
+
+        let read_sequence = io.expected_read_sequence();
+        let write_sequence = io.next_write_sequence();
+        let in_bytes = io.in_bytes();
+        let out_bytes = io.out_bytes();
+        let in_packets = io.in_packets();
+        let out_packets = io.out_packets();
+        let read_buffer = io.read.stream_buffer_size;
+        let write_buffer = io.write.stream_buffer_size;
+
+        let (_inner, state, _prefix) = io.into_upgrade_parts();
+        let reattached = PacketIo::from_upgrade_parts(Cursor::new(Vec::<u8>::new()), state);
+
+        assert_eq!(reattached.expected_read_sequence(), read_sequence);
+        assert_eq!(reattached.next_write_sequence(), write_sequence);
+        assert_eq!(reattached.in_bytes(), in_bytes);
+        assert_eq!(reattached.out_bytes(), out_bytes);
+        assert_eq!(reattached.in_packets(), in_packets);
+        assert_eq!(reattached.out_packets(), out_packets);
+        assert_eq!(reattached.read.stream_buffer_size, read_buffer);
+        assert_eq!(reattached.write.stream_buffer_size, write_buffer);
+
+        // The round trip carried real, non-zero, non-reset state.
+        assert_eq!(read_sequence, 2);
+        assert_eq!(write_sequence, 3);
+        assert!(in_bytes > 0 && out_bytes > 0);
+        assert_eq!(in_packets, 2);
+        assert_eq!(out_packets, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_replays_prefix_and_continues_next_packet() -> Result<(), Box<dyn Error>> {
+        let mut io = PacketIo::new(Cursor::new(Vec::new()));
+        // Advance both halves so sequences are non-zero before the upgrade.
+        io.write_logical(b"c0", false).await?;
+        io.write_logical(b"c1", false).await?;
+        // The third packet (sequence 2) is the "next" packet resumed after upgrade.
+        io.write_logical(b"resumed-next", false).await?;
+        io.get_mut().set_position(0);
+        let _ = io.read_logical(8).await?;
+        let _ = io.read_logical(8).await?;
+        assert_eq!(io.expected_read_sequence(), 2);
+        // Force a prefetch straddling the next packet's header and first byte.
+        io.peek_packet().await?;
+
+        // Raw wire of the un-consumed next packet, starting after the two read ones.
+        let full_wire = io.get_ref().get_ref().clone();
+        let next_packet_wire = full_wire[12..].to_vec();
+
+        let (_inner, state, unread_prefix) = io.into_upgrade_parts();
+        assert_eq!(unread_prefix.as_slice(), &next_packet_wire[..PEEK_BYTES]);
+
+        // Fresh transport preloaded with unread_prefix ++ continuation bytes.
+        let mut replayed = unread_prefix.clone();
+        replayed.extend_from_slice(&next_packet_wire[unread_prefix.len()..]);
+        assert_eq!(replayed, next_packet_wire);
+
+        let mut upgraded = PacketIo::from_upgrade_parts(Cursor::new(replayed), state);
+        let resumed = upgraded.read_logical(64).await?;
+        assert_eq!(resumed.payload, b"resumed-next");
+        // Sequence continued from 2 to 3 (not reset); no duplicated prefix bytes.
+        assert_eq!(upgraded.expected_read_sequence(), 3);
         Ok(())
     }
 }
