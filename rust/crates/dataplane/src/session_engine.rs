@@ -82,7 +82,7 @@ use control_proto::v1::{
     RouteRequest, RouteResult,
 };
 use mysql_wire::{
-    Attribute, CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags,
+    Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams, StatusFlags,
     encode_error_packet, encode_handshake_response, encode_initial_handshake, encode_ssl_request,
     parse_handshake_response, parse_ssl_request,
 };
@@ -115,8 +115,8 @@ use session_core::internal_client::{
 };
 use session_core::prepared::{PrepareDisposition, PrepareObserver, PreparedRegistry};
 use session_core::response::{
-    DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseObserver,
-    ResponsePacket,
+    DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseEffect,
+    ResponseObserver, ResponsePacket,
 };
 use session_core::special::{
     ChangeUserEffect, ChangeUserEvent, ChangeUserPlan, ChangeUserRelay, ChangeUserTurn,
@@ -2270,6 +2270,12 @@ impl Engine {
             {
                 return Some(WireErrorSource::Proxy);
             }
+            // Execute/fetch cursor guard: the terminal status decides whether the
+            // statement retains an open cursor. Its registry sync must reach the
+            // FSM before the command-completion boundary below.
+            if completes && let Some(source) = self.observe_prepared_cursor(pending, effect).await {
+                return Some(source);
+            }
             let event = effect.session_event();
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
@@ -2298,6 +2304,49 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Applies the prepared-statement cursor guard at a command's completion
+    /// boundary. A `COM_STMT_EXECUTE` reporting `SERVER_STATUS_CURSOR_EXISTS`
+    /// opens the statement's cursor guard (blocking migration); a
+    /// `COM_STMT_FETCH` keeps it open until `SERVER_STATUS_LAST_ROW_SENT`; a
+    /// non-cursor execute or a last-row fetch clears it. The guard update is
+    /// keyed on `pending.command` (not the ambiguous `Query` response shape),
+    /// and the resulting registry sync event reaches the FSM before the
+    /// command-completion boundary (the SES-00 ordering).
+    ///
+    /// Called only from the `response_rounds` success branch: a backend ERR
+    /// carries no status and never reaches here, so an execute that failed
+    /// after long data keeps its pending guard (PS-003).
+    async fn observe_prepared_cursor(
+        &mut self,
+        pending: &PendingCommand,
+        effect: ResponseEffect,
+    ) -> Option<WireErrorSource> {
+        let code = match pending.command {
+            Command::StmtExecute => CommandCode::STMT_EXECUTE,
+            Command::StmtFetch => CommandCode::STMT_FETCH,
+            _ => return None,
+        };
+        // Dispatch validated this fixed statement-ID prefix before any backend
+        // write, so a parse failure now is an internal invariant violation, not
+        // a client error: fail closed rather than silently skip the guard.
+        let Ok(statement_id) = PreparedRegistry::statement_id(&pending.payload, code) else {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(WireErrorSource::Proxy);
+        };
+        self.prepared
+            .observe_response(pending.command, statement_id, effect);
+        if self
+            .events
+            .send(self.prepared.session_event())
+            .await
+            .is_err()
+        {
+            return Some(WireErrorSource::Proxy);
+        }
+        None
     }
 
     /// Streams a `COM_STMT_PREPARE` special response to the client.
