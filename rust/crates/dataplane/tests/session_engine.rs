@@ -1974,6 +1974,24 @@ impl MysqlClient {
         self.writer.write_logical(&payload, true).await.is_ok()
     }
 
+    /// `COM_RESET_CONNECTION`: a generic OK/ERR command that clears ALL prepared
+    /// state on success. Returns whether the backend answered OK.
+    async fn reset_connection_ok(&mut self) -> bool {
+        self.writer.reset_sequence(0);
+        if self.writer.write_logical(&[0x1f], true).await.is_err() {
+            return false;
+        }
+        self.reader.reset_sequence(1);
+        match self.reader.peek_packet().await {
+            Ok(preview) => assert_eq!(preview.sequence_id, 1),
+            Err(_) => return false,
+        }
+        let Ok(response) = self.reader.read_logical(64 * 1024).await else {
+            return false;
+        };
+        response.payload.first() == Some(&0x00)
+    }
+
     /// Reads a binary result set to its terminator: the `0xFE` resultset-OK
     /// (success) or a leading `0xFF` error; headers, column definitions, and
     /// rows are streamed past.
@@ -4025,6 +4043,113 @@ async fn execute_error_after_long_data_keeps_pending_guard() {
     assert!(
         closed.is_some(),
         "only the explicit reset releases the drain"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// SES-05 sub-slice 3 (PS-001/CMD-024/CMD-025, mutation-sensitive): pending
+/// long-data guards are tracked independently per statement ID, and a
+/// `COM_STMT_CLOSE` clears ONLY the referenced statement. Long data on 7 and 8
+/// each block the drain; closing 7 leaves 8's guard intact, and only closing 8
+/// releases it. Keying the guard mutation to a fixed ID makes closing 7 clear
+/// 8 (or 8 never block), failing this test.
+#[tokio::test]
+async fn long_data_guards_are_statement_specific() {
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(
+        client.send_long_data(7).await,
+        "long data guards statement 7"
+    );
+    assert!(
+        client.send_long_data(8).await,
+        "long data guards statement 8"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "two pending long-data guards defer the drain"
+    );
+
+    assert!(client.stmt_close(7).await, "close statement 7");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "statement 8's long-data guard still defers the drain (statement-specific)"
+    );
+
+    assert!(client.stmt_close(8).await, "close statement 8");
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "closing the last guarded statement releases the drain"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// SES-05 sub-slice 3 (CMD-031, mutation-sensitive): a successful
+/// `COM_RESET_CONNECTION` clears ALL prepared state. A pending long-data guard
+/// (7) and an open cursor (8) both defer the drain; the reset-connection OK
+/// clears every guard at once and the drain closes. Making the reset's
+/// clear-all a no-op leaves the guards pending and fails this test.
+#[tokio::test]
+async fn reset_connection_clears_all_prepared_state() {
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(
+        client.send_long_data(7).await,
+        "long data guards statement 7"
+    );
+    assert_eq!(
+        client.stmt_execute(8, 0x01).await,
+        Some(StmtResult::Ok),
+        "statement 8 opens a cursor"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "a long-data guard and an open cursor defer the drain"
+    );
+
+    assert!(
+        client.reset_connection_ok().await,
+        "reset-connection succeeds"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "reset-connection clears all prepared guards and the drain closes"
     );
     stack.dispatch_task.abort();
 }
