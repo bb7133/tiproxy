@@ -200,9 +200,36 @@ pub fn plan_backend_handshake(
     require_backend_tls: bool,
     backend_tls_available: bool,
 ) -> Result<BackendHandshakePlan, BackendTlsUnavailable> {
-    let mut capabilities =
-        CapabilityFlags::from_bits_retain(routing.negotiated().bits() & backend.bits());
-    if routing.has_attributes() {
+    plan_backend_migration_handshake(
+        routing.negotiated(),
+        routing.has_attributes(),
+        backend,
+        require_backend_tls,
+        backend_tls_available,
+    )
+}
+
+/// Plans the second backend handshake used by session migration.
+///
+/// Unlike [`plan_backend_handshake`], migration no longer owns the borrowed
+/// [`RoutingHandshake`] created during the frontend handshake. The runtime
+/// retains only its payload-free facts, so this entry point accepts those
+/// facts directly while preserving the exact capability/TLS decision shared
+/// with the initial handshake.
+///
+/// # Errors
+///
+/// Returns [`BackendTlsUnavailable`] when backend TLS is required but the
+/// captured session snapshot has no usable backend TLS configuration.
+pub fn plan_backend_migration_handshake(
+    negotiated: CapabilityFlags,
+    has_attributes: bool,
+    backend: CapabilityFlags,
+    require_backend_tls: bool,
+    backend_tls_available: bool,
+) -> Result<BackendHandshakePlan, BackendTlsUnavailable> {
+    let mut capabilities = CapabilityFlags::from_bits_retain(negotiated.bits() & backend.bits());
+    if has_attributes {
         capabilities = capabilities.union(CapabilityFlags::CONNECT_ATTRS);
     }
     let enable_tls = if require_backend_tls {
@@ -211,7 +238,7 @@ pub fn plan_backend_handshake(
         }
         true
     } else {
-        routing.negotiated().contains(CapabilityFlags::SSL)
+        negotiated.contains(CapabilityFlags::SSL)
             && backend.contains(CapabilityFlags::SSL)
             && backend_tls_available
     };

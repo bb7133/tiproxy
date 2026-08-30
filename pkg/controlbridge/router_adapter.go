@@ -1511,12 +1511,14 @@ func (conn *projectedConn) Redirect(target router.BackendInst) bool {
 		Generation: conn.generation,
 		Priority:   controlpb.Priority_PRIORITY_CRITICAL,
 		Body: &controlpb.ControlEnvelope_RedirectCommand{RedirectCommand: &controlpb.RedirectCommand{
-			ConnectionId:    conn.id,
-			RedirectId:      redirectID,
-			BackendId:       target.ID(),
-			BackendAddress:  target.Addr(),
-			ClusterName:     target.ClusterName(),
-			CommandSequence: sequence,
+			ConnectionId:     conn.id,
+			RedirectId:       redirectID,
+			BackendId:        target.ID(),
+			BackendAddress:   target.Addr(),
+			ClusterName:      target.ClusterName(),
+			CommandSequence:  sequence,
+			BackendUnhealthy: !target.Healthy(),
+			BackendLocal:     target.Local(),
 		}},
 	}
 	if err := trySend(sender, envelope); err != nil {

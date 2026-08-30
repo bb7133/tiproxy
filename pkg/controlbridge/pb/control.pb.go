@@ -2651,8 +2651,16 @@ type RedirectCommand struct {
 	// acts). Additive; zero only for peers predating
 	// RECONCILE_SESSION_REHYDRATION.
 	CommandSequence uint64 `protobuf:"varint,7,opt,name=command_sequence,json=commandSequence,proto3" json:"command_sequence,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Backward-compatible negative form: peers predating this field encode
+	// false, which retains the historical assumption that router-issued
+	// redirect targets are healthy. A current peer sets true when the target
+	// has become unhealthy so the dataplane rejects the candidate before dial.
+	BackendUnhealthy bool `protobuf:"varint,8,opt,name=backend_unhealthy,json=backendUnhealthy,proto3" json:"backend_unhealthy,omitempty"`
+	// Router-observed locality for post-swap lifecycle/traffic attribution.
+	// Older peers default to the conservative non-local value.
+	BackendLocal  bool `protobuf:"varint,9,opt,name=backend_local,json=backendLocal,proto3" json:"backend_local,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RedirectCommand) Reset() {
@@ -2732,6 +2740,20 @@ func (x *RedirectCommand) GetCommandSequence() uint64 {
 		return x.CommandSequence
 	}
 	return 0
+}
+
+func (x *RedirectCommand) GetBackendUnhealthy() bool {
+	if x != nil {
+		return x.BackendUnhealthy
+	}
+	return false
+}
+
+func (x *RedirectCommand) GetBackendLocal() bool {
+	if x != nil {
+		return x.BackendLocal
+	}
+	return false
 }
 
 type RedirectResult struct {
@@ -4039,7 +4061,7 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x0fclient_in_bytes\x18\x06 \x01(\x04R\rclientInBytes\x12(\n" +
 	"\x10client_out_bytes\x18\a \x01(\x04R\x0eclientOutBytes\x12(\n" +
 	"\x10backend_in_bytes\x18\b \x01(\x04R\x0ebackendInBytes\x12*\n" +
-	"\x11backend_out_bytes\x18\t \x01(\x04R\x0fbackendOutBytes\"\x9f\x02\n" +
+	"\x11backend_out_bytes\x18\t \x01(\x04R\x0fbackendOutBytes\"\xf1\x02\n" +
 	"\x0fRedirectCommand\x12#\n" +
 	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x1f\n" +
 	"\vredirect_id\x18\x02 \x01(\tR\n" +
@@ -4049,7 +4071,9 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x0fbackend_address\x18\x04 \x01(\tR\x0ebackendAddress\x12!\n" +
 	"\fcluster_name\x18\x05 \x01(\tR\vclusterName\x120\n" +
 	"\x14deadline_unix_millis\x18\x06 \x01(\x04R\x12deadlineUnixMillis\x12)\n" +
-	"\x10command_sequence\x18\a \x01(\x04R\x0fcommandSequence\"\x90\x02\n" +
+	"\x10command_sequence\x18\a \x01(\x04R\x0fcommandSequence\x12+\n" +
+	"\x11backend_unhealthy\x18\b \x01(\bR\x10backendUnhealthy\x12#\n" +
+	"\rbackend_local\x18\t \x01(\bR\fbackendLocal\"\x90\x02\n" +
 	"\x0eRedirectResult\x12#\n" +
 	"\rconnection_id\x18\x01 \x01(\x04R\fconnectionId\x12\x1f\n" +
 	"\vredirect_id\x18\x02 \x01(\tR\n" +

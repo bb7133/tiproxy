@@ -36,6 +36,8 @@ fn redirect(connection_id: u64, redirect_id: &str, command_sequence: u64) -> Red
         backend_id: "tidb-b".to_owned(),
         backend_address: "10.0.0.2:4000".to_owned(),
         cluster_name: String::new(),
+        backend_unhealthy: false,
+        backend_local: false,
         deadline_unix_millis: 0,
         command_sequence,
     }

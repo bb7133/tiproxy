@@ -1097,6 +1097,168 @@ if [[ $ka_pin_ready != true ]]; then
 	echo "keyspace-guard phase: initial pin never absorbed (landed '$pin_port', want $TIDB_PORT_0)" >&2
 	exit 1
 fi
+
+# ---- MIG-01 live same-keyspace migration (all Rust wire variants) ----
+# The unit suite proves every candidate-only rollback class. This real-TiDB
+# row proves the successful production composition against TiDB's signed
+# session token and native SHOW/SET SESSION_STATES implementation: one client
+# remains open while the router moves it A0 -> A1 inside ks-old; current DB and
+# a user variable survive, and subsequent SQL is served by A1. The same phase
+# runs under plain, TLS, PROXY v2, zlib, zstd, and TLS+PROXY+zstd.
+if [[ $mode == rust ]]; then
+	mysql_backend_admin "CREATE DATABASE IF NOT EXISTS mig01_live;"
+	MIG_FIFO="$run_dir/mig01-session.fifo"
+	mkfifo "$MIG_FIFO"
+	mig_rust_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log" | tr -d ' ')
+	mysql --batch --skip-column-names --force --unbuffered \
+		-h 127.0.0.1 -P "$ka_sql_port" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$MIG_FIFO" >"$run_dir/mig01-session.out" 2>&1 &
+	MIG_SESSION_PID=$!
+	printf 'MIG_SESSION_PID=%q\n' "$MIG_SESSION_PID" >>"$run_dir/state.env"
+	printf 'MIG_FIFO=%q\n' "$MIG_FIFO" >>"$run_dir/state.env"
+	exec 8>"$MIG_FIFO"
+	migration_query() {
+		local marker=$1 sql=$2 line=
+		printf '%s\n' "$sql" >&8
+		for _ in {1..40}; do
+			line=$(grep -s "^$marker|" "$run_dir/mig01-session.out" | tail -1 || true)
+			if [[ -n $line ]]; then
+				printf '%s\n' "$line"
+				return 0
+			fi
+			if ! kill -0 "$MIG_SESSION_PID" 2>/dev/null; then
+				echo "MIG-01 live session died; tail:" >&2
+				tail -8 "$run_dir/mig01-session.out" >&2 || true
+				return 1
+			fi
+			sleep 0.25
+		done
+		echo "MIG-01 live session never answered marker $marker" >&2
+		return 1
+	}
+	mig_baseline=$(migration_query MIGBASE \
+		"USE mig01_live; SET @mig01_marker = 'state-live'; SELECT CONCAT('MIGBASE|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(), 'NULL'), '|', COALESCE(@mig01_marker, 'NULL'));") || exit 1
+	mig_base_port=$(cut -d'|' -f3 <<<"$mig_baseline")
+	mig_base_db=$(cut -d'|' -f4 <<<"$mig_baseline")
+	mig_base_marker=$(cut -d'|' -f5 <<<"$mig_baseline")
+	if [[ $mig_base_port != "$TIDB_PORT_0" || $mig_base_db != mig01_live || $mig_base_marker != state-live ]]; then
+		echo "MIG-01 invalid baseline: $mig_baseline" >&2
+		exit 1
+	fi
+	mig_proxy_conn_id=
+	for _ in {1..20}; do
+		mig_proxy_conn_id=$(tail -n "+$((mig_rust_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"connection_ready"' | head -1 |
+			sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p')
+		[[ -n $mig_proxy_conn_id ]] && break
+		sleep 0.5
+	done
+	if [[ -z $mig_proxy_conn_id ]]; then
+		echo "MIG-01 could not capture the persistent session's proxy connection id" >&2
+		exit 1
+	fi
+
+	# Make A1 the sole routeable same-keyspace target. A fresh connection is
+	# the absorption oracle; the old FIFO client is the migration oracle.
+	mig_redirect_offset=$(ka_log_lines)
+	cat >"$run_dir/mig01-swap.toml" <<MIGTOML
+[proxy]
+fail-backend-list = ["127.0.0.1:$TIDB_PORT_B", "127.0.0.1:$TIDB_PORT_0"]
+MIGTOML
+	curl --noproxy '*' --fail --silent --show-error -X PUT \
+		--data-binary "@$run_dir/mig01-swap.toml" \
+		"http://127.0.0.1:$ka_api_port/api/admin/config/" -o /dev/null
+	mig_swap_ready=false
+	for _ in {1..40}; do
+		mig_new_port=$(mysql_ka_root 'SELECT @@port' 2>/dev/null || true)
+		if [[ $mig_new_port == "$TIDB_PORT_1" ]]; then
+			mig_swap_ready=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $mig_swap_ready != true ]]; then
+		echo "MIG-01 target swap never absorbed (new connection '$mig_new_port', want $TIDB_PORT_1)" >&2
+		exit 1
+	fi
+	mig_begin=
+	for _ in {1..60}; do
+		mig_begin=$(ka_log_tail "$mig_redirect_offset" |
+			grep '"begin redirect connection"' |
+			grep "\"connID\":$mig_proxy_conn_id" |
+			grep "\"from\":\"127.0.0.1:$TIDB_PORT_0\"" |
+			grep "\"to\":\"127.0.0.1:$TIDB_PORT_1\"" | head -1 || true)
+		[[ -n $mig_begin ]] && break
+		sleep 0.5
+	done
+	if [[ -z $mig_begin ]]; then
+		echo "MIG-01 router never issued the exact A0 -> A1 redirect for connection $mig_proxy_conn_id" >&2
+		ka_log_tail "$mig_redirect_offset" | grep -s 'redirect connection' | tail -8 >&2 || true
+		exit 1
+	fi
+
+	mig_result=
+	for attempt in {1..40}; do
+		marker="MIGTRY$attempt"
+		row=$(migration_query "$marker" \
+			"SELECT CONCAT('$marker|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(), 'NULL'), '|', COALESCE(@mig01_marker, 'NULL'));") || exit 1
+		row_port=$(cut -d'|' -f3 <<<"$row")
+		row_db=$(cut -d'|' -f4 <<<"$row")
+		row_marker=$(cut -d'|' -f5 <<<"$row")
+		if [[ $row_port == "$TIDB_PORT_1" ]]; then
+			mig_result=$row
+			if [[ $row_db != mig01_live || $row_marker != state-live ]]; then
+				echo "MIG-01 reached A1 but lost restored state: $row" >&2
+				exit 1
+			fi
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ -z $mig_result ]]; then
+		echo "MIG-01 persistent session did not move to A1; last row: ${row:-<none>}" >&2
+		exit 1
+	fi
+	if ! kill -0 "$MIG_SESSION_PID" 2>/dev/null; then
+		echo "MIG-01 client process was replaced instead of surviving the atomic swap" >&2
+		exit 1
+	fi
+	echo "MIG-01 live migration: proxy_conn_id=$mig_proxy_conn_id A0=$TIDB_PORT_0 -> A1=$TIDB_PORT_1; database+user-variable restored ($mig_result)"
+
+	# Close the migrated client, then restore the initial A0 pin before the
+	# separate cross-keyspace refusal phase establishes its own old session.
+	exec 8>&-
+	for _ in {1..40}; do
+		kill -0 "$MIG_SESSION_PID" 2>/dev/null || break
+		sleep 0.25
+	done
+	kill "$MIG_SESSION_PID" 2>/dev/null || true
+	wait "$MIG_SESSION_PID" 2>/dev/null || true
+	rm -f "$MIG_FIFO"
+	printf 'MIG_SESSION_PID=\nMIG_FIFO=\n' >>"$run_dir/state.env"
+	cat >"$run_dir/mig01-swap.toml" <<MIGTOML
+[proxy]
+fail-backend-list = ["127.0.0.1:$TIDB_PORT_B", "127.0.0.1:$TIDB_PORT_1"]
+MIGTOML
+	curl --noproxy '*' --fail --silent --show-error -X PUT \
+		--data-binary "@$run_dir/mig01-swap.toml" \
+		"http://127.0.0.1:$ka_api_port/api/admin/config/" -o /dev/null
+	mig_reset_ready=false
+	for _ in {1..40}; do
+		mig_reset_port=$(mysql_ka_root 'SELECT @@port' 2>/dev/null || true)
+		if [[ $mig_reset_port == "$TIDB_PORT_0" ]]; then
+			mig_reset_ready=true
+			break
+		fi
+		sleep 0.5
+	done
+	if [[ $mig_reset_ready != true ]]; then
+		echo "MIG-01 could not restore the A0 pin (new connection '$mig_reset_port')" >&2
+		exit 1
+	fi
+fi
+
 # The persistent OLD session: a FIFO-driven mysql client that stays
 # open across the dynamic swap. FD 9 keeps the FIFO writable.
 KA_FIFO="$run_dir/ka-session.fifo"
@@ -2385,7 +2547,7 @@ fi
 echo "error parity: no healthy backend -> 1105/HY000 'No available TiDB instances'"
 
 if [[ $mode == rust ]]; then
-	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, keyspace guard, error parity, and recovered from drop-next"
+	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, MIG-01 live migration, keyspace guard, error parity, and recovered from drop-next"
 else
 	echo "PASS: Go baseline $variant executed SELECT 1, namespace matrix, keyspace guard, error parity, and recovered from drop-next"
 fi

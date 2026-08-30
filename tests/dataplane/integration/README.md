@@ -146,6 +146,31 @@ handshake unit matrix rather than this live phase — name classification
 per-plugin pass-through matrix proving none of them short-circuits the
 relay (`pass_through_plugins_have_no_fast_path`).
 
+### MIG-01 live same-keyspace migration (#43)
+
+Rust runs also exercise a real same-keyspace backend migration inside the
+isolated keyspace-guard topology. After every TiDB backend has published a
+session-token signing certificate, a FIFO-driven client is pinned to cluster
+A's first backend, selects a nonempty current database, and sets a user
+variable. The test then changes the real Go router's fail-backend list so the
+second backend is the only routeable member of that keyspace. A fresh
+connection proves the new route has absorbed, and fresh structured Go evidence
+binds the exact A0 -> A1 redirect command to the persistent proxy connection.
+The same still-running client must subsequently report A1's `@@port` while
+retaining both `DATABASE()` and the user variable. This is the live oracle for
+TiDB's signed `SHOW SESSION_STATES` result, the `tidb_session_token` second
+handshake, `SET SESSION_STATES`, and atomic owner swap; a disconnected/replaced
+client cannot pass it. The phase restores the original A0 pin before the
+separate cross-keyspace refusal test starts.
+
+This row runs in every admitted Rust variant: plain, TLS, outbound PROXY v2,
+zlib, zstd, and TLS+PROXY+zstd. Its candidate-failure rollback matrix remains
+in the deterministic session-engine E2E, where invalid/expired tokens,
+unhealthy/expired/unreachable targets, and restore ERR/disconnect all preserve
+the aligned old backend. Dedicated real-socket rows additionally isolate zlib
+candidate activation and the combined zstd+PROXY-v2 candidate ordering while
+checking exact retired-plus-current raw-byte totals.
+
 ## Control-frame dropper (chaos-E2E control-loss)
 
 `controldropper/` is a test-only man-in-the-middle for the Go/Rust **control**

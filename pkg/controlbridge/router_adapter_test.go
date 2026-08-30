@@ -164,9 +164,12 @@ func TestRouterAdapterRedirectEvictionAndReconcile(t *testing.T) {
 	conn.SetEventReceiver(receiver)
 	state.mu.Unlock()
 	target := router.NewStaticBackend("tidb-b:4000")
+	target.SetHealthy(false)
 	require.True(t, conn.Redirect(target))
 	redirect := lastEnvelope(t, peer).GetRedirectCommand()
 	require.NotNil(t, redirect)
+	require.True(t, redirect.GetBackendUnhealthy())
+	require.True(t, redirect.GetBackendLocal())
 	require.Equal(t, uint64(1), lastEnvelope(t, peer).GetRequestId(),
 		"application commands share the sender's checked request-id lineage")
 	redirectResult := &controlpb.ControlEnvelope{
