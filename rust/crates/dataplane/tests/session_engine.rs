@@ -4087,6 +4087,50 @@ impl CompressedClient {
         transport.flush().await.is_ok()
     }
 
+    /// Runs one compressed `COM_STMT_PREPARE` and reads the whole special
+    /// response over compressed framing, mirroring [`MysqlClient::stmt_prepare`]:
+    /// the compressed sequence resets once for the command and the multi-packet
+    /// metadata stream is decoded through the compressed transport.
+    async fn stmt_prepare(&mut self, sql: &str) -> Option<PrepareOutcome> {
+        let mut payload = vec![0x16_u8];
+        payload.extend_from_slice(sql.as_bytes());
+        if self.io.get_mut().reset_layer_sequence().is_err() {
+            return None;
+        }
+        self.io.reset_read_sequence(0);
+        if self.io.write_logical(&payload, true).await.is_err() {
+            return None;
+        }
+        let header = self.io.read_logical(64 * 1024).await.ok()?;
+        match header.payload.first() {
+            Some(&0xFF) => {
+                let code = u16::from_le_bytes([*header.payload.get(1)?, *header.payload.get(2)?]);
+                Some(PrepareOutcome::Error { code })
+            }
+            Some(&0x00) => {
+                let statement_id = u32::from_le_bytes([
+                    *header.payload.get(1)?,
+                    *header.payload.get(2)?,
+                    *header.payload.get(3)?,
+                    *header.payload.get(4)?,
+                ]);
+                let columns =
+                    u16::from_le_bytes([*header.payload.get(5)?, *header.payload.get(6)?]);
+                let parameters =
+                    u16::from_le_bytes([*header.payload.get(7)?, *header.payload.get(8)?]);
+                for _ in 0..(u32::from(parameters) + u32::from(columns)) {
+                    self.io.read_logical(64 * 1024).await.ok()?;
+                }
+                Some(PrepareOutcome::Ok {
+                    statement_id,
+                    parameters,
+                    columns,
+                })
+            }
+            _ => None,
+        }
+    }
+
     async fn quit(mut self) {
         let _ = self.io.get_mut().reset_layer_sequence();
         self.io.reset_read_sequence(0);
@@ -4164,6 +4208,52 @@ async fn compressed_client_zlib_roundtrips_end_to_end() {
 #[tokio::test]
 async fn compressed_client_zstd_roundtrips_end_to_end() {
     compressed_client_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
+}
+
+/// SES-05 over compression: a `COM_STMT_PREPARE` special response rides the
+/// client<->proxy compressed leg intact. The proxy reads the multi-packet
+/// prepare-OK metadata from the plaintext backend and re-frames it through the
+/// compressed transport in `prepare_response_rounds`; the client decodes the
+/// statement ID and counts, and the session keeps serving compressed commands
+/// (proving the compressed sequence realigned across the prepare's many
+/// packets).
+async fn compressed_stmt_prepare_roundtrips(algorithm: CompressionAlgorithm) {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        CompressedClient::connect(stack.sql_port, algorithm),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("compressed handshake+auth completes end to end for {algorithm:?}")
+    };
+    assert_eq!(
+        client.stmt_prepare("SELECT ? + ?").await,
+        Some(PrepareOutcome::Ok {
+            statement_id: 7,
+            parameters: 2,
+            columns: 1,
+        }),
+        "the compressed prepare special response round-trips ({algorithm:?})"
+    );
+    assert!(
+        client.query_ok("SELECT 1").await,
+        "the compressed session keeps serving after a prepare ({algorithm:?})"
+    );
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+#[tokio::test]
+async fn compressed_stmt_prepare_zlib_roundtrips_end_to_end() {
+    compressed_stmt_prepare_roundtrips(CompressionAlgorithm::Zlib).await;
+}
+
+#[tokio::test]
+async fn compressed_stmt_prepare_zstd_roundtrips_end_to_end() {
+    compressed_stmt_prepare_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
 }
 
 /// Contract #1 cancel-safety over COMPRESSION, exercising the real
