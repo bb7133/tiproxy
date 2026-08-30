@@ -43,9 +43,10 @@ use dataplane::{
     BoundSessionHandler, DataplaneServer, DispatchConnectionHandler, SystemMemoryProbe,
 };
 use mysql_wire::{
-    CapabilityFlags, HandshakeResponseParams, ResponseHeader, StatusFlags, encode_eof_packet,
-    encode_error_packet, encode_handshake_response, encode_initial_handshake,
-    encode_length_encoded_bytes, encode_length_encoded_int, encode_ok_packet, encode_ssl_request,
+    Attribute, CapabilityFlags, ChangeUserParams, HandshakeResponseParams, ResponseHeader,
+    StatusFlags, encode_change_user, encode_eof_packet, encode_error_packet,
+    encode_handshake_response, encode_initial_handshake, encode_length_encoded_bytes,
+    encode_length_encoded_int, encode_ok_packet, encode_ssl_request, parse_change_user,
     parse_handshake_response, parse_initial_handshake, parse_ssl_request,
 };
 use proxy_io::compression::{
@@ -637,6 +638,92 @@ fn fake_backend_capabilities(tls: bool) -> CapabilityFlags {
     broad
 }
 
+/// Runs the backend side of one strict, multi-round `COM_CHANGE_USER`
+/// exchange. The first challenge carries a fresh native-password salt; a
+/// second opaque auth-data round proves that the runtime can reverse direction
+/// more than once before the terminal packet. Special usernames select the
+/// denied and malformed-OK branches used by fail-closed tests.
+async fn respond_to_change_user<R, W>(
+    reader: &mut PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    request: &[u8],
+    broad: CapabilityFlags,
+) -> bool
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let Ok(parsed) = parse_change_user(request, broad) else {
+        return false;
+    };
+    if parsed.auth_response != b""
+        || parsed.auth_plugin_name != Some(b"auth_unknown_plugin".as_slice())
+    {
+        return false;
+    }
+
+    let fresh_salt = [9_u8; 20];
+    let mut switch = vec![0xFE_u8];
+    switch.extend_from_slice(b"mysql_native_password\0");
+    switch.extend_from_slice(&fresh_salt);
+    switch.push(0);
+    writer.reset_sequence(reader.expected_sequence());
+    if writer.write_logical(&switch, true).await.is_err() {
+        return false;
+    }
+    reader.reset_sequence(writer.next_sequence());
+    let Ok(first_response) = reader.read_logical(64 * 1024).await else {
+        return false;
+    };
+    if first_response.payload != native_scramble(FAKE_BACKEND_PASSWORD, &fresh_salt) {
+        return false;
+    }
+
+    // A second backend-owned auth packet forces another backend->client then
+    // client->backend turn. The payload is opaque to the proxy by design.
+    writer.reset_sequence(reader.expected_sequence());
+    if writer.write_logical(&[0x01, 0x04], true).await.is_err() {
+        return false;
+    }
+    reader.reset_sequence(writer.next_sequence());
+    let Ok(second_response) = reader.read_logical(64 * 1024).await else {
+        return false;
+    };
+    if second_response.payload != b"second-auth-response" {
+        return false;
+    }
+
+    writer.reset_sequence(reader.expected_sequence());
+    if parsed.username == b"denied_user" {
+        let Ok(error) = encode_error_packet(
+            1045,
+            Some(*b"28000"),
+            b"Access denied for change user",
+            broad,
+        ) else {
+            return false;
+        };
+        return writer.write_logical(&error, true).await.is_ok();
+    }
+    if parsed.username == b"malformed_ok" {
+        // Header-only OK: classification sees OK, but status parsing must fail
+        // closed instead of retaining the previous transaction flag.
+        return writer.write_logical(&[0x00], true).await.is_ok();
+    }
+    let Ok(ok) = encode_ok_packet(
+        ResponseHeader::OK,
+        0,
+        0,
+        StatusFlags::AUTOCOMMIT,
+        0,
+        b"",
+        broad,
+    ) else {
+        return false;
+    };
+    writer.write_logical(&ok, true).await.is_ok()
+}
+
 async fn run_fake_backend_commands<R, W>(
     mut reader: PacketReader<R>,
     mut writer: PacketWriter<W>,
@@ -676,6 +763,13 @@ where
         }
         if packet.payload.first() == Some(&0x01) {
             break; // COM_QUIT
+        }
+        if packet.payload.first() == Some(&0x11) {
+            if !respond_to_change_user(&mut reader, &mut writer, &packet.payload, broad).await {
+                break;
+            }
+            in_transaction = false;
+            continue;
         }
         if packet.payload == b"\x03SHOW SESSION_STATES" {
             if !respond_to_snapshot_query(&reader, &mut writer, snapshot_reply, broad).await {
@@ -1031,6 +1125,93 @@ async fn spawn_fake_backend_server(
         false,
         None,
     ));
+    (address.port(), transcript, written_bytes)
+}
+
+/// A migration target that accepts the private token only when the candidate
+/// handshake carries the expected *current* username and attributes. This
+/// makes the runtime tests kill mutations that keep reading the immutable
+/// initial handshake after a successful change-user, or that overwrite the old
+/// identity on a failed change-user.
+async fn spawn_identity_validating_backend(
+    expected_username: &[u8],
+    expected_attributes: &[(Vec<u8>, Vec<u8>)],
+) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicU64>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let written_bytes = Arc::new(AtomicU64::new(0));
+    let expected_username = expected_username.to_vec();
+    let expected_attributes = expected_attributes.to_vec();
+    let server_transcript = Arc::clone(&transcript);
+    let server_written = Arc::clone(&written_bytes);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let broad = fake_backend_capabilities(false);
+            let counted = CountedIo::new(stream);
+            let counters = counted.counters();
+            let (read, write) = tokio::io::split(counted);
+            let mut reader = PacketReader::new(read);
+            let mut writer = PacketWriter::new(write);
+            if !write_fake_backend_greeting(&mut writer, broad).await {
+                continue;
+            }
+            reader.reset_sequence(writer.next_sequence());
+            let Ok(response) = reader.read_logical(64 * 1024).await else {
+                continue;
+            };
+            let Ok(parsed) = parse_handshake_response(&response.payload) else {
+                continue;
+            };
+            let parsed_attributes = parsed.attributes.map(|attributes| {
+                attributes
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .map(|attribute| (attribute.key.to_vec(), attribute.value.to_vec()))
+                    .collect::<Vec<_>>()
+            });
+            let accepted = parsed.auth_plugin_name == Some(b"tidb_session_token".as_slice())
+                && parsed.auth_response == b"signed-token-private"
+                && parsed.database == Some(b"snapshot_db".as_slice())
+                && parsed.username == expected_username
+                && parsed_attributes.as_deref() == Some(expected_attributes.as_slice());
+            writer.reset_sequence(reader.expected_sequence());
+            if !accepted {
+                let _ = write_access_denied(&mut writer, broad).await;
+                server_written.fetch_add(counters.outbound(), Ordering::Relaxed);
+                continue;
+            }
+            let Ok(ok) = encode_ok_packet(
+                ResponseHeader::OK,
+                0,
+                0,
+                StatusFlags::AUTOCOMMIT,
+                0,
+                b"",
+                broad,
+            ) else {
+                continue;
+            };
+            if writer.write_logical(&ok, true).await.is_err() {
+                continue;
+            }
+            let _ = run_fake_backend_commands(
+                reader,
+                writer,
+                FakeAuth::Migration,
+                Arc::clone(&server_transcript),
+                SnapshotReply::Valid,
+                broad,
+                false,
+            )
+            .await;
+            server_written.fetch_add(counters.outbound(), Ordering::Relaxed);
+        }
+    });
     (address.port(), transcript, written_bytes)
 }
 
@@ -1425,7 +1606,12 @@ impl MysqlClient {
             | CapabilityFlags::LONG_PASSWORD
             | CapabilityFlags::SECURE_CONNECTION
             | CapabilityFlags::PLUGIN_AUTH
+            | CapabilityFlags::CONNECT_ATTRS
             | CapabilityFlags::DEPRECATE_EOF;
+        let initial_attributes = [Attribute {
+            key: b"program_name",
+            value: b"initial-client",
+        }];
         // The first scramble answers the proxy's greeting salt.
         let first_scramble = native_scramble(password, &proxy_salt);
         let Ok(response) = encode_handshake_response(HandshakeResponseParams {
@@ -1436,7 +1622,7 @@ impl MysqlClient {
             auth_response: &first_scramble,
             database: None,
             auth_plugin_name: Some(b"mysql_native_password"),
-            attributes: None,
+            attributes: Some(&initial_attributes),
             zstd_level: None,
         }) else {
             return Err(Vec::new());
@@ -1519,6 +1705,79 @@ impl MysqlClient {
         };
         let _ = self.capabilities;
         response.payload.first() == Some(&0x00)
+    }
+
+    /// Runs one strict multi-round `COM_CHANGE_USER` exchange. Every
+    /// non-terminal backend packet receives one client response; the first
+    /// auth-switch response is computed from the backend's fresh salt and the
+    /// second is an opaque sentinel understood only by the fake backend.
+    async fn change_user(
+        &mut self,
+        username: &[u8],
+        database: &[u8],
+        original_auth_response: &[u8],
+        attributes: &[Attribute<'_>],
+    ) -> Result<(), u16> {
+        let request = encode_change_user(
+            ChangeUserParams {
+                username,
+                auth_response: original_auth_response,
+                database,
+                character_set: Some(45),
+                auth_plugin_name: Some(b"mysql_native_password"),
+                attributes: Some(attributes),
+            },
+            self.capabilities,
+        )
+        .map_err(|_| u16::MAX)?;
+        self.writer.reset_sequence(0);
+        self.writer
+            .write_logical(&request, true)
+            .await
+            .map_err(|_| u16::MAX)?;
+        self.reader.reset_sequence(1);
+
+        loop {
+            let expected = self.reader.expected_sequence();
+            let preview = self.reader.peek_packet().await.map_err(|_| u16::MAX)?;
+            assert_eq!(preview.sequence_id, expected);
+            let response = self
+                .reader
+                .read_logical(64 * 1024)
+                .await
+                .map_err(|_| u16::MAX)?;
+            match response.payload.first() {
+                Some(0x00) => return Ok(()),
+                Some(0xFF) if response.payload.len() >= 3 => {
+                    return Err(u16::from_le_bytes([
+                        response.payload[1],
+                        response.payload[2],
+                    ]));
+                }
+                Some(0xFE) => {
+                    let data = &response.payload[1..];
+                    let nul = data.iter().position(|&byte| byte == 0).ok_or(u16::MAX)?;
+                    assert_eq!(&data[..nul], b"mysql_native_password");
+                    let mut salt = &data[nul + 1..];
+                    if salt.last() == Some(&0) {
+                        salt = &salt[..salt.len() - 1];
+                    }
+                    self.writer.reset_sequence(self.reader.expected_sequence());
+                    self.writer
+                        .write_logical(&native_scramble(FAKE_BACKEND_PASSWORD, salt), true)
+                        .await
+                        .map_err(|_| u16::MAX)?;
+                }
+                _ => {
+                    self.writer.reset_sequence(self.reader.expected_sequence());
+                    self.writer
+                        .write_logical(b"second-auth-response", true)
+                        .await
+                        .map_err(|_| u16::MAX)?;
+                }
+            }
+            self.reader.reset_sequence(self.writer.next_sequence());
+        }
     }
 
     /// `COM_STMT_SEND_LONG_DATA`: fire-and-forget, no response.
@@ -1986,9 +2245,287 @@ async fn drain_closes_idle_session_and_completes() {
     stack.dispatch_task.abort();
 }
 
+/// The backend sees the proxy-owned placeholder exchange, never client auth.
+fn assert_rewritten_change_user(
+    commands: &[Vec<u8>],
+    capabilities: CapabilityFlags,
+    expected_attributes: &[(Vec<u8>, Vec<u8>)],
+    original_secret: &[u8],
+) {
+    let Some(rewritten) = commands
+        .iter()
+        .find(|payload| payload.first() == Some(&0x11))
+    else {
+        unreachable!("rewritten change-user reaches the backend: {commands:?}")
+    };
+    let Ok(parsed) = parse_change_user(rewritten, capabilities) else {
+        unreachable!("rewritten request parses")
+    };
+    assert_eq!(parsed.username, b"new_user");
+    assert_eq!(parsed.database, b"new_db");
+    assert_eq!(parsed.auth_response, b"");
+    assert_eq!(
+        parsed.auth_plugin_name,
+        Some(b"auth_unknown_plugin".as_slice())
+    );
+    let parsed_attributes = parsed.attributes.map(|attributes| {
+        attributes
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|attribute| (attribute.key.to_vec(), attribute.value.to_vec()))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(parsed_attributes.as_deref(), Some(expected_attributes));
+    assert!(commands.iter().all(|payload| {
+        !payload
+            .windows(original_secret.len())
+            .any(|window| window == original_secret)
+    }));
+}
+
 /// A control redirect snapshots the old owner, authenticates the target with
 /// the private token, restores the exact escaped state, then atomically swaps
 /// under the exact admitted id. The client connection keeps serving.
+#[tokio::test]
+async fn change_user_success_commits_identity_clears_guard_and_migrates() {
+    let stack = spawn_stack().await;
+    let new_attributes = vec![(b"program_name".to_vec(), b"changed-client".to_vec())];
+    let (target_port, _target_transcript, _target_written_bytes) =
+        spawn_identity_validating_backend(b"new_user", &new_attributes).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("BEGIN").await, "old session enters a txn");
+    assert!(client.send_long_data(77).await, "prepared guard is pending");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let new_wire_attributes = [Attribute {
+        key: b"program_name",
+        value: b"changed-client",
+    }];
+    let original_secret = b"client-scramble-must-disappear";
+    assert_eq!(
+        client
+            .change_user(
+                b"new_user",
+                b"new_db",
+                original_secret,
+                &new_wire_attributes,
+            )
+            .await,
+        Ok(()),
+        "fresh-salt multi-round reauthentication succeeds"
+    );
+    assert!(
+        client.query_ok("SELECT after_change_user").await,
+        "the next command starts at a clean packet boundary"
+    );
+
+    let commands = stack
+        .backend_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert_rewritten_change_user(
+        &commands,
+        client.capabilities,
+        &new_attributes,
+        original_secret,
+    );
+    assert!(
+        !format!("{:?}", stack.sender.sent()).contains("client-scramble-must-disappear"),
+        "the original PendingCommand auth response never enters control IPC"
+    );
+
+    let redirect = command_envelope(
+        6800,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-change-user-success".to_owned(),
+            backend_id: "tidb-current-identity".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-change-user-success")
+    })
+    .await;
+    assert!(
+        matches!(
+            result.and_then(|envelope| envelope.body),
+            Some(Body::RedirectResult(result)) if result.succeeded
+        ),
+        "successful change-user clears txn/prepared guards and migration uses its current identity"
+    );
+    assert!(client.query_ok("SELECT after_identity_migration").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+/// A rejected change-user preserves both the previous identity and the pending
+/// prepared guard. The queued redirect must stay blocked until RESET clears the
+/// old guard, then authenticate its candidate as the original user/attributes.
+#[tokio::test]
+async fn change_user_failure_preserves_identity_and_prepared_guard() {
+    let stack = spawn_stack().await;
+    let old_attributes = vec![(b"program_name".to_vec(), b"initial-client".to_vec())];
+    let (target_port, _target_transcript, _target_written_bytes) =
+        spawn_identity_validating_backend(b"root", &old_attributes).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.send_long_data(88).await);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let denied_attributes = [Attribute {
+        key: b"program_name",
+        value: b"must-not-commit",
+    }];
+    assert_eq!(
+        client
+            .change_user(
+                b"denied_user",
+                b"denied_db",
+                b"denied-secret",
+                &denied_attributes,
+            )
+            .await,
+        Err(1045)
+    );
+    assert!(
+        client.query_ok("SELECT after_denied_change_user").await,
+        "ERR completes the command without closing the old owner"
+    );
+
+    let redirect = command_envelope(
+        6801,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-change-user-failed".to_owned(),
+            backend_id: "tidb-old-identity".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        stack.sender.sent().into_iter().all(|envelope| !matches!(
+            &envelope.body,
+            Some(Body::RedirectResult(result)) if result.redirect_id == "r-change-user-failed"
+        )),
+        "the failed change-user leaves the old long-data guard pending"
+    );
+
+    assert!(client.stmt_reset_ok(88).await);
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-change-user-failed")
+    })
+    .await;
+    assert!(
+        matches!(
+            result.and_then(|envelope| envelope.body),
+            Some(Body::RedirectResult(result)) if result.succeeded
+        ),
+        "RESET releases the old guard and the candidate sees the old identity"
+    );
+    assert!(
+        client
+            .query_ok("SELECT after_failed_identity_migration")
+            .await
+    );
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+/// The runtime rejects an unparseable request before a single change-user byte
+/// reaches the backend.
+#[tokio::test]
+async fn malformed_change_user_fails_before_backend_write() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    client.writer.reset_sequence(0);
+    assert!(client.writer.write_logical(&[0x11], true).await.is_ok());
+    client.reader.reset_sequence(1);
+    let closed = timeout(
+        Duration::from_secs(2),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await;
+    assert!(
+        matches!(closed, Ok(Err(_))),
+        "malformed request closes fail-closed"
+    );
+    let commands = stack
+        .backend_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert!(
+        commands
+            .iter()
+            .all(|payload| payload.first() != Some(&0x11)),
+        "no malformed change-user reaches the backend: {commands:?}"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// A header-only OK is relayed exactly once but cannot commit identity or keep
+/// the session alive because it lacks the status field that defines the
+/// transaction boundary.
+#[tokio::test]
+async fn change_user_ok_without_status_fails_closed() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    let attributes = [Attribute {
+        key: b"program_name",
+        value: b"malformed-ok",
+    }];
+    assert_eq!(
+        client
+            .change_user(b"malformed_ok", b"db", b"original-secret", &attributes,)
+            .await,
+        Ok(()),
+        "client receives the already-forwarded terminal byte"
+    );
+    assert!(
+        !client.query_ok("SELECT must_not_run").await,
+        "missing OK status poisons the session instead of retaining txn state"
+    );
+    stack.dispatch_task.abort();
+}
+
 #[tokio::test]
 async fn redirect_restores_candidate_and_swaps_atomically() {
     let stack = spawn_stack().await;
@@ -4077,6 +4614,7 @@ impl DirectionSync for CompressedTestTransport {
 /// switches to at that same boundary.
 struct CompressedClient {
     io: PacketIo<CompressedTestTransport>,
+    capabilities: CapabilityFlags,
 }
 
 impl CompressedClient {
@@ -4110,8 +4648,13 @@ impl CompressedClient {
             | CapabilityFlags::LONG_PASSWORD
             | CapabilityFlags::SECURE_CONNECTION
             | CapabilityFlags::PLUGIN_AUTH
+            | CapabilityFlags::CONNECT_ATTRS
             | CapabilityFlags::DEPRECATE_EOF
             | compress_capability;
+        let initial_attributes = [Attribute {
+            key: b"program_name",
+            value: b"initial-client",
+        }];
         let first_scramble = native_scramble(FAKE_BACKEND_PASSWORD, &proxy_salt);
         let response = encode_handshake_response(HandshakeResponseParams {
             capabilities,
@@ -4121,7 +4664,7 @@ impl CompressedClient {
             auth_response: &first_scramble,
             database: None,
             auth_plugin_name: Some(b"mysql_native_password"),
-            attributes: None,
+            attributes: Some(&initial_attributes),
             zstd_level,
         })
         .ok()?;
@@ -4167,6 +4710,7 @@ impl CompressedClient {
         .ok()?;
         Some(Self {
             io: PacketIo::new(CompressedTestTransport { inner: compressed }),
+            capabilities,
         })
     }
 
@@ -4187,6 +4731,73 @@ impl CompressedClient {
         match self.io.read_logical(64 * 1024).await {
             Ok(response) => response.payload.first() == Some(&0x00),
             Err(_) => false,
+        }
+    }
+
+    /// Multi-round change-user over the negotiated compressed transport.
+    /// There is one layered reset at command entry only; every later
+    /// backend/client direction reversal is governed by the production-equivalent
+    /// `DirectionSync` hooks on `PacketIo`.
+    async fn change_user(
+        &mut self,
+        username: &[u8],
+        database: &[u8],
+        original_auth_response: &[u8],
+        attributes: &[Attribute<'_>],
+    ) -> Result<(), u16> {
+        let request = encode_change_user(
+            ChangeUserParams {
+                username,
+                auth_response: original_auth_response,
+                database,
+                character_set: Some(45),
+                auth_plugin_name: Some(b"mysql_native_password"),
+                attributes: Some(attributes),
+            },
+            self.capabilities,
+        )
+        .map_err(|_| u16::MAX)?;
+        self.io.reset_layer_sequence().map_err(|_| u16::MAX)?;
+        self.io.reset_read_sequence(0);
+        self.io
+            .write_logical(&request, true)
+            .await
+            .map_err(|_| u16::MAX)?;
+
+        loop {
+            let response = self
+                .io
+                .read_logical(64 * 1024)
+                .await
+                .map_err(|_| u16::MAX)?;
+            match response.payload.first() {
+                Some(0x00) => return Ok(()),
+                Some(0xFF) if response.payload.len() >= 3 => {
+                    return Err(u16::from_le_bytes([
+                        response.payload[1],
+                        response.payload[2],
+                    ]));
+                }
+                Some(0xFE) => {
+                    let data = &response.payload[1..];
+                    let nul = data.iter().position(|&byte| byte == 0).ok_or(u16::MAX)?;
+                    assert_eq!(&data[..nul], b"mysql_native_password");
+                    let mut salt = &data[nul + 1..];
+                    if salt.last() == Some(&0) {
+                        salt = &salt[..salt.len() - 1];
+                    }
+                    self.io
+                        .write_logical(&native_scramble(FAKE_BACKEND_PASSWORD, salt), true)
+                        .await
+                        .map_err(|_| u16::MAX)?;
+                }
+                _ => {
+                    self.io
+                        .write_logical(b"second-auth-response", true)
+                        .await
+                        .map_err(|_| u16::MAX)?;
+                }
+            }
         }
     }
 
@@ -4377,6 +4988,70 @@ async fn compressed_stmt_prepare_zlib_roundtrips_end_to_end() {
 #[tokio::test]
 async fn compressed_stmt_prepare_zstd_roundtrips_end_to_end() {
     compressed_stmt_prepare_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
+}
+
+/// A zstd frontend performs two backend/client auth direction reversals inside
+/// one change-user exchange, consumes the final OK, then starts a fresh query.
+/// Any relay-internal compressed reset or bypass of `PacketIo`'s direction
+/// hooks makes the strict sequence fail before the next query.
+#[tokio::test]
+async fn compressed_zstd_change_user_multi_round_stays_aligned() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        CompressedClient::connect(stack.sql_port, CompressionAlgorithm::Zstd { level: 3 }),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("compressed zstd session established")
+    };
+    let attributes = [Attribute {
+        key: b"program_name",
+        value: b"zstd-change-user",
+    }];
+    assert_eq!(
+        client
+            .change_user(
+                b"zstd_user",
+                b"zstd_db",
+                b"zstd-original-scramble",
+                &attributes,
+            )
+            .await,
+        Ok(())
+    );
+    assert!(
+        client.query_ok("SELECT after_zstd_change_user").await,
+        "next command resets the compressed exchange exactly once"
+    );
+    let commands = stack
+        .backend_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    let Some(rewritten) = commands
+        .iter()
+        .find(|payload| payload.first() == Some(&0x11))
+    else {
+        unreachable!("rewritten request is recorded: {commands:?}")
+    };
+    let Ok(parsed) = parse_change_user(rewritten, client.capabilities) else {
+        unreachable!("rewritten compressed request parses")
+    };
+    assert_eq!(parsed.username, b"zstd_user");
+    assert_eq!(parsed.auth_response, b"");
+    assert_eq!(
+        parsed.auth_plugin_name,
+        Some(b"auth_unknown_plugin".as_slice())
+    );
+    assert!(commands.iter().all(|payload| {
+        !payload
+            .windows(b"zstd-original-scramble".len())
+            .any(|window| window == b"zstd-original-scramble")
+    }));
+    client.quit().await;
+    stack.dispatch_task.abort();
 }
 
 /// Contract #1 cancel-safety over COMPRESSION, exercising the real

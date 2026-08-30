@@ -59,9 +59,10 @@
 //! advertised (`COMPRESS` + `ZSTD`) and, when a client negotiates it, activated
 //! at the auth-OK boundary on each leg independently (WIRE-activation C); the
 //! compressed sequence is slaved to the packet sequence and reset once per
-//! command. `COM_CHANGE_USER` and
-//! `COM_STMT_PREPARE` (the prepared special response flow) are
-//! answered with a fixed unsupported error and the session closes. A
+//! command. `COM_CHANGE_USER` runs its backend-challenged auth relay on the
+//! same single socket owner and commits identity/prepared state only after the
+//! final OK. `COM_STMT_PREPARE` streams its special multi-packet response and
+//! registers statement metadata only after the terminal success boundary. A
 //! control redirect executes the bounded `SHOW SESSION_STATES` exchange at
 //! the FSM safe boundary, validates the signed token/session JSON, dials and
 //! authenticates the exact gate-admitted target with `tidb_session_token`,
@@ -81,8 +82,8 @@ use control_proto::v1::{
     RouteRequest, RouteResult,
 };
 use mysql_wire::{
-    CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags, encode_error_packet,
-    encode_handshake_response, encode_initial_handshake, encode_ssl_request,
+    Attribute, CapabilityFlags, CommandPacket, HandshakeResponseParams, StatusFlags,
+    encode_error_packet, encode_handshake_response, encode_initial_handshake, encode_ssl_request,
     parse_handshake_response, parse_ssl_request,
 };
 use proxy_io::PacketIo;
@@ -116,6 +117,10 @@ use session_core::prepared::{PrepareDisposition, PrepareObserver, PreparedRegist
 use session_core::response::{
     DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseObserver,
     ResponsePacket,
+};
+use session_core::special::{
+    ChangeUserEffect, ChangeUserEvent, ChangeUserPlan, ChangeUserRelay, ChangeUserTurn,
+    SessionIdentity, change_user_ok_in_transaction, plan_change_user,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -314,12 +319,6 @@ const ENGINE_CMD_CAPACITY: usize = 16;
 const ENGINE_REPORT_CAPACITY: usize = 8;
 /// Server-version bytes advertised in the proxy greeting.
 const SERVER_VERSION: &[u8] = b"8.0.11-TiProxy-rs";
-/// Fixed error for the fail-closed `COM_CHANGE_USER` slice boundary.
-const ER_CHANGE_USER_UNSUPPORTED: (u16, [u8; 5], &str) = (
-    1105,
-    *b"HY000",
-    "TiProxy-rs: COM_CHANGE_USER is not supported yet",
-);
 
 /// Bounds one candidate attempt by both the issuer's absolute deadline and
 /// the dataplane acquisition budget. Zero is the legacy/control default and
@@ -653,6 +652,7 @@ async fn run_bound_session_observed(
         salt: [0; 20],
         negotiated: CapabilityFlags::from_bits_retain(0),
         client_handshake_raw: Vec::new(),
+        session_identity: None,
         relay_hold: None,
         cmd_state: None,
         in_transaction: false,
@@ -927,6 +927,37 @@ struct PendingCommand {
     traffic_before: BackendTraffic,
 }
 
+enum ChangeUserRoundProgress {
+    Continue,
+    Finished,
+}
+
+fn classify_change_user_response(
+    payload: &[u8],
+    negotiated: CapabilityFlags,
+) -> Result<(ChangeUserEvent, bool, Option<bool>), ()> {
+    let classified = classify_backend_auth_packet(payload, negotiated).map_err(|_| ())?;
+    match classified {
+        AuthEvent::BackendOk => {
+            let in_transaction =
+                change_user_ok_in_transaction(payload, negotiated).map_err(|_| ())?;
+            Ok((
+                ChangeUserEvent::BackendOk { in_transaction },
+                true,
+                Some(in_transaction),
+            ))
+        }
+        AuthEvent::BackendError { .. } => {
+            let code = u16::from_le_bytes([payload[1], payload[2]]);
+            Ok((ChangeUserEvent::BackendError { code }, false, None))
+        }
+        AuthEvent::AuthSwitchRequest { .. }
+        | AuthEvent::FastAuthSuccess
+        | AuthEvent::ExtraAuthData => Ok((ChangeUserEvent::BackendAuthData, false, None)),
+        AuthEvent::ClientAuthResponse | AuthEvent::BackendReconnected { .. } => Err(()),
+    }
+}
+
 /// The single owner of all session wire I/O.
 struct Engine {
     connection_id: u64,
@@ -960,6 +991,11 @@ struct Engine {
     /// the backend (the backend re-challenges through the auth-switch
     /// relay, so the proxy-salt-scaled reply is acceptable there).
     client_handshake_raw: Vec<u8>,
+    /// Current authenticated user/database/attributes. Unlike the immutable
+    /// connection-shape fields in `client_handshake_raw`, these values change
+    /// only after a successful `COM_CHANGE_USER` final OK and are also the
+    /// identity used by a later session-token migration handshake.
+    session_identity: Option<SessionIdentity>,
     /// A backend auth payload held between relay classification and its
     /// forward effect.
     relay_hold: Option<Vec<u8>>,
@@ -1270,6 +1306,18 @@ impl Engine {
             connection_attributes: std::collections::BTreeMap::default(),
             tls: self.frontend_tls_active,
         };
+        let identity_attributes = parsed.attributes.map(|attributes| {
+            attributes
+                .iter()
+                .filter_map(Result::ok)
+                .map(|attribute| (attribute.key.to_vec(), attribute.value.to_vec()))
+                .collect::<Vec<_>>()
+        });
+        self.session_identity = Some(SessionIdentity::new(
+            parsed.username,
+            parsed.database,
+            identity_attributes.as_deref(),
+        ));
         self.cmd_state = Some(CommandSessionState::new(self.negotiated, parsed.database));
         let routing = negotiation.routing_handshake(&parsed, self.endpoints);
         if self
@@ -1826,9 +1874,6 @@ impl Engine {
                     .await;
                 continue;
             };
-            if self.refuse_unsupported_command(command).await {
-                return Some(WireErrorSource::ClientNetwork);
-            }
             let event = if command == Command::Quit {
                 SessionEvent::ClientCommandQuit
             } else {
@@ -1863,6 +1908,17 @@ impl Engine {
             let Some(pending) = self.pending_command.take() else {
                 return Some(WireErrorSource::Proxy);
             };
+            if pending.command == Command::ChangeUser {
+                let response_source = self.change_user_rounds(&pending).await;
+                self.record_command(&pending);
+                if let Some(source) = response_source {
+                    return Some(source);
+                }
+                if self.closing {
+                    return None;
+                }
+                continue;
+            }
             if let Some(source) = self.forward_command_to_backend(&pending).await {
                 self.record_command(&pending);
                 return Some(source);
@@ -1900,22 +1956,227 @@ impl Engine {
         }
     }
 
-    /// Answers the remaining fail-closed slice boundary before any forward:
-    /// `COM_CHANGE_USER` is a follow-up slice (SES-06) — an explicit refusal,
-    /// never a silent teardown. `COM_STMT_PREPARE` is now served by
-    /// [`prepare_response_rounds`](Self::prepare_response_rounds).
-    async fn refuse_unsupported_command(&mut self, command: Command) -> bool {
-        let refusal = if command == Command::ChangeUser {
-            Some(ER_CHANGE_USER_UNSUPPORTED)
-        } else {
-            None
+    /// Rewrites and relays one `COM_CHANGE_USER` authentication exchange.
+    ///
+    /// The command packet is the only client auth-bearing allocation retained
+    /// by the command owner. Auth responses after the backend's fresh challenge
+    /// stream directly client-to-backend with zero capture, and no payload is
+    /// exposed to logs, control IPC, or error values.
+    async fn change_user_rounds(&mut self, pending: &PendingCommand) -> Option<WireErrorSource> {
+        let Ok(plan) = plan_change_user(&pending.payload, self.negotiated) else {
+            // Go classifies a malformed change-user packet as a proxy
+            // protocol failure. Nothing reached the backend, and the
+            // original payload remains private to this command owner.
+            self.quit_source = QuitSource::ProxyMalformed;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Some(WireErrorSource::Proxy);
         };
-        let Some((code, state, message)) = refusal else {
-            return false;
+        if let Err(source) = self.begin_change_user(&plan).await {
+            return Some(source);
+        }
+
+        let mut relay = ChangeUserRelay::new();
+        loop {
+            let result = match relay.turn() {
+                ChangeUserTurn::AwaitingBackend => {
+                    self.change_user_backend_round(pending, &plan, &mut relay)
+                        .await
+                }
+                ChangeUserTurn::AwaitingClient => self
+                    .change_user_client_round(&mut relay)
+                    .await
+                    .map(|()| ChangeUserRoundProgress::Continue),
+                ChangeUserTurn::Finished => Err(WireErrorSource::Proxy),
+            };
+            match result {
+                Ok(ChangeUserRoundProgress::Continue) => {}
+                Ok(ChangeUserRoundProgress::Finished) => return None,
+                Err(source) => return Some(source),
+            }
+        }
+    }
+
+    async fn begin_change_user(&mut self, plan: &ChangeUserPlan) -> Result<(), WireErrorSource> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Err(WireErrorSource::Proxy);
         };
-        let _ = self.write_client_error(code, state, message).await;
-        let _ = self.events.send(SessionEvent::ClientIoError).await;
-        true
+        // One layered reset at the command boundary only. Every auth-loop
+        // direction reversal below goes through PacketIo's begin-read/write
+        // hooks; resetting the compressed layer inside the relay would rewind
+        // live frames.
+        if backend.backend_io.reset_layer_sequence().is_err() {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Err(WireErrorSource::Proxy);
+        }
+        backend.backend_io.reset_write_sequence(0);
+        backend.backend_io.reset_read_sequence(1);
+        if backend
+            .backend_io
+            .write_logical(&plan.rewritten, true)
+            .await
+            .is_err()
+        {
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Err(WireErrorSource::BackendNetwork);
+        }
+        Ok(())
+    }
+
+    async fn change_user_backend_round(
+        &mut self,
+        pending: &PendingCommand,
+        plan: &ChangeUserPlan,
+        relay: &mut ChangeUserRelay,
+    ) -> Result<ChangeUserRoundProgress, WireErrorSource> {
+        self.align_change_user_backend_read();
+        self.align_change_user_client_write();
+        let forwarded = {
+            let Some(backend) = self.backend.as_mut() else {
+                return Err(WireErrorSource::Proxy);
+            };
+            PacketIo::forward_packet_to(
+                &mut backend.backend_io,
+                &mut self.client_io,
+                COMMAND_PAYLOAD_LIMIT,
+            )
+            .await
+        };
+        let Ok(progress) = forwarded else {
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Err(WireErrorSource::BackendNetwork);
+        };
+        let payload = progress.captured_prefix();
+        if progress.logical_payload_bytes() != payload.len() as u64 {
+            // Classification needs the complete bounded auth packet (notably
+            // the auth-switch plugin terminator). The wire packet was already
+            // forwarded like Go, but retaining a partially classified
+            // exchange would be unsafe.
+            self.quit_source = QuitSource::ProxyMalformed;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Err(WireErrorSource::Proxy);
+        }
+        let Ok((event, successful, in_transaction)) =
+            classify_change_user_response(payload, self.negotiated)
+        else {
+            self.quit_source = QuitSource::ProxyMalformed;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Err(WireErrorSource::BackendNetwork);
+        };
+        let Ok(step) = relay.on_event(event) else {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Err(WireErrorSource::Proxy);
+        };
+        if step.effects.first() != Some(&ChangeUserEffect::ForwardBackendToClient) {
+            return Err(WireErrorSource::Proxy);
+        }
+
+        if step
+            .effects
+            .contains(&ChangeUserEffect::CommitPendingIdentity)
+        {
+            let Some(identity) = self.session_identity.as_mut() else {
+                return Err(WireErrorSource::Proxy);
+            };
+            identity.apply_change_user(&plan.pending);
+        }
+        if successful {
+            // This is the sole prepared-state clear seam: dispatch owns
+            // `ClearAll`, and the synchronization event must reach SES-00
+            // before the command-completion event.
+            if let Some(sync) = self.apply_command_mutations(pending, true)
+                && self.events.send(sync).await.is_err()
+            {
+                return Err(WireErrorSource::Proxy);
+            }
+        }
+        if let Some(in_transaction) = in_transaction {
+            self.in_transaction = in_transaction;
+        }
+        let Some(event) = step.session_event else {
+            return Ok(ChangeUserRoundProgress::Continue);
+        };
+        if self.events.send(event).await.is_err() {
+            return Err(WireErrorSource::Proxy);
+        }
+        let _ = self
+            .await_effect(SessionEffect::ForwardResponseToClient)
+            .await;
+        Ok(ChangeUserRoundProgress::Finished)
+    }
+
+    async fn change_user_client_round(
+        &mut self,
+        relay: &mut ChangeUserRelay,
+    ) -> Result<(), WireErrorSource> {
+        self.align_change_user_client_read();
+        self.align_change_user_backend_write();
+        let forwarded = {
+            let Some(backend) = self.backend.as_mut() else {
+                return Err(WireErrorSource::Proxy);
+            };
+            PacketIo::forward_packet_to(&mut self.client_io, &mut backend.backend_io, 0).await
+        };
+        if forwarded.is_err() {
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::ClientNetwork);
+        }
+        let Ok(step) = relay.on_event(ChangeUserEvent::ClientAuthResponse) else {
+            return Err(WireErrorSource::Proxy);
+        };
+        if step.effects != vec![ChangeUserEffect::ForwardClientToBackend]
+            || step.session_event.is_some()
+        {
+            return Err(WireErrorSource::Proxy);
+        }
+        Ok(())
+    }
+
+    /// Plain/TLS transports have independent packet read/write trackers and
+    /// need explicit direction handoff. Compressed transports MUST use their
+    /// centralized `DirectionSync` hook instead: it slaves the packet tracker
+    /// to the shared compressed sequence and rejects buffered transitions.
+    fn align_change_user_client_read(&mut self) {
+        if !matches!(self.client_io.get_ref(), ClientTransport::Compressed(_)) {
+            self.client_io
+                .reset_read_sequence(self.client_io.next_write_sequence());
+        }
+    }
+
+    fn align_change_user_client_write(&mut self) {
+        if !matches!(self.client_io.get_ref(), ClientTransport::Compressed(_)) {
+            self.client_io
+                .reset_write_sequence(self.client_io.expected_read_sequence());
+        }
+    }
+
+    fn align_change_user_backend_read(&mut self) {
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        if !matches!(
+            backend.backend_io.get_ref(),
+            BackendTransport::Compressed(_)
+        ) {
+            backend
+                .backend_io
+                .reset_read_sequence(backend.backend_io.next_write_sequence());
+        }
+    }
+
+    fn align_change_user_backend_write(&mut self) {
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        if !matches!(
+            backend.backend_io.get_ref(),
+            BackendTransport::Compressed(_)
+        ) {
+            backend
+                .backend_io
+                .reset_write_sequence(backend.backend_io.expected_read_sequence());
+        }
     }
 
     /// Forwards one accepted command to the backend on a fresh exchange:
@@ -2526,17 +2787,13 @@ impl Engine {
         )
         .map_err(|_| CandidateFailure::Handshake)?;
 
-        let parsed = parse_handshake_response(&self.client_handshake_raw)
-            .map_err(|_| CandidateFailure::Handshake)?;
-        let attributes = parsed.attributes.map(|attributes| {
-            attributes
-                .into_iter()
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>()
-        });
+        let identity = self
+            .session_identity
+            .as_ref()
+            .ok_or(CandidateFailure::Handshake)?;
         let plan = plan_backend_migration_handshake(
             self.negotiated,
-            attributes.is_some(),
+            identity.attributes().is_some(),
             backend_caps,
             require_backend_tls,
             backend_tls_available,
@@ -2605,10 +2862,17 @@ impl Engine {
         // SHOW SESSION_STATES replaces (and may clear) the original database.
         let parsed = parse_handshake_response(&self.client_handshake_raw)
             .map_err(|_| CandidateFailure::Handshake)?;
-        let attributes = parsed.attributes.map(|attributes| {
+        let identity = self
+            .session_identity
+            .as_ref()
+            .ok_or(CandidateFailure::Handshake)?;
+        let attributes = identity.attributes().map(|attributes| {
             attributes
-                .into_iter()
-                .filter_map(Result::ok)
+                .iter()
+                .map(|(key, value)| Attribute {
+                    key: key.as_slice(),
+                    value: value.as_slice(),
+                })
                 .collect::<Vec<_>>()
         });
         let database = snapshot.current_database().map(str::as_bytes);
@@ -2622,7 +2886,7 @@ impl Engine {
             capabilities,
             max_packet_size: parsed.max_packet_size,
             collation: parsed.collation,
-            username: parsed.username,
+            username: identity.username(),
             auth_response: snapshot.session_token().as_bytes(),
             database,
             auth_plugin_name: Some(b"tidb_session_token"),
