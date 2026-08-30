@@ -18,6 +18,7 @@
 //! against a scripted fake backend, serves commands, and resolves
 //! every control command to its exact gate terminal.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -385,6 +386,106 @@ fn encode_prepare_ok(statement_id: u32, columns: u16, parameters: u16, warnings:
     payload
 }
 
+/// The `DEPRECATE_EOF` result-set terminator carrying `status`: an OK packet
+/// with the `0xFE` header and a >=7-byte body, which the observer recognizes as
+/// the resultset OK (not a classic 5-byte EOF and not a data row). Execute
+/// surfaces `CURSOR_EXISTS` here; fetch surfaces `LAST_ROW_SENT`.
+fn encode_resultset_terminator(status: StatusFlags, capabilities: CapabilityFlags) -> Vec<u8> {
+    match encode_ok_packet(
+        ResponseHeader::EOF_OR_AUTH_SWITCH,
+        0,
+        0,
+        status,
+        0,
+        b"",
+        capabilities,
+    ) {
+        Ok(packet) => packet,
+        Err(_) => unreachable!("resultset OK terminator encodes"),
+    }
+}
+
+/// Emits a `COM_STMT_EXECUTE` response. The execute flags byte (payload[5])
+/// selects the shape: `0x80` sentinel = a backend error (e.g. execute after
+/// long data), `0x01` (read-only cursor) = a result-set header + column
+/// definition + a cursor-open terminator (`CURSOR_EXISTS`, no rows), otherwise
+/// a one-row result set with a plain terminator (no cursor).
+async fn respond_to_execute<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    payload: &[u8],
+    capabilities: CapabilityFlags,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    let flags = payload.get(5).copied().unwrap_or(0);
+    writer.reset_sequence(reader.expected_sequence());
+    if flags & 0x80 != 0 {
+        let Ok(error) =
+            encode_error_packet(1064, Some(*b"42000"), b"execute rejected", capabilities)
+        else {
+            return false;
+        };
+        return writer.write_logical(&error, true).await.is_ok();
+    }
+    for packet in [vec![0x01], result_column(b"c")] {
+        if writer.write_logical(&packet, true).await.is_err() {
+            return false;
+        }
+    }
+    if flags & 0x01 != 0 {
+        // Read-only cursor: the terminator opens the cursor; rows come by fetch.
+        let terminator = encode_resultset_terminator(
+            StatusFlags::AUTOCOMMIT | StatusFlags::CURSOR_EXISTS,
+            capabilities,
+        );
+        return writer.write_logical(&terminator, true).await.is_ok();
+    }
+    // No cursor: one binary row then a plain terminator.
+    if writer.write_logical(&[0x00, 0x00], true).await.is_err() {
+        return false;
+    }
+    let terminator = encode_resultset_terminator(StatusFlags::AUTOCOMMIT, capabilities);
+    writer.write_logical(&terminator, true).await.is_ok()
+}
+
+/// Emits a `COM_STMT_FETCH` response: one row on the first fetch of a statement
+/// (the cursor stays open), then a `LAST_ROW_SENT` terminator on the second.
+async fn respond_to_fetch<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    payload: &[u8],
+    fetch_counts: &mut HashMap<u32, u32>,
+    capabilities: CapabilityFlags,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    let statement_id = u32::from_le_bytes([
+        payload.get(1).copied().unwrap_or(0),
+        payload.get(2).copied().unwrap_or(0),
+        payload.get(3).copied().unwrap_or(0),
+        payload.get(4).copied().unwrap_or(0),
+    ]);
+    let count = fetch_counts.entry(statement_id).or_insert(0);
+    *count += 1;
+    let last = *count >= 2;
+    writer.reset_sequence(reader.expected_sequence());
+    if !last {
+        if writer.write_logical(&[0x00, 0x00], true).await.is_err() {
+            return false;
+        }
+        let terminator = encode_resultset_terminator(StatusFlags::AUTOCOMMIT, capabilities);
+        return writer.write_logical(&terminator, true).await.is_ok();
+    }
+    let terminator = encode_resultset_terminator(
+        StatusFlags::AUTOCOMMIT | StatusFlags::LAST_ROW_SENT,
+        capabilities,
+    );
+    writer.write_logical(&terminator, true).await.is_ok()
+}
+
 /// Emits a `COM_STMT_PREPARE` special response for the scripted backend. A
 /// fixed statement ID (7) keeps the register/guard-replacement discriminator
 /// deterministic; markers in the prepare text pick the branch: `FAIL` → a
@@ -724,6 +825,10 @@ where
     writer.write_logical(&ok, true).await.is_ok()
 }
 
+// The scripted backend's command loop dispatches every proxied command type
+// (query, prepare, execute, fetch, long-data, change-user, session-states);
+// its length tracks that command surface, not incidental complexity.
+#[allow(clippy::too_many_lines)]
 async fn run_fake_backend_commands<R, W>(
     mut reader: PacketReader<R>,
     mut writer: PacketWriter<W>,
@@ -747,6 +852,9 @@ where
     }
     // Command loop: OK for everything until quit/EOF.
     let mut in_transaction = false;
+    // Per-statement COM_STMT_FETCH counter: the first fetch of a cursor keeps it
+    // open, the second reports SERVER_STATUS_LAST_ROW_SENT.
+    let mut fetch_counts: HashMap<u32, u32> = HashMap::new();
     loop {
         reader.reset_sequence(0);
         // Strict wire sequence: every proxied command must restart
@@ -793,6 +901,28 @@ where
         if packet.payload.first() == Some(&0x16) {
             // COM_STMT_PREPARE special response (see `respond_to_prepare`).
             if !respond_to_prepare(&reader, &mut writer, &packet.payload[1..], broad).await {
+                break;
+            }
+            continue;
+        }
+        if packet.payload.first() == Some(&0x17) {
+            // COM_STMT_EXECUTE (see `respond_to_execute`).
+            if !respond_to_execute(&reader, &mut writer, &packet.payload, broad).await {
+                break;
+            }
+            continue;
+        }
+        if packet.payload.first() == Some(&0x1c) {
+            // COM_STMT_FETCH (see `respond_to_fetch`).
+            if !respond_to_fetch(
+                &reader,
+                &mut writer,
+                &packet.payload,
+                &mut fetch_counts,
+                broad,
+            )
+            .await
+            {
                 break;
             }
             continue;
@@ -1809,6 +1939,59 @@ impl MysqlClient {
         response.payload.first() == Some(&0x00)
     }
 
+    /// `COM_STMT_EXECUTE`: sends an execute for `statement_id` with the given
+    /// flags byte (`0x01` opens a read-only cursor; `0x80` is the harness
+    /// error sentinel) and drains the result set to its terminator.
+    async fn stmt_execute(&mut self, statement_id: u32, flags: u8) -> Option<StmtResult> {
+        let mut payload = vec![0x17_u8];
+        payload.extend_from_slice(&statement_id.to_le_bytes());
+        payload.push(flags);
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        self.writer.reset_sequence(0);
+        self.writer.write_logical(&payload, true).await.ok()?;
+        self.reader.reset_sequence(1);
+        self.drain_stmt_response().await
+    }
+
+    /// `COM_STMT_FETCH`: fetches from `statement_id`'s cursor and drains to the
+    /// terminator.
+    async fn stmt_fetch(&mut self, statement_id: u32) -> Option<StmtResult> {
+        let mut payload = vec![0x1c_u8];
+        payload.extend_from_slice(&statement_id.to_le_bytes());
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        self.writer.reset_sequence(0);
+        self.writer.write_logical(&payload, true).await.ok()?;
+        self.reader.reset_sequence(1);
+        self.drain_stmt_response().await
+    }
+
+    /// `COM_STMT_CLOSE`: fire-and-forget, no response; clears the statement's
+    /// guards by removing it from the registry.
+    async fn stmt_close(&mut self, statement_id: u32) -> bool {
+        let mut payload = vec![0x19_u8];
+        payload.extend_from_slice(&statement_id.to_le_bytes());
+        self.writer.reset_sequence(0);
+        self.writer.write_logical(&payload, true).await.is_ok()
+    }
+
+    /// Reads a binary result set to its terminator: the `0xFE` resultset-OK
+    /// (success) or a leading `0xFF` error; headers, column definitions, and
+    /// rows are streamed past.
+    async fn drain_stmt_response(&mut self) -> Option<StmtResult> {
+        loop {
+            let packet = self.reader.read_logical(64 * 1024).await.ok()?;
+            match packet.payload.first() {
+                Some(&0xFF) => {
+                    let code =
+                        u16::from_le_bytes([*packet.payload.get(1)?, *packet.payload.get(2)?]);
+                    return Some(StmtResult::Error { code });
+                }
+                Some(&0xFE) if packet.payload.len() >= 7 => return Some(StmtResult::Ok),
+                _ => {}
+            }
+        }
+    }
+
     /// `COM_STMT_PREPARE`: sends the prepare and reads the whole special
     /// response — the prepare-OK header, then the parameter and column
     /// definitions with no classic EOF between the groups under the
@@ -1871,6 +2054,15 @@ enum PrepareOutcome {
         parameters: u16,
         columns: u16,
     },
+    /// A leading backend error with its code.
+    Error { code: u16 },
+}
+
+/// One `COM_STMT_EXECUTE` / `COM_STMT_FETCH` outcome observed on the client wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StmtResult {
+    /// The result set (or empty result) reached its terminator.
+    Ok,
     /// A leading backend error with its code.
     Error { code: u16 },
 }
@@ -3617,6 +3809,222 @@ async fn stmt_prepare_malformed_backend_framing_tears_down_session() {
     assert!(
         closed.is_some(),
         "the malformed prepare framing tears the session down"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// Number of session-CLOSED lifecycle events (`ConnectionEvent` kind 3) the
+/// control sender has observed so far.
+fn closed_event_count(sender: &Arc<FakeSender>) -> usize {
+    sender
+        .sent()
+        .into_iter()
+        .filter(|e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3))
+        .count()
+}
+
+/// SES-05 sub-slice 2 (P0-1, mutation-sensitive): a `COM_STMT_EXECUTE` opening a
+/// read-only cursor holds the migration boundary; a fetch WITHOUT
+/// `LAST_ROW_SENT` keeps it open, and only the fetch reporting `LAST_ROW_SENT`
+/// clears it. Long force deadline so the close is attributable to the guard.
+/// Inverting the `!LAST_ROW_SENT` test (or clearing on any fetch) closes the
+/// drain one fetch too early and fails this test.
+#[tokio::test]
+async fn execute_cursor_blocks_drain_until_last_row_fetch() {
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert_eq!(
+        client.stmt_execute(7, 0x01).await,
+        Some(StmtResult::Ok),
+        "the cursor execute completes"
+    );
+
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "an open cursor defers the drain close"
+    );
+
+    assert_eq!(
+        client.stmt_fetch(7).await,
+        Some(StmtResult::Ok),
+        "the first fetch does not report the last row"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "a non-final fetch keeps the cursor open and the drain deferred"
+    );
+
+    assert_eq!(
+        client.stmt_fetch(7).await,
+        Some(StmtResult::Ok),
+        "the second fetch reports the last row"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "the last-row fetch clears the cursor and the drain closes"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// SES-05 sub-slice 2 (P0-2, mutation-sensitive): cursor guards are tracked per
+/// statement ID from the request payload. Two cursors (7 and 8) each block the
+/// drain; closing 7 leaves 8's guard intact, and only closing 8 releases the
+/// drain. Hardcoding the observed statement ID (e.g. always 7) makes the
+/// execute for 8 update 7 instead, so 8 never blocks and the test fails.
+#[tokio::test]
+async fn execute_cursor_guard_is_statement_specific_across_ids() {
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert_eq!(client.stmt_execute(7, 0x01).await, Some(StmtResult::Ok));
+    assert_eq!(client.stmt_execute(8, 0x01).await, Some(StmtResult::Ok));
+
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "two open cursors defer the drain close"
+    );
+
+    assert!(client.stmt_close(7).await, "close statement 7's cursor");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "statement 8's cursor still defers the drain (statement-specific)"
+    );
+
+    assert!(client.stmt_close(8).await, "close statement 8's cursor");
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "closing the last open cursor releases the drain"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// SES-05 sub-slice 2 (control): a successful non-cursor `COM_STMT_EXECUTE`
+/// CLEARS a pre-existing cursor guard (not merely idle→idle). A prior cursor on
+/// 7 blocks the drain; a subsequent no-cursor execute on 7 clears it and the
+/// drain closes.
+#[tokio::test]
+async fn non_cursor_execute_clears_prior_cursor_guard() {
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert_eq!(client.stmt_execute(7, 0x01).await, Some(StmtResult::Ok));
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "the open cursor defers the drain"
+    );
+
+    assert_eq!(
+        client.stmt_execute(7, 0x00).await,
+        Some(StmtResult::Ok),
+        "a non-cursor execute completes"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "the non-cursor execute clears the prior cursor guard and the drain closes"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// SES-05 sub-slice 2 (PS-003, mutation-sensitive): a `COM_STMT_EXECUTE` that
+/// the backend rejects AFTER a pending long-data upload must NOT clear the
+/// guard — the ERR carries no status and never reaches the cursor path. The
+/// pending guard keeps blocking the drain until an explicit RESET clears it.
+/// Clearing the guard on an execute error closes the drain too early.
+#[tokio::test]
+async fn execute_error_after_long_data_keeps_pending_guard() {
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(
+        client.send_long_data(7).await,
+        "a pending long-data upload guards statement 7"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "the pending long-data guard defers the drain"
+    );
+
+    assert_eq!(
+        client.stmt_execute(7, 0x80).await,
+        Some(StmtResult::Error { code: 1064 }),
+        "the execute is rejected by the backend"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        closed_event_count(&stack.sender),
+        0,
+        "the rejected execute leaves the long-data guard pending (PS-003)"
+    );
+
+    assert!(
+        client.stmt_reset_ok(7).await,
+        "reset clears the statement's guard"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "only the explicit reset releases the drain"
     );
     stack.dispatch_task.abort();
 }
