@@ -370,6 +370,91 @@ fn result_column(name: &[u8]) -> Vec<u8> {
     payload
 }
 
+/// The fixed `COM_STMT_PREPARE`-OK header: `0x00`, statement ID, column and
+/// parameter counts, one reserved filler, and the warning count. The wire
+/// order is columns-before-parameters even though the parameter definitions
+/// are streamed first (Go's `forwardPrepareCmd` reads them from these offsets).
+fn encode_prepare_ok(statement_id: u32, columns: u16, parameters: u16, warnings: u16) -> Vec<u8> {
+    let mut payload = vec![0x00_u8];
+    payload.extend_from_slice(&statement_id.to_le_bytes());
+    payload.extend_from_slice(&columns.to_le_bytes());
+    payload.extend_from_slice(&parameters.to_le_bytes());
+    payload.push(0x00);
+    payload.extend_from_slice(&warnings.to_le_bytes());
+    payload
+}
+
+/// Emits a `COM_STMT_PREPARE` special response for the scripted backend. A
+/// fixed statement ID (7) keeps the register/guard-replacement discriminator
+/// deterministic; markers in the prepare text pick the branch: `FAIL` → a
+/// leading backend error, `NOMETA` → a zero-metadata prepare-OK, otherwise a
+/// two-parameter/one-column prepare-OK. `DEPRECATE_EOF` is negotiated on both
+/// legs, so the parameter then column definitions carry no classic EOF.
+async fn respond_to_prepare<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    prepare_text: &[u8],
+    capabilities: CapabilityFlags,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.reset_sequence(reader.expected_sequence());
+    if prepare_text.starts_with(b"BADHDR") {
+        // A prepare-OK first byte followed by a truncated header (< the
+        // canonical 12 bytes): the observer must reject it and the proxy must
+        // tear the session down rather than treat it as a complete prepare.
+        return writer
+            .write_logical(&[0x00, 0xAA, 0xBB], true)
+            .await
+            .is_ok();
+    }
+    if prepare_text.windows(4).any(|window| window == b"FAIL") {
+        let Ok(err) = encode_error_packet(
+            1064,
+            Some(*b"42000"),
+            b"You have an error in your SQL syntax",
+            capabilities,
+        ) else {
+            return false;
+        };
+        return writer.write_logical(&err, true).await.is_ok();
+    }
+    let (parameters, columns): (u16, u16) = if prepare_text.starts_with(b"NOMETA") {
+        (0, 0)
+    } else {
+        (2, 1)
+    };
+    if writer
+        .write_logical(&encode_prepare_ok(7, columns, parameters, 0), true)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    for index in 0..parameters {
+        let name = format!("p{index}");
+        if writer
+            .write_logical(&result_column(name.as_bytes()), true)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    for index in 0..columns {
+        let name = format!("c{index}");
+        if writer
+            .write_logical(&result_column(name.as_bytes()), true)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SnapshotReply {
     Valid,
@@ -609,6 +694,13 @@ where
         }
         if packet.payload.first() == Some(&0x18) {
             // COM_STMT_SEND_LONG_DATA has no response.
+            continue;
+        }
+        if packet.payload.first() == Some(&0x16) {
+            // COM_STMT_PREPARE special response (see `respond_to_prepare`).
+            if !respond_to_prepare(&reader, &mut writer, &packet.payload[1..], broad).await {
+                break;
+            }
             continue;
         }
         if packet.payload.windows(5).any(|window| window == b"BEGIN") {
@@ -1046,6 +1138,7 @@ async fn spawn_stack_full(
         send_idle_byte,
         frontend_tls,
         None,
+        Duration::from_millis(400),
     )
     .await
 }
@@ -1059,6 +1152,24 @@ async fn spawn_tls_stack(snapshot_reply: SnapshotReply) -> Stack {
         false,
         None,
         Some(fake_backend_tls_config()),
+        Duration::from_millis(400),
+    )
+    .await
+}
+
+/// A stack whose graceful-close force deadline is far beyond any test's
+/// observation window, so a drain closes only when the session reaches a
+/// genuine safe boundary — never because the deadline preempted it.
+async fn spawn_stack_long_drain() -> Stack {
+    spawn_stack_configured(
+        SnapshotReply::Valid,
+        false,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+        None,
+        Duration::from_secs(30),
     )
     .await
 }
@@ -1089,6 +1200,9 @@ async fn spawn_configured_fake_backend(
     (address.port(), transcript, written_bytes)
 }
 
+// The test-stack constructor mirrors the executable's full composition; its
+// knobs are positional test parameters, not a production API surface.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_stack_configured(
     snapshot_reply: SnapshotReply,
     proxy_v2: bool,
@@ -1097,6 +1211,7 @@ async fn spawn_stack_configured(
     send_idle_byte: bool,
     frontend_tls: Option<FrontendTlsFixture>,
     tls_config: Option<Arc<ServerConfig>>,
+    drain_deadline: Duration,
 ) -> Stack {
     let (backend_port, backend_transcript, backend_written_bytes) =
         spawn_configured_fake_backend(snapshot_reply, proxy_v2, send_idle_byte, tls_config.clone())
@@ -1150,7 +1265,7 @@ async fn spawn_stack_configured(
             drain_rx,
             SessionLoopConfig {
                 handshake_deadline,
-                drain_deadline: Duration::from_millis(400),
+                drain_deadline,
                 backend_check_interval,
                 cleanup_deadline: Duration::from_secs(2),
             },
@@ -1435,10 +1550,70 @@ impl MysqlClient {
         response.payload.first() == Some(&0x00)
     }
 
+    /// `COM_STMT_PREPARE`: sends the prepare and reads the whole special
+    /// response — the prepare-OK header, then the parameter and column
+    /// definitions with no classic EOF between the groups under the
+    /// negotiated `DEPRECATE_EOF` — or a single leading backend error.
+    async fn stmt_prepare(&mut self, sql: &str) -> Option<PrepareOutcome> {
+        let mut payload = vec![0x16_u8];
+        payload.extend_from_slice(sql.as_bytes());
+        self.writer.reset_sequence(0);
+        if self.writer.write_logical(&payload, true).await.is_err() {
+            return None;
+        }
+        self.reader.reset_sequence(1);
+        match self.reader.peek_packet().await {
+            Ok(preview) => assert_eq!(preview.sequence_id, 1),
+            Err(_) => return None,
+        }
+        let header = self.reader.read_logical(64 * 1024).await.ok()?;
+        match header.payload.first() {
+            Some(&0xFF) => {
+                let code = u16::from_le_bytes([*header.payload.get(1)?, *header.payload.get(2)?]);
+                Some(PrepareOutcome::Error { code })
+            }
+            Some(&0x00) => {
+                let statement_id = u32::from_le_bytes([
+                    *header.payload.get(1)?,
+                    *header.payload.get(2)?,
+                    *header.payload.get(3)?,
+                    *header.payload.get(4)?,
+                ]);
+                let columns =
+                    u16::from_le_bytes([*header.payload.get(5)?, *header.payload.get(6)?]);
+                let parameters =
+                    u16::from_le_bytes([*header.payload.get(7)?, *header.payload.get(8)?]);
+                // Drain the parameter then column definitions (no EOFs).
+                for _ in 0..(u32::from(parameters) + u32::from(columns)) {
+                    self.reader.read_logical(64 * 1024).await.ok()?;
+                }
+                Some(PrepareOutcome::Ok {
+                    statement_id,
+                    parameters,
+                    columns,
+                })
+            }
+            _ => None,
+        }
+    }
+
     async fn quit(mut self) {
         self.writer.reset_sequence(0);
         let _ = self.writer.write_logical(&[0x01], true).await;
     }
+}
+
+/// One `COM_STMT_PREPARE` outcome observed on the client wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrepareOutcome {
+    /// Prepare-OK with the returned statement ID and metadata counts.
+    Ok {
+        statement_id: u32,
+        parameters: u16,
+        columns: u16,
+    },
+    /// A leading backend error with its code.
+    Error { code: u16 },
 }
 
 /// Keeps injecting the route assignment until the engine's armed
@@ -2664,6 +2839,251 @@ async fn drain_waits_for_prepared_long_data_guard() {
     stack.dispatch_task.abort();
 }
 
+/// SES-05: `COM_STMT_PREPARE` is served end to end (no longer the fail-closed
+/// refusal). The client receives the backend's statement ID and declared
+/// parameter/column counts through the prepare special response, and the
+/// session keeps serving afterward. A zero-metadata prepare completes on the
+/// header alone.
+#[tokio::test]
+async fn stmt_prepare_returns_metadata_end_to_end() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert_eq!(
+        client.stmt_prepare("SELECT ? + ?").await,
+        Some(PrepareOutcome::Ok {
+            statement_id: 7,
+            parameters: 2,
+            columns: 1,
+        }),
+        "the prepare special response reaches the client verbatim"
+    );
+    assert!(
+        client.query_ok("SELECT 1").await,
+        "the session serves normally after a prepare"
+    );
+    assert_eq!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok {
+            statement_id: 7,
+            parameters: 0,
+            columns: 0,
+        }),
+        "a zero-metadata prepare completes on the header alone"
+    );
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+/// SES-05: a leading backend error ends the prepare immediately, is forwarded
+/// verbatim to the client, and leaves the session able to serve the next
+/// command (the `CompleteError` branch, never a silent teardown).
+#[tokio::test]
+async fn stmt_prepare_error_is_forwarded_and_session_continues() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert_eq!(
+        client.stmt_prepare("FAIL SELECT").await,
+        Some(PrepareOutcome::Error { code: 1064 }),
+        "the backend prepare error reaches the client verbatim"
+    );
+    assert!(
+        client.query_ok("SELECT 1").await,
+        "the session serves normally after a prepare error"
+    );
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+/// SES-05 (mutation-sensitive): a completed `COM_STMT_PREPARE` registers its
+/// statement ID, atomically replacing any stale unknown-ID guard with a fresh
+/// Idle state, and the registry sync reaches the FSM before the completion
+/// boundary. An unfinished `COM_STMT_SEND_LONG_DATA` for that ID blocks the
+/// drain; the prepare that returns the SAME ID clears the guard and lets the
+/// drain close. Deleting the production `register` (or its sync event) leaves
+/// the guard pending and this test never observes the close.
+#[tokio::test]
+async fn stmt_prepare_register_replaces_stale_guard_and_unblocks_drain() {
+    // A long force deadline: the drain can close only at a genuine safe
+    // boundary, so the close is attributable to the guard clearing (register),
+    // never to the deadline preempting a still-pending guard.
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("SELECT 1").await);
+    // An unfinished long-data upload creates an unknown-ID guard for id 7.
+    assert!(client.send_long_data(7).await);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let closed_early = stack
+        .sender
+        .sent()
+        .into_iter()
+        .filter(|e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3))
+        .count();
+    assert_eq!(
+        closed_early, 0,
+        "the pending long-data guard defers the drain close"
+    );
+
+    // The prepare returns the SAME statement ID (7): register replaces the
+    // stale guard with a fresh Idle state, clearing the migration boundary.
+    assert_eq!(
+        client.stmt_prepare("SELECT ? + ?").await,
+        Some(PrepareOutcome::Ok {
+            statement_id: 7,
+            parameters: 2,
+            columns: 1,
+        }),
+        "the reused statement ID is served mid-drain"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "registering the reused statement ID clears the guard and the drain closes"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// SES-05 (mutation-sensitive, retained transaction): a prepare carries no
+/// server status, so a `COM_STMT_PREPARE` inside an open transaction — whether
+/// it succeeds or the backend rejects it — must NOT move the transaction
+/// boundary. A drain queued after `BEGIN` stays deferred across the prepare and
+/// closes only at `COMMIT`. Forcing the success branch to emit `TxnDone`
+/// (`if self.in_transaction` → `if false`) or the ERR branch to stop retaining
+/// the transaction closes the drain early and fails this test.
+async fn prepare_inside_open_transaction_keeps_boundary(prepare_sql: &str, expect_error: bool) {
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("BEGIN").await, "the transaction opens");
+
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let closed_after_begin = stack
+        .sender
+        .sent()
+        .into_iter()
+        .filter(|e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3))
+        .count();
+    assert_eq!(
+        closed_after_begin, 0,
+        "the open transaction defers the drain close"
+    );
+
+    // The prepare completes inside the transaction; it must not move the boundary.
+    let outcome = client.stmt_prepare(prepare_sql).await;
+    if expect_error {
+        assert!(
+            matches!(outcome, Some(PrepareOutcome::Error { .. })),
+            "prepare rejected inside the transaction: {outcome:?}"
+        );
+    } else {
+        assert!(
+            matches!(outcome, Some(PrepareOutcome::Ok { .. })),
+            "prepare succeeded inside the transaction: {outcome:?}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let closed_after_prepare = stack
+        .sender
+        .sent()
+        .into_iter()
+        .filter(|e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3))
+        .count();
+    assert_eq!(
+        closed_after_prepare, 0,
+        "the prepare retains the open transaction; the drain stays deferred"
+    );
+
+    // Only COMMIT ends the transaction and releases the drain.
+    assert!(
+        client.query_ok("COMMIT").await,
+        "the session still serves mid-drain"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(closed.is_some(), "the drain closes at the COMMIT boundary");
+    stack.dispatch_task.abort();
+}
+
+#[tokio::test]
+async fn prepare_ok_inside_open_transaction_keeps_boundary() {
+    prepare_inside_open_transaction_keeps_boundary("SELECT ? + ?", false).await;
+}
+
+#[tokio::test]
+async fn prepare_error_inside_open_transaction_keeps_boundary() {
+    prepare_inside_open_transaction_keeps_boundary("FAIL SELECT", true).await;
+}
+
+/// SES-05 (fail-closed): a malformed backend prepare response — a prepare-OK
+/// first byte followed by a truncated header — is a protocol violation. The
+/// proxy must reject it in `prepare_response_rounds` and tear the session down,
+/// never treat it as a complete prepare. The client sees no valid prepare
+/// result and the session closes.
+#[tokio::test]
+async fn stmt_prepare_malformed_backend_framing_tears_down_session() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert_eq!(
+        client.stmt_prepare("BADHDR").await,
+        None,
+        "a malformed prepare response yields no valid prepare result"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "the malformed prepare framing tears the session down"
+    );
+    stack.dispatch_task.abort();
+}
+
 /// The accepted decision's namespace is the routing truth: it must
 /// reach the wire on the session's CLOSED lifecycle event (and drive
 /// the route conversation), not the pre-decision registration seed.
@@ -3790,6 +4210,50 @@ impl CompressedClient {
         transport.flush().await.is_ok()
     }
 
+    /// Runs one compressed `COM_STMT_PREPARE` and reads the whole special
+    /// response over compressed framing, mirroring [`MysqlClient::stmt_prepare`]:
+    /// the compressed sequence resets once for the command and the multi-packet
+    /// metadata stream is decoded through the compressed transport.
+    async fn stmt_prepare(&mut self, sql: &str) -> Option<PrepareOutcome> {
+        let mut payload = vec![0x16_u8];
+        payload.extend_from_slice(sql.as_bytes());
+        if self.io.get_mut().reset_layer_sequence().is_err() {
+            return None;
+        }
+        self.io.reset_read_sequence(0);
+        if self.io.write_logical(&payload, true).await.is_err() {
+            return None;
+        }
+        let header = self.io.read_logical(64 * 1024).await.ok()?;
+        match header.payload.first() {
+            Some(&0xFF) => {
+                let code = u16::from_le_bytes([*header.payload.get(1)?, *header.payload.get(2)?]);
+                Some(PrepareOutcome::Error { code })
+            }
+            Some(&0x00) => {
+                let statement_id = u32::from_le_bytes([
+                    *header.payload.get(1)?,
+                    *header.payload.get(2)?,
+                    *header.payload.get(3)?,
+                    *header.payload.get(4)?,
+                ]);
+                let columns =
+                    u16::from_le_bytes([*header.payload.get(5)?, *header.payload.get(6)?]);
+                let parameters =
+                    u16::from_le_bytes([*header.payload.get(7)?, *header.payload.get(8)?]);
+                for _ in 0..(u32::from(parameters) + u32::from(columns)) {
+                    self.io.read_logical(64 * 1024).await.ok()?;
+                }
+                Some(PrepareOutcome::Ok {
+                    statement_id,
+                    parameters,
+                    columns,
+                })
+            }
+            _ => None,
+        }
+    }
+
     async fn quit(mut self) {
         let _ = self.io.get_mut().reset_layer_sequence();
         self.io.reset_read_sequence(0);
@@ -3867,6 +4331,52 @@ async fn compressed_client_zlib_roundtrips_end_to_end() {
 #[tokio::test]
 async fn compressed_client_zstd_roundtrips_end_to_end() {
     compressed_client_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
+}
+
+/// SES-05 over compression: a `COM_STMT_PREPARE` special response rides the
+/// client<->proxy compressed leg intact. The proxy reads the multi-packet
+/// prepare-OK metadata from the plaintext backend and re-frames it through the
+/// compressed transport in `prepare_response_rounds`; the client decodes the
+/// statement ID and counts, and the session keeps serving compressed commands
+/// (proving the compressed sequence realigned across the prepare's many
+/// packets).
+async fn compressed_stmt_prepare_roundtrips(algorithm: CompressionAlgorithm) {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        CompressedClient::connect(stack.sql_port, algorithm),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("compressed handshake+auth completes end to end for {algorithm:?}")
+    };
+    assert_eq!(
+        client.stmt_prepare("SELECT ? + ?").await,
+        Some(PrepareOutcome::Ok {
+            statement_id: 7,
+            parameters: 2,
+            columns: 1,
+        }),
+        "the compressed prepare special response round-trips ({algorithm:?})"
+    );
+    assert!(
+        client.query_ok("SELECT 1").await,
+        "the compressed session keeps serving after a prepare ({algorithm:?})"
+    );
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+#[tokio::test]
+async fn compressed_stmt_prepare_zlib_roundtrips_end_to_end() {
+    compressed_stmt_prepare_roundtrips(CompressionAlgorithm::Zlib).await;
+}
+
+#[tokio::test]
+async fn compressed_stmt_prepare_zstd_roundtrips_end_to_end() {
+    compressed_stmt_prepare_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
 }
 
 /// Contract #1 cancel-safety over COMPRESSION, exercising the real
