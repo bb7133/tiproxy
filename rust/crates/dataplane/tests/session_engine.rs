@@ -671,25 +671,24 @@ async fn run_fake_tls_backend_connection(
     send_idle_byte: bool,
 ) -> u64 {
     let broad = fake_backend_capabilities(true);
-    let (read, write) = stream.into_split();
+    let counted = CountedIo::new(stream);
+    let counters = counted.counters();
+    let (read, write) = tokio::io::split(counted);
     let mut reader = PacketReader::new(read);
     let mut writer = PacketWriter::new(write);
     if !write_fake_backend_greeting(&mut writer, broad).await {
-        return writer.out_bytes();
+        return counters.outbound();
     }
     let Ok(ssl_request) = reader.read_logical(64 * 1024).await else {
-        return writer.out_bytes();
+        return counters.outbound();
     };
     if parse_ssl_request(&ssl_request.payload).is_err() {
-        return writer.out_bytes();
+        return counters.outbound();
     }
     let next_sequence = reader.expected_sequence();
-    let greeting_bytes = writer.out_bytes();
     let read = reader.into_inner();
     let write = writer.into_inner();
-    let Ok(stream) = read.reunite(write) else {
-        return greeting_bytes;
-    };
+    let stream = read.unsplit(write);
     let Ok(tls) = accept_frontend(
         stream,
         Vec::new(),
@@ -699,7 +698,7 @@ async fn run_fake_tls_backend_connection(
     )
     .await
     else {
-        return greeting_bytes;
+        return counters.outbound();
     };
     let (read, write) = tokio::io::split(tls.stream);
     let mut reader = PacketReader::new(read);
@@ -707,20 +706,160 @@ async fn run_fake_tls_backend_connection(
     let mut writer = PacketWriter::new(write);
     writer.reset_sequence(next_sequence);
     let Some(auth) = finish_fake_backend_auth(&mut reader, &mut writer, broad).await else {
-        return greeting_bytes.saturating_add(writer.out_bytes());
+        return counters.outbound();
     };
-    greeting_bytes.saturating_add(
-        run_fake_backend_commands(
-            reader,
-            writer,
-            auth,
-            transcript,
-            snapshot_reply,
-            broad,
-            send_idle_byte,
-        )
-        .await,
+    let _ = run_fake_backend_commands(
+        reader,
+        writer,
+        auth,
+        transcript,
+        snapshot_reply,
+        broad,
+        send_idle_byte,
     )
+    .await;
+    counters.outbound()
+}
+
+async fn run_fake_compressed_backend_commands(
+    mut io: PacketIo<CompressedTestTransport>,
+    auth: FakeAuth,
+    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    snapshot_reply: SnapshotReply,
+    broad: CapabilityFlags,
+) {
+    loop {
+        if io.reset_layer_sequence().is_err() {
+            break;
+        }
+        io.reset_read_sequence(0);
+        match io.peek_packet().await {
+            Ok(preview) if preview.sequence_id == 0 => {}
+            _ => break,
+        }
+        let Ok(packet) = io.read_logical(1024 * 1024).await else {
+            break;
+        };
+        if let Ok(mut commands) = transcript.lock() {
+            commands.push(packet.payload.clone());
+        }
+        if packet.payload.first() == Some(&0x01) {
+            break;
+        }
+
+        let response = if packet.payload.starts_with(b"\x03SET SESSION_STATES '") {
+            if auth != FakeAuth::Migration
+                || matches!(snapshot_reply, SnapshotReply::RestoreDisconnect)
+            {
+                break;
+            }
+            if matches!(snapshot_reply, SnapshotReply::RestoreError) {
+                match encode_error_packet(1105, Some(*b"HY000"), b"restore rejected", broad) {
+                    Ok(error) => error,
+                    Err(_) => break,
+                }
+            } else {
+                match encode_ok_packet(
+                    ResponseHeader::OK,
+                    0,
+                    0,
+                    StatusFlags::AUTOCOMMIT,
+                    0,
+                    b"",
+                    broad,
+                ) {
+                    Ok(ok) => ok,
+                    Err(_) => break,
+                }
+            }
+        } else {
+            match encode_ok_packet(
+                ResponseHeader::OK,
+                1,
+                0,
+                StatusFlags::AUTOCOMMIT,
+                0,
+                b"",
+                broad,
+            ) {
+                Ok(ok) => ok,
+                Err(_) => break,
+            }
+        };
+        io.reset_write_sequence(io.expected_read_sequence());
+        if io.write_logical(&response, true).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn run_fake_compressed_backend_connection(
+    stream: TcpStream,
+    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    snapshot_reply: SnapshotReply,
+    algorithm: CompressionAlgorithm,
+) -> u64 {
+    let mut broad = fake_backend_capabilities(false);
+    broad |= match algorithm {
+        CompressionAlgorithm::Zlib => CapabilityFlags::COMPRESS,
+        CompressionAlgorithm::Zstd { .. } => CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM,
+    };
+    let counted = CountedIo::new(stream);
+    let counters = counted.counters();
+    let (read, write) = tokio::io::split(counted);
+    let mut reader = PacketReader::new(read);
+    let mut writer = PacketWriter::new(write);
+    let Some(auth) = fake_backend_auth(&mut reader, &mut writer, broad).await else {
+        return counters.outbound();
+    };
+
+    // Authentication terminates in plaintext. Both peers activate the selected
+    // codec only after the auth OK, at a clean command boundary.
+    let counted = reader.into_inner().unsplit(writer.into_inner());
+    let Ok(compressed) = CompressedIo::new(counted, algorithm, CompressionLimits::default()) else {
+        return counters.outbound();
+    };
+    run_fake_compressed_backend_commands(
+        PacketIo::new(CompressedTestTransport { inner: compressed }),
+        auth,
+        transcript,
+        snapshot_reply,
+        broad,
+    )
+    .await;
+    counters.outbound()
+}
+
+async fn run_fake_compressed_backend(
+    listener: TcpListener,
+    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    written_bytes: Arc<AtomicU64>,
+    snapshot_reply: SnapshotReply,
+    algorithm: CompressionAlgorithm,
+    proxy_v2: bool,
+) {
+    while let Ok((stream, _)) = listener.accept().await {
+        let stream = if proxy_v2 {
+            let (mut read, write) = stream.into_split();
+            if !strip_inbound_proxy_v2(&mut read).await {
+                continue;
+            }
+            let Ok(stream) = read.reunite(write) else {
+                continue;
+            };
+            stream
+        } else {
+            stream
+        };
+        let written = run_fake_compressed_backend_connection(
+            stream,
+            Arc::clone(&transcript),
+            snapshot_reply,
+            algorithm,
+        )
+        .await;
+        written_bytes.fetch_add(written, Ordering::Relaxed);
+    }
 }
 
 async fn run_fake_backend(
@@ -756,14 +895,16 @@ async fn run_fake_backend(
             .await
         } else {
             let broad = fake_backend_capabilities(false);
-            let (read, write) = stream.into_split();
+            let counted = CountedIo::new(stream);
+            let counters = counted.counters();
+            let (read, write) = tokio::io::split(counted);
             let mut reader = PacketReader::new(read);
             let mut writer = PacketWriter::new(write);
             let Some(auth) = fake_backend_auth(&mut reader, &mut writer, broad).await else {
-                written_bytes.fetch_add(writer.out_bytes(), Ordering::Relaxed);
+                written_bytes.fetch_add(counters.outbound(), Ordering::Relaxed);
                 continue;
             };
-            run_fake_backend_commands(
+            let _ = run_fake_backend_commands(
                 reader,
                 writer,
                 auth,
@@ -772,7 +913,8 @@ async fn run_fake_backend(
                 broad,
                 send_idle_byte,
             )
-            .await
+            .await;
+            counters.outbound()
         };
         written_bytes.fetch_add(written, Ordering::Relaxed);
     }
@@ -819,6 +961,30 @@ async fn spawn_fake_tls_backend_server(
         false,
         false,
         Some(fake_backend_tls_config()),
+    ));
+    (address.port(), transcript, written_bytes)
+}
+
+async fn spawn_fake_compressed_backend_server(
+    snapshot_reply: SnapshotReply,
+    algorithm: CompressionAlgorithm,
+    proxy_v2: bool,
+) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicU64>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let written_bytes = Arc::new(AtomicU64::new(0));
+    tokio::spawn(run_fake_compressed_backend(
+        listener,
+        Arc::clone(&transcript),
+        Arc::clone(&written_bytes),
+        snapshot_reply,
+        algorithm,
+        proxy_v2,
     ));
     (address.port(), transcript, written_bytes)
 }
@@ -897,6 +1063,32 @@ async fn spawn_tls_stack(snapshot_reply: SnapshotReply) -> Stack {
     .await
 }
 
+async fn spawn_configured_fake_backend(
+    snapshot_reply: SnapshotReply,
+    proxy_v2: bool,
+    send_idle_byte: bool,
+    tls_config: Option<Arc<ServerConfig>>,
+) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicU64>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let written_bytes = Arc::new(AtomicU64::new(0));
+    tokio::spawn(run_fake_backend(
+        listener,
+        Arc::clone(&transcript),
+        Arc::clone(&written_bytes),
+        snapshot_reply,
+        proxy_v2,
+        send_idle_byte,
+        tls_config,
+    ));
+    (address.port(), transcript, written_bytes)
+}
+
 async fn spawn_stack_configured(
     snapshot_reply: SnapshotReply,
     proxy_v2: bool,
@@ -906,24 +1098,9 @@ async fn spawn_stack_configured(
     frontend_tls: Option<FrontendTlsFixture>,
     tls_config: Option<Arc<ServerConfig>>,
 ) -> Stack {
-    // Fake backend.
-    let Ok(backend_listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
-        unreachable!("backend bind")
-    };
-    let Ok(backend_addr) = backend_listener.local_addr() else {
-        unreachable!("backend addr")
-    };
-    let backend_transcript = Arc::new(Mutex::new(Vec::new()));
-    let backend_written_bytes = Arc::new(AtomicU64::new(0));
-    tokio::spawn(run_fake_backend(
-        backend_listener,
-        Arc::clone(&backend_transcript),
-        Arc::clone(&backend_written_bytes),
-        snapshot_reply,
-        proxy_v2,
-        send_idle_byte,
-        tls_config.clone(),
-    ));
+    let (backend_port, backend_transcript, backend_written_bytes) =
+        spawn_configured_fake_backend(snapshot_reply, proxy_v2, send_idle_byte, tls_config.clone())
+            .await;
 
     // Dispatch loop with an observable sender and a driven state watch.
     let sender = FakeSender::new();
@@ -1019,7 +1196,7 @@ async fn spawn_stack_configured(
         sql_port: sql_addr.port(),
         server_task,
         dispatch_task,
-        backend_port: backend_addr.port(),
+        backend_port,
         metrics_rx,
         backend_transcript,
         backend_written_bytes,
@@ -1789,6 +1966,111 @@ async fn redirect_restores_candidate_over_backend_tls() {
     client.quit().await;
     assert_closed_backend_bytes_include_retired(&stack, &target_written_bytes).await;
     stack.dispatch_task.abort();
+}
+
+async fn redirect_restores_candidate_over_compression(
+    algorithm: CompressionAlgorithm,
+    proxy_v2: bool,
+) {
+    let stack = spawn_stack_full(
+        SnapshotReply::Valid,
+        proxy_v2,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+    )
+    .await;
+    let (target_port, target_transcript, target_written_bytes) =
+        spawn_fake_compressed_backend_server(SnapshotReply::Valid, algorithm, proxy_v2).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        CompressedClient::connect(stack.sql_port, algorithm),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("compressed session established for {algorithm:?}")
+    };
+    assert!(
+        client.query_ok("SELECT before_compressed_redirect").await,
+        "the old owner serves the compressed client before migration ({algorithm:?})"
+    );
+
+    let redirect_id = format!("r-compressed-{algorithm:?}-{proxy_v2}");
+    let redirect = command_envelope(
+        6150,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: redirect_id.clone(),
+            backend_id: "tidb-compressed-target".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == redirect_id)
+    })
+    .await;
+    assert!(matches!(
+        result.and_then(|envelope| envelope.body),
+        Some(Body::RedirectResult(result))
+            if result.succeeded && result.backend_id == "tidb-compressed-target"
+    ));
+    assert!(
+        client.query_ok("SELECT after_compressed_redirect").await,
+        "the migrated compressed backend stays aligned ({algorithm:?}, proxy_v2={proxy_v2})"
+    );
+
+    let target_commands = target_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    let restore = target_commands
+        .iter()
+        .position(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"));
+    let after = target_commands
+        .iter()
+        .position(|payload| payload.as_slice() == b"\x03SELECT after_compressed_redirect");
+    assert!(
+        matches!((restore, after), (Some(restore), Some(after)) if restore < after),
+        "candidate auth switches to compression before one restore, then serves user traffic: {target_commands:?}"
+    );
+    assert_eq!(
+        target_commands
+            .iter()
+            .filter(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"))
+            .count(),
+        1,
+        "the compressed candidate restores exactly once"
+    );
+
+    client.quit().await;
+    assert_closed_backend_bytes_include_retired(&stack, &target_written_bytes).await;
+    stack.dispatch_task.abort();
+}
+
+/// MIG-01 activates classic zlib on the candidate only after its plaintext auth
+/// OK, restores the state through compressed framing, then atomically swaps.
+#[tokio::test]
+async fn redirect_restores_candidate_over_zlib() {
+    redirect_restores_candidate_over_compression(CompressionAlgorithm::Zlib, false).await;
+}
+
+/// The same migration works with independently negotiated zstd while outbound
+/// PROXY v2 is written before the target greeting. The target refuses to greet
+/// unless that preamble is present, so success also proves the candidate dial
+/// uses the configured PROXY path. CLOSED totals compare both retired/current
+/// raw sockets even though both client and candidate traffic are compressed.
+#[tokio::test]
+async fn redirect_restores_candidate_over_zstd_and_proxy_v2() {
+    redirect_restores_candidate_over_compression(CompressionAlgorithm::Zstd { level: 3 }, true)
+        .await;
 }
 
 /// A backend ERR (pre-v9 missing signing certificate), a NULL/empty token,
@@ -3312,22 +3594,22 @@ fn compression_io_error(error: CompressionError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error)
 }
 
-/// Test-only client transport that reproduces the production
-/// `ClientTransport::Compressed` variant's [`DirectionSync`] delegation.
+/// Test-only socket transport that reproduces the production compressed client
+/// and backend variants' [`DirectionSync`] delegation.
 ///
 /// `PacketIo<T>` requires `T: DirectionSync`, but `CompressedIo`'s inherent
 /// `begin_read`/`begin_write` SHADOW (rather than implement) that trait, so a
 /// bare `PacketIo<CompressedIo<_>>` cannot compile. The production
-/// `dataplane::transport::ClientTransport` enum — which does the same forwarding
-/// — lives in a private module, so this integration test cannot name it; this
-/// wrapper forwards to the SAME `CompressedIo` codec and `PacketIo` direction
-/// hooks the proxy drives, without touching `src/`. It layers compression over
-/// the same innermost `CountedIo` the production client leg uses.
-struct CompressedClientTransport {
+/// `dataplane::transport::{ClientTransport, BackendTransport}` — which do the
+/// same forwarding — live in a private module, so this integration test cannot
+/// name them. This wrapper forwards to the SAME `CompressedIo` codec and
+/// `PacketIo` direction hooks the proxy drives, without touching `src/`. It
+/// layers compression over the same innermost `CountedIo` production uses.
+struct CompressedTestTransport {
     inner: CompressedIo<CountedIo<TcpStream>>,
 }
 
-impl AsyncRead for CompressedClientTransport {
+impl AsyncRead for CompressedTestTransport {
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -3337,7 +3619,7 @@ impl AsyncRead for CompressedClientTransport {
     }
 }
 
-impl AsyncWrite for CompressedClientTransport {
+impl AsyncWrite for CompressedTestTransport {
     fn poll_write(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -3355,7 +3637,7 @@ impl AsyncWrite for CompressedClientTransport {
     }
 }
 
-impl DirectionSync for CompressedClientTransport {
+impl DirectionSync for CompressedTestTransport {
     fn begin_read(&mut self) -> std::io::Result<Option<u8>> {
         self.inner.begin_read().map_err(compression_io_error)
     }
@@ -3374,7 +3656,7 @@ impl DirectionSync for CompressedClientTransport {
 /// and activates `MySQL` compressed framing, exactly the client leg the proxy
 /// switches to at that same boundary.
 struct CompressedClient {
-    io: PacketIo<CompressedClientTransport>,
+    io: PacketIo<CompressedTestTransport>,
 }
 
 impl CompressedClient {
@@ -3464,7 +3746,7 @@ impl CompressedClient {
         )
         .ok()?;
         Some(Self {
-            io: PacketIo::new(CompressedClientTransport { inner: compressed }),
+            io: PacketIo::new(CompressedTestTransport { inner: compressed }),
         })
     }
 
@@ -3677,25 +3959,15 @@ async fn compressed_control_interleave_during_staged_command_keeps_wire_intact()
 }
 
 // ---------------------------------------------------------------------
-// WIRE-C: compressed-BACKEND redirect/snapshot sequence regression (D)
+// WIRE-C: deterministic compressed-backend snapshot sequence regressions
 // ---------------------------------------------------------------------
 //
-// FALLBACK MODEL (clearly labeled). This is NOT a full real-socket session.
-// Wiring compression into the fake backend deterministically was too large to be
-// safe: the fake backend (`run_fake_backend`, `fake_backend_auth`,
-// `respond_to_snapshot_query`, `write_session_snapshot`) drives SPLIT
-// `PacketReader<OwnedReadHalf>` / `PacketWriter<OwnedWriteHalf>` halves across
-// auth, the command loop, and every snapshot helper. `CompressedIo` shares ONE
-// compressed sequence across reads and writes and so cannot be split; a
-// compressed backend would require reuniting the socket and rewriting all of
-// those helpers onto a single `PacketIo<compressed>` while staying in exact
-// sequence lockstep with the proxy's frozen backend-leg reset/direction cadence
-// — high flake risk with no ability to adjust `src`. Per the task's guidance,
-// this instead models the snapshot reset at the `PacketIo<compressed>` level:
-// the backend compressed layer is reset before the proxy-owned `SHOW
-// SESSION_STATES`, so the internal query starts a FRESH compressed seq-0
-// exchange (mirroring `capture_migration_snapshot`), and the old session stays
-// aligned for the next user command (mirroring `command_phase`).
+// The real-socket zlib/zstd migration rows above prove candidate negotiation,
+// restore, swap, PROXY ordering, and raw accounting. These in-memory rows remain
+// as narrow mutation-sensitive checks of the lower-level reset seam: the
+// backend compressed layer resets before a proxy-owned query, starts a fresh
+// compressed seq-0 exchange, stays aligned for the next command, and rejects a
+// reset while decoded bytes are staged.
 
 /// In-memory duplex byte transport modeling the backend leg's socket: reads
 /// drain `input` (the backend's scripted compressed responses), writes append to

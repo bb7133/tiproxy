@@ -208,9 +208,9 @@ The production engine invokes this client only after the session FSM enters
 `RedirectPending`. A complete result terminator marks validation errors as
 wire-aligned and recoverable on the old backend; a disconnect or earlier
 parser/limit failure closes the session rather than risking unread internal
-packets being mistaken for the next user response. MIG-01 owns candidate
-authentication/restoration and will consume the validated snapshot after this
-boundary.
+packets being mistaken for the next user response. MIG-01 consumes the
+validated snapshot after this boundary to authenticate an invisible candidate,
+restore it, and atomically swap the backend owner.
 
 The module dependency graph preserves the hot-path boundary:
 

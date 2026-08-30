@@ -2461,23 +2461,31 @@ impl Engine {
             .await?;
         self.restore_candidate_state(&mut candidate, snapshot.session_states(), capabilities)
             .await?;
-        if let Some(policy) = self
+        self.apply_candidate_keepalive(&candidate)?;
+        Ok(candidate)
+    }
+
+    /// Applies the healthy-target policy after every transport upgrade, through
+    /// the preserved innermost raw socket.
+    fn apply_candidate_keepalive(&self, candidate: &BackendIo) -> Result<(), CandidateFailure> {
+        let Some(policy) = self
             .seat
             .snapshot()
             .raw()
             .config
             .as_ref()
             .and_then(|config| config.healthy_backend_keepalive)
-        {
-            let Some(counted) = candidate.backend_io.get_ref().as_counted_stream() else {
-                return Err(CandidateFailure::Handshake);
-            };
-            let _ = proxy_io::socket::apply_keepalive(
-                counted.get_ref(),
-                crate::server::snapshot_keepalive(&policy),
-            );
-        }
-        Ok(candidate)
+        else {
+            return Ok(());
+        };
+        let Some(counted) = candidate.backend_io.get_ref().as_counted_stream() else {
+            return Err(CandidateFailure::Handshake);
+        };
+        let _ = proxy_io::socket::apply_keepalive(
+            counted.get_ref(),
+            crate::server::snapshot_keepalive(&policy),
+        );
+        Ok(())
     }
 
     /// Sends the fixed session-token handshake and consumes its sole terminal

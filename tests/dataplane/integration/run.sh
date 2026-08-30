@@ -1098,13 +1098,13 @@ if [[ $ka_pin_ready != true ]]; then
 	exit 1
 fi
 
-# ---- MIG-01 live same-keyspace migration (Rust plain/TLS) ----
+# ---- MIG-01 live same-keyspace migration (all Rust wire variants) ----
 # The unit suite proves every candidate-only rollback class. This real-TiDB
 # row proves the successful production composition against TiDB's signed
 # session token and native SHOW/SET SESSION_STATES implementation: one client
 # remains open while the router moves it A0 -> A1 inside ks-old; current DB and
-# a user variable survive, and subsequent SQL is served by A1. PROXY and
-# compression variants stay outside this claim until WIRE-B/C are active.
+# a user variable survive, and subsequent SQL is served by A1. The same phase
+# runs under plain, TLS, PROXY v2, zlib, zstd, and TLS+PROXY+zstd.
 if [[ $mode == rust ]]; then
 	mysql_backend_admin "CREATE DATABASE IF NOT EXISTS mig01_live;"
 	MIG_FIFO="$run_dir/mig01-session.fifo"

@@ -163,13 +163,13 @@ handshake, `SET SESSION_STATES`, and atomic owner swap; a disconnected/replaced
 client cannot pass it. The phase restores the original A0 pin before the
 separate cross-keyspace refusal test starts.
 
-Today this row runs in the admitted Rust plain and TLS variants. Its
-candidate-failure rollback matrix remains in the deterministic session-engine
-E2E, where invalid/expired tokens, unhealthy/expired/unreachable targets, and
-restore ERR/disconnect all preserve the aligned old backend. PROXY-v2 and
-compression are not claimed by this live row until WIRE-B/C activate those
-shared transports; once admitted, the same row automatically runs inside
-their variants as well.
+This row runs in every admitted Rust variant: plain, TLS, outbound PROXY v2,
+zlib, zstd, and TLS+PROXY+zstd. Its candidate-failure rollback matrix remains
+in the deterministic session-engine E2E, where invalid/expired tokens,
+unhealthy/expired/unreachable targets, and restore ERR/disconnect all preserve
+the aligned old backend. Dedicated real-socket rows additionally isolate zlib
+candidate activation and the combined zstd+PROXY-v2 candidate ordering while
+checking exact retired-plus-current raw-byte totals.
 
 ## Control-frame dropper (chaos-E2E control-loss)
 
