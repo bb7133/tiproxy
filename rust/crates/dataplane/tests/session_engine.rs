@@ -400,6 +400,15 @@ where
     W: AsyncWrite + Unpin,
 {
     writer.reset_sequence(reader.expected_sequence());
+    if prepare_text.starts_with(b"BADHDR") {
+        // A prepare-OK first byte followed by a truncated header (< the
+        // canonical 12 bytes): the observer must reject it and the proxy must
+        // tear the session down rather than treat it as a complete prepare.
+        return writer
+            .write_logical(&[0x00, 0xAA, 0xBB], true)
+            .await
+            .is_ok();
+    }
     if prepare_text.windows(4).any(|window| window == b"FAIL") {
         let Ok(err) = encode_error_packet(
             1064,
@@ -2957,6 +2966,120 @@ async fn stmt_prepare_register_replaces_stale_guard_and_unblocks_drain() {
     assert!(
         closed.is_some(),
         "registering the reused statement ID clears the guard and the drain closes"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// SES-05 (mutation-sensitive, retained transaction): a prepare carries no
+/// server status, so a `COM_STMT_PREPARE` inside an open transaction — whether
+/// it succeeds or the backend rejects it — must NOT move the transaction
+/// boundary. A drain queued after `BEGIN` stays deferred across the prepare and
+/// closes only at `COMMIT`. Forcing the success branch to emit `TxnDone`
+/// (`if self.in_transaction` → `if false`) or the ERR branch to stop retaining
+/// the transaction closes the drain early and fails this test.
+async fn prepare_inside_open_transaction_keeps_boundary(prepare_sql: &str, expect_error: bool) {
+    let stack = spawn_stack_long_drain().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("BEGIN").await, "the transaction opens");
+
+    stack.drain_tx.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let closed_after_begin = stack
+        .sender
+        .sent()
+        .into_iter()
+        .filter(|e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3))
+        .count();
+    assert_eq!(
+        closed_after_begin, 0,
+        "the open transaction defers the drain close"
+    );
+
+    // The prepare completes inside the transaction; it must not move the boundary.
+    let outcome = client.stmt_prepare(prepare_sql).await;
+    if expect_error {
+        assert!(
+            matches!(outcome, Some(PrepareOutcome::Error { .. })),
+            "prepare rejected inside the transaction: {outcome:?}"
+        );
+    } else {
+        assert!(
+            matches!(outcome, Some(PrepareOutcome::Ok { .. })),
+            "prepare succeeded inside the transaction: {outcome:?}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let closed_after_prepare = stack
+        .sender
+        .sent()
+        .into_iter()
+        .filter(|e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3))
+        .count();
+    assert_eq!(
+        closed_after_prepare, 0,
+        "the prepare retains the open transaction; the drain stays deferred"
+    );
+
+    // Only COMMIT ends the transaction and releases the drain.
+    assert!(
+        client.query_ok("COMMIT").await,
+        "the session still serves mid-drain"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(closed.is_some(), "the drain closes at the COMMIT boundary");
+    stack.dispatch_task.abort();
+}
+
+#[tokio::test]
+async fn prepare_ok_inside_open_transaction_keeps_boundary() {
+    prepare_inside_open_transaction_keeps_boundary("SELECT ? + ?", false).await;
+}
+
+#[tokio::test]
+async fn prepare_error_inside_open_transaction_keeps_boundary() {
+    prepare_inside_open_transaction_keeps_boundary("FAIL SELECT", true).await;
+}
+
+/// SES-05 (fail-closed): a malformed backend prepare response — a prepare-OK
+/// first byte followed by a truncated header — is a protocol violation. The
+/// proxy must reject it in `prepare_response_rounds` and tear the session down,
+/// never treat it as a complete prepare. The client sees no valid prepare
+/// result and the session closes.
+#[tokio::test]
+async fn stmt_prepare_malformed_backend_framing_tears_down_session() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert_eq!(
+        client.stmt_prepare("BADHDR").await,
+        None,
+        "a malformed prepare response yields no valid prepare result"
+    );
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    assert!(
+        closed.is_some(),
+        "the malformed prepare framing tears the session down"
     );
     stack.dispatch_task.abort();
 }
