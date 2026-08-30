@@ -112,7 +112,7 @@ use session_core::internal_client::{
     InternalLimits, InternalParserState, InternalProgress, InternalQuery, InternalResult,
     SessionStateSnapshot,
 };
-use session_core::prepared::PreparedRegistry;
+use session_core::prepared::{PrepareDisposition, PrepareObserver, PreparedRegistry};
 use session_core::response::{
     DEFAULT_RESPONSE_FLUSH_THRESHOLD, FlushAction, ResponseDisposition, ResponseObserver,
     ResponsePacket,
@@ -319,12 +319,6 @@ const ER_CHANGE_USER_UNSUPPORTED: (u16, [u8; 5], &str) = (
     1105,
     *b"HY000",
     "TiProxy-rs: COM_CHANGE_USER is not supported yet",
-);
-/// Fixed error for the fail-closed `COM_STMT_PREPARE` slice boundary.
-const ER_STMT_PREPARE_UNSUPPORTED: (u16, [u8; 5], &str) = (
-    1105,
-    *b"HY000",
-    "TiProxy-rs: COM_STMT_PREPARE is not supported yet",
 );
 
 /// Bounds one candidate attempt by both the issuer's absolute deadline and
@@ -1832,7 +1826,7 @@ impl Engine {
                     .await;
                 continue;
             };
-            if self.refuse_unsupported_command(command, expected).await {
+            if self.refuse_unsupported_command(command).await {
                 return Some(WireErrorSource::ClientNetwork);
             }
             let event = if command == Command::Quit {
@@ -1891,7 +1885,11 @@ impl Engine {
                 self.record_command(&pending);
                 continue;
             }
-            let response_source = self.response_rounds(&pending).await;
+            let response_source = if pending.expected == ExpectedResponse::Prepare {
+                self.prepare_response_rounds(&pending).await
+            } else {
+                self.response_rounds(&pending).await
+            };
             self.record_command(&pending);
             if let Some(source) = response_source {
                 return Some(source);
@@ -1902,19 +1900,13 @@ impl Engine {
         }
     }
 
-    /// Answers the fail-closed slice boundaries before any forward:
-    /// `COM_CHANGE_USER` and the prepared special response flow
-    /// (`COM_STMT_PREPARE` column metadata, cursors) are follow-up
-    /// slices — an explicit refusal, never a silent teardown.
-    async fn refuse_unsupported_command(
-        &mut self,
-        command: Command,
-        expected: ExpectedResponse,
-    ) -> bool {
+    /// Answers the remaining fail-closed slice boundary before any forward:
+    /// `COM_CHANGE_USER` is a follow-up slice (SES-06) — an explicit refusal,
+    /// never a silent teardown. `COM_STMT_PREPARE` is now served by
+    /// [`prepare_response_rounds`](Self::prepare_response_rounds).
+    async fn refuse_unsupported_command(&mut self, command: Command) -> bool {
         let refusal = if command == Command::ChangeUser {
             Some(ER_CHANGE_USER_UNSUPPORTED)
-        } else if expected == ExpectedResponse::Prepare {
-            Some(ER_STMT_PREPARE_UNSUPPORTED)
         } else {
             None
         };
@@ -2042,6 +2034,116 @@ impl Engine {
                 | ResponseDisposition::CompleteRaw
                 | ResponseDisposition::CompleteError { .. } => {
                     return None;
+                }
+            }
+        }
+    }
+
+    /// Streams a `COM_STMT_PREPARE` special response to the client.
+    ///
+    /// The response is the prepare-OK header, then the declared parameter
+    /// definitions, then the declared column definitions, with a classic EOF
+    /// after each non-empty group unless `DEPRECATE_EOF` was negotiated; a
+    /// leading ERR ends it immediately. [`PrepareObserver`] mirrors Go's
+    /// `forwardPrepareCmd`: it counts the two metadata groups from the header,
+    /// validates each classic EOF, and flushes exactly once at the terminal
+    /// boundary. The prepare-OK carries no server status (Go leaves the
+    /// transaction state untouched for a prepare), so `self.in_transaction` is
+    /// never rewritten here. On success the returned metadata is registered
+    /// before the completion event so a queued redirect or drain observes the
+    /// fresh (Idle) guard.
+    async fn prepare_response_rounds(
+        &mut self,
+        _pending: &PendingCommand,
+    ) -> Option<WireErrorSource> {
+        let mut observer = PrepareObserver::new(self.negotiated);
+        loop {
+            let progress = {
+                let Some(backend) = self.backend.as_mut() else {
+                    return Some(WireErrorSource::Proxy);
+                };
+                let forwarded = PacketIo::forward_packet_to(
+                    &mut backend.backend_io,
+                    &mut self.client_io,
+                    RESPONSE_CAPTURE,
+                )
+                .await;
+                let Ok(progress) = forwarded else {
+                    let _ = self.events.send(SessionEvent::BackendIoError).await;
+                    return Some(WireErrorSource::BackendNetwork);
+                };
+                progress
+            };
+            let first_physical = progress.first_packet_length().unwrap_or(0);
+            let Ok(packet) = ResponsePacket::from_forwarded(
+                progress.captured_prefix(),
+                progress.logical_payload_bytes(),
+                first_physical,
+                progress.physical_packets(),
+            ) else {
+                return Some(WireErrorSource::Proxy);
+            };
+            // A malformed prepare header/EOF is a backend protocol violation:
+            // fail closed and tear the session down, never silently forward on.
+            let Ok(effect) = observer.observe(packet) else {
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+                return Some(WireErrorSource::BackendNetwork);
+            };
+            if !matches!(effect.flush, FlushAction::None) && self.client_io.flush().await.is_err() {
+                let _ = self.events.send(SessionEvent::ClientIoError).await;
+                return Some(WireErrorSource::ClientNetwork);
+            }
+            // Register before the completion event: reusing a statement ID
+            // replaces any stale unknown-ID guard with a fresh Idle state
+            // atomically. The registry's sync event must then reach the FSM
+            // ahead of the command-completion boundary (the SES-00 ordering),
+            // so a queued redirect or drain observes the fresh guard rather
+            // than a stale pending one.
+            if let PrepareDisposition::CompleteSuccess(metadata) = effect.disposition {
+                self.prepared.register(metadata);
+                if self
+                    .events
+                    .send(self.prepared.session_event())
+                    .await
+                    .is_err()
+                {
+                    return Some(WireErrorSource::Proxy);
+                }
+            }
+            let event = self.prepare_session_event(effect.disposition);
+            if self.events.send(event).await.is_err() {
+                return Some(WireErrorSource::Proxy);
+            }
+            if !matches!(
+                self.await_effect(SessionEffect::ForwardResponseToClient)
+                    .await,
+                Awaited::Got
+            ) {
+                return None;
+            }
+            match effect.disposition {
+                PrepareDisposition::Continue => {}
+                PrepareDisposition::CompleteSuccess(_)
+                | PrepareDisposition::CompleteError { .. } => {
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Maps a prepare-response disposition onto the SES-00 FSM completion
+    /// event. A prepare carries no server status, so the transaction state is
+    /// the retained value (a prepare inside a transaction keeps it open;
+    /// outside, done) — mirroring `ResponseEffect::session_event`.
+    fn prepare_session_event(&self, disposition: PrepareDisposition) -> SessionEvent {
+        match disposition {
+            PrepareDisposition::Continue => SessionEvent::BackendResponsePart,
+            PrepareDisposition::CompleteError { .. } => SessionEvent::BackendResponseErrorComplete,
+            PrepareDisposition::CompleteSuccess(_) => {
+                if self.in_transaction {
+                    SessionEvent::BackendResponseTxnOpen
+                } else {
+                    SessionEvent::BackendResponseTxnDone
                 }
             }
         }
