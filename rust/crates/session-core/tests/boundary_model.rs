@@ -262,10 +262,13 @@ fn held_begin_commit_error_forwards_exactly_once() {
         hold.on_commit_error(),
         Ok(HoldEffect::ForwardCommitErrorToClient)
     );
-    // The FSM exits Command through the internal path with NO forwarding
-    // effect (Go handleErrorPacket keeps serverStatus: still in txn).
-    let effects = apply(&mut fsm, SessionEvent::InternalResponseTxnOpen);
-    assert_eq!(effects, Vec::new(), "no duplicate forwarding");
+    // The FSM exits Command through the internal ERROR path with NO
+    // forwarding effect and — unlike the commit-OK-still-in-txn case — NO
+    // `ResumeHeldRequest`: a statusless ERR keeps `serverStatus` (Go
+    // `handleErrorPacket`), so the transaction is retained and the aborted
+    // hold is answered by the forwarded error, never replayed.
+    let effects = apply(&mut fsm, SessionEvent::InternalResponseError);
+    assert_eq!(effects, Vec::new(), "no duplicate forwarding, no replay");
     assert_eq!(fsm.state(), SessionState::Ready);
     assert!(fsm.flags().in_txn, "commit failed: txn retained");
     assert!(fsm.flags().redirect_pending, "redirect stays queued");
@@ -302,6 +305,141 @@ fn held_begin_failure_and_close_paths() {
     }
     assert_eq!(hold.drop_for_close(), Ok(HoldEffect::DiscardHeldRequest));
     assert!(hold.take_for_replay().is_err(), "dropped is never replayed");
+}
+
+/// An internal COMMIT that returns OK but still reports `IN_TRANS` cannot
+/// migrate; the FSM authorizes the held request to replay once on the current
+/// backend right away (`InternalResponseTxnOpen` → `ResumeHeldRequest`). This
+/// is the branch a hardcoded `TxnDone` would silently swallow.
+#[test]
+fn held_begin_commit_ok_in_txn_replays_on_current_backend() {
+    let mut fsm = authenticated_fsm();
+    for event in [
+        SessionEvent::ClientCommand,
+        SessionEvent::BackendResponseTxnOpen,
+        SessionEvent::ControlRedirect,
+        SessionEvent::ClientCommand, // the held BEGIN's internal cycle
+    ] {
+        let _ = apply(&mut fsm, event);
+    }
+    let (mut hold, _) = HeldBegin::start();
+    match hold.on_commit_ok() {
+        Ok(()) => {}
+        Err(error) => unreachable!("commit ok failed: {error}"),
+    }
+    // Commit succeeded but the transaction is still open: no migration, but
+    // the held request must replay once on the current backend.
+    let effects = apply(&mut fsm, SessionEvent::InternalResponseTxnOpen);
+    assert_eq!(
+        effects,
+        vec![SessionEffect::ResumeHeldRequest],
+        "commit-OK-still-in-txn replays on the current backend"
+    );
+    assert_eq!(fsm.state(), SessionState::Ready);
+    assert!(fsm.flags().in_txn, "transaction stays open");
+    assert!(fsm.flags().redirect_pending, "redirect stays queued");
+    assert_eq!(hold.take_for_replay(), Ok(HoldEffect::ReplayHeldRequest));
+    let effects = apply(&mut fsm, SessionEvent::ClientCommand);
+    assert_eq!(effects, vec![SessionEffect::ForwardCommandToBackend]);
+    assert!(hold.take_for_replay().is_err(), "never duplicated");
+}
+
+/// A successful migration emits the swap, the success report, and the replay
+/// authorization in exactly that order. Dropping `ResumeHeldRequest` here
+/// would strand a held BEGIN on the new backend forever.
+#[test]
+fn redirect_ready_authorizes_resume_after_swap() {
+    let mut fsm = authenticated_fsm();
+    for event in [
+        SessionEvent::ClientCommand,
+        SessionEvent::ControlRedirect,
+        SessionEvent::BackendResponseTxnDone,
+    ] {
+        let _ = apply(&mut fsm, event);
+    }
+    assert_eq!(fsm.state(), SessionState::RedirectPending);
+    let effects = apply(&mut fsm, SessionEvent::RedirectBackendReady);
+    assert_eq!(
+        effects,
+        vec![
+            SessionEffect::SwapBackend,
+            SessionEffect::NotifyRedirectSucceeded,
+            SessionEffect::ResumeHeldRequest,
+        ],
+        "resume must follow the swap and the success report"
+    );
+    assert_eq!(fsm.state(), SessionState::Ready);
+}
+
+/// A failed migration keeps the old backend and still authorizes the replay
+/// (Go replays the held request whether the redirect succeeded or failed).
+#[test]
+fn redirect_failed_still_authorizes_resume() {
+    let mut fsm = authenticated_fsm();
+    for event in [
+        SessionEvent::ClientCommand,
+        SessionEvent::ControlRedirect,
+        SessionEvent::BackendResponseTxnDone,
+    ] {
+        let _ = apply(&mut fsm, event);
+    }
+    assert_eq!(fsm.state(), SessionState::RedirectPending);
+    let effects = apply(&mut fsm, SessionEvent::RedirectBackendFailed);
+    assert_eq!(
+        effects,
+        vec![
+            SessionEffect::NotifyRedirectFailed,
+            SessionEffect::ResumeHeldRequest,
+        ],
+        "a failed redirect still replays the held request on the old backend"
+    );
+    assert_eq!(fsm.state(), SessionState::Ready);
+}
+
+/// While draining, a commit-OK-still-in-txn does NOT authorize a replay: Go
+/// executes the held request only while `closeStatus < statusNotifyClose`, so
+/// the graceful close drops it instead. This kills an unconditional resume.
+#[test]
+fn held_begin_commit_ok_in_txn_while_draining_drops_without_resume() {
+    let mut fsm = authenticated_fsm();
+    for event in [
+        SessionEvent::ClientCommand,
+        SessionEvent::BackendResponseTxnOpen,
+        SessionEvent::ControlRedirect,
+        SessionEvent::ClientCommand, // the held BEGIN's internal cycle
+        SessionEvent::ControlGracefulClose,
+    ] {
+        let _ = apply(&mut fsm, event);
+    }
+    assert!(fsm.flags().draining, "graceful close armed");
+    let effects = apply(&mut fsm, SessionEvent::InternalResponseTxnOpen);
+    assert!(
+        !effects.contains(&SessionEffect::ResumeHeldRequest),
+        "draining drops the held request, never replays it"
+    );
+    assert_eq!(fsm.state(), SessionState::Draining);
+    assert!(fsm.flags().in_txn, "transaction stays open");
+}
+
+/// Teardown never authorizes a replay: a held BEGIN seen only at close is
+/// dropped by the runtime, so `teardown` must not emit `ResumeHeldRequest`.
+#[test]
+fn teardown_never_authorizes_resume() {
+    let mut fsm = authenticated_fsm();
+    for event in [
+        SessionEvent::ClientCommand,
+        SessionEvent::ControlRedirect,
+        SessionEvent::BackendResponseTxnDone,
+    ] {
+        let _ = apply(&mut fsm, event);
+    }
+    assert_eq!(fsm.state(), SessionState::RedirectPending);
+    let effects = apply(&mut fsm, SessionEvent::ClientEof);
+    assert_eq!(fsm.state(), SessionState::Closing);
+    assert!(
+        !effects.contains(&SessionEffect::ResumeHeldRequest),
+        "teardown drops the held request, never replays it"
+    );
 }
 
 /// Unknown state survives every statusless ERR completion: a real

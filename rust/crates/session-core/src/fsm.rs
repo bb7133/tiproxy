@@ -250,6 +250,15 @@ pub enum SessionEffect {
     NotifyRedirectSucceeded,
     /// Report a failed or refused migration to the control plane.
     NotifyRedirectFailed,
+    /// Authorize the runtime to re-submit a held `BEGIN`/`START TRANSACTION`
+    /// (SES-07/MIG-005), if it is holding one. Payload-free: this is not the
+    /// proxy's own query, and it does **not** itself mean the redirect
+    /// succeeded — it only tells the engine that the migration/internal-commit
+    /// phase resolved to a point where an outstanding
+    /// [`crate::boundary::HeldBegin`] may replay exactly once. It is a no-op
+    /// when the engine holds nothing. `teardown` never emits it, so a
+    /// held request seen only at close is dropped, never replayed.
+    ResumeHeldRequest,
     /// Arm the drain deadline for a graceful close in progress.
     BeginDrainTimer,
     /// Close the client connection.
@@ -636,7 +645,17 @@ impl SessionFsm {
     fn internal_response_complete(&mut self, txn_done: bool) -> (SessionState, Effects) {
         self.flags.in_txn = !txn_done;
         self.flags.txn_unknown = false;
-        self.finish_command(Effects::new())
+        let (state, mut effects) = self.finish_command(Effects::new());
+        // SES-07/MIG-005: an internal `COMMIT` that reported IN_TRANS
+        // (`txn_done == false`) left the transaction open, so no migration
+        // boundary is reachable; the held request replays once on the
+        // current backend. A graceful close instead drops it at teardown
+        // (Go executes the held request only while `closeStatus <
+        // statusNotifyClose`), so no resume is authorized while draining.
+        if !txn_done && !self.flags.draining {
+            effects.push(SessionEffect::ResumeHeldRequest);
+        }
+        (state, effects)
     }
 
     /// ERR completion: the client sees the forwarded ERR, the command
@@ -800,6 +819,9 @@ impl SessionFsm {
                     vec![
                         SessionEffect::SwapBackend,
                         SessionEffect::NotifyRedirectSucceeded,
+                        // SES-07/MIG-005: after the owner swap the held
+                        // request replays once on the new backend.
+                        SessionEffect::ResumeHeldRequest,
                     ],
                 ))
             }
@@ -808,7 +830,13 @@ impl SessionFsm {
                 self.flags.redirect_pending = false;
                 Some((
                     SessionState::Ready,
-                    vec![SessionEffect::NotifyRedirectFailed],
+                    vec![
+                        SessionEffect::NotifyRedirectFailed,
+                        // SES-07/MIG-005: Go replays the held request whether
+                        // the redirect succeeded or failed — here it replays
+                        // once on the retained backend.
+                        SessionEffect::ResumeHeldRequest,
+                    ],
                 ))
             }
             // Migration is serialized with command execution (Go

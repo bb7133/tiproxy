@@ -256,6 +256,17 @@ pub struct InternalOk {
     pub warnings: u16,
 }
 
+impl InternalOk {
+    /// Whether the terminal status of this internal command reports an open
+    /// transaction (`SERVER_STATUS_IN_TRANS`). The SES-07 held-`BEGIN` flow
+    /// branches on this to decide whether an internal `COMMIT` actually closed
+    /// the transaction (Go reads the same status bit).
+    #[must_use]
+    pub const fn in_transaction(&self) -> bool {
+        self.status.contains(StatusFlags::IN_TRANS)
+    }
+}
+
 /// Captured migration state from `SHOW SESSION_STATES`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionStateSnapshot {
