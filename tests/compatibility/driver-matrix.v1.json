@@ -351,8 +351,21 @@
     {"id":"DRV-CLI-006","driver_id":"mysql-cli","workload_id":"WL-ADAPTER-UNSUPPORTED","capability_ids":["prepared_statements"],"parity_case_ids":["CMD-022","CMD-023","PS-004"],"classification":"non_blocking","case_parameters":{"requested_capability":"binary_prepared_statements"},"expected":{"outcome":"rejection","detail":"Adapter reports that SQL PREPARE is not COM_STMT_PREPARE and does not claim binary prepared coverage."},"go_baseline":{"status":"not_applicable","evidence":"This is a pinned client interface limitation, not a Go dataplane behavior."}}
   ],
   "approval": {
-    "status": "pending",
+    "status": "approved",
     "required_roles": ["product_owner", "mysql_protocol_owner"],
-    "records": []
+    "records": [
+      {
+        "role": "product_owner",
+        "approver": "bb7133",
+        "date": "2026-08-31",
+        "note": "Approved the frozen driver/capability compatibility matrix (7 drivers with pinned versions, 11 capabilities, 41 cases). The 3 non-blocking cases (DRV-GO-009, DRV-NODE-006, DRV-CLI-006) are client-driver limitations (go-sql-driver has no zstd, mysql2 has no COM_STMT_FETCH cursor API, mysql CLI SQL PREPARE is not COM_STMT_PREPARE), not proxy defects, so non-blocking is correct. No case reclassifications."
+      },
+      {
+        "role": "mysql_protocol_owner",
+        "approver": "bb7133",
+        "date": "2026-08-31",
+        "note": "Approved the capability surface and the explicit-error-on-unsupported contract; unsupported behavior returns an explicit error rather than silently degrading."
+      }
+    ]
   }
 }
