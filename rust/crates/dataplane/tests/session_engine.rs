@@ -2579,6 +2579,116 @@ fn metering_source_count(registry: &MeteringSourceRegistry) -> usize {
     count
 }
 
+/// SES-07/MIG-005 redirect-in-transaction hold: a `BEGIN` issued while a
+/// redirect is armed and a transaction is open is held — the proxy commits the
+/// old backend internally (its OK never reaches the client), migrates, and
+/// replays the `BEGIN` exactly once on the new backend. The old backend sees
+/// `COMMIT` then the snapshot query; the new backend sees the restore then the
+/// single replayed `BEGIN`, whose OK answers the client.
+#[tokio::test]
+async fn redirect_in_transaction_holds_commits_and_replays_begin() {
+    let stack = spawn_stack().await;
+    let (target_port, target_transcript, _target_bytes) =
+        spawn_fake_backend_server(SnapshotReply::Valid).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+
+    // Open a transaction on the old backend: the session is now unsafe for a
+    // plain redirect, so the redirect can only proceed through the BEGIN hold.
+    assert!(
+        client.query_ok("BEGIN").await,
+        "transaction opens on old backend"
+    );
+
+    // Arm the redirect while in-transaction; it is queued, not fired. The
+    // short settle lets the admitted redirect reach the engine (set
+    // `redirect_target`) before the next command's forward point.
+    let redirect = command_envelope(
+        7001,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "hold-begin".to_owned(),
+            backend_id: "tidb-target".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            keyspace: String::new(),
+            backend_unhealthy: false,
+            backend_local: false,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A second BEGIN is held: internal COMMIT on the old backend, migrate, then
+    // the BEGIN replays on the new backend and its OK answers the client.
+    assert!(
+        client.query_ok("BEGIN").await,
+        "held BEGIN replays and answers the client exactly once"
+    );
+
+    let Some(result) = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "hold-begin")
+    })
+    .await
+    else {
+        unreachable!("redirect terminal")
+    };
+    let Some(Body::RedirectResult(result)) = result.body else {
+        unreachable!()
+    };
+    assert!(result.succeeded, "migration succeeds during the hold");
+
+    // The old backend saw the internal COMMIT before the snapshot query, and
+    // never received a client-visible duplicate.
+    {
+        let old = match stack.backend_transcript.lock() {
+            Ok(old) => old,
+            Err(error) => unreachable!("old transcript: {error}"),
+        };
+        let commit_at = old.iter().position(|packet| packet.as_slice() == b"\x03COMMIT");
+        let snapshot_at = old
+            .iter()
+            .position(|packet| packet.as_slice() == b"\x03SHOW SESSION_STATES");
+        assert!(commit_at.is_some(), "old backend received the internal COMMIT");
+        assert!(
+            snapshot_at.is_some(),
+            "old backend received the migration snapshot"
+        );
+        assert!(commit_at < snapshot_at, "COMMIT precedes the snapshot query");
+    }
+
+    // The new backend saw the restore then the replayed BEGIN exactly once.
+    {
+        let target = match target_transcript.lock() {
+            Ok(target) => target,
+            Err(error) => unreachable!("target transcript: {error}"),
+        };
+        let restored = target
+            .iter()
+            .any(|packet| packet.starts_with(b"\x03SET SESSION_STATES '"));
+        let replayed_begins = target
+            .iter()
+            .filter(|packet| packet.as_slice() == b"\x03BEGIN")
+            .count();
+        assert!(restored, "new backend received the session-state restore");
+        assert_eq!(
+            replayed_begins, 1,
+            "BEGIN replays exactly once on the new backend"
+        );
+    }
+
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
 /// A per-connection `CloseCommand` resolves under its exact admitted id
 /// with the initiating request id, and the client socket closes.
 #[tokio::test]
