@@ -127,6 +127,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::control_dispatch::{CommandKind, CommandToken, RedirectTarget, ResponseKind};
+use crate::metering::{
+    MeteringAttribution, MeteringSamplerError, MeteringSourceRegistry, is_public_endpoint,
+};
 use crate::observability::{
     BackendTraffic, MetricsRecorder, Observation, QuitSource, SessionLogContext, log_session,
 };
@@ -505,6 +508,7 @@ pub struct EngineSessionOwner {
     drain: watch::Receiver<bool>,
     loop_config: SessionLoopConfig,
     metrics: MetricsRecorder,
+    metering: Option<MeteringSourceRegistry>,
 }
 
 impl EngineSessionOwner {
@@ -524,6 +528,7 @@ impl EngineSessionOwner {
             drain,
             loop_config,
             metrics: MetricsRecorder::default(),
+            metering: None,
         }
     }
 
@@ -531,6 +536,13 @@ impl EngineSessionOwner {
     #[must_use]
     pub fn with_metrics(mut self, metrics: MetricsRecorder) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Attaches the process-wide immutable-source metering registry.
+    #[must_use]
+    pub fn with_metering(mut self, metering: MeteringSourceRegistry) -> Self {
+        self.metering = Some(metering);
         self
     }
 }
@@ -547,9 +559,10 @@ impl BoundSessionHandler for EngineSessionOwner {
         let drain = self.drain.clone();
         let config = self.loop_config;
         let metrics = self.metrics.clone();
+        let metering = self.metering.clone();
         Box::pin(async move {
             run_bound_session_observed(
-                connection, binding, client, namespace, shutdown, drain, config, metrics,
+                connection, binding, client, namespace, shutdown, drain, config, metrics, metering,
             )
             .await;
         })
@@ -579,6 +592,7 @@ pub async fn run_bound_session(
         drain,
         loop_config,
         MetricsRecorder::default(),
+        None,
     )
     .await;
 }
@@ -593,6 +607,7 @@ async fn run_bound_session_observed(
     mut drain: watch::Receiver<bool>,
     loop_config: SessionLoopConfig,
     metrics: MetricsRecorder,
+    metering: Option<MeteringSourceRegistry>,
 ) {
     let accepted_at = tokio::time::Instant::now();
     let (stream, seat) = connection.into_session_io();
@@ -601,8 +616,16 @@ async fn run_bound_session_observed(
         connection_id: metadata.connection_id.get(),
         listener_address: metadata.listener_address.to_string(),
         client_address: metadata.peer_address.to_string(),
-        proxy_address: metadata.listener_address.to_string(),
-        public_endpoint: false,
+        proxy_address: metadata.peer_address.to_string(),
+        public_endpoint: is_public_endpoint(
+            metadata.peer_address.ip(),
+            seat.snapshot()
+                .raw()
+                .config
+                .as_ref()
+                .map(|config| config.public_cidrs.as_slice())
+                .unwrap_or_default(),
+        ),
     };
     let endpoints = ConnectionEndpoints {
         listener_addr: metadata.listener_address,
@@ -616,6 +639,7 @@ async fn run_bound_session_observed(
         namespace: namespace.clone(),
         generation: seat.snapshot().generation(),
     };
+    let public_endpoint = identity.public_endpoint;
 
     let (mut directives, responses, commander) = binding.split();
 
@@ -623,6 +647,7 @@ async fn run_bound_session_observed(
     let (cmd_tx, cmd_rx) = mpsc::channel(ENGINE_CMD_CAPACITY);
     let (report_tx, mut report_rx) = mpsc::channel(ENGINE_REPORT_CAPACITY);
     let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
+    let session_metering = metering.clone();
 
     // Wrap the raw client socket in the innermost byte counter before any
     // framing/TLS/compression layer; the handle survives in-place upgrades.
@@ -639,6 +664,9 @@ async fn run_bound_session_observed(
         redirect_target: None,
         retired_backend_in: 0,
         retired_backend_out: 0,
+        backend_generation: 0,
+        public_endpoint,
+        metering,
         events: event_tx,
         cmds: cmd_rx,
         reports: report_tx,
@@ -785,10 +813,28 @@ async fn run_bound_session_observed(
         consume_report(report, &commander, &mut redirect_token).await;
     }
 
-    let totals = engine_exit
-        .as_ref()
-        .map(|exit| exit.totals)
-        .unwrap_or_default();
+    let totals = engine_exit.as_ref().map_or_else(
+        || {
+            session_metering
+                .as_ref()
+                .and_then(|registry| {
+                    if let Ok(totals) = registry.finalize_connection(identity.connection_id) {
+                        totals
+                    } else {
+                        registry.fail_closed();
+                        None
+                    }
+                })
+                .map_or_else(TrafficTotals::default, |(backend_in, backend_out)| {
+                    TrafficTotals {
+                        backend_in,
+                        backend_out,
+                        ..TrafficTotals::default()
+                    }
+                })
+        },
+        |exit| exit.totals,
+    );
     let shutdown_end = summary
         .as_ref()
         .is_some_and(|summary| summary.end == SessionEnd::ServerShutdown);
@@ -860,6 +906,9 @@ async fn run_bound_session_observed(
         quit_source,
     );
     let _ = commander.session_closed(forced, source, totals).await;
+    if let Some(registry) = session_metering {
+        registry.forget_connection(identity.connection_id);
+    }
 }
 
 /// Aborts the owned task when dropped: an externally cancelled session
@@ -913,6 +962,7 @@ struct BackendIo {
     id: String,
     address: String,
     cluster: String,
+    keyspace: String,
     local: bool,
 }
 
@@ -959,6 +1009,7 @@ fn classify_change_user_response(
 }
 
 /// The single owner of all session wire I/O.
+#[allow(clippy::struct_excessive_bools)]
 struct Engine {
     connection_id: u64,
     endpoints: ConnectionEndpoints,
@@ -981,6 +1032,13 @@ struct Engine {
     /// connection-lifetime CLOSED event after an atomic swap.
     retired_backend_in: u64,
     retired_backend_out: u64,
+    /// Successful backend generation: zero until initial auth attaches, then
+    /// incremented only by a successful atomic redirect swap.
+    backend_generation: u64,
+    /// Immutable classification of the direct upstream/LB peer at accept.
+    public_endpoint: bool,
+    /// Process-wide registry; absent only in legacy/unit compositions.
+    metering: Option<MeteringSourceRegistry>,
     events: mpsc::Sender<SessionEvent>,
     cmds: mpsc::Receiver<EngineCmd>,
     reports: mpsc::Sender<EngineReport>,
@@ -1105,6 +1163,58 @@ fn migration_auth_capabilities(
 }
 
 impl Engine {
+    fn register_current_metering(&mut self) -> Result<(), MeteringSamplerError> {
+        let Some(registry) = &self.metering else {
+            self.backend_generation = 1;
+            return Ok(());
+        };
+        if self.backend_generation != 0 {
+            return Err(MeteringSamplerError::SourceInvariant);
+        }
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or(MeteringSamplerError::SourceInvariant)?;
+        let generation = 1;
+        let result = registry.register(
+            MeteringAttribution {
+                connection_id: self.connection_id,
+                backend_generation: generation,
+                backend_id: backend.id.clone(),
+                cluster_name: backend.cluster.clone(),
+                keyspace: backend.keyspace.clone(),
+                local: backend.local,
+                public_endpoint: self.public_endpoint,
+            },
+            Arc::clone(&backend.counters),
+        );
+        if result
+            .as_ref()
+            .is_err_and(|error| !matches!(error, MeteringSamplerError::UnknownAttribution))
+        {
+            registry.fail_closed();
+        }
+        result?;
+        self.backend_generation = generation;
+        Ok(())
+    }
+
+    fn finalize_metering_source(
+        &self,
+        generation: u64,
+        inbound: u64,
+        outbound: u64,
+    ) -> Result<(), MeteringSamplerError> {
+        let Some(registry) = &self.metering else {
+            return Ok(());
+        };
+        let result = registry.finalize(self.connection_id, generation, inbound, outbound);
+        if result.is_err() {
+            registry.fail_closed();
+        }
+        result
+    }
+
     async fn run(mut self) -> EngineExit {
         let end = self.lifecycle().await;
         if let Some(source) = end {
@@ -1121,6 +1231,23 @@ impl Engine {
             }
         }
         self.shutdown_io().await;
+        // One exact final load feeds BOTH metering and CLOSED aggregation.
+        let (current_backend_in, current_backend_out) =
+            self.backend.as_ref().map_or((0, 0), |backend| {
+                (backend.counters.inbound(), backend.counters.outbound())
+            });
+        if self.backend_generation != 0
+            && self
+                .finalize_metering_source(
+                    self.backend_generation,
+                    current_backend_in,
+                    current_backend_out,
+                )
+                .is_err()
+        {
+            self.wire_end = Some(WireErrorSource::Proxy);
+            self.quit_source = QuitSource::ProxyError;
+        }
         let (backend_id, backend_address, cluster) = self.backend.as_ref().map_or_else(
             || (String::new(), String::new(), String::new()),
             |backend| {
@@ -1132,7 +1259,12 @@ impl Engine {
             },
         );
         EngineExit {
-            totals: self.totals(),
+            totals: TrafficTotals {
+                client_in: self.client_counters.inbound(),
+                client_out: self.client_counters.outbound(),
+                backend_in: self.retired_backend_in.saturating_add(current_backend_in),
+                backend_out: self.retired_backend_out.saturating_add(current_backend_out),
+            },
             source: self.wire_end.unwrap_or(WireErrorSource::ClientNetwork),
             quit_source: self.quit_source,
             backend_id,
@@ -1468,7 +1600,19 @@ impl Engine {
         let backend_id = acquired.backend.backend_id.clone();
         let backend_address = acquired.backend.address.clone();
         let backend_cluster = acquired.backend.cluster_name.clone();
+        let backend_keyspace = acquired.backend.keyspace.clone();
         let backend_local = acquired.backend.local;
+        // A metered session must know its immutable source attribution before
+        // consuming or forwarding any backend protocol bytes. RouteEngine has
+        // only completed the TCP dial here: the greeting is still unread and
+        // the socket has not entered the counted/billable transport. Reject an
+        // incomplete assignment locally without poisoning the process-wide
+        // registry; this is the session-scoped fail-closed policy.
+        if self.metering.is_some() && (backend_id.is_empty() || backend_keyspace.is_empty()) {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(WireErrorSource::Proxy);
+        }
         // Health-appropriate keepalive at dial time (KA-003 family):
         // the snapshot's healthy/unhealthy backend policy follows the
         // router-reported health of this assignment. Mid-session
@@ -1521,6 +1665,7 @@ impl Engine {
             id: backend_id.clone(),
             address: backend_address,
             cluster: backend_cluster,
+            keyspace: backend_keyspace,
             local: backend_local,
         };
         let Ok(greeting_packet) = backend
@@ -1747,6 +1892,14 @@ impl Engine {
                     Awaited::Got
                 ) {
                     return None;
+                }
+                // The source becomes billable only after the initial backend
+                // is fully authenticated and the FSM attaches it. The same
+                // Arc counters have covered dial → preamble/TLS → auth.
+                if self.register_current_metering().is_err() {
+                    self.quit_source = QuitSource::ProxyError;
+                    let _ = self.events.send(SessionEvent::BackendIoError).await;
+                    return Some(WireErrorSource::Proxy);
                 }
                 let _ = commander.set_backend(backend_id.clone()).await;
                 if !matches!(
@@ -2618,29 +2771,7 @@ impl Engine {
                 self.wire_end.get_or_insert(WireErrorSource::Proxy);
                 Awaited::Closing
             }
-            SessionEffect::SwapBackend => {
-                let Some(candidate) = self.candidate.take() else {
-                    self.closing = true;
-                    self.wire_end = Some(WireErrorSource::Proxy);
-                    return Awaited::Closing;
-                };
-                let Some(previous) = self.backend.replace(candidate) else {
-                    self.closing = true;
-                    self.wire_end = Some(WireErrorSource::Proxy);
-                    return Awaited::Closing;
-                };
-                self.retired_backend_in = self
-                    .retired_backend_in
-                    .saturating_add(previous.counters.inbound());
-                self.retired_backend_out = self
-                    .retired_backend_out
-                    .saturating_add(previous.counters.outbound());
-                self.redirect_target = None;
-                // Dropping the previous sole owner closes it only after the
-                // restored candidate has been installed atomically.
-                drop(previous);
-                Awaited::Got
-            }
+            SessionEffect::SwapBackend => self.swap_backend(),
             SessionEffect::ActivateFrontendTls
             | SessionEffect::SendProxyGreeting
             | SessionEffect::DialBackend
@@ -2659,6 +2790,77 @@ impl Engine {
                 Awaited::Closing
             }
         }
+    }
+
+    fn swap_backend(&mut self) -> Awaited {
+        let Some(candidate) = self.candidate.take() else {
+            return self.close_for_invariant();
+        };
+        let Some(next_generation) = self.backend_generation.checked_add(1) else {
+            return self.close_for_invariant();
+        };
+        let Some(previous) = self.backend.as_ref() else {
+            return self.close_for_invariant();
+        };
+        // Exactly one pair of atomic loads closes the old source and feeds the
+        // connection-lifetime CLOSED totals.
+        let previous_in = previous.counters.inbound();
+        let previous_out = previous.counters.outbound();
+        if self
+            .finalize_metering_source(self.backend_generation, previous_in, previous_out)
+            .is_err()
+        {
+            self.retired_backend_in = self.retired_backend_in.saturating_add(previous_in);
+            self.retired_backend_out = self.retired_backend_out.saturating_add(previous_out);
+            self.backend_generation = 0;
+            self.backend = None;
+            return self.close_for_invariant();
+        }
+        // The pointer swap is the successful activation boundary. Candidate
+        // counters remain unregistered (and unbillable) until it completes.
+        let Some(previous) = self.backend.replace(candidate) else {
+            self.backend = None;
+            return self.close_for_invariant();
+        };
+        if let Some(registry) = &self.metering {
+            let Some(current) = self.backend.as_ref() else {
+                registry.fail_closed();
+                return self.close_for_invariant();
+            };
+            let result = registry.register(
+                MeteringAttribution {
+                    connection_id: self.connection_id,
+                    backend_generation: next_generation,
+                    backend_id: current.id.clone(),
+                    cluster_name: current.cluster.clone(),
+                    keyspace: current.keyspace.clone(),
+                    local: current.local,
+                    public_endpoint: self.public_endpoint,
+                },
+                Arc::clone(&current.counters),
+            );
+            if result.is_err() {
+                registry.fail_closed();
+                self.retired_backend_in = self.retired_backend_in.saturating_add(previous_in);
+                self.retired_backend_out = self.retired_backend_out.saturating_add(previous_out);
+                self.backend_generation = 0;
+                return self.close_for_invariant();
+            }
+        }
+        self.backend_generation = next_generation;
+        self.retired_backend_in = self.retired_backend_in.saturating_add(previous_in);
+        self.retired_backend_out = self.retired_backend_out.saturating_add(previous_out);
+        self.redirect_target = None;
+        // Dropping the previous sole owner closes it only after the restored
+        // candidate has been installed atomically.
+        drop(previous);
+        Awaited::Got
+    }
+
+    fn close_for_invariant(&mut self) -> Awaited {
+        self.closing = true;
+        self.wire_end = Some(WireErrorSource::Proxy);
+        Awaited::Closing
     }
 
     async fn handle_redirect_snapshot(&mut self) {
@@ -2789,6 +2991,7 @@ impl Engine {
     ) -> Result<BackendIo, CandidateFailure> {
         if target.backend_id.is_empty()
             || target.backend_address.is_empty()
+            || (self.metering.is_some() && target.keyspace.is_empty())
             || !target.backend_healthy
         {
             return Err(CandidateFailure::InvalidTarget);
@@ -2817,6 +3020,7 @@ impl Engine {
             id: target.backend_id.clone(),
             address: target.backend_address.clone(),
             cluster: target.cluster_name.clone(),
+            keyspace: target.keyspace.clone(),
             local: target.backend_local,
         };
         let greeting = candidate
@@ -3480,26 +3684,6 @@ impl Engine {
         let _ = self.client_io.flush().await;
         if let Some(backend) = self.backend.as_mut() {
             let _ = backend.backend_io.flush().await;
-        }
-    }
-
-    fn totals(&self) -> TrafficTotals {
-        // Bytes come from the innermost raw counters (real wire I/O, Go's
-        // `basicReadWriter` accounting); the framing-layer `PacketIo` byte
-        // counters deliberately do not feed this metric.
-        TrafficTotals {
-            client_in: self.client_counters.inbound(),
-            client_out: self.client_counters.outbound(),
-            backend_in: self.retired_backend_in.saturating_add(
-                self.backend
-                    .as_ref()
-                    .map_or(0, |backend| backend.counters.inbound()),
-            ),
-            backend_out: self.retired_backend_out.saturating_add(
-                self.backend
-                    .as_ref()
-                    .map_or(0, |backend| backend.counters.outbound()),
-            ),
         }
     }
 

@@ -74,6 +74,7 @@ fn frame_limits_empty_fields_unknown_data_and_max_enum_are_safe()
             offending_request_id: 0,
             retryable: false,
             detail: "x".repeat(64 * 1024),
+            fatal: false,
         })),
         ..Default::default()
     };

@@ -24,6 +24,7 @@ pub mod admission;
 pub mod control_commands;
 pub mod control_dispatch;
 pub mod control_runtime;
+pub mod metering;
 pub mod observability;
 pub mod registry;
 pub mod route;

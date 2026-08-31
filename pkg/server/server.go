@@ -196,7 +196,7 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 		ReplayJobMgr:  srv.replay,
 	}
 	if srv.controlBridge != nil {
-		mgrs.DataplaneStatus = srv.controlBridge.Publisher()
+		mgrs.DataplaneStatus = srv.controlBridge
 		mgrs.DataplaneDrainer = srv.controlBridge
 	}
 	if srv.apiServer, err = api.NewServer(cfg.API, lg.Named("api"), mgrs, handler, ready); err != nil {

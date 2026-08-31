@@ -70,7 +70,8 @@ use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     CloseCommand, CloseResult, ConnectionEvent, ConnectionEventKind, ConnectionIdentity,
     ControlCapability, ControlEnvelope, DrainCommand, DrainResult, ErrorCode, ErrorSource,
-    Priority, ProtocolError, ReconcileRequest, ReconcileSnapshot, RedirectCommand, RedirectResult,
+    MeteringSourceSnapshot, Priority, ProtocolError, ReconcileRequest, ReconcileSnapshot,
+    RedirectCommand, RedirectResult,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -188,6 +189,8 @@ pub struct RedirectTarget {
     /// Router-selected cluster scope retained for identity and attribution;
     /// the candidate still dials the exact `backend_address` above.
     pub cluster_name: String,
+    /// Router-selected keyspace for immutable metering attribution.
+    pub keyspace: String,
     /// Router-observed health at issuance. Unhealthy targets are rejected
     /// before candidate I/O; the negative wire field keeps old peers healthy.
     pub backend_healthy: bool,
@@ -303,12 +306,19 @@ impl ControlCommandHandler {
     /// reconnects.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_metering(MeteringLedger::new())
+    }
+
+    /// Creates the handler over a caller-opened metering ledger. Production
+    /// uses this seam to install the fail-closed WAL before accepting SQL.
+    #[must_use]
+    pub fn with_metering(metering: MeteringLedger) -> Self {
         Self {
             gate: CommandGate::new(),
             active_session: None,
             active_lineage: None,
             reconcile_capable: true,
-            metering: MeteringLedger::new(),
+            metering,
             sessions: HashMap::new(),
             force_notified: BTreeSet::new(),
             initiating_redirect: HashMap::new(),
@@ -418,6 +428,14 @@ impl ControlCommandHandler {
     #[must_use]
     pub const fn active_session(&self) -> Option<(u64, u64, u64)> {
         self.active_session
+    }
+
+    /// Whether the live peer negotiated producer-qualified absolute metering.
+    #[must_use]
+    pub fn metering_absolute_capable(&self) -> bool {
+        self.active_session.is_some_and(|(_, _, capabilities)| {
+            (capabilities >> (ControlCapability::MeteringAbsoluteSnapshots as u64)) & 1 == 1
+        })
     }
 
     /// Records the applied config snapshot generation (drain
@@ -543,6 +561,48 @@ impl ControlCommandHandler {
             self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Durably records one sampler's absolute source snapshots and returns the
+    /// sealed batch that is now safe to send.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ledger's fail-closed validation, bound, sequence, or WAL
+    /// persistence error. No snapshot ownership transfers on failure.
+    pub fn record_metering_snapshots(
+        &mut self,
+        snapshots: Vec<MeteringSourceSnapshot>,
+    ) -> Result<Option<control_proto::v1::MeteringBatch>, MeteringError> {
+        let result = self.metering.record_snapshots(snapshots);
+        if result.is_err() {
+            self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Applies an explicit producer-qualified durable ACK.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed WAL persistence error when the durable retained
+    /// set cannot be trimmed safely.
+    pub fn acknowledge_metering(
+        &mut self,
+        producer_id: &str,
+        sequence: u64,
+    ) -> Result<bool, MeteringError> {
+        let result = self.metering.acknowledge(producer_id, sequence);
+        if result.is_err() {
+            self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Whether the installed ledger requires capability-4 absolute semantics.
+    #[must_use]
+    pub fn absolute_metering_enabled(&self) -> bool {
+        self.metering.is_absolute()
     }
 
     /// Records one fail-closed seal rejection (for example: the
@@ -837,6 +897,7 @@ impl ControlCommandHandler {
                         backend_id: command.backend_id.clone(),
                         backend_address: command.backend_address.clone(),
                         cluster_name: command.cluster_name.clone(),
+                        keyspace: command.keyspace.clone(),
                         backend_healthy: !command.backend_unhealthy,
                         backend_local: command.backend_local,
                         deadline_unix_millis: command.deadline_unix_millis,
@@ -1311,6 +1372,7 @@ fn result_envelope(outbound: OutboundControl, generation: u64, request_id: u64) 
                 offending_request_id: offending,
                 retryable: false,
                 detail: detail.to_owned(),
+                fatal: false,
             }),
             Vec::new(),
         ),
@@ -1450,6 +1512,14 @@ pub enum DispatchNotice {
         /// The producer's verdict channel.
         ack: tokio::sync::oneshot::Sender<Result<(), MeteringError>>,
     },
+    /// One sampler tick's immutable-source absolute snapshots. The ledger
+    /// persists and seals them before acknowledging ownership transfer.
+    MeteringSnapshots {
+        /// Absolute source samples.
+        snapshots: Vec<MeteringSourceSnapshot>,
+        /// Persistence/seal verdict.
+        ack: tokio::sync::oneshot::Sender<Result<(), MeteringError>>,
+    },
     /// The session terminated.
     SessionClosed {
         /// Connection id.
@@ -1514,6 +1584,23 @@ pub enum MeteringRecordError {
     DispatchUnavailable {
         /// The delta, returned to its owner.
         delta: control_proto::v1::MeteringDelta,
+    },
+}
+
+/// An absolute snapshot batch could not transfer to the durable ledger.
+#[derive(Debug)]
+pub enum MeteringSnapshotRecordError {
+    /// The ledger rejected the batch; ownership stays with the sampler.
+    Rejected {
+        /// Original snapshots.
+        snapshots: Vec<MeteringSourceSnapshot>,
+        /// Fail-closed verdict.
+        error: MeteringError,
+    },
+    /// The dispatch owner disappeared before accepting the batch.
+    DispatchUnavailable {
+        /// Original snapshots.
+        snapshots: Vec<MeteringSourceSnapshot>,
     },
 }
 
@@ -1711,6 +1798,35 @@ impl ControlDispatchHandle {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(MeteringRecordError::Rejected { delta, error }),
             Err(_) => Err(MeteringRecordError::DispatchUnavailable { delta }),
+        }
+    }
+
+    /// Transfers one sampler tick's absolute snapshots to the WAL-backed
+    /// ledger. `Ok` means the batch is durably replayable even if its first
+    /// wire send fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original snapshots when dispatch is unavailable or the
+    /// WAL-backed ledger rejects the handoff.
+    pub async fn record_metering_snapshots(
+        &self,
+        snapshots: Vec<MeteringSourceSnapshot>,
+    ) -> Result<(), MeteringSnapshotRecordError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::MeteringSnapshots {
+                snapshots: snapshots.clone(),
+                ack: ack_tx,
+            })
+            .await
+        {
+            return Err(MeteringSnapshotRecordError::DispatchUnavailable { snapshots });
+        }
+        match ack_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(MeteringSnapshotRecordError::Rejected { snapshots, error }),
+            Err(_) => Err(MeteringSnapshotRecordError::DispatchUnavailable { snapshots }),
         }
     }
 
@@ -2032,6 +2148,14 @@ pub enum DispatchFatal {
     /// The metering ledger's strictly monotonic sequence space is
     /// exhausted; continuing would freeze or reuse a sequence.
     MeteringSequenceExhausted,
+    /// The producer WAL could not durably append or trim.
+    MeteringPersistence,
+    /// A persistent ledger cannot speak to a peer missing capability 4.
+    MissingMeteringCapability,
+    /// Go's capability-4 consumer reported that it can no longer validate or
+    /// durably persist metering. Reconnecting would preserve SQL serving while
+    /// billing is unsafe, so the dataplane owner must stop and drain.
+    PeerMeteringFailure,
 }
 
 impl std::fmt::Display for DispatchFatal {
@@ -2041,6 +2165,13 @@ impl std::fmt::Display for DispatchFatal {
             Self::SnapshotOwnerGone => formatter.write_str("CTL-05 snapshot owner is gone"),
             Self::MeteringSequenceExhausted => {
                 formatter.write_str("metering sequence space is exhausted")
+            }
+            Self::MeteringPersistence => formatter.write_str("metering WAL persistence failed"),
+            Self::MissingMeteringCapability => {
+                formatter.write_str("peer lacks absolute metering capability")
+            }
+            Self::PeerMeteringFailure => {
+                formatter.write_str("peer's durable metering consumer failed")
             }
         }
     }
@@ -2385,10 +2516,20 @@ async fn on_connected_transition<S: DispatchSender>(
     }
     // Unacked metering is durable: delivery matters with or without an
     // ack path, and the consumer dedups by contiguous sequence.
+    let absolute = handler.absolute_metering_enabled();
+    if absolute && (capabilities >> (ControlCapability::MeteringAbsoluteSnapshots as u64)) & 1 == 0
+    {
+        return Err(DispatchFatal::MissingMeteringCapability);
+    }
     for batch in handler.metering_replay() {
         let envelope = ControlEnvelope {
             request_id: NEEDS_ALLOCATION,
             priority: Priority::Bulk.into(),
+            required_capabilities: if absolute {
+                vec![ControlCapability::MeteringAbsoluteSnapshots as u64]
+            } else {
+                Vec::new()
+            },
             body: Some(Body::MeteringBatch(batch)),
             ..ControlEnvelope::default()
         };
@@ -2579,6 +2720,36 @@ async fn apply_notice<S: DispatchSender>(
         DispatchNotice::Metering { delta, ack } => {
             apply_metering_notice(handler, *delta, ack)?;
         }
+        DispatchNotice::MeteringSnapshots { snapshots, ack } => {
+            let result = handler.record_metering_snapshots(snapshots);
+            let fatal = match &result {
+                Err(MeteringError::SequenceExhausted) => {
+                    Some(DispatchFatal::MeteringSequenceExhausted)
+                }
+                Err(MeteringError::Persistence) => Some(DispatchFatal::MeteringPersistence),
+                _ => None,
+            };
+            let batch = match &result {
+                Ok(batch) => batch.clone(),
+                Err(_) => None,
+            };
+            let _ = ack.send(result.map(|_| ()));
+            if let Some(fatal) = fatal {
+                return Err(fatal);
+            }
+            if let Some(batch) = batch {
+                let envelope = ControlEnvelope {
+                    request_id: NEEDS_ALLOCATION,
+                    priority: Priority::Bulk.into(),
+                    required_capabilities: vec![
+                        ControlCapability::MeteringAbsoluteSnapshots as u64,
+                    ],
+                    body: Some(Body::MeteringBatch(batch)),
+                    ..ControlEnvelope::default()
+                };
+                dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+            }
+        }
         DispatchNotice::SessionClosed {
             connection_id,
             forced,
@@ -2663,6 +2834,45 @@ async fn process_inbound<S: DispatchSender>(
             .send(tagged)
             .await
             .map_err(|_| DispatchFatal::SnapshotOwnerGone);
+    }
+    if let Some(Body::MeteringAck(ack)) = &tagged.envelope.body {
+        // ACKs are session-bound and capability-gated: a delayed ACK from a
+        // dead same-Go epoch must not trim the WAL of work replayed to the
+        // current session.
+        if handler.active_session().map(|(serial, _, _)| serial) != Some(tagged.origin.serial) {
+            handler.count_stale_dropped();
+            return Ok(());
+        }
+        if !handler.metering_absolute_capable() {
+            handler.count_unrouted();
+            return Ok(());
+        }
+        return match handler.acknowledge_metering(&ack.producer_id, ack.sequence) {
+            Err(MeteringError::Persistence) => Err(DispatchFatal::MeteringPersistence),
+            Err(MeteringError::SequenceExhausted) => Err(DispatchFatal::MeteringSequenceExhausted),
+            Ok(_) | Err(_) => Ok(()),
+        };
+    }
+    if let Some(Body::Error(error)) = &tagged.envelope.body
+        && error.fatal
+    {
+        // A fatal is exact-session and capability-4 scoped. A stale
+        // same-lineage frame cannot kill a healthy successor, and an older
+        // peer cannot invent fail-closed semantics it did not negotiate.
+        if handler.active_session().map(|(serial, _, _)| serial) != Some(tagged.origin.serial) {
+            handler.count_stale_dropped();
+            return Ok(());
+        }
+        if !handler.metering_absolute_capable()
+            || !tagged
+                .envelope
+                .required_capabilities
+                .contains(&(ControlCapability::MeteringAbsoluteSnapshots as u64))
+        {
+            handler.count_unrouted();
+            return Ok(());
+        }
+        return Err(DispatchFatal::PeerMeteringFailure);
     }
     let origin_serial = tagged.origin.serial;
     let outbound = handler.handle_envelope(&tagged.envelope, Instant::now(), unix_now_millis());

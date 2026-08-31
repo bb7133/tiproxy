@@ -29,13 +29,14 @@ use control_proto::control_transport::ClientConfig;
 use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
-use dataplane::control_runtime::spawn_control_runtime_with_client;
+use dataplane::control_runtime::spawn_control_runtime_with_client_and_handler;
+use dataplane::metering::{MeteringSourceRegistry, run_metering_sampler};
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
-    BoundSessionHandler, DEFAULT_OBSERVATION_CAPACITY, DataplaneServingHandle,
-    DataplaneSnapshotConsumer, DispatchConnectionHandler, MetricsRecorder, SystemMemoryProbe,
-    spawn_metrics_exporter,
+    BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
+    DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
+    MetricsRecorder, ServerError, SystemMemoryProbe, spawn_metrics_exporter,
 };
 use tokio::sync::watch;
 
@@ -110,11 +111,16 @@ async fn main() -> ExitCode {
     }
 }
 
+// This is the executable's composition root: keeping the startup resources,
+// three-way supervisor, and reverse-order shutdown visible in one function
+// makes the fail-closed ownership order auditable.
+#[allow(clippy::too_many_lines)]
 async fn run(options: Options) -> Result<(), String> {
     let capabilities = vec![
         ControlCapability::PerConnectionClose as u64,
         ControlCapability::ReconcileConnections as u64,
         ControlCapability::ReconcileSessionRehydration as u64,
+        ControlCapability::MeteringAbsoluteSnapshots as u64,
     ];
     let hello = Hello {
         role: Role::RustDataplane as i32,
@@ -131,6 +137,13 @@ async fn run(options: Options) -> Result<(), String> {
         build_version: VERSION.to_owned(),
         build_commit: COMMIT.to_owned(),
     };
+    let mut wal_name = options.control_socket.as_os_str().to_os_string();
+    wal_name.push(".metering.wal");
+    let ledger = MeteringLedger::open_persistent(PathBuf::from(wal_name))
+        .map_err(|error| format!("open metering WAL: {error}"))?;
+    let metering = MeteringSourceRegistry::new(ledger.process_generation())
+        .map_err(|error| format!("create metering registry: {error}"))?;
+    let dispatch_handler = ControlCommandHandler::with_metering(ledger);
     let mut client =
         ClientConfig::with_defaults(options.control_socket, options.control_uid, hello);
     client.required_capabilities = capabilities;
@@ -143,17 +156,19 @@ async fn run(options: Options) -> Result<(), String> {
     let shared_client = Arc::new(ControlClient::new(client).map_err(|error| error.to_string())?);
     let (drain_tx, drain_rx) = watch::channel(false);
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+    let (metering_shutdown_tx, metering_shutdown_rx) = watch::channel(false);
     let loop_config = session_loop_config(options.drain_grace);
     let (metrics, observations) = MetricsRecorder::channel(DEFAULT_OBSERVATION_CAPACITY);
     let owner: Arc<dyn BoundSessionHandler> = Arc::new(
         EngineSessionOwner::new(
             Arc::clone(&shared_client),
             "default",
-            session_shutdown_rx,
+            session_shutdown_rx.clone(),
             drain_rx,
             loop_config,
         )
-        .with_metrics(metrics.clone()),
+        .with_metrics(metrics.clone())
+        .with_metering(metering.clone()),
     );
     let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
     let (consumer, serving) = DataplaneSnapshotConsumer::new(
@@ -165,12 +180,13 @@ async fn run(options: Options) -> Result<(), String> {
     // backstop fires.
     let consumer =
         consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
-    let runtime = spawn_control_runtime_with_client(
+    let runtime = spawn_control_runtime_with_client_and_handler(
         Arc::clone(&shared_client),
         Duration::from_millis(100),
         8,
         store,
         consumer,
+        dispatch_handler,
     );
     if !installer.install(runtime.handle()) {
         runtime.shutdown();
@@ -184,43 +200,120 @@ async fn run(options: Options) -> Result<(), String> {
         observations,
         Duration::from_secs(1),
     );
+    let metering_dispatch = runtime.handle();
+    let metering_sampler = tokio::spawn(async move {
+        run_metering_sampler(
+            metering,
+            metering_dispatch,
+            metering_shutdown_rx,
+            Duration::from_secs(1),
+        )
+        .await
+    });
 
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
     let health_task = spawn_health(options.health_port, serving.clone()).await?;
 
-    // Coordinated shutdown on SIGTERM/SIGINT:
-    // stop-accept → graceful drain (per-session force at the loop's
-    // drain deadline) → absolute grace deadline force → join everything.
-    {
-        let serving = serving.clone();
-        let runtime_client = Arc::clone(&shared_client);
-        let grace = options.drain_grace;
-        tokio::spawn(async move {
-            wait_for_termination_signal().await;
-            serving.stop_accepting().await;
-            drain_tx.send_replace(true);
-            tokio::time::sleep(grace).await;
-            session_shutdown_tx.send_replace(true);
-            let _ = serving.shutdown().await;
-            runtime_client.shutdown();
-        });
-    }
-
-    let control_result = runtime.join().await;
+    // Supervise control and metering together. Either task disappearing must
+    // wake this owner: otherwise a sampler panic could leave SQL serving
+    // forever, or a control failure could leave the sampler waiting forever.
+    // The termination branch joins every session before asking the sampler for
+    // its final durable snapshot, so shutdown bytes and final source markers
+    // cannot race the sampler's exit.
+    let mut control_runtime = tokio::spawn(runtime.join());
+    let mut metering_sampler = metering_sampler;
+    let mut termination = Box::pin(wait_for_termination_signal());
+    let (control_result, sampler_result, serving_result) = tokio::select! {
+        control = &mut control_runtime => {
+            let control = match control {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("control runtime supervisor panicked".to_owned()),
+            };
+            let serving_result = stop_drain_and_join_sessions(
+                &serving,
+                &drain_tx,
+                &session_shutdown_tx,
+                options.drain_grace,
+            ).await;
+            metering_shutdown_tx.send_replace(true);
+            let sampler = match metering_sampler.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("metering sampler panicked".to_owned()),
+            };
+            (control, sampler, serving_result)
+        }
+        sampler = &mut metering_sampler => {
+            let sampler = match sampler {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("metering sampler panicked".to_owned()),
+            };
+            // Readiness becomes false at stop_accepting, before the grace
+            // period. Existing sessions then drain and finally receive the
+            // force signal. The control shutdown wakes its supervisor.
+            let serving_result = stop_drain_and_join_sessions(
+                &serving,
+                &drain_tx,
+                &session_shutdown_tx,
+                options.drain_grace,
+            ).await;
+            metering_shutdown_tx.send_replace(true);
+            shared_client.shutdown();
+            let control = match control_runtime.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("control runtime supervisor panicked".to_owned()),
+            };
+            (control, sampler, serving_result)
+        }
+        () = &mut termination => {
+            let serving_result = stop_drain_and_join_sessions(
+                &serving,
+                &drain_tx,
+                &session_shutdown_tx,
+                options.drain_grace,
+            ).await;
+            metering_shutdown_tx.send_replace(true);
+            let sampler = match metering_sampler.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("metering sampler panicked".to_owned()),
+            };
+            shared_client.shutdown();
+            let control = match control_runtime.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("control runtime supervisor panicked".to_owned()),
+            };
+            (control, sampler, serving_result)
+        }
+    };
     if let Some(task) = health_task {
         task.abort();
         let _ = task.await;
     }
-    let serving_result = serving.shutdown().await;
     metrics_exporter.shutdown();
     metrics_exporter.join().await;
-    match (control_result, serving_result) {
-        (Err(error), _) => Err(error.to_string()),
-        (Ok(()), Err(error)) => Err(format!("shut down SQL listeners: {error}")),
-        (Ok(()), Ok(())) => Ok(()),
+    match (control_result, sampler_result, serving_result) {
+        (_, Err(error), _) | (Err(error), _, _) => Err(error),
+        (Ok(()), Ok(()), Err(error)) => Err(format!("shut down SQL listeners: {error}")),
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
     }
+}
+
+/// Stops admission, lets the existing per-session graceful timers run, then
+/// forces and joins every session. The metering sampler is deliberately not
+/// stopped here: its owner signals it only after this future completes, so
+/// its last snapshot sees every final raw counter and final source marker.
+async fn stop_drain_and_join_sessions(
+    serving: &DataplaneServingHandle,
+    drain: &watch::Sender<bool>,
+    session_shutdown: &watch::Sender<bool>,
+    grace: Duration,
+) -> Result<(), ServerError> {
+    serving.stop_accepting().await;
+    drain.send_replace(true);
+    tokio::time::sleep(grace).await;
+    session_shutdown.send_replace(true);
+    serving.shutdown().await
 }
 
 /// Binds the optional integration readiness endpoint before its serving task

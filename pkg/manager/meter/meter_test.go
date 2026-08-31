@@ -5,18 +5,46 @@ package meter
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/pingcap/metering_sdk/common"
 	mconfig "github.com/pingcap/metering_sdk/config"
 	meteringreader "github.com/pingcap/metering_sdk/reader/metering"
 	"github.com/pingcap/metering_sdk/storage"
 	meteringwriter "github.com/pingcap/metering_sdk/writer/metering"
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/logger"
+	"github.com/pingcap/tiproxy/pkg/controlbridge"
 	"github.com/pingcap/tiproxy/pkg/util/waitgroup"
 	"github.com/stretchr/testify/require"
 )
+
+type controllableMeterWriter struct {
+	fail   bool
+	writes []*common.MeteringData
+}
+
+const testProducerID = "0123456789abcdef0123456789abcdef"
+
+func (writer *controllableMeterWriter) Write(_ context.Context, value any) error {
+	if writer.fail {
+		return errors.New("injected metering write failure")
+	}
+	data, ok := value.(*common.MeteringData)
+	if !ok {
+		return errors.New("unexpected metering data type")
+	}
+	copy := *data
+	copy.Data = append([]map[string]any(nil), data.Data...)
+	writer.writes = append(writer.writes, &copy)
+	return nil
+}
+
+func (*controllableMeterWriter) Close() error { return nil }
 
 func TestNewMeter(t *testing.T) {
 	tests := []struct {
@@ -163,6 +191,138 @@ func TestLoop(t *testing.T) {
 	require.Equal(t, int64(10000), totalPublicResp["cluster-2"])
 	require.Equal(t, int64(1000), totalPrivateResp["cluster-2"])
 	require.Equal(t, int64(4000), totalCrossAZ["cluster-2"])
+}
+
+func TestDurableOutboxRestartDedupAndStableSelfID(t *testing.T) {
+	dir := t.TempDir()
+	m := createDurableMeter(t, dir)
+	firstID := m.uuid
+	require.NoError(t, m.ApplyMeteringBatch(testProducerID, 1, []controlbridge.MeteringDelta{{
+		Keyspace:           "ks",
+		BackendID:          "backend-a",
+		ResponseBytes:      10,
+		CrossLocationBytes: 15,
+	}}))
+
+	restarted := createDurableMeter(t, dir)
+	require.Equal(t, firstID, restarted.uuid)
+	require.Equal(t, testProducerID, restarted.producerID)
+	require.EqualValues(t, 1, restarted.lastBatchSequence)
+	require.EqualValues(t, 10, restarted.data["ks"].privateRespBytes)
+	require.NoError(t, restarted.ApplyMeteringBatch(testProducerID, 1, []controlbridge.MeteringDelta{{
+		Keyspace:      "ks",
+		ResponseBytes: 999,
+	}}))
+	require.EqualValues(t, 10, restarted.data["ks"].privateRespBytes, "duplicate batch is a no-op")
+}
+
+func TestMeterWriteFailureRetainsFixedWindowAndNewTraffic(t *testing.T) {
+	m := createDurableMeter(t, t.TempDir())
+	writer := &controllableMeterWriter{fail: true}
+	replaceMeterWriter(t, m, writer)
+	ts := time.Now().Unix() / writeInterval * writeInterval
+	m.IncTraffic("ks", 10, 15, false)
+	m.flush(ts, time.Second)
+	require.False(t, m.Healthy())
+	require.NotNil(t, m.pending)
+	require.Equal(t, ts, m.pending.timestamp)
+
+	// Traffic accepted during an exporter outage is persisted in the next
+	// window; the failed window remains immutable for idempotent retry.
+	m.IncTraffic("ks", 20, 25, true)
+	writer.fail = false
+	m.flush(ts+writeInterval, time.Second)
+	require.True(t, m.Healthy())
+	require.Len(t, writer.writes, 1)
+	require.Equal(t, ts, writer.writes[0].Timestamp)
+	require.Equal(t, m.uuid, writer.writes[0].SelfID)
+
+	m.flush(ts+writeInterval, time.Second)
+	require.Len(t, writer.writes, 2)
+	require.Equal(t, ts+writeInterval, writer.writes[1].Timestamp)
+	publicResp, privateResp, cross := getInMemoryValues(t, writer.writes[0].Data, "ks")
+	require.EqualValues(t, 0, publicResp)
+	require.EqualValues(t, 10, privateResp)
+	require.EqualValues(t, 15, cross)
+	publicResp, privateResp, cross = getInMemoryValues(t, writer.writes[1].Data, "ks")
+	require.EqualValues(t, 20, publicResp)
+	require.EqualValues(t, 0, privateResp)
+	require.EqualValues(t, 25, cross)
+}
+
+func TestMeterPendingWindowRetriesIdenticallyAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	first := createDurableMeter(t, dir)
+	failing := &controllableMeterWriter{fail: true}
+	replaceMeterWriter(t, first, failing)
+	ts := time.Now().Unix() / writeInterval * writeInterval
+	first.IncTraffic("ks", 10, 15, false)
+	first.flush(ts, time.Second)
+	require.NotNil(t, first.pending)
+	selfID := first.uuid
+
+	restarted := createDurableMeter(t, dir)
+	writer := &controllableMeterWriter{}
+	replaceMeterWriter(t, restarted, writer)
+	restarted.flush(ts+writeInterval, time.Second)
+	require.Len(t, writer.writes, 1)
+	require.Equal(t, selfID, writer.writes[0].SelfID)
+	require.Equal(t, ts, writer.writes[0].Timestamp)
+	_, privateResp, cross := getInMemoryValues(t, writer.writes[0].Data, "ks")
+	require.EqualValues(t, 10, privateResp)
+	require.EqualValues(t, 15, cross)
+}
+
+func TestMeterCorruptOutboxFailsStartup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "run", meterStateFile)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, []byte("not-json"), 0o600))
+	lg, _ := logger.CreateLoggerForTest(t)
+	_, err := NewMeter(&config.Config{
+		Workdir: dir,
+		Metering: mconfig.MeteringConfig{
+			Type: storage.ProviderTypeS3, Bucket: "bucket",
+		},
+	}, lg)
+	require.ErrorContains(t, err, "corrupt")
+}
+
+func createDurableMeter(t *testing.T, dir string) *Meter {
+	t.Helper()
+	lg, _ := logger.CreateLoggerForTest(t)
+	m, err := NewMeter(&config.Config{
+		Workdir: dir,
+		Metering: mconfig.MeteringConfig{
+			Type: storage.ProviderTypeS3, Bucket: "bucket",
+		},
+	}, lg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.writer.Close() })
+	return m
+}
+
+func replaceMeterWriter(t *testing.T, m *Meter, writer *controllableMeterWriter) {
+	t.Helper()
+	require.NoError(t, m.writer.Close())
+	m.writer = writer
+}
+
+func getInMemoryValues(t *testing.T, data []map[string]any, clusterID string) (uint64, uint64, uint64) {
+	t.Helper()
+	for _, row := range data {
+		if row["cluster_id"] != clusterID {
+			continue
+		}
+		public, ok := row[publicEndpointKey].(*common.MeteringValue)
+		require.True(t, ok)
+		private, ok := row[privateEndpointKey].(*common.MeteringValue)
+		require.True(t, ok)
+		cross, ok := row[crossAZKey].(*common.MeteringValue)
+		require.True(t, ok)
+		return public.Value, private.Value, cross.Value
+	}
+	return 0, 0, 0
 }
 
 func createLocalMeter(t *testing.T, dir string) (*Meter, *meteringreader.MeteringReader) {

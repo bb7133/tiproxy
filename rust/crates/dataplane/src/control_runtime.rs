@@ -66,8 +66,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::control_dispatch::{
-    ControlDispatchHandle, DispatchFatal, DispatchStats, TaggedEnvelope, spawn_control_dispatch,
-    system_unix_millis,
+    ControlCommandHandler, ControlDispatchHandle, DispatchFatal, DispatchStats, TaggedEnvelope,
+    spawn_control_dispatch_with_handler, system_unix_millis,
 };
 
 /// Applies each newly validated snapshot to the serving side (for
@@ -324,9 +324,35 @@ pub fn spawn_control_runtime_with_client<C: SnapshotConsumer>(
     store: SnapshotStore,
     consumer: C,
 ) -> ControlRuntime {
+    spawn_control_runtime_with_client_and_handler(
+        client,
+        tick_interval,
+        snapshot_queue,
+        store,
+        consumer,
+        ControlCommandHandler::new(),
+    )
+}
+
+/// [`spawn_control_runtime_with_client`] with a pre-opened dispatch owner.
+/// Production DPL-06 uses this to install the WAL-backed metering ledger before
+/// the listener can admit SQL sessions.
+#[must_use]
+pub fn spawn_control_runtime_with_client_and_handler<C: SnapshotConsumer>(
+    client: Arc<ControlClient>,
+    tick_interval: Duration,
+    snapshot_queue: usize,
+    store: SnapshotStore,
+    consumer: C,
+    handler: ControlCommandHandler,
+) -> ControlRuntime {
     let (snapshot_tx, snapshot_rx) = mpsc::channel(snapshot_queue.max(1));
-    let (handle, forwarder, dispatch) =
-        spawn_control_dispatch(Arc::clone(&client), snapshot_tx, tick_interval);
+    let (handle, forwarder, dispatch) = spawn_control_dispatch_with_handler(
+        handler,
+        Arc::clone(&client),
+        snapshot_tx,
+        tick_interval,
+    );
     let transport = {
         let client = Arc::clone(&client);
         tokio::spawn(async move { client.run(&forwarder).await })

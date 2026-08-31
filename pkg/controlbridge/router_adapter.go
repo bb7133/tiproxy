@@ -1519,6 +1519,7 @@ func (conn *projectedConn) Redirect(target router.BackendInst) bool {
 			CommandSequence:  sequence,
 			BackendUnhealthy: !target.Healthy(),
 			BackendLocal:     target.Local(),
+			Keyspace:         target.Keyspace(),
 		}},
 	}
 	if err := trySend(sender, envelope); err != nil {

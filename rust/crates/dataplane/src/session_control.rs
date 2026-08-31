@@ -30,6 +30,7 @@ use tokio::sync::{mpsc, watch};
 use crate::control_dispatch::{
     ControlDispatchHandle, ExpectResponseError, ResponseKind, SessionDirective,
 };
+use crate::metering::is_public_endpoint;
 use crate::server::{AcceptedConnection, ConnectionFuture, ConnectionHandler};
 
 const SESSION_CONTROL_CAPACITY: usize = 8;
@@ -50,13 +51,23 @@ impl SessionControlBinding {
         namespace: String,
     ) -> Option<Self> {
         let metadata = connection.metadata();
+        let public_endpoint = is_public_endpoint(
+            metadata.peer_address.ip(),
+            connection
+                .snapshot()
+                .raw()
+                .config
+                .as_ref()
+                .map(|config| config.public_cidrs.as_slice())
+                .unwrap_or_default(),
+        );
         let connection_id = metadata.connection_id.get();
         let identity = ConnectionIdentity {
             connection_id,
             listener_address: metadata.listener_address.to_string(),
             client_address: metadata.peer_address.to_string(),
-            proxy_address: metadata.listener_address.to_string(),
-            public_endpoint: false,
+            proxy_address: metadata.peer_address.to_string(),
+            public_endpoint,
         };
         let (control_tx, control) = mpsc::channel(SESSION_CONTROL_CAPACITY);
         let (response_tx, responses) = mpsc::channel(SESSION_RESPONSE_CAPACITY);

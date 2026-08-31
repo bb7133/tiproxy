@@ -586,6 +586,7 @@ impl ControlClient {
             .into());
         }
         let drop_metrics = matches!(envelope.body, Some(Body::MetricsBatch(_)));
+        let prefer_metering = matches!(envelope.body, Some(Body::MeteringBatch(_)));
         let lane = match Priority::try_from(envelope.priority).unwrap_or(Priority::Control) {
             Priority::Critical => &self.queues.critical,
             Priority::Bulk => &self.queues.bulk,
@@ -599,6 +600,8 @@ impl ControlClient {
                     session_serial,
                 },
                 drop_metrics,
+                prefer_metering,
+                &self.metrics_dropped,
                 self.shutdown_tx.subscribe(),
                 &self.queues.not_empty,
             )
@@ -1201,6 +1204,8 @@ impl LaneQueue {
         &self,
         item: QueuedEnvelope,
         drop_when_full: bool,
+        prefer_metering: bool,
+        metrics_dropped: &AtomicU64,
         mut shutdown: watch::Receiver<bool>,
         not_empty: &Notify,
     ) -> Result<(), TransportError> {
@@ -1218,6 +1223,16 @@ impl LaneQueue {
             let wait_for_space = self.space.notified();
             {
                 let mut state = self.state.lock().await;
+                if prefer_metering {
+                    while (state.items.len() + usize::from(state.in_flight.is_some())
+                        >= self.limit.messages
+                        || state.bytes + item.size > self.limit.bytes)
+                        && Self::evict_oldest_metric(&mut state)
+                    {
+                        metrics_dropped.fetch_add(1, Ordering::Relaxed);
+                        self.space.notify_waiters();
+                    }
+                }
                 let occupied = state.items.len() + usize::from(state.in_flight.is_some());
                 if occupied < self.limit.messages && state.bytes + item.size <= self.limit.bytes {
                     state.bytes += item.size;
@@ -1240,12 +1255,38 @@ impl LaneQueue {
         }
     }
 
-    async fn pop(&self) -> Option<(ControlEnvelope, Option<u64>)> {
+    fn evict_oldest_metric(state: &mut LaneState) -> bool {
+        let Some(index) = state
+            .items
+            .iter()
+            .position(|candidate| matches!(candidate.envelope.body, Some(Body::MetricsBatch(_))))
+        else {
+            return false;
+        };
+        let Some(removed) = state.items.remove(index) else {
+            return false;
+        };
+        state.bytes -= removed.size;
+        true
+    }
+
+    async fn pop(&self, prefer_metering: bool) -> Option<(ControlEnvelope, Option<u64>)> {
         let mut state = self.state.lock().await;
         if state.in_flight.is_some() {
             return None;
         }
-        let item = state.items.pop_front()?;
+        let item = if prefer_metering {
+            let index = state
+                .items
+                .iter()
+                .position(|candidate| {
+                    matches!(candidate.envelope.body, Some(Body::MeteringBatch(_)))
+                })
+                .unwrap_or(0);
+            state.items.remove(index)?
+        } else {
+            state.items.pop_front()?
+        };
         let envelope = item.envelope.clone();
         let session_serial = item.session_serial;
         state.in_flight = Some(item);
@@ -1320,7 +1361,7 @@ impl OutboundQueues {
                 } else {
                     &self.bulk
                 };
-                if let Some(popped) = queue.pop().await {
+                if let Some(popped) = queue.pop(slot == 24).await {
                     return Ok(popped);
                 }
             }
@@ -2139,6 +2180,37 @@ mod tests {
                 .await
                 .is_err()
         );
+        client.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metering_evicts_and_schedules_before_metrics() -> Result<(), Box<dyn Error>> {
+        let (socket, _listener) = TestSocket::bind()?;
+        let mut config = test_config(&socket);
+        config.queue_limits.bulk = QueueLimit {
+            messages: 1,
+            bytes: 64 * 1_024,
+        };
+        let client = ControlClient::new(config)?;
+        client
+            .send(ControlEnvelope {
+                priority: Priority::Bulk as i32,
+                body: Some(Body::MetricsBatch(MetricsBatch::default())),
+                ..Default::default()
+            })
+            .await?;
+        client
+            .send(ControlEnvelope {
+                priority: Priority::Bulk as i32,
+                body: Some(Body::MeteringBatch(MeteringBatch::default())),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(client.metrics_dropped(), 1);
+        let (envelope, _) = client.queues.next(client.shutdown_tx.subscribe()).await?;
+        assert!(matches!(envelope.body, Some(Body::MeteringBatch(_))));
+        client.queues.commit(&envelope).await?;
         client.shutdown();
         Ok(())
     }
