@@ -2546,6 +2546,28 @@ if [[ $mode == go ]]; then
 fi
 echo "error parity: no healthy backend -> 1105/HY000 'No available TiDB instances'"
 
+# ---- VAL-01 driver-compatibility smoke (rust; opt-in via DATAPLANE_SMOKE=1) ----
+# Real MySQL clients (native Go + Python, no containers) run the key workloads
+# through the Rust TiProxy against the real TiDB, and TLS/compression
+# negotiation is asserted from the dataplane's connection-close log — so a
+# "query succeeded after a silent capability downgrade" fails, not passes. This
+# is off by default (fast local runs) and enabled for CI/acceptance.
+if [[ $mode == rust && ${DATAPLANE_SMOKE:-0} == 1 ]]; then
+	smoke_ca_args=()
+	if [[ $variant == tls || $variant == tls-proxy-zstd ]]; then
+		smoke_ca_args=(--ca-file "$CA_CERT")
+	fi
+	if "$repo_root/tests/compatibility/smoke/run-smoke.sh" \
+		--host 127.0.0.1 --port "$TIPROXY_PORT" --user root --database test \
+		--rust-log "$run_dir/tiproxy-rs.log" \
+		${smoke_ca_args[@]+"${smoke_ca_args[@]}"}; then
+		echo "driver smoke: all real-client workloads passed and negotiated their capabilities"
+	else
+		echo "driver smoke: a real-client workload failed or silently downgraded" >&2
+		exit 1
+	fi
+fi
+
 if [[ $mode == rust ]]; then
 	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, MIG-01 live migration, keyspace guard, error parity, and recovered from drop-next"
 else
