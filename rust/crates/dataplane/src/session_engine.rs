@@ -2480,6 +2480,16 @@ impl Engine {
                 if held.on_commit_ok().is_err() {
                     return self.poison_hold(WireErrorSource::Proxy).await;
                 }
+                // The internal COMMIT's OK is authoritative for the engine's
+                // own transaction tracker, exactly like a normal response
+                // status (Go's `query("COMMIT")` → `updateTxnStatus`). Without
+                // this, a commit that closed the transaction leaves
+                // `self.in_transaction` stale-true; if the replayed BEGIN then
+                // fails with a statusless MySQL ERR (which cannot correct it),
+                // a later statusless COM_STMT_PREPARE would read the stale flag
+                // in `prepare_session_event` and wrongly reopen the transaction,
+                // blocking drain/redirect forever.
+                self.in_transaction = in_transaction;
                 // A commit that closed the transaction reaches a migration
                 // boundary (`InternalResponseTxnDone` → StartRedirectHandshake,
                 // then the redirect resolution authorizes the replay). A commit
