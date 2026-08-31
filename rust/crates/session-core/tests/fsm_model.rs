@@ -336,7 +336,13 @@ fn redirect_success_walk() {
         &[(
             E::RedirectBackendReady,
             S::Ready,
-            &[F::SwapBackend, F::NotifyRedirectSucceeded],
+            // SES-07/MIG-005: the swap and success report are followed by the
+            // held-request replay authorization (a no-op when nothing is held).
+            &[
+                F::SwapBackend,
+                F::NotifyRedirectSucceeded,
+                F::ResumeHeldRequest,
+            ],
         )],
     );
     assert!(fsm.flags().backend_owner);
@@ -375,7 +381,9 @@ fn redirect_failure_keeps_owner_walk() {
             (
                 E::RedirectBackendFailed,
                 S::Ready,
-                &[F::NotifyRedirectFailed],
+                // SES-07/MIG-005: a failed redirect still authorizes the held
+                // request to replay on the retained backend (no-op when none).
+                &[F::NotifyRedirectFailed, F::ResumeHeldRequest],
             ),
         ],
     );
