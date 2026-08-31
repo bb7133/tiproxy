@@ -214,13 +214,18 @@ errors instead of Go's silent frame corruption.
 Zero-copy: decoded TLV contents and Unix path blocks borrow the caller's
 buffer; the only allocations are the TLV `Vec` and encoder output.
 
-The outbound PROXY-before-TLS ordering, socket integration, and the
-`RemoteAddr`/`ProxyAddr` override policy stay with the async adapters
-(WIRE-06) and session layers; this module is deliberately pure. Adapter
-note: Go's `listener.go` returns the PROXY **destination** address from
-`RemoteAddr` while the production path in `net/proxy.go` returns the
-**source** address (both pass Go's tests only because src == dst there);
-the Rust adapter must follow `net/proxy.go`.
+`PacketIo::probe_inbound_proxy_v2` integrates that codec at the MySQL boundary:
+it retains one complete, u16-bounded on-wire header without advancing MySQL
+sequence state, stages non-PROXY collision bytes for exact replay, and exposes
+only a redacted `Debug`. The session owner carries the retained header across
+initial and redirect backend dials. It clones the wire image and changes only
+the command nibble to `PROXY`, preserving family, transport, address body,
+Unix/UNSPEC quirks, and ordered TLVs exactly like Go; a headerless connection
+still synthesizes the actual peer-to-backend address pair. Go's `listener.go`
+returns the PROXY **destination** address from `RemoteAddr` while the production
+path in `net/proxy.go` returns the **source** address (both pass Go's tests only
+because src == dst there); Rust intentionally follows the production path for
+diagnostic source recovery while keeping routing/admission identity unchanged.
 
 ## TLS (`tls`)
 
@@ -279,5 +284,7 @@ Go's observable behavior:
   WIRE-05 codec on live sockets: disabled mode performs zero reads, fallback
   mode only peeks (a non-PROXY client's bytes arrive untouched), and a PROXY
   client has exactly its header consumed. This closes the WIRE-05 adapter
-  acceptance for disabled/fallback zero-consumption; the PROXY-before-TLS
-  ordering check against a real TiDB still waits for the FND-04 topology.
+  acceptance for disabled/fallback zero-consumption. The real TiDB `proxy` and
+  `tls-proxy-zstd` integration variants additionally prove the outbound header
+  is emitted before the backend greeting/TLS exchange and that authentication,
+  commands, and migration remain usable afterward.

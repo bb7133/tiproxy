@@ -86,7 +86,6 @@ use mysql_wire::{
     encode_error_packet, encode_handshake_response, encode_initial_handshake, encode_ssl_request,
     parse_handshake_response, parse_ssl_request,
 };
-use proxy_io::PacketIo;
 use proxy_io::compression::{CompressedIo, CompressionAlgorithm, CompressionLimits};
 use proxy_io::counted::{ByteCounters, CountedIo};
 use proxy_io::direction::DirectionSync;
@@ -96,6 +95,7 @@ use proxy_io::proxy_protocol::{
 use proxy_io::tls::{
     DEFAULT_CONN_BUFFER_SIZE, accept_frontend, build_backend_config, connect_backend,
 };
+use proxy_io::{InboundProxyV2Header, PacketIo};
 use session_core::auth::{
     AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, BackendTlsMode, CompressionSelection,
     UNKNOWN_AUTH_PLUGIN, classify_backend_auth_packet, compression_selection,
@@ -232,25 +232,31 @@ fn backend_server_name(address: &str) -> String {
 /// the handshake, so a partial or absent header is never tolerated.
 async fn write_backend_proxy_v2_header(
     conn: &mut CountedIo<tokio::net::TcpStream>,
+    inbound: Option<&InboundProxyV2Header>,
     client_addr: std::net::SocketAddr,
 ) -> Result<(), WireErrorSource> {
     // The header is written THROUGH the raw byte counter (this `CountedIo`
     // wraps the socket before the header is emitted), so its wire bytes count
     // once at the innermost layer just like Go's dial path.
-    let Ok(backend_addr) = conn.get_ref().peer_addr() else {
-        return Err(WireErrorSource::BackendNetwork);
-    };
-    let Ok(header) = encode_proxy_v2(
-        ProxyVersion::V2,
-        ProxyCommand::PROXY,
-        TransportProtocol::STREAM,
-        EncodeAddresses::Ip {
-            src: (client_addr.ip(), client_addr.port()),
-            dst: (backend_addr.ip(), backend_addr.port()),
-        },
-        &[],
-    ) else {
-        return Err(WireErrorSource::Proxy);
+    let header = if let Some(inbound) = inbound {
+        inbound.proxy_command_wire()
+    } else {
+        let Ok(backend_addr) = conn.get_ref().peer_addr() else {
+            return Err(WireErrorSource::BackendNetwork);
+        };
+        let Ok(header) = encode_proxy_v2(
+            ProxyVersion::V2,
+            ProxyCommand::PROXY,
+            TransportProtocol::STREAM,
+            EncodeAddresses::Ip {
+                src: (client_addr.ip(), client_addr.port()),
+                dst: (backend_addr.ip(), backend_addr.port()),
+            },
+            &[],
+        ) else {
+            return Err(WireErrorSource::Proxy);
+        };
+        header
     };
     if conn.write_all(&header).await.is_err() {
         return Err(WireErrorSource::BackendNetwork);
@@ -657,7 +663,7 @@ async fn run_bound_session_observed(
     let engine = Engine {
         connection_id: identity.connection_id,
         endpoints,
-        inbound_proxy_client: None,
+        inbound_proxy_header: None,
         client_io: PacketIo::new(ClientTransport::Plain(client_socket)),
         client_counters,
         backend: None,
@@ -1017,9 +1023,9 @@ struct Engine {
     connection_id: u64,
     endpoints: ConnectionEndpoints,
     /// The real client address from an inbound PROXY v2 header, when the
-    /// listener consumed one — used ONLY as the source of the outbound backend
-    /// PROXY header, never for routing/admission/identity.
-    inbound_proxy_client: Option<std::net::SocketAddr>,
+    /// listener consumed one — retained only for the outbound backend PROXY
+    /// preamble, never for routing/admission/identity or IPC/logging.
+    inbound_proxy_header: Option<InboundProxyV2Header>,
     client_io: PacketIo<ClientTransport>,
     /// Raw-socket byte counters for the client socket. Created once at accept
     /// and kept for the session: TLS/compression upgrades wrap the same
@@ -1368,7 +1374,7 @@ impl Engine {
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::ClientNetwork);
             };
-            self.inbound_proxy_client = source;
+            self.inbound_proxy_header = source;
         }
 
         // First client packet after the greeting. A client that sets `SSL`
@@ -1697,10 +1703,12 @@ impl Engine {
         let proxy_v2_result = if self.proxy_protocol_v2_enabled() {
             // Source is the original client: the inbound PROXY header's address
             // when the listener consumed one, else this connection's own peer.
-            let client_src = self
-                .inbound_proxy_client
-                .unwrap_or(self.endpoints.client_addr);
-            write_backend_proxy_v2_header(&mut backend_socket, client_src).await
+            write_backend_proxy_v2_header(
+                &mut backend_socket,
+                self.inbound_proxy_header.as_ref(),
+                self.endpoints.client_addr,
+            )
+            .await
         } else {
             Ok(())
         };
@@ -3285,12 +3293,13 @@ impl Engine {
         let mut backend_socket = CountedIo::new(stream);
         let counters = backend_socket.counters();
         if self.proxy_protocol_v2_enabled() {
-            let client_src = self
-                .inbound_proxy_client
-                .unwrap_or(self.endpoints.client_addr);
-            write_backend_proxy_v2_header(&mut backend_socket, client_src)
-                .await
-                .map_err(|_| CandidateFailure::Dial)?;
+            write_backend_proxy_v2_header(
+                &mut backend_socket,
+                self.inbound_proxy_header.as_ref(),
+                self.endpoints.client_addr,
+            )
+            .await
+            .map_err(|_| CandidateFailure::Dial)?;
         }
         let mut candidate = BackendIo {
             backend_io: PacketIo::new(BackendTransport::Plain(backend_socket)),
