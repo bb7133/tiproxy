@@ -664,18 +664,19 @@ where
     write_session_snapshot(reader, writer, session_states, session_token).await
 }
 
-/// Reads and discards an inbound PROXY v2 header from a raw backend stream,
-/// returning false on a short/malformed header. Framing mirrors the proxy's own
-/// probe (12-byte magic, 4-byte fixed header, sized body).
-async fn strip_inbound_proxy_v2(read: &mut tokio::net::tcp::OwnedReadHalf) -> bool {
+/// Reads an inbound PROXY v2 header from a raw backend stream, returning the
+/// complete on-wire header or `None` on a short/malformed header. Framing
+/// mirrors the proxy's own probe (12-byte magic, 4-byte fixed header, sized
+/// body).
+async fn strip_inbound_proxy_v2(read: &mut tokio::net::tcp::OwnedReadHalf) -> Option<Vec<u8>> {
     use proxy_io::proxy_protocol::{FIXED_HEADER_LEN, MAGIC_V2, ProxyV2Decode, decode_after_magic};
     let mut magic = [0_u8; MAGIC_V2.len()];
     if read.read_exact(&mut magic).await.is_err() || magic != MAGIC_V2 {
-        return false;
+        return None;
     }
     let mut wire = vec![0_u8; FIXED_HEADER_LEN];
     if read.read_exact(&mut wire).await.is_err() {
-        return false;
+        return None;
     }
     let body_len = match decode_after_magic(&wire) {
         ProxyV2Decode::Incomplete { needed_total } => needed_total.saturating_sub(FIXED_HEADER_LEN),
@@ -688,10 +689,13 @@ async fn strip_inbound_proxy_v2(read: &mut tokio::net::tcp::OwnedReadHalf) -> bo
             .await
             .is_err()
         {
-            return false;
+            return None;
         }
     }
-    true
+    let mut header = Vec::with_capacity(MAGIC_V2.len() + wire.len());
+    header.extend_from_slice(&magic);
+    header.extend_from_slice(&wire);
+    Some(header)
 }
 
 async fn respond_to_restore_query<R, W>(
@@ -1185,7 +1189,7 @@ async fn run_fake_compressed_backend(
     while let Ok((stream, _)) = listener.accept().await {
         let stream = if proxy_v2 {
             let (mut read, write) = stream.into_split();
-            if !strip_inbound_proxy_v2(&mut read).await {
+            if strip_inbound_proxy_v2(&mut read).await.is_none() {
                 continue;
             }
             let Ok(stream) = read.reunite(write) else {
@@ -1209,6 +1213,7 @@ async fn run_fake_compressed_backend(
 struct FakeBackendConfig {
     snapshot_reply: SnapshotReply,
     proxy_v2: bool,
+    proxy_headers: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
     send_idle_byte: bool,
     tls_config: Option<Arc<ServerConfig>>,
     accepted_connections: Option<Arc<AtomicU64>>,
@@ -1226,8 +1231,14 @@ async fn run_fake_backend(
         }
         let stream = if config.proxy_v2 {
             let (mut read, write) = stream.into_split();
-            if !strip_inbound_proxy_v2(&mut read).await {
+            let Some(header) = strip_inbound_proxy_v2(&mut read).await else {
                 continue;
+            };
+            if let Some(proxy_headers) = &config.proxy_headers {
+                let Ok(mut captured) = proxy_headers.lock() else {
+                    continue;
+                };
+                captured.push(header);
             }
             let Ok(stream) = read.reunite(write) else {
                 continue;
@@ -1289,6 +1300,7 @@ async fn spawn_fake_backend_server(
         FakeBackendConfig {
             snapshot_reply,
             proxy_v2: false,
+            proxy_headers: None,
             send_idle_byte: false,
             tls_config: None,
             accepted_connections: None,
@@ -1321,6 +1333,7 @@ async fn spawn_counting_fake_backend_server(
         FakeBackendConfig {
             snapshot_reply,
             proxy_v2: false,
+            proxy_headers: None,
             send_idle_byte: false,
             tls_config: None,
             accepted_connections: Some(Arc::clone(&accepted_connections)),
@@ -1439,6 +1452,7 @@ async fn spawn_fake_tls_backend_server(
         FakeBackendConfig {
             snapshot_reply,
             proxy_v2: false,
+            proxy_headers: None,
             send_idle_byte: false,
             tls_config: Some(fake_backend_tls_config()),
             accepted_connections: None,
@@ -1485,6 +1499,7 @@ struct Stack {
     backend_port: u16,
     metrics_rx: mpsc::Receiver<Observation>,
     backend_transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    backend_proxy_headers: Arc<Mutex<Vec<Vec<u8>>>>,
     backend_written_bytes: Arc<AtomicU64>,
 }
 
@@ -1584,7 +1599,12 @@ async fn spawn_configured_fake_backend(
     proxy_v2: bool,
     send_idle_byte: bool,
     tls_config: Option<Arc<ServerConfig>>,
-) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicU64>) {
+) -> (
+    u16,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<AtomicU64>,
+) {
     let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
         unreachable!("backend bind")
     };
@@ -1592,6 +1612,7 @@ async fn spawn_configured_fake_backend(
         unreachable!("backend addr")
     };
     let transcript = Arc::new(Mutex::new(Vec::new()));
+    let proxy_headers = Arc::new(Mutex::new(Vec::new()));
     let written_bytes = Arc::new(AtomicU64::new(0));
     tokio::spawn(run_fake_backend(
         listener,
@@ -1600,12 +1621,13 @@ async fn spawn_configured_fake_backend(
         FakeBackendConfig {
             snapshot_reply,
             proxy_v2,
+            proxy_headers: Some(Arc::clone(&proxy_headers)),
             send_idle_byte,
             tls_config,
             accepted_connections: None,
         },
     ));
-    (address.port(), transcript, written_bytes)
+    (address.port(), transcript, proxy_headers, written_bytes)
 }
 
 // The test-stack constructor mirrors the executable's full composition; its
@@ -1647,7 +1669,7 @@ async fn spawn_stack_configured_with_metering(
     drain_deadline: Duration,
     metering: Option<MeteringSourceRegistry>,
 ) -> Stack {
-    let (backend_port, backend_transcript, backend_written_bytes) =
+    let (backend_port, backend_transcript, backend_proxy_headers, backend_written_bytes) =
         spawn_configured_fake_backend(snapshot_reply, proxy_v2, send_idle_byte, tls_config.clone())
             .await;
 
@@ -1751,6 +1773,7 @@ async fn spawn_stack_configured_with_metering(
         backend_port,
         metrics_rx,
         backend_transcript,
+        backend_proxy_headers,
         backend_written_bytes,
     }
 }
@@ -1834,12 +1857,24 @@ impl MysqlClient {
         Self::login(port, FAKE_BACKEND_PASSWORD).await.ok()
     }
 
+    async fn connect_with_proxy_header(port: u16, header: &[u8]) -> Option<Self> {
+        Self::login_with_proxy_header(port, FAKE_BACKEND_PASSWORD, Some(header))
+            .await
+            .ok()
+    }
+
     /// Full connection-phase flow with a real challenge/response; the
     /// error branch returns the terminal non-OK payload.
     async fn login(port: u16, password: &str) -> Result<Self, Vec<u8>> {
-        let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await else {
-            return Err(Vec::new());
-        };
+        Self::login_with_proxy_header(port, password, None).await
+    }
+
+    async fn login_with_proxy_header(
+        port: u16,
+        password: &str,
+        proxy_header: Option<&[u8]>,
+    ) -> Result<Self, Vec<u8>> {
+        let stream = Self::open_stream(port, proxy_header).await?;
         let (read, write) = stream.into_split();
         let mut reader = PacketReader::new(read);
         let mut writer = PacketWriter::new(write);
@@ -1940,6 +1975,18 @@ impl MysqlClient {
             writer,
             capabilities,
         })
+    }
+
+    async fn open_stream(port: u16, proxy_header: Option<&[u8]>) -> Result<TcpStream, Vec<u8>> {
+        let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)).await else {
+            return Err(Vec::new());
+        };
+        if let Some(proxy_header) = proxy_header
+            && (stream.write_all(proxy_header).await.is_err() || stream.flush().await.is_err())
+        {
+            return Err(Vec::new());
+        }
+        Ok(stream)
     }
 
     async fn query_ok(&mut self, sql: &str) -> bool {
@@ -2430,6 +2477,119 @@ async fn outbound_proxy_v2_header_counts_once_in_raw_backend_out() {
         PROXY_V2_IPV4_HEADER_LEN,
         "raw backend out must grow by exactly the PROXY header (plain={plain}, proxied={proxied})"
     );
+}
+
+/// WIRE-05 / PP2-002: when the client supplied a complete inbound header, the
+/// backend hop must receive that same family/address/TLV image with only the
+/// command nibble normalized to `PROXY`, matching Go. This real-socket row also
+/// proves the header is the backend's first frame: the fake backend strips and
+/// captures it before it can emit the `MySQL` greeting.
+#[tokio::test]
+async fn inbound_proxy_v2_header_and_tlvs_are_forwarded_verbatim() {
+    use proxy_io::proxy_protocol::{
+        EncodeAddresses, MAGIC_V2, ProxyCommand, ProxyVersion, TransportProtocol, encode_proxy_v2,
+    };
+    use std::net::{IpAddr, Ipv6Addr};
+
+    let stack = spawn_stack_full(
+        SnapshotReply::Valid,
+        true,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+    )
+    .await;
+    let (target_port, _target_transcript, target_proxy_headers, _target_written_bytes) =
+        spawn_configured_fake_backend(SnapshotReply::Valid, true, false, None).await;
+    spawn_route_answer(&stack, 1, 2);
+
+    let Ok(src_ip) = "2001:db8::7133".parse::<Ipv6Addr>() else {
+        unreachable!("static IPv6 source parses")
+    };
+    let Ok(dst_ip) = "2001:db8::4000".parse::<Ipv6Addr>() else {
+        unreachable!("static IPv6 destination parses")
+    };
+    let Ok(inbound) = encode_proxy_v2(
+        ProxyVersion::V2,
+        ProxyCommand::LOCAL,
+        TransportProtocol::STREAM,
+        EncodeAddresses::Ip {
+            src: (IpAddr::V6(src_ip), 31_234),
+            dst: (IpAddr::V6(dst_ip), 4_000),
+        },
+        &[(0x01, b"ordered-first"), (0xee, b"opaque-second")],
+    ) else {
+        unreachable!("bounded static PROXY header encodes")
+    };
+    let mut expected = inbound.clone();
+    expected[MAGIC_V2.len()] = (expected[MAGIC_V2.len()] & 0xf0) | ProxyCommand::PROXY.as_nibble();
+
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        MysqlClient::connect_with_proxy_header(stack.sql_port, &inbound),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("inbound LOCAL+IPv6+TLV session establishes")
+    };
+    assert!(client.query_ok("SELECT proxy_v2_tlv").await);
+
+    let captured = stack
+        .backend_proxy_headers
+        .lock()
+        .map_or_else(|_| Vec::new(), |headers| headers.clone());
+    assert_eq!(captured, vec![expected.clone()]);
+    assert_eq!(captured[0].len(), inbound.len());
+    assert_eq!(&captured[0][..MAGIC_V2.len()], &inbound[..MAGIC_V2.len()]);
+    assert_eq!(
+        &captured[0][MAGIC_V2.len() + 1..],
+        &inbound[MAGIC_V2.len() + 1..],
+        "family, transport, IPv6 address body and ordered TLVs are verbatim"
+    );
+
+    let redirect = command_envelope(
+        7133,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "proxy-v2-verbatim-redirect".to_owned(),
+            backend_id: "tidb-proxy-v2-target".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            keyspace: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(
+            &envelope.body,
+            Some(Body::RedirectResult(result))
+                if result.redirect_id == "proxy-v2-verbatim-redirect"
+        )
+    })
+    .await;
+    assert!(matches!(
+        result.and_then(|envelope| envelope.body),
+        Some(Body::RedirectResult(result))
+            if result.succeeded && result.backend_id == "tidb-proxy-v2-target"
+    ));
+    assert!(client.query_ok("SELECT proxy_v2_tlv_after_redirect").await);
+    assert_eq!(
+        target_proxy_headers
+            .lock()
+            .map_or_else(|_| Vec::new(), |headers| headers.clone()),
+        vec![expected],
+        "redirect candidate receives the same normalized inbound header"
+    );
+
+    client.quit().await;
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
 }
 
 /// The real session path emits payload-free metrics with the legacy command

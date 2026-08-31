@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 
 use mysql_wire::{
@@ -28,6 +30,57 @@ const PEEK_BYTES: usize = PHYSICAL_PACKET_HEADER_LEN + 1;
 
 /// Default payload-copy buffer used by streaming packet operations.
 pub const DEFAULT_STREAM_BUFFER_SIZE: usize = 32 * 1024;
+
+/// One complete inbound PROXY v2 header retained for a backend hop.
+///
+/// Go keeps the parsed inbound header and emits it again after changing only
+/// the command to `PROXY`. Retaining the bounded wire image is both more exact
+/// and more tolerant than rebuilding its address/TLV body: unknown families,
+/// Unix address blocks, short-address quirks, and TLV order remain byte-for-byte
+/// intact. The raw metadata is deliberately hidden from `Debug` and has no IPC
+/// or logging representation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InboundProxyV2Header {
+    source: Option<SocketAddr>,
+    wire: Vec<u8>,
+}
+
+impl InboundProxyV2Header {
+    /// Returns the decoded inet source, when one was recoverable.
+    #[must_use]
+    pub const fn source(&self) -> Option<SocketAddr> {
+        self.source
+    }
+
+    /// Returns the bounded on-wire size, including the twelve-byte magic.
+    #[must_use]
+    pub const fn wire_len(&self) -> usize {
+        self.wire.len()
+    }
+
+    /// Clones the header for a backend hop and normalizes only the command
+    /// nibble to `PROXY`, matching Go `Authenticator.writeProxyProtocol`.
+    #[must_use]
+    pub fn proxy_command_wire(&self) -> Vec<u8> {
+        let mut wire = self.wire.clone();
+        // Construction requires a decoded header, so the first post-magic byte
+        // always exists. Preserve the version nibble and every later byte.
+        wire[crate::proxy_protocol::MAGIC_V2.len()] = (wire[crate::proxy_protocol::MAGIC_V2.len()]
+            & 0xf0)
+            | crate::proxy_protocol::ProxyCommand::PROXY.as_nibble();
+        wire
+    }
+}
+
+impl fmt::Debug for InboundProxyV2Header {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InboundProxyV2Header")
+            .field("has_inet_source", &self.source.is_some())
+            .field("wire_len", &self.wire.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Non-consuming view of the next physical packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1525,9 +1578,10 @@ where
     /// first `MySQL` read (mirrors Go `proxyReadWriter.readProxy`: peek 4, then
     /// the full 12-byte magic; non-magic leading bytes are left verbatim).
     ///
-    /// - `Ok(Some(src))`: a complete PROXY v2 header was present and consumed —
-    ///   its wire bytes count into `in_bytes` but never advance the `MySQL`
-    ///   sequence — and its source address is returned.
+    /// - `Ok(Some(header))`: a complete PROXY v2 header was present and
+    ///   consumed — its wire bytes count into `in_bytes` but never advance the
+    ///   `MySQL` sequence — and its bounded wire image is retained for the
+    ///   backend hop.
     /// - `Ok(None)`: the leading bytes are not a PROXY header (or the first four
     ///   match the magic but the full twelve do not); those bytes are staged as
     ///   a raw prefix so the `MySQL` reader consumes them unchanged, exactly
@@ -1538,7 +1592,7 @@ where
     /// A truncated or undecodable declared header fails closed.
     pub async fn probe_inbound_proxy_v2(
         &mut self,
-    ) -> Result<Option<std::net::SocketAddr>, PacketIoError> {
+    ) -> Result<Option<InboundProxyV2Header>, PacketIoError> {
         use crate::proxy_protocol::{
             FIXED_HEADER_LEN, MAGIC_V2, ProxyAddresses, ProxyV2Decode, decode_after_magic,
         };
@@ -1572,8 +1626,8 @@ where
         }
         let source = match decode_after_magic(&wire) {
             ProxyV2Decode::Done { header, .. } => match header.addresses {
-                ProxyAddresses::Inet { src, .. } => Some(std::net::SocketAddr::from(src)),
-                ProxyAddresses::Inet6 { src, .. } => Some(std::net::SocketAddr::from(src)),
+                ProxyAddresses::Inet { src, .. } => Some(SocketAddr::from(src)),
+                ProxyAddresses::Inet6 { src, .. } => Some(SocketAddr::from(src)),
                 ProxyAddresses::Unix { .. } | ProxyAddresses::None => None,
             },
             ProxyV2Decode::Incomplete { .. } => {
@@ -1587,7 +1641,13 @@ where
         // The header's wire bytes are consumed input but not a MySQL packet, so
         // they never advance the packet sequence.
         self.read.add_in_bytes(MAGIC_V2.len() + wire.len())?;
-        Ok(source)
+        let mut complete_wire = Vec::with_capacity(MAGIC_V2.len() + wire.len());
+        complete_wire.extend_from_slice(&MAGIC_V2);
+        complete_wire.extend_from_slice(&wire);
+        Ok(Some(InboundProxyV2Header {
+            source,
+            wire: complete_wire,
+        }))
     }
 
     /// Streams one logical packet from `src` into `dst` and flushes it.
@@ -2392,8 +2452,16 @@ mod tests {
         let mut wire = header.clone();
         wire.extend_from_slice(&packet);
         let mut io = PacketIo::new(Cursor::new(wire));
-        let src = io.probe_inbound_proxy_v2().await?;
-        assert_eq!(src, Some("127.0.0.1:5000".parse::<SocketAddr>()?));
+        let inbound = io
+            .probe_inbound_proxy_v2()
+            .await?
+            .ok_or("complete header not retained")?;
+        assert_eq!(
+            inbound.source(),
+            Some("127.0.0.1:5000".parse::<SocketAddr>()?)
+        );
+        assert_eq!(inbound.wire_len(), header.len());
+        assert_eq!(inbound.proxy_command_wire(), header);
         assert_eq!(io.in_bytes(), header.len() as u64, "header counted once");
         assert_eq!(
             io.expected_read_sequence(),
@@ -2446,6 +2514,88 @@ mod tests {
         // no body bytes follow
         let mut io = PacketIo::new(Cursor::new(wire));
         assert!(io.probe_inbound_proxy_v2().await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_proxy_v2_forwarding_preserves_wire_except_command()
+    -> Result<(), Box<dyn Error>> {
+        use crate::proxy_protocol::{
+            EncodeAddresses, FIXED_HEADER_LEN, MAGIC_V2, ProxyCommand, ProxyVersion,
+            TransportProtocol, encode_proxy_v2,
+        };
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let secret = b"top-secret-tlv";
+        let cases = [
+            encode_proxy_v2(
+                ProxyVersion::V2,
+                ProxyCommand::LOCAL,
+                TransportProtocol::STREAM,
+                EncodeAddresses::Ip {
+                    src: (IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>()?), 31_234),
+                    dst: (IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>()?), 4_000),
+                },
+                &[(0x01, b"first"), (0xee, secret)],
+            )?,
+            encode_proxy_v2(
+                ProxyVersion::V2,
+                ProxyCommand::LOCAL,
+                TransportProtocol::UNSPEC,
+                EncodeAddresses::Unspec,
+                &[(0xee, secret)],
+            )?,
+            encode_proxy_v2(
+                ProxyVersion::V2,
+                ProxyCommand::LOCAL,
+                TransportProtocol::STREAM,
+                EncodeAddresses::Unix {
+                    src: b"/tmp/source.sock",
+                    dst: b"/tmp/destination.sock",
+                },
+                &[(0x01, b"first"), (0xee, secret)],
+            )?,
+        ];
+
+        for original in cases {
+            let mut wire = original.clone();
+            wire.extend_from_slice(&encoded_physical_packet(b"hello", 0)?);
+            let mut io = PacketIo::new(Cursor::new(wire));
+            let inbound = io
+                .probe_inbound_proxy_v2()
+                .await?
+                .ok_or("complete header not retained")?;
+
+            assert_eq!(inbound.wire, original, "owned wire image is verbatim");
+            assert!(
+                inbound.wire_len() <= MAGIC_V2.len() + FIXED_HEADER_LEN + usize::from(u16::MAX),
+                "the declared u16 body length bounds retained metadata"
+            );
+
+            let forwarded = inbound.proxy_command_wire();
+            assert_eq!(forwarded.len(), original.len());
+            assert_eq!(
+                forwarded[MAGIC_V2.len()],
+                (original[MAGIC_V2.len()] & 0xf0) | ProxyCommand::PROXY.as_nibble()
+            );
+            assert_eq!(
+                &forwarded[..MAGIC_V2.len()],
+                &original[..MAGIC_V2.len()],
+                "magic is unchanged"
+            );
+            assert_eq!(
+                &forwarded[MAGIC_V2.len() + 1..],
+                &original[MAGIC_V2.len() + 1..],
+                "family, transport, address body and TLVs stay byte-identical"
+            );
+
+            let debug = format!("{inbound:?}");
+            assert!(!debug.contains("2001:db8"), "Debug redacts addresses");
+            assert!(
+                !debug.contains("top-secret-tlv"),
+                "Debug redacts TLV contents"
+            );
+        }
         Ok(())
     }
 
