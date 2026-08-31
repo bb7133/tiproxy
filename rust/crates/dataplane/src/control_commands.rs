@@ -213,6 +213,11 @@ enum RedirectState {
     Pending {
         redirect_id: String,
         command_sequence: u64,
+        /// Exact router-issued target. A failed redirect keeps the
+        /// physical owner unchanged, but its terminal route event must still
+        /// name this attempted target so Go retires the pending migration
+        /// gauge and score under the same `(from, to)` labels it issued.
+        target_backend_id: String,
     },
 }
 
@@ -579,6 +584,7 @@ impl CommandGate {
         if let RedirectState::Pending {
             redirect_id,
             command_sequence,
+            ..
         } = &connection.redirect
         {
             if *redirect_id == command.redirect_id {
@@ -619,6 +625,7 @@ impl CommandGate {
         connection.redirect = RedirectState::Pending {
             redirect_id: command.redirect_id.clone(),
             command_sequence: sequence,
+            target_backend_id: command.backend_id.clone(),
         };
         RedirectAdmission::Start
     }
@@ -637,11 +644,12 @@ impl CommandGate {
         code: ErrorCode,
     ) -> Option<RedirectResult> {
         let connection = self.connections.get_mut(&connection_id)?;
-        let bound_sequence = match &connection.redirect {
+        let (bound_sequence, target_backend_id) = match &connection.redirect {
             RedirectState::Pending {
                 redirect_id: pending,
                 command_sequence,
-            } if pending == redirect_id => *command_sequence,
+                target_backend_id,
+            } if pending == redirect_id => (*command_sequence, target_backend_id.clone()),
             _ => return None,
         };
         let previous_backend_id = connection.backend_id.clone();
@@ -652,11 +660,13 @@ impl CommandGate {
             connection_id,
             redirect_id: redirect_id.to_owned(),
             previous_backend_id,
-            backend_id: if succeeded {
-                new_backend_id.to_owned()
-            } else {
-                connection.backend_id.clone()
-            },
+            // This field is the attempted route target, not the surviving
+            // physical owner. Go's router moved score and incremented its
+            // pending metric for `(previous_backend_id, target_backend_id)`
+            // when it issued the command; both success and failure must close
+            // that exact route event. On failure `connection.backend_id`
+            // deliberately remains unchanged.
+            backend_id: target_backend_id,
             succeeded,
             code: code.into(),
             detail: String::new(),
