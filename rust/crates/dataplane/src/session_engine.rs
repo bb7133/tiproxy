@@ -101,6 +101,7 @@ use session_core::auth::{
     UNKNOWN_AUTH_PLUGIN, classify_backend_auth_packet, compression_selection,
     plan_backend_handshake, plan_backend_migration_handshake,
 };
+use session_core::boundary::{HeldBegin, HoldEffect, need_hold_request};
 use session_core::command::{
     Command, CommandSessionState, CommandStateEffects, ExpectedResponse, SessionMutation, dispatch,
 };
@@ -685,6 +686,8 @@ async fn run_bound_session_observed(
         cmd_state: None,
         in_transaction: false,
         prepared: PreparedRegistry::new(),
+        held: None,
+        hold_replay_ready: false,
         pending_command: None,
         wire_end: None,
         quit_source: QuitSource::None,
@@ -1062,6 +1065,14 @@ struct Engine {
     /// SES-00 prepared-statement registry: long-data/cursor guards
     /// synchronize into the FSM before command-completion boundaries.
     prepared: PreparedRegistry,
+    /// SES-07/MIG-005 pending-redirect `BEGIN` hold. Present only between the
+    /// internal `COMMIT` and the exactly-once replay/drop of a held
+    /// transaction opener; the buffered request bytes live in
+    /// `pending_command`, this owns only the one-shot discipline.
+    held: Option<HeldBegin>,
+    /// Set by [`SessionEffect::ResumeHeldRequest`] once the FSM authorizes the
+    /// held request to replay; the hold loop consumes it to leave the pump.
+    hold_replay_ready: bool,
     pending_command: Option<PendingCommand>,
     wire_end: Option<WireErrorSource>,
     quit_source: QuitSource,
@@ -1086,6 +1097,45 @@ enum Awaited {
     Got,
     /// Teardown began (or the loop is gone); abandon the wire phase.
     Closing,
+}
+
+/// Resolution of a SES-07/MIG-005 pending-redirect `BEGIN` hold.
+enum HoldFlow {
+    /// The redirect/commit phase resolved and the held request must replay
+    /// exactly once as an ordinary command on the current backend owner.
+    Replay,
+    /// The internal `COMMIT` failed with a `MySQL` error that was forwarded to
+    /// the client as the answer to its `BEGIN`; the command is complete and is
+    /// deliberately not executed.
+    Answered,
+    /// A graceful close consumed the session before the held request could
+    /// replay; it is dropped, never executed.
+    Dropped,
+    /// An unrecoverable wire/proxy error ended the exchange; the poison event
+    /// was already sent to the FSM.
+    Fatal(WireErrorSource),
+}
+
+/// Terminal outcome of the proxy-owned internal `COMMIT` round-trip.
+enum InternalCommitOutcome {
+    /// The commit completed with an OK carrying the terminal transaction
+    /// status (`in_transaction` is the `SERVER_STATUS_IN_TRANS` bit).
+    Committed {
+        /// Whether the terminal OK still reported an open transaction.
+        in_transaction: bool,
+    },
+    /// The commit completed with a `MySQL` ERR packet; the original bytes are
+    /// forwarded to the client verbatim as the answer to the `BEGIN`.
+    MysqlError {
+        /// The exact ERR packet payload as read from the backend.
+        packet: Vec<u8>,
+    },
+    /// The backend socket failed (send or read); poison as a backend-network
+    /// end.
+    BackendNetwork,
+    /// A malformed/desynchronized or impossible internal response; poison as a
+    /// proxy invariant.
+    ProxyInvariant,
 }
 
 /// Whether a failed migration-snapshot attempt can safely return to the old
@@ -2061,6 +2111,53 @@ impl Engine {
             let Some(pending) = self.pending_command.take() else {
                 return Some(WireErrorSource::Proxy);
             };
+            // SES-07/MIG-005: hold a transaction-opening BEGIN while a redirect
+            // is armed — commit the old backend internally, migrate, then
+            // replay the BEGIN exactly once. This is a single non-looping check
+            // before the forward, so the replay falls through to the ordinary
+            // forward/response below and is therefore never re-held.
+            if self.redirect_target.is_some()
+                && need_hold_request(
+                    pending.command,
+                    &pending.payload,
+                    self.in_transaction,
+                    self.prepared.has_pending(),
+                )
+            {
+                match self.hold_pending_begin(&pending).await {
+                    HoldFlow::Answered => {
+                        self.record_command(&pending);
+                        if self.closing {
+                            return None;
+                        }
+                        continue;
+                    }
+                    HoldFlow::Dropped => {
+                        self.record_command(&pending);
+                        return None;
+                    }
+                    HoldFlow::Fatal(source) => {
+                        self.record_command(&pending);
+                        return Some(source);
+                    }
+                    HoldFlow::Replay => {
+                        // Re-enter the FSM for the replayed request: it is now
+                        // an ordinary command on the (possibly swapped) backend.
+                        if self.events.send(SessionEvent::ClientCommand).await.is_err() {
+                            self.record_command(&pending);
+                            return Some(WireErrorSource::Proxy);
+                        }
+                        if !matches!(
+                            self.await_effect(SessionEffect::ForwardCommandToBackend)
+                                .await,
+                            Awaited::Got
+                        ) {
+                            self.record_command(&pending);
+                            return None;
+                        }
+                    }
+                }
+            }
             if pending.command == Command::ChangeUser {
                 let response_source = self.change_user_rounds(&pending).await;
                 self.record_command(&pending);
@@ -2366,6 +2463,169 @@ impl Engine {
             return Some(WireErrorSource::BackendNetwork);
         }
         None
+    }
+
+    /// SES-07/MIG-005 pending-redirect `BEGIN` hold. The caller has already
+    /// checked [`need_hold_request`] and an armed redirect at the forward
+    /// point. This commits the current backend internally (its OK never
+    /// reaches the client), lets the redirect/commit phase resolve, and
+    /// reports whether the buffered request replays exactly once, was answered
+    /// by a commit error, was dropped by a graceful close, or ended fatally.
+    async fn hold_pending_begin(&mut self, _pending: &PendingCommand) -> HoldFlow {
+        // Begin the hold; the first effect is always the internal COMMIT,
+        // which this runtime issues explicitly below.
+        let (mut held, _send_commit) = HeldBegin::start();
+        match self.run_internal_commit().await {
+            InternalCommitOutcome::Committed { in_transaction } => {
+                if held.on_commit_ok().is_err() {
+                    return self.poison_hold(WireErrorSource::Proxy).await;
+                }
+                // The internal COMMIT's OK is authoritative for the engine's
+                // own transaction tracker, exactly like a normal response
+                // status (Go's `query("COMMIT")` → `updateTxnStatus`). Without
+                // this, a commit that closed the transaction leaves
+                // `self.in_transaction` stale-true; if the replayed BEGIN then
+                // fails with a statusless MySQL ERR (which cannot correct it),
+                // a later statusless COM_STMT_PREPARE would read the stale flag
+                // in `prepare_session_event` and wrongly reopen the transaction,
+                // blocking drain/redirect forever.
+                self.in_transaction = in_transaction;
+                // A commit that closed the transaction reaches a migration
+                // boundary (`InternalResponseTxnDone` → StartRedirectHandshake,
+                // then the redirect resolution authorizes the replay). A commit
+                // that left it open cannot migrate; the FSM authorizes the
+                // replay on the current backend right away (unless draining).
+                let event = if in_transaction {
+                    SessionEvent::InternalResponseTxnOpen
+                } else {
+                    SessionEvent::InternalResponseTxnDone
+                };
+                if self.events.send(event).await.is_err() {
+                    return HoldFlow::Fatal(WireErrorSource::Proxy);
+                }
+            }
+            InternalCommitOutcome::MysqlError { packet } => {
+                // Go's `IsMySQLError` path: the commit's own error answers the
+                // BEGIN, forwarded verbatim exactly once; the request is never
+                // executed. The client write sequence is already positioned at
+                // the response slot for this command.
+                if held.on_commit_error().is_err() {
+                    return self.poison_hold(WireErrorSource::Proxy).await;
+                }
+                if self.client_io.write_logical(&packet, true).await.is_err() {
+                    self.quit_source = QuitSource::ClientNetwork;
+                    let _ = self.events.send(SessionEvent::ClientIoError).await;
+                    return HoldFlow::Fatal(WireErrorSource::ClientNetwork);
+                }
+                if self
+                    .events
+                    .send(SessionEvent::InternalResponseError)
+                    .await
+                    .is_err()
+                {
+                    return HoldFlow::Fatal(WireErrorSource::Proxy);
+                }
+                return HoldFlow::Answered;
+            }
+            InternalCommitOutcome::BackendNetwork => {
+                self.quit_source = QuitSource::BackendNetwork;
+                return self.poison_hold(WireErrorSource::BackendNetwork).await;
+            }
+            InternalCommitOutcome::ProxyInvariant => {
+                self.quit_source = QuitSource::ProxyMalformed;
+                return self.poison_hold(WireErrorSource::Proxy).await;
+            }
+        }
+
+        // Pump control effects until the FSM resolves the hold: the redirect
+        // handshake, the atomic swap, the success/failure notification, and
+        // finally `ResumeHeldRequest` (which sets `hold_replay_ready`), or a
+        // teardown that switches the engine into closing.
+        self.held = Some(held);
+        self.hold_replay_ready = false;
+        let flow = loop {
+            let Some(cmd) = self.cmds.recv().await else {
+                break HoldFlow::Fatal(WireErrorSource::Proxy);
+            };
+            if matches!(self.handle_cmd(cmd).await, Awaited::Closing) {
+                break HoldFlow::Dropped;
+            }
+            if self.hold_replay_ready {
+                self.hold_replay_ready = false;
+                break HoldFlow::Replay;
+            }
+        };
+        if matches!(flow, HoldFlow::Dropped)
+            && let Some(held) = self.held.as_mut()
+        {
+            // Go executes the held request only while `closeStatus <
+            // statusNotifyClose`; here the close won, so drop it.
+            let _ = held.drop_for_close();
+        }
+        self.held = None;
+        flow
+    }
+
+    /// Reports the poison event to the FSM and returns a fatal hold flow. The
+    /// `wire_end` is recorded so the close log attributes the source.
+    async fn poison_hold(&mut self, source: WireErrorSource) -> HoldFlow {
+        self.wire_end = Some(source);
+        let _ = self.events.send(SessionEvent::BackendIoError).await;
+        HoldFlow::Fatal(source)
+    }
+
+    /// Issues the proxy-owned internal `COMMIT` on the current backend and
+    /// parses its single response. Mirrors [`Self::capture_migration_snapshot`]:
+    /// a clean ERR terminator is recoverable (forwarded to the client), any
+    /// earlier parser error or IO failure poisons the connection.
+    async fn run_internal_commit(&mut self) -> InternalCommitOutcome {
+        let limits = InternalLimits::default();
+        let query = InternalQuery::Commit;
+        let Ok(request) = query.encode(limits) else {
+            return InternalCommitOutcome::ProxyInvariant;
+        };
+        let Ok(mut parser) = query.parser(self.negotiated, limits) else {
+            return InternalCommitOutcome::ProxyInvariant;
+        };
+        let Some(backend) = self.backend.as_mut() else {
+            return InternalCommitOutcome::ProxyInvariant;
+        };
+        // Like every proxy-owned query, the internal COMMIT is a fresh command
+        // exchange from compressed sequence zero (Go's `ResetSequence`).
+        if let Err(error) = send_proxy_owned_query(&mut backend.backend_io, &request).await {
+            return match error {
+                ProxyOwnedQueryError::LayeredReset => InternalCommitOutcome::ProxyInvariant,
+                ProxyOwnedQueryError::Send => InternalCommitOutcome::BackendNetwork,
+            };
+        }
+        loop {
+            let payload = match backend
+                .backend_io
+                .read_logical(limits.max_result_bytes)
+                .await
+            {
+                Ok(packet) => packet.payload,
+                Err(_) => return InternalCommitOutcome::BackendNetwork,
+            };
+            match parser.consume(&payload) {
+                Ok(InternalProgress::Continue) => {}
+                Ok(InternalProgress::Complete(InternalResult::Ok(ok))) => {
+                    return InternalCommitOutcome::Committed {
+                        in_transaction: ok.in_transaction(),
+                    };
+                }
+                Ok(InternalProgress::Complete(InternalResult::SessionStates(_))) => {
+                    // A COMMIT can only answer OK or ERR.
+                    return InternalCommitOutcome::ProxyInvariant;
+                }
+                Err(_) if parser.state() == InternalParserState::Complete => {
+                    // A backend ERR after a clean terminator: the commit failed
+                    // with a server error the client must see verbatim.
+                    return InternalCommitOutcome::MysqlError { packet: payload };
+                }
+                Err(_) => return InternalCommitOutcome::ProxyInvariant,
+            }
+        }
     }
 
     /// Streams one command's backend response(s) to the client.
@@ -2749,6 +3009,24 @@ impl Engine {
                     })
                     .await;
                 Awaited::Got
+            }
+            SessionEffect::ResumeHeldRequest => {
+                // SES-07/MIG-005: the FSM reached a point where a held
+                // `BEGIN` may replay (redirect resolved, or an internal
+                // COMMIT left the transaction open with no draining). Take the
+                // held request for its single replay; a no-op when nothing is
+                // held (the effect is emitted unconditionally at those
+                // boundaries). A wrong-phase take is a proxy invariant.
+                match self.held.as_mut() {
+                    None => Awaited::Got,
+                    Some(held) => match held.take_for_replay() {
+                        Ok(HoldEffect::ReplayHeldRequest) => {
+                            self.hold_replay_ready = true;
+                            Awaited::Got
+                        }
+                        Ok(_) | Err(_) => self.close_for_invariant(),
+                    },
+                }
             }
             SessionEffect::ReleaseBackend => {
                 self.closing = true;
