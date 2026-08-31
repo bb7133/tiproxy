@@ -16,6 +16,7 @@ mysql-wire.workspace = true
 proxy-io.workspace = true
 session-core.workspace = true
 getrandom.workspace = true
+prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

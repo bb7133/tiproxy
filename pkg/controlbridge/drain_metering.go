@@ -219,11 +219,37 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 		}
 		return handler.publisher.HandleResult(sender, envelope)
 	case *controlpb.ControlEnvelope_MeteringBatch:
-		// Dedup by contiguous sequence; the acknowledgement flows back
-		// through the reconcile snapshot. Refused batches are the
-		// producer's replay concern, not an error.
-		_ = handler.consumer.Apply(body.MeteringBatch)
-		return nil
+		if body.MeteringBatch.GetProducerId() == "" {
+			// Legacy peers retain delta + reconcile-watermark semantics.
+			_ = handler.consumer.Apply(body.MeteringBatch)
+			return nil
+		}
+		// Capability 4: persist source baselines + pending aggregates before
+		// the explicit critical ACK. Duplicates are re-ACKed; gaps,
+		// producer mismatches, or durable-state failures return without an
+		// ACK and emit a fatal, capability-gated error. Rust then stops SQL
+		// admission and drains the dataplane owner; merely tearing down this
+		// session would reconnect and could leave billable SQL serving while
+		// the durable consumer remained unavailable.
+		if _, err := handler.consumer.ApplyAbsolute(body.MeteringBatch); err != nil {
+			metrics.ServerErrCounter.WithLabelValues("rust_metering_invalid").Inc()
+			return sendFatalMeteringError(ctx, sender, envelope.GetRequestId(), err)
+		}
+		requestID, err := sender.AllocateRequestID()
+		if err != nil {
+			return sendFatalMeteringError(ctx, sender, envelope.GetRequestId(), err)
+		}
+		return sender.Send(ctx, &controlpb.ControlEnvelope{
+			RequestId: requestID,
+			Priority:  controlpb.Priority_PRIORITY_CRITICAL,
+			RequiredCapabilities: []uint64{
+				uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS),
+			},
+			Body: &controlpb.ControlEnvelope_MeteringAck{MeteringAck: &controlpb.MeteringAck{
+				ProducerId: body.MeteringBatch.GetProducerId(),
+				Sequence:   body.MeteringBatch.GetSequence(),
+			}},
+		})
 	case *controlpb.ControlEnvelope_MetricsBatch:
 		// Metrics are deliberately best effort: invalid or stale batches are
 		// counted and ignored without taking down the control stream. The
@@ -250,6 +276,32 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 	default:
 		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
 	}
+}
+
+// sendFatalMeteringError is intentionally correlated to the inbound batch id,
+// so failure of the sender's request-id allocator cannot suppress the
+// fail-closed signal. A successful send keeps this control session alive long
+// enough for Rust to receive the fatal frame and run its coordinated
+// stop-admission -> graceful drain -> force-close path.
+func sendFatalMeteringError(
+	ctx context.Context,
+	sender EnvelopeSender,
+	requestID uint64,
+	cause error,
+) error {
+	return sender.Send(ctx, &controlpb.ControlEnvelope{
+		RequestId: requestID,
+		Priority:  controlpb.Priority_PRIORITY_CRITICAL,
+		RequiredCapabilities: []uint64{
+			uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS),
+		},
+		Body: &controlpb.ControlEnvelope_Error{Error: &controlpb.ProtocolError{
+			Code:               controlpb.ErrorCode_ERROR_CODE_INTERNAL,
+			OffendingRequestId: requestID,
+			Detail:             bounded(cause.Error()),
+			Fatal:              true,
+		}},
+	})
 }
 
 // ResolveOrphans delegates the maintenance cadence to the adapter.
@@ -525,9 +577,16 @@ func (issuer *DrainIssuer) Progress(callerID string) (*controlpb.DrainResult, bo
 // double-count. LastApplied feeds the reconcile snapshot so the
 // producer can drop acknowledged retention.
 type MeteringConsumer struct {
-	mu          sync.Mutex
-	lastApplied uint64
-	totals      map[meteringKey]*meteringTotals
+	mu                sync.Mutex
+	lastApplied       uint64
+	processGeneration uint64
+	totals            map[meteringKey]*meteringTotals
+	producerID        string
+	sources           map[meteringSourceKey]meteringSourceBaseline
+	pending           map[meteringKey]*meteringTotals
+	statePath         string
+	sink              MeteringSink
+	healthy           bool
 }
 
 type meteringKey struct {
@@ -543,7 +602,12 @@ type meteringTotals struct {
 
 // NewMeteringConsumer creates an empty consumer.
 func NewMeteringConsumer() *MeteringConsumer {
-	return &MeteringConsumer{totals: make(map[meteringKey]*meteringTotals)}
+	return &MeteringConsumer{
+		totals:  make(map[meteringKey]*meteringTotals),
+		sources: make(map[meteringSourceKey]meteringSourceBaseline),
+		pending: make(map[meteringKey]*meteringTotals),
+		healthy: true,
+	}
 }
 
 // Apply accumulates one batch if and only if its sequence advances past

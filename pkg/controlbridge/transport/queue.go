@@ -97,6 +97,53 @@ func (queue *laneQueue) push(ctx context.Context, item queuedEnvelope, dropWhenF
 	}
 }
 
+// pushMetering gives durable metering precedence over best-effort metrics in
+// the shared bulk lane. It first evicts queued metrics until the metering
+// record fits; if the lane contains only metering, it applies backpressure.
+// An in-flight record is no longer owned by the queue and is never evicted.
+func (queue *laneQueue) pushMetering(ctx context.Context, item queuedEnvelope) error {
+	for {
+		queue.mu.Lock()
+		if queue.closed {
+			queue.mu.Unlock()
+			return ErrTransportClosed
+		}
+		for (len(queue.items) >= queue.limit.Messages || queue.bytes+item.size > queue.limit.Bytes) &&
+			queue.evictOldestMetricLocked() {
+		}
+		if len(queue.items) < queue.limit.Messages && queue.bytes+item.size <= queue.limit.Bytes {
+			queue.items = append(queue.items, item)
+			queue.bytes += item.size
+			queue.mu.Unlock()
+			signal(queue.notEmpty)
+			return nil
+		}
+		queue.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-queue.done:
+			return ErrTransportClosed
+		case <-queue.space:
+		}
+	}
+}
+
+func (queue *laneQueue) evictOldestMetricLocked() bool {
+	for index, item := range queue.items {
+		if item.envelope.GetMetricsBatch() == nil {
+			continue
+		}
+		copy(queue.items[index:], queue.items[index+1:])
+		queue.items[len(queue.items)-1] = queuedEnvelope{}
+		queue.items = queue.items[:len(queue.items)-1]
+		queue.bytes -= item.size
+		signal(queue.space)
+		return true
+	}
+	return false
+}
+
 func (queue *laneQueue) pop() (queuedEnvelope, bool) {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
@@ -105,6 +152,31 @@ func (queue *laneQueue) pop() (queuedEnvelope, bool) {
 	}
 	item := queue.items[0]
 	copy(queue.items, queue.items[1:])
+	queue.items[len(queue.items)-1] = queuedEnvelope{}
+	queue.items = queue.items[:len(queue.items)-1]
+	queue.bytes -= item.size
+	signal(queue.space)
+	if len(queue.items) > 0 {
+		signal(queue.notEmpty)
+	}
+	return item, true
+}
+
+func (queue *laneQueue) popMeteringFirst() (queuedEnvelope, bool) {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if len(queue.items) == 0 {
+		return queuedEnvelope{}, false
+	}
+	index := 0
+	for candidate := range queue.items {
+		if queue.items[candidate].envelope.GetMeteringBatch() != nil {
+			index = candidate
+			break
+		}
+	}
+	item := queue.items[index]
+	copy(queue.items[index:], queue.items[index+1:])
 	queue.items[len(queue.items)-1] = queuedEnvelope{}
 	queue.items = queue.items[:len(queue.items)-1]
 	queue.bytes -= item.size
@@ -174,6 +246,9 @@ func (queues *outboundQueues) enqueue(ctx context.Context, envelope *controlpb.C
 		}
 		return ErrQueueFull
 	}
+	if envelope.GetMeteringBatch() != nil && queue == queues.bulk {
+		return queue.pushMetering(ctx, item)
+	}
 	return queue.push(ctx, item, dropWhenFull)
 }
 
@@ -182,7 +257,14 @@ func (queues *outboundQueues) next(ctx context.Context) (*controlpb.ControlEnvel
 		for range len(queues.schedule) {
 			queue := queues.schedule[queues.cursor]
 			queues.cursor = (queues.cursor + 1) % len(queues.schedule)
-			if item, ok := queue.pop(); ok {
+			var item queuedEnvelope
+			var ok bool
+			if queue == queues.bulk {
+				item, ok = queue.popMeteringFirst()
+			} else {
+				item, ok = queue.pop()
+			}
+			if ok {
 				return item.envelope, nil
 			}
 		}

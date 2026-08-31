@@ -58,17 +58,17 @@
 //! No `MySQL` payload bytes appear anywhere here: commands and results
 //! carry identifiers, addresses, and counters only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-
-use std::collections::VecDeque;
 
 use control_proto::v1::{
     CloseResult, ConnectionIdentity, DrainCommand, DrainResult, ErrorCode, MeteringBatch,
-    MeteringDelta, ReconcileConnection, ReconcileRequest, ReconcileSnapshot, RedirectCommand,
-    RedirectResult,
+    MeteringDelta, MeteringSourceSnapshot, ReconcileConnection, ReconcileRequest,
+    ReconcileSnapshot, RedirectCommand, RedirectResult,
 };
 use tokio::time::Instant;
+
+use crate::metering::{MeteringWal, MeteringWalError};
 
 /// Admission decision for one `RedirectCommand`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,7 +298,7 @@ struct DrainState {
     force_deadline: Instant,
     /// Matched live sessions still open (per-id accounting: a session
     /// closes at most once, out-of-scope ids never count).
-    remaining: std::collections::BTreeSet<u64>,
+    remaining: BTreeSet<u64>,
     matched_total: u64,
     gracefully_closed: u64,
     force_closed: u64,
@@ -769,7 +769,7 @@ impl CommandGate {
         command_generation: u64,
         graceful_deadline: Instant,
         force_deadline: Instant,
-        matched_connections: std::collections::BTreeSet<u64>,
+        matched_connections: BTreeSet<u64>,
     ) -> DrainAdmission {
         // Provenance only: a drain minted before the applied snapshot
         // references configuration (listeners, backends) that may no
@@ -1100,6 +1100,9 @@ pub struct MeteringLedger {
     last_sealed_sequence: u64,
     open: Vec<MeteringDelta>,
     unacked: VecDeque<MeteringBatch>,
+    producer_id: String,
+    process_generation: u64,
+    wal: Option<MeteringWal>,
 }
 
 /// Typed metering-ledger failure: metering is never dropped, so every
@@ -1117,6 +1120,12 @@ pub enum MeteringError {
     SequenceExhausted,
     /// A single delta's counters would overflow the cumulative entry.
     CounterOverflow,
+    /// A durable WAL update failed. The dispatch runtime must terminate;
+    /// continuing could send data that cannot be replayed or ACK data that
+    /// remains retained only in volatile memory.
+    Persistence,
+    /// An absolute snapshot lacks an immutable source identity.
+    UnknownAttribution,
     /// A metering key exceeds its byte bound; unbounded keys would let
     /// one delta alone exceed the control frame bound.
     OversizedKey {
@@ -1147,6 +1156,42 @@ impl MeteringLedger {
         Self::default()
     }
 
+    /// Opens the crash-safe absolute-snapshot ledger. The WAL increments and
+    /// persists this process's generation before the ledger becomes usable.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on corrupt/unsafe/unwritable state.
+    pub fn open_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self, MeteringWalError> {
+        let (wal, loaded) = MeteringWal::open(path)?;
+        Ok(Self {
+            last_sealed_sequence: loaded.next_sequence - 1,
+            open: Vec::new(),
+            unacked: loaded.unacked.into(),
+            producer_id: loaded.producer_id,
+            process_generation: loaded.process_generation,
+            wal: Some(wal),
+        })
+    }
+
+    /// Stable producer id (empty only for the legacy volatile ledger).
+    #[must_use]
+    pub fn producer_id(&self) -> &str {
+        &self.producer_id
+    }
+
+    /// This Rust process's persisted generation (zero for legacy mode).
+    #[must_use]
+    pub const fn process_generation(&self) -> u64 {
+        self.process_generation
+    }
+
+    /// Whether this ledger is the producer-qualified persistent mode.
+    #[must_use]
+    pub fn is_absolute(&self) -> bool {
+        !self.producer_id.is_empty()
+    }
+
     /// Accumulates one delta into the open batch, merging with an
     /// existing entry for the same `(keyspace, backend_id,
     /// public_endpoint)` key (cumulative, checked). When the open batch
@@ -1159,6 +1204,12 @@ impl MeteringLedger {
     /// is lost — when a counter would overflow, or when an implied seal
     /// hits the retention or sequence bound.
     pub fn record(&mut self, delta: MeteringDelta) -> Result<(), MeteringError> {
+        if self.is_absolute() {
+            // A persistent producer has no legal delta-batch WAL shape. Its
+            // only production ingress is record_snapshots; accepting a legacy
+            // delta here would acknowledge volatile ownership and fail later.
+            return Err(MeteringError::UnknownAttribution);
+        }
         for (field, len) in [
             ("keyspace", delta.keyspace.len()),
             ("backend_id", delta.backend_id.len()),
@@ -1219,11 +1270,116 @@ impl MeteringLedger {
             .last_sealed_sequence
             .checked_add(1)
             .ok_or(MeteringError::SequenceExhausted)?;
-        self.last_sealed_sequence = sequence;
         let batch = MeteringBatch {
             sequence,
-            deltas: std::mem::take(&mut self.open),
+            deltas: self.open.clone(),
+            producer_id: self.producer_id.clone(),
+            snapshots: Vec::new(),
         };
+        if let Some(wal) = &self.wal {
+            let mut candidate = self.unacked.clone();
+            candidate.push_back(batch.clone());
+            wal.persist(
+                &self.producer_id,
+                self.process_generation,
+                sequence
+                    .checked_add(1)
+                    .ok_or(MeteringError::SequenceExhausted)?,
+                candidate.make_contiguous(),
+            )
+            .map_err(|_| MeteringError::Persistence)?;
+        }
+        self.last_sealed_sequence = sequence;
+        self.open.clear();
+        self.unacked.push_back(batch.clone());
+        Ok(Some(batch))
+    }
+
+    /// Seals one sampler's absolute source snapshots as a durable batch and
+    /// returns that exact batch for sending. Persistence completes before the
+    /// batch becomes visible to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for missing attribution, bounds/sequence exhaustion, or
+    /// any WAL durability failure.
+    pub fn record_snapshots(
+        &mut self,
+        snapshots: Vec<MeteringSourceSnapshot>,
+    ) -> Result<Option<MeteringBatch>, MeteringError> {
+        if snapshots.is_empty() {
+            return Ok(None);
+        }
+        if snapshots.len() > MAX_DELTAS_PER_BATCH {
+            return Err(MeteringError::BacklogFull {
+                unacked: self.unacked.len(),
+            });
+        }
+        if self.unacked.len() >= MAX_UNACKED_METERING_BATCHES {
+            return Err(MeteringError::BacklogFull {
+                unacked: self.unacked.len(),
+            });
+        }
+        let mut sources = BTreeSet::new();
+        for snapshot in &snapshots {
+            if snapshot.connection_id == 0
+                || snapshot.process_generation != self.process_generation
+                || snapshot.backend_generation == 0
+                || snapshot.backend_id.is_empty()
+                || snapshot.keyspace.is_empty()
+            {
+                return Err(MeteringError::UnknownAttribution);
+            }
+            if !sources.insert((
+                snapshot.connection_id,
+                snapshot.process_generation,
+                snapshot.backend_generation,
+            )) {
+                return Err(MeteringError::UnknownAttribution);
+            }
+            for (field, len) in [
+                ("keyspace", snapshot.keyspace.len()),
+                ("backend_id", snapshot.backend_id.len()),
+                ("cluster_name", snapshot.cluster_name.len()),
+            ] {
+                if len > MAX_METERING_KEY_BYTES {
+                    return Err(MeteringError::OversizedKey {
+                        field,
+                        actual: len,
+                        limit: MAX_METERING_KEY_BYTES,
+                    });
+                }
+            }
+        }
+        if self.producer_id.is_empty() || self.process_generation == 0 || self.wal.is_none() {
+            return Err(MeteringError::UnknownAttribution);
+        }
+        let sequence = self
+            .last_sealed_sequence
+            .checked_add(1)
+            .ok_or(MeteringError::SequenceExhausted)?;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(MeteringError::SequenceExhausted)?;
+        let batch = MeteringBatch {
+            sequence,
+            deltas: Vec::new(),
+            producer_id: self.producer_id.clone(),
+            snapshots,
+        };
+        let mut candidate = self.unacked.clone();
+        candidate.push_back(batch.clone());
+        self.wal
+            .as_ref()
+            .ok_or(MeteringError::Persistence)?
+            .persist(
+                &self.producer_id,
+                self.process_generation,
+                next_sequence,
+                candidate.make_contiguous(),
+            )
+            .map_err(|_| MeteringError::Persistence)?;
+        self.last_sealed_sequence = sequence;
         self.unacked.push_back(batch.clone());
         Ok(Some(batch))
     }
@@ -1237,6 +1393,12 @@ impl MeteringLedger {
     /// Applies the peer's acknowledged sequence (from its reconcile
     /// snapshot): every retained batch at or below it is dropped.
     pub fn acked_through(&mut self, sequence: u64) {
+        // A producer-qualified WAL can only be trimmed by MeteringAck, whose
+        // producer id prevents a restarted/fresh consumer from acknowledging
+        // another producer's sequence by coincidence.
+        if !self.producer_id.is_empty() {
+            return;
+        }
         while self
             .unacked
             .front()
@@ -1244,6 +1406,48 @@ impl MeteringLedger {
         {
             let _ = self.unacked.pop_front();
         }
+    }
+
+    /// Applies a producer-qualified durable ACK. The candidate trim is written
+    /// to the WAL before volatile state changes. Duplicate ACKs return true;
+    /// mismatched producers or impossible future sequences return false.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MeteringError::Persistence`] when the WAL cannot be replaced.
+    pub fn acknowledge(&mut self, producer_id: &str, sequence: u64) -> Result<bool, MeteringError> {
+        if self.producer_id.is_empty()
+            || producer_id != self.producer_id
+            || sequence > self.last_sealed_sequence
+        {
+            return Ok(false);
+        }
+        let mut candidate = self.unacked.clone();
+        while candidate
+            .front()
+            .is_some_and(|batch| batch.sequence <= sequence)
+        {
+            let _ = candidate.pop_front();
+        }
+        if candidate.len() == self.unacked.len() {
+            return Ok(true);
+        }
+        let next_sequence = self
+            .last_sealed_sequence
+            .checked_add(1)
+            .ok_or(MeteringError::SequenceExhausted)?;
+        self.wal
+            .as_ref()
+            .ok_or(MeteringError::Persistence)?
+            .persist(
+                &self.producer_id,
+                self.process_generation,
+                next_sequence,
+                candidate.make_contiguous(),
+            )
+            .map_err(|_| MeteringError::Persistence)?;
+        self.unacked = candidate;
+        Ok(true)
     }
 
     /// Sealed batches the peer has not acknowledged, in sequence order:

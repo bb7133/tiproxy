@@ -290,6 +290,7 @@ dependencies = [
  "control-proto",
  "getrandom",
  "mysql-wire",
+ "prost",
  "proxy-io",
  "rcgen",
  "rustls",

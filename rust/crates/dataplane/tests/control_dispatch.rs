@@ -31,8 +31,8 @@ use control_proto::control_transport::{ConnectionState, Handler, SessionMeta, Tr
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     CloseCommand, ConnectionIdentity, ControlCapability, ControlEnvelope, DrainCommand, ErrorCode,
-    ErrorSource, MeteringDelta, ReconcileConnection, ReconcileSnapshot, RedirectCommand,
-    RouteAssignment,
+    ErrorSource, MeteringAck, MeteringDelta, MeteringSourceSnapshot, ProtocolError,
+    ReconcileConnection, ReconcileSnapshot, RedirectCommand, RouteAssignment,
 };
 use dataplane::control_dispatch::{
     CommandKind, CommandToken, ControlCommandHandler, DispatchFatal, DispatchNotice,
@@ -60,6 +60,7 @@ fn redirect(connection_id: u64, redirect_id: &str, sequence: u64) -> RedirectCom
         backend_id: "tidb-b".to_owned(),
         backend_address: "10.0.0.2:4000".to_owned(),
         cluster_name: String::new(),
+        keyspace: String::new(),
         backend_unhealthy: false,
         backend_local: false,
         deadline_unix_millis: 0,
@@ -674,6 +675,8 @@ async fn unroutable_bodies_are_answered_not_dropped() {
         Body::MeteringBatch(control_proto::v1::MeteringBatch {
             sequence: 1,
             deltas: Vec::new(),
+            producer_id: String::new(),
+            snapshots: Vec::new(),
         }),
     );
     let out = handler.handle_envelope(&inbound, Instant::now(), 1);
@@ -879,6 +882,215 @@ fn spawn_loop(handler: ControlCommandHandler) -> LoopHarness {
 fn full_caps() -> u64 {
     (1u64 << (ControlCapability::ReconcileConnections as u64))
         | (1u64 << (ControlCapability::ReconcileSessionRehydration as u64))
+}
+
+fn metering_cap() -> u64 {
+    1u64 << (ControlCapability::MeteringAbsoluteSnapshots as u64)
+}
+
+/// A Go durable-consumer failure is a dataplane fatal, not a reconnect-only
+/// transport error: the binary supervisor turns this dispatch exit into the
+/// coordinated stop-admission -> graceful drain -> force-close path.
+#[tokio::test(start_paused = true)]
+async fn fatal_metering_error_terminates_the_dataplane_owner() {
+    let harness = spawn_loop(ControlCommandHandler::new());
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 1,
+            capabilities: metering_cap(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    tokio::task::yield_now().await;
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            ControlEnvelope {
+                request_id: 77,
+                required_capabilities: vec![ControlCapability::MeteringAbsoluteSnapshots as u64],
+                body: Some(Body::Error(ProtocolError {
+                    code: ErrorCode::Internal.into(),
+                    offending_request_id: 77,
+                    retryable: false,
+                    detail: "durable metering consumer failed".to_owned(),
+                    fatal: true,
+                })),
+                ..ControlEnvelope::default()
+            },
+            1,
+            1,
+        ))
+        .await
+        .ok();
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), harness.task).await,
+        Ok(Ok(Err(DispatchFatal::PeerMeteringFailure)))
+    ));
+}
+
+/// A fatal frame cannot escape its exact negotiated session: a delayed frame
+/// from a superseded session is dropped, and a request that omitted capability
+/// 4 cannot opt an older peer into the shutdown contract.
+#[tokio::test(start_paused = true)]
+async fn stale_or_unscoped_metering_fatal_does_not_kill_a_successor() {
+    let harness = spawn_loop(ControlCommandHandler::new());
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: metering_cap(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    tokio::task::yield_now().await;
+    let fatal = |required_capabilities| ControlEnvelope {
+        request_id: 89,
+        required_capabilities,
+        body: Some(Body::Error(ProtocolError {
+            code: ErrorCode::Internal.into(),
+            offending_request_id: 89,
+            retryable: false,
+            detail: "durable metering consumer failed".to_owned(),
+            fatal: true,
+        })),
+        ..ControlEnvelope::default()
+    };
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            fatal(vec![ControlCapability::MeteringAbsoluteSnapshots as u64]),
+            1,
+            1,
+        ))
+        .await
+        .ok();
+    harness
+        .inbound_tx
+        .send(tagged_on(fatal(Vec::new()), 2, 2))
+        .await
+        .ok();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!harness.task.is_finished());
+    harness.task.abort();
+}
+
+/// An explicit ACK is bound to the exact control-session serial that read it.
+/// A delayed ACK from a dead session cannot trim the durable batch already
+/// replayed to its successor, even when both sessions belong to one Go process.
+#[tokio::test(start_paused = true)]
+async fn stale_metering_ack_does_not_trim_successor_replay() {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    let directory = std::env::temp_dir().join(format!(
+        "tiproxy-control-dispatch-metering-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ));
+    let Ok(()) = std::fs::create_dir_all(&directory) else {
+        unreachable!("create metering WAL directory")
+    };
+    let Ok(mut ledger) = dataplane::MeteringLedger::open_persistent(directory.join("metering.wal"))
+    else {
+        unreachable!("open persistent metering ledger")
+    };
+    let Ok(Some(batch)) = ledger.record_snapshots(vec![MeteringSourceSnapshot {
+        connection_id: 1,
+        process_generation: ledger.process_generation(),
+        backend_generation: 1,
+        backend_id: "tidb-a".to_owned(),
+        keyspace: "ks-stale-ack".to_owned(),
+        ..MeteringSourceSnapshot::default()
+    }]) else {
+        unreachable!("snapshot seals one durable batch")
+    };
+    let harness = spawn_loop(ControlCommandHandler::with_metering(ledger));
+    let connect = |serial| {
+        harness.state_tx.send(ConnectionState::Connected {
+            epoch: serial,
+            serial,
+            capabilities: metering_cap(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+    };
+    let replays = |sent: &[ControlEnvelope]| {
+        sent.iter()
+            .filter(|envelope| {
+                matches!(
+                    &envelope.body,
+                    Some(Body::MeteringBatch(replayed)) if replayed == &batch
+                )
+            })
+            .count()
+    };
+
+    // Session A receives the first replay.
+    connect(1).ok();
+    assert_eq!(replays(&wait_for_sent(&harness.sender, 1).await), 1);
+
+    // Session B supersedes A and receives the still-unacknowledged batch.
+    harness.state_tx.send(ConnectionState::Disconnected).ok();
+    connect(2).ok();
+    assert_eq!(replays(&wait_for_sent(&harness.sender, 2).await), 2);
+
+    // A's delayed explicit ACK is FIFO ahead of the marker. Once the marker
+    // answer arrives, the ACK was judged while B was still the live session.
+    let late_ack = ControlEnvelope {
+        request_id: 90,
+        control_epoch: 1,
+        body: Some(Body::MeteringAck(MeteringAck {
+            producer_id: batch.producer_id.clone(),
+            sequence: batch.sequence,
+        })),
+        ..ControlEnvelope::default()
+    };
+    harness
+        .inbound_tx
+        .send(tagged_on(late_ack, 1, 1))
+        .await
+        .ok();
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            envelope(91, 0, Body::RedirectCommand(redirect(999, "ack-marker", 1))),
+            2,
+            2,
+        ))
+        .await
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 3).await;
+    assert!(sent.iter().any(|envelope| envelope.request_id == 91));
+
+    // Session C must receive the batch again. If the serial guard is removed,
+    // A's ACK trims the WAL and this replay disappears.
+    harness.state_tx.send(ConnectionState::Disconnected).ok();
+    connect(3).ok();
+    let mut sent = Vec::new();
+    for _ in 0..100_000 {
+        sent = harness.sender.sent();
+        if replays(&sent) >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(replays(&sent), 3, "the stale ACK did not trim the WAL");
+    assert_eq!(
+        harness.stats.stale_dropped.load(Ordering::Relaxed),
+        1,
+        "the dead session's explicit ACK is counted as stale"
+    );
+
+    harness.task.abort();
+    let _ = harness.task.await;
+    assert!(std::fs::remove_dir_all(directory).is_ok());
 }
 
 async fn wait_for_sent(sender: &Arc<FakeSender>, count: usize) -> Vec<ControlEnvelope> {
@@ -2929,6 +3141,8 @@ async fn queued_cross_lineage_frame_never_reaches_the_gate() {
         Body::MeteringBatch(control_proto::v1::MeteringBatch {
             sequence: 1,
             deltas: Vec::new(),
+            producer_id: String::new(),
+            snapshots: Vec::new(),
         }),
     );
     harness
@@ -2949,6 +3163,8 @@ async fn queued_cross_lineage_frame_never_reaches_the_gate() {
         Body::MeteringBatch(control_proto::v1::MeteringBatch {
             sequence: 2,
             deltas: Vec::new(),
+            producer_id: String::new(),
+            snapshots: Vec::new(),
         }),
     );
     harness
@@ -3033,6 +3249,8 @@ async fn no_live_session_frame_is_deferred_then_classified() {
         Body::MeteringBatch(control_proto::v1::MeteringBatch {
             sequence: 1,
             deltas: Vec::new(),
+            producer_id: String::new(),
+            snapshots: Vec::new(),
         }),
     );
     harness
@@ -3100,6 +3318,8 @@ async fn no_live_session_frame_is_deferred_then_classified() {
         Body::MeteringBatch(control_proto::v1::MeteringBatch {
             sequence: 2,
             deltas: Vec::new(),
+            producer_id: String::new(),
+            snapshots: Vec::new(),
         }),
     );
     harness

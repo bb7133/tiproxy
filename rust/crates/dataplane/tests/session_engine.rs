@@ -37,6 +37,7 @@ use control_proto::v1::{
 use dataplane::control_dispatch::{
     ControlCommandHandler, DispatchSender, spawn_control_dispatch_parts,
 };
+use dataplane::metering::MeteringSourceRegistry;
 use dataplane::observability::{MetricsRecorder, Observation, QuitSource};
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::{EngineSessionOwner, send_proxy_owned_query};
@@ -1485,6 +1486,21 @@ async fn spawn_stack_long_drain() -> Stack {
     .await
 }
 
+async fn spawn_metered_stack(registry: MeteringSourceRegistry) -> Stack {
+    spawn_stack_configured_with_metering(
+        SnapshotReply::Valid,
+        false,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+        None,
+        Duration::from_millis(400),
+        Some(registry),
+    )
+    .await
+}
+
 async fn spawn_configured_fake_backend(
     snapshot_reply: SnapshotReply,
     proxy_v2: bool,
@@ -1523,6 +1539,32 @@ async fn spawn_stack_configured(
     frontend_tls: Option<FrontendTlsFixture>,
     tls_config: Option<Arc<ServerConfig>>,
     drain_deadline: Duration,
+) -> Stack {
+    spawn_stack_configured_with_metering(
+        snapshot_reply,
+        proxy_v2,
+        handshake_deadline,
+        backend_check_interval,
+        send_idle_byte,
+        frontend_tls,
+        tls_config,
+        drain_deadline,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_stack_configured_with_metering(
+    snapshot_reply: SnapshotReply,
+    proxy_v2: bool,
+    handshake_deadline: Duration,
+    backend_check_interval: Duration,
+    send_idle_byte: bool,
+    frontend_tls: Option<FrontendTlsFixture>,
+    tls_config: Option<Arc<ServerConfig>>,
+    drain_deadline: Duration,
+    metering: Option<MeteringSourceRegistry>,
 ) -> Stack {
     let (backend_port, backend_transcript, backend_written_bytes) =
         spawn_configured_fake_backend(snapshot_reply, proxy_v2, send_idle_byte, tls_config.clone())
@@ -1568,21 +1610,24 @@ async fn spawn_stack_configured(
     let (metrics, metrics_rx) = MetricsRecorder::channel(128);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (drain_tx, drain_rx) = watch::channel(false);
-    let owner: Arc<dyn BoundSessionHandler> = Arc::new(
-        EngineSessionOwner::new(
-            Arc::clone(&client),
-            "default",
-            shutdown_rx,
-            drain_rx,
-            SessionLoopConfig {
-                handshake_deadline,
-                drain_deadline,
-                backend_check_interval,
-                cleanup_deadline: Duration::from_secs(2),
-            },
-        )
-        .with_metrics(metrics),
-    );
+    let owner = EngineSessionOwner::new(
+        Arc::clone(&client),
+        "default",
+        shutdown_rx,
+        drain_rx,
+        SessionLoopConfig {
+            handshake_deadline,
+            drain_deadline,
+            backend_check_interval,
+            cleanup_deadline: Duration::from_secs(2),
+        },
+    )
+    .with_metrics(metrics);
+    let owner = match metering {
+        Some(registry) => owner.with_metering(registry),
+        None => owner,
+    };
+    let owner: Arc<dyn BoundSessionHandler> = Arc::new(owner);
     let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
     assert!(installer.install(handle));
 
@@ -2090,6 +2135,15 @@ enum StmtResult {
 /// HandshakeResponseEvent=1, RouteRequest=2 on a fresh client, +2 per
 /// later session on the same client).
 fn spawn_route_answer(stack: &Stack, connection_id: u64, request_id: u64) {
+    spawn_route_answer_with_keyspace(stack, connection_id, request_id, "");
+}
+
+fn spawn_route_answer_with_keyspace(
+    stack: &Stack,
+    connection_id: u64,
+    request_id: u64,
+    keyspace: &str,
+) {
     let forwarder = Arc::clone(&stack.forwarder);
     let backend_port = stack.backend_port;
     tokio::spawn(async move {
@@ -2115,6 +2169,7 @@ fn spawn_route_answer(stack: &Stack, connection_id: u64, request_id: u64) {
         }
     });
     let forwarder = Arc::clone(&stack.forwarder);
+    let keyspace = keyspace.to_owned();
     tokio::spawn(async move {
         let assignment = ControlEnvelope {
             request_id,
@@ -2125,7 +2180,7 @@ fn spawn_route_answer(stack: &Stack, connection_id: u64, request_id: u64) {
                 backend_id: "tidb-fake".to_owned(),
                 backend_address: format!("127.0.0.1:{backend_port}"),
                 cluster_name: String::new(),
-                keyspace: String::new(),
+                keyspace,
                 healthy: true,
                 local: true,
                 code: ErrorCode::Ok as i32,
@@ -2358,6 +2413,118 @@ async fn session_path_emits_query_traffic_and_exact_quit_source() {
     stack.dispatch_task.abort();
 }
 
+#[tokio::test]
+async fn metering_unknown_initial_keyspace_rejects_before_billable_forwarding() {
+    let Ok(registry) = MeteringSourceRegistry::new(7) else {
+        unreachable!("metering registry")
+    };
+    let stack = spawn_metered_stack(registry.clone()).await;
+    spawn_route_answer(&stack, 1, 2);
+    let client = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten();
+    assert!(client.is_none(), "unknown keyspace must reject the session");
+    assert_eq!(
+        metering_source_count(&registry),
+        0,
+        "an un-attributed backend never becomes a billable source"
+    );
+    stack.dispatch_task.abort();
+}
+
+#[tokio::test]
+async fn metering_redirect_unknown_keeps_old_and_success_starts_new_generation() {
+    let Ok(registry) = MeteringSourceRegistry::new(7) else {
+        unreachable!("metering registry")
+    };
+    let stack = spawn_metered_stack(registry.clone()).await;
+    let (target_port, _target_transcript, _target_written_bytes) =
+        spawn_fake_backend_server(SnapshotReply::Valid).await;
+    spawn_route_answer_with_keyspace(&stack, 1, 2, "keyspace-a");
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("metered session established")
+    };
+    assert_eq!(metering_source_count(&registry), 1);
+
+    let unknown = command_envelope(
+        6001,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "meter-unknown".to_owned(),
+            backend_id: "tidb-other".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            keyspace: String::new(),
+            backend_unhealthy: false,
+            backend_local: false,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(unknown).await;
+    let Some(unknown) = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "meter-unknown")
+    })
+    .await
+    else {
+        unreachable!("unknown redirect terminal")
+    };
+    let Some(Body::RedirectResult(unknown)) = unknown.body else {
+        unreachable!()
+    };
+    assert!(!unknown.succeeded);
+    assert_eq!(metering_source_count(&registry), 1);
+    assert!(client.query_ok("SELECT old_survives").await);
+
+    let valid = command_envelope(
+        6002,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "meter-valid".to_owned(),
+            backend_id: "tidb-other".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            keyspace: "keyspace-b".to_owned(),
+            backend_unhealthy: false,
+            backend_local: false,
+            deadline_unix_millis: 0,
+            command_sequence: 2,
+        }),
+    );
+    let _ = stack.forwarder.handle(valid).await;
+    let Some(valid) = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "meter-valid")
+    })
+    .await
+    else {
+        unreachable!("valid redirect terminal")
+    };
+    let Some(Body::RedirectResult(valid)) = valid.body else {
+        unreachable!()
+    };
+    assert!(valid.succeeded);
+    assert_eq!(
+        metering_source_count(&registry),
+        2,
+        "old final and new generation coexist until WAL handoff"
+    );
+    assert!(client.query_ok("SELECT new_generation").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+fn metering_source_count(registry: &MeteringSourceRegistry) -> usize {
+    let Ok(count) = registry.active_source_count() else {
+        unreachable!("metering source registry is available")
+    };
+    count
+}
+
 /// A per-connection `CloseCommand` resolves under its exact admitted id
 /// with the initiating request id, and the client socket closes.
 #[tokio::test]
@@ -2559,6 +2726,7 @@ async fn change_user_success_commits_identity_clears_guard_and_migrates() {
             backend_id: "tidb-current-identity".to_owned(),
             backend_address: format!("127.0.0.1:{target_port}"),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: true,
             deadline_unix_millis: 0,
@@ -2629,6 +2797,7 @@ async fn change_user_failure_preserves_identity_and_prepared_guard() {
             backend_id: "tidb-old-identity".to_owned(),
             backend_address: format!("127.0.0.1:{target_port}"),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: true,
             deadline_unix_millis: 0,
@@ -2759,6 +2928,7 @@ async fn redirect_restores_candidate_and_swaps_atomically() {
             backend_id: "tidb-other".to_owned(),
             backend_address: format!("127.0.0.1:{target_port}"),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: true,
             deadline_unix_millis: 0,
@@ -2862,6 +3032,7 @@ async fn redirect_restores_candidate_over_backend_tls() {
             backend_id: "tidb-tls-target".to_owned(),
             backend_address: format!("127.0.0.1:{target_port}"),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: true,
             deadline_unix_millis: 0,
@@ -2929,6 +3100,7 @@ async fn redirect_restores_candidate_over_compression(
             backend_id: "tidb-compressed-target".to_owned(),
             backend_address: format!("127.0.0.1:{target_port}"),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: true,
             deadline_unix_millis: 0,
@@ -3027,6 +3199,7 @@ async fn complete_snapshot_validation_failures_preserve_old_backend() {
                 backend_id: "tidb-other".to_owned(),
                 backend_address: "127.0.0.1:1".to_owned(),
                 cluster_name: String::new(),
+                keyspace: String::new(),
                 backend_unhealthy: false,
                 backend_local: true,
                 deadline_unix_millis: 0,
@@ -3093,6 +3266,7 @@ async fn candidate_failures_preserve_old_backend() {
                 backend_id: "tidb-other".to_owned(),
                 backend_address: format!("127.0.0.1:{target_port}"),
                 cluster_name: String::new(),
+                keyspace: String::new(),
                 backend_unhealthy: false,
                 backend_local: true,
                 deadline_unix_millis: 0,
@@ -3137,6 +3311,7 @@ async fn candidate_failures_preserve_old_backend() {
             backend_id: "tidb-unreachable".to_owned(),
             backend_address: "127.0.0.1:1".to_owned(),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: true,
             deadline_unix_millis: 0,
@@ -3180,6 +3355,7 @@ async fn expired_redirect_deadline_preserves_old_backend() {
             backend_id: "tidb-expired".to_owned(),
             backend_address: format!("127.0.0.1:{target_port}"),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: true,
             deadline_unix_millis: 1,
@@ -3235,6 +3411,7 @@ async fn unhealthy_redirect_target_preserves_old_backend() {
             backend_id: "tidb-unhealthy".to_owned(),
             backend_address: format!("127.0.0.1:{target_port}"),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: true,
             backend_local: true,
             deadline_unix_millis: 0,
@@ -3287,6 +3464,7 @@ async fn incomplete_snapshot_failures_close_the_session() {
                 backend_id: "tidb-other".to_owned(),
                 backend_address: "127.0.0.1:1".to_owned(),
                 cluster_name: String::new(),
+                keyspace: String::new(),
                 backend_unhealthy: false,
                 backend_local: true,
                 deadline_unix_millis: 0,
@@ -3355,6 +3533,7 @@ async fn control_activity_during_fragmented_command_keeps_wire_intact() {
             backend_id: "tidb-other".to_owned(),
             backend_address: "127.0.0.1:1".to_owned(),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: true,
             deadline_unix_millis: 0,
@@ -5644,6 +5823,7 @@ async fn compressed_control_interleave_during_staged_command_keeps_wire_intact()
             backend_id: "tidb-other".to_owned(),
             backend_address: "127.0.0.1:1".to_owned(),
             cluster_name: String::new(),
+            keyspace: String::new(),
             backend_unhealthy: false,
             backend_local: false,
             deadline_unix_millis: 0,

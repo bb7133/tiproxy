@@ -42,6 +42,7 @@ message ControlEnvelope {
     ProtocolError error = 40;
     CloseCommand close_command = 41;
     CloseResult close_result = 42;
+    MeteringAck metering_ack = 43;
   }
 }
 
@@ -70,6 +71,10 @@ enum ControlCapability {
   // RECONCILE_CONNECTIONS behavior applies (identification by omission,
   // no orphan closes).
   CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION = 3;
+  // DPL-06: metering uses producer-qualified absolute per-backend-source
+  // snapshots and an explicit durable ACK. Without it the legacy delta-batch
+  // behavior applies.
+  CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS = 4;
 }
 
 message Hello {
@@ -291,6 +296,8 @@ message RedirectCommand {
   // Router-observed locality for post-swap lifecycle/traffic attribution.
   // Older peers default to the conservative non-local value.
   bool backend_local = 9;
+  // Router keyspace retained for the new immutable metering source.
+  string keyspace = 10;
 }
 
 message RedirectResult {
@@ -364,6 +371,39 @@ message MeteringDelta {
 message MeteringBatch {
   uint64 sequence = 1;
   repeated MeteringDelta deltas = 2;
+  // Stable across Rust process restarts while its WAL is intact. Empty means
+  // this is a legacy delta producer.
+  string producer_id = 3;
+  // Present only when METERING_ABSOLUTE_SNAPSHOTS is negotiated.
+  repeated MeteringSourceSnapshot snapshots = 4;
+}
+
+// One absolute raw-socket counter sample for one immutable backend source.
+// A redirect retires the old source with final=true and starts a new
+// backend_generation at raw zero. process_generation disambiguates connection
+// id reuse after a Rust process restart; wrap epochs make u64 wrap explicit.
+message MeteringSourceSnapshot {
+  uint64 connection_id = 1;
+  uint64 process_generation = 2;
+  uint64 backend_generation = 3;
+  string backend_id = 4;
+  string cluster_name = 5;
+  string keyspace = 6;
+  bool local = 7;
+  bool public_endpoint = 8;
+  uint64 backend_inbound_bytes = 9;
+  uint64 backend_outbound_bytes = 10;
+  uint64 inbound_wrap_epoch = 11;
+  uint64 outbound_wrap_epoch = 12;
+  bool final = 13;
+}
+
+// Sent by Go only after this producer-qualified batch and the resulting
+// pending aggregates are durable. Duplicate batches are re-ACKed without
+// being applied twice.
+message MeteringAck {
+  string producer_id = 1;
+  uint64 sequence = 2;
 }
 
 message ReconcileRequest {
@@ -461,4 +501,10 @@ message ProtocolError {
   uint64 offending_request_id = 2;
   bool retryable = 3;
   string detail = 4;
+  // A fatal error means the sender can no longer preserve a negotiated
+  // safety invariant. The receiver must terminate its dataplane owner instead
+  // of merely reconnecting the control stream. DPL-06 uses this only for
+  // absolute-metering validation or durable-consumer failures; ordinary
+  // request-scoped protocol errors leave it false.
+  bool fatal = 5;
 }

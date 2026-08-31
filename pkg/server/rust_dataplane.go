@@ -39,6 +39,14 @@ func (srv *Server) startRustDataplane(
 			return fmt.Errorf("resolve Rust dataplane control socket: %w", err)
 		}
 	}
+	meteringStatePath, err := filepath.Abs(filepath.Join(
+		cfg.Workdir,
+		"run",
+		"rust-metering-consumer.json",
+	))
+	if err != nil {
+		return fmt.Errorf("resolve Rust metering consumer state: %w", err)
+	}
 	allowedUID := uint32(os.Getuid())
 	if cfg.RustDataplane.AllowedUID >= 0 {
 		allowedUID = uint32(cfg.RustDataplane.AllowedUID)
@@ -68,6 +76,11 @@ func (srv *Server) startRustDataplane(
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS),
+	}
+	var meteringSink controlbridge.MeteringSink
+	if srv.meter != nil {
+		meteringSink = srv.meter
 	}
 	bridge, err := controlbridge.NewBridge(controlbridge.BridgeConfig{
 		Transport: transport.ServerConfig{
@@ -93,7 +106,9 @@ func (srv *Server) startRustDataplane(
 			}
 			return ns.GetRouter(), nil
 		},
-		Publisher: publisher,
+		Publisher:         publisher,
+		MeteringStatePath: meteringStatePath,
+		MeteringSink:      meteringSink,
 	})
 	if err != nil {
 		return fmt.Errorf("start Rust dataplane control bridge: %w", err)

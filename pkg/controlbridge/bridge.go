@@ -44,6 +44,12 @@ type BridgeConfig struct {
 	Publisher *SnapshotPublisher
 	// SnapshotSyncInterval paces desired-generation and reconnect sync.
 	SnapshotSyncInterval time.Duration
+	// MeteringStatePath is the absolute crash-safe consumer state file. Empty
+	// retains the legacy in-memory delta consumer for old compositions.
+	MeteringStatePath string
+	// MeteringSink receives derived response/cross-AZ deltas after durable
+	// staging. Nil keeps durable totals available without an external writer.
+	MeteringSink MeteringSink
 }
 
 // DrainScope selects which sessions a drain covers; empty lists mean
@@ -140,6 +146,12 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 		return nil, err
 	}
 	consumer := NewMeteringConsumer()
+	if config.MeteringStatePath != "" {
+		consumer, err = OpenMeteringConsumer(config.MeteringStatePath, config.MeteringSink)
+		if err != nil {
+			return nil, err
+		}
+	}
 	composite, err := NewCompositeControlHandler(adapter, issuer, consumer)
 	if err != nil {
 		return nil, err
@@ -190,6 +202,20 @@ func (bridge *Bridge) Consumer() *MeteringConsumer {
 // Publisher exposes the snapshot generation owner, when configured.
 func (bridge *Bridge) Publisher() *SnapshotPublisher {
 	return bridge.publisher
+}
+
+// Status implements the API readiness surface. A metering durable-state or
+// sink failure forces the applied generation to zero, so readiness degrades
+// immediately instead of advertising a billable dataplane as healthy.
+func (bridge *Bridge) Status() SnapshotStatus {
+	if bridge.publisher == nil {
+		return SnapshotStatus{}
+	}
+	status := bridge.publisher.Status()
+	if !bridge.consumer.Healthy() {
+		status.AppliedGeneration = 0
+	}
+	return status
 }
 
 // StartDrain issues (or idempotently re-issues) one operator drain.

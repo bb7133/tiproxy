@@ -31,18 +31,24 @@ func TestQueuePressureAndPriority(t *testing.T) {
 	metering := envelopeWithPriority(controlpb.Priority_PRIORITY_BULK, &controlpb.ControlEnvelope_MeteringBatch{
 		MeteringBatch: &controlpb.MeteringBatch{Sequence: 2},
 	})
+	require.NoError(t, queues.enqueue(t.Context(), metering))
+	first, err := queues.next(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, first.GetMeteringBatch())
+
+	require.NoError(t, queues.enqueue(t.Context(), metering))
+	require.ErrorIs(t, queues.enqueue(t.Context(), bulkMetric), ErrMetricsDropped)
 	pushDone := make(chan error, 1)
 	go func() {
 		pushDone <- queues.enqueue(t.Context(), metering)
 	}()
 	select {
 	case err := <-pushDone:
-		require.Failf(t, "metering enqueue returned before space", "error: %v", err)
+		require.Failf(t, "metering enqueue returned before metering space", "error: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	first, err := queues.next(t.Context())
+	_, err = queues.next(t.Context())
 	require.NoError(t, err)
-	require.NotNil(t, first.GetMetricsBatch())
 	require.NoError(t, <-pushDone)
 
 	for id := uint64(1); id <= 17; id++ {

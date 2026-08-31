@@ -21,7 +21,7 @@ pub struct ControlEnvelope {
     pub sent_unix_millis: u64,
     #[prost(uint64, repeated, tag="7")]
     pub required_capabilities: ::prost::alloc::vec::Vec<u64>,
-    #[prost(oneof="control_envelope::Body", tags="20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42")]
+    #[prost(oneof="control_envelope::Body", tags="20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43")]
     pub body: ::core::option::Option<control_envelope::Body>,
 }
 /// Nested message and enum types in `ControlEnvelope`.
@@ -74,6 +74,8 @@ pub mod control_envelope {
         CloseCommand(super::CloseCommand),
         #[prost(message, tag="42")]
         CloseResult(super::CloseResult),
+        #[prost(message, tag="43")]
+        MeteringAck(super::MeteringAck),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -415,6 +417,9 @@ pub struct RedirectCommand {
     /// Older peers default to the conservative non-local value.
     #[prost(bool, tag="9")]
     pub backend_local: bool,
+    /// Router keyspace retained for the new immutable metering source.
+    #[prost(string, tag="10")]
+    pub keyspace: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RedirectResult {
@@ -532,6 +537,56 @@ pub struct MeteringBatch {
     pub sequence: u64,
     #[prost(message, repeated, tag="2")]
     pub deltas: ::prost::alloc::vec::Vec<MeteringDelta>,
+    /// Stable across Rust process restarts while its WAL is intact. Empty means
+    /// this is a legacy delta producer.
+    #[prost(string, tag="3")]
+    pub producer_id: ::prost::alloc::string::String,
+    /// Present only when METERING_ABSOLUTE_SNAPSHOTS is negotiated.
+    #[prost(message, repeated, tag="4")]
+    pub snapshots: ::prost::alloc::vec::Vec<MeteringSourceSnapshot>,
+}
+/// One absolute raw-socket counter sample for one immutable backend source.
+/// A redirect retires the old source with final=true and starts a new
+/// backend_generation at raw zero. process_generation disambiguates connection
+/// id reuse after a Rust process restart; wrap epochs make u64 wrap explicit.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MeteringSourceSnapshot {
+    #[prost(uint64, tag="1")]
+    pub connection_id: u64,
+    #[prost(uint64, tag="2")]
+    pub process_generation: u64,
+    #[prost(uint64, tag="3")]
+    pub backend_generation: u64,
+    #[prost(string, tag="4")]
+    pub backend_id: ::prost::alloc::string::String,
+    #[prost(string, tag="5")]
+    pub cluster_name: ::prost::alloc::string::String,
+    #[prost(string, tag="6")]
+    pub keyspace: ::prost::alloc::string::String,
+    #[prost(bool, tag="7")]
+    pub local: bool,
+    #[prost(bool, tag="8")]
+    pub public_endpoint: bool,
+    #[prost(uint64, tag="9")]
+    pub backend_inbound_bytes: u64,
+    #[prost(uint64, tag="10")]
+    pub backend_outbound_bytes: u64,
+    #[prost(uint64, tag="11")]
+    pub inbound_wrap_epoch: u64,
+    #[prost(uint64, tag="12")]
+    pub outbound_wrap_epoch: u64,
+    #[prost(bool, tag="13")]
+    pub r#final: bool,
+}
+/// Sent by Go only after this producer-qualified batch and the resulting
+/// pending aggregates are durable. Duplicate batches are re-ACKed without
+/// being applied twice.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MeteringAck {
+    #[prost(string, tag="1")]
+    pub producer_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag="2")]
+    pub sequence: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReconcileRequest {
@@ -620,6 +675,13 @@ pub struct ProtocolError {
     pub retryable: bool,
     #[prost(string, tag="4")]
     pub detail: ::prost::alloc::string::String,
+    /// A fatal error means the sender can no longer preserve a negotiated
+    /// safety invariant. The receiver must terminate its dataplane owner instead
+    /// of merely reconnecting the control stream. DPL-06 uses this only for
+    /// absolute-metering validation or durable-consumer failures; ordinary
+    /// request-scoped protocol errors leave it false.
+    #[prost(bool, tag="5")]
+    pub fatal: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -696,6 +758,10 @@ pub enum ControlCapability {
     /// RECONCILE_CONNECTIONS behavior applies (identification by omission,
     /// no orphan closes).
     ReconcileSessionRehydration = 3,
+    /// DPL-06: metering uses producer-qualified absolute per-backend-source
+    /// snapshots and an explicit durable ACK. Without it the legacy delta-batch
+    /// behavior applies.
+    MeteringAbsoluteSnapshots = 4,
 }
 impl ControlCapability {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -708,6 +774,7 @@ impl ControlCapability {
             Self::PerConnectionClose => "CONTROL_CAPABILITY_PER_CONNECTION_CLOSE",
             Self::ReconcileConnections => "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS",
             Self::ReconcileSessionRehydration => "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION",
+            Self::MeteringAbsoluteSnapshots => "CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -717,6 +784,7 @@ impl ControlCapability {
             "CONTROL_CAPABILITY_PER_CONNECTION_CLOSE" => Some(Self::PerConnectionClose),
             "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS" => Some(Self::ReconcileConnections),
             "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION" => Some(Self::ReconcileSessionRehydration),
+            "CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS" => Some(Self::MeteringAbsoluteSnapshots),
             _ => None,
         }
     }
