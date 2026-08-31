@@ -427,6 +427,75 @@ fn go_restart_preserves_rust_sessions() {
     assert_eq!(gate.len(), 2, "existing sessions survive a Go restart");
 }
 
+/// PARITY-ADM-003 (reporter fidelity): the reconcile request a Rust-alive
+/// dataplane emits after a Go restart carries the EXACT per-connection fields
+/// Go's `rehydrateReconciled`/`RehydrateConn` consume to re-attach a connection
+/// *without running selection*. It locks the relationships that make the
+/// re-attach valid, not merely field presence:
+///   1. the embedded identity's `connection_id` equals the outer
+///      `connection_id` (the documented rehydration precondition — Go returns
+///      an orphan otherwise);
+///   2. the admitted identity is echoed verbatim, so real listener/client/
+///      proxy addresses reach Go routing;
+///   3. the reported `generation` is the connection's admitted
+///      `snapshot_generation`, NOT the `known_generation` method argument;
+///   4. `backend_id` is the authoritative owner (not a pending redirect's
+///      target), and `pending_redirect_id`/`last_redirect_command_sequence`
+///      carry the in-flight redirect id and its command watermark.
+/// Dropping identity, echoing the wrong identity, reporting `known_generation`,
+/// or leaking the redirect target as the backend each breaks a Go precondition
+/// and fails an assertion here.
+#[test]
+fn reconcile_request_carries_rehydration_fidelity() {
+    let mut gate = CommandGate::new();
+    // Two connections admitted under DIFFERENT snapshot generations, so a
+    // report that leaked the method's `known_generation` would collapse them.
+    gate.register_connection(identity(1), "ns-a", 7);
+    let _ = gate.set_backend(1, "tidb-a");
+    gate.register_connection(identity(2), "ns-b", 11);
+    // Authoritative backend distinct from the redirect target ("tidb-b"), so
+    // reporting the redirect target instead of the owner is discriminable.
+    let _ = gate.set_backend(2, "tidb-owner");
+    let _ = gate.admit_redirect(&redirect(2, "r-42", 5), 11);
+
+    // `known_generation` (9) deliberately differs from BOTH connections'
+    // snapshot generations (7 and 11).
+    let request = gate.build_reconcile_request(9, 0, 0);
+    assert_eq!(request.known_generation, 9);
+    assert_eq!(request.connections.len(), 2);
+
+    let first = &request.connections[0];
+    assert_eq!(first.connection_id, 1);
+    let id1 = match first.identity.as_ref() {
+        Some(identity) => identity,
+        None => unreachable!("connection 1 reports its admission identity"),
+    };
+    assert_eq!(id1.connection_id, first.connection_id, "embedded id == outer id");
+    assert_eq!(id1, &identity(1), "admission identity echoed verbatim");
+    assert_eq!(first.generation, 7, "reports snapshot_generation, not known_generation");
+    assert_eq!(first.backend_id, "tidb-a");
+    assert!(!first.redirect_pending);
+    assert_eq!(first.pending_redirect_id, "");
+    assert_eq!(first.last_redirect_command_sequence, 0);
+
+    let second = &request.connections[1];
+    assert_eq!(second.connection_id, 2);
+    let id2 = match second.identity.as_ref() {
+        Some(identity) => identity,
+        None => unreachable!("connection 2 reports its admission identity"),
+    };
+    assert_eq!(id2.connection_id, second.connection_id, "embedded id == outer id");
+    assert_eq!(id2, &identity(2), "admission identity echoed verbatim");
+    assert_eq!(second.generation, 11, "each connection reports its own snapshot_generation");
+    assert_eq!(
+        second.backend_id, "tidb-owner",
+        "reports the authoritative owner, not the redirect target"
+    );
+    assert!(second.redirect_pending);
+    assert_eq!(second.pending_redirect_id, "r-42");
+    assert_eq!(second.last_redirect_command_sequence, 5);
+}
+
 /// Reconciliation, Rust-restarted direction: connections Go still
 /// lists that this gate does not know are ghosts to answer with
 /// terminal CLOSED events (no negative counts), and terminal redirect
