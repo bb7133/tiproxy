@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "exclusions": [
+    {
+      "parity_id": "ADM-001",
+      "reason": "Admission rejection depends on process memory and listener acceptance, outside an immutable MySQL byte trace."
+    },
+    {
+      "parity_id": "ADM-002",
+      "reason": "The live max-connections gate executes before a session and packet stream exist."
+    },
+    {
+      "parity_id": "ADM-003",
+      "reason": "Backend selection, retry, abandonment, and rehydration require router and control-plane actors rather than one wire trace."
+    },
+    {
+      "parity_id": "ADM-004",
+      "reason": "Public endpoint and cluster classification require listener, PROXY address, CIDR, and dial context."
+    },
+    {
+      "parity_id": "CFG-001",
+      "reason": "Atomic configuration generation and listener reload behavior are exercised by control-protocol and runtime-config tests."
+    },
+    {
+      "parity_id": "CFG-002",
+      "reason": "Configuration validation runs before admission and has no MySQL packet representation."
+    },
+    {
+      "parity_id": "CMP-001",
+      "reason": "The v1 oracle stores uncompressed MySQL frames; zlib negotiation and framing use Go golden vectors and compressed session tests."
+    },
+    {
+      "parity_id": "CMP-003",
+      "reason": "Compressed sequence, reset, peek, discard, flush, and corrupt-frame semantics use the dedicated compression vector/runtime suites."
+    },
+    {
+      "parity_id": "EXCL-001",
+      "reason": "SQL traffic capture and replay are intentionally excluded from the Rust dataplane and must never enter this corpus."
+    },
+    {
+      "parity_id": "HS-007",
+      "reason": "Handshake retry classification depends on the routing hook and distinct backend candidates, not a single byte stream."
+    },
+    {
+      "parity_id": "HS-009",
+      "reason": "Direct backend authentication is a replay/test topology path and remains outside ordinary proxy-session corpus coverage."
+    },
+    {
+      "parity_id": "HS-010",
+      "reason": "Exact capability advertisement and masking are locked by handshake/runtime tests; existing corpus cases cover negotiated subsets only."
+    },
+    {
+      "parity_id": "HS-011",
+      "reason": "The current Go oracle has no malformed backend-greeting vector; retain this exclusion until that source gap is filled."
+    },
+    {
+      "parity_id": "KA-001",
+      "reason": "Frontend keepalive requires operating-system socket options and cannot be represented as MySQL records."
+    },
+    {
+      "parity_id": "KA-002",
+      "reason": "Backend keepalive transitions require a live health feed and socket owner."
+    },
+    {
+      "parity_id": "KA-003",
+      "reason": "Idle peer probing requires socket EOF and concurrency with the session loop, covered by runtime tests."
+    },
+    {
+      "parity_id": "LIFE-001",
+      "reason": "Coordinated stop-accept, safe drain, and force deadlines require listener and process lifecycle orchestration."
+    },
+    {
+      "parity_id": "LIFE-002",
+      "reason": "Force-close interruption and idempotent teardown require concurrent live I/O rather than sequential corpus records."
+    },
+    {
+      "parity_id": "LIFE-003",
+      "reason": "Close-time redirect reporting, hook notification, socket release, and route unregistering require control-plane ownership."
+    },
+    {
+      "parity_id": "LIFE-004",
+      "reason": "Managed-task panic recovery and cancellation are process supervision behavior."
+    },
+    {
+      "parity_id": "LIFE-005",
+      "reason": "Lifecycle quit-source attribution spans transport and control failures; focused observability/runtime tests are authoritative."
+    },
+    {
+      "parity_id": "MIG-001",
+      "reason": "Asynchronous redirect serialization and once-only callbacks require control commands and two backend owners."
+    },
+    {
+      "parity_id": "MIG-003",
+      "reason": "Candidate TLS, PROXY, compression, token authentication, restore, and atomic swap require a second live backend."
+    },
+    {
+      "parity_id": "MIG-005",
+      "reason": "Held-BEGIN and internal-COMMIT ordering require an armed redirect and old/new backend interaction."
+    },
+    {
+      "parity_id": "MIG-006",
+      "reason": "Candidate failure preservation and old-backend disconnect classification require two independently failing sockets."
+    },
+    {
+      "parity_id": "MIG-007",
+      "reason": "Successful swap accounting, counter reset, keepalive, hooks, and stable frontend identity require live ownership transfer."
+    },
+    {
+      "parity_id": "MIG-008",
+      "reason": "Keyspace-stable redirect refusal lives at the Go router issuance boundary before any Rust packet stream."
+    },
+    {
+      "parity_id": "MTR-001",
+      "reason": "Raw socket byte and physical-packet accounting are validated at CountedIo and live session seams, not normalized trace payloads."
+    },
+    {
+      "parity_id": "MTR-002",
+      "reason": "Durable per-keyspace/public/cross-AZ metering requires immutable attribution, migration, WAL, ACK, and the Go meter sink."
+    },
+    {
+      "parity_id": "MTR-003",
+      "reason": "Prometheus command, handshake, lifetime, connection, and error-source labels are checked by observability integration tests."
+    },
+    {
+      "parity_id": "MTR-004",
+      "reason": "Migration pending/success/failure metrics and backend gauges are Go control-plane observations of Rust lifecycle events."
+    },
+    {
+      "parity_id": "MTR-005",
+      "reason": "Payload-free lifecycle log fields depend on connection, listener, namespace, backend, and quit context unavailable in a byte trace."
+    },
+    {
+      "parity_id": "PKT-006",
+      "reason": "Buffer sizing, pooling, direct writes, counters, flush behavior, and post-TLS bounds require concrete I/O implementations."
+    },
+    {
+      "parity_id": "TLS-002",
+      "reason": "SSLRequest-to-HandshakeResponse capability reconciliation crosses the transport upgrade boundary and needs a live TLS session."
+    },
+    {
+      "parity_id": "TLS-003",
+      "reason": "Backend TLS enforcement, certificate cloning, and SNI require a selected backend and TLS transport."
+    },
+    {
+      "parity_id": "TLS-004",
+      "reason": "TLS policy, identity, and certificate rotation are configuration and filesystem lifecycle behavior."
+    },
+    {
+      "parity_id": "TOPO-001",
+      "reason": "Multi-address/range listener binding and coordinated stop require operating-system listeners."
+    },
+    {
+      "parity_id": "TOPO-002",
+      "reason": "Namespace routing and dynamic topology stability require the Go router projection and live admissions."
+    },
+    {
+      "parity_id": "TOPO-003",
+      "reason": "Named backend-cluster isolation and legacy PD fallback are configuration/topology behavior before packet forwarding."
+    }
+  ]
+}

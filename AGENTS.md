@@ -79,9 +79,11 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/session-core/` - Protocol-independent session lifecycle and migration state.
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
 - `rust/crates/dataplane/` - Rust dataplane orchestration across wire, transport, session, and control components.
+- `rust/crates/differential-runner/` - Payload-free Rust consumer for the immutable Go protocol corpus; it drives merged wire/session parsers and emits sharded semantic observations.
 - `rust/crates/tiproxy-rs/` - Rust dataplane executable and build/version metadata.
 - `tests/compatibility/` - Versioned client-driver and MySQL capability contract shared by the Go/Rust dataplane integration tests.
 - `tests/dataplane/corpus/` - Deterministic, language-neutral Go dataplane protocol corpus.
+- `tests/dataplane/differential/` - Go/Rust corpus comparator, first-divergence report, parity coverage/exclusion gate, mutation self-check, and sharded CI entrypoint.
 - `tests/dataplane/drift/` - Semantic CI gate that keeps Go dataplane changes synchronized with Rust parity artifacts.
 - `tests/dataplane/integration/` - Real TiDB topology, fault injection, readiness, diagnostics, and owned cleanup for Go/Rust dataplane validation.
 

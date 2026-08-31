@@ -943,6 +943,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiproxy-differential-runner"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "mysql-wire",
+ "serde_json",
+ "session-core",
+]
+
+[[package]]
 name = "tiproxy-rs"
 version = "0.1.0"
 dependencies = [

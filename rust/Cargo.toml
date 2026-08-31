@@ -2,6 +2,7 @@
 members = [
     "crates/control-proto",
     "crates/dataplane",
+    "crates/differential-runner",
     "crates/mysql-wire",
     "crates/proxy-io",
     "crates/session-core",
