@@ -442,6 +442,7 @@ fn go_restart_preserves_rust_sessions() {
 ///   4. `backend_id` is the authoritative owner (not a pending redirect's
 ///      target), and `pending_redirect_id`/`last_redirect_command_sequence`
 ///      carry the in-flight redirect id and its command watermark.
+///
 /// Dropping identity, echoing the wrong identity, reporting `known_generation`,
 /// or leaking the redirect target as the backend each breaks a Go precondition
 /// and fails an assertion here.
@@ -466,9 +467,8 @@ fn reconcile_request_carries_rehydration_fidelity() {
 
     let first = &request.connections[0];
     assert_eq!(first.connection_id, 1);
-    let id1 = match first.identity.as_ref() {
-        Some(identity) => identity,
-        None => unreachable!("connection 1 reports its admission identity"),
+    let Some(id1) = first.identity.as_ref() else {
+        unreachable!("connection 1 reports its admission identity")
     };
     assert_eq!(id1.connection_id, first.connection_id, "embedded id == outer id");
     assert_eq!(id1, &identity(1), "admission identity echoed verbatim");
@@ -480,9 +480,8 @@ fn reconcile_request_carries_rehydration_fidelity() {
 
     let second = &request.connections[1];
     assert_eq!(second.connection_id, 2);
-    let id2 = match second.identity.as_ref() {
-        Some(identity) => identity,
-        None => unreachable!("connection 2 reports its admission identity"),
+    let Some(id2) = second.identity.as_ref() else {
+        unreachable!("connection 2 reports its admission identity")
     };
     assert_eq!(id2.connection_id, second.connection_id, "embedded id == outer id");
     assert_eq!(id2, &identity(2), "admission identity echoed verbatim");
@@ -494,6 +493,86 @@ fn reconcile_request_carries_rehydration_fidelity() {
     assert!(second.redirect_pending);
     assert_eq!(second.pending_redirect_id, "r-42");
     assert_eq!(second.last_redirect_command_sequence, 5);
+}
+
+/// PARITY-ADM-003 (same-generation / new-epoch incarnation): when a connection
+/// id is re-registered with the SAME snapshot generation but a NEW admission
+/// identity — a legitimate new-epoch reconnect reusing the id, Go
+/// `TestSameGenerationNewEpochLineage` — the reconcile reporter reflects the
+/// CURRENT incarnation (new identity, fresh state), the stale incarnation is
+/// superseded with no drift (exactly one live entry per id), and the reported
+/// generation stays the connection's snapshot generation.
+///
+/// The retire-exactly-once accounting is Go-side (`AssignmentRehydrator`),
+/// driven by the reporter's converging snapshots plus the unacked-terminal ack
+/// mechanism in `apply_reconcile_snapshot` (a snapshot re-reports a
+/// ghost/terminal only while the peer still lists it — at-least-once replay —
+/// then the peer's "nothing outstanding" view acks it; at-least-once replay
+/// plus Go idempotency composes the exactly-once effect). That invariant is
+/// proven by Go `TestSameGenerationNewEpochLineage` /
+/// `TestGoRestartRehydratesAccountingAndClosesExactlyOnce` and the `chain-c`
+/// real-TiDB Go-restart E2E, and on the Rust side by
+/// `rust_restart_clears_ghosts_and_replays_lost_results` and
+/// `redirect_replay_survives_epochs_and_generations_stay_separate` — it is
+/// deliberately NOT re-faked here with an invented epoch/count. This test pins
+/// only the Rust reporter's own obligation: report the current incarnation,
+/// never a stale one, so Go re-attaches the live connection and retires the old.
+#[test]
+fn reconcile_reports_current_incarnation_same_generation_new_identity() {
+    let mut gate = CommandGate::new();
+    // The original incarnation of id 1, with an in-flight redirect.
+    let mut stale = identity(1);
+    stale.client_address = "10.0.0.2:23456".to_owned();
+    gate.register_connection(stale, "ns-a", 7);
+    let _ = gate.set_backend(1, "tidb-a");
+    let _ = gate.admit_redirect(&redirect(1, "r-stale", 3), 7);
+
+    // A new incarnation reuses id 1 with the SAME generation (7) and a NEW
+    // admission identity (a different client address).
+    let mut fresh = identity(1);
+    fresh.client_address = "10.0.0.3:34567".to_owned();
+    gate.register_connection(fresh, "ns-a", 7);
+    let _ = gate.set_backend(1, "tidb-b");
+
+    // No drift: exactly one live entry for the id (the stale incarnation is
+    // superseded, not doubled).
+    assert_eq!(gate.len(), 1, "one live incarnation per id — no drift");
+
+    let request = gate.build_reconcile_request(9, 0, 0);
+    assert_eq!(request.connections.len(), 1);
+    let conn = &request.connections[0];
+    assert_eq!(conn.connection_id, 1);
+    let Some(id) = conn.identity.as_ref() else {
+        unreachable!("the current incarnation reports its identity")
+    };
+    // Reports the CURRENT incarnation's identity, never the stale one.
+    assert_eq!(
+        id.client_address, "10.0.0.3:34567",
+        "reports the new incarnation's identity"
+    );
+    assert_ne!(
+        id.client_address, "10.0.0.2:23456",
+        "the stale incarnation is superseded"
+    );
+    assert_eq!(conn.generation, 7, "same snapshot generation across the incarnation");
+    assert_eq!(conn.backend_id, "tidb-b", "reports the current incarnation's backend");
+    // The stale incarnation's in-flight redirect does not leak into the fresh
+    // one: the new registration starts from a clean redirect state.
+    assert!(
+        !conn.redirect_pending,
+        "the fresh incarnation carries no stale redirect"
+    );
+    assert_eq!(conn.pending_redirect_id, "");
+    assert_eq!(conn.last_redirect_command_sequence, 0);
+
+    // Report stability: building the reconcile request again reports the same
+    // current incarnation on the wire (any internal export markers aside), so a
+    // Go lineage that reconciles more than once re-attaches the same connection.
+    let again = gate.build_reconcile_request(9, 0, 0);
+    assert_eq!(
+        again.connections, request.connections,
+        "a repeated build reports the identical current incarnation"
+    );
 }
 
 /// Reconciliation, Rust-restarted direction: connections Go still
