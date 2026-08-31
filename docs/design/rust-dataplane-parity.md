@@ -53,6 +53,14 @@ Severity is evaluated separately for canary and cutover:
 `Rust owner` names the crate or boundary responsible for the behavior. It is
 not a person assignment.
 
+`tests/dataplane/differential` enforces that every permanent ID is either
+referenced by the immutable Go v1 corpus or has one concrete, reviewable entry
+in `parity-exclusions.json`. Corpus references to unknown IDs, stale
+exclusions, and newly added rows with neither coverage nor an exclusion all
+fail CI. The sharded Rust consumer replays covered traces through merged
+parser/FSM code and reports the first case, packet index, state/effect, and
+expected/observed semantic field without emitting packet payloads.
+
 ## Audited Go source inventory
 
 The manifest audit covers all production files under these paths. Test and

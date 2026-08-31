@@ -1,0 +1,98 @@
+name: Dataplane differential
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/dataplane-differential.yml"
+      - "AGENTS.md"
+      - "Makefile"
+      - "docs/design/rust-dataplane-parity.md"
+      - "rust/Cargo.lock"
+      - "rust/Cargo.toml"
+      - "rust/crates/differential-runner/**"
+      - "rust/crates/mysql-wire/**"
+      - "rust/crates/session-core/**"
+      - "tests/dataplane/corpus/**"
+      - "tests/dataplane/differential/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/dataplane-differential.yml"
+      - "AGENTS.md"
+      - "Makefile"
+      - "docs/design/rust-dataplane-parity.md"
+      - "rust/Cargo.lock"
+      - "rust/Cargo.toml"
+      - "rust/crates/differential-runner/**"
+      - "rust/crates/mysql-wire/**"
+      - "rust/crates/session-core/**"
+      - "tests/dataplane/corpus/**"
+      - "tests/dataplane/differential/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dataplane-differential-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Parity manifest coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Enforce bidirectional corpus coverage
+        run: make dataplane-differential-coverage
+      - name: Test the comparator and coverage gate
+        run: go test ./tests/dataplane/differential/...
+
+  compare:
+    name: Corpus shard ${{ matrix.shard }}/4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/target
+          key: differential-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Compare Go oracle with Rust
+        env:
+          DIFFERENTIAL_SHARD_INDEX: ${{ matrix.shard }}
+          DIFFERENTIAL_SHARD_COUNT: 4
+        run: make dataplane-differential
+      - name: Prove the known Rust mutation is killed
+        if: matrix.shard == 0
+        env:
+          DIFFERENTIAL_SHARD_COUNT: 4
+        run: make dataplane-differential-mutation

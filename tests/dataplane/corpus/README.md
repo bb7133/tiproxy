@@ -44,6 +44,12 @@ runs must be identical.
 
 ## Differential consumers
 
+The production Rust consumer and sharded CI comparator live in
+`tests/dataplane/differential`; see its README for the payload-free observation
+schema, first-divergence report, mutation self-check, and parity coverage gate.
+The commands below remain useful for validating a standalone final-result
+observation against the corpus schema.
+
 A Go or Rust consumer writes observations using the schema's
 `observation_set` definition. To create a complete expected-output skeleton:
 
