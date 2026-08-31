@@ -124,8 +124,10 @@ fn redirect_duplicates_act_at_most_once() {
 
     // A new id after the terminal starts a fresh redirect from the new
     // backend.
+    let mut failed_command = redirect(1, "r-2", 2);
+    failed_command.backend_id = "tidb-c".to_owned();
     assert_eq!(
-        gate.admit_redirect(&redirect(1, "r-2", 2), 7),
+        gate.admit_redirect(&failed_command, 7),
         RedirectAdmission::Start
     );
     let Some(second) = gate.complete_redirect(1, "r-2", false, "", ErrorCode::RedirectFailed)
@@ -138,8 +140,13 @@ fn redirect_duplicates_act_at_most_once() {
         "backend updated by r-1"
     );
     assert_eq!(
-        second.backend_id, "tidb-b",
-        "failed redirect keeps the owner"
+        second.backend_id, "tidb-c",
+        "the failed terminal names the attempted target for exact Go accounting"
+    );
+    assert_eq!(
+        gate.connection_backend(1).as_deref(),
+        Some("tidb-b"),
+        "failed redirect reports its attempted target without moving the owner"
     );
 
     // Unknown connections are never acted on.

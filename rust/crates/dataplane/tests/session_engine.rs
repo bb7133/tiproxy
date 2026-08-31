@@ -1179,17 +1179,25 @@ async fn run_fake_compressed_backend(
     }
 }
 
-async fn run_fake_backend(
-    listener: TcpListener,
-    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
-    written_bytes: Arc<AtomicU64>,
+struct FakeBackendConfig {
     snapshot_reply: SnapshotReply,
     proxy_v2: bool,
     send_idle_byte: bool,
     tls_config: Option<Arc<ServerConfig>>,
+    accepted_connections: Option<Arc<AtomicU64>>,
+}
+
+async fn run_fake_backend(
+    listener: TcpListener,
+    transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    written_bytes: Arc<AtomicU64>,
+    config: FakeBackendConfig,
 ) {
     while let Ok((stream, _)) = listener.accept().await {
-        let stream = if proxy_v2 {
+        if let Some(accepted_connections) = &config.accepted_connections {
+            accepted_connections.fetch_add(1, Ordering::Relaxed);
+        }
+        let stream = if config.proxy_v2 {
             let (mut read, write) = stream.into_split();
             if !strip_inbound_proxy_v2(&mut read).await {
                 continue;
@@ -1201,13 +1209,13 @@ async fn run_fake_backend(
         } else {
             stream
         };
-        let written = if let Some(tls_config) = tls_config.clone() {
+        let written = if let Some(tls_config) = config.tls_config.clone() {
             run_fake_tls_backend_connection(
                 stream,
                 tls_config,
                 Arc::clone(&transcript),
-                snapshot_reply,
-                send_idle_byte,
+                config.snapshot_reply,
+                config.send_idle_byte,
             )
             .await
         } else {
@@ -1226,9 +1234,9 @@ async fn run_fake_backend(
                 writer,
                 auth,
                 Arc::clone(&transcript),
-                snapshot_reply,
+                config.snapshot_reply,
                 broad,
-                send_idle_byte,
+                config.send_idle_byte,
             )
             .await;
             counters.outbound()
@@ -1251,12 +1259,52 @@ async fn spawn_fake_backend_server(
         listener,
         Arc::clone(&transcript),
         Arc::clone(&written_bytes),
-        snapshot_reply,
-        false,
-        false,
-        None,
+        FakeBackendConfig {
+            snapshot_reply,
+            proxy_v2: false,
+            send_idle_byte: false,
+            tls_config: None,
+            accepted_connections: None,
+        },
     ));
     (address.port(), transcript, written_bytes)
+}
+
+async fn spawn_counting_fake_backend_server(
+    snapshot_reply: SnapshotReply,
+) -> (
+    u16,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let written_bytes = Arc::new(AtomicU64::new(0));
+    let accepted_connections = Arc::new(AtomicU64::new(0));
+    tokio::spawn(run_fake_backend(
+        listener,
+        Arc::clone(&transcript),
+        Arc::clone(&written_bytes),
+        FakeBackendConfig {
+            snapshot_reply,
+            proxy_v2: false,
+            send_idle_byte: false,
+            tls_config: None,
+            accepted_connections: Some(Arc::clone(&accepted_connections)),
+        },
+    ));
+    (
+        address.port(),
+        transcript,
+        written_bytes,
+        accepted_connections,
+    )
 }
 
 /// A migration target that accepts the private token only when the candidate
@@ -1361,10 +1409,13 @@ async fn spawn_fake_tls_backend_server(
         listener,
         Arc::clone(&transcript),
         Arc::clone(&written_bytes),
-        snapshot_reply,
-        false,
-        false,
-        Some(fake_backend_tls_config()),
+        FakeBackendConfig {
+            snapshot_reply,
+            proxy_v2: false,
+            send_idle_byte: false,
+            tls_config: Some(fake_backend_tls_config()),
+            accepted_connections: None,
+        },
     ));
     (address.port(), transcript, written_bytes)
 }
@@ -1519,10 +1570,13 @@ async fn spawn_configured_fake_backend(
         listener,
         Arc::clone(&transcript),
         Arc::clone(&written_bytes),
-        snapshot_reply,
-        proxy_v2,
-        send_idle_byte,
-        tls_config,
+        FakeBackendConfig {
+            snapshot_reply,
+            proxy_v2,
+            send_idle_byte,
+            tls_config,
+            accepted_connections: None,
+        },
     ));
     (address.port(), transcript, written_bytes)
 }
@@ -2905,11 +2959,191 @@ async fn change_user_ok_without_status_fails_closed() {
     stack.dispatch_task.abort();
 }
 
+fn assert_atomic_redirect_transcripts(stack: &Stack, target_transcript: &Arc<Mutex<Vec<Vec<u8>>>>) {
+    let old_commands = stack
+        .backend_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert_eq!(
+        old_commands
+            .iter()
+            .filter(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES")
+            .count(),
+        1,
+        "MIG-00 captures one snapshot at the redirect safe boundary"
+    );
+    let target_commands = target_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert_eq!(
+        target_commands
+            .iter()
+            .filter(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"))
+            .count(),
+        1,
+        "MIG-01 restores the candidate exactly once before swap"
+    );
+    assert!(
+        old_commands.iter().all(|payload| !payload
+            .windows(b"signed-token-private".len())
+            .any(|window| window == b"signed-token-private")),
+        "the signed token is backend-to-proxy only"
+    );
+    let before = old_commands
+        .iter()
+        .position(|payload| payload.as_slice() == b"\x03SELECT 1");
+    let snapshot = old_commands
+        .iter()
+        .position(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES");
+    let restore = target_commands
+        .iter()
+        .position(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"));
+    let after = target_commands
+        .iter()
+        .position(|payload| payload.as_slice() == b"\x03SELECT after_snapshot");
+    assert!(
+        matches!((before, snapshot, restore, after), (Some(before), Some(snapshot), Some(restore), Some(after)) if before < snapshot && restore < after),
+        "snapshot is on the old owner and restore precedes target traffic: old={old_commands:?} target={target_commands:?}"
+    );
+    assert!(
+        old_commands
+            .iter()
+            .all(|payload| payload.as_slice() != b"\x03SELECT after_snapshot"),
+        "the first post-redirect command reaches only the new owner"
+    );
+}
+
+struct RedirectReplayAndStale<'a> {
+    stack: &'a Stack,
+    client: &'a mut MysqlClient,
+    redirect: ControlEnvelope,
+    target_transcript: &'a Arc<Mutex<Vec<Vec<u8>>>>,
+    target_connections: &'a AtomicU64,
+    stale_port: u16,
+    stale_transcript: &'a Arc<Mutex<Vec<Vec<u8>>>>,
+    stale_connections: &'a AtomicU64,
+}
+
+async fn assert_completed_redirect_replay_is_side_effect_free(
+    fixture: &RedirectReplayAndStale<'_>,
+) {
+    let mut duplicate = fixture.redirect.clone();
+    duplicate.request_id = 6001;
+    let _ = fixture.stack.forwarder.handle(duplicate).await;
+    let replay = wait_sent(&fixture.stack.sender, |envelope| {
+        envelope.request_id == 6001
+            && matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-e2e")
+    })
+    .await;
+    assert!(matches!(
+        replay.and_then(|envelope| envelope.body),
+        Some(Body::RedirectResult(result))
+            if result.succeeded
+                && result.previous_backend_id == "tidb-fake"
+                && result.backend_id == "tidb-other"
+    ));
+    assert_eq!(
+        fixture.target_connections.load(Ordering::Relaxed),
+        1,
+        "a completed duplicate replays its terminal without a second dial"
+    );
+    assert_eq!(
+        fixture
+            .stack
+            .backend_transcript
+            .lock()
+            .map_or(0, |commands| commands
+                .iter()
+                .filter(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES")
+                .count()),
+        1,
+        "a completed duplicate does not snapshot the old owner twice"
+    );
+    assert_eq!(
+        fixture
+            .target_transcript
+            .lock()
+            .map_or(0, |commands| commands
+                .iter()
+                .filter(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"))
+                .count()),
+        1,
+        "a completed duplicate does not restore the target twice"
+    );
+}
+
+async fn assert_stale_redirect_is_side_effect_free(fixture: &mut RedirectReplayAndStale<'_>) {
+    let stale = ControlEnvelope {
+        generation: 9,
+        ..command_envelope(
+            6002,
+            Body::RedirectCommand(RedirectCommand {
+                connection_id: 1,
+                redirect_id: "r-stale-generation".to_owned(),
+                backend_id: "tidb-stale-target".to_owned(),
+                backend_address: format!("127.0.0.1:{}", fixture.stale_port),
+                cluster_name: String::new(),
+                keyspace: String::new(),
+                backend_unhealthy: false,
+                backend_local: true,
+                deadline_unix_millis: 0,
+                command_sequence: 2,
+            }),
+        )
+    };
+    let _ = fixture.stack.forwarder.handle(stale).await;
+    let stale_error = wait_sent(&fixture.stack.sender, |envelope| {
+        envelope.request_id == 6002
+            && matches!(&envelope.body, Some(Body::Error(error)) if error.code == ErrorCode::StaleGeneration as i32)
+    })
+    .await;
+    assert!(stale_error.is_some(), "stale generation fails explicitly");
+    assert_eq!(
+        fixture.stale_connections.load(Ordering::Relaxed),
+        0,
+        "a stale generation is rejected before any target socket is touched"
+    );
+    assert!(
+        fixture
+            .stale_transcript
+            .lock()
+            .is_ok_and(|commands| commands.is_empty()),
+        "a stale generation cannot authenticate or restore a candidate"
+    );
+    assert!(
+        fixture
+            .client
+            .query_ok("SELECT after_stale_generation")
+            .await
+    );
+    assert!(
+        fixture
+            .target_transcript
+            .lock()
+            .is_ok_and(|commands| commands
+                .iter()
+                .any(|payload| payload.as_slice() == b"\x03SELECT after_stale_generation")),
+        "rejecting stale control leaves the successful target as sole owner"
+    );
+    assert!(
+        fixture
+            .stack
+            .backend_transcript
+            .lock()
+            .is_ok_and(|commands| commands
+                .iter()
+                .all(|payload| payload.as_slice() != b"\x03SELECT after_stale_generation")),
+        "the retired owner never receives a later user command"
+    );
+}
+
 #[tokio::test]
 async fn redirect_restores_candidate_and_swaps_atomically() {
     let stack = spawn_stack().await;
-    let (target_port, target_transcript, target_written_bytes) =
-        spawn_fake_backend_server(SnapshotReply::Valid).await;
+    let (target_port, target_transcript, target_written_bytes, target_connections) =
+        spawn_counting_fake_backend_server(SnapshotReply::Valid).await;
+    let (stale_port, stale_transcript, _, stale_connections) =
+        spawn_counting_fake_backend_server(SnapshotReply::Valid).await;
     spawn_route_answer(&stack, 1, 2);
     let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
         .await
@@ -2935,7 +3169,7 @@ async fn redirect_restores_candidate_and_swaps_atomically() {
             command_sequence: 1,
         }),
     );
-    let _ = stack.forwarder.handle(redirect).await;
+    let _ = stack.forwarder.handle(redirect.clone()).await;
     let result = wait_sent(
         &stack.sender,
         |e| matches!(&e.body, Some(Body::RedirectResult(result)) if result.redirect_id == "r-e2e"),
@@ -2952,56 +3186,30 @@ async fn redirect_restores_candidate_and_swaps_atomically() {
         unreachable!()
     };
     assert!(result.succeeded, "the restored candidate takes ownership");
+    assert_eq!(result.previous_backend_id, "tidb-fake");
     assert_eq!(result.backend_id, "tidb-other");
+    assert_eq!(
+        target_connections.load(Ordering::Relaxed),
+        1,
+        "one accepted redirect creates exactly one candidate connection"
+    );
     assert!(
         client.query_ok("SELECT after_snapshot").await,
         "the session keeps its backend and keeps serving"
     );
-    let old_transcript = stack
-        .backend_transcript
-        .lock()
-        .map_or_else(|_| Vec::new(), |commands| commands.clone());
-    assert_eq!(
-        old_transcript
-            .iter()
-            .filter(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES")
-            .count(),
-        1,
-        "MIG-00 captures one snapshot at the redirect safe boundary"
-    );
-    let target_transcript = target_transcript
-        .lock()
-        .map_or_else(|_| Vec::new(), |commands| commands.clone());
-    assert_eq!(
-        target_transcript
-            .iter()
-            .filter(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"))
-            .count(),
-        1,
-        "MIG-01 restores the candidate exactly once before swap"
-    );
-    assert!(
-        old_transcript.iter().all(|payload| !payload
-            .windows(b"signed-token-private".len())
-            .any(|window| window == b"signed-token-private")),
-        "the signed token is backend-to-proxy only"
-    );
-    let before = old_transcript
-        .iter()
-        .position(|payload| payload.as_slice() == b"\x03SELECT 1");
-    let snapshot = old_transcript
-        .iter()
-        .position(|payload| payload.as_slice() == b"\x03SHOW SESSION_STATES");
-    let restore = target_transcript
-        .iter()
-        .position(|payload| payload.starts_with(b"\x03SET SESSION_STATES '"));
-    let after = target_transcript
-        .iter()
-        .position(|payload| payload.as_slice() == b"\x03SELECT after_snapshot");
-    assert!(
-        matches!((before, snapshot, restore, after), (Some(before), Some(snapshot), Some(restore), Some(after)) if before < snapshot && restore < after),
-        "snapshot is on the old owner and restore precedes target traffic: old={old_transcript:?} target={target_transcript:?}"
-    );
+    assert_atomic_redirect_transcripts(&stack, &target_transcript);
+    let mut replay_and_stale = RedirectReplayAndStale {
+        stack: &stack,
+        client: &mut client,
+        redirect,
+        target_transcript: &target_transcript,
+        target_connections: &target_connections,
+        stale_port,
+        stale_transcript: &stale_transcript,
+        stale_connections: &stale_connections,
+    };
+    assert_completed_redirect_replay_is_side_effect_free(&replay_and_stale).await;
+    assert_stale_redirect_is_side_effect_free(&mut replay_and_stale).await;
     client.quit().await;
     assert_closed_backend_bytes_include_retired(&stack, &target_written_bytes).await;
     stack.dispatch_task.abort();
@@ -3219,6 +3427,11 @@ async fn complete_snapshot_validation_failures_preserve_old_backend() {
             unreachable!("redirect terminal for {behavior:?}")
         };
         assert!(!result.succeeded);
+        assert_eq!(result.previous_backend_id, "tidb-fake");
+        assert_eq!(
+            result.backend_id, "tidb-other",
+            "a failed terminal names the attempted route target while preserving the old owner"
+        );
         assert!(
             client.query_ok("SELECT after_snapshot_failure").await,
             "wire-complete {behavior:?} failure must preserve the old backend"
@@ -3286,6 +3499,11 @@ async fn candidate_failures_preserve_old_backend() {
             unreachable!("redirect terminal for {behavior:?}")
         };
         assert!(!result.succeeded);
+        assert_eq!(result.previous_backend_id, "tidb-fake");
+        assert_eq!(
+            result.backend_id, "tidb-other",
+            "candidate-only failure closes the exact old-to-target route event"
+        );
         assert!(
             client.query_ok("SELECT after_candidate_failure").await,
             "candidate-only {behavior:?} failure must preserve the old backend"

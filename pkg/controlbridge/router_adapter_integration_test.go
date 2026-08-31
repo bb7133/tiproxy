@@ -137,10 +137,144 @@ func TestRouterAdapterWithFakeRustUDSPeer(t *testing.T) {
 	require.Eventually(t, func() bool { return handler.handshakeCount() == 1 }, time.Second, 10*time.Millisecond)
 	require.Equal(t, 1, handler.rt.ConnCount())
 
-	writePeerEnvelope(t, peer, ack.GetControlEpoch(), connectionEvent(100,
-		controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED))
+	state := adapter.get(100)
+	require.NotNil(t, state)
+	state.mu.Lock()
+	conn := state.conn
+	receiver := &udsLifecycleReceiver{
+		next:    conn.eventReceiver(),
+		success: make(chan redirectRoute, 2),
+		failure: make(chan redirectRoute, 2),
+		closed:  make(chan string, 2),
+	}
+	conn.SetEventReceiver(receiver)
+	state.mu.Unlock()
+
+	successTarget := router.NewStaticBackend("tidb-success:4000")
+	require.True(t, conn.Redirect(successTarget))
+	successCommandEnvelope := readPeerResponse(t, peer, func(envelope *controlpb.ControlEnvelope) bool {
+		return envelope.GetRedirectCommand() != nil
+	})
+	successCommand := successCommandEnvelope.GetRedirectCommand()
+	require.Equal(t, uint64(7), successCommandEnvelope.GetGeneration())
+	require.Equal(t, uint64(1), successCommand.GetCommandSequence())
+	require.Equal(t, "tidb-success:4000", successCommand.GetBackendId())
+	successResult := &controlpb.RedirectResult{
+		ConnectionId:      100,
+		RedirectId:        successCommand.GetRedirectId(),
+		PreviousBackendId: "tidb-uds:4000",
+		BackendId:         "tidb-success:4000",
+		Succeeded:         true,
+		Code:              controlpb.ErrorCode_ERROR_CODE_OK,
+	}
+	for _, requestID := range []uint64{20, 21} {
+		writePeerEnvelope(t, peer, ack.GetControlEpoch(), &controlpb.ControlEnvelope{
+			RequestId: requestID,
+			Priority:  controlpb.Priority_PRIORITY_CRITICAL,
+			Body: &controlpb.ControlEnvelope_RedirectResult{
+				RedirectResult: successResult,
+			},
+		})
+	}
+	select {
+	case route := <-receiver.success:
+		require.Equal(t, redirectRoute{from: "tidb-uds:4000", to: "tidb-success:4000"}, route)
+	case <-time.After(time.Second):
+		t.Fatal("successful redirect callback missing")
+	}
+	require.Never(t, func() bool { return len(receiver.success) != 0 },
+		100*time.Millisecond, 10*time.Millisecond, "duplicate success terminal must not call the router twice")
+	require.Equal(t, "tidb-success:4000", conn.ServerAddr())
+	require.Equal(t, 1, handler.rt.ConnCount())
+
+	failureTarget := router.NewStaticBackend("tidb-failure:4000")
+	require.True(t, conn.Redirect(failureTarget))
+	failureCommandEnvelope := readPeerResponse(t, peer, func(envelope *controlpb.ControlEnvelope) bool {
+		return envelope.GetRedirectCommand() != nil
+	})
+	failureCommand := failureCommandEnvelope.GetRedirectCommand()
+	require.Equal(t, uint64(7), failureCommandEnvelope.GetGeneration())
+	require.Equal(t, uint64(2), failureCommand.GetCommandSequence())
+	require.Equal(t, "tidb-failure:4000", failureCommand.GetBackendId())
+	failureResult := &controlpb.RedirectResult{
+		ConnectionId:      100,
+		RedirectId:        failureCommand.GetRedirectId(),
+		PreviousBackendId: "tidb-success:4000",
+		BackendId:         "tidb-failure:4000",
+		Succeeded:         false,
+		Code:              controlpb.ErrorCode_ERROR_CODE_REDIRECT_FAILED,
+	}
+	for _, requestID := range []uint64{22, 23} {
+		writePeerEnvelope(t, peer, ack.GetControlEpoch(), &controlpb.ControlEnvelope{
+			RequestId: requestID,
+			Priority:  controlpb.Priority_PRIORITY_CRITICAL,
+			Body: &controlpb.ControlEnvelope_RedirectResult{
+				RedirectResult: failureResult,
+			},
+		})
+	}
+	select {
+	case route := <-receiver.failure:
+		require.Equal(t, redirectRoute{from: "tidb-success:4000", to: "tidb-failure:4000"}, route)
+	case <-time.After(time.Second):
+		t.Fatal("failed redirect callback missing")
+	}
+	require.Never(t, func() bool { return len(receiver.failure) != 0 },
+		100*time.Millisecond, 10*time.Millisecond, "duplicate failure terminal must not call the router twice")
+	require.Equal(t, "tidb-success:4000", conn.ServerAddr(), "failure keeps the successful owner")
+	require.Equal(t, 1, handler.rt.ConnCount())
+
+	closed := connectionEvent(100, controlpb.ConnectionEventKind_CONNECTION_EVENT_KIND_CLOSED)
+	writePeerEnvelope(t, peer, ack.GetControlEpoch(), closed)
+	writePeerEnvelope(t, peer, ack.GetControlEpoch(), closed)
+	select {
+	case backendID := <-receiver.closed:
+		require.Equal(t, "tidb-success:4000", backendID)
+	case <-time.After(time.Second):
+		t.Fatal("closed callback missing")
+	}
+	require.Never(t, func() bool { return len(receiver.closed) != 0 },
+		100*time.Millisecond, 10*time.Millisecond, "duplicate CLOSED must not call the router twice")
 	require.Eventually(t, func() bool { return handler.closeCount() == 1 }, time.Second, 10*time.Millisecond)
 	require.Equal(t, 0, handler.rt.ConnCount())
+}
+
+type redirectRoute struct {
+	from string
+	to   string
+}
+
+// udsLifecycleReceiver records callbacks crossing the real framed UDS seam,
+// then forwards them to the router that owns connection accounting.
+type udsLifecycleReceiver struct {
+	next    router.ConnEventReceiver
+	success chan redirectRoute
+	failure chan redirectRoute
+	closed  chan string
+}
+
+func (receiver *udsLifecycleReceiver) OnRedirectSucceed(
+	from, to string,
+	conn router.RedirectableConn,
+) error {
+	receiver.success <- redirectRoute{from: from, to: to}
+	return receiver.next.OnRedirectSucceed(from, to, conn)
+}
+
+func (receiver *udsLifecycleReceiver) OnRedirectFail(
+	from, to string,
+	conn router.RedirectableConn,
+) error {
+	receiver.failure <- redirectRoute{from: from, to: to}
+	return receiver.next.OnRedirectFail(from, to, conn)
+}
+
+func (receiver *udsLifecycleReceiver) OnConnClosed(
+	backendID string,
+	conn router.RedirectableConn,
+) error {
+	receiver.closed <- backendID
+	return receiver.next.OnConnClosed(backendID, conn)
 }
 
 func writePeerEnvelope(t *testing.T, peer *net.UnixConn, epoch uint64, envelope *controlpb.ControlEnvelope) {

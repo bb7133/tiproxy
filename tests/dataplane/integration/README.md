@@ -171,6 +171,38 @@ the aligned old backend. Dedicated real-socket rows additionally isolate zlib
 candidate activation and the combined zstd+PROXY-v2 candidate ordering while
 checking exact retired-plus-current raw-byte totals.
 
+### MIG-02 atomic redirect lifecycle (#44)
+
+MIG-02 closes the control/accounting boundary around that live MIG-01 swap.
+The production Rust command gate binds each accepted redirect id and sequence to
+the router-issued target backend. A successful terminal changes the physical
+owner; a failed terminal keeps the old owner but still reports the attempted
+target, because the Go router opened its pending score and metric route under
+that exact `(old,target)` pair. This prevents failed redirects from leaking a
+pending gauge under one label while decrementing an unrelated `(old,old)`
+label.
+
+The deterministic acceptance rows deliberately complement, rather than repeat,
+the real-TiDB migration phase:
+
+- `redirect_restores_candidate_and_swaps_atomically` drives the production
+  dispatcher and session engine through success, a completed duplicate, and a
+  stale generation. Backend accept/transcript counters prove one candidate
+  dial, one snapshot, one restore, zero stale-target I/O, and that every later
+  user command reaches only the new owner. Final CLOSED accounting still
+  includes the retired old socket and current socket exactly once.
+- `TestRouterAdapterWithFakeRustUDSPeer` crosses the real framed Unix socket and
+  proves generation/sequence propagation plus exactly one Go callback for
+  duplicated success, failure, and CLOSED terminals. A failure leaves the
+  projected server address and connection count on the successful owner.
+- `TestRedirectFailureBalancesExactRouteAccounting` uses the production
+  `ScoreBasedRouter` health/rebalance loop. It observes the real old-to-target
+  pending gauge rise, feeds the exact failed Rust terminal, and requires the
+  gauge to return to its prior baseline once; replay cannot decrement it twice.
+
+Together these rows make the live A0 -> A1 result a single-owner atomic swap
+with generation-safe, idempotent control effects and balanced Go accounting.
+
 ## Control-frame dropper (chaos-E2E control-loss)
 
 `controldropper/` is a test-only man-in-the-middle for the Go/Rust **control**
