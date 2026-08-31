@@ -101,11 +101,11 @@ use session_core::auth::{
     UNKNOWN_AUTH_PLUGIN, classify_backend_auth_packet, compression_selection,
     plan_backend_handshake, plan_backend_migration_handshake,
 };
+use session_core::boundary::{HeldBegin, HoldEffect, need_hold_request};
 use session_core::command::{
     Command, CommandSessionState, CommandStateEffects, ExpectedResponse, SessionMutation, dispatch,
 };
 use session_core::error_source::FailureKind;
-use session_core::boundary::{HeldBegin, HoldEffect, need_hold_request};
 use session_core::fsm::{SessionEffect, SessionEvent};
 use session_core::handshake::{
     ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend, verify_backend,
@@ -2589,7 +2589,11 @@ impl Engine {
             };
         }
         loop {
-            let payload = match backend.backend_io.read_logical(limits.max_result_bytes).await {
+            let payload = match backend
+                .backend_io
+                .read_logical(limits.max_result_bytes)
+                .await
+            {
                 Ok(packet) => packet.payload,
                 Err(_) => return InternalCommitOutcome::BackendNetwork,
             };

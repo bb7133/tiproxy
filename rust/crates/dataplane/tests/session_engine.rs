@@ -2653,16 +2653,24 @@ async fn redirect_in_transaction_holds_commits_and_replays_begin() {
             Ok(old) => old,
             Err(error) => unreachable!("old transcript: {error}"),
         };
-        let commit_at = old.iter().position(|packet| packet.as_slice() == b"\x03COMMIT");
+        let commit_at = old
+            .iter()
+            .position(|packet| packet.as_slice() == b"\x03COMMIT");
         let snapshot_at = old
             .iter()
             .position(|packet| packet.as_slice() == b"\x03SHOW SESSION_STATES");
-        assert!(commit_at.is_some(), "old backend received the internal COMMIT");
+        assert!(
+            commit_at.is_some(),
+            "old backend received the internal COMMIT"
+        );
         assert!(
             snapshot_at.is_some(),
             "old backend received the migration snapshot"
         );
-        assert!(commit_at < snapshot_at, "COMMIT precedes the snapshot query");
+        assert!(
+            commit_at < snapshot_at,
+            "COMMIT precedes the snapshot query"
+        );
     }
 
     // The new backend saw the restore then the replayed BEGIN exactly once.
