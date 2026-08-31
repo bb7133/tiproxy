@@ -470,9 +470,15 @@ fn reconcile_request_carries_rehydration_fidelity() {
     let Some(id1) = first.identity.as_ref() else {
         unreachable!("connection 1 reports its admission identity")
     };
-    assert_eq!(id1.connection_id, first.connection_id, "embedded id == outer id");
+    assert_eq!(
+        id1.connection_id, first.connection_id,
+        "embedded id == outer id"
+    );
     assert_eq!(id1, &identity(1), "admission identity echoed verbatim");
-    assert_eq!(first.generation, 7, "reports snapshot_generation, not known_generation");
+    assert_eq!(
+        first.generation, 7,
+        "reports snapshot_generation, not known_generation"
+    );
     assert_eq!(first.backend_id, "tidb-a");
     assert!(!first.redirect_pending);
     assert_eq!(first.pending_redirect_id, "");
@@ -483,9 +489,15 @@ fn reconcile_request_carries_rehydration_fidelity() {
     let Some(id2) = second.identity.as_ref() else {
         unreachable!("connection 2 reports its admission identity")
     };
-    assert_eq!(id2.connection_id, second.connection_id, "embedded id == outer id");
+    assert_eq!(
+        id2.connection_id, second.connection_id,
+        "embedded id == outer id"
+    );
     assert_eq!(id2, &identity(2), "admission identity echoed verbatim");
-    assert_eq!(second.generation, 11, "each connection reports its own snapshot_generation");
+    assert_eq!(
+        second.generation, 11,
+        "each connection reports its own snapshot_generation"
+    );
     assert_eq!(
         second.backend_id, "tidb-owner",
         "reports the authoritative owner, not the redirect target"
@@ -554,8 +566,14 @@ fn reconcile_reports_current_incarnation_same_generation_new_identity() {
         id.client_address, "10.0.0.2:23456",
         "the stale incarnation is superseded"
     );
-    assert_eq!(conn.generation, 7, "same snapshot generation across the incarnation");
-    assert_eq!(conn.backend_id, "tidb-b", "reports the current incarnation's backend");
+    assert_eq!(
+        conn.generation, 7,
+        "same snapshot generation across the incarnation"
+    );
+    assert_eq!(
+        conn.backend_id, "tidb-b",
+        "reports the current incarnation's backend"
+    );
     // The stale incarnation's in-flight redirect does not leak into the fresh
     // one: the new registration starts from a clean redirect state.
     assert!(
