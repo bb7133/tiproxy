@@ -725,6 +725,128 @@ mod tests {
         );
     }
 
+    /// WIRE-04: backend TLS is mandatory when configured as required and is
+    /// otherwise opportunistic only when the client, backend, and snapshot
+    /// configuration all permit it. Every disabled row must also remove SSL
+    /// from the forwarded capability mask so credentials cannot accidentally
+    /// follow a plaintext `SSLRequest`.
+    #[test]
+    fn backend_tls_planning_matches_required_and_opportunistic_matrix() {
+        let protocol = CapabilityFlags::PROTOCOL_41;
+        let ssl = CapabilityFlags::SSL;
+
+        assert_eq!(
+            plan_backend_migration_handshake(protocol | ssl, true, protocol | ssl, true, false),
+            Err(BackendTlsUnavailable),
+            "required TLS without a compiled backend policy is a typed failure"
+        );
+
+        let cases = [
+            (
+                "required",
+                protocol | ssl,
+                protocol | ssl,
+                true,
+                true,
+                BackendTlsMode::Enabled,
+            ),
+            (
+                "opportunistic-all-permit",
+                protocol | ssl,
+                protocol | ssl,
+                false,
+                true,
+                BackendTlsMode::Enabled,
+            ),
+            (
+                "opportunistic-client-plaintext",
+                protocol,
+                protocol | ssl,
+                false,
+                true,
+                BackendTlsMode::Disabled,
+            ),
+            (
+                "opportunistic-backend-no-ssl",
+                protocol | ssl,
+                protocol,
+                false,
+                true,
+                BackendTlsMode::Disabled,
+            ),
+            (
+                "opportunistic-no-config",
+                protocol | ssl,
+                protocol | ssl,
+                false,
+                false,
+                BackendTlsMode::Disabled,
+            ),
+        ];
+
+        for (name, negotiated, backend, required, available, expected_tls) in cases {
+            let Ok(plan) =
+                plan_backend_migration_handshake(negotiated, true, backend, required, available)
+            else {
+                unreachable!("{name}: valid matrix row")
+            };
+            assert_eq!(plan.tls, expected_tls, "{name}");
+            assert_eq!(
+                plan.capabilities.contains(ssl),
+                expected_tls == BackendTlsMode::Enabled,
+                "{name}: SSL capability must exactly match the transport mode"
+            );
+            assert!(
+                plan.capabilities.contains(CapabilityFlags::CONNECT_ATTRS),
+                "{name}: client attributes survive capability intersection"
+            );
+            assert!(plan.capabilities.contains(protocol), "{name}");
+        }
+    }
+
+    /// The initial entry point consumes the typed routing gate but must remain
+    /// exactly the same decision as the migration entry point.
+    #[test]
+    fn initial_and_migration_backend_tls_planning_are_identical() {
+        let protocol = CapabilityFlags::PROTOCOL_41;
+        let ssl = CapabilityFlags::SSL;
+        let frontend = protocol | ssl | CapabilityFlags::PLUGIN_AUTH;
+        let Ok(negotiation) = crate::handshake::negotiate_frontend(frontend, frontend) else {
+            unreachable!("static frontend capability set is valid")
+        };
+        let response = mysql_wire::HandshakeResponse {
+            capabilities: frontend,
+            max_packet_size: 16 * 1024 * 1024,
+            collation: 45,
+            username: b"root",
+            auth_response: b"",
+            database: None,
+            auth_plugin_name: Some(b"mysql_native_password"),
+            attributes: None,
+            zstd_level: None,
+            raw: b"",
+            trailing: b"",
+        };
+        let routing = negotiation.routing_handshake(
+            &response,
+            crate::handshake::ConnectionEndpoints {
+                listener_addr: ([127, 0, 0, 1], 4000).into(),
+                client_addr: ([127, 0, 0, 1], 5000).into(),
+            },
+        );
+        assert_eq!(
+            plan_backend_handshake(&routing, frontend, false, true),
+            plan_backend_migration_handshake(
+                routing.negotiated(),
+                routing.has_attributes(),
+                frontend,
+                false,
+                true,
+            ),
+            "initial and migration handshakes share one TLS/capability decision"
+        );
+    }
+
     /// Success: OK forwards to the client and activates compression per
     /// side — client from the negotiated mask, backend from the
     /// negotiated∩backend mask.

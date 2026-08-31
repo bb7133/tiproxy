@@ -1501,6 +1501,7 @@ struct Stack {
     backend_transcript: Arc<Mutex<Vec<Vec<u8>>>>,
     backend_proxy_headers: Arc<Mutex<Vec<Vec<u8>>>>,
     backend_written_bytes: Arc<AtomicU64>,
+    backend_accepted_connections: Arc<AtomicU64>,
 }
 
 async fn spawn_stack() -> Stack {
@@ -1604,6 +1605,7 @@ async fn spawn_configured_fake_backend(
     Arc<Mutex<Vec<Vec<u8>>>>,
     Arc<Mutex<Vec<Vec<u8>>>>,
     Arc<AtomicU64>,
+    Arc<AtomicU64>,
 ) {
     let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
         unreachable!("backend bind")
@@ -1614,6 +1616,7 @@ async fn spawn_configured_fake_backend(
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let proxy_headers = Arc::new(Mutex::new(Vec::new()));
     let written_bytes = Arc::new(AtomicU64::new(0));
+    let accepted_connections = Arc::new(AtomicU64::new(0));
     tokio::spawn(run_fake_backend(
         listener,
         Arc::clone(&transcript),
@@ -1624,10 +1627,16 @@ async fn spawn_configured_fake_backend(
             proxy_headers: Some(Arc::clone(&proxy_headers)),
             send_idle_byte,
             tls_config,
-            accepted_connections: None,
+            accepted_connections: Some(Arc::clone(&accepted_connections)),
         },
     ));
-    (address.port(), transcript, proxy_headers, written_bytes)
+    (
+        address.port(),
+        transcript,
+        proxy_headers,
+        written_bytes,
+        accepted_connections,
+    )
 }
 
 // The test-stack constructor mirrors the executable's full composition; its
@@ -1669,7 +1678,7 @@ async fn spawn_stack_configured_with_metering(
     drain_deadline: Duration,
     metering: Option<MeteringSourceRegistry>,
 ) -> Stack {
-    let (backend_port, backend_transcript, backend_proxy_headers, backend_written_bytes) =
+    let backend =
         spawn_configured_fake_backend(snapshot_reply, proxy_v2, send_idle_byte, tls_config.clone())
             .await;
 
@@ -1770,11 +1779,12 @@ async fn spawn_stack_configured_with_metering(
         sql_port: sql_addr.port(),
         server_task,
         dispatch_task,
-        backend_port,
+        backend_port: backend.0,
         metrics_rx,
-        backend_transcript,
-        backend_proxy_headers,
-        backend_written_bytes,
+        backend_transcript: backend.1,
+        backend_proxy_headers: backend.2,
+        backend_written_bytes: backend.3,
+        backend_accepted_connections: backend.4,
     }
 }
 
@@ -2500,8 +2510,9 @@ async fn inbound_proxy_v2_header_and_tlvs_are_forwarded_verbatim() {
         None,
     )
     .await;
-    let (target_port, _target_transcript, target_proxy_headers, _target_written_bytes) =
-        spawn_configured_fake_backend(SnapshotReply::Valid, true, false, None).await;
+    let target = spawn_configured_fake_backend(SnapshotReply::Valid, true, false, None).await;
+    let target_port = target.0;
+    let target_proxy_headers = target.2;
     spawn_route_answer(&stack, 1, 2);
 
     let Ok(src_ip) = "2001:db8::7133".parse::<Ipv6Addr>() else {
@@ -5786,6 +5797,105 @@ async fn drive_frontend_tls_handshake(port: u16, ca_pem: &str) -> bool {
         }
     }
     !conn.is_handshaking()
+}
+
+/// Opens a real production listener and reads its protocol-10 greeting,
+/// returning the still-open raw socket and advertised capability mask.
+async fn read_frontend_greeting(port: u16) -> Option<(TcpStream, CapabilityFlags)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header).await.ok()?;
+    assert_eq!(
+        header[3], 0,
+        "the frontend greeting starts at sequence zero"
+    );
+    let length =
+        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).await.ok()?;
+    let greeting = parse_initial_handshake(&payload).ok()?;
+    Some((stream, greeting.capabilities))
+}
+
+/// Writes one sequence-1 packet and reports whether the production listener
+/// closes without sending plaintext after rejecting it.
+async fn rejected_frontend_packet_closes(mut stream: TcpStream, payload: &[u8]) -> bool {
+    let Ok(length) = u32::try_from(payload.len()) else {
+        return false;
+    };
+    let length = length.to_le_bytes();
+    let header = [length[0], length[1], length[2], 1];
+    if stream.write_all(&header).await.is_err()
+        || stream.write_all(payload).await.is_err()
+        || stream.flush().await.is_err()
+    {
+        return false;
+    }
+    let mut byte = [0_u8; 1];
+    matches!(
+        timeout(Duration::from_secs(2), stream.read(&mut byte)).await,
+        Ok(Ok(0))
+    )
+}
+
+/// WIRE-04 production seam: the SSL capability follows the live frontend TLS
+/// snapshot, and an unsupported or non-exact `SSLRequest` fails closed before
+/// routing, backend contact, credentials, or any plaintext fallback.
+#[tokio::test]
+async fn frontend_tls_capability_and_ssl_request_shape_fail_closed() {
+    let requested = CapabilityFlags::PROTOCOL_41
+        | CapabilityFlags::SECURE_CONNECTION
+        | CapabilityFlags::PLUGIN_AUTH
+        | CapabilityFlags::SSL;
+
+    // No compiled frontend TLS policy: SSL is absent from the greeting, and a
+    // client that sends an exact SSLRequest anyway is rejected before routing.
+    let plain = spawn_stack().await;
+    let Some((stream, advertised)) = read_frontend_greeting(plain.sql_port).await else {
+        unreachable!("plain frontend greeting")
+    };
+    assert!(!advertised.contains(CapabilityFlags::SSL));
+    let ssl_request = encode_ssl_request(requested, 16 * 1024 * 1024, 45);
+    assert!(rejected_frontend_packet_closes(stream, &ssl_request).await);
+    assert_eq!(
+        plain.backend_accepted_connections.load(Ordering::Relaxed),
+        0,
+        "an unsupported SSLRequest must not dial a backend"
+    );
+    plain.shutdown_tx.send(true).ok();
+    plain.dispatch_task.abort();
+    plain.server_task.abort();
+
+    // A compiled policy advertises SSL, but only the protocol's exact 32-byte
+    // SSLRequest shape can cross the TLS upgrade boundary.
+    let Some((fixture, _ca_pem)) = write_frontend_tls_fixture() else {
+        unreachable!("frontend TLS fixture")
+    };
+    let tls = spawn_stack_full(
+        SnapshotReply::Valid,
+        false,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        Some(fixture),
+    )
+    .await;
+    let Some((stream, advertised)) = read_frontend_greeting(tls.sql_port).await else {
+        unreachable!("TLS frontend greeting")
+    };
+    assert!(advertised.contains(CapabilityFlags::SSL));
+    let mut malformed = encode_ssl_request(requested, 16 * 1024 * 1024, 45).to_vec();
+    malformed.push(0);
+    assert_eq!(malformed.len(), 33);
+    assert!(rejected_frontend_packet_closes(stream, &malformed).await);
+    assert_eq!(
+        tls.backend_accepted_connections.load(Ordering::Relaxed),
+        0,
+        "a malformed SSLRequest must not dial a backend"
+    );
+    tls.shutdown_tx.send(true).ok();
+    tls.dispatch_task.abort();
+    tls.server_task.abort();
 }
 
 /// WIRE-MTR (production TLS path): under a REAL engine frontend-TLS session,
