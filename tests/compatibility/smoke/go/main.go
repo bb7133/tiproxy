@@ -71,8 +71,11 @@ func run(host string, port int, user, password, database, caFile, serverName, at
 	params.Set("timeout", "15s")
 	params.Set("readTimeout", "15s")
 	params.Set("writeTimeout", "15s")
-	// A unique connection attribute the proxy echoes into its close log, so the
-	// orchestrator correlates this exact connection's negotiated capabilities.
+	// A unique per-case connection attribute, set for future
+	// attribute-correlatable observability. The orchestrator currently
+	// correlates POSITIONALLY (exactly one new connection_closed line in the
+	// case's log window), because the dataplane close log does not yet echo
+	// connection attributes.
 	if attr != "" {
 		params.Set("connectionAttributes", "tiproxy_smoke_case:"+attr)
 	}

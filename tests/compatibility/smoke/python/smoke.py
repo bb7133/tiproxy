@@ -42,8 +42,10 @@ def build_config(args):
         "use_pure": True,
     }
     if args.attr:
-        # A unique connection attribute the proxy echoes into its close log so
-        # the orchestrator correlates this exact connection's negotiated caps.
+        # A unique per-case connection attribute, set for future
+        # attribute-correlatable observability. The orchestrator currently
+        # correlates POSITIONALLY (exactly one new connection_closed line in the
+        # case's log window); the dataplane close log does not yet echo attrs.
         cfg["conn_attrs"] = {"tiproxy_smoke_case": args.attr}
     if args.workload == "tls":
         if not args.ca_file:
