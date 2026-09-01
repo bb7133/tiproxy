@@ -41,9 +41,11 @@ deltas since a sample are included immediately rather than waiting for the
 next `/proc` read.
 
 Reload publishes a complete validated snapshot atomically for new connections.
-Existing handlers retain their captured `Arc`. Listener changes remain
-restart-required under control protocol v1; DPL-03 owns any later listener
-generation policy.
+Existing handlers retain their captured `Arc`; their session seat also receives
+complete last-good generations so the one explicit live exception — exact
+backend-identity health — can re-select the captured healthy/unhealthy
+keepalive policy on the socket owner. Listener changes remain restart-required
+under control protocol v1; DPL-03 owns any later listener generation policy.
 
 This implements the Rust targets behind `PARITY-ADM-001`, `PARITY-ADM-002`,
 `PARITY-KA-001`, the new-session subset of `PARITY-CFG-001`, and the

@@ -176,8 +176,10 @@ pub struct DataplaneHandle {
 
 impl DataplaneHandle {
     /// Atomically publishes a complete validated generation for new
-    /// admissions/sessions. Existing sessions retain their captured `Arc`.
-    /// Listener changes fail because listeners are restart-required in v1.
+    /// admissions/sessions. Existing sessions retain their captured `Arc`,
+    /// while their private watch receiver exposes the explicit live-topology
+    /// exceptions (currently backend-health keepalive refresh). Listener
+    /// changes fail because listeners are restart-required in v1.
     ///
     /// # Errors
     ///
@@ -263,6 +265,7 @@ impl DataplaneHandle {
 pub struct AcceptedConnection {
     stream: TcpStream,
     snapshot: Arc<ValidatedSnapshot>,
+    snapshot_updates: watch::Receiver<Arc<ValidatedSnapshot>>,
     lease: ConnectionLease,
 }
 
@@ -300,6 +303,7 @@ impl AcceptedConnection {
             self.stream,
             SessionSeat {
                 snapshot: self.snapshot,
+                snapshot_updates: self.snapshot_updates,
                 lease: self.lease,
             },
         )
@@ -310,6 +314,7 @@ impl AcceptedConnection {
 /// snapshot and the registry lease, alive until dropped.
 pub struct SessionSeat {
     snapshot: Arc<ValidatedSnapshot>,
+    snapshot_updates: watch::Receiver<Arc<ValidatedSnapshot>>,
     lease: ConnectionLease,
 }
 
@@ -318,6 +323,14 @@ impl SessionSeat {
     #[must_use]
     pub fn snapshot(&self) -> &Arc<ValidatedSnapshot> {
         &self.snapshot
+    }
+
+    /// Subscribes to complete last-good generations published after admission.
+    /// The admission snapshot remains immutable; session owners use this feed
+    /// only for fields explicitly documented as live, such as backend health.
+    #[must_use]
+    pub fn subscribe_snapshot_updates(&self) -> watch::Receiver<Arc<ValidatedSnapshot>> {
+        self.snapshot_updates.clone()
     }
 
     /// Payload-free identity and accounting metadata.
@@ -736,6 +749,7 @@ async fn run_listener(
                         Arc::clone(&name),
                         actual_address,
                         snapshot,
+                        snapshot_rx.clone(),
                         &admission,
                         &registry,
                         &counters,
@@ -844,6 +858,7 @@ fn prepare_connection(
     listener_name: Arc<str>,
     listener_address: SocketAddr,
     snapshot: Arc<ValidatedSnapshot>,
+    snapshot_updates: watch::Receiver<Arc<ValidatedSnapshot>>,
     admission: &AdmissionController,
     registry: &ConnectionRegistry,
     counters: &ServerCounters,
@@ -887,6 +902,7 @@ fn prepare_connection(
     Some(AcceptedConnection {
         stream,
         snapshot,
+        snapshot_updates,
         lease,
     })
 }
@@ -1058,6 +1074,46 @@ mod tests {
         let metrics = handle.metrics();
         assert_eq!(metrics.active_connections, 0);
         assert_eq!(metrics.connection_buffer_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_session_keeps_admission_snapshot_and_observes_live_generation()
+    -> Result<(), Box<dyn Error>> {
+        let snap = snapshot(1, 0, 0.0, one_listener())?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let (_stream, seat) = connection.into_session_io();
+                let admission_generation = seat.snapshot().generation();
+                let mut updates = seat.subscribe_snapshot_updates();
+                let _ = tx.send((admission_generation, None));
+                if updates.changed().await.is_ok() {
+                    let live_generation = updates.borrow_and_update().generation();
+                    let _ = tx.send((seat.snapshot().generation(), Some(live_generation)));
+                }
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        let _client = TcpStream::connect(actual).await?;
+        assert_eq!(
+            timeout(TokioDuration::from_secs(2), rx.recv()).await?,
+            Some((1, None))
+        );
+        handle.update_snapshot(snapshot(2, 0, 0.0, one_listener())?)?;
+        assert_eq!(
+            timeout(TokioDuration::from_secs(2), rx.recv()).await?,
+            Some((1, Some(2))),
+            "live generations must not replace the admission snapshot"
+        );
+
+        handle.shutdown();
+        owner.await??;
         Ok(())
     }
 

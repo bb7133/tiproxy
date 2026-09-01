@@ -259,14 +259,16 @@ An equal generation with identical contents reuses the same `Arc`; stale,
 conflicting, invalid, or unsupported generations return a redacted reason and
 leave the old `Arc` untouched. A session captures that immutable handle when it
 starts, so later certificate rotation affects new sessions without mutating an
-established session's TLS context.
+established session's TLS context. The session also owns a last-good generation
+receiver used only for explicitly live fields: current backend health may
+re-select the captured generation's healthy/unhealthy keepalive policy.
 
 The Rust-mode reload contract is:
 
 | Snapshot field or source setting | Rust-mode behavior | Reason |
 | --- | --- | --- |
 | `max-connections`, memory threshold, connection buffer | Reloadable; new admission/session state uses the committed generation. | No listener or process identity changes. |
-| Frontend/healthy-backend/unhealthy-backend keepalive | Reloadable for new connections; the runtime may separately refresh health-driven backend keepalive as specified by `CFG-001`. | Connection-scoped socket settings are immutable unless explicitly refreshed. |
+| Frontend/healthy-backend/unhealthy-backend keepalive | Reloadable for new connections; an established session keeps its captured policy values but re-selects healthy versus unhealthy from live topology immediately at a safe command boundary and after migration, with a five-second retry ticker. | No mixed-generation policy values; only the health selector is live. |
 | PROXY v2 mode, backend TLS requirement, graceful timers, public CIDRs | Reloadable for new connections and new drain operations. | Complete snapshot replacement avoids mixed policy. |
 | Frontend/backend certificate, key, CA paths; TLS minimum; allowed CNs; skip-CA policy | Reloadable after Rust rereads and validates every referenced regular file beneath the configured TLS roots. Atomic rename to a new file path is supported. | Existing sessions retain their captured generation; invalid/expired/mismatched material keeps last-good. |
 | Backend discovery and namespace routing entries | Reloadable as part of the same generation. | A session's selected namespace/backend identity remains connection-stable. |

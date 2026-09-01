@@ -8,6 +8,8 @@ import "github.com/prometheus/client_golang/prometheus"
 const (
 	LblRes        = "res"
 	LblMetricName = "metric"
+	LblHealth     = "health"
+	LblResult     = "result"
 )
 
 var (
@@ -43,6 +45,14 @@ var (
 			Name:      "dial_backend_fail",
 			Help:      "Counter of failing to dial backends.",
 		}, []string{LblBackend})
+
+	BackendKeepAliveUpdateCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: ModuleProxy,
+			Subsystem: LabelBackend,
+			Name:      "keepalive_update_total",
+			Help:      "Counter of health-driven backend keepalive policy updates.",
+		}, []string{LblBackend, LblHealth, LblResult})
 
 	PingBackendGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{

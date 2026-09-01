@@ -1753,6 +1753,7 @@ async fn spawn_stack_configured_with_metering(
     drop(sql_listener);
     let snapshot = engine_snapshot(
         sql_addr.port(),
+        backend.0,
         proxy_v2,
         frontend_tls.as_ref(),
         tls_config.is_some(),
@@ -1790,12 +1791,14 @@ async fn spawn_stack_configured_with_metering(
 
 fn engine_snapshot(
     port: u16,
+    backend_port: u16,
     proxy_v2: bool,
     frontend_tls: Option<&FrontendTlsFixture>,
     require_backend_tls: bool,
 ) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
     use control_proto::v1::{
-        ConfigSnapshot, KeepalivePolicy, Listener, ProxyProtocolMode, StateSnapshot, TlsPolicy,
+        BackendSnapshot, ConfigSnapshot, KeepalivePolicy, Listener, ProxyProtocolMode,
+        StateSnapshot, TlsPolicy,
     };
     let proxy_protocol = if proxy_v2 {
         ProxyProtocolMode::V2
@@ -1816,13 +1819,17 @@ fn engine_snapshot(
         interval_millis: 3_000,
         user_timeout_millis: 15_000,
     };
+    let unhealthy_keepalive = KeepalivePolicy {
+        enabled: false,
+        ..KeepalivePolicy::default()
+    };
     let raw = StateSnapshot {
         config: Some(ConfigSnapshot {
             high_memory_reject_threshold: 0.9,
             connection_buffer_bytes: 32 * 1024,
             frontend_keepalive: Some(keepalive),
             healthy_backend_keepalive: Some(keepalive),
-            unhealthy_backend_keepalive: Some(keepalive),
+            unhealthy_backend_keepalive: Some(unhealthy_keepalive),
             proxy_protocol: proxy_protocol as i32,
             listeners: vec![Listener {
                 address: "127.0.0.1".to_owned(),
@@ -1838,6 +1845,14 @@ fn engine_snapshot(
             require_backend_tls,
             ..ConfigSnapshot::default()
         }),
+        backends: vec![BackendSnapshot {
+            backend_id: "tidb-fake".to_owned(),
+            address: format!("127.0.0.1:{backend_port}"),
+            cluster_name: String::new(),
+            healthy: true,
+            local: true,
+            ..BackendSnapshot::default()
+        }],
         ..StateSnapshot::default()
     };
     let Ok(store) = control_proto::snapshot::SnapshotStore::new(store_dirs) else {
@@ -1850,6 +1865,59 @@ fn engine_snapshot(
         control_proto::snapshot::SnapshotLineage::for_tests("go-fixture"),
     ) else {
         unreachable!("snapshot applies")
+    };
+    outcome.snapshot
+}
+
+fn engine_health_snapshot(
+    sql_port: u16,
+    backend_port: u16,
+    generation: u64,
+    healthy: bool,
+) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
+    let base = engine_snapshot(sql_port, backend_port, false, None, false);
+    let mut raw = base.raw().clone();
+    raw.backends[0].healthy = healthy;
+    let Ok(store) = control_proto::snapshot::SnapshotStore::new([]) else {
+        unreachable!("store")
+    };
+    let Ok(outcome) = store.apply(
+        generation,
+        raw,
+        control_proto::snapshot::UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+        control_proto::snapshot::SnapshotLineage::for_tests("go-fixture"),
+    ) else {
+        unreachable!("health snapshot applies")
+    };
+    outcome.snapshot
+}
+
+fn engine_redirect_health_snapshot(
+    sql_port: u16,
+    current_port: u16,
+    target_port: u16,
+    generation: u64,
+) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
+    let base = engine_health_snapshot(sql_port, current_port, generation, true);
+    let mut raw = base.raw().clone();
+    raw.backends.push(control_proto::v1::BackendSnapshot {
+        backend_id: "tidb-other".to_owned(),
+        address: format!("127.0.0.1:{target_port}"),
+        cluster_name: String::new(),
+        healthy: false,
+        local: true,
+        ..control_proto::v1::BackendSnapshot::default()
+    });
+    let Ok(store) = control_proto::snapshot::SnapshotStore::new([]) else {
+        unreachable!("store")
+    };
+    let Ok(outcome) = store.apply(
+        generation,
+        raw,
+        control_proto::snapshot::UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+        control_proto::snapshot::SnapshotLineage::for_tests("go-fixture"),
+    ) else {
+        unreachable!("redirect health snapshot applies")
     };
     outcome.snapshot
 }
@@ -2663,6 +2731,72 @@ async fn session_path_emits_query_traffic_and_exact_quit_source() {
     );
     assert!(saw_handshake && saw_query && saw_close);
     stack.dispatch_task.abort();
+}
+
+/// A complete topology generation re-applies the admission snapshot's
+/// health-specific policy to an already authenticated socket, without
+/// replacing its protocol config or disturbing the next command boundary.
+#[tokio::test]
+async fn existing_session_reapplies_keepalive_on_backend_health_flip() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("SELECT before_health_flip").await);
+
+    let unhealthy = engine_health_snapshot(stack.sql_port, stack.backend_port, 2, false);
+    assert!(stack.server_handle.update_snapshot(unhealthy).is_ok());
+    let unhealthy_update = timeout(Duration::from_secs(2), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            if let Observation::BackendKeepaliveUpdated {
+                backend,
+                healthy: false,
+                succeeded,
+            } = observation
+            {
+                return Some((backend, succeeded));
+            }
+        }
+        None
+    })
+    .await;
+    assert!(matches!(
+        unhealthy_update,
+        Ok(Some((backend, true))) if backend.ends_with(&stack.backend_port.to_string())
+    ));
+    assert!(client.query_ok("SELECT after_unhealthy_flip").await);
+
+    let healthy = engine_health_snapshot(stack.sql_port, stack.backend_port, 3, true);
+    assert!(stack.server_handle.update_snapshot(healthy).is_ok());
+    let healthy_update = timeout(Duration::from_secs(2), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            if let Observation::BackendKeepaliveUpdated {
+                healthy: true,
+                succeeded,
+                ..
+            } = observation
+            {
+                return Some(succeeded);
+            }
+        }
+        None
+    })
+    .await;
+    assert_eq!(
+        healthy_update,
+        Ok(Some(cfg!(target_os = "linux"))),
+        "non-Linux reports the configured TCP_USER_TIMEOUT diagnostic"
+    );
+    assert!(client.query_ok("SELECT after_healthy_flip").await);
+
+    client.quit().await;
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
 }
 
 #[tokio::test]
@@ -3623,6 +3757,80 @@ async fn redirect_restores_candidate_and_swaps_atomically() {
     client.quit().await;
     assert_closed_backend_bytes_include_retired(&stack, &target_written_bytes).await;
     stack.dispatch_task.abort();
+}
+
+#[tokio::test]
+async fn redirect_immediately_reconciles_target_keepalive_with_live_topology() {
+    let mut stack = spawn_stack().await;
+    let (target_port, _target_transcript, _target_written_bytes) =
+        spawn_fake_backend_server(SnapshotReply::Valid).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+
+    // The control command was admitted while the target was healthy, but the
+    // latest complete topology already marks that exact target unhealthy. The
+    // current owner remains healthy, so only the post-swap reconciliation can
+    // produce the unhealthy update below.
+    let topology =
+        engine_redirect_health_snapshot(stack.sql_port, stack.backend_port, target_port, 2);
+    assert!(stack.server_handle.update_snapshot(topology).is_ok());
+    let redirect = command_envelope(
+        6040,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "r-health-flip".to_owned(),
+            backend_id: "tidb-other".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            keyspace: String::new(),
+            backend_unhealthy: false,
+            backend_local: true,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(
+            &envelope.body,
+            Some(Body::RedirectResult(result)) if result.redirect_id == "r-health-flip"
+        )
+    })
+    .await;
+    assert!(matches!(
+        result.and_then(|envelope| envelope.body),
+        Some(Body::RedirectResult(result)) if result.succeeded
+    ));
+
+    let update = timeout(Duration::from_secs(2), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            if let Observation::BackendKeepaliveUpdated {
+                backend,
+                healthy: false,
+                succeeded: true,
+            } = observation
+            {
+                return Some(backend);
+            }
+        }
+        None
+    })
+    .await;
+    assert!(matches!(
+        update,
+        Ok(Some(backend)) if backend.ends_with(&target_port.to_string())
+    ));
+    assert!(client.query_ok("SELECT after_health_flip_redirect").await);
+
+    client.quit().await;
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
 }
 
 /// Backend TLS is renegotiated independently for both the original owner and

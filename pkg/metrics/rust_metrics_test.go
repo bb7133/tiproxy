@@ -39,6 +39,29 @@ func TestRustMetricsCounterSequenceDedup(t *testing.T) {
 	require.Equal(t, before+5, after)
 }
 
+func TestRustMetricsBackendKeepAliveUpdate(t *testing.T) {
+	store := newRustMetricsStore()
+	labels := map[string]string{
+		LblBackend: "rust-keepalive-test",
+		LblHealth:  "unhealthy",
+		LblResult:  "succeed",
+	}
+	counter := BackendKeepAliveUpdateCounter.WithLabelValues(
+		labels[LblBackend], labels[LblHealth], labels[LblResult],
+	)
+	before, err := ReadCounter(counter)
+	require.NoError(t, err)
+	require.NoError(t, store.apply(9, &controlpb.MetricsBatch{
+		Sequence: 1,
+		Metrics: []*controlpb.MetricDelta{{
+			Name: "tiproxy_backend_keepalive_update_total", Labels: labels, CounterDelta: 1,
+		}},
+	}))
+	after, err := ReadCounter(counter)
+	require.NoError(t, err)
+	require.Equal(t, before+1, after)
+}
+
 func TestRustMetricsGaugeReconcilesAcrossEpoch(t *testing.T) {
 	store := newRustMetricsStore()
 	before, err := ReadGauge(ConnGauge)
@@ -139,6 +162,8 @@ func TestRustMetricsRejectsUnboundedOrMalformedInput(t *testing.T) {
 		{Name: "tiproxy_server_connections", Gauge: 1, CounterDelta: 1},
 		{Name: "tiproxy_server_connections", Gauge: -1},
 		{Name: "tiproxy_server_connections", Gauge: 1.5},
+		{Name: "tiproxy_backend_keepalive_update_total", Labels: map[string]string{LblBackend: "a", LblHealth: "unknown", LblResult: "succeed"}, CounterDelta: 1},
+		{Name: "tiproxy_backend_keepalive_update_total", Labels: map[string]string{LblBackend: "a", LblHealth: "healthy", LblResult: "unknown"}, CounterDelta: 1},
 	}
 	for i, metric := range tests {
 		err := store.apply(20, &controlpb.MetricsBatch{Sequence: uint64(i + 1), Metrics: []*controlpb.MetricDelta{metric}})
