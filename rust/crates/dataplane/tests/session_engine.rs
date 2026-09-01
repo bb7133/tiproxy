@@ -244,9 +244,9 @@ const WIRE03_LOCAL_INFILE_QUERY: &[u8] = b"\x03LOAD DATA LOCAL INFILE 'wire03.cs
 const WIRE03_LARGE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize + 257;
 const WIRE03_EXACT_MULTIPLE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize;
 
-// PKT-002/003 (plain, non-compression): a marker query drives a backend response
-// sized to exercise MySQL's 16 MiB physical-packet boundary through the plaintext
-// production forward path.
+// PKT-002 (plain, non-compression): a marker query drives a backend response
+// sized to exercise MySQL's 16 MiB physical-packet boundary on the response leg
+// through the plaintext production forward path.
 const PKT_UNDER_MAX_QUERY: &[u8] = b"\x03SELECT pkt_under_max_response";
 const PKT_LARGE_QUERY: &[u8] = b"\x03SELECT pkt_large_response";
 const PKT_EXACT_MULTIPLE_QUERY: &[u8] = b"\x03SELECT pkt_exact_multiple_response";
@@ -2235,24 +2235,38 @@ impl MysqlClient {
     }
 
     /// Sends one command and reads a large OK-shaped logical response that
-    /// crosses `MySQL`'s 16 MiB physical-packet boundary. Returns the number of
-    /// physical packets the proxy emitted for the response, so PKT-001/002 can
-    /// assert exact framing (including the exact-multiple zero-length terminator).
-    async fn query_large_ok(&mut self, sql: &str, expected_len: usize) -> Option<u64> {
+    /// crosses `MySQL`'s 16 MiB physical-packet boundary. Returns
+    /// `(physical_packets, sequence_mismatches, next_expected_sequence)` so
+    /// PKT-001/002 can assert exact physical framing: the split/terminator
+    /// packet count, that every physical packet advanced the 8-bit sequence
+    /// exactly once (zero mismatches, from the reader's own `ForwardProgress`
+    /// rather than a tolerant resync), and the post-read sequence. A bounded
+    /// timeout turns a missing zero-length terminator into a fast failure
+    /// instead of hanging until the CI job times out.
+    async fn query_large_ok(&mut self, sql: &str, expected_len: usize) -> Option<(u64, u64, u8)> {
         let mut payload = vec![0x03_u8];
         payload.extend_from_slice(sql.as_bytes());
         self.writer.reset_sequence(0);
         self.writer.write_logical(&payload, true).await.ok()?;
         self.reader.reset_sequence(1);
-        let before = self.reader.in_packets();
-        let response = self.reader.read_logical(expected_len + 64).await.ok()?;
+        let response = timeout(
+            Duration::from_secs(10),
+            self.reader.read_logical(expected_len + 64),
+        )
+        .await
+        .ok()?
+        .ok()?;
         if response.payload.len() != expected_len
             || response.payload.first() != Some(&0x00)
             || response.payload.last() != Some(&b'L')
         {
             return None;
         }
-        self.reader.in_packets().checked_sub(before)
+        Some((
+            response.progress.physical_packets(),
+            response.progress.sequence_mismatches(),
+            self.reader.expected_sequence(),
+        ))
     }
 
     /// Runs one strict multi-round `COM_CHANGE_USER` exchange. Every
@@ -3696,11 +3710,14 @@ async fn empty_command_payload_fails_closed_before_backend_write() {
     stack.dispatch_task.abort();
 }
 
-/// PKT-001/002/003: a backend response is forwarded through the production
-/// engine with exact `MySQL` physical framing. A `MAX-1` logical response is a
-/// single physical packet; `MAX+33` splits into two; an exact `MaxPayloadLen`
-/// response emits the required zero-length terminator (also two packets). Each
-/// subsequent command realigns at a clean sequence boundary.
+/// PKT-001/002: a backend response is forwarded through the production engine
+/// with exact `MySQL` physical framing. A `MAX-1` logical response is a single
+/// physical packet; `MAX+33` splits into two; an exact `MaxPayloadLen` response
+/// emits the required zero-length terminator (also two packets). Each response
+/// advances the 8-bit sequence exactly once per physical packet (zero
+/// mismatches, observed from the reader's `ForwardProgress`, not a tolerant
+/// resync), and each subsequent command realigns at a clean sequence boundary.
+/// The tuple is `(physical_packets, sequence_mismatches, next_expected_sequence)`.
 #[tokio::test]
 async fn packet_framing_splits_and_realigns_through_production_engine() {
     let stack = spawn_stack().await;
@@ -3716,8 +3733,8 @@ async fn packet_framing_splits_and_realigns_through_production_engine() {
         client
             .query_large_ok("SELECT pkt_under_max_response", PKT_UNDER_MAX_RESPONSE_LEN)
             .await,
-        Some(1),
-        "a MAX-1 logical response is a single physical packet"
+        Some((1, 0, 2)),
+        "a MAX-1 response is one physical packet, no sequence mismatch, next seq 2"
     );
     assert!(
         client.query_ok("SELECT after_under_max").await,
@@ -3727,8 +3744,8 @@ async fn packet_framing_splits_and_realigns_through_production_engine() {
         client
             .query_large_ok("SELECT pkt_large_response", PKT_LARGE_RESPONSE_LEN)
             .await,
-        Some(2),
-        "a MAX+33 logical response spans exactly two physical packets"
+        Some((2, 0, 3)),
+        "a MAX+33 response is two physical packets, no sequence mismatch, next seq 3"
     );
     assert!(
         client.query_ok("SELECT after_large").await,
@@ -3741,8 +3758,8 @@ async fn packet_framing_splits_and_realigns_through_production_engine() {
                 PKT_EXACT_MULTIPLE_RESPONSE_LEN,
             )
             .await,
-        Some(2),
-        "an exact MaxPayloadLen response adds the zero-length physical terminator"
+        Some((2, 0, 3)),
+        "exact MaxPayloadLen adds the zero-length terminator (two packets), next seq 3"
     );
     assert!(
         client.query_ok("SELECT after_exact").await,
