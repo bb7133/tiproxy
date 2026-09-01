@@ -2235,7 +2235,7 @@ impl MysqlClient {
     }
 
     /// Sends one command and reads a large OK-shaped logical response that
-    /// crosses MySQL's 16 MiB physical-packet boundary. Returns the number of
+    /// crosses `MySQL`'s 16 MiB physical-packet boundary. Returns the number of
     /// physical packets the proxy emitted for the response, so PKT-001/002 can
     /// assert exact framing (including the exact-multiple zero-length terminator).
     async fn query_large_ok(&mut self, sql: &str, expected_len: usize) -> Option<u64> {
@@ -3697,7 +3697,7 @@ async fn empty_command_payload_fails_closed_before_backend_write() {
 }
 
 /// PKT-001/002/003: a backend response is forwarded through the production
-/// engine with exact MySQL physical framing. A `MAX-1` logical response is a
+/// engine with exact `MySQL` physical framing. A `MAX-1` logical response is a
 /// single physical packet; `MAX+33` splits into two; an exact `MaxPayloadLen`
 /// response emits the required zero-length terminator (also two packets). Each
 /// subsequent command realigns at a clean sequence boundary.
