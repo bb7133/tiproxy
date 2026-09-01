@@ -97,6 +97,10 @@ var rustMetricSpecs = map[string]rustMetricSpec{
 	"tiproxy_backend_dial_backend_fail": {
 		name: "tiproxy_backend_dial_backend_fail", kind: rustCounter, labels: []string{LblBackend},
 	},
+	"tiproxy_backend_keepalive_update_total": {
+		name: "tiproxy_backend_keepalive_update_total", kind: rustCounter,
+		labels: []string{LblBackend, LblHealth, LblResult},
+	},
 	"tiproxy_traffic_inbound_bytes": {
 		name: "tiproxy_traffic_inbound_bytes", kind: rustCounter, labels: []string{LblBackend},
 	},
@@ -328,6 +332,13 @@ func validateRustLabelValues(name string, values []string) error {
 		if !allowed(values[0], []string{"succeed", "fail"}) {
 			return fmt.Errorf("Rust get-backend metric has invalid result %q", values[0])
 		}
+	case "tiproxy_backend_keepalive_update_total":
+		if !allowed(values[1], []string{"healthy", "unhealthy"}) {
+			return fmt.Errorf("Rust keepalive metric has invalid health %q", values[1])
+		}
+		if !allowed(values[2], []string{"succeed", "fail"}) {
+			return fmt.Errorf("Rust keepalive metric has invalid result %q", values[2])
+		}
 	case "tiproxy_session_query_total", "tiproxy_session_query_duration_seconds":
 		if !allowed(values[1], rustCommandLabels) {
 			return fmt.Errorf("Rust query metric has invalid command %q", values[1])
@@ -362,6 +373,8 @@ func applyRustCounter(name string, labels []string, delta float64) {
 		GetBackendCounter.WithLabelValues(labels...).Add(delta)
 	case "tiproxy_backend_dial_backend_fail":
 		DialBackendFailCounter.WithLabelValues(labels...).Add(delta)
+	case "tiproxy_backend_keepalive_update_total":
+		BackendKeepAliveUpdateCounter.WithLabelValues(labels...).Add(delta)
 	case "tiproxy_traffic_inbound_bytes":
 		InboundBytesCounter.WithLabelValues(labels...).Add(delta)
 	case "tiproxy_traffic_inbound_packets":

@@ -107,6 +107,16 @@ pub enum Observation {
         /// Attempted backend address.
         backend: String,
     },
+    /// A live topology generation changed the current backend's health-driven
+    /// keepalive policy, or a prior best-effort application was retried.
+    BackendKeepaliveUpdated {
+        /// Current backend address (the bounded legacy backend label).
+        backend: String,
+        /// Health state selected from the latest complete topology snapshot.
+        healthy: bool,
+        /// Whether the socket policy was applied (or no policy was configured).
+        succeeded: bool,
+    },
     /// Initial backend authentication completed successfully.
     HandshakeCompleted {
         /// Backend address (the legacy metric label).
@@ -148,6 +158,7 @@ impl Observation {
     fn labels_are_bounded(&self) -> bool {
         match self {
             Self::DialBackendFailed { backend }
+            | Self::BackendKeepaliveUpdated { backend, .. }
             | Self::HandshakeCompleted { backend, .. }
             | Self::CommandCompleted { backend, .. } => backend.len() <= MAX_LABEL_BYTES,
             Self::GetBackend { .. } | Self::SessionClosed { .. } => true,
@@ -319,6 +330,11 @@ impl Aggregator {
                 ),
                 1,
             ),
+            Observation::BackendKeepaliveUpdated {
+                backend,
+                healthy,
+                succeeded,
+            } => self.backend_keepalive_updated(backend, healthy, succeeded),
             Observation::HandshakeCompleted {
                 backend,
                 duration,
@@ -385,6 +401,26 @@ impl Aggregator {
                 );
             }
         }
+    }
+
+    fn backend_keepalive_updated(&mut self, backend: String, healthy: bool, succeeded: bool) {
+        self.counter(
+            MetricKey::new(
+                "tiproxy_backend_keepalive_update_total",
+                vec![
+                    ("backend", backend),
+                    (
+                        "health",
+                        if healthy { "healthy" } else { "unhealthy" }.to_owned(),
+                    ),
+                    (
+                        "result",
+                        if succeeded { "succeed" } else { "fail" }.to_owned(),
+                    ),
+                ],
+            ),
+            1,
+        );
     }
 
     fn traffic(&mut self, backend: &str, traffic: BackendTraffic, local: bool) {
@@ -859,6 +895,33 @@ mod tests {
             histogram.histogram_bucket_deltas.len(),
             GET_BACKEND_BUCKETS.len()
         );
+    }
+
+    #[test]
+    fn backend_keepalive_updates_have_closed_bounded_labels() {
+        let mut aggregator = Aggregator::default();
+        aggregator.observe(Observation::BackendKeepaliveUpdated {
+            backend: "127.0.0.1:4000".to_owned(),
+            healthy: false,
+            succeeded: true,
+        });
+        let metrics = aggregator.wire_metrics(&[]);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "tiproxy_backend_keepalive_update_total"
+                && metric
+                    .labels
+                    .get("backend")
+                    .is_some_and(|value| value == "127.0.0.1:4000")
+                && metric
+                    .labels
+                    .get("health")
+                    .is_some_and(|value| value == "unhealthy")
+                && metric
+                    .labels
+                    .get("result")
+                    .is_some_and(|value| value == "succeed")
+                && metric.counter_delta == 1
+        }));
     }
 
     #[test]

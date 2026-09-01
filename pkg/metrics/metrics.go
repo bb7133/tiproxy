@@ -115,6 +115,7 @@ func init() {
 		GetBackendHistogram,
 		GetBackendCounter,
 		DialBackendFailCounter,
+		BackendKeepAliveUpdateCounter,
 		PingBackendGauge,
 		BackendConnGauge,
 		BackendScoreGauge,

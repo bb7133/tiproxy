@@ -75,6 +75,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_proto::control_transport::ControlClient;
+use control_proto::snapshot::ValidatedSnapshot;
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     ConnectionIdentity, ControlEnvelope, ErrorCode, ErrorSource as WireErrorSource,
@@ -327,6 +328,7 @@ const RESPONSE_CAPTURE: usize = 23;
 const ENGINE_CMD_CAPACITY: usize = 16;
 /// Engine → owner report queue depth.
 const ENGINE_REPORT_CAPACITY: usize = 8;
+const BACKEND_HEALTH_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Server-version bytes advertised in the proxy greeting.
 const SERVER_VERSION: &[u8] = b"8.0.11-TiProxy-rs";
 
@@ -660,6 +662,7 @@ async fn run_bound_session_observed(
     // framing/TLS/compression layer; the handle survives in-place upgrades.
     let client_socket = CountedIo::new(stream);
     let client_counters = client_socket.counters();
+    let snapshot_updates = seat.subscribe_snapshot_updates();
     let engine = Engine {
         connection_id: identity.connection_id,
         endpoints,
@@ -673,6 +676,7 @@ async fn run_bound_session_observed(
         retired_backend_out: 0,
         backend_generation: 0,
         public_endpoint,
+        snapshot_updates,
         metering,
         events: event_tx,
         cmds: cmd_rx,
@@ -973,6 +977,25 @@ struct BackendIo {
     cluster: String,
     keyspace: String,
     local: bool,
+    /// Latest health observed for this exact backend identity.
+    healthy: bool,
+    /// Whether the policy for `healthy` reached the raw socket. Failures are
+    /// best-effort like Go and retried by the health ticker.
+    keepalive_applied: bool,
+}
+
+fn backend_health_in_snapshot(
+    backends: &[control_proto::v1::BackendSnapshot],
+    backend_id: &str,
+    address: &str,
+    cluster: &str,
+) -> bool {
+    backends.iter().any(|candidate| {
+        candidate.backend_id == backend_id
+            && candidate.address == address
+            && candidate.cluster_name == cluster
+            && candidate.healthy
+    })
 }
 
 /// One client command held between its event and the FSM's forward
@@ -1046,6 +1069,10 @@ struct Engine {
     backend_generation: u64,
     /// Immutable classification of the direct upstream/LB peer at accept.
     public_endpoint: bool,
+    /// Complete last-good generations published after admission. Existing
+    /// sessions consult only live topology health; connection-scoped config
+    /// continues to come from `seat.snapshot()`.
+    snapshot_updates: watch::Receiver<Arc<ValidatedSnapshot>>,
     /// Process-wide registry; absent only in legacy/unit compositions.
     metering: Option<MeteringSourceRegistry>,
     events: mpsc::Sender<SessionEvent>,
@@ -1673,20 +1700,22 @@ impl Engine {
         // the snapshot's healthy/unhealthy backend policy follows the
         // router-reported health of this assignment. Mid-session
         // health transitions re-apply with DPL-07's topology feed.
-        {
+        let backend_healthy = acquired.backend.healthy;
+        let keepalive_applied = {
             let config = self.seat.snapshot().raw().config.as_ref();
-            let policy = if acquired.backend.healthy {
+            let policy = if backend_healthy {
                 config.and_then(|config| config.healthy_backend_keepalive)
             } else {
                 config.and_then(|config| config.unhealthy_backend_keepalive)
             };
-            if let Some(policy) = policy {
-                let _ = proxy_io::socket::apply_keepalive(
+            policy.is_none_or(|policy| {
+                proxy_io::socket::apply_keepalive(
                     &acquired.conn,
                     crate::server::snapshot_keepalive(&policy),
-                );
-            }
-        }
+                )
+                .is_ok()
+            })
+        };
         // Wrap the raw backend socket in the innermost byte counter now — before
         // the PROXY header, any backend TLS upgrade, and MySQL framing — so the
         // PROXY preamble, TLS records, compressed frames, and plain packets all
@@ -1725,6 +1754,8 @@ impl Engine {
             cluster: backend_cluster,
             keyspace: backend_keyspace,
             local: backend_local,
+            healthy: backend_healthy,
+            keepalive_applied,
         };
         let Ok(greeting_packet) = backend
             .backend_io
@@ -1784,6 +1815,10 @@ impl Engine {
             return Some(source);
         }
         self.backend = Some(backend);
+        // Health may have changed while the handshake was in flight. Reconcile
+        // before exposing the command phase, using the latest complete
+        // topology but this session's immutable keepalive values.
+        self.refresh_backend_keepalive();
         if self
             .events
             .send(SessionEvent::BackendGreetingReceived)
@@ -2001,6 +2036,57 @@ impl Engine {
         self.command_phase().await
     }
 
+    fn refresh_backend_keepalive(&mut self) {
+        let latest = Arc::clone(&self.snapshot_updates.borrow());
+        let Some(backend) = self.backend.as_ref() else {
+            return;
+        };
+        let healthy = backend_health_in_snapshot(
+            &latest.raw().backends,
+            &backend.id,
+            &backend.address,
+            &backend.cluster,
+        );
+        if healthy == backend.healthy && backend.keepalive_applied {
+            return;
+        }
+
+        let backend_label = backend.address.clone();
+        let policy = self
+            .seat
+            .snapshot()
+            .raw()
+            .config
+            .as_ref()
+            .and_then(|config| {
+                if healthy {
+                    config.healthy_backend_keepalive
+                } else {
+                    config.unhealthy_backend_keepalive
+                }
+            })
+            .map(|policy| crate::server::snapshot_keepalive(&policy));
+        let succeeded = policy.is_none_or(|policy| {
+            self.backend
+                .as_ref()
+                .and_then(|backend| backend.backend_io.get_ref().as_counted_stream())
+                .is_some_and(|stream| {
+                    proxy_io::socket::apply_keepalive(stream.get_ref(), policy).is_ok()
+                })
+        });
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        backend.healthy = healthy;
+        backend.keepalive_applied = succeeded;
+        self.metrics
+            .try_record(Observation::BackendKeepaliveUpdated {
+                backend: backend_label,
+                healthy,
+                succeeded,
+            });
+    }
+
     /// Ready/command/response/infile phases.
     #[allow(clippy::too_many_lines)]
     async fn command_phase(&mut self) -> Option<WireErrorSource> {
@@ -2010,6 +2096,11 @@ impl Engine {
         // compressed frame `peek_packet` may already have decoded and staged
         // (advancing the shared sequence) when the control arm won the select.
         let mut just_served_control = false;
+        let mut snapshot_updates_open = true;
+        let first_health_recheck = tokio::time::Instant::now() + BACKEND_HEALTH_RECHECK_INTERVAL;
+        let mut health_recheck =
+            tokio::time::interval_at(first_health_recheck, BACKEND_HEALTH_RECHECK_INTERVAL);
+        health_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if self.closing {
                 return None;
@@ -2036,6 +2127,21 @@ impl Engine {
             // client stalling mid-frame is bounded by the owner's force
             // deadline, like any other mid-command stall.
             let (payload, command_started) = tokio::select! {
+                changed = self.snapshot_updates.changed(), if snapshot_updates_open => {
+                    if changed.is_err() {
+                        snapshot_updates_open = false;
+                    } else {
+                        drop(self.snapshot_updates.borrow_and_update());
+                        self.refresh_backend_keepalive();
+                    }
+                    just_served_control = true;
+                    continue;
+                }
+                _ = health_recheck.tick() => {
+                    self.refresh_backend_keepalive();
+                    just_served_control = true;
+                    continue;
+                }
                 cmd = self.cmds.recv() => {
                     let cmd = cmd?;
                     match self.handle_cmd(cmd).await {
@@ -3140,6 +3246,10 @@ impl Engine {
         // Dropping the previous sole owner closes it only after the restored
         // candidate has been installed atomically.
         drop(previous);
+        // The candidate was admitted healthy, but topology may have flipped
+        // while its handshake/restore ran. Reconcile immediately after the
+        // atomic owner swap rather than waiting for the periodic retry.
+        self.refresh_backend_keepalive();
         Awaited::Got
     }
 
@@ -3309,6 +3419,8 @@ impl Engine {
             cluster: target.cluster_name.clone(),
             keyspace: target.keyspace.clone(),
             local: target.backend_local,
+            healthy: target.backend_healthy,
+            keepalive_applied: false,
         };
         let greeting = candidate
             .backend_io
@@ -3360,13 +3472,13 @@ impl Engine {
             .await?;
         self.restore_candidate_state(&mut candidate, snapshot.session_states(), capabilities)
             .await?;
-        self.apply_candidate_keepalive(&candidate)?;
+        self.apply_candidate_keepalive(&mut candidate)?;
         Ok(candidate)
     }
 
     /// Applies the healthy-target policy after every transport upgrade, through
     /// the preserved innermost raw socket.
-    fn apply_candidate_keepalive(&self, candidate: &BackendIo) -> Result<(), CandidateFailure> {
+    fn apply_candidate_keepalive(&self, candidate: &mut BackendIo) -> Result<(), CandidateFailure> {
         let Some(policy) = self
             .seat
             .snapshot()
@@ -3375,15 +3487,17 @@ impl Engine {
             .as_ref()
             .and_then(|config| config.healthy_backend_keepalive)
         else {
+            candidate.keepalive_applied = true;
             return Ok(());
         };
         let Some(counted) = candidate.backend_io.get_ref().as_counted_stream() else {
             return Err(CandidateFailure::Handshake);
         };
-        let _ = proxy_io::socket::apply_keepalive(
+        candidate.keepalive_applied = proxy_io::socket::apply_keepalive(
             counted.get_ref(),
             crate::server::snapshot_keepalive(&policy),
-        );
+        )
+        .is_ok();
         Ok(())
     }
 
@@ -4119,9 +4233,10 @@ fn fill_salt(salt: &mut [u8; 20]) {
 #[cfg(test)]
 mod tls_wiring_tests {
     use super::{
-        backend_server_name, candidate_budget, leading_capabilities, migration_auth_capabilities,
-        normalize_leading_capabilities, proxy_capabilities,
+        backend_health_in_snapshot, backend_server_name, candidate_budget, leading_capabilities,
+        migration_auth_capabilities, normalize_leading_capabilities, proxy_capabilities,
     };
+    use control_proto::v1::BackendSnapshot;
     use mysql_wire::{
         CapabilityFlags, HandshakeResponseParams, encode_handshake_response, encode_ssl_request,
         parse_handshake_response, parse_ssl_request,
@@ -4235,6 +4350,52 @@ mod tls_wiring_tests {
         assert_eq!(backend_server_name("[::1]:4000"), "::1");
         // A bare host with no port is used verbatim.
         assert_eq!(backend_server_name("localhost"), "localhost");
+    }
+
+    #[test]
+    fn live_backend_health_requires_the_exact_backend_identity() {
+        let backend = BackendSnapshot {
+            backend_id: "tidb-1".to_owned(),
+            address: "127.0.0.1:4000".to_owned(),
+            cluster_name: "cluster-a".to_owned(),
+            healthy: true,
+            ..BackendSnapshot::default()
+        };
+        assert!(backend_health_in_snapshot(
+            std::slice::from_ref(&backend),
+            "tidb-1",
+            "127.0.0.1:4000",
+            "cluster-a"
+        ));
+        assert!(!backend_health_in_snapshot(
+            std::slice::from_ref(&backend),
+            "tidb-1",
+            "127.0.0.1:4001",
+            "cluster-a"
+        ));
+        assert!(!backend_health_in_snapshot(
+            std::slice::from_ref(&backend),
+            "tidb-1",
+            "127.0.0.1:4000",
+            "cluster-b"
+        ));
+        assert!(!backend_health_in_snapshot(
+            &[],
+            "tidb-1",
+            "127.0.0.1:4000",
+            "cluster-a"
+        ));
+
+        let unhealthy = BackendSnapshot {
+            healthy: false,
+            ..backend
+        };
+        assert!(!backend_health_in_snapshot(
+            &[unhealthy],
+            "tidb-1",
+            "127.0.0.1:4000",
+            "cluster-a"
+        ));
     }
 
     #[test]
