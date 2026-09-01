@@ -344,6 +344,51 @@ if [[ $(mysql_ingress 'SELECT 1') != 1 ]]; then
 	exit 1
 fi
 
+# MTR-005 lifecycle-log attribution. The faultproxy is the accepted TCP peer;
+# in PROXY variants it additionally carries the downstream client's source in
+# the v2 header. Run one connection alone in a fresh log window so the row can
+# prove both fields without correlating against unrelated lifecycle records.
+if [[ $mode == rust ]]; then
+	mtr005_offset=$(wc -l <"$run_dir/tiproxy-rs.log" | tr -d ' ')
+	if [[ $(mysql_ingress 'SELECT 1') != 1 ]]; then
+		echo "MTR-005 attribution query failed" >&2
+		exit 1
+	fi
+	mtr005_fresh=
+	for _ in {1..20}; do
+		mtr005_fresh=$(tail -n "+$((mtr005_offset + 1))" "$run_dir/tiproxy-rs.log")
+		if grep -q '"event":"connection_closed"' <<<"$mtr005_fresh"; then
+			break
+		fi
+		sleep 0.25
+	done
+	# Allow a closely following record to settle, then reject an ambiguous
+	# window instead of selecting whichever close happens to be last.
+	sleep 0.25
+	mtr005_fresh=$(tail -n "+$((mtr005_offset + 1))" "$run_dir/tiproxy-rs.log")
+	mtr005_closed=$(grep -c '"event":"connection_closed"' <<<"$mtr005_fresh" || true)
+	if [[ $mtr005_closed != 1 ]]; then
+		echo "MTR-005 expected exactly one fresh connection_closed record, got $mtr005_closed" >&2
+		exit 1
+	fi
+	mtr005_line=$(grep '"event":"connection_closed"' <<<"$mtr005_fresh")
+	mtr005_peer=$(sed -n 's/.*"client_addr":"\([^"]*\)".*/\1/p' <<<"$mtr005_line")
+	mtr005_source=$(sed -n 's/.*"proxy_client_addr":"\([^"]*\)".*/\1/p' <<<"$mtr005_line")
+	if [[ -z $mtr005_peer || -z $mtr005_source ]]; then
+		echo "MTR-005 lifecycle log omitted a client address: $mtr005_line" >&2
+		exit 1
+	fi
+	if [[ $PROXY_ENABLED == true && $mtr005_peer == "$mtr005_source" ]]; then
+		echo "MTR-005 PROXY source regressed to the TCP peer: $mtr005_line" >&2
+		exit 1
+	fi
+	if [[ $PROXY_ENABLED != true && $mtr005_peer != "$mtr005_source" ]]; then
+		echo "MTR-005 direct connection did not fall back to the TCP peer: $mtr005_line" >&2
+		exit 1
+	fi
+	echo "MTR-005 lifecycle addresses: peer=$mtr005_peer proxy-client=$mtr005_source"
+fi
+
 # Namespace/topology matrix (DPL-07 #41): three username-resolved
 # combinations against the REAL cluster, identical in both modes.
 # `proxy.pd-addrs` always registers an implicit PD-backed backend

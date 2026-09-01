@@ -747,7 +747,8 @@ pub struct SessionLogContext {
     pub listener: String,
     /// Actual TCP peer address.
     pub client_address: String,
-    /// PROXY-protocol client address; equals the peer until WIRE-06 supplies it.
+    /// PROXY-protocol inner client address; falls back to the TCP peer when no
+    /// inet source was decoded.
     pub proxy_client_address: String,
     /// Bounded namespace identifier.
     pub namespace: String,

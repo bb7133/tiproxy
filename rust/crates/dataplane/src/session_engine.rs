@@ -71,7 +71,7 @@
 //! aligned old backend; an old-backend disconnect or incomplete snapshot
 //! response closes the poisoned session.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_proto::control_transport::ControlClient;
@@ -211,6 +211,31 @@ fn normalize_leading_capabilities(payload: &mut [u8], trusted: CapabilityFlags) 
     if payload.len() >= 4 {
         payload[0..4].copy_from_slice(&trusted.bits().to_le_bytes());
     }
+}
+
+/// Resolves the lifecycle-log client carried inside PROXY v2. The direct TCP
+/// peer remains the fallback for direct connections and headers without an
+/// inet source (LOCAL/UNSPEC/Unix), matching Go `RemoteAddr()`.
+fn proxy_client_log_address(
+    peer: std::net::SocketAddr,
+    source: Option<std::net::SocketAddr>,
+) -> String {
+    source.unwrap_or(peer).to_string()
+}
+
+/// Publishes the one decoded inet source to both lifecycle-log owners. The
+/// source cannot change after the one-shot probe, so an immutable cell avoids
+/// a lock and keeps force-close attribution available after Engine abort.
+fn record_proxy_client_log_source(
+    shared: &OnceLock<std::net::SocketAddr>,
+    context: &mut SessionLogContext,
+    peer: std::net::SocketAddr,
+    source: Option<std::net::SocketAddr>,
+) {
+    if let Some(source) = source {
+        let _ = shared.set(source);
+    }
+    context.proxy_client_address = proxy_client_log_address(peer, source);
 }
 
 /// The SNI/server name for a backend TLS handshake: the host of a `host:port`
@@ -621,6 +646,7 @@ async fn run_bound_session_observed(
     let accepted_at = tokio::time::Instant::now();
     let (stream, seat) = connection.into_session_io();
     let metadata = seat.metadata();
+    let peer_address = metadata.peer_address;
     let identity = ConnectionIdentity {
         connection_id: metadata.connection_id.get(),
         listener_address: metadata.listener_address.to_string(),
@@ -648,6 +674,11 @@ async fn run_bound_session_observed(
         namespace: namespace.clone(),
         generation: seat.snapshot().generation(),
     };
+    // The inbound header is consumed only after the greeting, inside the
+    // Engine socket owner. Share its immutable decoded inet source with the
+    // outer owner so even a force-aborted engine keeps the correct close-log
+    // attribution; routing, public/private metering, and IPC remain peer-based.
+    let proxy_client_source = Arc::new(OnceLock::new());
     let public_endpoint = identity.public_endpoint;
 
     let (mut directives, responses, commander) = binding.split();
@@ -667,6 +698,7 @@ async fn run_bound_session_observed(
         connection_id: identity.connection_id,
         endpoints,
         inbound_proxy_header: None,
+        proxy_client_source: Arc::clone(&proxy_client_source),
         client_io: PacketIo::new(ClientTransport::Plain(client_socket)),
         client_counters,
         backend: None,
@@ -909,6 +941,8 @@ async fn run_bound_session_observed(
     {
         log_context.namespace.clone_from(&exit.namespace);
     }
+    log_context.proxy_client_address =
+        proxy_client_log_address(peer_address, proxy_client_source.get().copied());
     log_session(
         "connection_closed",
         &log_context,
@@ -1046,9 +1080,13 @@ struct Engine {
     connection_id: u64,
     endpoints: ConnectionEndpoints,
     /// The real client address from an inbound PROXY v2 header, when the
-    /// listener consumed one — retained only for the outbound backend PROXY
-    /// preamble, never for routing/admission/identity or IPC/logging.
+    /// listener consumed one. The owned header supplies the outbound backend
+    /// preamble and its decoded inet source supplies lifecycle-log attribution;
+    /// routing/admission/public-endpoint metering and IPC remain peer-based.
     inbound_proxy_header: Option<InboundProxyV2Header>,
+    /// Set at most once when the one-shot inbound probe decodes an inet source.
+    /// The outer owner reads it for the close log even if the Engine is aborted.
+    proxy_client_source: Arc<OnceLock<std::net::SocketAddr>>,
     client_io: PacketIo<ClientTransport>,
     /// Raw-socket byte counters for the client socket. Created once at accept
     /// and kept for the session: TLS/compression upgrades wrap the same
@@ -1401,6 +1439,13 @@ impl Engine {
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::ClientNetwork);
             };
+            let source_address = source.as_ref().and_then(InboundProxyV2Header::source);
+            record_proxy_client_log_source(
+                &self.proxy_client_source,
+                &mut self.log_context,
+                self.endpoints.client_addr,
+                source_address,
+            );
             self.inbound_proxy_header = source;
         }
 
@@ -4235,12 +4280,15 @@ mod tls_wiring_tests {
     use super::{
         backend_health_in_snapshot, backend_server_name, candidate_budget, leading_capabilities,
         migration_auth_capabilities, normalize_leading_capabilities, proxy_capabilities,
+        proxy_client_log_address, record_proxy_client_log_source,
     };
+    use crate::observability::SessionLogContext;
     use control_proto::v1::BackendSnapshot;
     use mysql_wire::{
         CapabilityFlags, HandshakeResponseParams, encode_handshake_response, encode_ssl_request,
         parse_handshake_response, parse_ssl_request,
     };
+    use std::sync::OnceLock;
 
     #[test]
     fn proxy_capabilities_advertise_ssl_only_when_available() {
@@ -4396,6 +4444,39 @@ mod tls_wiring_tests {
             "127.0.0.1:4000",
             "cluster-a"
         ));
+    }
+
+    #[test]
+    fn proxy_client_log_address_prefers_inbound_inet_source_and_falls_back_to_peer() {
+        let peer = std::net::SocketAddr::from(([10, 0, 0, 8], 3306));
+        let source = std::net::SocketAddr::from(([203, 0, 113, 9], 45678));
+
+        assert_eq!(
+            proxy_client_log_address(peer, Some(source)),
+            "203.0.113.9:45678"
+        );
+        assert_eq!(proxy_client_log_address(peer, None), "10.0.0.8:3306");
+    }
+
+    #[test]
+    fn proxy_client_log_source_is_shared_with_the_force_close_owner() {
+        let peer = std::net::SocketAddr::from(([10, 0, 0, 8], 3306));
+        let source = std::net::SocketAddr::from(([203, 0, 113, 9], 45678));
+        let shared = OnceLock::new();
+        let mut context = SessionLogContext {
+            connection_id: 7,
+            listener: "127.0.0.1:6000".to_owned(),
+            client_address: peer.to_string(),
+            proxy_client_address: peer.to_string(),
+            namespace: "default".to_owned(),
+            generation: 9,
+        };
+
+        record_proxy_client_log_source(&shared, &mut context, peer, Some(source));
+
+        assert_eq!(context.client_address, "10.0.0.8:3306");
+        assert_eq!(context.proxy_client_address, "203.0.113.9:45678");
+        assert_eq!(shared.get().copied(), Some(source));
     }
 
     #[test]
