@@ -69,6 +69,22 @@ pass_count=0
 fail_count=0
 skip_count=0
 
+# --- driver whitelist -------------------------------------------------------
+# Only these adapters exist. An unknown --drivers token (typo) must be a hard
+# usage error, never a silent 0-coverage pass.
+driver_known() { case "$1" in go | python) return 0 ;; *) return 1 ;; esac; }
+
+validate_drivers() { # <drivers-string>; error + return 1 on any unknown token
+	local d
+	for d in $1; do
+		driver_known "$d" || {
+			echo "unknown driver: $d (known: go, python)" >&2
+			return 1
+		}
+	done
+	return 0
+}
+
 # --- negotiation assertion (fail-closed, positional exactly-one correlation) --
 # check_negotiation <rust_log> <offset> <expect_bit> <cap_name> <label>
 # Echoes a PASS/FAIL line; returns 0 only when exactly one new connection_closed
@@ -142,9 +158,21 @@ run_self_test() {
 	_expect 1 bit-absent "$dir/absent.log" 0 "$CLIENT_COMPRESS" CLIENT_COMPRESS self
 	_expect 0 bit-present "$dir/present.log" 0 "$CLIENT_COMPRESS" CLIENT_COMPRESS self
 
+	# driver whitelist rows: a known set passes, any unknown token is rejected.
+	if validate_drivers "go python" >/dev/null 2>&1; then
+		echo "self-test OK: known-drivers-accepted"
+	else
+		echo "self-test FAIL: known-drivers-accepted (go python rejected)"; rc=1
+	fi
+	if validate_drivers "foo" >/dev/null 2>&1; then
+		echo "self-test FAIL: unknown-driver-rejected (foo accepted)"; rc=1
+	else
+		echo "self-test OK: unknown-driver-rejected"
+	fi
+
 	rm -rf "$dir"
 	if ((rc == 0)); then
-		echo "=== run-smoke self-test: all 5 negotiation rows OK ==="
+		echo "=== run-smoke self-test: all negotiation + driver-whitelist rows OK ==="
 	else
 		echo "=== run-smoke self-test: FAILURES ===" >&2
 	fi
@@ -157,6 +185,7 @@ if ((self_test)); then
 fi
 
 [[ -n $port ]] || { echo "--port is required" >&2; exit 2; }
+validate_drivers "$drivers" || exit 2
 
 # --- adapter setup ---------------------------------------------------------
 requested_drivers="$drivers"
@@ -229,7 +258,9 @@ run_case() {
 	case $driver in
 	go) out=$("$go_bin" "${common[@]}" 2>&1); rc=$? ;;
 	python) out=$("$py_bin" "$script_dir/python/smoke.py" "${common[@]}" 2>&1); rc=$? ;;
-	*) echo "unknown driver $driver" >&2; return 1 ;;
+	# Unreachable: --drivers is whitelist-validated at startup. Defense in depth:
+	# an unknown driver here is a counted failure, never a silent pass.
+	*) echo "FAIL unknown driver $driver"; ((fail_count++)); return 1 ;;
 	esac
 
 	if ((rc != 0)); then
