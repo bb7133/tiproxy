@@ -27,20 +27,22 @@ released. Run one variant with:
 tests/dataplane/integration/run.sh --mode go --variant plain
 ```
 
-The Rust dataplane runs the plain, TLS, and PROXY variant topologies for real:
+The Rust dataplane runs the same six transport families for real:
 
 ```sh
 tests/dataplane/integration/run.sh --mode rust --variant plain
 tests/dataplane/integration/run.sh --mode rust --variant tls
 tests/dataplane/integration/run.sh --mode rust --variant proxy
+tests/dataplane/integration/run.sh --mode rust --variant compress-zlib
+tests/dataplane/integration/run.sh --mode rust --variant compress-zstd
+tests/dataplane/integration/run.sh --mode rust --variant tls-proxy-zstd
 ```
 
 `preflight.sh` demands the capability contract from
 `tiproxy-rs --integration-capabilities` — currently
-`control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2`
-(`tls` is wired by WIRE-activation A1 and `proxy-v2` by WIRE-activation B;
-`zlib`/`zstd` stay absent until their slice exists, so those variants are
-still refused).
+`control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd`.
+The launcher refuses any variant whose required capability is absent; it never
+substitutes a raw TCP relay or the Go dataplane for a Rust success.
 The launcher enables the Go config's `rust-dataplane` gate (the Go
 process cedes the SQL listeners and serves only the control plane and
 API), waits for the control socket (created under `/tmp` with the run's
@@ -95,9 +97,29 @@ WIRE-activation B: the fault proxy prepends an inbound PROXY v2 header on the
 client leg (consumed by a greeting-first probe), the dataplane emits an
 outbound PROXY v2 header on the backend dial, and the direct listener-B
 connection — which carries no inbound header — is served without blocking. The
-compression variants remain refused by the capability contract until their
-Rust slice exists; a raw TCP relay or the Go dataplane is never reported as
-Rust success.
+compression variants exercise WIRE-C over real TiDB: classic zlib, negotiated
+zstd, and the combined frontend TLS + inbound/outbound PROXY v2 + zstd path.
+Each run proves a real query, recovery, migration, diagnostics, and owned
+cleanup under the selected transport.
+
+### VAL-01 external-driver smoke (#48)
+
+The Rust/plain topology can additionally run two native external drivers
+against the same real TiDB backends:
+
+```sh
+DATAPLANE_SMOKE=1 tests/dataplane/integration/run.sh \
+  --mode rust --variant plain
+```
+
+The adapters are pinned in-tree: Go `go-sql-driver/mysql v1.10.0` and Python
+`mysql-connector-python 9.4.0`. Both run the key connection/query/transaction/
+prepared-statement workload, and each driver's compression row must produce
+exactly one fresh Rust `connection_closed` record carrying `CLIENT_COMPRESS`.
+A missing driver, unreadable log, zero or ambiguous close records, or a silent
+compression downgrade fails the acceptance run by default. Driver-level TLS is
+a documented follow-up; the proxy TLS path itself is covered by the dedicated
+TLS variants and authentication matrix below.
 
 ### SES-02 live authentication matrix (#27)
 

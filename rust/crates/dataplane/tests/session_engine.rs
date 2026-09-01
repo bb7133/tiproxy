@@ -45,8 +45,8 @@ use dataplane::{
     BoundSessionHandler, DataplaneServer, DispatchConnectionHandler, SystemMemoryProbe,
 };
 use mysql_wire::{
-    Attribute, CapabilityFlags, ChangeUserParams, HandshakeResponseParams, ResponseHeader,
-    StatusFlags, encode_change_user, encode_eof_packet, encode_error_packet,
+    Attribute, CapabilityFlags, ChangeUserParams, HandshakeResponseParams, MAX_PAYLOAD_LEN,
+    ResponseHeader, StatusFlags, encode_change_user, encode_eof_packet, encode_error_packet,
     encode_handshake_response, encode_initial_handshake, encode_length_encoded_bytes,
     encode_length_encoded_int, encode_ok_packet, encode_ssl_request, parse_change_user,
     parse_handshake_response, parse_initial_handshake, parse_ssl_request,
@@ -238,6 +238,12 @@ enum FakeAuth {
     Migration,
 }
 
+const WIRE03_LARGE_QUERY: &[u8] = b"\x03SELECT wire03_large_response";
+const WIRE03_EXACT_MULTIPLE_QUERY: &[u8] = b"\x03SELECT wire03_exact_multiple_response";
+const WIRE03_LOCAL_INFILE_QUERY: &[u8] = b"\x03LOAD DATA LOCAL INFILE 'wire03.csv'";
+const WIRE03_LARGE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize + 257;
+const WIRE03_EXACT_MULTIPLE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize;
+
 /// The fake backend's connection phase: either the initial Go-oracle
 /// unknown-plugin/auth-switch relay or MIG-01's direct session-token login.
 async fn write_fake_backend_greeting<W: AsyncWrite + Unpin>(
@@ -263,6 +269,7 @@ async fn finish_fake_backend_auth<R, W>(
     reader: &mut PacketReader<R>,
     writer: &mut PacketWriter<W>,
     broad: CapabilityFlags,
+    expected_compression: Option<CompressionAlgorithm>,
 ) -> Option<FakeAuth>
 where
     R: AsyncRead + Unpin,
@@ -280,6 +287,22 @@ where
     let Ok(parsed) = parse_handshake_response(&response.payload) else {
         return None;
     };
+    match expected_compression {
+        Some(CompressionAlgorithm::Zlib)
+            if !parsed.capabilities.contains(CapabilityFlags::COMPRESS) =>
+        {
+            return None;
+        }
+        Some(CompressionAlgorithm::Zstd { level })
+            if !parsed
+                .capabilities
+                .contains(CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM)
+                || parsed.zstd_level != u8::try_from(level).ok() =>
+        {
+            return None;
+        }
+        _ => {}
+    }
     if parsed.auth_plugin_name == Some(b"tidb_session_token".as_slice()) {
         writer.reset_sequence(reader.expected_sequence());
         if parsed.auth_response != b"signed-token-private"
@@ -360,7 +383,7 @@ where
         return None;
     }
     reader.reset_sequence(writer.next_sequence());
-    finish_fake_backend_auth(reader, writer, broad).await
+    finish_fake_backend_auth(reader, writer, broad, None).await
 }
 
 fn result_column(name: &[u8]) -> Vec<u8> {
@@ -1053,7 +1076,7 @@ async fn run_fake_tls_backend_connection(
     reader.reset_sequence(next_sequence);
     let mut writer = PacketWriter::new(write);
     writer.reset_sequence(next_sequence);
-    let Some(auth) = finish_fake_backend_auth(&mut reader, &mut writer, broad).await else {
+    let Some(auth) = finish_fake_backend_auth(&mut reader, &mut writer, broad, None).await else {
         return counters.outbound();
     };
     let _ = run_fake_backend_commands(
@@ -1067,6 +1090,43 @@ async fn run_fake_tls_backend_connection(
     )
     .await;
     counters.outbound()
+}
+
+async fn run_fake_compressed_local_infile(
+    io: &mut PacketIo<CompressedTestTransport>,
+    transcript: &Arc<Mutex<Vec<Vec<u8>>>>,
+    broad: CapabilityFlags,
+) -> bool {
+    io.reset_write_sequence(io.expected_read_sequence());
+    if io.write_logical(b"\xfbwire03.csv", true).await.is_err() {
+        return false;
+    }
+    loop {
+        let Ok(chunk) = io.read_logical(1024 * 1024).await else {
+            return false;
+        };
+        if let Ok(mut commands) = transcript.lock() {
+            commands.push(chunk.payload.clone());
+        }
+        if chunk.payload.is_empty() {
+            break;
+        }
+    }
+    let Ok(ok) = encode_ok_packet(
+        ResponseHeader::OK,
+        1,
+        0,
+        StatusFlags::AUTOCOMMIT,
+        0,
+        b"",
+        broad,
+    ) else {
+        return false;
+    };
+    // Do not manually reset the packet sequence here. The compressed
+    // transport's direction transition must carry the sequence from the
+    // multi-packet upload into this final response.
+    io.write_logical(&ok, true).await.is_ok()
 }
 
 async fn run_fake_compressed_backend_commands(
@@ -1095,7 +1155,35 @@ async fn run_fake_compressed_backend_commands(
             break;
         }
 
-        let response = if packet.payload.starts_with(b"\x03SET SESSION_STATES '") {
+        if packet.payload == WIRE03_LOCAL_INFILE_QUERY {
+            if !run_fake_compressed_local_infile(&mut io, &transcript, broad).await {
+                break;
+            }
+            continue;
+        }
+
+        let response = if packet.payload == WIRE03_LARGE_QUERY
+            || packet.payload == WIRE03_EXACT_MULTIPLE_QUERY
+        {
+            let Ok(mut ok) = encode_ok_packet(
+                ResponseHeader::OK,
+                1,
+                0,
+                StatusFlags::AUTOCOMMIT,
+                0,
+                b"",
+                broad,
+            ) else {
+                break;
+            };
+            let response_len = if packet.payload == WIRE03_LARGE_QUERY {
+                WIRE03_LARGE_RESPONSE_LEN
+            } else {
+                WIRE03_EXACT_MULTIPLE_RESPONSE_LEN
+            };
+            ok.resize(response_len, b'L');
+            ok
+        } else if packet.payload.starts_with(b"\x03SET SESSION_STATES '") {
             if auth != FakeAuth::Migration
                 || matches!(snapshot_reply, SnapshotReply::RestoreDisconnect)
             {
@@ -1144,6 +1232,7 @@ async fn run_fake_compressed_backend_commands(
 async fn run_fake_compressed_backend_connection(
     stream: TcpStream,
     transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    active_algorithms: Arc<Mutex<Vec<CompressionAlgorithm>>>,
     snapshot_reply: SnapshotReply,
     algorithm: CompressionAlgorithm,
 ) -> u64 {
@@ -1157,7 +1246,13 @@ async fn run_fake_compressed_backend_connection(
     let (read, write) = tokio::io::split(counted);
     let mut reader = PacketReader::new(read);
     let mut writer = PacketWriter::new(write);
-    let Some(auth) = fake_backend_auth(&mut reader, &mut writer, broad).await else {
+    if !write_fake_backend_greeting(&mut writer, broad).await {
+        return counters.outbound();
+    }
+    reader.reset_sequence(writer.next_sequence());
+    let Some(auth) =
+        finish_fake_backend_auth(&mut reader, &mut writer, broad, Some(algorithm)).await
+    else {
         return counters.outbound();
     };
 
@@ -1167,6 +1262,9 @@ async fn run_fake_compressed_backend_connection(
     let Ok(compressed) = CompressedIo::new(counted, algorithm, CompressionLimits::default()) else {
         return counters.outbound();
     };
+    if let Ok(mut active) = active_algorithms.lock() {
+        active.push(compressed.codec().algorithm());
+    }
     run_fake_compressed_backend_commands(
         PacketIo::new(CompressedTestTransport { inner: compressed }),
         auth,
@@ -1181,6 +1279,7 @@ async fn run_fake_compressed_backend_connection(
 async fn run_fake_compressed_backend(
     listener: TcpListener,
     transcript: Arc<Mutex<Vec<Vec<u8>>>>,
+    active_algorithms: Arc<Mutex<Vec<CompressionAlgorithm>>>,
     written_bytes: Arc<AtomicU64>,
     snapshot_reply: SnapshotReply,
     algorithm: CompressionAlgorithm,
@@ -1202,6 +1301,7 @@ async fn run_fake_compressed_backend(
         let written = run_fake_compressed_backend_connection(
             stream,
             Arc::clone(&transcript),
+            Arc::clone(&active_algorithms),
             snapshot_reply,
             algorithm,
         )
@@ -1465,7 +1565,12 @@ async fn spawn_fake_compressed_backend_server(
     snapshot_reply: SnapshotReply,
     algorithm: CompressionAlgorithm,
     proxy_v2: bool,
-) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicU64>) {
+) -> (
+    u16,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<AtomicU64>,
+    Arc<Mutex<Vec<CompressionAlgorithm>>>,
+) {
     let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
         unreachable!("backend bind")
     };
@@ -1474,15 +1579,17 @@ async fn spawn_fake_compressed_backend_server(
     };
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let written_bytes = Arc::new(AtomicU64::new(0));
+    let active_algorithms = Arc::new(Mutex::new(Vec::new()));
     tokio::spawn(run_fake_compressed_backend(
         listener,
         Arc::clone(&transcript),
+        Arc::clone(&active_algorithms),
         Arc::clone(&written_bytes),
         snapshot_reply,
         algorithm,
         proxy_v2,
     ));
-    (address.port(), transcript, written_bytes)
+    (address.port(), transcript, written_bytes, active_algorithms)
 }
 
 /// The whole stack under test.
@@ -2344,14 +2451,33 @@ fn spawn_route_answer(stack: &Stack, connection_id: u64, request_id: u64) {
     spawn_route_answer_with_keyspace(stack, connection_id, request_id, "");
 }
 
+fn spawn_route_answer_to(stack: &Stack, connection_id: u64, request_id: u64, backend_port: u16) {
+    spawn_route_answer_with_keyspace_to(stack, connection_id, request_id, "", backend_port);
+}
+
 fn spawn_route_answer_with_keyspace(
     stack: &Stack,
     connection_id: u64,
     request_id: u64,
     keyspace: &str,
 ) {
+    spawn_route_answer_with_keyspace_to(
+        stack,
+        connection_id,
+        request_id,
+        keyspace,
+        stack.backend_port,
+    );
+}
+
+fn spawn_route_answer_with_keyspace_to(
+    stack: &Stack,
+    connection_id: u64,
+    request_id: u64,
+    keyspace: &str,
+    backend_port: u16,
+) {
     let forwarder = Arc::clone(&stack.forwarder);
-    let backend_port = stack.backend_port;
     tokio::spawn(async move {
         // The production adapter always answers the handshake event
         // with a correlated accept decision; the engine consumes it
@@ -3900,7 +4026,7 @@ async fn redirect_restores_candidate_over_compression(
         None,
     )
     .await;
-    let (target_port, target_transcript, target_written_bytes) =
+    let (target_port, target_transcript, target_written_bytes, _) =
         spawn_fake_compressed_backend_server(SnapshotReply::Valid, algorithm, proxy_v2).await;
     spawn_route_answer(&stack, 1, 2);
     let Some(mut client) = timeout(
@@ -6270,6 +6396,26 @@ impl CompressedClient {
     /// zstd case), then wraps the reunited socket in compressed framing matching
     /// the negotiated `algorithm`.
     async fn connect(port: u16, algorithm: CompressionAlgorithm) -> Option<Self> {
+        let (compression_capabilities, zstd_level) = match algorithm {
+            CompressionAlgorithm::Zlib => (CapabilityFlags::COMPRESS, None),
+            CompressionAlgorithm::Zstd { level } => (
+                CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM,
+                Some(u8::try_from(level).ok()?),
+            ),
+        };
+        Self::connect_advertising(port, algorithm, compression_capabilities, zstd_level).await
+    }
+
+    /// Connects with an explicit compression capability mask. This permits the
+    /// Go-compatible mixed-leg shape where the client advertises BOTH flags:
+    /// zlib wins on the client leg, while a zstd-only backend independently
+    /// intersects that mask and activates zstd at `zstd_level`.
+    async fn connect_advertising(
+        port: u16,
+        algorithm: CompressionAlgorithm,
+        compression_capabilities: CapabilityFlags,
+        zstd_level: Option<u8>,
+    ) -> Option<Self> {
         let stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
         let (read, write) = stream.into_split();
         let mut reader = PacketReader::new(read);
@@ -6284,20 +6430,13 @@ impl CompressedClient {
         proxy_salt.extend_from_slice(parsed.auth_plugin_data_part_2);
         // Negotiate compression on top of the base client capabilities; the proxy
         // advertises both COMPRESS and ZSTD, so either bit negotiates.
-        let (compress_capability, zstd_level) = match algorithm {
-            CompressionAlgorithm::Zlib => (CapabilityFlags::COMPRESS, None),
-            CompressionAlgorithm::Zstd { level } => (
-                CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM,
-                Some(u8::try_from(level).ok()?),
-            ),
-        };
         let capabilities = CapabilityFlags::PROTOCOL_41
             | CapabilityFlags::LONG_PASSWORD
             | CapabilityFlags::SECURE_CONNECTION
             | CapabilityFlags::PLUGIN_AUTH
             | CapabilityFlags::CONNECT_ATTRS
             | CapabilityFlags::DEPRECATE_EOF
-            | compress_capability;
+            | compression_capabilities;
         let initial_attributes = [Attribute {
             key: b"program_name",
             value: b"initial-client",
@@ -6373,6 +6512,68 @@ impl CompressedClient {
         }
         self.io.reset_read_sequence(0);
         if self.io.write_logical(&payload, true).await.is_err() {
+            return false;
+        }
+        match self.io.read_logical(64 * 1024).await {
+            Ok(response) => response.payload.first() == Some(&0x00),
+            Err(_) => false,
+        }
+    }
+
+    /// Reads one OK-shaped logical payload that crosses the 16-MiB physical
+    /// packet boundary and returns the number of physical packets consumed.
+    async fn query_large_ok(&mut self, sql: &str, expected_len: usize) -> Option<(u64, u8)> {
+        let mut payload = vec![0x03_u8];
+        payload.extend_from_slice(sql.as_bytes());
+        self.io.get_mut().reset_layer_sequence().ok()?;
+        self.io.reset_read_sequence(0);
+        self.io.write_logical(&payload, true).await.ok()?;
+        let before = self.io.in_packets();
+        let response = self.io.read_logical(expected_len).await.ok()?;
+        if response.payload.len() != expected_len
+            || response.payload.first() != Some(&0x00)
+            || response.payload.last() != Some(&b'L')
+        {
+            return None;
+        }
+        Some((
+            self.io.in_packets().checked_sub(before)?,
+            self.compressed_sequence(),
+        ))
+    }
+
+    fn compression_algorithm(&self) -> CompressionAlgorithm {
+        self.io.get_ref().inner.codec().algorithm()
+    }
+
+    fn compressed_sequence(&self) -> u8 {
+        self.io.get_ref().inner.codec().sequence()
+    }
+
+    /// Runs the full compressed LOCAL INFILE duplex: query, backend request,
+    /// multiple client chunks, empty terminator, and final backend OK.
+    async fn local_infile(&mut self, sql: &str, chunks: &[&[u8]]) -> bool {
+        let mut payload = vec![0x03_u8];
+        payload.extend_from_slice(sql.as_bytes());
+        if self.io.get_mut().reset_layer_sequence().is_err() {
+            return false;
+        }
+        self.io.reset_read_sequence(0);
+        if self.io.write_logical(&payload, true).await.is_err() {
+            return false;
+        }
+        let Ok(request) = self.io.read_logical(64 * 1024).await else {
+            return false;
+        };
+        if request.payload != b"\xfbwire03.csv" {
+            return false;
+        }
+        for chunk in chunks {
+            if self.io.write_logical(chunk, false).await.is_err() {
+                return false;
+            }
+        }
+        if self.io.write_logical(&[], true).await.is_err() {
             return false;
         }
         match self.io.read_logical(64 * 1024).await {
@@ -6570,6 +6771,31 @@ async fn compressed_client_roundtrips(algorithm: CompressionAlgorithm) {
     stack.dispatch_task.abort();
 }
 
+async fn mixed_zlib_client_zstd_backend_stack() -> (
+    Stack,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<Mutex<Vec<CompressionAlgorithm>>>,
+) {
+    let stack = spawn_stack().await;
+    let backend_algorithm = CompressionAlgorithm::Zstd { level: 3 };
+    let (backend_port, transcript, _, active_algorithms) =
+        spawn_fake_compressed_backend_server(SnapshotReply::Valid, backend_algorithm, false).await;
+    let topology = engine_snapshot(stack.sql_port, backend_port, false, None, false);
+    assert!(stack.server_handle.update_snapshot(topology).is_ok());
+    spawn_route_answer_to(&stack, 1, 2, backend_port);
+    (stack, transcript, active_algorithms)
+}
+
+async fn connect_mixed_zlib_client(port: u16) -> Option<CompressedClient> {
+    CompressedClient::connect_advertising(
+        port,
+        CompressionAlgorithm::Zlib,
+        CapabilityFlags::COMPRESS | CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM,
+        Some(3),
+    )
+    .await
+}
+
 /// A client that negotiates classic zlib `COMPRESS` round-trips two compressed
 /// commands end to end. This exercises the full production sequence bridge
 /// (`CompressedIo` codec + `PacketIo` `DirectionSync` hooks) over real sockets.
@@ -6589,6 +6815,149 @@ async fn compressed_client_zlib_roundtrips_end_to_end() {
 #[tokio::test]
 async fn compressed_client_zstd_roundtrips_end_to_end() {
     compressed_client_roundtrips(CompressionAlgorithm::Zstd { level: 3 }).await;
+}
+
+/// The client advertises both compression flags, so Go precedence selects zlib
+/// on the client leg. The selected backend advertises only zstd, so the backend
+/// leg independently intersects the same negotiated mask and selects zstd.
+/// Two commands prove both codecs stay live across a command reset.
+#[tokio::test]
+async fn compressed_mixed_zlib_client_zstd_backend_roundtrips() {
+    let (stack, transcript, backend_active_algorithms) =
+        mixed_zlib_client_zstd_backend_stack().await;
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        connect_mixed_zlib_client(stack.sql_port),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("mixed zlib-client/zstd-backend session established")
+    };
+    assert_eq!(client.compression_algorithm(), CompressionAlgorithm::Zlib);
+    assert!(client.query_ok("SELECT mixed_one").await);
+    assert_eq!(
+        backend_active_algorithms
+            .lock()
+            .map_or_else(|_| Vec::new(), |algorithms| algorithms.clone()),
+        [CompressionAlgorithm::Zstd { level: 3 }],
+        "the accepted backend connection activated zstd level 3"
+    );
+    assert_eq!(client.compressed_sequence(), 2);
+    assert!(client.query_ok("SELECT mixed_two").await);
+    assert_eq!(
+        client.compressed_sequence(),
+        2,
+        "the second command reset the shared read/write sequence to zero"
+    );
+    client.quit().await;
+
+    let commands = transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert_eq!(
+        &commands[..2],
+        [
+            b"\x03SELECT mixed_one".as_slice(),
+            b"\x03SELECT mixed_two".as_slice(),
+        ]
+    );
+    stack.dispatch_task.abort();
+}
+
+/// One compressed logical response crosses `MySQL`'s 16-MiB physical-packet
+/// boundary. The client must consume exactly two physical packets and reset
+/// both layered sequences cleanly for the immediately following command.
+#[tokio::test]
+async fn compressed_large_logical_response_splits_and_realigns() {
+    let (stack, transcript, _) = mixed_zlib_client_zstd_backend_stack().await;
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        connect_mixed_zlib_client(stack.sql_port),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("mixed compressed session established for large response")
+    };
+    assert_eq!(
+        client
+            .query_large_ok("SELECT wire03_large_response", WIRE03_LARGE_RESPONSE_LEN)
+            .await,
+        Some((2, 3)),
+        "the >16-MiB logical response is two MySQL packets and two response frames"
+    );
+    assert_eq!(
+        client
+            .query_large_ok(
+                "SELECT wire03_exact_multiple_response",
+                WIRE03_EXACT_MULTIPLE_RESPONSE_LEN,
+            )
+            .await,
+        Some((2, 3)),
+        "the exact MaxPayloadLen response adds the zero-length physical terminator"
+    );
+    assert!(
+        client.query_ok("SELECT after_large_response").await,
+        "the next compressed command starts at a clean sequence boundary"
+    );
+    assert_eq!(client.compressed_sequence(), 2);
+    client.quit().await;
+
+    let commands = transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert_eq!(commands[0], WIRE03_LARGE_QUERY);
+    assert_eq!(commands[1], WIRE03_EXACT_MULTIPLE_QUERY);
+    assert_eq!(commands[2], b"\x03SELECT after_large_response");
+    stack.dispatch_task.abort();
+}
+
+/// LOCAL INFILE reverses direction twice inside one compressed command. Two
+/// chunks and the empty terminator share the upload direction; the final OK
+/// returns on the same layered sequence, then the next command resets to zero.
+#[tokio::test]
+async fn compressed_local_infile_multi_turn_realigns() {
+    let (stack, transcript, _) = mixed_zlib_client_zstd_backend_stack().await;
+    let Some(mut client) = timeout(
+        Duration::from_secs(5),
+        connect_mixed_zlib_client(stack.sql_port),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        unreachable!("mixed compressed session established for LOCAL INFILE")
+    };
+    let chunks = [b"1,alpha\n".as_slice(), b"2,beta\n".as_slice()];
+    assert!(
+        client
+            .local_infile("LOAD DATA LOCAL INFILE 'wire03.csv'", &chunks)
+            .await
+    );
+    assert_eq!(
+        client.compressed_sequence(),
+        4,
+        "query, infile request, upload frame, and final OK share one sequence"
+    );
+    assert!(
+        client.query_ok("SELECT after_local_infile").await,
+        "the next compressed command starts at a clean sequence boundary"
+    );
+    assert_eq!(client.compressed_sequence(), 2);
+    client.quit().await;
+
+    let commands = transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert_eq!(commands[0], WIRE03_LOCAL_INFILE_QUERY);
+    assert_eq!(commands[1], chunks[0]);
+    assert_eq!(commands[2], chunks[1]);
+    assert!(
+        commands[3].is_empty(),
+        "the upload ends with one empty packet"
+    );
+    assert_eq!(commands[4], b"\x03SELECT after_local_infile");
+    stack.dispatch_task.abort();
 }
 
 /// SES-05 over compression: a `COM_STMT_PREPARE` special response rides the

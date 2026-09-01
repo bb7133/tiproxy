@@ -4,9 +4,9 @@
 package router
 
 import (
-	"github.com/pingcap/tiproxy/lib/config"
 	"testing"
 
+	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	"github.com/stretchr/testify/require"
 )
