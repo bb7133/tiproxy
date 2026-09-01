@@ -288,4 +288,11 @@ fi
 	exit 1
 }
 
+# VAL-01 driver-smoke negotiation self-test: locks the fail-closed assertion
+# rows (missing-log / 0-line / 2-line / bit-absent / bit-present) plus the
+# driver whitelist (unknown-driver rejected) without a real TiDB, so the smoke
+# gate cannot silently regress to false-green. `set -e` fails the harness if any
+# row misbehaves.
+"$repo_root/tests/compatibility/smoke/run-smoke.sh" --self-test
+
 echo "PASS: integration framework self-tests"
