@@ -3597,6 +3597,45 @@ async fn malformed_change_user_fails_before_backend_write() {
     stack.dispatch_task.abort();
 }
 
+/// PKT-005: a command whose logical payload is empty carries no command byte and
+/// is malformed. The production engine fails the session closed before any
+/// backend write, matching Go's rejection of a sub-one-byte command packet.
+#[tokio::test]
+async fn empty_command_payload_fails_closed_before_backend_write() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    client.writer.reset_sequence(0);
+    // A zero-length logical command is a single zero-length physical packet with
+    // no command byte.
+    assert!(client.writer.write_logical(&[], true).await.is_ok());
+    client.reader.reset_sequence(1);
+    let closed = timeout(
+        Duration::from_secs(2),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await;
+    assert!(
+        matches!(closed, Ok(Err(_))),
+        "an empty command payload closes fail-closed"
+    );
+    let commands = stack
+        .backend_transcript
+        .lock()
+        .map_or_else(|_| Vec::new(), |commands| commands.clone());
+    assert!(
+        commands.iter().all(|payload| !payload.is_empty()),
+        "no empty command reaches the backend: {commands:?}"
+    );
+    stack.dispatch_task.abort();
+}
+
 /// A header-only OK is relayed exactly once but cannot commit identity or keep
 /// the session alive because it lacks the status field that defines the
 /// transaction boundary.
