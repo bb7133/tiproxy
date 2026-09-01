@@ -600,6 +600,33 @@ mysql_backend_admin "DROP USER IF EXISTS 'auth_native'@'%'; DROP USER IF EXISTS 
 # a per-plugin pass-through matrix (pass_through_plugins_have_no_fast_path).
 echo "auth matrix: mysql_native_password relayed; $auth_sha2_note; wrong password rejected (1045); $auth_reqssl_note (mode=$mode, tls=$TLS_ENABLED)"
 
+# ---- VAL-01 driver-compatibility smoke (rust plain; opt-in via DATAPLANE_SMOKE=1) ----
+# Real MySQL clients (native Go + Python, no containers) run the key workloads
+# through the Rust TiProxy against the real TiDB, and compression negotiation is
+# asserted from the dataplane's connection-close log — so a "query succeeded
+# after a silent capability downgrade" fails, not passes. This runs here, right
+# after the auth matrix, while every TiDB backend is still healthy and before the
+# deliberately destructive phases (keyspace guard, error parity, drop-next) take
+# backends down. It is off by default (fast local runs) and enabled for
+# CI/acceptance.
+#
+# Scoped to the `plain` variant on purpose: the `tls`/`tls-proxy-zstd` variants
+# require mutual TLS (a client certificate) and trip driver-specific TLS quirks
+# (e.g. Connector/Python's OpenSSL-3 CA keyUsage strictness). The Go/Python smoke
+# adapters already accept --ca-file, so driver-level TLS smoke is a documented
+# follow-up; the proxy's own TLS path is already covered by run.sh's existing TLS
+# phases (mysql CLI with client certs, the REQUIRE SSL auth matrix, and WIRE-04).
+if [[ $mode == rust && $variant == plain && ${DATAPLANE_SMOKE:-0} == 1 ]]; then
+	if "$repo_root/tests/compatibility/smoke/run-smoke.sh" \
+		--host 127.0.0.1 --port "$TIPROXY_PORT" --user root --database test \
+		--rust-log "$run_dir/tiproxy-rs.log"; then
+		echo "driver smoke: all real-client workloads passed and negotiated their capabilities"
+	else
+		echo "driver smoke: a real-client workload failed or silently downgraded" >&2
+		exit 1
+	fi
+fi
+
 # ---- Cluster x listener matrix (DPL-07 #41 cluster dimension) ----
 # Deterministic construction: routing-rule = "port" groups backends by
 # their `tiproxy-port` topology label, so listener A can ONLY select
@@ -2545,28 +2572,6 @@ if [[ $mode == go ]]; then
 	fi
 fi
 echo "error parity: no healthy backend -> 1105/HY000 'No available TiDB instances'"
-
-# ---- VAL-01 driver-compatibility smoke (rust; opt-in via DATAPLANE_SMOKE=1) ----
-# Real MySQL clients (native Go + Python, no containers) run the key workloads
-# through the Rust TiProxy against the real TiDB, and TLS/compression
-# negotiation is asserted from the dataplane's connection-close log — so a
-# "query succeeded after a silent capability downgrade" fails, not passes. This
-# is off by default (fast local runs) and enabled for CI/acceptance.
-if [[ $mode == rust && ${DATAPLANE_SMOKE:-0} == 1 ]]; then
-	smoke_ca_args=()
-	if [[ $variant == tls || $variant == tls-proxy-zstd ]]; then
-		smoke_ca_args=(--ca-file "$CA_CERT")
-	fi
-	if "$repo_root/tests/compatibility/smoke/run-smoke.sh" \
-		--host 127.0.0.1 --port "$TIPROXY_PORT" --user root --database test \
-		--rust-log "$run_dir/tiproxy-rs.log" \
-		${smoke_ca_args[@]+"${smoke_ca_args[@]}"}; then
-		echo "driver smoke: all real-client workloads passed and negotiated their capabilities"
-	else
-		echo "driver smoke: a real-client workload failed or silently downgraded" >&2
-		exit 1
-	fi
-fi
 
 if [[ $mode == rust ]]; then
 	echo "PASS: Rust dataplane $variant executed SELECT 1, namespace matrix, MIG-01 live migration, keyspace guard, error parity, and recovered from drop-next"

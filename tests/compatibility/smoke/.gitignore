@@ -1,0 +1,3 @@
+# VAL-01 smoke build artifacts (created by run-smoke.sh; never committed)
+.go-smoke.bin
+.venv/
