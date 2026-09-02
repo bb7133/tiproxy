@@ -9,6 +9,7 @@
     "metering",
     "metrics_log",
     "routing",
+    "runtime",
     "topology"
   ],
   "contracts": [
@@ -33,9 +34,9 @@
     {
       "id": "CP-BRIDGE-001",
       "family": "bridge",
-      "summary": "In-process control startup preserves version negotiation, capabilities, epoch and generation lineage, request correlation, bounded queues, and fail-closed reconnect behavior.",
+      "summary": "The residual Go/Rust migration adapter preserves version negotiation, capabilities, epoch and generation lineage, request correlation, bounded queues, and fail-closed reconnect behavior until final cutover.",
       "go_owner": "pkg/controlbridge and pkg/controlbridge/transport",
-      "rust_target": "#142",
+      "rust_target": "#153",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
@@ -46,7 +47,26 @@
       "observed_fields": ["protocol_version", "capabilities", "control_epoch", "generation", "request_id", "process_id"],
       "fault_scenarios": ["CP-FAULT-BRIDGE-RECONNECT", "CP-FAULT-PROCESS-DEATH"],
       "bridge_messages": ["hello", "hello_ack", "heartbeat", "error", "reconcile_request", "reconcile_snapshot"],
-      "handoff": "Replace transport with direct calls only after the same state-machine observations pass in one Rust process."
+      "handoff": "Keep this legacy adapter shrink-only while responsibilities remain in Go; delete its final transport lifecycle at CP-CUTOVER."
+    },
+    {
+      "id": "CP-RUNTIME-001",
+      "family": "runtime",
+      "summary": "One Rust process owns the in-process control runtime, domain module seam, lifecycle, ordered shutdown, atomic last-good config/TLS views, and bounded logs and metrics.",
+      "go_owner": "pkg/server plus pkg/manager/config, pkg/manager/cert, pkg/manager/logger, and pkg/metrics",
+      "rust_target": "#142",
+      "go_baseline": "anchored",
+      "rust_status": "owned",
+      "anchors": [
+        {"path": "pkg/server/server.go", "contains": "func NewServer"},
+        {"path": "pkg/server/server.go", "contains": "func (s *Server) Close"},
+        {"path": "rust/crates/control-plane/src/runtime.rs", "contains": "pub struct ControlRuntime"},
+        {"path": "tests/controlplane/cp001/go-observer/main.go", "contains": "func run"}
+      ],
+      "observed_fields": ["process_id", "owner_generation", "config_generation", "lifecycle_phase", "shutdown_reason", "tls_generation", "log_level", "metrics_namespace"],
+      "fault_scenarios": ["CP-FAULT-RUNTIME-CONFIG-RELOAD", "CP-FAULT-RUNTIME-MODULE-FAILURE", "CP-FAULT-PROCESS-DEATH"],
+      "bridge_messages": [],
+      "handoff": "All later Rust control modules compose through this process-local domain/runtime; no module may introduce a second process, transport, or protobuf domain model."
     },
     {
       "id": "CP-CONFIG-001",
@@ -284,8 +304,8 @@
     }
   ],
   "bridge_messages": [
-    {"name": "hello", "direction": "bidirectional", "target_issue": "#142"},
-    {"name": "hello_ack", "direction": "bidirectional", "target_issue": "#142"},
+    {"name": "hello", "direction": "bidirectional", "target_issue": "#153"},
+    {"name": "hello_ack", "direction": "bidirectional", "target_issue": "#153"},
     {"name": "state_snapshot", "direction": "go_to_rust", "target_issue": "#146"},
     {"name": "snapshot_result", "direction": "rust_to_go", "target_issue": "#146"},
     {"name": "handshake_response", "direction": "rust_to_go", "target_issue": "#147"},
@@ -303,8 +323,8 @@
     {"name": "metering_batch", "direction": "rust_to_go", "target_issue": "#148"},
     {"name": "reconcile_request", "direction": "rust_to_go", "target_issue": "#147"},
     {"name": "reconcile_snapshot", "direction": "go_to_rust", "target_issue": "#147"},
-    {"name": "heartbeat", "direction": "bidirectional", "target_issue": "#142"},
-    {"name": "error", "direction": "bidirectional", "target_issue": "#142"},
+    {"name": "heartbeat", "direction": "bidirectional", "target_issue": "#153"},
+    {"name": "error", "direction": "bidirectional", "target_issue": "#153"},
     {"name": "close_command", "direction": "go_to_rust", "target_issue": "#150"},
     {"name": "close_result", "direction": "rust_to_go", "target_issue": "#150"},
     {"name": "metering_ack", "direction": "go_to_rust", "target_issue": "#148"}

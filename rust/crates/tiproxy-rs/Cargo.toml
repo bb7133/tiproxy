@@ -12,6 +12,7 @@ build = "build.rs"
 default = []
 
 [dependencies]
+control-plane.workspace = true
 control-proto.workspace = true
 dataplane.workspace = true
 tokio = { workspace = true, features = ["signal"] }

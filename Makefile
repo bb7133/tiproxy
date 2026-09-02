@@ -43,7 +43,7 @@ CARGO_DENY_VERSION := 0.20.2
 RUST_TOOL_ROOT ?= $(GOBIN)/rust-tools
 RUST_TOOL_BIN := $(RUST_TOOL_ROOT)/bin
 
-.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests control-proto-generate control-proto-generate-check controlplane-contracts controlplane-differential controlplane-differential-self-test dataplane-differential dataplane-differential-coverage dataplane-differential-mutation dataplane-integration dataplane-integration-go dataplane-integration-self-test
+.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests control-proto-generate control-proto-generate-check controlplane-contracts controlplane-differential controlplane-differential-self-test controlplane-cp001-evidence dataplane-differential dataplane-differential-coverage dataplane-differential-mutation dataplane-integration dataplane-integration-go dataplane-integration-self-test
 
 default: cmd
 
@@ -125,6 +125,23 @@ controlplane-differential:
 
 controlplane-differential-self-test:
 	$(GO) run ./tests/controlplane/differential/cmd/controlplane-differential -mode self-test
+
+# Paired observations come from the production Go ConfigManager and the actual
+# Rust control-plane crate. The second Rust run deliberately mutates one public
+# owner-generation observation and must be rejected by the exact comparator.
+controlplane-cp001-evidence:
+	@set -eu; \
+	tmp_dir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp_dir"' EXIT INT TERM; \
+	$(GO) run ./tests/controlplane/cp001/go-observer > "$$tmp_dir/go.json"; \
+	$(RUST_BUILD_ENV) $(CARGO) run --locked --quiet --manifest-path $(RUST_MANIFEST) -p control-plane --example cp001_observer > "$$tmp_dir/rust.json"; \
+	$(GO) run ./tests/controlplane/differential/cmd/controlplane-differential -mode compare -baseline "$$tmp_dir/go.json" -candidate "$$tmp_dir/rust.json"; \
+	CP001_MUTATE_OWNER_GENERATION=1 $(RUST_BUILD_ENV) $(CARGO) run --locked --quiet --manifest-path $(RUST_MANIFEST) -p control-plane --example cp001_observer > "$$tmp_dir/rust-mutated.json"; \
+	set +e; \
+	$(GO) run ./tests/controlplane/differential/cmd/controlplane-differential -mode compare -baseline "$$tmp_dir/go.json" -candidate "$$tmp_dir/rust-mutated.json"; \
+	status=$$?; \
+	set -e; \
+	if [ "$$status" -ne 1 ]; then echo "CP-001 owner-generation mutation was not killed (status=$$status)" >&2; exit 1; fi
 
 DIFFERENTIAL_SHARD_INDEX ?= 0
 DIFFERENTIAL_SHARD_COUNT ?= 4

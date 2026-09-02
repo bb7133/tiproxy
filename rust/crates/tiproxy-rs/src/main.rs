@@ -24,6 +24,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use control_plane::{
+    ConfigSource, ControlConfig, ControlRuntime as InProcessControlRuntime, JsonStderrSink,
+    LifecyclePhase, LogLevel, MetricsPolicy, OwnershipRegistry, ShutdownReason, TlsPolicy,
+};
 use control_proto::CONTROL_PROTOCOL_V1;
 use control_proto::control_transport::ClientConfig;
 use control_proto::control_transport::ControlClient;
@@ -76,8 +80,7 @@ enum Command {
 /// C) are all wired, so `tls`, `proxy-v2`, `zlib`, and `zstd` are advertised
 /// and the topology preflight admits plain, tls, proxy, and compressed
 /// variants.
-const INTEGRATION_CAPABILITIES: &str =
-    "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
+const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -116,6 +119,26 @@ async fn main() -> ExitCode {
 // makes the fail-closed ownership order auditable.
 #[allow(clippy::too_many_lines)]
 async fn run(options: Options) -> Result<(), String> {
+    // CP-001 owns the process-local lifecycle/config/TLS/log/metrics
+    // foundation. The legacy protobuf client below is an outer adapter for
+    // responsibilities that still live in Go; its messages never become this
+    // runtime's domain model.
+    let process_started_unix_millis: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let process_id = format!("tiproxy-rs-{}", std::process::id());
+    let in_process_registry = OwnershipRegistry::new();
+    let in_process = InProcessControlRuntime::claim_process(
+        &in_process_registry,
+        process_id.clone(),
+        initial_control_config(&options)?,
+        Arc::new(JsonStderrSink),
+    )
+    .map_err(|error| format!("start in-process control runtime: {error}"))?;
+    let in_process_config = in_process.handle().config().current();
     let capabilities = vec![
         ControlCapability::PerConnectionClose as u64,
         ControlCapability::ReconcileConnections as u64,
@@ -124,13 +147,8 @@ async fn run(options: Options) -> Result<(), String> {
     ];
     let hello = Hello {
         role: Role::RustDataplane as i32,
-        process_id: format!("tiproxy-rs-{}", std::process::id()),
-        process_started_unix_millis: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX),
+        process_id,
+        process_started_unix_millis,
         supported_versions: vec![u32::from(CONTROL_PROTOCOL_V1)],
         capabilities: capabilities.clone(),
         max_frame_bytes: control_proto::DEFAULT_MAX_FRAME_BYTES,
@@ -147,7 +165,7 @@ async fn run(options: Options) -> Result<(), String> {
     let mut client =
         ClientConfig::with_defaults(options.control_socket, options.control_uid, hello);
     client.required_capabilities = capabilities;
-    let store = SnapshotStore::new(options.tls_roots)
+    let store = SnapshotStore::new(in_process_config.tls().roots().to_vec())
         .map_err(|error| format!("create snapshot store: {error}"))?;
 
     // DPL-04: the real session owner replaces DPL-03's parked handler.
@@ -157,7 +175,7 @@ async fn run(options: Options) -> Result<(), String> {
     let (drain_tx, drain_rx) = watch::channel(false);
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
     let (metering_shutdown_tx, metering_shutdown_rx) = watch::channel(false);
-    let loop_config = session_loop_config(options.drain_grace);
+    let loop_config = session_loop_config(in_process_config.drain_grace());
     let (metrics, observations) = MetricsRecorder::channel(DEFAULT_OBSERVATION_CAPACITY);
     let owner: Arc<dyn BoundSessionHandler> = Arc::new(
         EngineSessionOwner::new(
@@ -214,7 +232,10 @@ async fn run(options: Options) -> Result<(), String> {
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
-    let health_task = spawn_health(options.health_port, serving.clone()).await?;
+    let health_task = spawn_health(in_process_config.health_port(), serving.clone()).await?;
+    in_process
+        .mark_ready()
+        .map_err(|error| format!("mark in-process control runtime ready: {error}"))?;
 
     // Supervise control and metering together. Either task disappearing must
     // wake this owner: otherwise a sampler panic could leave SQL serving
@@ -231,11 +252,19 @@ async fn run(options: Options) -> Result<(), String> {
                 Ok(result) => result.map_err(|error| error.to_string()),
                 Err(_) => Err("control runtime supervisor panicked".to_owned()),
             };
+            if control.is_err() {
+                in_process.fail("legacy_bridge", "runtime_failure");
+            } else {
+                in_process
+                    .begin_shutdown(ShutdownReason::ModuleExit)
+                    .map_err(|error| format!("begin module-exit shutdown: {error}"))?;
+            }
             let serving_result = stop_drain_and_join_sessions(
+                &in_process,
                 &serving,
                 &drain_tx,
                 &session_shutdown_tx,
-                options.drain_grace,
+                in_process_config.drain_grace(),
             ).await;
             metering_shutdown_tx.send_replace(true);
             let sampler = match metering_sampler.await {
@@ -249,14 +278,22 @@ async fn run(options: Options) -> Result<(), String> {
                 Ok(result) => result.map_err(|error| error.to_string()),
                 Err(_) => Err("metering sampler panicked".to_owned()),
             };
+            if sampler.is_err() {
+                in_process.fail("metering_sampler", "runtime_failure");
+            } else {
+                in_process
+                    .begin_shutdown(ShutdownReason::ModuleExit)
+                    .map_err(|error| format!("begin module-exit shutdown: {error}"))?;
+            }
             // Readiness becomes false at stop_accepting, before the grace
             // period. Existing sessions then drain and finally receive the
             // force signal. The control shutdown wakes its supervisor.
             let serving_result = stop_drain_and_join_sessions(
+                &in_process,
                 &serving,
                 &drain_tx,
                 &session_shutdown_tx,
-                options.drain_grace,
+                in_process_config.drain_grace(),
             ).await;
             metering_shutdown_tx.send_replace(true);
             shared_client.shutdown();
@@ -267,11 +304,15 @@ async fn run(options: Options) -> Result<(), String> {
             (control, sampler, serving_result)
         }
         () = &mut termination => {
+            in_process
+                .begin_shutdown(ShutdownReason::Signal)
+                .map_err(|error| format!("begin signal shutdown: {error}"))?;
             let serving_result = stop_drain_and_join_sessions(
+                &in_process,
                 &serving,
                 &drain_tx,
                 &session_shutdown_tx,
-                options.drain_grace,
+                in_process_config.drain_grace(),
             ).await;
             metering_shutdown_tx.send_replace(true);
             let sampler = match metering_sampler.await {
@@ -292,11 +333,14 @@ async fn run(options: Options) -> Result<(), String> {
     }
     metrics_exporter.shutdown();
     metrics_exporter.join().await;
-    match (control_result, sampler_result, serving_result) {
-        (_, Err(error), _) | (Err(error), _, _) => Err(error),
-        (Ok(()), Ok(()), Err(error)) => Err(format!("shut down SQL listeners: {error}")),
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
-    }
+    let finish_result = in_process
+        .finish()
+        .map_err(|error| format!("finish in-process control runtime: {error}"));
+    sampler_result?;
+    control_result?;
+    serving_result?;
+    finish_result?;
+    Ok(())
 }
 
 /// Stops admission, lets the existing per-session graceful timers run, then
@@ -304,16 +348,27 @@ async fn run(options: Options) -> Result<(), String> {
 /// stopped here: its owner signals it only after this future completes, so
 /// its last snapshot sees every final raw counter and final source marker.
 async fn stop_drain_and_join_sessions(
+    runtime: &InProcessControlRuntime,
     serving: &DataplaneServingHandle,
     drain: &watch::Sender<bool>,
     session_shutdown: &watch::Sender<bool>,
     grace: Duration,
-) -> Result<(), ServerError> {
+) -> Result<(), String> {
+    runtime
+        .advance_shutdown(LifecyclePhase::Draining)
+        .map_err(|error| format!("enter control runtime drain phase: {error}"))?;
     serving.stop_accepting().await;
     drain.send_replace(true);
     tokio::time::sleep(grace).await;
     session_shutdown.send_replace(true);
-    serving.shutdown().await
+    let serving_result = serving
+        .shutdown()
+        .await
+        .map_err(|error: ServerError| format!("shut down SQL listeners: {error}"));
+    runtime
+        .advance_shutdown(LifecyclePhase::Stopping)
+        .map_err(|error| format!("enter control runtime stop phase: {error}"))?;
+    serving_result
 }
 
 /// Binds the optional integration readiness endpoint before its serving task
@@ -341,6 +396,23 @@ fn session_loop_config(drain_grace: Duration) -> SessionLoopConfig {
         drain_deadline: drain_grace,
         ..SessionLoopConfig::default()
     }
+}
+
+/// Projects the process CLI into the first Rust-native control-domain view.
+/// Later CP-CFG work may replace it with a dynamic source without changing any
+/// module's in-process contract.
+fn initial_control_config(options: &Options) -> Result<ControlConfig, String> {
+    let tls = TlsPolicy::new(options.tls_roots.clone())
+        .map_err(|error| format!("validate in-process TLS policy: {error}"))?;
+    ControlConfig::new(
+        1,
+        options.drain_grace,
+        options.health_port,
+        tls,
+        LogLevel::Info,
+        MetricsPolicy::default(),
+    )
+    .map_err(|error| format!("validate in-process control config: {error}"))
 }
 
 /// Resolves on SIGTERM or SIGINT.
@@ -459,8 +531,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options, parse_options,
-        session_loop_config, version_output,
+        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options,
+        initial_control_config, parse_options, session_loop_config, version_output,
     };
 
     #[test]
@@ -526,7 +598,7 @@ mod tests {
         };
         assert_eq!(
             INTEGRATION_CAPABILITIES,
-            "control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
+            "in-process-control-runtime,control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
             "only what the binary truthfully provides: the plain slice plus wired TLS, PROXY v2, and compression"
         );
         for wired in ["tls", "proxy-v2", "zlib", "zstd"] {
@@ -535,6 +607,23 @@ mod tests {
                 "{wired:?} is wired (WIRE-activation A1/B/C), so it must be advertised"
             );
         }
+    }
+
+    #[test]
+    fn operational_cli_projects_into_rust_control_domain() {
+        let options = Options {
+            control_socket: PathBuf::from("/tmp/control.sock"),
+            control_uid: 42,
+            tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
+            drain_grace: std::time::Duration::from_secs(45),
+            health_port: 8081,
+        };
+        let config = initial_control_config(&options)
+            .unwrap_or_else(|error| unreachable!("valid control config: {error}"));
+        assert_eq!(config.generation(), 1);
+        assert_eq!(config.drain_grace(), options.drain_grace);
+        assert_eq!(config.health_port(), options.health_port);
+        assert_eq!(config.tls().roots(), options.tls_roots);
     }
 
     #[test]

@@ -13,7 +13,7 @@
     {
       "id": "CP-FAULT-BRIDGE-RECONNECT",
       "summary": "Disconnect control delivery with live state and reconnect under a new epoch.",
-      "target_issue": "#142",
+      "target_issue": "#153",
       "contracts": ["CP-BRIDGE-001", "CP-ROUTE-003"],
       "steps": ["record the live generation and connection set", "disconnect control delivery", "reconnect and reconcile"],
       "expectations": ["the epoch changes", "generation does not regress", "live state converges exactly once"],
@@ -122,10 +122,28 @@
       "id": "CP-FAULT-PROCESS-DEATH",
       "summary": "Kill either legacy control owner or Rust dataplane with active sessions and pending lifecycle work.",
       "target_issue": "#142",
-      "contracts": ["CP-BRIDGE-001", "CP-HA-001", "CP-ROUTE-003"],
+      "contracts": ["CP-BRIDGE-001", "CP-HA-001", "CP-ROUTE-003", "CP-RUNTIME-001"],
       "steps": ["record process, owner, and connection lineage", "kill one process", "restart and reconcile"],
       "expectations": ["stale ownership is fenced", "connection accounting converges", "terminal effects occur once"],
-      "observed_fields": ["process_id", "owner_id", "control_epoch", "generation", "connection_id", "terminal_count"]
+      "observed_fields": ["process_id", "owner_id", "owner_generation", "control_epoch", "generation", "connection_id", "terminal_count"]
+    },
+    {
+      "id": "CP-FAULT-RUNTIME-CONFIG-RELOAD",
+      "summary": "Reject one invalid process configuration and then commit its valid immediate successor while old and new TLS users coexist.",
+      "target_issue": "#142",
+      "contracts": ["CP-RUNTIME-001"],
+      "steps": ["record the last-good config and TLS view", "submit an invalid or skipped generation", "submit the valid immediate successor"],
+      "expectations": ["the invalid candidate is rejected without notifying subscribers", "the immediate successor commits exactly once", "established TLS users retain the old immutable view while new users see the successor"],
+      "observed_fields": ["config_generation", "validation_class", "notification_count", "tls_generation", "log_level", "metrics_namespace"]
+    },
+    {
+      "id": "CP-FAULT-RUNTIME-MODULE-FAILURE",
+      "summary": "Fail one managed process-local module and complete the mandatory ordered shutdown.",
+      "target_issue": "#142",
+      "contracts": ["CP-RUNTIME-001"],
+      "steps": ["reach ready with one exact owner", "fail a managed module", "quiesce admission, drain sessions, seal final effects, stop and join modules", "release the owner"],
+      "expectations": ["one bounded failure event identifies the module and public error class", "shutdown begins once", "the owner remains current through final sealing and joins", "the owner is released only after stopped"],
+      "observed_fields": ["process_id", "owner_generation", "lifecycle_phase", "shutdown_reason", "module", "error_class", "shutdown_count"]
     },
     {
       "id": "CP-FAULT-ROUTE-NO-BACKEND",

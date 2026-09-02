@@ -1,0 +1,19 @@
+[package]
+name = "control-plane"
+description = "In-process TiProxy control-plane domain and lifecycle foundation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

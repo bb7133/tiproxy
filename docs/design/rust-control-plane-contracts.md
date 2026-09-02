@@ -25,6 +25,20 @@ owner. Each later stateful slice must prove:
 Traffic capture and the offline replayer belong to M2 and are intentionally
 absent from this M1 catalog.
 
+CP-001 adds `rust/crates/control-plane` to the existing `tiproxy-rs` binary. It
+owns one process-local runtime lease, Rust-native module/config/TLS types,
+bounded lifecycle observations, and the shutdown order: quiesce admission,
+drain and join sessions, seal final metering, stop and join the residual bridge,
+then release the owner. Invalid config lineage retains the last-good view;
+existing TLS users retain their immutable `Arc` while new users see the next
+committed view. The internal crate deliberately has no `control-proto`
+dependency.
+
+CP-001 does **not** claim that the migration bridge has already disappeared.
+`hello`, `hello_ack`, `heartbeat`, and `error`, along with every remaining
+responsibility message, stay in the exact inventory until their real owner
+moves. The final lifecycle transport retirement belongs to CP-CUTOVER #153.
+
 ## Contract catalog
 
 [`contracts.v1.json`](../../tests/controlplane/contracts.v1.json) is the
@@ -86,6 +100,7 @@ make controlplane-differential \
 ```bash
 make controlplane-contracts
 make controlplane-differential-self-test
+make controlplane-cp001-evidence
 go test ./tests/controlplane/...
 ```
 
@@ -93,6 +108,12 @@ The contract gate validates strict JSON decoding, anchors, family/issue
 coverage, bidirectional contract/fault references, schema syntax, and exact
 protobuf inventory. The self-test proves that order-only differences normalize
 and that a known metering mutation is killed at the expected field.
+
+The CP-001 evidence gate is not a committed synthetic fixture. It drives the
+production Go `ConfigManager` and the actual Rust `control-plane` crate through
+invalid/valid reload, immutable old/new TLS views, owner retirement, and clean
+successor claim. Their public observations must compare exactly. A second Rust
+run mutates `owner_generation`; CI passes only when the comparator rejects it.
 
 When Go behavior changes intentionally, update its test first, then the contract
 and fault row in the same PR. When a Rust slice takes ownership, keep the row and
