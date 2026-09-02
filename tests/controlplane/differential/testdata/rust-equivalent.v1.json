@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "producer": "rust",
+  "observations": [
+    {
+      "scenario_id": "CP-FAULT-METER-DUPLICATE",
+      "step": 1,
+      "contracts": ["CP-METER-001"],
+      "subject": {"cluster": "default", "namespace": "default", "generation": 7},
+      "outcome": "reacknowledged",
+      "effects": ["durable_ack"],
+      "state": [
+        {"key": "producer_id", "value": "rust-1"}
+      ],
+      "counters": [
+        {"key": "last_applied_sequence", "value": 1},
+        {"key": "durable_batches", "value": 1}
+      ]
+    },
+    {
+      "scenario_id": "CP-FAULT-BRIDGE-RECONNECT",
+      "step": 0,
+      "contracts": ["CP-BRIDGE-001"],
+      "subject": {"cluster": "default", "namespace": "default", "generation": 2},
+      "outcome": "reconnected",
+      "effects": ["snapshot_requested", "hello_accepted"],
+      "state": [
+        {"key": "semantic_address", "value": "127.0.0.1:6000"},
+        {"key": "owner_id", "value": "go-control"},
+        {"key": "negotiated_version", "value": "1"}
+      ],
+      "counters": [
+        {"key": "reconcile_count", "value": 1},
+        {"key": "control_epoch", "value": 2}
+      ]
+    }
+  ]
+}

@@ -43,7 +43,7 @@ CARGO_DENY_VERSION := 0.20.2
 RUST_TOOL_ROOT ?= $(GOBIN)/rust-tools
 RUST_TOOL_BIN := $(RUST_TOOL_ROOT)/bin
 
-.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests control-proto-generate control-proto-generate-check dataplane-differential dataplane-differential-coverage dataplane-differential-mutation dataplane-integration dataplane-integration-go dataplane-integration-self-test
+.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests control-proto-generate control-proto-generate-check controlplane-contracts controlplane-differential controlplane-differential-self-test dataplane-differential dataplane-differential-coverage dataplane-differential-mutation dataplane-integration dataplane-integration-go dataplane-integration-self-test
 
 default: cmd
 
@@ -113,6 +113,18 @@ control-proto-generate:
 control-proto-generate-check:
 	./scripts/generate-control-proto.sh
 	git diff --exit-code -- pkg/controlbridge/pb/control.pb.go rust/crates/control-proto/src/generated proto/dataplane/v1/testdata
+
+controlplane-contracts:
+	$(GO) run ./tests/controlplane/differential/cmd/controlplane-differential -mode validate
+
+CONTROLPLANE_BASELINE ?=
+CONTROLPLANE_CANDIDATE ?=
+
+controlplane-differential:
+	$(GO) run ./tests/controlplane/differential/cmd/controlplane-differential -mode compare -baseline "$(CONTROLPLANE_BASELINE)" -candidate "$(CONTROLPLANE_CANDIDATE)"
+
+controlplane-differential-self-test:
+	$(GO) run ./tests/controlplane/differential/cmd/controlplane-differential -mode self-test
 
 DIFFERENTIAL_SHARD_INDEX ?= 0
 DIFFERENTIAL_SHARD_COUNT ?= 4

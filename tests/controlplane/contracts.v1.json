@@ -1,0 +1,312 @@
+{
+  "schema_version": 1,
+  "families": [
+    "api",
+    "bridge",
+    "config",
+    "election",
+    "external",
+    "metering",
+    "metrics_log",
+    "routing",
+    "topology"
+  ],
+  "contracts": [
+    {
+      "id": "CP-API-001",
+      "family": "api",
+      "summary": "Admin config, status, drain, close, health, and diagnostic responses retain Go status codes, bounded errors, and idempotency.",
+      "go_owner": "pkg/server/api",
+      "rust_target": "#150",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/server/api/config_test.go", "contains": "func TestConfig"},
+        {"path": "pkg/server/api/dataplane_test.go", "contains": "func TestDataplaneStatusAPI"},
+        {"path": "pkg/controlbridge/drain_metering_test.go", "contains": "func TestDrainCommandRoundTripContract"}
+      ],
+      "observed_fields": ["http_status", "response_code", "drain_id", "command_sequence", "applied_generation"],
+      "fault_scenarios": ["CP-FAULT-ADMIN-DRAIN-REPLAY", "CP-FAULT-CONTROL-UNAVAILABLE"],
+      "bridge_messages": ["drain_command", "drain_result", "close_command", "close_result"],
+      "handoff": "Implement CP-ADMIN against these responses before retiring the Go API and operator bridge."
+    },
+    {
+      "id": "CP-BRIDGE-001",
+      "family": "bridge",
+      "summary": "In-process control startup preserves version negotiation, capabilities, epoch and generation lineage, request correlation, bounded queues, and fail-closed reconnect behavior.",
+      "go_owner": "pkg/controlbridge and pkg/controlbridge/transport",
+      "rust_target": "#142",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/controlbridge/transport/server_test.go", "contains": "func TestServerHandshakeLifecycleAndReconnect"},
+        {"path": "pkg/controlbridge/bridge_test.go", "contains": "func TestBridgeOwnsListenerAndCadenceLifecycle"},
+        {"path": "pkg/controlbridge/pb/codec_test.go", "contains": "func TestFrameBoundsAndPartialIO"}
+      ],
+      "observed_fields": ["protocol_version", "capabilities", "control_epoch", "generation", "request_id", "process_id"],
+      "fault_scenarios": ["CP-FAULT-BRIDGE-RECONNECT", "CP-FAULT-PROCESS-DEATH"],
+      "bridge_messages": ["hello", "hello_ack", "heartbeat", "error", "reconcile_request", "reconcile_snapshot"],
+      "handoff": "Replace transport with direct calls only after the same state-machine observations pass in one Rust process."
+    },
+    {
+      "id": "CP-CONFIG-001",
+      "family": "config",
+      "summary": "Config parsing, defaults, validation, cloning, reload, removal, and checksums remain atomic and deterministic.",
+      "go_owner": "lib/config and pkg/manager/config",
+      "rust_target": "#146",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "lib/config/proxy_test.go", "contains": "func TestProxyConfig"},
+        {"path": "pkg/manager/config/config_test.go", "contains": "func TestConfigReload"},
+        {"path": "pkg/manager/config/config_test.go", "contains": "func TestChecksum"}
+      ],
+      "observed_fields": ["checksum", "reload_result", "validation_class", "effective_defaults", "restart_required"],
+      "fault_scenarios": ["CP-FAULT-CONFIG-INVALID-RELOAD"],
+      "bridge_messages": ["state_snapshot", "snapshot_result"],
+      "handoff": "Land the Rust config model with a field-level parity table and atomic last-good reload behavior."
+    },
+    {
+      "id": "CP-CONFIG-002",
+      "family": "config",
+      "summary": "Every dynamic control value is projected in stable order while unsupported or restart-required changes fail closed.",
+      "go_owner": "pkg/controlbridge/snapshot.go",
+      "rust_target": "#146",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/controlbridge/snapshot_test.go", "contains": "func TestSnapshotBuilderBuildsCompleteDeterministicSnapshot"},
+        {"path": "pkg/controlbridge/snapshot_test.go", "contains": "func TestSnapshotBuilderRejectsUnsafeOrRestartRequiredValues"},
+        {"path": "pkg/controlbridge/snapshot_publisher_test.go", "contains": "func TestSnapshotPublisherApplyRejectReconnectAndCoalesce"}
+      ],
+      "observed_fields": ["generation", "listener_address", "backend_address", "namespace", "apply_code"],
+      "fault_scenarios": ["CP-FAULT-CONFIG-SNAPSHOT-REJECT"],
+      "bridge_messages": ["state_snapshot", "snapshot_result"],
+      "handoff": "Use the catalog as the temporary migration boundary; delete snapshot encoding only after its Rust state object is differential-green."
+    },
+    {
+      "id": "CP-CONFIG-003",
+      "family": "config",
+      "summary": "Certificate and TLS policy changes rotate safely for new connections without corrupting established sessions or accepting partial material.",
+      "go_owner": "pkg/manager/cert",
+      "rust_target": "#146",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/manager/cert/manager_test.go", "contains": "func TestRotate"},
+        {"path": "pkg/manager/cert/manager_test.go", "contains": "func TestWatchConfig"},
+        {"path": "pkg/controlbridge/snapshot.go", "contains": "minimum TLS version must be 1.2 or 1.3"}
+      ],
+      "observed_fields": ["certificate_generation", "minimum_tls_version", "allowed_common_names", "existing_session_state", "new_connection_result"],
+      "fault_scenarios": ["CP-FAULT-TLS-ROTATION"],
+      "bridge_messages": ["state_snapshot", "snapshot_result"],
+      "handoff": "Rust owns certificate watchers and atomic TLS config swaps before Go cert management can be removed."
+    },
+    {
+      "id": "CP-ELECT-001",
+      "family": "election",
+      "summary": "Etcd lease election preserves single ownership, explicit owner identity, session loss, transient failure, and retirement semantics.",
+      "go_owner": "pkg/manager/elect",
+      "rust_target": "#144",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/manager/elect/election_test.go", "contains": "func TestElectOwner"},
+        {"path": "pkg/manager/elect/election_test.go", "contains": "func TestEtcdServerDown"},
+        {"path": "pkg/manager/elect/election_test.go", "contains": "func TestOwnerHang"}
+      ],
+      "observed_fields": ["owner_id", "lease_id", "owner_state", "session_revision", "retirement_reason"],
+      "fault_scenarios": ["CP-FAULT-ETCD-TRANSIENT", "CP-FAULT-LEASE-LOSS"],
+      "bridge_messages": [],
+      "handoff": "The Rust election/session object must prove one active owner and the same retirement boundary before owner-only jobs move."
+    },
+    {
+      "id": "CP-EXT-001",
+      "family": "external",
+      "summary": "Etcd, HTTP, DNS, retry, timeout, cancellation, and error-class foundations are bounded and reusable by later control modules.",
+      "go_owner": "pkg/util/etcd, pkg/util/http, and pkg/util/netutil",
+      "rust_target": "#143",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/util/etcd/etcd_test.go", "contains": "func TestSyncEtcdClientTimeout"},
+        {"path": "pkg/util/http/http_test.go", "contains": "func TestNewHTTPClientDisableKeepAlivesNoConnectionReuse"},
+        {"path": "pkg/util/netutil/dns_test.go", "contains": "func TestDNSDialerTriesAllResolvedIPs"}
+      ],
+      "observed_fields": ["dependency", "endpoint_address", "deadline_millis", "retry_count", "error_class", "cancellation_state"],
+      "fault_scenarios": ["CP-FAULT-ETCD-TRANSIENT", "CP-FAULT-WATCH-COMPACTION", "CP-FAULT-DEPENDENCY-TIMEOUT"],
+      "bridge_messages": [],
+      "handoff": "Complete CP-EXT before election, topology, or admin code introduces one-off client behavior."
+    },
+    {
+      "id": "CP-HA-001",
+      "family": "election",
+      "summary": "Only the current fenced owner binds and refreshes VIPs; retirement and shutdown remove VIPs before releasing ownership.",
+      "go_owner": "pkg/manager/vip",
+      "rust_target": "#149",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/manager/vip/manager_test.go", "contains": "func TestNetworkOperation"},
+        {"path": "pkg/manager/vip/manager_test.go", "contains": "func TestPreCloseDeletesVIPBeforeCloseElection"},
+        {"path": "pkg/manager/vip/manager_test.go", "contains": "func TestPreClosePreventsReacquireDuringElectionClose"}
+      ],
+      "observed_fields": ["owner_id", "fencing_generation", "vip_address", "interface", "bind_state", "garp_count"],
+      "fault_scenarios": ["CP-FAULT-VIP-OWNER-LOSS", "CP-FAULT-PROCESS-DEATH"],
+      "bridge_messages": [],
+      "handoff": "Move VIP and owner-only jobs together, retaining remove-before-lease-release ordering and explicit fencing evidence."
+    },
+    {
+      "id": "CP-METER-001",
+      "family": "metering",
+      "summary": "Absolute producer-qualified counters are durable, ACKed, deduplicated, gap-checked, generation-isolated, and exactly once across restart.",
+      "go_owner": "pkg/controlbridge and pkg/manager/meter",
+      "rust_target": "#148",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/controlbridge/metering_absolute_test.go", "contains": "func TestAbsoluteMeteringDeltasRedirectFinalAndRestart"},
+        {"path": "pkg/controlbridge/metering_absolute_test.go", "contains": "func TestAbsoluteMeteringRejectsUnknownGapMutationAndHandlesWrap"},
+        {"path": "pkg/manager/meter/meter_test.go", "contains": "func TestMeterPendingWindowRetriesIdenticallyAfterRestart"}
+      ],
+      "observed_fields": ["producer_id", "generation", "sequence", "last_applied_sequence", "absolute_bytes", "durable_batches"],
+      "fault_scenarios": ["CP-FAULT-METER-DUPLICATE", "CP-FAULT-METER-GAP", "CP-FAULT-METER-RESTART"],
+      "bridge_messages": ["metering_batch", "metering_ack"],
+      "handoff": "Rust persistence must replay the same absolute window and receive a durable ACK before the Go sink is removed."
+    },
+    {
+      "id": "CP-OBS-001",
+      "family": "metrics_log",
+      "summary": "Metrics and structured logs keep names, labels, bounded cardinality, epoch replacement, health signals, and error classifications.",
+      "go_owner": "pkg/metrics, pkg/manager/logger, and pkg/server/api",
+      "rust_target": "#150",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/metrics/rust_metrics_test.go", "contains": "func TestRustMetricsGaugeReconcilesAcrossEpoch"},
+        {"path": "pkg/metrics/rust_metrics_test.go", "contains": "func TestRustMetricsRejectsUnboundedOrMalformedInput"},
+        {"path": "pkg/server/api/metrics_test.go", "contains": "func TestMetrics"}
+      ],
+      "observed_fields": ["metric_name", "labels", "counter_sequence", "control_epoch", "health_state", "error_class"],
+      "fault_scenarios": ["CP-FAULT-METRICS-EPOCH-RESTART", "CP-FAULT-CONTROL-UNAVAILABLE"],
+      "bridge_messages": ["metrics_batch", "heartbeat", "error"],
+      "handoff": "Emit Rust-native diagnostics with the same bounded public surface before deleting Go aggregation and health endpoints."
+    },
+    {
+      "id": "CP-ROUTE-001",
+      "family": "routing",
+      "summary": "Backend selection, retry exclusion, health, locality, keyspace, redirect, and exact route accounting match Go decisions.",
+      "go_owner": "pkg/balance/router and pkg/controlbridge/router_adapter.go",
+      "rust_target": "#147",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/controlbridge/router_adapter_test.go", "contains": "func TestRouterAdapterRetryAndExactlyOnceLifecycle"},
+        {"path": "pkg/balance/router/router_score_test.go", "contains": "func TestNoBackends"},
+        {"path": "pkg/balance/router/group_test.go", "contains": "func TestCrossKeyspaceFailoverRefusesRedirect"}
+      ],
+      "observed_fields": ["backend_id", "backend_address", "cluster_name", "keyspace", "assignment_id", "route_count"],
+      "fault_scenarios": ["CP-FAULT-ROUTE-NO-BACKEND", "CP-FAULT-ROUTE-REDIRECT-DUPLICATE"],
+      "bridge_messages": ["route_request", "route_assignment", "route_result", "redirect_command", "redirect_result"],
+      "handoff": "Port the selector and accounting as a deterministic Rust state machine, then compare decisions on identical topology inputs."
+    },
+    {
+      "id": "CP-ROUTE-002",
+      "family": "routing",
+      "summary": "Namespace and keyspace matching, listener routing, conflict rejection, and dynamic change retain existing-session semantics.",
+      "go_owner": "pkg/manager/namespace, pkg/controlbridge, and pkg/balance/router",
+      "rust_target": "#146",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/controlbridge/namespace_parity_test.go", "contains": "func TestNamespaceParityAcrossModes"},
+        {"path": "pkg/controlbridge/namespace_parity_test.go", "contains": "func TestDynamicNamespaceChangeKeepsExistingSession"},
+        {"path": "pkg/balance/router/router_test.go", "contains": "func TestBackendKeyspacePrefersPathParsedOverLabel"}
+      ],
+      "observed_fields": ["namespace", "keyspace", "listener_address", "backend_cluster", "existing_session_state", "rejection_code"],
+      "fault_scenarios": ["CP-FAULT-NAMESPACE-CHANGE"],
+      "bridge_messages": ["handshake_response", "handshake_decision", "handshake_result", "state_snapshot", "snapshot_result"],
+      "handoff": "Keep namespace/keyspace selection beside Rust config while preserving immutable session bindings and bounded client errors."
+    },
+    {
+      "id": "CP-ROUTE-003",
+      "family": "routing",
+      "summary": "Connection lifecycle, reconciliation, redirect watermarks, orphan closure, and generation reuse converge exactly once after either process restarts.",
+      "go_owner": "pkg/controlbridge/router_adapter.go and pkg/controlbridge/reconcile_rehydrate_test.go",
+      "rust_target": "#147",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/controlbridge/reconcile_rehydrate_test.go", "contains": "func TestGoRestartRehydratesAccountingAndClosesExactlyOnce"},
+        {"path": "pkg/controlbridge/reconcile_rehydrate_test.go", "contains": "func TestReconcileConvergesReusedIdAcrossGenerations"},
+        {"path": "pkg/controlbridge/redirect_lifecycle_integration_test.go", "contains": "func TestRedirectFailureBalancesExactRouteAccounting"}
+      ],
+      "observed_fields": ["connection_id", "generation", "command_sequence", "pending_redirect_id", "terminal_count", "route_count"],
+      "fault_scenarios": ["CP-FAULT-BRIDGE-RECONNECT", "CP-FAULT-PROCESS-DEATH"],
+      "bridge_messages": ["connection_event", "redirect_command", "redirect_result", "reconcile_request", "reconcile_snapshot", "close_command", "close_result"],
+      "handoff": "Collapse reconciliation into direct Rust state ownership only after restart and duplicate-event traces are differential-green."
+    },
+    {
+      "id": "CP-TOPO-001",
+      "family": "topology",
+      "summary": "TiProxy self-registration, TTL refresh, TiDB/keyspace discovery, and Prometheus topology retain semantic addresses and revisions.",
+      "go_owner": "pkg/manager/infosync",
+      "rust_target": "#145",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/manager/infosync/info_test.go", "contains": "func TestTTLRefresh"},
+        {"path": "pkg/manager/infosync/info_test.go", "contains": "func TestFetchTiDBTopology"},
+        {"path": "pkg/manager/infosync/info_test.go", "contains": "func TestGetPromInfo"}
+      ],
+      "observed_fields": ["proxy_address", "status_address", "backend_address", "cluster_name", "keyspace", "revision", "ttl"],
+      "fault_scenarios": ["CP-FAULT-TOPOLOGY-PARTIAL", "CP-FAULT-ETCD-TRANSIENT"],
+      "bridge_messages": ["state_snapshot", "snapshot_result", "heartbeat"],
+      "handoff": "Implement discovery and self-registration in Rust without normalizing away semantic addresses or revisions."
+    },
+    {
+      "id": "CP-TOPO-002",
+      "family": "topology",
+      "summary": "Multi-cluster backend lifecycle applies dynamic updates atomically, retains last-good clusters, and skips only unavailable clusters.",
+      "go_owner": "pkg/manager/backendcluster",
+      "rust_target": "#145",
+      "go_baseline": "anchored",
+      "rust_status": "pending",
+      "anchors": [
+        {"path": "pkg/manager/backendcluster/manager_test.go", "contains": "func TestManagerFetchesAllClusters"},
+        {"path": "pkg/manager/backendcluster/manager_test.go", "contains": "func TestManagerKeepsOldClusterWhenUpdateFails"},
+        {"path": "pkg/manager/backendcluster/manager_test.go", "contains": "func TestManagerGetTiDBTopologySkipsUnavailableCluster"}
+      ],
+      "observed_fields": ["cluster_name", "backend_id", "backend_address", "keyspace", "health", "topology_generation"],
+      "fault_scenarios": ["CP-FAULT-TOPOLOGY-PARTIAL", "CP-FAULT-WATCH-COMPACTION"],
+      "bridge_messages": ["state_snapshot", "snapshot_result"],
+      "handoff": "Rust topology ownership must demonstrate atomic per-cluster refresh and last-good isolation before Go managers are removed."
+    }
+  ],
+  "bridge_messages": [
+    {"name": "hello", "direction": "bidirectional", "target_issue": "#142"},
+    {"name": "hello_ack", "direction": "bidirectional", "target_issue": "#142"},
+    {"name": "state_snapshot", "direction": "go_to_rust", "target_issue": "#146"},
+    {"name": "snapshot_result", "direction": "rust_to_go", "target_issue": "#146"},
+    {"name": "handshake_response", "direction": "rust_to_go", "target_issue": "#147"},
+    {"name": "handshake_decision", "direction": "go_to_rust", "target_issue": "#147"},
+    {"name": "handshake_result", "direction": "rust_to_go", "target_issue": "#147"},
+    {"name": "route_request", "direction": "rust_to_go", "target_issue": "#147"},
+    {"name": "route_assignment", "direction": "go_to_rust", "target_issue": "#147"},
+    {"name": "route_result", "direction": "rust_to_go", "target_issue": "#147"},
+    {"name": "connection_event", "direction": "rust_to_go", "target_issue": "#147"},
+    {"name": "redirect_command", "direction": "go_to_rust", "target_issue": "#147"},
+    {"name": "redirect_result", "direction": "rust_to_go", "target_issue": "#147"},
+    {"name": "drain_command", "direction": "go_to_rust", "target_issue": "#150"},
+    {"name": "drain_result", "direction": "rust_to_go", "target_issue": "#150"},
+    {"name": "metrics_batch", "direction": "rust_to_go", "target_issue": "#150"},
+    {"name": "metering_batch", "direction": "rust_to_go", "target_issue": "#148"},
+    {"name": "reconcile_request", "direction": "rust_to_go", "target_issue": "#147"},
+    {"name": "reconcile_snapshot", "direction": "go_to_rust", "target_issue": "#147"},
+    {"name": "heartbeat", "direction": "bidirectional", "target_issue": "#142"},
+    {"name": "error", "direction": "bidirectional", "target_issue": "#142"},
+    {"name": "close_command", "direction": "go_to_rust", "target_issue": "#150"},
+    {"name": "close_result", "direction": "rust_to_go", "target_issue": "#150"},
+    {"name": "metering_ack", "direction": "go_to_rust", "target_issue": "#148"}
+  ]
+}

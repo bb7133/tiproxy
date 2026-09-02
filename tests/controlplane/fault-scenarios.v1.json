@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "CP-FAULT-ADMIN-DRAIN-REPLAY",
+      "summary": "Replay and reorder an already completed drain or close request.",
+      "target_issue": "#150",
+      "contracts": ["CP-API-001"],
+      "steps": ["start a bounded drain", "apply its terminal result", "replay the same command and result"],
+      "expectations": ["the same terminal response is returned", "no second lifecycle effect occurs"],
+      "observed_fields": ["drain_id", "command_sequence", "terminal_count", "http_status"]
+    },
+    {
+      "id": "CP-FAULT-BRIDGE-RECONNECT",
+      "summary": "Disconnect control delivery with live state and reconnect under a new epoch.",
+      "target_issue": "#142",
+      "contracts": ["CP-BRIDGE-001", "CP-ROUTE-003"],
+      "steps": ["record the live generation and connection set", "disconnect control delivery", "reconnect and reconcile"],
+      "expectations": ["the epoch changes", "generation does not regress", "live state converges exactly once"],
+      "observed_fields": ["process_id", "control_epoch", "generation", "connection_id", "route_count"]
+    },
+    {
+      "id": "CP-FAULT-CONFIG-INVALID-RELOAD",
+      "summary": "Reload a syntactically valid configuration containing an invalid dynamic value.",
+      "target_issue": "#146",
+      "contracts": ["CP-CONFIG-001"],
+      "steps": ["record last-good checksum", "publish invalid configuration", "observe reload result"],
+      "expectations": ["reload fails closed", "last-good effective configuration remains active"],
+      "observed_fields": ["checksum", "reload_result", "validation_class", "effective_generation"]
+    },
+    {
+      "id": "CP-FAULT-CONFIG-SNAPSHOT-REJECT",
+      "summary": "Reject a projected generation and reconnect while a newer desired generation is pending.",
+      "target_issue": "#146",
+      "contracts": ["CP-CONFIG-002"],
+      "steps": ["publish generation N", "reject N and stage N+1", "reconnect and apply N+1"],
+      "expectations": ["N never becomes applied", "N+1 remains desired and applies once"],
+      "observed_fields": ["generation", "applied_generation", "apply_code", "publish_count"]
+    },
+    {
+      "id": "CP-FAULT-CONTROL-UNAVAILABLE",
+      "summary": "Make control state unavailable while querying health, diagnostics, and metrics.",
+      "target_issue": "#150",
+      "contracts": ["CP-API-001", "CP-OBS-001"],
+      "steps": ["record healthy responses", "remove control availability", "query public endpoints"],
+      "expectations": ["health changes deterministically", "diagnostics remain bounded", "stale state is labeled"],
+      "observed_fields": ["http_status", "health_state", "control_epoch", "error_class"]
+    },
+    {
+      "id": "CP-FAULT-DEPENDENCY-TIMEOUT",
+      "summary": "Hold an external dependency beyond its configured deadline and then cancel the caller.",
+      "target_issue": "#143",
+      "contracts": ["CP-EXT-001"],
+      "steps": ["start a bounded dependency request", "hold it past deadline", "cancel its owner"],
+      "expectations": ["the request terminates", "the error class is stable", "no background retry leaks"],
+      "observed_fields": ["dependency", "deadline_millis", "retry_count", "error_class", "cancellation_state"]
+    },
+    {
+      "id": "CP-FAULT-ETCD-TRANSIENT",
+      "summary": "Interrupt etcd connectivity without deleting durable keys, then restore it.",
+      "target_issue": "#144",
+      "contracts": ["CP-ELECT-001", "CP-EXT-001", "CP-TOPO-001"],
+      "steps": ["record revision and owner", "interrupt etcd", "restore connectivity"],
+      "expectations": ["ownership is never duplicated", "recovery uses a monotonic revision", "semantic addresses remain unchanged"],
+      "observed_fields": ["owner_id", "lease_id", "revision", "retry_count", "proxy_address"]
+    },
+    {
+      "id": "CP-FAULT-LEASE-LOSS",
+      "summary": "Expire or revoke the active election lease while the owner is running.",
+      "target_issue": "#144",
+      "contracts": ["CP-ELECT-001"],
+      "steps": ["elect one owner", "remove its lease", "observe retirement and successor"],
+      "expectations": ["the old owner retires before owner-only work resumes", "exactly one successor becomes active"],
+      "observed_fields": ["owner_id", "lease_id", "owner_state", "retirement_reason"]
+    },
+    {
+      "id": "CP-FAULT-METER-DUPLICATE",
+      "summary": "Deliver the same absolute metering sequence more than once.",
+      "target_issue": "#148",
+      "contracts": ["CP-METER-001"],
+      "steps": ["apply sequence 1", "redeliver sequence 1", "persist and ACK"],
+      "expectations": ["the absolute total is unchanged", "the same durable sequence is ACKed"],
+      "observed_fields": ["producer_id", "last_applied_sequence", "absolute_bytes", "durable_batches"]
+    },
+    {
+      "id": "CP-FAULT-METER-GAP",
+      "summary": "Deliver an unknown sequence gap or mutate a previously observed absolute sequence.",
+      "target_issue": "#148",
+      "contracts": ["CP-METER-001"],
+      "steps": ["apply a valid sequence", "skip or mutate the next sequence", "observe sink decision"],
+      "expectations": ["the batch is rejected", "durable totals and ACK do not advance"],
+      "observed_fields": ["sequence", "last_applied_sequence", "absolute_bytes", "error_class"]
+    },
+    {
+      "id": "CP-FAULT-METER-RESTART",
+      "summary": "Restart either producer or durable sink with a pending absolute metering window.",
+      "target_issue": "#148",
+      "contracts": ["CP-METER-001"],
+      "steps": ["persist a pending window", "restart one side", "redeliver and ACK"],
+      "expectations": ["the identical window is retried", "generation isolation prevents double accounting"],
+      "observed_fields": ["producer_id", "generation", "sequence", "absolute_bytes", "durable_batches"]
+    },
+    {
+      "id": "CP-FAULT-METRICS-EPOCH-RESTART",
+      "summary": "Restart the metric producer and reuse series under a new control epoch.",
+      "target_issue": "#150",
+      "contracts": ["CP-OBS-001"],
+      "steps": ["record metrics in epoch N", "restart producer", "publish epoch N+1 and a stale N batch"],
+      "expectations": ["N+1 replaces gauges", "stale N is ignored", "counters remain monotonic"],
+      "observed_fields": ["metric_name", "control_epoch", "counter_sequence", "series_count"]
+    },
+    {
+      "id": "CP-FAULT-NAMESPACE-CHANGE",
+      "summary": "Change namespace, listener, cluster, or keyspace mappings while sessions are active.",
+      "target_issue": "#146",
+      "contracts": ["CP-ROUTE-002"],
+      "steps": ["open a session under generation N", "publish changed mappings in N+1", "open a second session"],
+      "expectations": ["the existing session keeps its immutable binding", "the new session uses N+1", "cross-keyspace redirects are refused"],
+      "observed_fields": ["namespace", "keyspace", "listener_address", "backend_cluster", "existing_session_state"]
+    },
+    {
+      "id": "CP-FAULT-PROCESS-DEATH",
+      "summary": "Kill either legacy control owner or Rust dataplane with active sessions and pending lifecycle work.",
+      "target_issue": "#142",
+      "contracts": ["CP-BRIDGE-001", "CP-HA-001", "CP-ROUTE-003"],
+      "steps": ["record process, owner, and connection lineage", "kill one process", "restart and reconcile"],
+      "expectations": ["stale ownership is fenced", "connection accounting converges", "terminal effects occur once"],
+      "observed_fields": ["process_id", "owner_id", "control_epoch", "generation", "connection_id", "terminal_count"]
+    },
+    {
+      "id": "CP-FAULT-ROUTE-NO-BACKEND",
+      "summary": "Remove all eligible backends or make every candidate unhealthy during selection.",
+      "target_issue": "#147",
+      "contracts": ["CP-ROUTE-001"],
+      "steps": ["publish an empty or ineligible topology", "request a route", "observe client and accounting results"],
+      "expectations": ["selection fails with the frozen bounded code", "route count remains zero"],
+      "observed_fields": ["namespace", "cluster_name", "keyspace", "rejection_code", "route_count"]
+    },
+    {
+      "id": "CP-FAULT-ROUTE-REDIRECT-DUPLICATE",
+      "summary": "Replay, reorder, or delay a redirect command across lifecycle and generation boundaries.",
+      "target_issue": "#147",
+      "contracts": ["CP-ROUTE-001"],
+      "steps": ["issue redirect sequence N", "apply or evict its terminal result", "replay N after a newer sequence"],
+      "expectations": ["the stale redirect never acts", "route accounting stays balanced"],
+      "observed_fields": ["connection_id", "generation", "command_sequence", "redirect_id", "route_count"]
+    },
+    {
+      "id": "CP-FAULT-TLS-ROTATION",
+      "summary": "Rotate complete and partial certificate material while old and new sessions coexist.",
+      "target_issue": "#146",
+      "contracts": ["CP-CONFIG-003"],
+      "steps": ["open a session on certificate generation N", "publish partial then complete N+1 material", "open a new session"],
+      "expectations": ["partial material is rejected", "the old session survives", "the new session uses N+1"],
+      "observed_fields": ["certificate_generation", "minimum_tls_version", "existing_session_state", "new_connection_result"]
+    },
+    {
+      "id": "CP-FAULT-TOPOLOGY-PARTIAL",
+      "summary": "Make one backend cluster unavailable while other clusters and self-registration remain healthy.",
+      "target_issue": "#145",
+      "contracts": ["CP-TOPO-001", "CP-TOPO-002"],
+      "steps": ["record a multi-cluster generation", "fail one cluster refresh", "restore that cluster"],
+      "expectations": ["healthy clusters continue", "the failed cluster keeps last-good state", "recovery advances generation once"],
+      "observed_fields": ["proxy_address", "cluster_name", "backend_address", "health", "topology_generation"]
+    },
+    {
+      "id": "CP-FAULT-VIP-OWNER-LOSS",
+      "summary": "Lose ownership while VIP bind or GARP refresh work is active.",
+      "target_issue": "#149",
+      "contracts": ["CP-HA-001"],
+      "steps": ["bind VIP as fenced owner", "lose ownership", "elect a successor"],
+      "expectations": ["the old owner removes the VIP before lease release", "no reacquire occurs during close", "only the successor binds"],
+      "observed_fields": ["owner_id", "fencing_generation", "vip_address", "bind_state", "garp_count"]
+    },
+    {
+      "id": "CP-FAULT-WATCH-COMPACTION",
+      "summary": "Compact or invalidate an external watch revision during topology refresh.",
+      "target_issue": "#143",
+      "contracts": ["CP-EXT-001", "CP-TOPO-002"],
+      "steps": ["record watch revision", "invalidate it", "relist and resume watching"],
+      "expectations": ["a full relist occurs", "the resumed revision is monotonic", "no cluster disappears because of the gap"],
+      "observed_fields": ["dependency", "revision", "retry_count", "cluster_name", "topology_generation"]
+    }
+  ]
+}

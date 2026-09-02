@@ -1,0 +1,63 @@
+name: Control-plane contracts
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/controlplane-contracts.yml"
+      - "AGENTS.md"
+      - "Makefile"
+      - "docs/design/rust-control-plane-contracts.md"
+      - "lib/config/**"
+      - "pkg/balance/**"
+      - "pkg/controlbridge/**"
+      - "pkg/manager/**"
+      - "pkg/metrics/**"
+      - "pkg/server/api/**"
+      - "pkg/util/**"
+      - "proto/dataplane/v1/control.proto"
+      - "tests/controlplane/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/controlplane-contracts.yml"
+      - "AGENTS.md"
+      - "Makefile"
+      - "docs/design/rust-control-plane-contracts.md"
+      - "lib/config/**"
+      - "pkg/balance/**"
+      - "pkg/controlbridge/**"
+      - "pkg/manager/**"
+      - "pkg/metrics/**"
+      - "pkg/server/api/**"
+      - "pkg/util/**"
+      - "proto/dataplane/v1/control.proto"
+      - "tests/controlplane/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controlplane-contracts-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate contract and fault catalogs
+        run: make controlplane-contracts
+      - name: Prove comparator equivalence and mutation detection
+        run: make controlplane-differential-self-test
+      - name: Run control-plane baseline tests
+        run: go test ./tests/controlplane/...
