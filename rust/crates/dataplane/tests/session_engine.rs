@@ -4812,6 +4812,223 @@ async fn forced_shutdown_with_stuck_backend_joins_everything_in_budget() {
     slow.abort();
 }
 
+/// PKT-007 production wiring: a transport break while reading the backend
+/// greeting is a backend NETWORK break on BOTH observables. Pre-fix, the wire
+/// reported `BackendNetwork` while the connection-close log said
+/// `BackendHandshake` — this drives the real session engine against a backend
+/// that accepts the
+/// dial then closes before greeting, and pins the corrected, non-divergent
+/// classification (the mutation-killer is `quit_source != BackendHandshake`).
+#[tokio::test]
+async fn backend_greeting_transport_break_is_backend_network_on_both_observables() {
+    let mut stack = spawn_stack().await;
+    // A backend that accepts the candidate dial then closes without ever
+    // sending a greeting: the proxy's greeting read hits a clean EOF.
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("dead-backend bind")
+    };
+    let Ok(dead_addr) = listener.local_addr() else {
+        unreachable!("dead-backend addr")
+    };
+    let dead_backend = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    spawn_route_answer_to(&stack, 1, 2, dead_addr.port());
+    // The client handshake never completes; the connect attempt ends in error.
+    let _ = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port)).await;
+
+    // Wire observable: the CLOSED lifecycle event is a backend network break.
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(ControlEnvelope {
+        body: Some(Body::ConnectionEvent(event)),
+        ..
+    }) = closed
+    else {
+        unreachable!("a handshake-phase failure emits a CLOSED lifecycle event")
+    };
+    assert_eq!(
+        event.error_source, 2,
+        "wire observable is BackendNetwork (ERROR_SOURCE_BACKEND_NETWORK=2): {event:?}"
+    );
+
+    // Log observable: the connection-close reason is ALSO a backend network
+    // break, NOT BackendHandshake — the divergence this fix removes.
+    let closed_source = timeout(Duration::from_secs(5), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            if let Observation::SessionClosed { source, .. } = observation {
+                return Some(source);
+            }
+        }
+        None
+    })
+    .await;
+    assert_eq!(
+        closed_source,
+        Ok(Some(QuitSource::BackendNetwork)),
+        "greeting transport break classifies as a backend network break on both observables"
+    );
+
+    dead_backend.abort();
+    stack.dispatch_task.abort();
+}
+
+/// PKT-007 production wiring — the `IoSide` inversion, end to end. The client
+/// sends a query whose backend response crosses the 16 MiB physical boundary,
+/// then hard-closes (RST) WITHOUT reading, so the proxy's `backend -> client`
+/// forward breaks on the DESTINATION (client) write mid-response. That
+/// destination-write break must attribute to the CLIENT (`ClientNetwork`) on
+/// both observables — pre-fix it was hardcoded `BackendNetwork`. This binds the
+/// real `forward_packet_to(source=Backend, dest=Client)` call site: reversing
+/// the site's source/dest, or reverting it to a hardcoded leg, turns this red.
+#[tokio::test]
+async fn backend_to_client_destination_write_break_is_client_network_on_both_observables() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    // Send the large-response query but never read the reply.
+    let mut query = vec![0x03_u8];
+    query.extend_from_slice(b"SELECT pkt_large_response");
+    client.writer.reset_sequence(0);
+    let Ok(()) = client.writer.write_logical(&query, true).await else {
+        unreachable!("the query reaches the proxy")
+    };
+    // Hard-close: reunite the split halves and set SO_LINGER=0 so the close
+    // sends RST, breaking the proxy's in-flight forward-to-client write instead
+    // of letting the ~16 MiB response buffer.
+    let MysqlClient { reader, writer, .. } = client;
+    let Ok(stream) = reader.into_inner().reunite(writer.into_inner()) else {
+        unreachable!("the client's split halves reunite")
+    };
+    let _ = stream.set_linger(Some(Duration::from_secs(0)));
+    drop(stream);
+
+    // Log observable: the destination(client)-write break attributes to the
+    // CLIENT, not the backend that was the read source.
+    let closed_source = timeout(Duration::from_secs(10), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            if let Observation::SessionClosed { source, .. } = observation {
+                return Some(source);
+            }
+        }
+        None
+    })
+    .await;
+    assert_eq!(
+        closed_source,
+        Ok(Some(QuitSource::ClientNetwork)),
+        "a backend->client destination-write break is the client's network break"
+    );
+
+    // Wire observable agrees (ERROR_SOURCE_CLIENT_NETWORK == 1).
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(ControlEnvelope {
+        body: Some(Body::ConnectionEvent(event)),
+        ..
+    }) = closed
+    else {
+        unreachable!("the aborted session emits a CLOSED lifecycle event")
+    };
+    assert_eq!(
+        event.error_source, 1,
+        "wire observable is ClientNetwork: {event:?}"
+    );
+
+    stack.dispatch_task.abort();
+}
+
+/// PKT-007 production wiring — a transport break while the proxy reads the
+/// backend's AUTH reply is a backend NETWORK break on BOTH observables. This
+/// binds `backend_read`'s sole caller (the auth relay): it previously
+/// overwrote `quit_source = BackendHandshake` AFTER `backend_read` had already
+/// classified the disconnect through `end_source`, re-forking
+/// wire=`BackendNetwork` / log=`BackendHandshake`. Reinstating that overwrite
+/// turns this red.
+#[tokio::test]
+async fn backend_auth_read_transport_break_is_backend_network_on_both_observables() {
+    let mut stack = spawn_stack().await;
+    // A backend that greets and reads the proxy's handshake response, then
+    // closes before sending any auth reply — so the proxy's auth-relay
+    // `backend_read` hits EOF.
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("auth-drop backend bind")
+    };
+    let Ok(addr) = listener.local_addr() else {
+        unreachable!("auth-drop backend addr")
+    };
+    let backend = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (read, write) = tokio::io::split(stream);
+            let mut reader = PacketReader::new(read);
+            let mut writer = PacketWriter::new(write);
+            let caps = fake_backend_capabilities(false);
+            if !write_fake_backend_greeting(&mut writer, caps).await {
+                continue;
+            }
+            reader.reset_sequence(writer.next_sequence());
+            // Consume the proxy's handshake response, then close with no auth
+            // reply.
+            let _ = reader.read_logical(64 * 1024).await;
+            drop((reader, writer));
+        }
+    });
+    spawn_route_answer_to(&stack, 1, 2, addr.port());
+    let _ = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port)).await;
+
+    // Log observable: an auth-phase backend read disconnect is a backend network
+    // break, NOT BackendHandshake.
+    let closed_source = timeout(Duration::from_secs(10), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            if let Observation::SessionClosed { source, .. } = observation {
+                return Some(source);
+            }
+        }
+        None
+    })
+    .await;
+    assert_eq!(
+        closed_source,
+        Ok(Some(QuitSource::BackendNetwork)),
+        "an auth-phase backend read disconnect must not be reported as BackendHandshake"
+    );
+
+    // Wire observable agrees (ERROR_SOURCE_BACKEND_NETWORK == 2).
+    let closed = wait_sent(
+        &stack.sender,
+        |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+    )
+    .await;
+    let Some(ControlEnvelope {
+        body: Some(Body::ConnectionEvent(event)),
+        ..
+    }) = closed
+    else {
+        unreachable!("the failed auth session emits a CLOSED lifecycle event")
+    };
+    assert_eq!(
+        event.error_source, 2,
+        "wire observable is BackendNetwork: {event:?}"
+    );
+
+    backend.abort();
+    stack.dispatch_task.abort();
+}
+
 /// Drain honors the transaction safe boundary end to end: an open
 /// transaction (BEGIN, backend status `SERVER_STATUS_IN_TRANS`) defers
 /// the graceful close; COMMIT clears it and the terminal follows.

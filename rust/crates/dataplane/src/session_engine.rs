@@ -96,7 +96,7 @@ use proxy_io::proxy_protocol::{
 use proxy_io::tls::{
     DEFAULT_CONN_BUFFER_SIZE, accept_frontend, build_backend_config, connect_backend,
 };
-use proxy_io::{InboundProxyV2Header, PacketIo};
+use proxy_io::{InboundProxyV2Header, IoSide, PacketIo, PacketIoError};
 use session_core::auth::{
     AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, BackendTlsMode, CompressionSelection,
     UNKNOWN_AUTH_PLUGIN, classify_backend_auth_packet, compression_selection,
@@ -106,7 +106,9 @@ use session_core::boundary::{HeldBegin, HoldEffect, need_hold_request};
 use session_core::command::{
     Command, CommandSessionState, CommandStateEffects, ExpectedResponse, SessionMutation, dispatch,
 };
-use session_core::error_source::FailureKind;
+use session_core::error_source::{
+    DisconnectState, FailureDescriptor, FailureKind, SideMarker, is_disconnect_io,
+};
 use session_core::fsm::{SessionEffect, SessionEvent};
 use session_core::handshake::{
     ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend, verify_backend,
@@ -1802,14 +1804,25 @@ impl Engine {
             healthy: backend_healthy,
             keepalive_applied,
         };
-        let Ok(greeting_packet) = backend
+        let greeting_read = backend
             .backend_io
             .read_logical(HANDSHAKE_PAYLOAD_LIMIT)
-            .await
-        else {
-            self.quit_source = QuitSource::BackendHandshake;
-            let _ = self.events.send(SessionEvent::BackendIoError).await;
-            return Some(WireErrorSource::BackendNetwork);
+            .await;
+        let greeting_packet = match greeting_read {
+            Ok(packet) => packet,
+            Err(error) => {
+                // A transport break while reading the backend greeting is a
+                // backend NETWORK break on both observables — disconnect
+                // dominates the handshake phase (Go). Previously this discarded
+                // the transport error and hardcoded quit_source=BackendHandshake
+                // while the wire said BackendNetwork: the exact A/B divergence
+                // this fix removes. A genuine capability/TLS rejection is
+                // handled by the verify/plan branches below and stays
+                // BackendHandshake.
+                let source = classify_packet_io(&error, SideMarker::Backend, SideMarker::Backend);
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+                return Some(self.end_source(source));
+            }
         };
         let greeting_payload = greeting_packet.payload;
         let Ok(backend_greeting) = mysql_wire::parse_initial_handshake(&greeting_payload) else {
@@ -1963,7 +1976,13 @@ impl Engine {
                     let payload = match self.backend_read(HANDSHAKE_PAYLOAD_LIMIT).await {
                         Ok(payload) => payload,
                         Err(source) => {
-                            self.quit_source = QuitSource::BackendHandshake;
+                            // `backend_read` already classified this transport
+                            // error through `end_source` (setting `quit_source`
+                            // to the winner and returning its wire projection).
+                            // A post-hoc `quit_source = BackendHandshake` here
+                            // would re-fork the observables: an auth-phase read
+                            // disconnect must stay BackendNetwork on BOTH, and a
+                            // malformed/non-disconnect read its own class.
                             let _ = self.events.send(SessionEvent::BackendIoError).await;
                             return Some(source);
                         }
@@ -2451,9 +2470,16 @@ impl Engine {
             )
             .await
         };
-        let Ok(progress) = forwarded else {
-            let _ = self.events.send(SessionEvent::BackendIoError).await;
-            return Err(WireErrorSource::BackendNetwork);
+        let progress = match forwarded {
+            Ok(progress) => progress,
+            Err(error) => {
+                // backend -> client forward: a source-read break is the
+                // backend's, a destination-write break is the client's (the
+                // IoSide inversion fix — never blindly `BackendNetwork`).
+                let source = classify_packet_io(&error, SideMarker::Backend, SideMarker::Client);
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+                return Err(self.end_source(source));
+            }
         };
         let payload = progress.captured_prefix();
         if progress.logical_payload_bytes() != payload.len() as u64 {
@@ -2527,9 +2553,12 @@ impl Engine {
             };
             PacketIo::forward_packet_to(&mut self.client_io, &mut backend.backend_io, 0).await
         };
-        if forwarded.is_err() {
+        if let Err(error) = forwarded {
+            // client -> backend forward: source-read break is the client's,
+            // destination-write break is the backend's.
+            let source = classify_packet_io(&error, SideMarker::Client, SideMarker::Backend);
             let _ = self.events.send(SessionEvent::ClientIoError).await;
-            return Err(WireErrorSource::ClientNetwork);
+            return Err(self.end_source(source));
         }
         let Ok(step) = relay.on_event(ChangeUserEvent::ClientAuthResponse) else {
             return Err(WireErrorSource::Proxy);
@@ -2671,10 +2700,14 @@ impl Engine {
                 if held.on_commit_error().is_err() {
                     return self.poison_hold(WireErrorSource::Proxy).await;
                 }
-                if self.client_io.write_logical(&packet, true).await.is_err() {
-                    self.quit_source = QuitSource::ClientNetwork;
+                let write = self.client_io.write_logical(&packet, true).await;
+                if let Err(error) = write {
+                    // A write to the client failed: attribute to the client
+                    // (a disconnect breaks its network; an Encode framing fault
+                    // is a proxy bug, not a network break).
+                    let source = classify_packet_io(&error, SideMarker::Client, SideMarker::Client);
                     let _ = self.events.send(SessionEvent::ClientIoError).await;
-                    return HoldFlow::Fatal(WireErrorSource::ClientNetwork);
+                    return HoldFlow::Fatal(self.end_source(source));
                 }
                 if self
                     .events
@@ -2798,21 +2831,28 @@ impl Engine {
             return Some(WireErrorSource::Proxy);
         };
         loop {
-            let progress = {
+            let forwarded = {
                 let Some(backend) = self.backend.as_mut() else {
                     return Some(WireErrorSource::Proxy);
                 };
-                let forwarded = PacketIo::forward_packet_to(
+                PacketIo::forward_packet_to(
                     &mut backend.backend_io,
                     &mut self.client_io,
                     RESPONSE_CAPTURE,
                 )
-                .await;
-                let Ok(progress) = forwarded else {
+                .await
+            };
+            let progress = match forwarded {
+                Ok(progress) => progress,
+                Err(error) => {
+                    // backend -> client forward: attribute a source-read break
+                    // to the backend and a destination-write break to the
+                    // client (IoSide inversion fix).
+                    let source =
+                        classify_packet_io(&error, SideMarker::Backend, SideMarker::Client);
                     let _ = self.events.send(SessionEvent::BackendIoError).await;
-                    return Some(WireErrorSource::BackendNetwork);
-                };
-                progress
+                    return Some(self.end_source(source));
+                }
             };
             let first_physical = progress.first_packet_length().unwrap_or(0);
             let Ok(packet) = ResponsePacket::from_forwarded(
@@ -2940,21 +2980,28 @@ impl Engine {
     ) -> Option<WireErrorSource> {
         let mut observer = PrepareObserver::new(self.negotiated);
         loop {
-            let progress = {
+            let forwarded = {
                 let Some(backend) = self.backend.as_mut() else {
                     return Some(WireErrorSource::Proxy);
                 };
-                let forwarded = PacketIo::forward_packet_to(
+                PacketIo::forward_packet_to(
                     &mut backend.backend_io,
                     &mut self.client_io,
                     RESPONSE_CAPTURE,
                 )
-                .await;
-                let Ok(progress) = forwarded else {
+                .await
+            };
+            let progress = match forwarded {
+                Ok(progress) => progress,
+                Err(error) => {
+                    // backend -> client forward: attribute a source-read break
+                    // to the backend and a destination-write break to the
+                    // client (IoSide inversion fix).
+                    let source =
+                        classify_packet_io(&error, SideMarker::Backend, SideMarker::Client);
                     let _ = self.events.send(SessionEvent::BackendIoError).await;
-                    return Some(WireErrorSource::BackendNetwork);
-                };
-                progress
+                    return Some(self.end_source(source));
+                }
             };
             let first_physical = progress.first_packet_length().unwrap_or(0);
             let Ok(packet) = ResponsePacket::from_forwarded(
@@ -3750,9 +3797,12 @@ impl Engine {
                     // the one counter per channel in lockstep.
                     let seq = self.client_io.expected_read_sequence();
                     self.client_io.reset_write_sequence(seq);
-                    if self.client_io.write_logical(&payload, true).await.is_err() {
+                    let write = self.client_io.write_logical(&payload, true).await;
+                    if let Err(error) = write {
+                        let source =
+                            classify_packet_io(&error, SideMarker::Client, SideMarker::Client);
                         let _ = self.events.send(SessionEvent::ClientIoError).await;
-                        return Err(WireErrorSource::ClientNetwork);
+                        return Err(self.end_source(source));
                     }
                 }
                 AuthEffect::ForwardClientToBackend => {
@@ -4061,8 +4111,13 @@ impl Engine {
         let Ok(encoded) = encode_initial_handshake(params) else {
             return Err(WireErrorSource::Proxy);
         };
-        if self.client_io.write_logical(&encoded, true).await.is_err() {
-            return Err(WireErrorSource::ClientNetwork);
+        let write = self.client_io.write_logical(&encoded, true).await;
+        if let Err(error) = write {
+            return Err(self.end_source(classify_packet_io(
+                &error,
+                SideMarker::Client,
+                SideMarker::Client,
+            )));
         }
         Ok(())
     }
@@ -4078,29 +4133,64 @@ impl Engine {
         else {
             return Err(WireErrorSource::Proxy);
         };
-        if self.client_io.write_logical(&encoded, true).await.is_err() {
-            return Err(WireErrorSource::ClientNetwork);
+        let write = self.client_io.write_logical(&encoded, true).await;
+        if let Err(error) = write {
+            return Err(self.end_source(classify_packet_io(
+                &error,
+                SideMarker::Client,
+                SideMarker::Client,
+            )));
         }
         Ok(())
     }
 
-    async fn client_read_end(&mut self, error: &proxy_io::PacketIoError) -> WireErrorSource {
-        if is_clean_eof(error) {
-            let _ = self.events.send(SessionEvent::ClientEof).await;
-            WireErrorSource::ClientNetwork
+    /// Records a classified session end from a single [`QuitSource`]: sets the
+    /// log observable (`quit_source`; first classification wins, matching the
+    /// `run()` finalizer) and returns the wire observable projected from the
+    /// SAME winning value via [`wire_source_of`]. Projecting the *stored* winner
+    /// — not the just-passed `source` — is essential: if an earlier
+    /// classification already set `quit_source`, returning `wire_source_of` of a
+    /// later, different `source` would re-open the A/B divergence (first-wins
+    /// log + last-call wire). Both observables therefore always derive from one
+    /// classification.
+    fn end_source(&mut self, source: QuitSource) -> WireErrorSource {
+        let (winner, wire) = resolve_end_source(self.quit_source, source);
+        self.quit_source = winner;
+        wire
+    }
+
+    async fn client_read_end(&mut self, error: &PacketIoError) -> WireErrorSource {
+        // A client read failure: the client stream is the only stream in this
+        // transfer, so both IoSide directions resolve to the client. The clean
+        // EOF vs. hard error distinction only selects the telemetry event; the
+        // classification (network break, malformed framing, or proxy fault)
+        // comes from the descriptor.
+        let source = classify_packet_io(error, SideMarker::Client, SideMarker::Client);
+        let event = if is_clean_eof(error) {
+            SessionEvent::ClientEof
         } else {
-            let _ = self.events.send(SessionEvent::ClientIoError).await;
-            WireErrorSource::ClientNetwork
-        }
+            SessionEvent::ClientIoError
+        };
+        let _ = self.events.send(event).await;
+        self.end_source(source)
     }
 
     async fn backend_read(&mut self, limit: usize) -> Result<Vec<u8>, WireErrorSource> {
-        let Some(backend) = self.backend.as_mut() else {
-            return Err(WireErrorSource::Proxy);
+        let result = {
+            let Some(backend) = self.backend.as_mut() else {
+                return Err(WireErrorSource::Proxy);
+            };
+            backend.backend_io.read_logical(limit).await
         };
-        match backend.backend_io.read_logical(limit).await {
+        match result {
             Ok(packet) => Ok(packet.payload),
-            Err(_) => Err(WireErrorSource::BackendNetwork),
+            Err(error) => {
+                // A backend read failure: the backend stream is this transfer's
+                // only stream, so the error attributes to the backend endpoint
+                // (network break) or to the proxy (malformed framing).
+                let source = classify_packet_io(&error, SideMarker::Backend, SideMarker::Backend);
+                Err(self.end_source(source))
+            }
         }
     }
 
@@ -4236,12 +4326,139 @@ const fn coarse_quit_source(source: WireErrorSource) -> QuitSource {
     }
 }
 
+/// Projects the Go-parity 11-variant [`QuitSource`] classification onto the
+/// coarser 7-variant wire [`WireErrorSource`]. This is the SINGLE forward
+/// mapping used by every classified failure site, so the log observable
+/// (`quit_source`) and the wire observable (`ConnectionEvent.error_source`)
+/// are two projections of ONE classification — eliminating the pre-fix A/B
+/// divergence where the two were assigned independently. The per-kind pairs
+/// match Go's `Error2Source` grouping used by [`failure_source`] /
+/// [`failure_quit_source`]; malformed and non-disconnect proxy faults resolve
+/// to the proxy component rather than being mis-attributed as a network break.
+const fn wire_source_of(source: QuitSource) -> WireErrorSource {
+    match source {
+        QuitSource::None => WireErrorSource::Unspecified,
+        // Client-side handshake/capability/auth failures collapse to the
+        // client-network wire component, matching the existing kind table.
+        QuitSource::ClientNetwork | QuitSource::ClientHandshake | QuitSource::ClientAuthFail => {
+            WireErrorSource::ClientNetwork
+        }
+        QuitSource::ClientSqlError => WireErrorSource::BackendSql,
+        QuitSource::ProxyQuit => WireErrorSource::Shutdown,
+        // Malformed packets/sequence violations and other proxy-internal
+        // faults are proxy bugs (Go: "we assume clients and TiDB are right"),
+        // NOT network breaks.
+        QuitSource::ProxyMalformed | QuitSource::ProxyError => WireErrorSource::Proxy,
+        QuitSource::ProxyNoBackend | QuitSource::BackendNetwork | QuitSource::BackendHandshake => {
+            WireErrorSource::BackendNetwork
+        }
+    }
+}
+
+/// Resolves the winning end classification and its wire projection from the
+/// already-stored `quit_source` and a newly-classified `source`. First
+/// classification wins for the log observable; the wire observable is the
+/// projection of that SAME winner, so the two never diverge regardless of which
+/// site called last. Split out from [`SessionEngine::end_source`] purely so the
+/// winner-projection invariant is unit-testable without an engine instance.
+const fn resolve_end_source(
+    stored: QuitSource,
+    source: QuitSource,
+) -> (QuitSource, WireErrorSource) {
+    let winner = match stored {
+        QuitSource::None => source,
+        _ => stored,
+    };
+    (winner, wire_source_of(winner))
+}
+
+/// Builds the Go-parity [`FailureDescriptor`] for a packet-I/O error observed
+/// on a transfer whose read stream belongs to `source_end` and whose write
+/// stream belongs to `dest_end`. For a single-stream read helper, pass the same
+/// marker for both. The [`IoSide`] carried by [`PacketIoError::Io`] selects
+/// which endpoint the failure attributes to — this is what fixes the [`IoSide`]
+/// inversion (a destination-write break on a `backend -> client` forward is the
+/// client's break, not the backend's).
+fn descriptor_for_packet_io(
+    error: &PacketIoError,
+    source_end: SideMarker,
+    dest_end: SideMarker,
+) -> FailureDescriptor<'static> {
+    match error {
+        PacketIoError::Io { side, source, .. } => {
+            let endpoint = match side {
+                IoSide::Source => source_end,
+                IoSide::Destination => dest_end,
+            };
+            if is_disconnect_io(source) {
+                // Disconnect + side dominates phase (Go `Error2Source`): the
+                // broken connection's side wins, whichever operation was in
+                // flight.
+                FailureDescriptor {
+                    disconnect: DisconnectState::Attributed(endpoint),
+                    ..FailureDescriptor::default()
+                }
+            } else {
+                // A non-disconnect transport fault (InvalidData, WriteZero,
+                // Other): a proxy-side error, NOT a network break — Go reaches
+                // the `ErrProxyErr` default branch for these.
+                FailureDescriptor {
+                    kind: Some(FailureKind::ProxyInternal),
+                    ..FailureDescriptor::default()
+                }
+            }
+        }
+        // Framing decode/encode and compressed-sequence violations are proxy
+        // bugs (`SrcProxyMalformed`).
+        PacketIoError::Decode(_) | PacketIoError::Encode(_) => FailureDescriptor {
+            malformed_or_sequence: true,
+            ..FailureDescriptor::default()
+        },
+        // A bounded materializing read observed an over-limit logical payload.
+        // This is the GENERIC `read_logical(limit)` transport cap — backend
+        // responses and post-handshake command reads hit it too — NOT Go's
+        // handshake-only `ErrPacketTooLarge` sentinel (which Go produces only in
+        // the pre-handshake 1 MiB client path). Mapping it to
+        // `FailureKind::PacketTooLarge`/ClientHandshake would mis-attribute a
+        // backend oversized response to the client and mislabel a command-phase
+        // over-limit as a handshake failure. We instead preserve the pre-fix
+        // behavior: attribute the over-limit termination to the over-sending
+        // endpoint (the read source) as a transport break, so a backend
+        // oversized response stays BackendNetwork and a client one stays
+        // ClientNetwork. A finer Go `ErrPacketTooLarge`(ClientHandshake)
+        // distinction needs handshake-phase context from the call site and is a
+        // tracked follow-up (see PR scope note).
+        PacketIoError::LogicalPayloadTooLarge { .. } => FailureDescriptor {
+            disconnect: DisconnectState::Attributed(source_end),
+            ..FailureDescriptor::default()
+        },
+        // Accounting-invariant violations are proxy-internal faults.
+        PacketIoError::CounterOverflow { .. } | PacketIoError::ForwardAlreadyComplete => {
+            FailureDescriptor {
+                kind: Some(FailureKind::ProxyInternal),
+                ..FailureDescriptor::default()
+            }
+        }
+    }
+}
+
+/// Classifies a packet-I/O error into the Go-parity [`QuitSource`], attributing
+/// disconnects to the endpoint selected by the error's [`IoSide`] and the
+/// transfer's `source_end`/`dest_end`.
+fn classify_packet_io(
+    error: &PacketIoError,
+    source_end: SideMarker,
+    dest_end: SideMarker,
+) -> QuitSource {
+    QuitSource::classify(&descriptor_for_packet_io(error, source_end, dest_end))
+}
+
 /// Whether a packet read error is a clean peer EOF at a packet
 /// boundary.
-fn is_clean_eof(error: &proxy_io::PacketIoError) -> bool {
+fn is_clean_eof(error: &PacketIoError) -> bool {
     matches!(
         error,
-        proxy_io::PacketIoError::Io { source, .. }
+        PacketIoError::Io { source, .. }
             if source.kind() == std::io::ErrorKind::UnexpectedEof
     )
 }
@@ -4272,6 +4489,237 @@ fn fill_salt(salt: &mut [u8; 20]) {
                 *byte = 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod error_classification_tests {
+    use super::{
+        DisconnectState, IoSide, PacketIoError, QuitSource, SideMarker, WireErrorSource,
+        classify_packet_io, coarse_quit_source, descriptor_for_packet_io, resolve_end_source,
+        wire_source_of,
+    };
+    use mysql_wire::DecodeError;
+    use std::io::{Error as IoError, ErrorKind};
+
+    /// The Go `IsDisconnectError` set, portably mapped to `ErrorKind`.
+    const DISCONNECT_KINDS: &[ErrorKind] = &[
+        ErrorKind::UnexpectedEof,
+        ErrorKind::BrokenPipe,
+        ErrorKind::ConnectionReset,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::TimedOut,
+    ];
+
+    fn io(side: IoSide, kind: ErrorKind) -> PacketIoError {
+        PacketIoError::Io {
+            side,
+            operation: "test",
+            source: IoError::from(kind),
+        }
+    }
+
+    #[test]
+    fn backend_read_disconnect_is_backend_network_on_both_observables() {
+        // A backend read: the backend stream is both source and destination, so
+        // every disconnect kind is a backend network break — the log observable
+        // (quit) and wire observable agree.
+        for &kind in DISCONNECT_KINDS {
+            let quit = classify_packet_io(
+                &io(IoSide::Source, kind),
+                SideMarker::Backend,
+                SideMarker::Backend,
+            );
+            assert_eq!(quit, QuitSource::BackendNetwork, "{kind:?}");
+            assert_eq!(
+                wire_source_of(quit),
+                WireErrorSource::BackendNetwork,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_read_disconnect_is_client_network_on_both_observables() {
+        for &kind in DISCONNECT_KINDS {
+            let quit = classify_packet_io(
+                &io(IoSide::Source, kind),
+                SideMarker::Client,
+                SideMarker::Client,
+            );
+            assert_eq!(quit, QuitSource::ClientNetwork, "{kind:?}");
+            assert_eq!(
+                wire_source_of(quit),
+                WireErrorSource::ClientNetwork,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_write_break_attributes_the_write_endpoint_not_the_read_leg() {
+        // THE IoSide inversion regression guard. A `backend -> client` forward
+        // (source=Backend, dest=Client) whose DESTINATION write breaks is the
+        // CLIENT's network break, never the backend's.
+        for &kind in DISCONNECT_KINDS {
+            let quit = classify_packet_io(
+                &io(IoSide::Destination, kind),
+                SideMarker::Backend,
+                SideMarker::Client,
+            );
+            assert_eq!(
+                quit,
+                QuitSource::ClientNetwork,
+                "backend->client dst-write {kind:?} is the client's break"
+            );
+            assert_eq!(wire_source_of(quit), WireErrorSource::ClientNetwork);
+        }
+        // Symmetrically, a `client -> backend` forward whose destination
+        // (backend) write breaks is the backend's.
+        for &kind in DISCONNECT_KINDS {
+            let quit = classify_packet_io(
+                &io(IoSide::Destination, kind),
+                SideMarker::Client,
+                SideMarker::Backend,
+            );
+            assert_eq!(
+                quit,
+                QuitSource::BackendNetwork,
+                "client->backend dst-write {kind:?} is the backend's break"
+            );
+        }
+    }
+
+    #[test]
+    fn non_disconnect_io_is_a_proxy_fault_not_a_network_break() {
+        // InvalidData / NotFound / Other / WriteZero are NOT connection breaks:
+        // they fall through to the proxy-error class, never network.
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+            ErrorKind::WriteZero,
+        ] {
+            let error = io(IoSide::Source, kind);
+            let quit = classify_packet_io(&error, SideMarker::Backend, SideMarker::Backend);
+            assert_eq!(
+                quit,
+                QuitSource::ProxyError,
+                "{kind:?} is not a network break"
+            );
+            assert_eq!(wire_source_of(quit), WireErrorSource::Proxy);
+            let descriptor =
+                descriptor_for_packet_io(&error, SideMarker::Backend, SideMarker::Backend);
+            assert_eq!(
+                descriptor.disconnect,
+                DisconnectState::NotDisconnect,
+                "{kind:?} must not be an attributed disconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_decode_error_is_proxy_malformed_not_network() {
+        // Go treats a framing/sequence error as a proxy bug (SrcProxyMalformed),
+        // never a client/backend network break — even on a client read leg.
+        let quit = classify_packet_io(
+            &PacketIoError::Decode(DecodeError::EmptyCommandPacket),
+            SideMarker::Client,
+            SideMarker::Client,
+        );
+        assert_eq!(quit, QuitSource::ProxyMalformed);
+        assert_eq!(wire_source_of(quit), WireErrorSource::Proxy);
+    }
+
+    #[test]
+    fn oversized_logical_payload_attributes_to_the_over_sending_endpoint() {
+        // The generic read_logical(limit) transport cap is NOT Go's handshake
+        // ErrPacketTooLarge sentinel: it fires on backend responses and
+        // post-handshake command reads too. It must attribute to the over-sending
+        // read source, so a backend oversized response stays BackendNetwork (not
+        // mis-attributed to the client) and a client one stays ClientNetwork.
+        let oversized = || PacketIoError::LogicalPayloadTooLarge {
+            limit: 16,
+            observed: 32,
+        };
+        // Backend read (source=Backend): a backend oversized response.
+        let backend = classify_packet_io(&oversized(), SideMarker::Backend, SideMarker::Backend);
+        assert_eq!(
+            backend,
+            QuitSource::BackendNetwork,
+            "backend oversized must NOT mis-attribute to the client"
+        );
+        assert_eq!(wire_source_of(backend), WireErrorSource::BackendNetwork);
+        // Client read (source=Client): a client oversized (handshake or command).
+        let client = classify_packet_io(&oversized(), SideMarker::Client, SideMarker::Client);
+        assert_eq!(client, QuitSource::ClientNetwork);
+        assert_eq!(wire_source_of(client), WireErrorSource::ClientNetwork);
+    }
+
+    #[test]
+    fn end_source_projects_the_stored_winner_not_the_last_call() {
+        // Blocker regression: once an earlier classification stores a log
+        // source, a later end_source(new) must keep that winner AND return its
+        // wire projection — never first-wins-log + last-call-wire (A/B split).
+        // Fresh: the new source wins and both observables agree.
+        assert_eq!(
+            resolve_end_source(QuitSource::None, QuitSource::BackendNetwork),
+            (QuitSource::BackendNetwork, WireErrorSource::BackendNetwork)
+        );
+        // Preexisting: the stored winner is kept, and the wire is its
+        // projection — NOT wire_source_of(the later ClientNetwork).
+        assert_eq!(
+            resolve_end_source(QuitSource::BackendHandshake, QuitSource::ClientNetwork),
+            (
+                QuitSource::BackendHandshake,
+                WireErrorSource::BackendNetwork
+            ),
+            "stored winner drives BOTH observables; a mutation projecting the \
+             later source would return ClientNetwork here"
+        );
+    }
+
+    #[test]
+    fn accounting_invariant_faults_are_proxy_errors() {
+        for error in [
+            PacketIoError::CounterOverflow { field: "inbound" },
+            PacketIoError::ForwardAlreadyComplete,
+        ] {
+            let quit = classify_packet_io(&error, SideMarker::Backend, SideMarker::Client);
+            assert_eq!(quit, QuitSource::ProxyError);
+            assert_eq!(wire_source_of(quit), WireErrorSource::Proxy);
+        }
+    }
+
+    #[test]
+    fn wire_and_log_observables_are_one_classification() {
+        // Projecting quit -> wire -> quit is stable for the coarse network and
+        // shutdown variants, proving the two observables never diverge for the
+        // classes this fix targets.
+        for quit in [
+            QuitSource::ClientNetwork,
+            QuitSource::BackendNetwork,
+            QuitSource::ProxyQuit,
+        ] {
+            assert_eq!(coarse_quit_source(wire_source_of(quit)), quit);
+        }
+    }
+
+    #[test]
+    fn wrapped_disconnect_is_still_a_network_break() {
+        // Go's errors.Is unwraps: a disconnect nested in a wrapper still
+        // classifies as a network break attributed to the observed endpoint.
+        let wrapped = IoError::other(IoError::from(ErrorKind::TimedOut));
+        let quit = classify_packet_io(
+            &PacketIoError::Io {
+                side: IoSide::Source,
+                operation: "test",
+                source: wrapped,
+            },
+            SideMarker::Backend,
+            SideMarker::Backend,
+        );
+        assert_eq!(quit, QuitSource::BackendNetwork);
     }
 }
 
