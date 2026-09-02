@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/control-plane",
     "crates/control-proto",
     "crates/dataplane",
     "crates/differential-runner",
@@ -20,6 +21,7 @@ repository = "https://github.com/pingcap/tiproxy"
 
 [workspace.dependencies]
 getrandom = "=0.2.17"
+control-plane = { path = "crates/control-plane", version = "0.1.0" }
 control-proto = { path = "crates/control-proto", version = "0.1.0" }
 criterion = { version = "=0.8.2", default-features = false }
 dataplane = { path = "crates/dataplane", version = "0.1.0" }

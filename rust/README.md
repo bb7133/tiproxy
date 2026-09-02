@@ -17,6 +17,9 @@ boundaries and build policy remain stable.
   state.
 - `control-proto` owns the versioned control-plane contract between Go and Rust.
   MySQL packet payloads are forbidden at this boundary.
+- `control-plane` owns the process-local Rust control-domain seam, unique-owner
+  lease, versioned config/TLS views, ordered lifecycle, and bounded runtime
+  observations. It intentionally does not depend on `control-proto`.
 - `dataplane` composes the four libraries without moving hot-path traffic into
   the control plane. Its listener, admission, and registry contracts are
   documented in [`crates/dataplane/README.md`](crates/dataplane/README.md).

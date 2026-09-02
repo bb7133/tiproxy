@@ -78,6 +78,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/proxy-io/` - Client/backend transport ownership, including future TLS, compression, and PROXY protocol support.
 - `rust/crates/session-core/` - Protocol-independent session lifecycle and migration state.
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
+- `rust/crates/control-plane/` - Process-local Rust control-domain types, ownership fencing, config/TLS views, lifecycle/shutdown, and bounded observability; it must not depend on `control-proto`.
 - `rust/crates/dataplane/` - Rust dataplane orchestration across wire, transport, session, and control components.
 - `rust/crates/differential-runner/` - Payload-free Rust consumer for the immutable Go protocol corpus; it drives merged wire/session parsers and emits sharded semantic observations.
 - `rust/crates/tiproxy-rs/` - Rust dataplane executable and build/version metadata.
