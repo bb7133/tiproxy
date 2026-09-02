@@ -1976,7 +1976,13 @@ impl Engine {
                     let payload = match self.backend_read(HANDSHAKE_PAYLOAD_LIMIT).await {
                         Ok(payload) => payload,
                         Err(source) => {
-                            self.quit_source = QuitSource::BackendHandshake;
+                            // `backend_read` already classified this transport
+                            // error through `end_source` (setting `quit_source`
+                            // to the winner and returning its wire projection).
+                            // A post-hoc `quit_source = BackendHandshake` here
+                            // would re-fork the observables: an auth-phase read
+                            // disconnect must stay BackendNetwork on BOTH, and a
+                            // malformed/non-disconnect read its own class.
                             let _ = self.events.send(SessionEvent::BackendIoError).await;
                             return Some(source);
                         }
