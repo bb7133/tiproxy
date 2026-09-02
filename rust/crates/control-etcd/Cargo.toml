@@ -1,0 +1,25 @@
+[package]
+name = "control-etcd"
+description = "Fenced etcd session and election ownership for the TiProxy Rust control plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+control-external.workspace = true
+control-plane.workspace = true
+etcd-client.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

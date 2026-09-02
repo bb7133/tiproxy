@@ -56,6 +56,24 @@
       "observed_fields": ["dependency", "deadline_millis", "retry_count", "error_class", "cancellation_state"]
     },
     {
+      "id": "CP-FAULT-ELECTION-WATCH-COMPACTION",
+      "summary": "Compact an election watch revision, then relist the exact current owner before resuming.",
+      "target_issue": "#144",
+      "contracts": ["CP-ELECT-001"],
+      "steps": ["record watch revision and current owner fence", "compact past the revision", "relist the exact owner and resume watching"],
+      "expectations": ["a fresh leader relist occurs", "the resumed revision is monotonic", "the exact lease and session revision remain current"],
+      "observed_fields": ["owner_id", "lease_id", "owner_state", "session_revision", "revision", "retry_count"]
+    },
+    {
+      "id": "CP-FAULT-ETCD-PROCESS-DEATH",
+      "summary": "Kill a live etcd election member and wait for its lease-attached presence key to expire.",
+      "target_issue": "#144",
+      "contracts": ["CP-ELECT-001"],
+      "steps": ["elect a subprocess owner", "verify its ephemeral session key", "kill the process and wait beyond its lease TTL"],
+      "expectations": ["the session key disappears", "the dead process cannot refresh ownership", "no active session key remains after TTL"],
+      "observed_fields": ["owner_id", "lease_id", "owner_state", "session_revision", "retirement_reason"]
+    },
+    {
       "id": "CP-FAULT-ETCD-TRANSIENT",
       "summary": "Interrupt etcd connectivity without deleting durable keys, then restore it.",
       "target_issue": "#144",

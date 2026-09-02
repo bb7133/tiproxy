@@ -12,6 +12,8 @@ single-process Rust migration.
 - `differential/`: CLI and synthetic comparator self-test fixtures.
 - `cp001/`: paired CP-001 observations from the production Go config manager
   and the Rust process-local control runtime.
+- `cp003/`: production Go versus Rust etcd lease/election parity, including
+  transient outage, lease loss, compacted watch, and subprocess-death faults.
 
 Run the gates:
 
@@ -19,6 +21,7 @@ Run the gates:
 make controlplane-contracts
 make controlplane-differential-self-test
 make controlplane-cp001-evidence
+make controlplane-cp003-evidence
 go test ./tests/controlplane/...
 ```
 
@@ -35,6 +38,8 @@ behavior only and must never be cited as Go/Rust production parity evidence.
 `controlplane-cp001-evidence` is different: it runs both real implementations,
 compares their normalized public outcomes exactly, then changes the Rust owner
 generation and requires the comparator to kill that mutation.
+`controlplane-cp003-evidence` additionally uses a restartable embedded etcd
+server and requires two independent election-observation mutations to fail.
 
 Observation state is a public semantic projection. Do not record raw MySQL
 packets, SQL text, authentication material, credentials, or arbitrary payloads.
