@@ -227,13 +227,27 @@ pub fn is_disconnect_io(error: &std::io::Error) -> bool {
     if is_disconnect_kind(error.kind()) {
         return true;
     }
-    // Go's `errors.Is` unwraps; a disconnect `io::Error` may be nested inside a
-    // wrapper (`io::Error::new(kind, inner)`). The inner is exposed via
-    // `get_ref()`; recurse when it is itself an `io::Error`.
-    if let Some(inner) = error.get_ref()
-        && let Some(io_inner) = inner.downcast_ref::<std::io::Error>()
-    {
-        return is_disconnect_io(io_inner);
+    // Go's `errors.Is` unwraps through ANY wrapper via `Unwrap()`, not only a
+    // directly-nested `io::Error`. Descend the attached-inner chain: an
+    // `io::Error` exposes its inner through `get_ref()` (its own `source()`
+    // instead returns the *inner's* source, skipping the inner itself), while a
+    // non-io wrapper exposes it through `source()`. So a disconnect buried under
+    // a custom wrapper (`io::Error(Other) -> Wrapper -> io::Error(TimedOut)`)
+    // still classifies.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = error
+        .get_ref()
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            if is_disconnect_kind(io_err.kind()) {
+                return true;
+            }
+            current = io_err
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static));
+        } else {
+            current = err.source();
+        }
     }
     false
 }
@@ -843,16 +857,55 @@ mod tests {
             );
         }
         // errors.Is parity: a disconnect nested in a wrapper is still a disconnect.
-        let wrapped = Error::new(ErrorKind::Other, Error::from(ErrorKind::ConnectionReset));
+        let wrapped = Error::other(Error::from(ErrorKind::ConnectionReset));
         assert!(
             is_disconnect_io(&wrapped),
             "nested ConnectionReset must be a disconnect"
         );
         // A wrapped non-disconnect stays a non-disconnect.
-        let wrapped_non = Error::new(ErrorKind::Other, Error::from(ErrorKind::InvalidData));
+        let wrapped_non = Error::other(Error::from(ErrorKind::InvalidData));
         assert!(
             !is_disconnect_io(&wrapped_non),
             "nested InvalidData must NOT be a disconnect"
+        );
+    }
+
+    #[test]
+    fn is_disconnect_io_unwraps_custom_non_io_wrappers() {
+        use std::error::Error as StdError;
+        use std::fmt;
+        use std::io::{Error, ErrorKind};
+
+        // A non-io error type whose `source()` yields an `io::Error` — mirrors a
+        // library wrapper around a transport failure. Go's `errors.Is` walks
+        // through any such `Unwrap()`-able wrapper, so the disconnect below the
+        // wrapper must still classify. A `get_ref()`/direct-downcast-only walk
+        // would miss it.
+        #[derive(Debug)]
+        struct Wrapper(Error);
+        impl fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "wrapper: {}", self.0)
+            }
+        }
+        impl StdError for Wrapper {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        // io::Error(Other) -> Wrapper -> io::Error(TimedOut).
+        let buried = Error::other(Wrapper(Error::from(ErrorKind::TimedOut)));
+        assert!(
+            is_disconnect_io(&buried),
+            "a disconnect buried under a custom non-io wrapper must classify"
+        );
+
+        // Same shape, non-disconnect leaf → stays false.
+        let buried_non = Error::other(Wrapper(Error::from(ErrorKind::InvalidData)));
+        assert!(
+            !is_disconnect_io(&buried_non),
+            "a non-disconnect under a custom wrapper must NOT classify"
         );
     }
 }
