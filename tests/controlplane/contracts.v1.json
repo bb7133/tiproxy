@@ -147,14 +147,16 @@
       "go_owner": "pkg/util/etcd, pkg/util/http, and pkg/util/netutil",
       "rust_target": "#143",
       "go_baseline": "anchored",
-      "rust_status": "pending",
+      "rust_status": "owned",
       "anchors": [
         {"path": "pkg/util/etcd/etcd_test.go", "contains": "func TestSyncEtcdClientTimeout"},
         {"path": "pkg/util/http/http_test.go", "contains": "func TestNewHTTPClientDisableKeepAlivesNoConnectionReuse"},
-        {"path": "pkg/util/netutil/dns_test.go", "contains": "func TestDNSDialerTriesAllResolvedIPs"}
+        {"path": "pkg/util/netutil/dns_test.go", "contains": "func TestDNSDialerTriesAllResolvedIPs"},
+        {"path": "rust/crates/control-external/src/etcd.rs", "contains": "pub struct EtcdConnector"},
+        {"path": "tests/controlplane/cp002/go-fixture/main.go", "contains": "func run"}
       ],
       "observed_fields": ["dependency", "endpoint_address", "deadline_millis", "retry_count", "error_class", "cancellation_state"],
-      "fault_scenarios": ["CP-FAULT-ETCD-TRANSIENT", "CP-FAULT-WATCH-COMPACTION", "CP-FAULT-DEPENDENCY-TIMEOUT"],
+      "fault_scenarios": ["CP-FAULT-ETCD-TRANSIENT", "CP-FAULT-WATCH-COMPACTION", "CP-FAULT-DEPENDENCY-TIMEOUT", "CP-FAULT-EXTERNAL-PROCESS-RESTART"],
       "bridge_messages": [],
       "handoff": "Complete CP-EXT before election, topology, or admin code introduces one-off client behavior."
     },

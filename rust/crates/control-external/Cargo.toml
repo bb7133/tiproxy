@@ -1,0 +1,29 @@
+[package]
+name = "control-external"
+description = "Fenced external dependency foundation for the TiProxy Rust control plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+control-plane.workspace = true
+etcd-client.workspace = true
+futures-util.workspace = true
+http.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "implemented": [
+    {
+      "dependency": "etcd-client",
+      "source": "crates.io/etcd-client@0.20.0",
+      "go_surface": [
+        "pkg/util/etcd",
+        "pkg/manager/backendcluster",
+        "pkg/manager/elect",
+        "pkg/manager/infosync",
+        "pkg/manager/config/namespace.go",
+        "pkg/manager/vip",
+        "pkg/balance/metricsreader"
+      ],
+      "rust_owner": "control-external connector policy",
+      "consumer_issue": "#144",
+      "boundary": "semantic etcd-client operations; generated etcd protobuf modules remain private"
+    },
+    {
+      "dependency": "kvproto/diagnosticspb",
+      "source": "github.com/pingcap/kvproto@b41e86365ce0/proto/diagnosticspb.proto sha256=df7e86e7f9cf7982075c564b7174ec1f7ae5a661e0aafecb1dacc8ba996c224e",
+      "go_surface": ["pkg/server/api/server.go"],
+      "rust_owner": "minimal wire-compatible tonic/prost service binding",
+      "consumer_issue": "#150",
+      "boundary": "Diagnostics SearchLog and ServerInfo only; no PD, TiKV, BR, or coprocessor bindings"
+    },
+    {
+      "dependency": "HTTP/DNS/retry",
+      "source": "reqwest rustls + tokio system resolver + owner-cancellable bounded retry",
+      "go_surface": ["pkg/util/http", "pkg/util/netutil"],
+      "rust_owner": "control-external bounded clients",
+      "consumer_issue": "#145",
+      "boundary": "no implicit redirects, no credential-bearing URLs, no idle connection reuse, bounded response and resolution sets"
+    }
+  ],
+  "deferred": [
+    {
+      "dependency": "TiDB parser Normalize/NormalizeDigest",
+      "go_surface": [
+        "pkg/proxy/backend/backend_conn_mgr.go",
+        "pkg/sqlreplay/cmd/cmd.go",
+        "pkg/sqlreplay/replay/replay.go",
+        "pkg/util/lex/filter.go"
+      ],
+      "consumer_issues": ["#151", "#152", "#153"],
+      "plan": "Do not embed the Go TiDB parser or accept generic sqlparser dialect drift. Freeze a Go corpus for Normalize and NormalizeDigest, implement a bounded Rust tokenizer/normalizer, and require exact differential and malformed-input evidence before each caller moves."
+    },
+    {
+      "dependency": "TiDB objstore/storeapi",
+      "go_surface": ["pkg/sqlreplay", "pkg/manager/meter"],
+      "consumer_issues": ["#148", "#151", "#152"],
+      "plan": "Adopt Apache OpenDAL behind TiProxy-owned traits with only fs, s3, gcs, azblob, oss, and cos services enabled by their consumer slice. Freeze path, pagination, atomic-publish, retry, credential-redaction, and provider-error parity before replacing either Go owner."
+    }
+  ]
+}

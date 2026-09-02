@@ -65,6 +65,15 @@
       "observed_fields": ["owner_id", "lease_id", "revision", "retry_count", "proxy_address"]
     },
     {
+      "id": "CP-FAULT-EXTERNAL-PROCESS-RESTART",
+      "summary": "Kill and replace the real loopback dependency process, then reconstruct the fenced Rust clients against the successor endpoint.",
+      "target_issue": "#143",
+      "contracts": ["CP-EXT-001"],
+      "steps": ["exercise real etcd, HTTP, and DNS clients", "SIGKILL the dependency process", "start a successor on the exact etcd address and repeat"],
+      "expectations": ["Go and Rust semantic observations match", "all requests remain bounded", "the successor generation reconnects without a second owner"],
+      "observed_fields": ["dependency", "endpoint_address", "deadline_millis", "retry_count", "cancellation_state", "http_body_bytes"]
+    },
+    {
       "id": "CP-FAULT-LEASE-LOSS",
       "summary": "Expire or revoke the active election lease while the owner is running.",
       "target_issue": "#144",

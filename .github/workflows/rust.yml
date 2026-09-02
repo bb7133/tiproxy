@@ -14,6 +14,7 @@ on:
       - "rust-toolchain.toml"
       - "rust/**"
       - "scripts/generate-control-proto.sh"
+      - "tests/controlplane/**"
   push:
     branches:
       - main
@@ -29,6 +30,7 @@ on:
       - "rust-toolchain.toml"
       - "rust/**"
       - "scripts/generate-control-proto.sh"
+      - "tests/controlplane/**"
 
 permissions:
   contents: read
@@ -62,6 +64,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Restore Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -77,6 +81,8 @@ jobs:
         run: make control-proto-generate-check
       - name: Run Go control bridge tests
         run: go test -race ./pkg/controlbridge/...
+      - name: Run CP-002 live external dependency evidence
+        run: make controlplane-cp002-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests
@@ -137,6 +143,8 @@ jobs:
         run: |
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Restore release cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
