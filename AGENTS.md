@@ -82,6 +82,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/differential-runner/` - Payload-free Rust consumer for the immutable Go protocol corpus; it drives merged wire/session parsers and emits sharded semantic observations.
 - `rust/crates/tiproxy-rs/` - Rust dataplane executable and build/version metadata.
 - `tests/compatibility/` - Versioned client-driver and MySQL capability contract shared by the Go/Rust dataplane integration tests.
+- `tests/controlplane/` - Versioned Go control-plane contract and fault catalogs plus the payload-free observation comparator used by every Rust control-plane migration slice.
 - `tests/dataplane/corpus/` - Deterministic, language-neutral Go dataplane protocol corpus.
 - `tests/dataplane/differential/` - Go/Rust corpus comparator, first-divergence report, parity coverage/exclusion gate, mutation self-check, and sharded CI entrypoint.
 - `tests/dataplane/drift/` - Semantic CI gate that keeps Go dataplane changes synchronized with Rust parity artifacts.

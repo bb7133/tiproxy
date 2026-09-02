@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pingcap/tiproxy/tests/controlplane/schema/observations.v1.schema.json",
+  "title": "TiProxy control-plane differential observations v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "producer", "observations"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"enum": ["go", "rust"]},
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scenario_id", "step", "contracts", "subject", "outcome", "effects", "state", "counters"],
+        "properties": {
+          "scenario_id": {"type": "string", "maxLength": 256},
+          "step": {"type": "integer", "minimum": 0},
+          "contracts": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "pattern": "^CP-[A-Z]+-[0-9]{3}$"}
+          },
+          "subject": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "namespace": {"type": "string", "maxLength": 256},
+              "cluster": {"type": "string", "maxLength": 256},
+              "generation": {"type": "integer", "minimum": 0}
+            }
+          },
+          "outcome": {"type": "string", "minLength": 1, "maxLength": 256},
+          "error_class": {"type": "string", "maxLength": 256},
+          "error_source": {"type": "string", "maxLength": 256},
+          "effects": {"$ref": "#/$defs/strings"},
+          "state": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/field"}
+          },
+          "counters": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/counter"}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "strings": {
+      "type": "array",
+      "items": {"type": "string", "maxLength": 256}
+    },
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "value"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "value": {"type": "string", "maxLength": 256}
+      }
+    },
+    "counter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "value"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "value": {"type": "integer"}
+      }
+    }
+  }
+}
