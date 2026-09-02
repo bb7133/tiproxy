@@ -202,6 +202,42 @@ pub enum DisconnectState {
     Attributed(SideMarker),
 }
 
+/// Go `pnet.IsDisconnectError` parity: an I/O error is a *disconnect* when its
+/// error kind — or that of any wrapped `io::Error` in its source chain — is a
+/// connection-break kind: end-of-file (`io.EOF`), broken pipe (`EPIPE`),
+/// connection reset (`ECONNRESET`), connection aborted (`ECONNABORTED`), or a
+/// timeout (`ETIMEDOUT` / deadline exceeded). Non-connection kinds
+/// (`NotFound`/`ENOENT`, `InvalidData`, `Other`, …) are NOT disconnects: they
+/// fall through to the wrapped failure classes (e.g. proxy/malformed), exactly
+/// like Go. Rust maps the relevant errnos to these `ErrorKind`s portably, so we
+/// classify on `ErrorKind` rather than raw platform errnos.
+#[must_use]
+pub fn is_disconnect_io(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    const fn is_disconnect_kind(kind: ErrorKind) -> bool {
+        matches!(
+            kind,
+            ErrorKind::UnexpectedEof
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::TimedOut
+        )
+    }
+    if is_disconnect_kind(error.kind()) {
+        return true;
+    }
+    // Go's `errors.Is` unwraps; a disconnect `io::Error` may be nested inside a
+    // wrapper (`io::Error::new(kind, inner)`). The inner is exposed via
+    // `get_ref()`; recurse when it is itself an `io::Error`.
+    if let Some(inner) = error.get_ref()
+        && let Some(io_inner) = inner.downcast_ref::<std::io::Error>()
+    {
+        return is_disconnect_io(io_inner);
+    }
+    false
+}
+
 /// Specific failure classes mirroring Go's typed sentinel errors, plus the
 /// typed control/shutdown domains issue #24 requires (Go expresses those two
 /// through `ErrProxyErr` wrapping and `context.Canceled` rather than
@@ -775,5 +811,48 @@ mod tests {
             assert!(!message.contains('/') && !message.contains('\\'));
             assert!(!message.contains("{}") && !message.contains('%'));
         }
+    }
+
+    #[test]
+    fn is_disconnect_io_matches_go_disconnect_set() {
+        use std::io::{Error, ErrorKind};
+        // Go `IsDisconnectError`: EOF / EPIPE / ECONNRESET / ECONNABORTED / ETIMEDOUT.
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                is_disconnect_io(&Error::from(kind)),
+                "{kind:?} must be a disconnect"
+            );
+        }
+        // Non-connection kinds are NOT disconnects (fall through to wrapped classes).
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::InvalidData,
+            ErrorKind::PermissionDenied,
+            ErrorKind::WriteZero,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_disconnect_io(&Error::from(kind)),
+                "{kind:?} must NOT be a disconnect"
+            );
+        }
+        // errors.Is parity: a disconnect nested in a wrapper is still a disconnect.
+        let wrapped = Error::new(ErrorKind::Other, Error::from(ErrorKind::ConnectionReset));
+        assert!(
+            is_disconnect_io(&wrapped),
+            "nested ConnectionReset must be a disconnect"
+        );
+        // A wrapped non-disconnect stays a non-disconnect.
+        let wrapped_non = Error::new(ErrorKind::Other, Error::from(ErrorKind::InvalidData));
+        assert!(
+            !is_disconnect_io(&wrapped_non),
+            "nested InvalidData must NOT be a disconnect"
+        );
     }
 }
