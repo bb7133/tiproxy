@@ -39,6 +39,7 @@ mod model;
 mod module;
 mod register;
 mod registrar;
+mod resolver;
 
 pub use discovery::poll_tidb_topology;
 pub use model::{BackendInfo, TopologySnapshot, parse_tidb_topology};
@@ -50,3 +51,6 @@ pub use register::{
     info_key, ttl_key, ttl_value,
 };
 pub use registrar::{RegistrarError, run};
+pub use resolver::{
+    AdvertiseEndpointResolver, InterfaceAdvertiseResolver, StaticAdvertiseResolver,
+};

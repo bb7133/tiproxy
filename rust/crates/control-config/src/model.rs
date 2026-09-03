@@ -136,12 +136,20 @@ impl Default for HealthCheckConfig {
 /// Configured identity and dependency inputs consumed by CP-TOPO.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopologyConfig {
-    /// Resolved advertised SQL host.
-    pub advertise_host: Arc<str>,
-    /// Advertised SQL port.
+    /// Explicit advertise-address override, when a non-empty `advertise-addr`
+    /// is configured. This is deterministic raw material: resolving it (and any
+    /// interface fallback) into the published host belongs to CP-TOPO, not here.
+    pub advertise_host_override: Option<Arc<str>>,
+    /// The bind host of the first expanded SQL serving listener.
+    pub bind_sql_host: Arc<str>,
+    /// Advertised SQL port, taken from that first expanded listener (so a
+    /// port range contributes its first port, matching Go).
     pub sql_port: u16,
     /// HTTP status port.
     pub status_port: u16,
+    /// The raw HA virtual IP string (empty when HA is disabled). Kept verbatim
+    /// because the resolver excludes it with Go's `HasPrefix` compatibility.
+    pub ha_virtual_ip: Arc<str>,
     /// Stable, name-sorted backend clusters.
     pub backend_clusters: Arc<[BackendClusterConfig]>,
     /// Complete client TLS material for PD/etcd connections.
@@ -424,26 +432,30 @@ impl EffectiveConfig {
     /// Returns a stable error when the SQL/API addresses cannot produce the
     /// self-registration identity.
     pub fn topology(&self) -> Result<TopologyConfig, ConfigError> {
-        let (bound_host, sql_port) = split_host_port(
-            self.proxy
-                .addr
-                .split(',')
-                .next()
-                .unwrap_or(self.proxy.addr.as_str())
-                .trim(),
-            "proxy.addr",
-        )?;
+        // Reuse the SQL serving projection so the registration port is the
+        // first expanded listener's port (a port range contributes its first
+        // port), instead of re-splitting the raw `proxy.addr`.
+        let listeners = serving_listeners(&self.proxy)?;
+        let first = listeners.first().ok_or(ConfigError::InvalidField {
+            field: "proxy.addr",
+            class: "no_listener",
+        })?;
+        let bind_sql_host = Arc::clone(&first.address);
+        let sql_port = first.port;
         let (_, status_port) = split_host_port(&self.api.addr, "api.addr")?;
-        let advertise_host = if self.proxy.advertise_addr.trim().is_empty() {
-            bound_host
+        let advertise_trimmed = self.proxy.advertise_addr.trim();
+        let advertise_host_override = if advertise_trimmed.is_empty() {
+            None
         } else {
-            self.proxy.advertise_addr.trim().to_owned()
+            Some(Arc::from(advertise_trimmed))
         };
         let backend_clusters = self.normalized_backend_clusters()?;
         Ok(TopologyConfig {
-            advertise_host: Arc::from(advertise_host),
+            advertise_host_override,
+            bind_sql_host,
             sql_port,
             status_port,
+            ha_virtual_ip: Arc::from(self.ha.virtual_ip.as_str()),
             backend_clusters: Arc::from(backend_clusters),
             cluster_tls: client_tls(&self.security.cluster_tls),
             health: HealthCheckConfig::default(),

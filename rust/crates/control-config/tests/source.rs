@@ -65,9 +65,9 @@ max-connections = 10
         initial
             .topology()
             .unwrap_or_else(|error| unreachable!("topology: {error}"))
-            .advertise_host
-            .as_ref(),
-        "proxy.example"
+            .advertise_host_override
+            .as_deref(),
+        Some("proxy.example")
     );
 
     let updates = store.subscribe();

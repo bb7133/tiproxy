@@ -41,11 +41,13 @@
 //! has no in-process consumer until routing lands; wiring a per-cluster poll
 //! loop is a dependent follow-up.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use control_config::{
-    ConfigNamespaceSnapshot, ConfigNamespaceSource, ConfigNamespaceStore, TopologyRuntimeIdentity,
+    BackendClusterConfig, ClientTlsConfig, ConfigNamespaceSnapshot, ConfigNamespaceSource,
+    TopologyRuntimeIdentity,
 };
 use control_external::{EtcdClientConfig, EtcdConnector};
 use control_plane::{
@@ -55,6 +57,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::registrar::RegistrarError;
+use crate::resolver::AdvertiseEndpointResolver;
 
 /// Grace period for a retired generation's children to deregister before they
 /// are aborted, so a wedged child can never block a reconfigure or shutdown.
@@ -99,8 +102,9 @@ pub trait TopologyClientFactory: Send + Sync {
 
 /// The self-registration control-plane module.
 pub struct TopologyModule {
-    source: ConfigNamespaceStore,
+    source: Arc<dyn ConfigNamespaceSource>,
     factory: Box<dyn TopologyClientFactory>,
+    resolver: Arc<dyn AdvertiseEndpointResolver>,
     identity: TopologyRuntimeIdentity,
     ready: watch::Sender<bool>,
 }
@@ -136,10 +140,15 @@ impl TopologyModuleHandle {
 
 impl TopologyModule {
     /// Builds the module and its readiness handle.
+    ///
+    /// `source`, `factory`, and `resolver` are all injected from the
+    /// composition root: the factory reads TLS material and the resolver owns
+    /// interface enumeration, keeping both out of this crate.
     #[must_use]
     pub fn new(
-        source: ConfigNamespaceStore,
+        source: Arc<dyn ConfigNamespaceSource>,
         factory: Box<dyn TopologyClientFactory>,
+        resolver: Arc<dyn AdvertiseEndpointResolver>,
         identity: TopologyRuntimeIdentity,
     ) -> (Self, TopologyModuleHandle) {
         let (ready_tx, ready_rx) = watch::channel(false);
@@ -147,6 +156,7 @@ impl TopologyModule {
             Self {
                 source,
                 factory,
+                resolver,
                 identity,
                 ready: ready_tx,
             },
@@ -159,11 +169,13 @@ impl TopologyModule {
         let mut lifecycle = context.lifecycle();
         let mut updates = self.source.subscribe();
         let mut children = Children::default();
+        let mut active_plan: Option<RegistrationPlan> = None;
 
         // Apply the current generation once (including generation 1), then wait
         // for changes; borrowing after `subscribe` avoids a dropped edge.
         let initial = updates.borrow_and_update().clone();
-        self.reconfigure(&mut children, &initial, &owner).await?;
+        self.reconfigure(&mut children, &mut active_plan, &initial, &owner)
+            .await?;
         let _ = self.ready.send_replace(true);
 
         loop {
@@ -180,7 +192,10 @@ impl TopologyModule {
                         return Err(module_error("config_source_stopped"));
                     }
                     let snapshot = updates.borrow_and_update().clone();
-                    if let Err(error) = self.reconfigure(&mut children, &snapshot, &owner).await {
+                    if let Err(error) = self
+                        .reconfigure(&mut children, &mut active_plan, &snapshot, &owner)
+                        .await
+                    {
                         stop_children(&mut children).await;
                         return Err(error);
                     }
@@ -198,25 +213,29 @@ impl TopologyModule {
         }
     }
 
-    /// Rebuilds the per-cluster registration children for one generation.
+    /// Reconciles the per-cluster registration children for one generation.
     ///
-    /// The new client set is built first; only then are the old children
+    /// A [`RegistrationPlan`] is derived first; if it equals the active plan the
+    /// call is a no-op, so a config generation that does not change registration
+    /// (e.g. a namespace or log-level edit) causes no lease flap. Otherwise the
+    /// new client set is built and validated *before* the old children are
     /// stopped and joined, so no retired-generation write can race a new one.
     async fn reconfigure(
         &self,
         children: &mut Children,
+        active_plan: &mut Option<RegistrationPlan>,
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
     ) -> Result<(), ModuleError> {
         let topology = snapshot
             .topology()
             .map_err(|_| module_error("topology_config"))?;
-        let clusters = self
-            .factory
-            .build(&topology)
-            .map_err(|_| module_error("topology_client_build"))?;
+        let advertise_host = self
+            .resolver
+            .resolve(&topology)
+            .map_err(|_| module_error("advertise_resolve"))?;
         let info = TopologyInfo::new(
-            &topology.advertise_host,
+            &advertise_host,
             topology.sql_port,
             topology.status_port,
             &self.identity.version,
@@ -224,6 +243,28 @@ impl TopologyModule {
             &self.identity.deploy_path.to_string_lossy(),
             self.identity.start_timestamp,
         );
+        let plan = RegistrationPlan {
+            info: info.clone(),
+            backend_clusters: Arc::clone(&topology.backend_clusters),
+            cluster_tls: topology.cluster_tls.clone(),
+        };
+        if active_plan.as_ref() == Some(&plan) {
+            // Nothing that affects registration changed; keep the children.
+            return Ok(());
+        }
+
+        // Build and validate the new client set before retiring the old one
+        // (prospective validation: a bad transport fails here, not mid-swap).
+        let clusters = self
+            .factory
+            .build(&topology)
+            .map_err(|_| module_error("topology_client_build"))?;
+        let mut names = BTreeSet::new();
+        for cluster in &clusters {
+            if !names.insert(Arc::clone(&cluster.cluster_name)) {
+                return Err(module_error("duplicate_cluster_name"));
+            }
+        }
 
         // Fence: retire the previous generation before the new one publishes.
         stop_children(children).await;
@@ -245,8 +286,21 @@ impl TopologyModule {
                 .await
             });
         }
+        *active_plan = Some(plan);
         Ok(())
     }
+}
+
+/// The registration-affecting projection of one configuration generation.
+///
+/// Two generations with an equal plan produce identical registrations, so the
+/// module can skip a rebuild (and its lease flap) when only unrelated
+/// configuration changed.
+#[derive(Clone, PartialEq, Eq)]
+struct RegistrationPlan {
+    info: TopologyInfo,
+    backend_clusters: Arc<[BackendClusterConfig]>,
+    cluster_tls: ClientTlsConfig,
 }
 
 impl ControlModule for TopologyModule {
