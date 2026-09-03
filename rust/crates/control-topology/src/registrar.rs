@@ -83,7 +83,7 @@ pub enum RegistrarError {
 /// Runs self-registration until `shutdown` is set or the owner is lost.
 ///
 /// The `shutdown` channel is the cooperative stop signal: setting it to `true`
-/// makes the loop delete its registration (best effort) and return `Ok(())`.
+/// makes the loop revoke its own lease (best effort) and return `Ok(())`.
 /// `owner` fences every keepalive round so a retired generation stops
 /// publishing even while its keepalive stream is otherwise healthy.
 /// `receive_timeout` bounds each keepalive response wait; pass the cluster's

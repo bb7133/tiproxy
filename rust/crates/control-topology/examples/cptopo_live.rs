@@ -100,16 +100,14 @@ async fn main() -> Result<(), AnyError> {
     let receive_timeout = config.request_timeout();
     let connector = EtcdConnector::new(owner.clone(), config.clone());
     let registrar_owner = owner.clone();
-    let registrar = tokio::spawn(async move {
-        let _ = Box::pin(registrar_run(
-            registrar_owner,
-            connector,
-            info,
-            receive_timeout,
-            shutdown_rx,
-        ))
-        .await;
-    });
+    // Keep the registrar's Result so a stuck or failed shutdown is not masked.
+    let registrar = tokio::spawn(Box::pin(registrar_run(
+        registrar_owner,
+        connector,
+        info,
+        receive_timeout,
+        shutdown_rx,
+    )));
 
     let (info_value, info_lease) =
         wait_for_key(&owner, &config, &info_key, Duration::from_secs(10))
@@ -187,11 +185,30 @@ async fn main() -> Result<(), AnyError> {
         rebuilt_lease != 0 && rebuilt_lease != info_lease,
         "rebuilt registration did not use a fresh lease",
     )?;
+    let (_, rebuilt_ttl) = get_key(&owner, &config, &ttl_key)
+        .await?
+        .ok_or("ttl missing after rebuild")?;
+    require(
+        rebuilt_ttl == rebuilt_lease,
+        "rebuilt info and ttl are not under the same lease",
+    )?;
 
-    // --- Row 4: revoke-only cleanup is same-address ABA safe. ---
-    // A successor re-registers this exact address under a fresh lease. When the
-    // old owner shuts down it revokes only its own (rebuilt) lease, which must
-    // not remove the successor's keys.
+    // --- Row 4: revoke-only cleanup revokes exactly this lease, ABA safe. ---
+    // Pin a sentinel to the rebuilt (old) lease at a key OUTSIDE the topology
+    // prefix. On shutdown it must vanish only because that exact lease was
+    // revoked: a no-op deregister would leave it, and a topology-prefix delete
+    // would not reach it. Meanwhile a successor re-registers this address under
+    // a fresh lease and must survive.
+    let sentinel_key = "/cptopo-test/revoke-sentinel";
+    put_with_lease(&owner, &config, sentinel_key, b"1", rebuilt_lease).await?;
+    require(
+        get_key(&owner, &config, sentinel_key)
+            .await?
+            .map(|(_, l)| l)
+            == Some(rebuilt_lease),
+        "sentinel was not attached to the rebuilt lease",
+    )?;
+
     let successor_lease = grant_and_put(&owner, &config, &info_key, &ttl_key).await?;
     require(
         successor_lease != 0 && successor_lease != rebuilt_lease,
@@ -205,11 +222,17 @@ async fn main() -> Result<(), AnyError> {
         "the successor did not take over the address",
     )?;
 
-    // The old owner shuts down and revokes only its own lease.
+    // The old owner shuts down and revokes only its own lease; require the loop
+    // to actually finish (no stuck revoke, no masked failure).
     let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(10), registrar).await;
+    tokio::time::timeout(Duration::from_secs(10), registrar).await???;
 
-    // The successor's info + ttl must survive under the successor lease.
+    // The old lease's sentinel must be gone (proving the exact-lease revoke),
+    // and the successor's info + ttl must survive under the successor lease.
+    require(
+        get_key(&owner, &config, sentinel_key).await?.is_none(),
+        "the old lease was not revoked (its sentinel survived)",
+    )?;
     let (_, survived_info) = get_key(&owner, &config, &info_key)
         .await?
         .ok_or("the old owner's cleanup removed the successor's info")?;
@@ -228,6 +251,27 @@ async fn main() -> Result<(), AnyError> {
     runtime.finish()?;
 
     println!("CPTOPO_LIVE_OK");
+    Ok(())
+}
+
+/// Puts a key under a specific existing lease.
+async fn put_with_lease(
+    owner: &OwnerToken,
+    config: &EtcdClientConfig,
+    key: &str,
+    value: &[u8],
+    lease: i64,
+) -> Result<(), AnyError> {
+    let mut connection = EtcdConnector::new(owner.clone(), config.clone())
+        .connect()
+        .await?;
+    let key = key.as_bytes().to_vec();
+    let value = value.to_vec();
+    connection
+        .execute(move |client| {
+            Box::pin(client.put(key, value, Some(PutOptions::new().with_lease(lease))))
+        })
+        .await?;
     Ok(())
 }
 
