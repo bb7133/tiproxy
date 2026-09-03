@@ -31,7 +31,8 @@ pub use config::{
 };
 pub use ownership::{OwnerError, OwnerLease, OwnerScope, OwnerToken, OwnershipRegistry};
 pub use runtime::{
-    ControlModule, ControlRuntime, EventSink, JsonStderrSink, LifecyclePhase, LifecycleSnapshot,
-    ModuleContext, ModuleError, ModuleFuture, RuntimeError, RuntimeEvent, RuntimeEventKind,
-    RuntimeHandle, RuntimeMetrics, RuntimeMetricsSnapshot, ShutdownReason,
+    ControlModule, ControlModuleSet, ControlRuntime, EventSink, JsonStderrSink, LifecyclePhase,
+    LifecycleSnapshot, ModuleContext, ModuleError, ModuleExit, ModuleFuture, ModuleSetError,
+    RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeHandle, RuntimeMetrics,
+    RuntimeMetricsSnapshot, ShutdownReason,
 };

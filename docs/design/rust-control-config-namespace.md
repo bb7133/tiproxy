@@ -64,6 +64,22 @@ pub struct BackendClusterConfig {
     pub pd_addrs: Arc<[Arc<str>]>,
     pub ns_servers: Arc<[Arc<str>]>,
 }
+
+pub struct TopologyConfig {
+    pub advertise_host: Arc<str>,
+    pub sql_port: u16,
+    pub status_port: u16,
+    pub backend_clusters: Arc<[BackendClusterConfig]>,
+    pub cluster_tls: ClientTlsConfig,
+    pub health: HealthCheckConfig,
+}
+
+pub struct TopologyRuntimeIdentity {
+    pub version: Arc<str>,
+    pub git_hash: Arc<str>,
+    pub deploy_path: PathBuf,
+    pub start_timestamp: i64,
+}
 ```
 
 The actual types may use private fields plus accessors, but the information and
@@ -86,11 +102,21 @@ semantics above are stable:
 - When `proxy.backend-clusters` is empty, non-empty legacy `proxy.pd-addrs`
   yields one cluster named `default`, matching `Config.GetBackendClusters`.
 
-CP-TOPO consumes only `BackendClusterConfig` and the cluster-transport TLS
-policy needed to create its etcd clients. Namespace frontend/backend TLS and
-static backend instances remain in the same immutable CP-CFG snapshot for
-CP-ROUTE. Routing/balance policy is retained by `EffectiveConfig` but is not a
-CP-TOPO input.
+CP-TOPO consumes `TopologyConfig`, which is a stable projection of the
+effective configuration. `cluster_tls` contains the complete CA and optional
+client certificate/private-key paths needed to construct an mTLS etcd client,
+not only minimum-version or common-name policy. `health` initially carries the
+current Go defaults (enable, interval, retry count/interval, dial timeout, and
+metrics interval/timeout); those values become ordinary validated fields if
+Go exposes them as user configuration later. `advertise_host`, `sql_port`, and
+`status_port` are the resolved equivalent of Go `Config.GetIPPort`.
+
+Binary/build/process facts are not configuration: the composition root passes
+`TopologyRuntimeIdentity` directly to the CP-TOPO constructor. CP-TOPO combines
+it with `TopologyConfig` to write its self-registration record. Namespace
+frontend/backend TLS and static backend instances remain in the same immutable
+CP-CFG snapshot for CP-ROUTE. Routing/balance policy is retained by
+`EffectiveConfig` but is not a CP-TOPO input.
 
 ## CP-001 module executor and composition
 
@@ -121,6 +147,13 @@ Feature-specific sources are constructor dependencies, not fields added to
 snapshot, later CP-ROUTE, then SQL listener readiness. This establishes one
 generation authority per domain without a protobuf or a global generation
 shared across unrelated sources.
+
+`ConfigNamespaceSource` never has a pre-initial empty view. Its constructor
+synchronously parses and validates defaults plus the configured file/CLI
+overrides and installs generation 1 before returning the source handle. The
+etcd overlay loop may then advance later generations. Therefore CP-TOPO's first
+`current()` is always a real generation-1-or-newer snapshot; module readiness
+does not race initialization.
 
 The first CP-CFG implementation adds this executor to `control-plane`. CP-TOPO
 may build its module core in parallel and then use the same executor after
