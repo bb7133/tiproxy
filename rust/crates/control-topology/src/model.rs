@@ -23,6 +23,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Deserialize;
+
 /// Classic (non-keyspace) `TiDB` topology prefix.
 const TIDB_PREFIX: &str = "/topology/tidb/";
 /// Keyspace-scoped `TiDB` topology prefix.
@@ -46,8 +48,9 @@ pub struct BackendInfo {
     pub keyspace: String,
     /// The backend's advertised IP (from the info blob; empty for static).
     pub ip: String,
-    /// The backend's status (HTTP) port.
-    pub status_port: u32,
+    /// The backend's status (HTTP) port. Widened to `u64` to match Go's `uint`
+    /// so record acceptance is identical for out-of-`u32`-range values.
+    pub status_port: u64,
     /// The backend's build version string.
     pub version: String,
     /// The backend's build git hash.
@@ -60,47 +63,47 @@ pub struct BackendInfo {
     pub labels: BTreeMap<String, String>,
 }
 
+/// Typed projection of a `TiDB` `info` record used to match Go's
+/// `json.Unmarshal` into the concrete `TiDBTopologyInfo` struct exactly.
+///
+/// Each field is `Option` with `#[serde(default)]` so a missing or `null`
+/// value defaults (as Go leaves the zero value) while a wrong JSON type fails
+/// the whole record (as Go's typed unmarshal does). Unknown fields are ignored,
+/// also matching Go. `status_port` is `u64` to mirror Go's `uint`.
+#[derive(Deserialize)]
+struct RawBackendInfo {
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    status_port: Option<u64>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    git_hash: Option<String>,
+    #[serde(default)]
+    deploy_path: Option<String>,
+    #[serde(default)]
+    start_timestamp: Option<i64>,
+    #[serde(default)]
+    labels: Option<BTreeMap<String, String>>,
+}
+
 impl BackendInfo {
-    /// Parses one `info` record. Returns `None` on any malformed JSON, matching
-    /// Go's behaviour of logging and skipping an unparseable entry.
+    /// Parses one `info` record. Returns `None` when the record is not valid
+    /// JSON or has a wrong-typed field, matching Go's concrete `json.Unmarshal`
+    /// which rejects (and thus skips) the whole entry on a type mismatch.
     fn from_info_json(addr: &str, keyspace: &str, raw: &[u8]) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
-        let object = value.as_object()?;
-        let string_field = |name: &str| -> String {
-            object
-                .get(name)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
-        let labels = object
-            .get("labels")
-            .and_then(serde_json::Value::as_object)
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| (key.clone(), value.to_owned()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let parsed: RawBackendInfo = serde_json::from_slice(raw).ok()?;
         Some(Self {
             addr: addr.to_owned(),
             keyspace: keyspace.to_owned(),
-            ip: string_field("ip"),
-            status_port: object
-                .get("status_port")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|port| u32::try_from(port).ok())
-                .unwrap_or(0),
-            version: string_field("version"),
-            git_hash: string_field("git_hash"),
-            deploy_path: string_field("deploy_path"),
-            start_timestamp: object
-                .get("start_timestamp")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0),
-            labels,
+            ip: parsed.ip.unwrap_or_default(),
+            status_port: parsed.status_port.unwrap_or_default(),
+            version: parsed.version.unwrap_or_default(),
+            git_hash: parsed.git_hash.unwrap_or_default(),
+            deploy_path: parsed.deploy_path.unwrap_or_default(),
+            start_timestamp: parsed.start_timestamp.unwrap_or_default(),
+            labels: parsed.labels.unwrap_or_default(),
         })
     }
 }
@@ -279,5 +282,42 @@ mod tests {
             .unwrap_or_else(|| unreachable!("valid info json parses"));
         assert_eq!(info.status_port, 0);
         assert_eq!(info.ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn wrong_type_field_rejects_whole_record() {
+        // A string status_port is a type mismatch: Go's concrete unmarshal
+        // rejects and skips the whole entry, so the parser must too.
+        assert!(
+            BackendInfo::from_info_json("a:1", "", br#"{"ip":"1.2.3.4","status_port":"nope"}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn wrong_type_label_value_rejects_whole_record() {
+        assert!(BackendInfo::from_info_json("a:1", "", br#"{"labels":{"zone":5}}"#).is_none());
+    }
+
+    #[test]
+    fn null_and_missing_fields_default() {
+        let info = BackendInfo::from_info_json("a:1", "", br#"{"ip":null,"status_port":null}"#)
+            .unwrap_or_else(|| unreachable!("null fields default like Go"));
+        assert_eq!(info.ip, "");
+        assert_eq!(info.status_port, 0);
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let info = BackendInfo::from_info_json("a:1", "", br#"{"ip":"1.2.3.4","future":123}"#)
+            .unwrap_or_else(|| unreachable!("unknown fields ignored like Go"));
+        assert_eq!(info.ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn status_port_beyond_u32_is_accepted_like_go_uint() {
+        let info = BackendInfo::from_info_json("a:1", "", br#"{"status_port":5000000000}"#)
+            .unwrap_or_else(|| unreachable!("uint-range status_port is accepted"));
+        assert_eq!(info.status_port, 5_000_000_000);
     }
 }
