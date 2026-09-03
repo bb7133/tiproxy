@@ -11,7 +11,9 @@ repository.workspace = true
 default = []
 
 [dependencies]
+control-config.workspace = true
 control-external.workspace = true
+control-plane.workspace = true
 etcd-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true

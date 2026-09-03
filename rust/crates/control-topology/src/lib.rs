@@ -36,11 +36,15 @@
 
 mod discovery;
 mod model;
+mod module;
 mod register;
 mod registrar;
 
 pub use discovery::poll_tidb_topology;
 pub use model::{BackendInfo, TopologySnapshot, parse_tidb_topology};
+pub use module::{
+    TopologyClientFactory, TopologyClusterClient, TopologyModule, TopologyModuleHandle,
+};
 pub use register::{
     TIPROXY_TOPOLOGY_PATH, TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo,
     info_key, ttl_key, ttl_value,
