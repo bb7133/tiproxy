@@ -61,15 +61,26 @@ connection="$tmp_dir/connection.json"
 fixture_pid=$!
 wait_for_file "$connection"
 
-output="$tmp_dir/cptopo.out"
+live_output="$tmp_dir/cptopo-live.out"
 CPTOPO_CONNECTION_FILE="$connection" cargo run --locked --quiet \
     --manifest-path rust/Cargo.toml -p control-topology --example cptopo_live \
-    >"$output"
+    >"$live_output"
 
-if ! grep -q "CPTOPO_LIVE_OK" "$output"; then
-    echo "CP-TOPO live evidence did not pass" >&2
-    cat "$output" >&2
+if ! grep -q "CPTOPO_LIVE_OK" "$live_output"; then
+    echo "CP-TOPO live (registrar/poll) evidence did not pass" >&2
+    cat "$live_output" >&2
     exit 1
 fi
 
-echo "CP-TOPO live evidence passed"
+module_output="$tmp_dir/cptopo-module.out"
+CPTOPO_CONNECTION_FILE="$connection" cargo run --locked --quiet \
+    --manifest-path rust/Cargo.toml -p control-topology --example cptopo_module \
+    >"$module_output"
+
+if ! grep -q "CPTOPO_MODULE_OK" "$module_output"; then
+    echo "CP-TOPO module integration evidence did not pass" >&2
+    cat "$module_output" >&2
+    exit 1
+fi
+
+echo "CP-TOPO live evidence passed (registrar/poll + module integration)"
