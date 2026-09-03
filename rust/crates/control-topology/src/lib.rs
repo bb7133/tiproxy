@@ -36,9 +36,11 @@
 
 mod model;
 mod register;
+mod registrar;
 
 pub use model::{BackendInfo, TopologySnapshot, parse_tidb_topology};
 pub use register::{
     TIPROXY_TOPOLOGY_PATH, TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo,
     info_key, ttl_key, ttl_value,
 };
+pub use registrar::{RegistrarError, run};

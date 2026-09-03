@@ -372,8 +372,12 @@ dependencies = [
 name = "control-topology"
 version = "0.1.0"
 dependencies = [
+ "control-external",
+ "etcd-client",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
