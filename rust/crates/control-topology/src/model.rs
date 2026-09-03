@@ -22,8 +22,10 @@
 //! expired loses its `ttl` key and is dropped).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use serde::Deserialize;
+use serde::de::{Deserializer, MapAccess, Visitor};
 
 /// Classic (non-keyspace) `TiDB` topology prefix.
 const TIDB_PREFIX: &str = "/topology/tidb/";
@@ -66,26 +68,84 @@ pub struct BackendInfo {
 /// Typed projection of a `TiDB` `info` record used to match Go's
 /// `json.Unmarshal` into the concrete `TiDBTopologyInfo` struct exactly.
 ///
-/// Each field is `Option` with `#[serde(default)]` so a missing or `null`
-/// value defaults (as Go leaves the zero value) while a wrong JSON type fails
-/// the whole record (as Go's typed unmarshal does). Unknown fields are ignored,
-/// also matching Go. `status_port` is `u64` to mirror Go's `uint`.
-#[derive(Deserialize)]
+/// A hand-written [`Deserialize`] reproduces Go `encoding/json` object
+/// semantics that `derive` does not: field names match **case-insensitively**,
+/// duplicate members are accepted with the **last** value winning, a missing or
+/// `null` value leaves the zero value, and unknown members are ignored. A
+/// wrong JSON type on any known field still fails the whole record, as Go's
+/// typed unmarshal does. `status_port` is `u64` to mirror Go's `uint`.
+#[derive(Default)]
 struct RawBackendInfo {
-    #[serde(default)]
-    ip: Option<String>,
-    #[serde(default)]
-    status_port: Option<u64>,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    git_hash: Option<String>,
-    #[serde(default)]
-    deploy_path: Option<String>,
-    #[serde(default)]
-    start_timestamp: Option<i64>,
-    #[serde(default)]
-    labels: Option<BTreeMap<String, String>>,
+    ip: String,
+    status_port: u64,
+    version: String,
+    git_hash: String,
+    deploy_path: String,
+    start_timestamp: i64,
+    labels: BTreeMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for RawBackendInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawBackendInfoVisitor;
+
+        impl<'de> Visitor<'de> for RawBackendInfoVisitor {
+            type Value = RawBackendInfo;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a TiDB topology info object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<RawBackendInfo, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut info = RawBackendInfo::default();
+                // Each value is read as `Option<T>` so a JSON `null` leaves the
+                // zero value (Go's behaviour) while a wrong type fails closed;
+                // a repeated key simply overwrites, giving Go's last-wins.
+                while let Some(key) = map.next_key::<String>()? {
+                    if key.eq_ignore_ascii_case("ip") {
+                        if let Some(value) = map.next_value::<Option<String>>()? {
+                            info.ip = value;
+                        }
+                    } else if key.eq_ignore_ascii_case("status_port") {
+                        if let Some(value) = map.next_value::<Option<u64>>()? {
+                            info.status_port = value;
+                        }
+                    } else if key.eq_ignore_ascii_case("version") {
+                        if let Some(value) = map.next_value::<Option<String>>()? {
+                            info.version = value;
+                        }
+                    } else if key.eq_ignore_ascii_case("git_hash") {
+                        if let Some(value) = map.next_value::<Option<String>>()? {
+                            info.git_hash = value;
+                        }
+                    } else if key.eq_ignore_ascii_case("deploy_path") {
+                        if let Some(value) = map.next_value::<Option<String>>()? {
+                            info.deploy_path = value;
+                        }
+                    } else if key.eq_ignore_ascii_case("start_timestamp") {
+                        if let Some(value) = map.next_value::<Option<i64>>()? {
+                            info.start_timestamp = value;
+                        }
+                    } else if key.eq_ignore_ascii_case("labels") {
+                        if let Some(value) = map.next_value::<Option<BTreeMap<String, String>>>()? {
+                            info.labels = value;
+                        }
+                    } else {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(info)
+            }
+        }
+
+        deserializer.deserialize_map(RawBackendInfoVisitor)
+    }
 }
 
 impl BackendInfo {
@@ -97,13 +157,13 @@ impl BackendInfo {
         Some(Self {
             addr: addr.to_owned(),
             keyspace: keyspace.to_owned(),
-            ip: parsed.ip.unwrap_or_default(),
-            status_port: parsed.status_port.unwrap_or_default(),
-            version: parsed.version.unwrap_or_default(),
-            git_hash: parsed.git_hash.unwrap_or_default(),
-            deploy_path: parsed.deploy_path.unwrap_or_default(),
-            start_timestamp: parsed.start_timestamp.unwrap_or_default(),
-            labels: parsed.labels.unwrap_or_default(),
+            ip: parsed.ip,
+            status_port: parsed.status_port,
+            version: parsed.version,
+            git_hash: parsed.git_hash,
+            deploy_path: parsed.deploy_path,
+            start_timestamp: parsed.start_timestamp,
+            labels: parsed.labels,
         })
     }
 }
@@ -319,5 +379,29 @@ mod tests {
         let info = BackendInfo::from_info_json("a:1", "", br#"{"status_port":5000000000}"#)
             .unwrap_or_else(|| unreachable!("uint-range status_port is accepted"));
         assert_eq!(info.status_port, 5_000_000_000);
+    }
+
+    #[test]
+    fn field_names_match_case_insensitively_like_go() {
+        // Go encoding/json matches struct fields case-insensitively.
+        let info = BackendInfo::from_info_json("a:1", "", br#"{"IP":"10.0.0.1","Status_Port":5}"#)
+            .unwrap_or_else(|| unreachable!("case-insensitive fields parse"));
+        assert_eq!(info.ip, "10.0.0.1");
+        assert_eq!(info.status_port, 5);
+    }
+
+    #[test]
+    fn duplicate_keys_take_the_last_value_like_go() {
+        // Go accepts duplicate object members and keeps the last.
+        let info = BackendInfo::from_info_json("a:1", "", br#"{"ip":"first","ip":"second"}"#)
+            .unwrap_or_else(|| unreachable!("duplicate keys parse"));
+        assert_eq!(info.ip, "second");
+    }
+
+    #[test]
+    fn wrong_type_on_a_duplicated_key_still_rejects() {
+        // A later wrong-typed occurrence is still a type mismatch on a known
+        // field, so the whole record is rejected.
+        assert!(BackendInfo::from_info_json("a:1", "", br#"{"ip":"ok","ip":5}"#).is_none());
     }
 }
