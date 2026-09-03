@@ -21,10 +21,12 @@
 //! * first registration publishes `info` + `ttl` under one non-zero lease;
 //! * the discovery poll keeps only `info` records with a live `ttl` sibling;
 //! * an externally revoked lease is detected and the registration is rebuilt
-//!   under a fresh lease.
+//!   under a fresh lease;
+//! * revoke-only shutdown cleanup is same-address ABA safe: a successor that
+//!   re-registers the address under a new lease survives the old owner's
+//!   lease revoke.
 //!
-//! Shutdown-cleanup and the same-address ABA gate are added once the cleanup
-//! semantics decision lands. The harness reads `CPTOPO_CONNECTION_FILE`.
+//! The harness reads `CPTOPO_CONNECTION_FILE`.
 
 use std::fs;
 use std::path::Path;
@@ -186,9 +188,40 @@ async fn main() -> Result<(), AnyError> {
         "rebuilt registration did not use a fresh lease",
     )?;
 
-    // Teardown: stop the registrar and the runtime.
+    // --- Row 4: revoke-only cleanup is same-address ABA safe. ---
+    // A successor re-registers this exact address under a fresh lease. When the
+    // old owner shuts down it revokes only its own (rebuilt) lease, which must
+    // not remove the successor's keys.
+    let successor_lease = grant_and_put(&owner, &config, &info_key, &ttl_key).await?;
+    require(
+        successor_lease != 0 && successor_lease != rebuilt_lease,
+        "successor lease was not fresh",
+    )?;
+    let (_, taken_over) = get_key(&owner, &config, &info_key)
+        .await?
+        .ok_or("address vanished after the successor put")?;
+    require(
+        taken_over == successor_lease,
+        "the successor did not take over the address",
+    )?;
+
+    // The old owner shuts down and revokes only its own lease.
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), registrar).await;
+
+    // The successor's info + ttl must survive under the successor lease.
+    let (_, survived_info) = get_key(&owner, &config, &info_key)
+        .await?
+        .ok_or("the old owner's cleanup removed the successor's info")?;
+    let (_, survived_ttl) = get_key(&owner, &config, &ttl_key)
+        .await?
+        .ok_or("the old owner's cleanup removed the successor's ttl")?;
+    require(
+        survived_info == successor_lease && survived_ttl == successor_lease,
+        "the successor registration is not under the successor lease after cleanup",
+    )?;
+
+    // Teardown the runtime.
     runtime.begin_shutdown(ShutdownReason::Requested)?;
     runtime.advance_shutdown(LifecyclePhase::Draining)?;
     runtime.advance_shutdown(LifecyclePhase::Stopping)?;
@@ -196,6 +229,44 @@ async fn main() -> Result<(), AnyError> {
 
     println!("CPTOPO_LIVE_OK");
     Ok(())
+}
+
+/// Grants a fresh lease and registers the given info/ttl keys under it,
+/// simulating a same-address successor.
+async fn grant_and_put(
+    owner: &OwnerToken,
+    config: &EtcdClientConfig,
+    info_key: &str,
+    ttl_key: &str,
+) -> Result<i64, AnyError> {
+    let mut connection = EtcdConnector::new(owner.clone(), config.clone())
+        .connect()
+        .await?;
+    let lease = connection
+        .execute(|client| Box::pin(client.lease_grant(45, None)))
+        .await?
+        .id();
+    let info = info_key.as_bytes().to_vec();
+    connection
+        .execute(move |client| {
+            Box::pin(client.put(
+                info,
+                b"{\"successor\":true}".to_vec(),
+                Some(PutOptions::new().with_lease(lease)),
+            ))
+        })
+        .await?;
+    let ttl = ttl_key.as_bytes().to_vec();
+    connection
+        .execute(move |client| {
+            Box::pin(client.put(
+                ttl,
+                b"1".to_vec(),
+                Some(PutOptions::new().with_lease(lease)),
+            ))
+        })
+        .await?;
+    Ok(lease)
 }
 
 async fn wait_for_key(

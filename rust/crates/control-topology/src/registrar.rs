@@ -25,7 +25,8 @@
 //!   every [`TOPOLOGY_REFRESH_INTERVAL_SECS`] so a restarted PD re-learns the
 //!   record without waiting for the lease to churn;
 //! * if the lease is lost, rebuild the session (Go's `session.Done()` arm);
-//! * on shutdown, best-effort delete the registration and return.
+//! * on shutdown, revoke this instance's own lease (an audited divergence from
+//!   Go's prefix delete) and return.
 //!
 //! Lease grant, setup, and the info/ttl writes go through
 //! [`control_external::EtcdConnection`], so they are fenced by the process
@@ -47,14 +48,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_external::{EtcdConnectError, EtcdConnection, EtcdConnector, EtcdOperationError};
 use control_plane::OwnerToken;
-use etcd_client::{DeleteOptions, LeaseKeepAliveStream, LeaseKeeper, PutOptions};
+use etcd_client::{LeaseKeepAliveStream, LeaseKeeper, PutOptions};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::register::{
-    TIPROXY_TOPOLOGY_PATH, TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo,
-    info_key, ttl_key, ttl_value,
+    TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo, info_key, ttl_key,
+    ttl_value,
 };
 
 /// Lease keepalive cadence: a third of the lease TTL, so two consecutive missed
@@ -289,22 +290,23 @@ impl Session {
         }
     }
 
-    /// Best-effort de-registration on shutdown.
+    /// Best-effort de-registration on shutdown: revoke only this child's own
+    /// lease.
     ///
-    /// Mirrors Go `removeTopology`, which deletes the whole `/topology/tiproxy`
-    /// prefix (not only this instance's keys) and tolerates any error, leaving
-    /// the lease to expire. Preserved verbatim for Go differential parity; a
-    /// narrower per-address delete is a deliberate future decision, not a
-    /// defensive change to make here.
+    /// Revoking the lease atomically removes exactly this instance's `info` and
+    /// `ttl` keys; if the revoke fails, the 45s lease TTL reclaims them. This is
+    /// a deliberate, audited divergence from Go `removeTopology`, which deletes
+    /// the whole `/topology/tiproxy` prefix: a prefix delete would drop other
+    /// live proxies' registrations, and even a per-address delete could clobber
+    /// a same-address successor that has re-registered under a newer lease
+    /// (an ABA race). Revoking only this lease touches only the keys this lease
+    /// still owns. Steady-state registration and discovery remain
+    /// differential-parity with Go; only shutdown cleanup diverges.
     async fn deregister(&mut self) {
+        let lease_id = self.lease_id;
         let _ = self
             .connection
-            .execute(|client| {
-                Box::pin(client.delete(
-                    TIPROXY_TOPOLOGY_PATH,
-                    Some(DeleteOptions::new().with_prefix()),
-                ))
-            })
+            .execute(move |client| Box::pin(client.lease_revoke(lease_id)))
             .await;
     }
 }
