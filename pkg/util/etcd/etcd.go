@@ -103,6 +103,19 @@ func CreateEtcdServer(addr, dir string, lg *zap.Logger) (*embed.Etcd, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Client and peer listeners must not share one SO_REUSEPORT socket. On
+	// Linux, a client RPC may otherwise be accepted by the peer gRPC server and
+	// fail with an apparently transient "unknown service" response.
+	peerListenAddr, peerAdvertiseAddr, err := allocEtcdServerAddr("127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	for peerListenAddr == listenAddr {
+		peerListenAddr, peerAdvertiseAddr, err = allocEtcdServerAddr("127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+	}
 	serverURL, err := url.Parse(fmt.Sprintf("http://%s", listenAddr))
 	if err != nil {
 		return nil, err
@@ -111,13 +124,21 @@ func CreateEtcdServer(addr, dir string, lg *zap.Logger) (*embed.Etcd, error) {
 	if err != nil {
 		return nil, err
 	}
+	peerServerURL, err := url.Parse(fmt.Sprintf("http://%s", peerListenAddr))
+	if err != nil {
+		return nil, err
+	}
+	peerAdvertiseURL, err := url.Parse(fmt.Sprintf("http://%s", peerAdvertiseAddr))
+	if err != nil {
+		return nil, err
+	}
 	cfg := embed.NewConfig()
 	cfg.Dir = dir
 	cfg.ListenClientUrls = []url.URL{*serverURL}
-	cfg.ListenPeerUrls = []url.URL{*serverURL}
+	cfg.ListenPeerUrls = []url.URL{*peerServerURL}
 	cfg.AdvertiseClientUrls = []url.URL{*advertiseURL}
-	cfg.AdvertisePeerUrls = []url.URL{*advertiseURL}
-	cfg.InitialCluster = fmt.Sprintf("%s=%s", cfg.Name, advertiseURL.String())
+	cfg.AdvertisePeerUrls = []url.URL{*peerAdvertiseURL}
+	cfg.InitialCluster = fmt.Sprintf("%s=%s", cfg.Name, peerAdvertiseURL.String())
 	cfg.ZapLoggerBuilder = embed.NewZapLoggerBuilder(lg)
 	cfg.LogLevel = "fatal"
 	// Reuse port so that it can reboot with the same port immediately.

@@ -129,14 +129,16 @@
       "go_owner": "pkg/manager/elect",
       "rust_target": "#144",
       "go_baseline": "anchored",
-      "rust_status": "pending",
+      "rust_status": "owned",
       "anchors": [
         {"path": "pkg/manager/elect/election_test.go", "contains": "func TestElectOwner"},
         {"path": "pkg/manager/elect/election_test.go", "contains": "func TestEtcdServerDown"},
-        {"path": "pkg/manager/elect/election_test.go", "contains": "func TestOwnerHang"}
+        {"path": "pkg/manager/elect/election_test.go", "contains": "func TestOwnerHang"},
+        {"path": "rust/crates/control-etcd/src/session.rs", "contains": "pub struct ElectionSession"},
+        {"path": "tests/controlplane/cp003/go-observer/main.go", "contains": "func run"}
       ],
       "observed_fields": ["owner_id", "lease_id", "owner_state", "session_revision", "retirement_reason"],
-      "fault_scenarios": ["CP-FAULT-ETCD-TRANSIENT", "CP-FAULT-LEASE-LOSS"],
+      "fault_scenarios": ["CP-FAULT-ELECTION-WATCH-COMPACTION", "CP-FAULT-ETCD-PROCESS-DEATH", "CP-FAULT-ETCD-TRANSIENT", "CP-FAULT-LEASE-LOSS"],
       "bridge_messages": [],
       "handoff": "The Rust election/session object must prove one active owner and the same retirement boundary before owner-only jobs move."
     },

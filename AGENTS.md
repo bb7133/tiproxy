@@ -80,6 +80,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
 - `rust/crates/control-plane/` - Process-local Rust control-domain types, ownership fencing, config/TLS views, lifecycle/shutdown, and bounded observability; it must not depend on `control-proto`.
 - `rust/crates/control-external/` - Fenced, bounded Rust clients for control-plane external dependencies plus the minimal diagnostics gRPC binding; generated etcd protobuf types stay private to `etcd-client`.
+- `rust/crates/control-etcd/` - Stateful PD-etcd lease, session, election, resumable-watch, and transaction ownership fenced by the Rust process generation.
 - `rust/crates/dataplane/` - Rust dataplane orchestration across wire, transport, session, and control components.
 - `rust/crates/differential-runner/` - Payload-free Rust consumer for the immutable Go protocol corpus; it drives merged wire/session parsers and emits sharded semantic observations.
 - `rust/crates/tiproxy-rs/` - Rust dataplane executable and build/version metadata.
