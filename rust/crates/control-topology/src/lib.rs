@@ -44,7 +44,8 @@ mod resolver;
 pub use discovery::poll_tidb_topology;
 pub use model::{BackendInfo, TopologySnapshot, parse_tidb_topology};
 pub use module::{
-    TopologyClientFactory, TopologyClusterClient, TopologyModule, TopologyModuleHandle,
+    RejectionClass, TopologyClientFactory, TopologyClusterClient, TopologyModule,
+    TopologyModuleHandle, TopologyStatus,
 };
 pub use register::{
     TIPROXY_TOPOLOGY_PATH, TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo,

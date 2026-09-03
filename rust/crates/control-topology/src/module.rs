@@ -89,11 +89,50 @@ pub trait TopologyClientFactory: Send + Sync {
     /// # Errors
     ///
     /// Returns a human-readable reason when the TLS material or endpoints are
-    /// unusable; the module treats this as a terminal misconfiguration.
+    /// unusable. On the initial generation the module treats this as a fatal
+    /// startup error; on a later generation it is a rejection that retains the
+    /// last-good registration.
     fn build(
         &self,
         config: &control_config::TopologyConfig,
     ) -> Result<Vec<TopologyClusterClient>, String>;
+}
+
+/// Why a configuration generation could not be applied to registration.
+///
+/// Deliberately payload-free: it names the failure class for an observer
+/// without carrying any configuration or credential content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectionClass {
+    /// The generation's topology projection could not be produced.
+    TopologyProjection,
+    /// No advertise host could be resolved (e.g. no usable interface).
+    AdvertiseUnresolved,
+    /// The factory could not build the etcd client set (e.g. bad TLS material).
+    ClientBuildFailed,
+    /// The built cluster set did not match the configured cluster names.
+    ClusterSetMismatch,
+    /// The factory returned two clients for the same cluster name.
+    DuplicateClusterName,
+}
+
+/// Observable registration status.
+///
+/// This never carries configuration or credential payload — only generation
+/// numbers and a [`RejectionClass`]. `ready` remains monotonic; this status is
+/// how an observer distinguishes a healthy hot-update from a rejected one after
+/// the module is already ready.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TopologyStatus {
+    /// The most recent configuration generation the module observed.
+    pub observed_generation: u64,
+    /// The most recent generation whose registration was successfully applied
+    /// (or was an unchanged no-op). Stays at the last good generation when a
+    /// newer one is rejected.
+    pub applied_generation: u64,
+    /// The class of the most recent rejection, cleared on a successful apply or
+    /// no-op.
+    pub last_rejection: Option<RejectionClass>,
 }
 
 /// The self-registration control-plane module.
@@ -103,6 +142,7 @@ pub struct TopologyModule {
     resolver: Arc<dyn AdvertiseEndpointResolver>,
     identity: TopologyRuntimeIdentity,
     ready: watch::Sender<bool>,
+    status: watch::Sender<TopologyStatus>,
 }
 
 /// Registration-readiness handle returned alongside a [`TopologyModule`].
@@ -113,6 +153,7 @@ pub struct TopologyModule {
 /// assert a published topology-discovery snapshot, which a later slice owns.
 pub struct TopologyModuleHandle {
     ready: watch::Receiver<bool>,
+    status: watch::Receiver<TopologyStatus>,
 }
 
 impl TopologyModuleHandle {
@@ -132,6 +173,17 @@ impl TopologyModuleHandle {
         }
         Ok(())
     }
+
+    /// Subscribes to the observable registration status.
+    ///
+    /// Unlike [`Self::wait_ready`] (which is monotonic), this reports every
+    /// generation the module observes and applies, and the class of any
+    /// rejection, so a consumer can tell a healthy hot-update from a rejected
+    /// one after the module is ready.
+    #[must_use]
+    pub fn status(&self) -> watch::Receiver<TopologyStatus> {
+        self.status.clone()
+    }
 }
 
 impl TopologyModule {
@@ -148,6 +200,7 @@ impl TopologyModule {
         identity: TopologyRuntimeIdentity,
     ) -> (Self, TopologyModuleHandle) {
         let (ready_tx, ready_rx) = watch::channel(false);
+        let (status_tx, status_rx) = watch::channel(TopologyStatus::default());
         (
             Self {
                 source,
@@ -155,8 +208,12 @@ impl TopologyModule {
                 resolver,
                 identity,
                 ready: ready_tx,
+                status: status_tx,
             },
-            TopologyModuleHandle { ready: ready_rx },
+            TopologyModuleHandle {
+                ready: ready_rx,
+                status: status_rx,
+            },
         )
     }
 
@@ -171,7 +228,7 @@ impl TopologyModule {
         // for changes; borrowing after `subscribe` avoids a dropped edge.
         let initial = updates.borrow_and_update().clone();
         if !self
-            .reconfigure(&mut children, &mut active_plan, &initial, &owner)
+            .apply_and_report(&mut children, &mut active_plan, &initial, &owner)
             .await
         {
             return Err(module_error("initial_generation_rejected"));
@@ -195,9 +252,10 @@ impl TopologyModule {
                     // A rejected generation (unresolvable advertise, build
                     // failure, or a factory result that does not match the
                     // configured cluster set) retains the last-good
-                    // registration rather than tearing it down.
+                    // registration rather than tearing it down; the rejection
+                    // class is published on the status watch.
                     let _ = self
-                        .reconfigure(&mut children, &mut active_plan, &snapshot, &owner)
+                        .apply_and_report(&mut children, &mut active_plan, &snapshot, &owner)
                         .await;
                 }
                 exited = children.tasks.join_next(), if !children.tasks.is_empty() => {
@@ -215,9 +273,9 @@ impl TopologyModule {
 
     /// Reconciles the per-cluster registration children for one generation.
     ///
-    /// Returns `true` when registration is in a good applied state (either
-    /// freshly applied or an unchanged no-op) and `false` when the generation
-    /// was rejected and the previous good state was retained.
+    /// Returns `Ok(())` when registration is in a good applied state (either
+    /// freshly applied or an unchanged no-op) and `Err(class)` when the
+    /// generation was rejected and the previous good state was retained.
     ///
     /// The client set is built every generation, so a TLS content rotation
     /// (same paths, new PEM) is read here and produces a different plan. The
@@ -234,12 +292,12 @@ impl TopologyModule {
         active_plan: &mut Option<RegistrationPlan>,
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
-    ) -> bool {
+    ) -> Result<(), RejectionClass> {
         let Ok(topology) = snapshot.topology() else {
-            return false;
+            return Err(RejectionClass::TopologyProjection);
         };
         let Ok(advertise_host) = self.resolver.resolve(&topology) else {
-            return false;
+            return Err(RejectionClass::AdvertiseUnresolved);
         };
         let info = TopologyInfo::new(
             &advertise_host,
@@ -253,7 +311,7 @@ impl TopologyModule {
         // Build every generation: this reads the PEM material, so a rotation is
         // observed here rather than swallowed by a path-only comparison.
         let Ok(mut clusters) = self.factory.build(&topology) else {
-            return false;
+            return Err(RejectionClass::ClientBuildFailed);
         };
         clusters.sort_by(|left, right| left.cluster_name.cmp(&right.cluster_name));
 
@@ -262,7 +320,7 @@ impl TopologyModule {
         // cluster. This runs before any state is mutated.
         let built: Vec<&str> = clusters.iter().map(|c| c.cluster_name.as_ref()).collect();
         if built.windows(2).any(|pair| pair[0] == pair[1]) {
-            return false;
+            return Err(RejectionClass::DuplicateClusterName);
         }
         let mut expected: Vec<&str> = topology
             .backend_clusters
@@ -271,7 +329,7 @@ impl TopologyModule {
             .collect();
         expected.sort_unstable();
         if built != expected {
-            return false;
+            return Err(RejectionClass::ClusterSetMismatch);
         }
 
         let plan = RegistrationPlan {
@@ -286,7 +344,7 @@ impl TopologyModule {
         };
         if active_plan.as_ref() == Some(&plan) {
             // Nothing that affects registration changed; keep the children.
-            return true;
+            return Ok(());
         }
 
         // Fence: retire the previous generation before the new one publishes.
@@ -310,7 +368,37 @@ impl TopologyModule {
             });
         }
         *active_plan = Some(plan);
-        true
+        Ok(())
+    }
+
+    /// Applies one generation and publishes the resulting observable status.
+    ///
+    /// Returns whether registration is in a good applied state (applied or a
+    /// no-op). A no-op still counts as the generation being successfully
+    /// consumed, so it advances `applied_generation` and clears any prior
+    /// rejection; a rejection only advances `observed_generation`.
+    async fn apply_and_report(
+        &self,
+        children: &mut Children,
+        active_plan: &mut Option<RegistrationPlan>,
+        snapshot: &ConfigNamespaceSnapshot,
+        owner: &OwnerToken,
+    ) -> bool {
+        let generation = snapshot.generation();
+        let outcome = self
+            .reconfigure(children, active_plan, snapshot, owner)
+            .await;
+        self.status.send_modify(|status| {
+            status.observed_generation = generation;
+            match outcome {
+                Ok(()) => {
+                    status.applied_generation = generation;
+                    status.last_rejection = None;
+                }
+                Err(class) => status.last_rejection = Some(class),
+            }
+        });
+        outcome.is_ok()
     }
 }
 
