@@ -35,5 +35,10 @@
 #![forbid(unsafe_code)]
 
 mod model;
+mod register;
 
 pub use model::{BackendInfo, TopologySnapshot, parse_tidb_topology};
+pub use register::{
+    TIPROXY_TOPOLOGY_PATH, TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo,
+    info_key, ttl_key, ttl_value,
+};

@@ -11,6 +11,7 @@ repository.workspace = true
 default = []
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 
 [lints]
