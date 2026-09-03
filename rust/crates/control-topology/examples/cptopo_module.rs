@@ -21,7 +21,8 @@
 //! * generation 1 registers `info` + `ttl` under one lease;
 //! * an unrelated hot-reload is a no-op — the lease is unchanged (no flap);
 //! * a changed client (a rotation) rebuilds under a fresh lease;
-//! * lifecycle shutdown stops and joins the children and deregisters.
+//! * lifecycle shutdown stops and joins the children (whether shutdown also
+//!   deregisters is a pending cleanup-semantics decision, so it is not asserted).
 //!
 //! The harness reads `CPTOPO_CONNECTION_FILE`.
 
@@ -48,6 +49,7 @@ type AnyError = Box<dyn std::error::Error>;
 
 const ADVERTISE_HOST: &str = "127.0.0.88";
 const INFO_KEY: &str = "/topology/tiproxy/127.0.0.88:6000/info";
+const TTL_KEY: &str = "/topology/tiproxy/127.0.0.88:6000/ttl";
 
 /// Factory whose built client varies by mode, so the test can force a rebuild
 /// (a changed client) or keep a stable client (a no-op).
@@ -164,6 +166,14 @@ async fn main() -> Result<(), AnyError> {
         .await?
         .ok_or("registration never appeared for generation 1")?;
     require(lease_one != 0, "generation 1 lease is zero")?;
+    // info and ttl must be published under the same non-zero lease.
+    let ttl_lease = wait_for_key_lease(&owner, &probe_config, TTL_KEY, Duration::from_secs(5))
+        .await?
+        .ok_or("ttl key never appeared for generation 1")?;
+    require(
+        ttl_lease == lease_one,
+        "info and ttl are not under the same lease",
+    )?;
 
     // No-op generation: an unrelated hot-reload must not flap the lease.
     let mut status = handle.status();
@@ -219,9 +229,18 @@ async fn wait_for_lease(
     config: &EtcdClientConfig,
     timeout: Duration,
 ) -> Result<Option<i64>, AnyError> {
+    wait_for_key_lease(owner, config, INFO_KEY, timeout).await
+}
+
+async fn wait_for_key_lease(
+    owner: &OwnerToken,
+    config: &EtcdClientConfig,
+    key: &str,
+    timeout: Duration,
+) -> Result<Option<i64>, AnyError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(lease) = key_lease(owner, config, INFO_KEY).await? {
+        if let Some(lease) = key_lease(owner, config, key).await? {
             return Ok(Some(lease));
         }
         if tokio::time::Instant::now() >= deadline {

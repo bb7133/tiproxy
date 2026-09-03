@@ -41,6 +41,8 @@
 //! has no in-process consumer until routing lands; wiring a per-cluster poll
 //! loop is a dependent follow-up.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +65,31 @@ use crate::register::TopologyInfo;
 
 /// Stable module name used in metrics, logs, and [`ControlModule::name`].
 const MODULE_NAME: &str = "control_topology";
+
+/// The future a per-cluster registration child runs to completion.
+pub(crate) type ChildFuture = Pin<Box<dyn Future<Output = Result<(), RegistrarError>> + Send>>;
+
+/// Builds one per-cluster registration child. Production uses
+/// [`crate::registrar::run`]; a test injects a deterministic child to exercise
+/// unexpected-exit and wedged-shutdown handling.
+pub(crate) type ChildRunner = Arc<
+    dyn Fn(OwnerToken, EtcdConnector, TopologyInfo, Duration, watch::Receiver<bool>) -> ChildFuture
+        + Send
+        + Sync,
+>;
+
+/// The production child runner: the real self-registration loop.
+fn default_child_runner() -> ChildRunner {
+    Arc::new(|owner, connector, info, receive_timeout, shutdown| {
+        Box::pin(crate::registrar::run(
+            owner,
+            connector,
+            info,
+            receive_timeout,
+            shutdown,
+        ))
+    })
+}
 
 /// One backend cluster's connection material, produced by a
 /// [`TopologyClientFactory`].
@@ -143,6 +170,7 @@ pub struct TopologyModule {
     identity: TopologyRuntimeIdentity,
     ready: watch::Sender<bool>,
     status: watch::Sender<TopologyStatus>,
+    child_runner: ChildRunner,
 }
 
 /// Registration-readiness handle returned alongside a [`TopologyModule`].
@@ -199,6 +227,30 @@ impl TopologyModule {
         resolver: Arc<dyn AdvertiseEndpointResolver>,
         identity: TopologyRuntimeIdentity,
     ) -> (Self, TopologyModuleHandle) {
+        Self::build(source, factory, resolver, identity, default_child_runner())
+    }
+
+    /// Test-only constructor that injects a deterministic child runner, used to
+    /// exercise unexpected-child-exit and wedged-shutdown handling without a
+    /// live backend. Not compiled into the production crate.
+    #[cfg(test)]
+    fn new_with_child_runner(
+        source: Arc<dyn ConfigNamespaceSource>,
+        factory: Box<dyn TopologyClientFactory>,
+        resolver: Arc<dyn AdvertiseEndpointResolver>,
+        identity: TopologyRuntimeIdentity,
+        child_runner: ChildRunner,
+    ) -> (Self, TopologyModuleHandle) {
+        Self::build(source, factory, resolver, identity, child_runner)
+    }
+
+    fn build(
+        source: Arc<dyn ConfigNamespaceSource>,
+        factory: Box<dyn TopologyClientFactory>,
+        resolver: Arc<dyn AdvertiseEndpointResolver>,
+        identity: TopologyRuntimeIdentity,
+        child_runner: ChildRunner,
+    ) -> (Self, TopologyModuleHandle) {
         let (ready_tx, ready_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(TopologyStatus::default());
         (
@@ -209,6 +261,7 @@ impl TopologyModule {
                 identity,
                 ready: ready_tx,
                 status: status_tx,
+                child_runner,
             },
             TopologyModuleHandle {
                 ready: ready_rx,
@@ -353,19 +406,14 @@ impl TopologyModule {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let receive_timeout = cluster.client.request_timeout();
             let connector = EtcdConnector::new(owner.clone(), cluster.client);
-            let child_owner = owner.clone();
-            let child_info = info.clone();
             children.shutdowns.push(shutdown_tx);
-            children.tasks.spawn(async move {
-                Box::pin(crate::registrar::run(
-                    child_owner,
-                    connector,
-                    child_info,
-                    receive_timeout,
-                    shutdown_rx,
-                ))
-                .await
-            });
+            children.tasks.spawn((self.child_runner)(
+                owner.clone(),
+                connector,
+                info.clone(),
+                receive_timeout,
+                shutdown_rx,
+            ));
         }
         *active_plan = Some(plan);
         Ok(())
@@ -478,5 +526,555 @@ const fn module_error(error_class: &'static str) -> ModuleError {
     ModuleError {
         module: MODULE_NAME,
         error_class,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ChildRunner, RejectionClass, TopologyClusterClient, TopologyModule, TopologyStatus,
+    };
+    use std::future::pending;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use control_config::{ConfigNamespaceStore, TopologyConfig, TopologyRuntimeIdentity};
+    use control_external::{EtcdClientConfig, EtcdTlsConfig};
+    use control_plane::{
+        ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
+        MetricsPolicy, ModuleError, OwnershipRegistry, RuntimeEvent, ShutdownReason, TlsPolicy,
+    };
+    use tokio::sync::watch;
+
+    use crate::TopologyClientFactory;
+    use crate::resolver::StaticAdvertiseResolver;
+
+    type TestError = Box<dyn std::error::Error>;
+    type ModuleTask = tokio::task::JoinHandle<Result<(), ModuleError>>;
+
+    struct NullSink;
+    impl EventSink for NullSink {
+        fn record(&self, _event: &RuntimeEvent) {}
+    }
+
+    fn identity() -> TopologyRuntimeIdentity {
+        TopologyRuntimeIdentity {
+            version: Arc::from("v-test"),
+            git_hash: Arc::from("hash-test"),
+            deploy_path: PathBuf::from("/deploy/test"),
+            start_timestamp: 1_700_000_000,
+        }
+    }
+
+    /// A two-cluster config; `max_connections` is hot-reloadable, so varying it
+    /// publishes a new generation without touching a reload-locked field.
+    fn config(max_connections: u64) -> Vec<u8> {
+        format!(
+            "\n[proxy]\naddr = \"0.0.0.0:6000\"\nmax-connections = {max_connections}\n\n[api]\naddr = \"0.0.0.0:10080\"\n\n[[proxy.backend-clusters]]\nname = \"cluster-a\"\npd-addrs = \"pd-a:2379\"\nns-servers = [\"dns-a:53\"]\n\n[[proxy.backend-clusters]]\nname = \"cluster-b\"\npd-addrs = \"pd-b:2379\"\nns-servers = [\"dns-b:53\"]\n"
+        )
+        .into_bytes()
+    }
+
+    fn client(timeout_ms: u64, ca: &[u8]) -> EtcdClientConfig {
+        let tls = EtcdTlsConfig::new(ca.to_vec(), None, None, Some("cluster.local".to_owned()))
+            .unwrap_or_else(|_| unreachable!("non-empty CA is valid"));
+        EtcdClientConfig::new(["127.0.0.1:1".to_owned()], Some(tls))
+            .unwrap_or_else(|_| unreachable!("static endpoint is valid"))
+            .with_timeouts(
+                Duration::from_millis(500),
+                Duration::from_millis(timeout_ms),
+                Duration::from_secs(1),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+            )
+            .unwrap_or_else(|_| unreachable!("timeouts are valid"))
+    }
+
+    fn cluster(name: Arc<str>, client: EtcdClientConfig) -> TopologyClusterClient {
+        TopologyClusterClient {
+            cluster_name: name,
+            client,
+        }
+    }
+
+    /// Counts child spawns and stops so a test can prove whether a generation
+    /// rebuilt (spawn + stop) or was a no-op / rejection (neither).
+    #[derive(Clone, Default)]
+    struct Counters {
+        spawns: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl Counters {
+        fn spawns(&self) -> usize {
+            self.spawns.load(Ordering::SeqCst)
+        }
+        fn stops(&self) -> usize {
+            self.stops.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A runner that just waits for its stop signal, counting spawns and stops.
+    fn counting_runner(counters: &Counters) -> ChildRunner {
+        let counters = counters.clone();
+        Arc::new(move |_owner, _connector, _info, _timeout, mut shutdown| {
+            counters.spawns.fetch_add(1, Ordering::SeqCst);
+            let stops = Arc::clone(&counters.stops);
+            Box::pin(async move {
+                let _ = shutdown.changed().await;
+                stops.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+    }
+
+    fn runtime() -> Result<ControlRuntime, TestError> {
+        let registry = Box::leak(Box::new(OwnershipRegistry::new()));
+        Ok(ControlRuntime::claim_process(
+            registry,
+            "cptopo-module-test",
+            ControlConfig::new(
+                1,
+                Duration::from_secs(30),
+                0,
+                TlsPolicy::default(),
+                LogLevel::Info,
+                MetricsPolicy::default(),
+            )?,
+            Arc::new(NullSink),
+        )?)
+    }
+
+    fn spawn(
+        store: ConfigNamespaceStore,
+        factory: Box<dyn TopologyClientFactory>,
+        runner: ChildRunner,
+        runtime: &ControlRuntime,
+    ) -> Result<(ModuleTask, super::TopologyModuleHandle), TestError> {
+        let (module, handle) = TopologyModule::new_with_child_runner(
+            Arc::new(store),
+            factory,
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            runner,
+        );
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+        Ok((task, handle))
+    }
+
+    async fn wait_ready(handle: &mut super::TopologyModuleHandle) -> Result<(), TestError> {
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+        Ok(())
+    }
+
+    async fn wait_observed(
+        status: &mut watch::Receiver<TopologyStatus>,
+        generation: u64,
+    ) -> Result<TopologyStatus, TestError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let current = *status.borrow_and_update();
+                if current.observed_generation >= generation {
+                    return Ok(current);
+                }
+            }
+            tokio::time::timeout(deadline - tokio::time::Instant::now(), status.changed())
+                .await??;
+        }
+    }
+
+    fn shutdown(runtime: &ControlRuntime) -> Result<(), TestError> {
+        runtime.advance_shutdown(LifecyclePhase::Draining)?;
+        runtime.advance_shutdown(LifecyclePhase::Stopping)?;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// Generation-2 factory behaviour, applied after the base generation.
+    #[derive(Clone, Copy)]
+    enum Gen2 {
+        Same,
+        TransportChange,
+        Missing,
+        Extra,
+        Renamed,
+        Duplicate,
+        BuildFail,
+    }
+
+    struct SwitchableFactory {
+        gen2: Arc<watch::Sender<Option<Gen2>>>,
+    }
+
+    impl TopologyClientFactory for SwitchableFactory {
+        fn build(&self, config: &TopologyConfig) -> Result<Vec<TopologyClusterClient>, String> {
+            let names: Vec<Arc<str>> = config
+                .backend_clusters
+                .iter()
+                .map(|c| Arc::clone(&c.name))
+                .collect();
+            let base = || {
+                names
+                    .iter()
+                    .map(|name| cluster(Arc::clone(name), client(500, b"pem-a")))
+                    .collect::<Vec<_>>()
+            };
+            match *self.gen2.borrow() {
+                None | Some(Gen2::Same) => Ok(base()),
+                Some(Gen2::TransportChange) => Ok(names
+                    .iter()
+                    .map(|name| cluster(Arc::clone(name), client(700, b"pem-a")))
+                    .collect()),
+                Some(Gen2::Missing) => Ok(names
+                    .iter()
+                    .take(1)
+                    .map(|name| cluster(Arc::clone(name), client(500, b"pem-a")))
+                    .collect()),
+                Some(Gen2::Extra) => {
+                    let mut built = base();
+                    built.push(cluster(Arc::from("cluster-extra"), client(500, b"pem-a")));
+                    Ok(built)
+                }
+                Some(Gen2::Renamed) => {
+                    let mut built = vec![cluster(Arc::clone(&names[0]), client(500, b"pem-a"))];
+                    built.push(cluster(Arc::from("cluster-renamed"), client(500, b"pem-a")));
+                    Ok(built)
+                }
+                Some(Gen2::Duplicate) => Ok(vec![
+                    cluster(Arc::clone(&names[0]), client(500, b"pem-a")),
+                    cluster(Arc::clone(&names[0]), client(500, b"pem-a")),
+                ]),
+                Some(Gen2::BuildFail) => Err("factory build failed".to_owned()),
+            }
+        }
+    }
+
+    struct Outcome {
+        status: TopologyStatus,
+        spawns: usize,
+        stops: usize,
+    }
+
+    async fn run_two_generations(gen2: Gen2) -> Result<Outcome, TestError> {
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let (gen2_tx, _gen2_rx) = watch::channel(None);
+        let gen2_tx = Arc::new(gen2_tx);
+        let counters = Counters::default();
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn(
+            store.clone(),
+            Box::new(SwitchableFactory {
+                gen2: Arc::clone(&gen2_tx),
+            }),
+            counting_runner(&counters),
+            &runtime,
+        )?;
+
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        assert_eq!(status.borrow_and_update().applied_generation, 1);
+        assert_eq!(counters.spawns(), 2, "two clusters spawn on generation 1");
+        assert_eq!(counters.stops(), 0);
+
+        gen2_tx.send_replace(Some(gen2));
+        store.apply_toml(&config(200), None, 2, &std::env::current_dir()?)?;
+        let after = wait_observed(&mut status, 2).await?;
+        // Sample counters before shutdown so its stops do not mask retain-old.
+        let outcome = Outcome {
+            status: after,
+            spawns: counters.spawns(),
+            stops: counters.stops(),
+        };
+
+        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        shutdown(&runtime)?;
+        Ok(outcome)
+    }
+
+    async fn assert_rejected(gen2: Gen2, expected: RejectionClass) -> Result<(), TestError> {
+        let outcome = run_two_generations(gen2).await?;
+        assert_eq!(outcome.status.observed_generation, 2);
+        assert_eq!(
+            outcome.status.applied_generation, 1,
+            "a rejected generation retains the last-good applied generation"
+        );
+        assert_eq!(outcome.status.last_rejection, Some(expected));
+        assert_eq!(outcome.spawns, 2, "a rejected generation does not spawn");
+        assert_eq!(
+            outcome.stops, 0,
+            "a rejected generation does not stop old children"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrelated_hot_reload_is_a_noop_without_flap() -> Result<(), TestError> {
+        let outcome = run_two_generations(Gen2::Same).await?;
+        assert_eq!(outcome.status.applied_generation, 2);
+        assert_eq!(outcome.status.last_rejection, None);
+        assert_eq!(outcome.spawns, 2, "a no-op does not re-spawn");
+        assert_eq!(outcome.stops, 0, "a no-op does not stop");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_plan_change_rebuilds() -> Result<(), TestError> {
+        let outcome = run_two_generations(Gen2::TransportChange).await?;
+        assert_eq!(outcome.status.applied_generation, 2);
+        assert_eq!(outcome.status.last_rejection, None);
+        assert_eq!(
+            outcome.spawns, 4,
+            "the changed transport re-spawns both clusters"
+        );
+        assert_eq!(outcome.stops, 2, "the old children were stopped");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_cluster_is_rejected_and_retains() -> Result<(), TestError> {
+        assert_rejected(Gen2::Missing, RejectionClass::ClusterSetMismatch).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extra_cluster_is_rejected_and_retains() -> Result<(), TestError> {
+        assert_rejected(Gen2::Extra, RejectionClass::ClusterSetMismatch).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renamed_cluster_is_rejected_and_retains() -> Result<(), TestError> {
+        assert_rejected(Gen2::Renamed, RejectionClass::ClusterSetMismatch).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_cluster_is_rejected_and_retains() -> Result<(), TestError> {
+        assert_rejected(Gen2::Duplicate, RejectionClass::DuplicateClusterName).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_failure_is_rejected_and_retains() -> Result<(), TestError> {
+        assert_rejected(Gen2::BuildFail, RejectionClass::ClientBuildFailed).await
+    }
+
+    /// A factory that reads its CA bytes from a fixed path every build, so a
+    /// same-path A->B rotation is observed only because the material is re-read
+    /// and the plan compares bytes.
+    struct FilePemFactory {
+        path: PathBuf,
+    }
+
+    impl TopologyClientFactory for FilePemFactory {
+        fn build(&self, config: &TopologyConfig) -> Result<Vec<TopologyClusterClient>, String> {
+            let ca = std::fs::read(&self.path).map_err(|error| format!("read pem: {error}"))?;
+            Ok(config
+                .backend_clusters
+                .iter()
+                .map(|c| cluster(Arc::clone(&c.name), client(500, &ca)))
+                .collect())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_path_pem_bytes_change_rebuilds() -> Result<(), TestError> {
+        let path = std::env::temp_dir().join(format!("cptopo-pem-{}.pem", std::process::id()));
+        std::fs::write(&path, b"ca-bytes-a")?;
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let counters = Counters::default();
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn(
+            store.clone(),
+            Box::new(FilePemFactory { path: path.clone() }),
+            counting_runner(&counters),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        let _ = status.borrow_and_update();
+        assert_eq!(counters.spawns(), 2);
+
+        // Same path, new bytes: the factory re-reads and the plan differs.
+        std::fs::write(&path, b"ca-bytes-b")?;
+        store.apply_toml(&config(200), None, 2, &std::env::current_dir()?)?;
+        wait_observed(&mut status, 2).await?;
+        let spawns = counters.spawns();
+        let stops = counters.stops();
+
+        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        shutdown(&runtime)?;
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            spawns, 4,
+            "a same-path PEM bytes rotation re-spawns both clusters"
+        );
+        assert_eq!(stops, 2, "the old children were stopped on rotation");
+        Ok(())
+    }
+
+    /// A runner where the first child exits (or panics) on a trigger and the
+    /// sibling waits for its stop signal, so a single unexpected exit can be
+    /// checked to fail the module while the sibling is stopped and joined once.
+    fn one_fails_runner(
+        fail: watch::Receiver<bool>,
+        panic: bool,
+        sibling_stops: Arc<AtomicUsize>,
+    ) -> ChildRunner {
+        let call = Arc::new(AtomicUsize::new(0));
+        Arc::new(move |_owner, _connector, _info, _timeout, mut shutdown| {
+            let index = call.fetch_add(1, Ordering::SeqCst);
+            let mut fail = fail.clone();
+            let sibling_stops = Arc::clone(&sibling_stops);
+            Box::pin(async move {
+                if index == 0 {
+                    let _ = fail.changed().await;
+                    assert!(!panic, "injected child panic");
+                    Ok(())
+                } else {
+                    let _ = shutdown.changed().await;
+                    sibling_stops.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+        })
+    }
+
+    async fn assert_child_exit_fails_loud(panic: bool) -> Result<(), TestError> {
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let (fail_tx, fail_rx) = watch::channel(false);
+        let sibling_stops = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn(
+            store,
+            Box::new(SwitchableFactory {
+                gen2: Arc::new(watch::channel(None).0),
+            }),
+            one_fails_runner(fail_rx, panic, Arc::clone(&sibling_stops)),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+
+        fail_tx.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await??;
+        let Err(error) = result else {
+            unreachable!("an unexpected child exit must fail the module")
+        };
+        assert_eq!(error.module, "control_topology");
+        assert_eq!(error.error_class, "registration_child_exited");
+        assert_eq!(
+            sibling_stops.load(Ordering::SeqCst),
+            1,
+            "the sibling child is stopped and joined exactly once"
+        );
+
+        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        shutdown(&runtime)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_child_error_fails_the_module_loud() -> Result<(), TestError> {
+        assert_child_exit_fails_loud(false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_panic_fails_the_module_loud() -> Result<(), TestError> {
+        assert_child_exit_fails_loud(true).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wedged_child_is_aborted_so_shutdown_completes() -> Result<(), TestError> {
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let runner: ChildRunner = Arc::new(|_owner, _connector, _info, _timeout, _shutdown| {
+            Box::pin(async move {
+                pending::<()>().await;
+                Ok(())
+            })
+        });
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn(
+            store,
+            Box::new(SwitchableFactory {
+                gen2: Arc::new(watch::channel(None).0),
+            }),
+            runner,
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+
+        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        // Even a wedged child must not prevent shutdown: it is aborted after the
+        // bounded grace, so the module returns within grace plus slack.
+        let result = tokio::time::timeout(Duration::from_secs(15), task).await??;
+        assert!(
+            result.is_ok(),
+            "a wedged child must not block a clean shutdown"
+        );
+        shutdown(&runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unspecified_bind_with_port_range_resolves_first_port_and_global_unicast_host()
+    -> Result<(), TestError> {
+        use control_config::ConfigNamespaceSource;
+        use std::net::IpAddr;
+
+        use crate::register::TopologyInfo;
+        use crate::resolver::{AdvertiseEndpointResolver, InterfaceAdvertiseResolver};
+
+        // A wildcard bind host with a SQL port range: the projection's bind host
+        // is unspecified and the SQL port is the range's first port.
+        let toml = br#"
+[proxy]
+addr = "0.0.0.0:6000"
+port-range = [10000, 10002]
+
+[api]
+addr = "0.0.0.0:10080"
+
+[[proxy.backend-clusters]]
+name = "cluster-a"
+pd-addrs = "pd-a:2379"
+ns-servers = ["dns-a:53"]
+"#;
+        let store = ConfigNamespaceStore::from_toml(toml, None, &std::env::current_dir()?)?;
+        let topology = store.current().topology()?;
+        assert_eq!(topology.bind_sql_host.as_ref(), "0.0.0.0");
+        assert_eq!(
+            topology.sql_port, 10000,
+            "the first port of the range is used"
+        );
+
+        // The resolver replaces the wildcard bind host with a global-unicast
+        // interface candidate, and the registration address pairs it with the
+        // first port.
+        let resolver = InterfaceAdvertiseResolver::new(Arc::new(|| {
+            vec![
+                "10.0.0.7"
+                    .parse::<IpAddr>()
+                    .unwrap_or_else(|_| unreachable!("valid ip")),
+            ]
+        }));
+        let advertise_host = resolver.resolve(&topology)?;
+        assert_eq!(advertise_host.as_ref(), "10.0.0.7");
+
+        let id = identity();
+        let info = TopologyInfo::new(
+            &advertise_host,
+            topology.sql_port,
+            topology.status_port,
+            &id.version,
+            &id.git_hash,
+            &id.deploy_path.to_string_lossy(),
+            id.start_timestamp,
+        );
+        assert_eq!(info.registration_addr(), "10.0.0.7:10000");
+        Ok(())
     }
 }
