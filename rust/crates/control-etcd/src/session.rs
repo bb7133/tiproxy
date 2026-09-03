@@ -143,6 +143,66 @@ pub enum WatchOutcome {
     Retired(RetirementReason),
 }
 
+/// Conflict policy for an owner-fenced persistent put.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistentPutMode {
+    /// Replace the current value, or create it when absent.
+    Upsert,
+    /// Create only when the target key does not exist.
+    Create,
+}
+
+/// Semantic result of an owner-fenced persistent put.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistentPutOutcome {
+    /// The value was committed without an etcd lease.
+    Applied,
+    /// `Create` found an existing target while the exact owner fence remained valid.
+    AlreadyExists,
+}
+
+/// Successful owner-fenced persistent put plus the etcd commit revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersistentPutResult {
+    outcome: PersistentPutOutcome,
+    revision: i64,
+}
+
+impl PersistentPutResult {
+    /// Returns whether the target was applied or an existing create won.
+    #[must_use]
+    pub const fn outcome(self) -> PersistentPutOutcome {
+        self.outcome
+    }
+
+    /// Returns the etcd response revision that linearizes this result.
+    #[must_use]
+    pub const fn revision(self) -> i64 {
+        self.revision
+    }
+}
+
+/// Successful owner-fenced persistent delete plus its etcd commit revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersistentDeleteResult {
+    deleted: bool,
+    revision: i64,
+}
+
+impl PersistentDeleteResult {
+    /// Returns whether the target key existed and was deleted.
+    #[must_use]
+    pub const fn deleted(self) -> bool {
+        self.deleted
+    }
+
+    /// Returns the etcd response revision that linearizes this result.
+    #[must_use]
+    pub const fn revision(self) -> i64 {
+        self.revision
+    }
+}
+
 /// Stateful etcd election failure.
 #[derive(Debug, Error)]
 pub enum ElectionError {
@@ -640,6 +700,149 @@ impl ElectionSession {
         self.execute_fenced_put(key, value).await
     }
 
+    /// Commits one persistent put only while the exact election key still
+    /// matches its creation revision, lease, and exact member value.
+    ///
+    /// Unlike [`Self::fenced_put`], the target value is deliberately not
+    /// attached to the election lease. `Create` additionally compares the
+    /// target version with zero in the same transaction. A failed create
+    /// reports `AlreadyExists` only after the transaction's failure branch
+    /// proves that the exact owner fence is still current.
+    ///
+    /// # Errors
+    ///
+    /// Rejects uncertain/retired owners, oversized inputs, stale process
+    /// owners, and dependency failures. A failed owner comparison
+    /// definitively retires this member before returning `NotLeader`.
+    pub async fn fenced_persistent_put(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        mode: PersistentPutMode,
+    ) -> Result<PersistentPutResult, ElectionError> {
+        self.ensure_process_owner()?;
+        if !self.snapshot().may_commit_owner_work() {
+            return Err(ElectionError::NotLeader);
+        }
+        let key = key.into();
+        let value = value.into();
+        self.validate_transaction_input(&key, Some(&value))?;
+
+        let (elected_key, revision, lease_id, member_id) = self.fencing_state()?;
+        let mut compares = vec![
+            Compare::create_revision(elected_key.clone(), CompareOp::Equal, revision),
+            Compare::lease(elected_key.clone(), CompareOp::Equal, lease_id),
+            Compare::value(elected_key.clone(), CompareOp::Equal, member_id),
+        ];
+        if matches!(mode, PersistentPutMode::Create) {
+            compares.push(Compare::version(key.clone(), CompareOp::Equal, 0));
+        }
+        let txn = Txn::new()
+            .when(compares)
+            .and_then([TxnOp::put(key.clone(), value, None)])
+            .or_else([TxnOp::get(elected_key, None), TxnOp::get(key, None)]);
+        let response = match self
+            .connection
+            .execute(move |client| Box::pin(client.txn(txn)))
+            .await
+        {
+            Ok(response) => response,
+            Err(source) => {
+                let error = map_operation_error("fenced_persistent_put", source);
+                self.record_runtime_failure(&error);
+                return Err(error);
+            }
+        };
+        self.advance_optional_header(response.header());
+        let response_revision = response
+            .header()
+            .map_or(0, etcd_client::ResponseHeader::revision);
+        if response.succeeded() {
+            return Ok(PersistentPutResult {
+                outcome: PersistentPutOutcome::Applied,
+                revision: response_revision,
+            });
+        }
+        if !self.failed_transaction_retains_owner(&response)? {
+            self.retire_local(RetirementReason::OwnerChanged);
+            return Err(ElectionError::NotLeader);
+        }
+        if matches!(mode, PersistentPutMode::Create) && failed_transaction_target_exists(&response)?
+        {
+            return Ok(PersistentPutResult {
+                outcome: PersistentPutOutcome::AlreadyExists,
+                revision: response_revision,
+            });
+        }
+        Err(ElectionError::InvalidResponse {
+            class: "persistent_put_compare_failed_without_conflict",
+        })
+    }
+
+    /// Deletes one persistent key only while the exact election fence is
+    /// current. The returned boolean reports whether etcd removed a value.
+    ///
+    /// # Errors
+    ///
+    /// Rejects uncertain/retired owners, invalid inputs, stale process owners,
+    /// and dependency failures. A failed owner comparison definitively retires
+    /// this member before returning `NotLeader`.
+    pub async fn fenced_persistent_delete(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<PersistentDeleteResult, ElectionError> {
+        self.ensure_process_owner()?;
+        if !self.snapshot().may_commit_owner_work() {
+            return Err(ElectionError::NotLeader);
+        }
+        let key = key.into();
+        self.validate_transaction_input(&key, None)?;
+        let (elected_key, revision, lease_id, member_id) = self.fencing_state()?;
+        let txn = Txn::new()
+            .when([
+                Compare::create_revision(elected_key.clone(), CompareOp::Equal, revision),
+                Compare::lease(elected_key.clone(), CompareOp::Equal, lease_id),
+                Compare::value(elected_key.clone(), CompareOp::Equal, member_id),
+            ])
+            .and_then([TxnOp::delete(key, None)])
+            .or_else([TxnOp::get(elected_key, None)]);
+        let response = match self
+            .connection
+            .execute(move |client| Box::pin(client.txn(txn)))
+            .await
+        {
+            Ok(response) => response,
+            Err(source) => {
+                let error = map_operation_error("fenced_persistent_delete", source);
+                self.record_runtime_failure(&error);
+                return Err(error);
+            }
+        };
+        self.advance_optional_header(response.header());
+        let response_revision = response
+            .header()
+            .map_or(0, etcd_client::ResponseHeader::revision);
+        if !response.succeeded() {
+            if !self.failed_transaction_retains_owner(&response)? {
+                self.retire_local(RetirementReason::OwnerChanged);
+                return Err(ElectionError::NotLeader);
+            }
+            return Err(ElectionError::InvalidResponse {
+                class: "persistent_delete_compare_failed_with_current_owner",
+            });
+        }
+        let responses = response.op_responses();
+        let [TxnOpResponse::Delete(delete)] = responses.as_slice() else {
+            return Err(ElectionError::InvalidResponse {
+                class: "missing_persistent_delete_response",
+            });
+        };
+        Ok(PersistentDeleteResult {
+            deleted: delete.deleted() == 1,
+            revision: response_revision,
+        })
+    }
+
     async fn execute_fenced_put(
         &mut self,
         key: Vec<u8>,
@@ -684,6 +887,62 @@ impl ElectionSession {
             return Err(ElectionError::NotLeader);
         }
         Ok(())
+    }
+
+    fn validate_transaction_input(
+        &self,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<(), ElectionError> {
+        if key.is_empty()
+            || key.len() > MAX_TXN_KEY_BYTES
+            || key.contains(&0)
+            || value.is_some_and(|value| value.len() > MAX_TXN_VALUE_BYTES)
+            || self.is_reserved_election_key(key)
+        {
+            return Err(ElectionError::InvalidTransactionInput);
+        }
+        Ok(())
+    }
+
+    fn fencing_state(&self) -> Result<(Vec<u8>, i64, i64, Vec<u8>), ElectionError> {
+        let leader_key = self
+            .leader_key
+            .as_ref()
+            .ok_or(ElectionError::InvalidResponse {
+                class: "missing_local_leader_key",
+            })?;
+        Ok((
+            leader_key.key().to_vec(),
+            leader_key.rev(),
+            self.snapshot().lease_id,
+            self.config.member_id().to_vec(),
+        ))
+    }
+
+    fn failed_transaction_retains_owner(
+        &self,
+        response: &etcd_client::TxnResponse,
+    ) -> Result<bool, ElectionError> {
+        let responses = response.op_responses();
+        let Some(TxnOpResponse::Get(owner)) = responses.first() else {
+            return Err(ElectionError::InvalidResponse {
+                class: "missing_failed_transaction_owner_response",
+            });
+        };
+        let Some(owner) = owner.kvs().first() else {
+            return Ok(false);
+        };
+        let leader_key = self
+            .leader_key
+            .as_ref()
+            .ok_or(ElectionError::InvalidResponse {
+                class: "missing_local_leader_key",
+            })?;
+        Ok(owner.key() == leader_key.key()
+            && owner.value() == self.config.member_id()
+            && owner.lease() == self.snapshot().lease_id
+            && owner.create_revision() == leader_key.rev())
     }
 
     /// Resigns, revokes the lease, and crosses the local retirement fence.
@@ -1146,6 +1405,18 @@ fn map_operation_error(operation: &'static str, error: EtcdOperationError) -> El
             source: dependency,
         },
     }
+}
+
+fn failed_transaction_target_exists(
+    response: &etcd_client::TxnResponse,
+) -> Result<bool, ElectionError> {
+    let responses = response.op_responses();
+    let Some(TxnOpResponse::Get(target)) = responses.get(1) else {
+        return Err(ElectionError::InvalidResponse {
+            class: "missing_failed_transaction_target_response",
+        });
+    };
+    Ok(!target.kvs().is_empty())
 }
 
 #[cfg(test)]

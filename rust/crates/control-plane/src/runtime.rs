@@ -14,6 +14,7 @@
 
 //! Single-process control runtime, domain module seam, and observability.
 
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::watch;
+use tokio::task::{Id, JoinSet};
 
 use crate::config::{ConfigError, ConfigSource, ConfigStore, ControlConfig};
 use crate::ownership::{OwnerError, OwnerLease, OwnerScope, OwnerToken, OwnershipRegistry};
@@ -271,6 +273,124 @@ pub trait ControlModule: Send + 'static {
 
     /// Runs until shutdown or a fatal module error.
     fn run(self: Box<Self>, context: ModuleContext) -> ModuleFuture;
+}
+
+/// Registration failure for a process-local control module.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ModuleSetError {
+    /// A stable module name may be registered only once per process runtime.
+    #[error("control module {0} is already registered")]
+    DuplicateModule(&'static str),
+}
+
+/// Terminal result for one registered control module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleExit {
+    /// Stable module name.
+    pub module: &'static str,
+    /// Successful shutdown or a bounded public failure.
+    pub result: Result<(), ModuleError>,
+}
+
+/// Explicit executor for feature modules owned by the binary composition root.
+///
+/// The set does not own lifecycle transitions. Its caller reacts to the first
+/// unexpected exit by moving the shared [`ControlRuntime`] into shutdown, then
+/// joins every remaining module before releasing process ownership.
+pub struct ControlModuleSet {
+    context: ModuleContext,
+    registered: BTreeSet<&'static str>,
+    task_names: HashMap<Id, &'static str>,
+    tasks: JoinSet<Result<(), ModuleError>>,
+}
+
+impl ControlModuleSet {
+    /// Creates an empty module set for one process runtime.
+    #[must_use]
+    pub fn new(handle: &RuntimeHandle) -> Self {
+        Self {
+            context: handle.module_context(),
+            registered: BTreeSet::new(),
+            task_names: HashMap::new(),
+            tasks: JoinSet::new(),
+        }
+    }
+
+    /// Registers and starts one module.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModuleSetError::DuplicateModule`] when the stable name was
+    /// already registered, even if its original task has exited.
+    pub fn spawn<M>(&mut self, module: M) -> Result<(), ModuleSetError>
+    where
+        M: ControlModule,
+    {
+        self.spawn_boxed(Box::new(module))
+    }
+
+    /// Registers and starts a dynamically composed module.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModuleSetError::DuplicateModule`] when the stable name was
+    /// already registered, even if its original task has exited.
+    pub fn spawn_boxed(&mut self, module: Box<dyn ControlModule>) -> Result<(), ModuleSetError> {
+        let name = module.name();
+        if !self.registered.insert(name) {
+            return Err(ModuleSetError::DuplicateModule(name));
+        }
+        let context = self.context.clone();
+        let task = self.tasks.spawn(async move { module.run(context).await });
+        self.task_names.insert(task.id(), name);
+        Ok(())
+    }
+
+    /// Returns whether no registered module task remains to be joined.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    /// Waits for the next module terminal result.
+    ///
+    /// Task panics and cancellations are converted to bounded public classes;
+    /// concrete panic payloads and join errors never cross this boundary.
+    pub async fn join_next(&mut self) -> Option<ModuleExit> {
+        let joined = self.tasks.join_next_with_id().await?;
+        match joined {
+            Ok((id, result)) => {
+                let module = self.task_names.remove(&id).unwrap_or("module_executor");
+                Some(ModuleExit { module, result })
+            }
+            Err(error) => {
+                let module = self
+                    .task_names
+                    .remove(&error.id())
+                    .unwrap_or("module_executor");
+                let error_class = if error.is_panic() {
+                    "module_panicked"
+                } else if error.is_cancelled() {
+                    "module_cancelled"
+                } else {
+                    "module_join_failed"
+                };
+                Some(ModuleExit {
+                    module,
+                    result: Err(ModuleError {
+                        module,
+                        error_class,
+                    }),
+                })
+            }
+        }
+    }
+
+    /// Aborts all still-running tasks as a bounded final shutdown backstop.
+    /// Callers must continue calling [`Self::join_next`] until the set is empty.
+    pub fn abort_all(&mut self) {
+        self.tasks.abort_all();
+    }
 }
 
 /// Context shared with a process-local control module.

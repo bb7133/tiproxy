@@ -75,16 +75,19 @@
       "go_owner": "lib/config and pkg/manager/config",
       "rust_target": "#146",
       "go_baseline": "anchored",
-      "rust_status": "pending",
+      "rust_status": "owned",
       "anchors": [
         {"path": "lib/config/proxy_test.go", "contains": "func TestProxyConfig"},
         {"path": "pkg/manager/config/config_test.go", "contains": "func TestConfigReload"},
-        {"path": "pkg/manager/config/config_test.go", "contains": "func TestChecksum"}
+        {"path": "pkg/manager/config/config_test.go", "contains": "func TestChecksum"},
+        {"path": "rust/crates/control-config/src/model.rs", "contains": "pub struct EffectiveConfig"},
+        {"path": "rust/crates/control-config/src/source.rs", "contains": "pub struct ConfigNamespaceStore"},
+        {"path": "tests/controlplane/cp004/run.sh", "contains": "CP-CFG/NS differential and real-etcd evidence passed"}
       ],
       "observed_fields": ["checksum", "reload_result", "validation_class", "effective_defaults", "restart_required"],
       "fault_scenarios": ["CP-FAULT-CONFIG-INVALID-RELOAD"],
       "bridge_messages": ["state_snapshot", "snapshot_result"],
-      "handoff": "Land the Rust config model with a field-level parity table and atomic last-good reload behavior."
+      "handoff": "Rust now owns the full canonical model, contiguous accepted generations, atomic last-good file/etcd overlays, and checksums. The bridge message pair remains only for residual protocol/static and backend fields."
     },
     {
       "id": "CP-CONFIG-002",
@@ -93,16 +96,19 @@
       "go_owner": "pkg/controlbridge/snapshot.go",
       "rust_target": "#146",
       "go_baseline": "anchored",
-      "rust_status": "pending",
+      "rust_status": "owned",
       "anchors": [
         {"path": "pkg/controlbridge/snapshot_test.go", "contains": "func TestSnapshotBuilderBuildsCompleteDeterministicSnapshot"},
         {"path": "pkg/controlbridge/snapshot_test.go", "contains": "func TestSnapshotBuilderRejectsUnsafeOrRestartRequiredValues"},
-        {"path": "pkg/controlbridge/snapshot_publisher_test.go", "contains": "func TestSnapshotPublisherApplyRejectReconnectAndCoalesce"}
+        {"path": "pkg/controlbridge/snapshot_publisher_test.go", "contains": "func TestSnapshotPublisherApplyRejectReconnectAndCoalesce"},
+        {"path": "rust/crates/control-config/src/module.rs", "contains": "pub struct ConfigModule"},
+        {"path": "rust/crates/tiproxy-rs/src/config_composition.rs", "contains": "pub struct ConfigServingAdapter"},
+        {"path": "pkg/controlbridge/snapshot_publisher.go", "contains": "func shrinkRustOwnedSnapshot"}
       ],
-      "observed_fields": ["generation", "listener_address", "backend_address", "namespace", "apply_code"],
+      "observed_fields": ["generation", "source_revision", "config_checksum", "namespace_checksum", "effective_config", "ordered_namespaces", "apply_result"],
       "fault_scenarios": ["CP-FAULT-CONFIG-SNAPSHOT-REJECT"],
       "bridge_messages": ["state_snapshot", "snapshot_result"],
-      "handoff": "Use the catalog as the temporary migration boundary; delete snapshot encoding only after its Rust state object is differential-green."
+      "handoff": "Rust owns all config and namespace projection fields. With capability 5, Go sends only advertised_capability, server_version, and backends; state_snapshot/snapshot_result remain until CP-TOPO/CP-ROUTE retire that residual surface."
     },
     {
       "id": "CP-CONFIG-003",
@@ -111,16 +117,19 @@
       "go_owner": "pkg/manager/cert",
       "rust_target": "#146",
       "go_baseline": "anchored",
-      "rust_status": "pending",
+      "rust_status": "owned",
       "anchors": [
         {"path": "pkg/manager/cert/manager_test.go", "contains": "func TestRotate"},
         {"path": "pkg/manager/cert/manager_test.go", "contains": "func TestWatchConfig"},
-        {"path": "pkg/controlbridge/snapshot.go", "contains": "minimum TLS version must be 1.2 or 1.3"}
+        {"path": "pkg/controlbridge/snapshot.go", "contains": "minimum TLS version must be 1.2 or 1.3"},
+        {"path": "rust/crates/control-config/src/source.rs", "contains": "pub fn refresh_external_material"},
+        {"path": "rust/crates/tiproxy-rs/src/config_composition.rs", "contains": "pub struct ServingCandidateValidator"},
+        {"path": "rust/crates/control-config/tests/source.rs", "contains": "fn external_material_refresh_advances_generation_and_retains_last_good_on_rejection"}
       ],
       "observed_fields": ["certificate_generation", "minimum_tls_version", "allowed_common_names", "existing_session_state", "new_connection_result"],
       "fault_scenarios": ["CP-FAULT-TLS-ROTATION"],
       "bridge_messages": ["state_snapshot", "snapshot_result"],
-      "handoff": "Rust owns certificate watchers and atomic TLS config swaps before Go cert management can be removed."
+      "handoff": "Rust validates and content-watches every global and namespace TLS material path, advances an atomic immutable generation for accepted rotations, and retains last-good on partial/invalid material. CP-ADMIN/CP-TOPO/CP-ROUTE consume their non-SQL projections later."
     },
     {
       "id": "CP-ELECT-001",
@@ -239,7 +248,7 @@
       "family": "routing",
       "summary": "Namespace and keyspace matching, listener routing, conflict rejection, and dynamic change retain existing-session semantics.",
       "go_owner": "pkg/manager/namespace, pkg/controlbridge, and pkg/balance/router",
-      "rust_target": "#146",
+      "rust_target": "#147",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
@@ -250,7 +259,7 @@
       "observed_fields": ["namespace", "keyspace", "listener_address", "backend_cluster", "existing_session_state", "rejection_code"],
       "fault_scenarios": ["CP-FAULT-NAMESPACE-CHANGE"],
       "bridge_messages": ["handshake_response", "handshake_decision", "handshake_result", "state_snapshot", "snapshot_result"],
-      "handoff": "Keep namespace/keyspace selection beside Rust config while preserving immutable session bindings and bounded client errors."
+      "handoff": "#146 owns namespace persistence, canonical identity, TLS validation, and immutable source generations only. #147 owns keyspace discovery input, listener/user/backend binding, conflict rejection, and immutable per-session routing."
     },
     {
       "id": "CP-ROUTE-003",

@@ -75,6 +75,12 @@ enum ControlCapability {
   // snapshots and an explicit durable ACK. Without it the legacy delta-batch
   // behavior applies.
   CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS = 4;
+  // CP-CFG/NS: the Rust process owns configuration and namespace snapshots.
+  // When negotiated, Go sends only protocol/static handshake facts in
+  // ConfigSnapshot and no NamespaceSnapshot values; Rust composes the owned
+  // fields from its process-local revisioned source. Backends remain on the
+  // legacy bridge until CP-TOPO/CP-ROUTE retire them.
+  CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE = 5;
 }
 
 message Hello {

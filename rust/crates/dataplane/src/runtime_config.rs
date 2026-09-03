@@ -24,12 +24,13 @@
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant};
 
-use control_proto::snapshot::{SnapshotError, ValidatedSnapshot};
+use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime, ValidatedSnapshot};
+use control_proto::v1::StateSnapshot;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::admission::MemoryProbe;
-use crate::control_runtime::SnapshotConsumer;
+use crate::control_runtime::{SnapshotComposition, SnapshotConsumer};
 use crate::server::{
     AcceptedConnection, ConnectionFuture, ConnectionHandler, DataplaneHandle, DataplaneServer,
     ServerError,
@@ -48,6 +49,14 @@ pub struct GenerationStatusSnapshot {
     pub rejected_total: u64,
     /// Current age of the last successful apply.
     pub last_good_age: Option<Duration>,
+    /// Latest Rust-owned config/namespace generation composed into serving.
+    pub composition_generation: u64,
+    /// Latest rejected Rust-owned composition generation.
+    pub rejected_composition_generation: u64,
+    /// Successful independent config/namespace recompositions.
+    pub composition_applied_total: u64,
+    /// Rejected independent config/namespace recompositions.
+    pub composition_rejected_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +66,10 @@ struct GenerationStatusInner {
     applied_total: u64,
     rejected_total: u64,
     last_good_at: Option<Instant>,
+    composition_generation: u64,
+    rejected_composition_generation: u64,
+    composition_applied_total: u64,
+    composition_rejected_total: u64,
 }
 
 /// Cloneable status reader shared with diagnostics/metrics exporters.
@@ -76,14 +89,21 @@ impl GenerationStatus {
             applied_total: inner.applied_total,
             rejected_total: inner.rejected_total,
             last_good_age: inner.last_good_at.map(|instant| instant.elapsed()),
+            composition_generation: inner.composition_generation,
+            rejected_composition_generation: inner.rejected_composition_generation,
+            composition_applied_total: inner.composition_applied_total,
+            composition_rejected_total: inner.composition_rejected_total,
         }
     }
 
-    fn applied(&self, generation: u64) {
+    fn applied(&self, generation: u64, composition_generation: u64) {
         let mut inner = lock_std(&self.inner);
         inner.applied_generation = generation;
         inner.applied_total = inner.applied_total.saturating_add(1);
         inner.last_good_at = Some(Instant::now());
+        if composition_generation != 0 {
+            inner.composition_generation = composition_generation;
+        }
     }
 
     fn rejected(&self, generation: u64) {
@@ -91,12 +111,26 @@ impl GenerationStatus {
         inner.rejected_generation = generation;
         inner.rejected_total = inner.rejected_total.saturating_add(1);
     }
+
+    fn composition_applied(&self, generation: u64) {
+        let mut inner = lock_std(&self.inner);
+        inner.composition_generation = generation;
+        inner.composition_applied_total = inner.composition_applied_total.saturating_add(1);
+        inner.last_good_at = Some(Instant::now());
+    }
+
+    fn composition_rejected(&self, generation: u64) {
+        let mut inner = lock_std(&self.inner);
+        inner.rejected_composition_generation = generation;
+        inner.composition_rejected_total = inner.composition_rejected_total.saturating_add(1);
+    }
 }
 
 struct ServingState {
     handle: Option<DataplaneHandle>,
     owner: Option<JoinHandle<Result<(), ServerError>>>,
     shutting_down: bool,
+    last_bridge_source: Option<StateSnapshot>,
 }
 
 impl ServingState {
@@ -105,8 +139,20 @@ impl ServingState {
             handle: None,
             owner: None,
             shutting_down: false,
+            last_bridge_source: None,
         }
     }
+}
+
+/// In-process field-level composer used while topology remains on the legacy
+/// bridge and config/namespace are Rust-owned.
+pub trait ServingSnapshotComposer: Send + Sync + 'static {
+    /// Replaces owned fields and returns a complete effective snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded validation error without changing serving state.
+    fn compose(&self, source: &StateSnapshot) -> Result<SnapshotComposition, SnapshotError>;
 }
 
 #[derive(Clone)]
@@ -126,6 +172,7 @@ pub struct DataplaneSnapshotConsumer {
     handler: Arc<dyn ConnectionHandler>,
     status: GenerationStatus,
     force_join_grace: Duration,
+    composer: Option<Arc<dyn ServingSnapshotComposer>>,
 }
 
 /// Cloneable shutdown/join/status surface retained by the executable while
@@ -134,6 +181,7 @@ pub struct DataplaneSnapshotConsumer {
 pub struct DataplaneServingHandle {
     state: Arc<Mutex<ServingState>>,
     status: GenerationStatus,
+    composer: Option<Arc<dyn ServingSnapshotComposer>>,
 }
 
 impl DataplaneSnapshotConsumer {
@@ -152,9 +200,28 @@ impl DataplaneSnapshotConsumer {
                 handler,
                 status: status.clone(),
                 force_join_grace: Duration::ZERO,
+                composer: None,
             },
-            DataplaneServingHandle { state, status },
+            DataplaneServingHandle {
+                state,
+                status,
+                composer: None,
+            },
         )
+    }
+
+    /// Builds a consumer that replaces Rust-owned fields before bridge
+    /// validation and serving application.
+    #[must_use]
+    pub fn new_with_composer(
+        memory: Arc<dyn MemoryProbe>,
+        handler: Arc<dyn ConnectionHandler>,
+        composer: Arc<dyn ServingSnapshotComposer>,
+    ) -> (Self, DataplaneServingHandle) {
+        let (mut consumer, mut serving) = Self::new(memory, handler);
+        consumer.composer = Some(Arc::clone(&composer));
+        serving.composer = Some(composer);
+        (consumer, serving)
     }
 
     /// Forwards the forced-shutdown join grace to every server this
@@ -167,6 +234,16 @@ impl DataplaneSnapshotConsumer {
 }
 
 impl SnapshotConsumer for DataplaneSnapshotConsumer {
+    fn compose(&self, source: &StateSnapshot) -> Result<SnapshotComposition, SnapshotError> {
+        match &self.composer {
+            Some(composer) => composer.compose(source),
+            None => Ok(SnapshotComposition {
+                snapshot: source.clone(),
+                generation: 0,
+            }),
+        }
+    }
+
     fn apply(
         &mut self,
         snapshot: &Arc<ValidatedSnapshot>,
@@ -192,6 +269,8 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
                 ));
             }
 
+            let bridge_source = snapshot.source_raw().clone();
+            let composition_generation = snapshot.composition_generation();
             let result = if let Some(handle) = &serving.handle {
                 // Lineage check immediately before the serving swap,
                 // inside the serving lock with no await between: a
@@ -231,7 +310,8 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
             };
             match result {
                 Ok(()) => {
-                    status.applied(generation);
+                    serving.last_bridge_source = Some(bridge_source);
+                    status.applied(generation, composition_generation);
                     Ok(())
                 }
                 Err(error) => {
@@ -255,6 +335,60 @@ impl DataplaneServingHandle {
     pub async fn metrics(&self) -> Option<crate::server::ServerMetricsSnapshot> {
         let serving = self.state.lock().await;
         serving.handle.as_ref().map(DataplaneHandle::metrics)
+    }
+
+    /// Re-composes the last bridge topology with the latest Rust-owned
+    /// config/namespace generation and atomically swaps the serving view. A
+    /// call before the first bridge snapshot is a no-op; that first snapshot
+    /// will use the latest composer state.
+    ///
+    /// # Errors
+    ///
+    /// Returns complete snapshot validation or serving preflight errors while
+    /// retaining the prior last-good view.
+    pub async fn reload_composed(
+        &self,
+        validator: &SnapshotStore,
+        now: UnixTime,
+    ) -> Result<bool, SnapshotError> {
+        let Some(composer) = &self.composer else {
+            return Ok(false);
+        };
+        let serving = self.state.lock().await;
+        let Some(source) = &serving.last_bridge_source else {
+            return Ok(false);
+        };
+        let Some(handle) = &serving.handle else {
+            return Ok(false);
+        };
+        let composition = composer.compose(source)?;
+        if composition.generation == self.status.snapshot().composition_generation {
+            return Ok(false);
+        }
+        let bridge_generation = self.status.snapshot().applied_generation;
+        let generation = composition.generation;
+        let snapshot = match validator.validate_composed(
+            bridge_generation,
+            generation,
+            composition.snapshot,
+            now,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.status.composition_rejected(generation);
+                return Err(error);
+            }
+        };
+        match handle.update_snapshot(snapshot) {
+            Ok(()) => {
+                self.status.composition_applied(generation);
+                Ok(true)
+            }
+            Err(error) => {
+                self.status.composition_rejected(generation);
+                Err(snapshot_apply_error(&error))
+            }
+        }
     }
 
     /// Whether the SQL serving side is live for readiness probes: an

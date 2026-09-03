@@ -77,6 +77,7 @@ func (srv *Server) startRustDataplane(
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE),
 	}
 	var meteringSink controlbridge.MeteringSink
 	if srv.meter != nil {

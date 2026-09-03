@@ -1,0 +1,178 @@
+workdir = "/tmp/tiproxy-cp004"
+enable-traffic-replay = false
+
+[proxy]
+addr = "127.0.0.1:6000"
+advertise-addr = "proxy.example"
+pd-addrs = "pd-legacy:2379"
+port-range = [6000, 6002]
+max-connections = 101
+high-memory-usage-reject-threshold = 0.75
+conn-buffer-size = 4096
+proxy-protocol = "v2"
+graceful-wait-before-shutdown = 11
+graceful-close-conn-timeout = 22
+public-endpoints = ["10.0.0.9/24", "2001:db8::1"]
+fail-backend-list = ["tidb-a", "127.0.0.1:4000"]
+failover-timeout = 33
+
+[proxy.frontend-keepalive]
+enabled = true
+idle = "1m2.003s"
+cnt = 3
+intvl = "4s"
+timeout = "5s"
+
+[proxy.backend-healthy-keepalive]
+enabled = true
+idle = "6s"
+cnt = 7
+intvl = "8s"
+timeout = "9s"
+
+[proxy.backend-unhealthy-keepalive]
+enabled = false
+idle = "10s"
+cnt = 11
+intvl = "12s"
+timeout = "13s"
+
+[[proxy.backend-clusters]]
+name = " alpha "
+pd-addrs = "pd-a:2379,pd-b:2379"
+ns-servers = ["dns-a", "127.0.0.1:5353"]
+
+[[proxy.backend-clusters]]
+name = "beta"
+pd-addrs = "pd-c:2379"
+
+[api]
+addr = "127.0.0.1:3080"
+proxy-protocol = "v2"
+
+[security]
+encryption-key-path = "/tmp/tiproxy-cp004/key"
+require-backend-tls = true
+
+[security.server-tls]
+cert = "/tmp/tiproxy-cp004/server.pem"
+key = "/tmp/tiproxy-cp004/server-key.pem"
+ca = "/tmp/tiproxy-cp004/ca.pem"
+min-tls-version = "1.3"
+cert-allowed-cn = ["client-b", " client-a ", "client-b"]
+auto-certs = true
+rsa-key-size = 2048
+autocert-expire-duration = "24h"
+skip-ca = true
+
+[security.server-http-tls]
+cert = "/tmp/tiproxy-cp004/http.pem"
+key = "/tmp/tiproxy-cp004/http-key.pem"
+ca = "/tmp/tiproxy-cp004/ca.pem"
+min-tls-version = "1.2"
+rsa-key-size = 3072
+
+[security.cluster-tls]
+cert = "/tmp/tiproxy-cp004/client.pem"
+key = "/tmp/tiproxy-cp004/client-key.pem"
+ca = "/tmp/tiproxy-cp004/ca.pem"
+min-tls-version = "1.3"
+rsa-key-size = 4096
+
+[security.sql-tls]
+cert = "/tmp/tiproxy-cp004/sql-client.pem"
+key = "/tmp/tiproxy-cp004/sql-client-key.pem"
+ca = "/tmp/tiproxy-cp004/sql-ca.pem"
+min-tls-version = "1.2"
+cert-allowed-cn = ["tidb-b", " tidb-a ", "tidb-b"]
+rsa-key-size = 1024
+skip-ca = true
+
+[log]
+encoder = "json"
+simple = true
+level = "debug"
+
+[log.log-file]
+filename = "/tmp/tiproxy-cp004/tiproxy.log"
+max-size = 400
+max-days = 14
+max-backups = 7
+
+[balance]
+label-name = "zone"
+routing-rule = "client_cidr"
+policy = "location"
+routing-policy = "random"
+
+[balance.status]
+migrations-per-second = 1.5
+
+[balance.health]
+migrations-per-second = 2.5
+
+[balance.memory]
+migrations-per-second = 3.5
+
+[balance.cpu]
+migrations-per-second = 4.5
+
+[balance.location]
+migrations-per-second = 5.5
+
+[balance.conn-count]
+migrations-per-second = 6.5
+count-ratio-threshold = 1.25
+
+[labels]
+region = "us-west"
+"zone.id" = "z1"
+
+[ha]
+virtual-ip = "10.0.0.200/32"
+interface = "eth0"
+garp-burst-count = 8
+garp-refresh-count = 9
+
+[metering]
+type = "s3"
+region = "us-west-2"
+bucket = "metering"
+prefix = "tiproxy"
+endpoint = "https://s3.example"
+shared-pool-id = "pool-a"
+
+[metering.aws]
+assume-role-arn = "arn:aws:iam::123456789012:role/test"
+s3-force-path-style = true
+access-key = "fixture-access"
+secret-access-key = "fixture-secret"
+session-token = "fixture-token"
+
+[metering.oss]
+assume-role-arn = "acs:ram::123456789012:role/test"
+access-key = "oss-access"
+secret-access-key = "oss-secret"
+session-token = "oss-token"
+
+[metering.cos]
+assume-role-arn = "qcs::cam::uin/123456789012:roleName/test"
+access-key = "cos-access"
+secret-access-key = "cos-secret"
+session-token = "cos-token"
+
+[metering.azure]
+account-name = "account"
+account-key = "account-key"
+sas-token = "sas-token"
+
+[metering.localfs]
+base-path = "/tmp/tiproxy-cp004/metering"
+create-dirs = true
+permissions = "0750"
+
+[rust-dataplane]
+enabled = true
+control-socket = "/tmp/tiproxy-cp004/control.sock"
+allowed-uid = 501
+tls-allowed-roots = ["/tmp/tiproxy-cp004"]

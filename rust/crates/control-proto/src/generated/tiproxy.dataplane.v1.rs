@@ -762,6 +762,12 @@ pub enum ControlCapability {
     /// snapshots and an explicit durable ACK. Without it the legacy delta-batch
     /// behavior applies.
     MeteringAbsoluteSnapshots = 4,
+    /// CP-CFG/NS: the Rust process owns configuration and namespace snapshots.
+    /// When negotiated, Go sends only protocol/static handshake facts in
+    /// ConfigSnapshot and no NamespaceSnapshot values; Rust composes the owned
+    /// fields from its process-local revisioned source. Backends remain on the
+    /// legacy bridge until CP-TOPO/CP-ROUTE retire them.
+    RustConfigNamespace = 5,
 }
 impl ControlCapability {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -775,6 +781,7 @@ impl ControlCapability {
             Self::ReconcileConnections => "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS",
             Self::ReconcileSessionRehydration => "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION",
             Self::MeteringAbsoluteSnapshots => "CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS",
+            Self::RustConfigNamespace => "CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -785,6 +792,7 @@ impl ControlCapability {
             "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS" => Some(Self::ReconcileConnections),
             "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION" => Some(Self::ReconcileSessionRehydration),
             "CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS" => Some(Self::MeteringAbsoluteSnapshots),
+            "CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE" => Some(Self::RustConfigNamespace),
             _ => None,
         }
     }

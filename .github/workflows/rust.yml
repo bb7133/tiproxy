@@ -85,6 +85,8 @@ jobs:
         run: make controlplane-cp002-evidence
       - name: Run CP-ETCD live lease and election evidence
         run: make controlplane-cp003-evidence
+      - name: Run CP-CFG/NS differential and real-etcd evidence
+        run: make controlplane-cp004-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests

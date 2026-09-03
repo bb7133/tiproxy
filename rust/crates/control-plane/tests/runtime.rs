@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use control_plane::{
-    ConfigSource, ControlConfig, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
-    MetricsPolicy, OwnerError, OwnerScope, OwnershipRegistry, RuntimeEvent, RuntimeEventKind,
+    ConfigSource, ControlConfig, ControlModule, ControlModuleSet, ControlRuntime, EventSink,
+    LifecyclePhase, LogLevel, MetricsPolicy, ModuleContext, ModuleError, ModuleFuture,
+    ModuleSetError, OwnerError, OwnerScope, OwnershipRegistry, RuntimeEvent, RuntimeEventKind,
     ShutdownReason, TlsPolicy, TlsSource,
 };
 
@@ -274,5 +275,73 @@ fn internal_domain_has_no_control_proto_dependency() {
     assert!(
         !manifest.contains("control-proto"),
         "the legacy protobuf boundary must not become the internal domain model"
+    );
+}
+
+struct ImmediateModule {
+    name: &'static str,
+    result: Result<(), ModuleError>,
+}
+
+impl ControlModule for ImmediateModule {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn run(self: Box<Self>, _context: ModuleContext) -> ModuleFuture {
+        Box::pin(async move { self.result })
+    }
+}
+
+#[tokio::test]
+async fn module_set_rejects_duplicate_names_and_reports_bounded_results() {
+    let registry = OwnershipRegistry::new();
+    let runtime = ControlRuntime::claim_process(
+        &registry,
+        "tiproxy-rs-modules",
+        config(1, Vec::new()),
+        Arc::new(RecordingSink::default()),
+    )
+    .unwrap_or_else(|error| unreachable!("runtime claim: {error}"));
+    let mut modules = ControlModuleSet::new(&runtime.handle());
+
+    modules
+        .spawn(ImmediateModule {
+            name: "config",
+            result: Ok(()),
+        })
+        .unwrap_or_else(|error| unreachable!("register config module: {error}"));
+    assert_eq!(
+        modules.spawn(ImmediateModule {
+            name: "config",
+            result: Ok(()),
+        }),
+        Err(ModuleSetError::DuplicateModule("config"))
+    );
+    modules
+        .spawn(ImmediateModule {
+            name: "topology",
+            result: Err(ModuleError {
+                module: "topology",
+                error_class: "dependency_unavailable",
+            }),
+        })
+        .unwrap_or_else(|error| unreachable!("register topology module: {error}"));
+
+    let mut exits = Vec::new();
+    while let Some(exit) = modules.join_next().await {
+        exits.push(exit);
+    }
+    exits.sort_by_key(|exit| exit.module);
+    assert_eq!(exits.len(), 2);
+    assert_eq!(exits[0].module, "config");
+    assert_eq!(exits[0].result, Ok(()));
+    assert_eq!(exits[1].module, "topology");
+    assert_eq!(
+        exits[1].result,
+        Err(ModuleError {
+            module: "topology",
+            error_class: "dependency_unavailable",
+        })
     );
 }

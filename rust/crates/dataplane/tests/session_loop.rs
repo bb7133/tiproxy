@@ -355,6 +355,48 @@ async fn scripted_lifecycle_completes_cleanly() {
     );
 }
 
+/// A process-local coordinated drain can override the deadline captured when
+/// the session was admitted. This is the dynamic-config path used at process
+/// shutdown; ordinary control-plane graceful-close commands keep the admitted
+/// default.
+#[tokio::test(start_paused = true)]
+async fn coordinated_drain_uses_latest_deadline_override() {
+    let (control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let mut events = HANDSHAKE.to_vec();
+    events.extend([
+        SessionEvent::ClientCommand,
+        SessionEvent::BackendResponseTxnOpen,
+    ]);
+    let looped = SessionLoop::new(
+        FakeSource::parking(&events),
+        Recorder::default(),
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig {
+            drain_deadline: Duration::from_secs(60),
+            ..SessionLoopConfig::default()
+        },
+    );
+    let run = tokio::spawn(looped.run());
+    quiesce().await;
+    let _ = control_tx
+        .send(SessionControl::GracefulCloseAfter(Duration::from_secs(7)))
+        .await;
+    quiesce().await;
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    quiesce().await;
+    assert!(!run.is_finished(), "override must not close early");
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let summary = match run.await {
+        Ok(summary) => summary,
+        Err(error) => unreachable!("session loop panicked: {error}"),
+    };
+    assert_eq!(summary.end, SessionEnd::Closed);
+    assert_eq!(summary.final_state, SessionState::Closed);
+}
+
 /// A client EOF with a stuck child still releases everything: the child
 /// gets the drain window, is aborted only after it, and joins within the
 /// second bound.

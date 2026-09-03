@@ -243,6 +243,9 @@ func (publisher *SnapshotPublisher) Sync(ctx context.Context, sender EnvelopeSen
 		return err
 	}
 	desired.RequestId = requestID
+	if sender.HasCapability(uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE)) {
+		shrinkRustOwnedSnapshot(desired)
+	}
 
 	publisher.mu.Lock()
 	// A concurrent result/update/sync may have changed the send decision while
@@ -272,6 +275,29 @@ func (publisher *SnapshotPublisher) Sync(ctx context.Context, sender EnvelopeSen
 	publisher.status.SentGeneration = desired.GetGeneration()
 	publisher.mu.Unlock()
 	return nil
+}
+
+// shrinkRustOwnedSnapshot removes every value whose production owner moved to
+// CP-CFG/NS. Protocol/static handshake facts still originate in Go, and the
+// backend list remains on the bridge until CP-TOPO/CP-ROUTE take ownership.
+// This transformation happens only after capability negotiation, preserving
+// complete-snapshot compatibility with older Rust peers.
+func shrinkRustOwnedSnapshot(envelope *controlpb.ControlEnvelope) {
+	snapshot := envelope.GetStateSnapshot()
+	if snapshot == nil {
+		return
+	}
+	config := snapshot.GetConfig()
+	if config == nil {
+		config = &controlpb.ConfigSnapshot{}
+	}
+	snapshot.Config = &controlpb.ConfigSnapshot{
+		AdvertisedCapability: config.GetAdvertisedCapability(),
+		ServerVersion:        config.GetServerVersion(),
+	}
+	snapshot.Namespaces = nil
+	envelope.RequiredCapabilities = append(envelope.RequiredCapabilities,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE))
 }
 
 // HandleResult applies one exactly correlated SnapshotResult. The caller
