@@ -229,6 +229,7 @@ impl TopologyModule {
         stop_children(children).await;
         for cluster in clusters {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let receive_timeout = cluster.client.request_timeout();
             let connector = EtcdConnector::new(owner.clone(), cluster.client);
             let child_owner = owner.clone();
             let child_info = info.clone();
@@ -238,6 +239,7 @@ impl TopologyModule {
                     child_owner,
                     connector,
                     child_info,
+                    receive_timeout,
                     shutdown_rx,
                 ))
                 .await

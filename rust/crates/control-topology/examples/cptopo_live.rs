@@ -95,10 +95,18 @@ async fn main() -> Result<(), AnyError> {
 
     // --- Row 1: first registration publishes info + ttl under one lease. ---
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let receive_timeout = config.request_timeout();
     let connector = EtcdConnector::new(owner.clone(), config.clone());
     let registrar_owner = owner.clone();
     let registrar = tokio::spawn(async move {
-        let _ = Box::pin(registrar_run(registrar_owner, connector, info, shutdown_rx)).await;
+        let _ = Box::pin(registrar_run(
+            registrar_owner,
+            connector,
+            info,
+            receive_timeout,
+            shutdown_rx,
+        ))
+        .await;
     });
 
     let (info_value, info_lease) =

@@ -27,10 +27,13 @@
 //! * if the lease is lost, rebuild the session (Go's `session.Done()` arm);
 //! * on shutdown, best-effort delete the registration and return.
 //!
-//! Every etcd call goes through [`control_external::EtcdConnection`], so it is
-//! fenced by the process [`control_plane::OwnerToken`] and never commits work
-//! for a retired generation. This loop is deliberately NOT gated on
-//! control-plane leadership: self-registration is a per-instance duty.
+//! Lease grant, setup, and the info/ttl writes go through
+//! [`control_external::EtcdConnection`], so they are fenced by the process
+//! [`control_plane::OwnerToken`] and never commit work for a retired
+//! generation. The keepalive round owns its keeper and stream directly (they
+//! outlive a single `execute` call); it is fenced explicitly by the same
+//! `OwnerToken` and a bounded receive timeout. This loop is deliberately NOT
+//! gated on control-plane leadership: self-registration is a per-instance duty.
 //!
 //! A caller that owns several backend clusters runs one [`run`] per cluster
 //! (Go keeps one `InfoSyncer` per cluster), each with its own connector but the
@@ -57,9 +60,6 @@ use crate::register::{
 /// Lease keepalive cadence: a third of the lease TTL, so two consecutive missed
 /// refreshes still leave headroom before expiry.
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
-/// Bound on one keepalive response wait, so a hung stream can never wedge the
-/// loop (and therefore never wedge a caller joining this task on shutdown).
-const KEEPALIVE_RECEIVE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Backoff between failed session-establishment attempts. Matches Go
 /// `putRetryIntvl`; establishment itself retries until the caller shuts down.
 const ESTABLISH_BACKOFF: Duration = Duration::from_secs(1);
@@ -85,6 +85,9 @@ pub enum RegistrarError {
 /// makes the loop delete its registration (best effort) and return `Ok(())`.
 /// `owner` fences every keepalive round so a retired generation stops
 /// publishing even while its keepalive stream is otherwise healthy.
+/// `receive_timeout` bounds each keepalive response wait; pass the cluster's
+/// [`control_external::EtcdClientConfig::request_timeout`] so a factory-tuned
+/// timeout is honoured rather than a second hard-coded policy.
 ///
 /// # Errors
 ///
@@ -95,6 +98,7 @@ pub async fn run(
     owner: OwnerToken,
     connector: EtcdConnector,
     info: TopologyInfo,
+    receive_timeout: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), RegistrarError> {
     if *shutdown.borrow_and_update() {
@@ -103,7 +107,7 @@ pub async fn run(
     loop {
         // Establish a session, retrying until it succeeds or shutdown wins.
         let mut session = loop {
-            match Session::establish(&owner, &connector, &info).await {
+            match Session::establish(&owner, &connector, &info, receive_timeout).await {
                 Ok(session) => break session,
                 Err(RegistrarError::OwnerLost) => return Ok(()),
                 Err(RegistrarError::Etcd(_)) => {
@@ -184,6 +188,7 @@ struct Session {
     lease_id: i64,
     keeper: LeaseKeeper,
     stream: LeaseKeepAliveStream,
+    receive_timeout: Duration,
 }
 
 impl Session {
@@ -193,6 +198,7 @@ impl Session {
         owner: &OwnerToken,
         connector: &EtcdConnector,
         info: &TopologyInfo,
+        receive_timeout: Duration,
     ) -> Result<Self, RegistrarError> {
         let mut connection = connector
             .connect()
@@ -216,6 +222,7 @@ impl Session {
             lease_id,
             keeper,
             stream,
+            receive_timeout,
         };
         session.publish(info).await?;
         Ok(session)
@@ -269,7 +276,7 @@ impl Session {
             .keep_alive()
             .await
             .map_err(|_| RegistrarError::Etcd("keep_alive_send"))?;
-        let response = time::timeout(KEEPALIVE_RECEIVE_TIMEOUT, self.stream.message())
+        let response = time::timeout(self.receive_timeout, self.stream.message())
             .await
             .map_err(|_| RegistrarError::Etcd("keep_alive_timeout"))?
             .map_err(|_| RegistrarError::Etcd("keep_alive_receive"))?;
