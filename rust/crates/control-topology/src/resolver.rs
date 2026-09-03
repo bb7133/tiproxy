@@ -63,12 +63,13 @@ impl InterfaceAdvertiseResolver {
 
 impl AdvertiseEndpointResolver for InterfaceAdvertiseResolver {
     fn resolve(&self, config: &TopologyConfig) -> Result<Arc<str>, String> {
-        let candidates = (self.candidates)();
+        // The candidate provider is called lazily so an override or a concrete
+        // bind host never triggers an interface scan.
         select_advertise_host(
             config.advertise_host_override.as_deref(),
             &config.bind_sql_host,
             &config.ha_virtual_ip,
-            &candidates,
+            || (self.candidates)(),
         )
     }
 }
@@ -104,7 +105,7 @@ fn select_advertise_host(
     override_host: Option<&str>,
     bind_host: &str,
     ha_virtual_ip: &str,
-    candidates: &[IpAddr],
+    candidates: impl FnOnce() -> Vec<IpAddr>,
 ) -> Result<Arc<str>, String> {
     if let Some(override_host) = override_host {
         let override_host = override_host.trim();
@@ -116,8 +117,8 @@ fn select_advertise_host(
     if !bind_host.is_empty() && !is_wildcard_bind(bind_host) {
         return Ok(Arc::from(bind_host));
     }
-    for candidate in candidates {
-        if !is_global_unicast(candidate) {
+    for candidate in candidates() {
+        if !is_global_unicast(&candidate) {
             continue;
         }
         let text = candidate.to_string();
@@ -141,8 +142,9 @@ fn is_wildcard_bind(host: &str) -> bool {
     }
 }
 
-/// A conservative global-unicast test matching Go `IsGlobalUnicast`'s intent:
-/// exclude loopback, unspecified, multicast, broadcast, and link-local.
+/// A global-unicast test matching Go `IsGlobalUnicast`'s intent: exclude
+/// loopback, unspecified, multicast, broadcast, and link-local (both the IPv4
+/// `169.254.0.0/16` and the IPv6 `fe80::/10` link-local ranges).
 fn is_global_unicast(address: &IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
@@ -153,9 +155,20 @@ fn is_global_unicast(address: &IpAddr) -> bool {
                 && !address.is_link_local()
         }
         IpAddr::V6(address) => {
-            !address.is_loopback() && !address.is_unspecified() && !address.is_multicast()
+            !address.is_loopback()
+                && !address.is_unspecified()
+                && !address.is_multicast()
+                && !is_ipv6_unicast_link_local(address)
         }
     }
+}
+
+/// Whether an IPv6 address is in the `fe80::/10` link-local range.
+///
+/// Implemented directly on the leading segment because
+/// `Ipv6Addr::is_unicast_link_local` is not yet stable.
+fn is_ipv6_unicast_link_local(address: &std::net::Ipv6Addr) -> bool {
+    (address.segments()[0] & 0xffc0) == 0xfe80
 }
 
 #[cfg(test)]
@@ -172,38 +185,52 @@ mod tests {
     fn wildcard_bind_selects_first_global_unicast_candidate() {
         // 0.0.0.0 bind with a port range's first port handled elsewhere; here
         // the host resolves to the first global-unicast candidate.
-        let candidates = [ip("127.0.0.1"), ip("10.0.0.7"), ip("10.0.0.8")];
-        let host = select_advertise_host(None, "0.0.0.0", "", &candidates)
-            .unwrap_or_else(|_| unreachable!("a candidate is available"));
+        let host = select_advertise_host(None, "0.0.0.0", "", || {
+            vec![ip("127.0.0.1"), ip("10.0.0.7"), ip("10.0.0.8")]
+        })
+        .unwrap_or_else(|_| unreachable!("a candidate is available"));
         assert_eq!(host.as_ref(), "10.0.0.7");
     }
 
     #[test]
-    fn explicit_dns_override_is_not_rewritten() {
-        let candidates = [ip("10.0.0.7")];
-        let host = select_advertise_host(Some("proxy.dns.local"), "0.0.0.0", "", &candidates)
-            .unwrap_or_else(|_| unreachable!("override wins"));
+    fn explicit_dns_override_is_not_rewritten_and_skips_interface_scan() {
+        // The provider must not even run when an override is present.
+        let host = select_advertise_host(Some("proxy.dns.local"), "0.0.0.0", "", || {
+            unreachable!("override must not trigger an interface scan")
+        })
+        .unwrap_or_else(|_| unreachable!("override wins"));
         assert_eq!(host.as_ref(), "proxy.dns.local");
     }
 
     #[test]
     fn ha_virtual_ip_candidate_is_excluded() {
         // Go excludes a candidate that is a prefix of the HA virtual IP.
-        let candidates = [ip("10.0.0.5"), ip("10.0.0.9")];
-        let host = select_advertise_host(None, "::", "10.0.0.5/24", &candidates)
-            .unwrap_or_else(|_| unreachable!("a non-VIP candidate is available"));
+        let host = select_advertise_host(None, "::", "10.0.0.5/24", || {
+            vec![ip("10.0.0.5"), ip("10.0.0.9")]
+        })
+        .unwrap_or_else(|_| unreachable!("a non-VIP candidate is available"));
         assert_eq!(host.as_ref(), "10.0.0.9");
     }
 
     #[test]
-    fn concrete_bind_host_is_kept() {
-        let host = select_advertise_host(None, "192.168.1.10", "", &[])
-            .unwrap_or_else(|_| unreachable!("concrete bind host is kept"));
+    fn ipv6_link_local_candidate_is_skipped() {
+        // fe80::/10 is link-local, not global-unicast (Go IsGlobalUnicast).
+        let host = select_advertise_host(None, "::", "", || vec![ip("fe80::1"), ip("2001:db8::1")])
+            .unwrap_or_else(|_| unreachable!("a global candidate is available"));
+        assert_eq!(host.as_ref(), "2001:db8::1");
+    }
+
+    #[test]
+    fn concrete_bind_host_is_kept_and_skips_interface_scan() {
+        let host = select_advertise_host(None, "192.168.1.10", "", || {
+            unreachable!("concrete bind host must not trigger an interface scan")
+        })
+        .unwrap_or_else(|_| unreachable!("concrete bind host is kept"));
         assert_eq!(host.as_ref(), "192.168.1.10");
     }
 
     #[test]
     fn wildcard_bind_without_candidate_fails_closed() {
-        assert!(select_advertise_host(None, "0.0.0.0", "", &[ip("127.0.0.1")]).is_err());
+        assert!(select_advertise_host(None, "0.0.0.0", "", || vec![ip("127.0.0.1")]).is_err());
     }
 }

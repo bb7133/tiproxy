@@ -41,14 +41,10 @@
 //! has no in-process consumer until routing lands; wiring a per-cluster poll
 //! loop is a dependent follow-up.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_config::{
-    BackendClusterConfig, ClientTlsConfig, ConfigNamespaceSnapshot, ConfigNamespaceSource,
-    TopologyRuntimeIdentity,
-};
+use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceSource, TopologyRuntimeIdentity};
 use control_external::{EtcdClientConfig, EtcdConnector};
 use control_plane::{
     ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture, OwnerToken,
@@ -174,8 +170,12 @@ impl TopologyModule {
         // Apply the current generation once (including generation 1), then wait
         // for changes; borrowing after `subscribe` avoids a dropped edge.
         let initial = updates.borrow_and_update().clone();
-        self.reconfigure(&mut children, &mut active_plan, &initial, &owner)
-            .await?;
+        if !self
+            .reconfigure(&mut children, &mut active_plan, &initial, &owner)
+            .await
+        {
+            return Err(module_error("initial_generation_rejected"));
+        }
         let _ = self.ready.send_replace(true);
 
         loop {
@@ -192,13 +192,13 @@ impl TopologyModule {
                         return Err(module_error("config_source_stopped"));
                     }
                     let snapshot = updates.borrow_and_update().clone();
-                    if let Err(error) = self
+                    // A rejected generation (unresolvable advertise, build
+                    // failure, or a factory result that does not match the
+                    // configured cluster set) retains the last-good
+                    // registration rather than tearing it down.
+                    let _ = self
                         .reconfigure(&mut children, &mut active_plan, &snapshot, &owner)
-                        .await
-                    {
-                        stop_children(&mut children).await;
-                        return Err(error);
-                    }
+                        .await;
                 }
                 exited = children.tasks.join_next(), if !children.tasks.is_empty() => {
                     // A child completed while we were not tearing it down: an
@@ -215,25 +215,32 @@ impl TopologyModule {
 
     /// Reconciles the per-cluster registration children for one generation.
     ///
-    /// A [`RegistrationPlan`] is derived first; if it equals the active plan the
-    /// call is a no-op, so a config generation that does not change registration
-    /// (e.g. a namespace or log-level edit) causes no lease flap. Otherwise the
-    /// new client set is built and validated *before* the old children are
-    /// stopped and joined, so no retired-generation write can race a new one.
+    /// Returns `true` when registration is in a good applied state (either
+    /// freshly applied or an unchanged no-op) and `false` when the generation
+    /// was rejected and the previous good state was retained.
+    ///
+    /// The client set is built every generation, so a TLS content rotation
+    /// (same paths, new PEM) is read here and produces a different plan. The
+    /// [`RegistrationPlan`] holds the built [`EtcdClientConfig`] set itself
+    /// (which compares endpoints and PEM bytes), so an equal plan is a genuine
+    /// no-op — a namespace or log-level edit does not flap leases — while any
+    /// material or endpoint change rebuilds. The factory result is closed-loop
+    /// validated against the configured cluster set, and everything is checked
+    /// *before* the old children are stopped, so a rejected generation never
+    /// tears down a working registration and no retired write races a new one.
     async fn reconfigure(
         &self,
         children: &mut Children,
         active_plan: &mut Option<RegistrationPlan>,
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
-    ) -> Result<(), ModuleError> {
-        let topology = snapshot
-            .topology()
-            .map_err(|_| module_error("topology_config"))?;
-        let advertise_host = self
-            .resolver
-            .resolve(&topology)
-            .map_err(|_| module_error("advertise_resolve"))?;
+    ) -> bool {
+        let Ok(topology) = snapshot.topology() else {
+            return false;
+        };
+        let Ok(advertise_host) = self.resolver.resolve(&topology) else {
+            return false;
+        };
         let info = TopologyInfo::new(
             &advertise_host,
             topology.sql_port,
@@ -243,27 +250,43 @@ impl TopologyModule {
             &self.identity.deploy_path.to_string_lossy(),
             self.identity.start_timestamp,
         );
+        // Build every generation: this reads the PEM material, so a rotation is
+        // observed here rather than swallowed by a path-only comparison.
+        let Ok(mut clusters) = self.factory.build(&topology) else {
+            return false;
+        };
+        clusters.sort_by(|left, right| left.cluster_name.cmp(&right.cluster_name));
+
+        // Closed-loop validation: the built set must match the configured
+        // cluster names exactly, with no duplicate, missing, extra, or renamed
+        // cluster. This runs before any state is mutated.
+        let built: Vec<&str> = clusters.iter().map(|c| c.cluster_name.as_ref()).collect();
+        if built.windows(2).any(|pair| pair[0] == pair[1]) {
+            return false;
+        }
+        let mut expected: Vec<&str> = topology
+            .backend_clusters
+            .iter()
+            .map(|cluster| cluster.name.as_ref())
+            .collect();
+        expected.sort_unstable();
+        if built != expected {
+            return false;
+        }
+
         let plan = RegistrationPlan {
             info: info.clone(),
-            backend_clusters: Arc::clone(&topology.backend_clusters),
-            cluster_tls: topology.cluster_tls.clone(),
+            clusters: clusters
+                .iter()
+                .map(|cluster| PlannedCluster {
+                    name: Arc::clone(&cluster.cluster_name),
+                    client: cluster.client.clone(),
+                })
+                .collect(),
         };
         if active_plan.as_ref() == Some(&plan) {
             // Nothing that affects registration changed; keep the children.
-            return Ok(());
-        }
-
-        // Build and validate the new client set before retiring the old one
-        // (prospective validation: a bad transport fails here, not mid-swap).
-        let clusters = self
-            .factory
-            .build(&topology)
-            .map_err(|_| module_error("topology_client_build"))?;
-        let mut names = BTreeSet::new();
-        for cluster in &clusters {
-            if !names.insert(Arc::clone(&cluster.cluster_name)) {
-                return Err(module_error("duplicate_cluster_name"));
-            }
+            return true;
         }
 
         // Fence: retire the previous generation before the new one publishes.
@@ -287,20 +310,28 @@ impl TopologyModule {
             });
         }
         *active_plan = Some(plan);
-        Ok(())
+        true
     }
 }
 
-/// The registration-affecting projection of one configuration generation.
+/// The registration-determining projection of one configuration generation:
+/// the resolved published info and the built, name-sorted client set.
 ///
-/// Two generations with an equal plan produce identical registrations, so the
-/// module can skip a rebuild (and its lease flap) when only unrelated
-/// configuration changed.
-#[derive(Clone, PartialEq, Eq)]
+/// Equality is the no-flap decision. The built [`EtcdClientConfig`]s carry the
+/// endpoints and PEM material actually in use, so an equal plan guarantees an
+/// identical registration. The type deliberately has no `Debug`, so credential
+/// material never reaches a log or diagnostic through it.
+#[derive(PartialEq, Eq)]
 struct RegistrationPlan {
     info: TopologyInfo,
-    backend_clusters: Arc<[BackendClusterConfig]>,
-    cluster_tls: ClientTlsConfig,
+    clusters: Vec<PlannedCluster>,
+}
+
+/// One planned cluster registration: its name and the exact built client.
+#[derive(PartialEq, Eq)]
+struct PlannedCluster {
+    name: Arc<str>,
+    client: EtcdClientConfig,
 }
 
 impl ControlModule for TopologyModule {
