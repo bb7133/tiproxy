@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `control_topology` control-plane module.
+//! The `control_topology` self-registration module.
 //!
-//! [`TopologyModule`] mounts self-registration into the shared
-//! [`control_plane::ControlModuleSet`]. It subscribes to the injected
+//! [`TopologyModule`] is a [`control_plane::ControlModule`] that runs
+//! self-registration. It subscribes to the injected
 //! [`control_config::ConfigNamespaceStore`], and for every configuration
 //! generation it fans one [`crate::registrar::run`] loop out per backend
 //! cluster (Go keeps one `InfoSyncer` per cluster), each publishing the same
 //! [`TopologyInfo`] under its own per-instance lease.
+//!
+//! This slice is a registration foundation: the binary does not yet add it to
+//! its [`control_plane::ControlModuleSet`], and topology discovery is not yet
+//! driven (see the scope note below). It is not a full topology mount and does
+//! not on its own make topology ready for routing.
 //!
 //! # Generation fence
 //!
@@ -37,6 +42,7 @@
 //! loop is a dependent follow-up.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use control_config::{
     ConfigNamespaceSnapshot, ConfigNamespaceSource, ConfigNamespaceStore, TopologyRuntimeIdentity,
@@ -46,7 +52,13 @@ use control_plane::{
     ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture, OwnerToken,
 };
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
+
+use crate::registrar::RegistrarError;
+
+/// Grace period for a retired generation's children to deregister before they
+/// are aborted, so a wedged child can never block a reconfigure or shutdown.
+const CHILD_STOP_GRACE: Duration = Duration::from_secs(5);
 
 use crate::register::TopologyInfo;
 
@@ -93,11 +105,12 @@ pub struct TopologyModule {
     ready: watch::Sender<bool>,
 }
 
-/// Readiness handle returned alongside a [`TopologyModule`].
+/// Registration-readiness handle returned alongside a [`TopologyModule`].
 ///
 /// The composition root waits on [`TopologyModuleHandle::wait_ready`] before
-/// starting modules that depend on the initial topology snapshot, mirroring the
-/// frozen readiness order (config initial -> topology initial -> routing).
+/// starting modules that depend on registration having begun. This signals only
+/// that the initial generation's registration children are spawned; it does not
+/// assert a published topology-discovery snapshot, which a later slice owns.
 pub struct TopologyModuleHandle {
     ready: watch::Receiver<bool>,
 }
@@ -106,8 +119,9 @@ impl TopologyModuleHandle {
     /// Resolves once the module has applied its initial configuration
     /// generation and spawned the registration children.
     ///
-    /// "Ready" is a local determinism guarantee: it does not require PD to be
-    /// reachable; registration keeps retrying underneath.
+    /// This is a local determinism guarantee that registration has begun: it
+    /// does not require PD to be reachable (registration keeps retrying
+    /// underneath) and does not imply a topology snapshot has been published.
     ///
     /// # Errors
     ///
@@ -144,7 +158,7 @@ impl TopologyModule {
         let owner = context.owner().clone();
         let mut lifecycle = context.lifecycle();
         let mut updates = self.source.subscribe();
-        let mut children: Vec<Child> = Vec::new();
+        let mut children = Children::default();
 
         // Apply the current generation once (including generation 1), then wait
         // for changes; borrowing after `subscribe` avoids a dropped edge.
@@ -171,6 +185,15 @@ impl TopologyModule {
                         return Err(error);
                     }
                 }
+                exited = children.tasks.join_next(), if !children.tasks.is_empty() => {
+                    // A child completed while we were not tearing it down: an
+                    // unexpected retirement, owner loss, or panic. Fail loud so
+                    // the runtime does not treat an unregistered proxy as healthy.
+                    if exited.is_some() {
+                        stop_children(&mut children).await;
+                        return Err(module_error("registration_child_exited"));
+                    }
+                }
             }
         }
     }
@@ -181,7 +204,7 @@ impl TopologyModule {
     /// stopped and joined, so no retired-generation write can race a new one.
     async fn reconfigure(
         &self,
-        children: &mut Vec<Child>,
+        children: &mut Children,
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
     ) -> Result<(), ModuleError> {
@@ -207,15 +230,17 @@ impl TopologyModule {
         for cluster in clusters {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let connector = EtcdConnector::new(owner.clone(), cluster.client);
+            let child_owner = owner.clone();
             let child_info = info.clone();
-            let task = tokio::spawn(async move {
-                // A child that returns simply retires; the loop already
-                // performed its own best-effort cleanup.
-                let _ = Box::pin(crate::registrar::run(connector, child_info, shutdown_rx)).await;
-            });
-            children.push(Child {
-                shutdown: shutdown_tx,
-                task,
+            children.shutdowns.push(shutdown_tx);
+            children.tasks.spawn(async move {
+                Box::pin(crate::registrar::run(
+                    child_owner,
+                    connector,
+                    child_info,
+                    shutdown_rx,
+                ))
+                .await
             });
         }
         Ok(())
@@ -232,22 +257,33 @@ impl ControlModule for TopologyModule {
     }
 }
 
-/// A running per-cluster registration child and its stop signal.
-struct Child {
-    shutdown: watch::Sender<bool>,
-    task: JoinHandle<()>,
+/// The running per-cluster registration children and their stop signals.
+///
+/// The tasks live in a [`JoinSet`] so the module can both supervise them (an
+/// unexpected exit is observable) and reliably retire them.
+#[derive(Default)]
+struct Children {
+    shutdowns: Vec<watch::Sender<bool>>,
+    tasks: JoinSet<Result<(), RegistrarError>>,
 }
 
-/// Signals every child to stop, then joins them all.
+/// Signals every child to stop, joins them within a grace period, and aborts
+/// any that do not retire in time.
 ///
-/// Signalling first lets the children deregister concurrently; the joins then
-/// guarantee no child is still writing when the caller proceeds.
-async fn stop_children(children: &mut Vec<Child>) {
-    for child in children.iter() {
-        let _ = child.shutdown.send(true);
+/// Signalling first lets the children deregister concurrently; the bounded join
+/// plus abort backstop guarantees this returns even if a child is wedged, so a
+/// reconfigure or shutdown can never deadlock on a stuck registration.
+async fn stop_children(children: &mut Children) {
+    for shutdown in children.shutdowns.drain(..) {
+        let _ = shutdown.send(true);
     }
-    for child in children.drain(..) {
-        let _ = child.task.await;
+    let drained = tokio::time::timeout(CHILD_STOP_GRACE, async {
+        while children.tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        children.tasks.abort_all();
+        while children.tasks.join_next().await.is_some() {}
     }
 }
 

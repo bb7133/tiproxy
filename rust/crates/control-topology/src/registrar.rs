@@ -43,6 +43,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_external::{EtcdConnectError, EtcdConnection, EtcdConnector, EtcdOperationError};
+use control_plane::OwnerToken;
 use etcd_client::{DeleteOptions, LeaseKeepAliveStream, LeaseKeeper, PutOptions};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -56,6 +57,9 @@ use crate::register::{
 /// Lease keepalive cadence: a third of the lease TTL, so two consecutive missed
 /// refreshes still leave headroom before expiry.
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
+/// Bound on one keepalive response wait, so a hung stream can never wedge the
+/// loop (and therefore never wedge a caller joining this task on shutdown).
+const KEEPALIVE_RECEIVE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Backoff between failed session-establishment attempts. Matches Go
 /// `putRetryIntvl`; establishment itself retries until the caller shuts down.
 const ESTABLISH_BACKOFF: Duration = Duration::from_secs(1);
@@ -79,6 +83,8 @@ pub enum RegistrarError {
 ///
 /// The `shutdown` channel is the cooperative stop signal: setting it to `true`
 /// makes the loop delete its registration (best effort) and return `Ok(())`.
+/// `owner` fences every keepalive round so a retired generation stops
+/// publishing even while its keepalive stream is otherwise healthy.
 ///
 /// # Errors
 ///
@@ -86,6 +92,7 @@ pub enum RegistrarError {
 /// released while running, or [`RegistrarError::Etcd`] only if a session can
 /// never be established before shutdown is observed on a fatal path.
 pub async fn run(
+    owner: OwnerToken,
     connector: EtcdConnector,
     info: TopologyInfo,
     mut shutdown: watch::Receiver<bool>,
@@ -96,7 +103,7 @@ pub async fn run(
     loop {
         // Establish a session, retrying until it succeeds or shutdown wins.
         let mut session = loop {
-            match Session::establish(&connector, &info).await {
+            match Session::establish(&owner, &connector, &info).await {
                 Ok(session) => break session,
                 Err(RegistrarError::OwnerLost) => return Ok(()),
                 Err(RegistrarError::Etcd(_)) => {
@@ -172,6 +179,7 @@ impl RegistrationWrite {
 
 /// An established registration lease and its keepalive stream.
 struct Session {
+    owner: OwnerToken,
     connection: EtcdConnection,
     lease_id: i64,
     keeper: LeaseKeeper,
@@ -182,6 +190,7 @@ impl Session {
     /// Connects, grants a lease, opens its keepalive stream, and performs the
     /// initial publish.
     async fn establish(
+        owner: &OwnerToken,
         connector: &EtcdConnector,
         info: &TopologyInfo,
     ) -> Result<Self, RegistrarError> {
@@ -202,6 +211,7 @@ impl Session {
             .await
             .map_err(|error| map_operation_error(&error))?;
         let mut session = Self {
+            owner: owner.clone(),
             connection,
             lease_id,
             keeper,
@@ -247,16 +257,25 @@ impl Session {
 
     /// Drives one lease keepalive round. `Ok(false)` means the lease is gone and
     /// the session must be rebuilt.
+    ///
+    /// The owner generation is checked before and after the round so a retired
+    /// generation stops renewing even while its stream is healthy, and the
+    /// response wait is bounded so a hung stream can never wedge the loop.
     async fn keep_alive(&mut self) -> Result<bool, RegistrarError> {
+        if !self.owner.is_current() {
+            return Err(RegistrarError::OwnerLost);
+        }
         self.keeper
             .keep_alive()
             .await
             .map_err(|_| RegistrarError::Etcd("keep_alive_send"))?;
-        let response = self
-            .stream
-            .message()
+        let response = time::timeout(KEEPALIVE_RECEIVE_TIMEOUT, self.stream.message())
             .await
+            .map_err(|_| RegistrarError::Etcd("keep_alive_timeout"))?
             .map_err(|_| RegistrarError::Etcd("keep_alive_receive"))?;
+        if !self.owner.is_current() {
+            return Err(RegistrarError::OwnerLost);
+        }
         match response {
             Some(response) if response.id() == self.lease_id && response.ttl() > 0 => Ok(true),
             _ => Ok(false),
