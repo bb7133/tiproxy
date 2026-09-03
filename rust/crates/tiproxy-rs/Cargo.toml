@@ -12,6 +12,9 @@ build = "build.rs"
 default = []
 
 [dependencies]
+control-config.workspace = true
+control-etcd.workspace = true
+control-external.workspace = true
 control-plane.workspace = true
 control-proto.workspace = true
 dataplane.workspace = true

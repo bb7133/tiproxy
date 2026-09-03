@@ -28,6 +28,7 @@ mod session;
 
 pub use config::{ElectionConfig, ElectionConfigError};
 pub use session::{
-    ElectionError, ElectionSession, ElectionSnapshot, ElectionState, RecoveryOutcome,
+    ElectionError, ElectionSession, ElectionSnapshot, ElectionState, PersistentDeleteResult,
+    PersistentPutMode, PersistentPutOutcome, PersistentPutResult, RecoveryOutcome,
     RetirementReason, WatchOutcome,
 };

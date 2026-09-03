@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/control-config",
     "crates/control-etcd",
     "crates/control-external",
     "crates/control-plane",
@@ -22,7 +23,9 @@ license = "Apache-2.0"
 repository = "https://github.com/pingcap/tiproxy"
 
 [workspace.dependencies]
+crc32fast = { version = "=1.5.1", default-features = false }
 getrandom = "=0.2.17"
+control-config = { path = "crates/control-config", version = "0.1.0" }
 control-external = { path = "crates/control-external", version = "0.1.0" }
 control-etcd = { path = "crates/control-etcd", version = "0.1.0" }
 control-plane = { path = "crates/control-plane", version = "0.1.0" }
@@ -37,6 +40,7 @@ http = { version = "=1.3.1", default-features = false }
 libc = { version = "=0.2.189", default-features = false }
 mysql-wire = { path = "crates/mysql-wire", version = "0.1.0" }
 proxy-io = { path = "crates/proxy-io", version = "0.1.0" }
+serde = { version = "=1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
 session-core = { path = "crates/session-core", version = "0.1.0" }
 prost = { version = "=0.14.1", default-features = false, features = ["derive", "std"] }
@@ -48,6 +52,7 @@ socket2 = { version = "=0.6.1", default-features = false, features = ["all"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "=1.47.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 thiserror = { version = "=2.0.17", default-features = false }
+toml = { version = "=0.9.8", default-features = false, features = ["display", "parse", "serde"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["codegen", "server", "transport"] }
 tonic-prost = { version = "=0.14.6", default-features = false }
 x509-parser = { version = "=0.18.1", default-features = false }

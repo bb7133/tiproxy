@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+mod config_composition;
 mod health;
 
 use std::env;
@@ -24,9 +25,17 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use config_composition::{
+    ConfigServingAdapter, RustConfigComposer, ServingCandidateValidator, control_config,
+};
+use control_config::{
+    ConfigModule, ConfigModuleHandle, ConfigModuleOptions, ConfigNamespaceSource,
+};
+use control_etcd::ElectionConfig;
+use control_external::{EtcdClientConfig, EtcdTlsConfig};
 use control_plane::{
-    ConfigSource, ControlConfig, ControlRuntime as InProcessControlRuntime, JsonStderrSink,
-    LifecyclePhase, LogLevel, MetricsPolicy, OwnershipRegistry, ShutdownReason, TlsPolicy,
+    ConfigSource, ControlModuleSet, ControlRuntime as InProcessControlRuntime, JsonStderrSink,
+    LifecyclePhase, OwnershipRegistry, ShutdownReason,
 };
 use control_proto::CONTROL_PROTOCOL_V1;
 use control_proto::control_transport::ClientConfig;
@@ -51,6 +60,7 @@ const BUILD_TIME: &str = env!("TIPROXY_BUILD_TIME");
 const CONTROL_SOCKET_ENV: &str = "TIPROXY_CONTROL_SOCKET";
 const CONTROL_UID_ENV: &str = "TIPROXY_CONTROL_UID";
 const TLS_ROOTS_ENV: &str = "TIPROXY_TLS_ROOTS";
+const CONFIG_FILE_ENV: &str = "TIPROXY_CONFIG";
 
 /// Upper bound for `--drain-grace-seconds` (30 days, the drain
 /// subsystem's shared deadline cap): far above any real grace and small
@@ -59,10 +69,11 @@ const MAX_DRAIN_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
+    config_file: PathBuf,
     control_socket: PathBuf,
     control_uid: u32,
     tls_roots: Vec<PathBuf>,
-    drain_grace: Duration,
+    drain_grace: Option<Duration>,
     health_port: u16,
 }
 
@@ -130,20 +141,30 @@ async fn run(options: Options) -> Result<(), String> {
         .try_into()
         .unwrap_or(u64::MAX);
     let process_id = format!("tiproxy-rs-{}", std::process::id());
+    let config_owner = load_config_owner(&options, &process_id)?;
+    let initial_config = control_config(
+        config_owner.handle.source().current().as_ref(),
+        options.health_port,
+        &config_owner.tls_roots,
+        options.drain_grace,
+    )?;
     let in_process_registry = OwnershipRegistry::new();
-    let in_process = InProcessControlRuntime::claim_process(
-        &in_process_registry,
-        process_id.clone(),
-        initial_control_config(&options)?,
-        Arc::new(JsonStderrSink),
-    )
-    .map_err(|error| format!("start in-process control runtime: {error}"))?;
+    let in_process = Arc::new(
+        InProcessControlRuntime::claim_process(
+            &in_process_registry,
+            process_id.clone(),
+            initial_config,
+            Arc::new(JsonStderrSink),
+        )
+        .map_err(|error| format!("start in-process control runtime: {error}"))?,
+    );
     let in_process_config = in_process.handle().config().current();
     let capabilities = vec![
         ControlCapability::PerConnectionClose as u64,
         ControlCapability::ReconcileConnections as u64,
         ControlCapability::ReconcileSessionRehydration as u64,
         ControlCapability::MeteringAbsoluteSnapshots as u64,
+        ControlCapability::RustConfigNamespace as u64,
     ];
     let hello = Hello {
         role: Role::RustDataplane as i32,
@@ -165,14 +186,13 @@ async fn run(options: Options) -> Result<(), String> {
     let mut client =
         ClientConfig::with_defaults(options.control_socket, options.control_uid, hello);
     client.required_capabilities = capabilities;
-    let store = SnapshotStore::new(in_process_config.tls().roots().to_vec())
-        .map_err(|error| format!("create snapshot store: {error}"))?;
+    let store = config_owner.snapshots.clone();
 
     // DPL-04: the real session owner replaces DPL-03's parked handler.
     // Sessions share the control client with the runtime; the drain and
     // session-shutdown watches drive the coordinated local shutdown.
     let shared_client = Arc::new(ControlClient::new(client).map_err(|error| error.to_string())?);
-    let (drain_tx, drain_rx) = watch::channel(false);
+    let (drain_tx, drain_rx) = watch::channel(None::<Duration>);
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
     let (metering_shutdown_tx, metering_shutdown_rx) = watch::channel(false);
     let loop_config = session_loop_config(in_process_config.drain_grace());
@@ -189,20 +209,49 @@ async fn run(options: Options) -> Result<(), String> {
         .with_metering(metering.clone()),
     );
     let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
-    let (consumer, serving) = DataplaneSnapshotConsumer::new(
+    let composer = Arc::new(RustConfigComposer::new(
+        config_owner.handle.source().clone(),
+        options.drain_grace,
+    ));
+    let (consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
         Arc::new(SystemMemoryProbe::new()),
         Arc::new(connection_handler),
+        composer,
     );
     // Forced shutdown lets each session owner finish its bounded
     // terminal work (close notice + engine join) before the abort
     // backstop fires.
     let consumer =
         consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
+    let runtime_handle = in_process.handle();
+    let mut modules = ControlModuleSet::new(&runtime_handle);
+    modules
+        .spawn(config_owner.module)
+        .map_err(|error| format!("start config owner module: {error}"))?;
+    // Persistent `/config` is part of generation one. Do not let the legacy
+    // bridge open SQL listeners against the file-only base while the initial
+    // linearizable relist is still outstanding.
+    config_owner
+        .handle
+        .wait_ready()
+        .await
+        .map_err(|error| format!("initialize config owner: {error}"))?;
+    modules
+        .spawn(ConfigServingAdapter::new(
+            config_owner.handle.source().clone(),
+            serving.clone(),
+            store.clone(),
+            Arc::clone(&in_process),
+            options.health_port,
+            config_owner.tls_roots,
+            options.drain_grace,
+        ))
+        .map_err(|error| format!("start config serving adapter: {error}"))?;
     let runtime = spawn_control_runtime_with_client_and_handler(
         Arc::clone(&shared_client),
         Duration::from_millis(100),
         8,
-        store,
+        store.clone(),
         consumer,
         dispatch_handler,
     );
@@ -246,7 +295,7 @@ async fn run(options: Options) -> Result<(), String> {
     let mut control_runtime = tokio::spawn(runtime.join());
     let mut metering_sampler = metering_sampler;
     let mut termination = Box::pin(wait_for_termination_signal());
-    let (control_result, sampler_result, serving_result) = tokio::select! {
+    let (control_result, sampler_result, serving_result, module_result) = tokio::select! {
         control = &mut control_runtime => {
             let control = match control {
                 Ok(result) => result.map_err(|error| error.to_string()),
@@ -264,14 +313,13 @@ async fn run(options: Options) -> Result<(), String> {
                 &serving,
                 &drain_tx,
                 &session_shutdown_tx,
-                in_process_config.drain_grace(),
             ).await;
             metering_shutdown_tx.send_replace(true);
             let sampler = match metering_sampler.await {
                 Ok(result) => result.map_err(|error| error.to_string()),
                 Err(_) => Err("metering sampler panicked".to_owned()),
             };
-            (control, sampler, serving_result)
+            (control, sampler, serving_result, Ok(()))
         }
         sampler = &mut metering_sampler => {
             let sampler = match sampler {
@@ -293,7 +341,6 @@ async fn run(options: Options) -> Result<(), String> {
                 &serving,
                 &drain_tx,
                 &session_shutdown_tx,
-                in_process_config.drain_grace(),
             ).await;
             metering_shutdown_tx.send_replace(true);
             shared_client.shutdown();
@@ -301,7 +348,7 @@ async fn run(options: Options) -> Result<(), String> {
                 Ok(result) => result.map_err(|error| error.to_string()),
                 Err(_) => Err("control runtime supervisor panicked".to_owned()),
             };
-            (control, sampler, serving_result)
+            (control, sampler, serving_result, Ok(()))
         }
         () = &mut termination => {
             in_process
@@ -312,7 +359,6 @@ async fn run(options: Options) -> Result<(), String> {
                 &serving,
                 &drain_tx,
                 &session_shutdown_tx,
-                in_process_config.drain_grace(),
             ).await;
             metering_shutdown_tx.send_replace(true);
             let sampler = match metering_sampler.await {
@@ -324,9 +370,37 @@ async fn run(options: Options) -> Result<(), String> {
                 Ok(result) => result.map_err(|error| error.to_string()),
                 Err(_) => Err("control runtime supervisor panicked".to_owned()),
             };
-            (control, sampler, serving_result)
+            (control, sampler, serving_result, Ok(()))
+        }
+        module = modules.join_next() => {
+            let failure = match module {
+                Some(exit) => match exit.result {
+                    Ok(()) => format!("control module {} exited unexpectedly", exit.module),
+                    Err(error) => format!("control module {} failed: {error}", exit.module),
+                },
+                None => "control module executor became empty unexpectedly".to_owned(),
+            };
+            in_process.fail("control_module", "runtime_failure");
+            let serving_result = stop_drain_and_join_sessions(
+                &in_process,
+                &serving,
+                &drain_tx,
+                &session_shutdown_tx,
+            ).await;
+            metering_shutdown_tx.send_replace(true);
+            shared_client.shutdown();
+            let sampler = match metering_sampler.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("metering sampler panicked".to_owned()),
+            };
+            let control = match control_runtime.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("control runtime supervisor panicked".to_owned()),
+            };
+            (control, sampler, serving_result, Err(failure))
         }
     };
+    let module_executor_result = join_modules(&mut modules).await;
     if let Some(task) = health_task {
         task.abort();
         let _ = task.await;
@@ -339,8 +413,20 @@ async fn run(options: Options) -> Result<(), String> {
     sampler_result?;
     control_result?;
     serving_result?;
+    module_result?;
+    module_executor_result?;
     finish_result?;
     Ok(())
+}
+
+async fn join_modules(modules: &mut ControlModuleSet) -> Result<(), String> {
+    let mut result = Ok(());
+    while let Some(exit) = modules.join_next().await {
+        if let Err(error) = exit.result {
+            result = Err(format!("control module {} failed: {error}", exit.module));
+        }
+    }
+    result
 }
 
 /// Stops admission, lets the existing per-session graceful timers run, then
@@ -350,15 +436,18 @@ async fn run(options: Options) -> Result<(), String> {
 async fn stop_drain_and_join_sessions(
     runtime: &InProcessControlRuntime,
     serving: &DataplaneServingHandle,
-    drain: &watch::Sender<bool>,
+    drain: &watch::Sender<Option<Duration>>,
     session_shutdown: &watch::Sender<bool>,
-    grace: Duration,
 ) -> Result<(), String> {
     runtime
         .advance_shutdown(LifecyclePhase::Draining)
         .map_err(|error| format!("enter control runtime drain phase: {error}"))?;
     serving.stop_accepting().await;
-    drain.send_replace(true);
+    // Read after admission stops so a successfully committed dynamic update
+    // is the sole process-shutdown deadline. The launch-time snapshot must
+    // not silently pin this reloadable Go field for the process lifetime.
+    let grace = runtime.handle().config().current().drain_grace();
+    drain.send_replace(Some(grace));
     tokio::time::sleep(grace).await;
     session_shutdown.send_replace(true);
     let serving_result = serving
@@ -398,21 +487,126 @@ fn session_loop_config(drain_grace: Duration) -> SessionLoopConfig {
     }
 }
 
-/// Projects the process CLI into the first Rust-native control-domain view.
-/// Later CP-CFG work may replace it with a dynamic source without changing any
-/// module's in-process contract.
-fn initial_control_config(options: &Options) -> Result<ControlConfig, String> {
-    let tls = TlsPolicy::new(options.tls_roots.clone())
-        .map_err(|error| format!("validate in-process TLS policy: {error}"))?;
-    ControlConfig::new(
-        1,
+struct ConfigOwner {
+    module: ConfigModule,
+    handle: ConfigModuleHandle,
+    snapshots: SnapshotStore,
+    tls_roots: Vec<PathBuf>,
+}
+
+fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner, String> {
+    let current_dir = env::current_dir().map_err(|_| "resolve current directory".to_owned())?;
+    let base = ConfigModuleOptions {
+        config_file: Some(options.config_file.clone()),
+        advertise_addr: None,
+        current_dir,
+        etcd: None,
+        election: None,
+        persistence_factory: None,
+    };
+    let (_, bootstrap) = ConfigModule::load(base.clone())
+        .map_err(|error| format!("load initial Rust config source: {error}"))?;
+    let initial = bootstrap.source().current();
+
+    let mut tls_roots = options.tls_roots.clone();
+    tls_roots.extend(
+        initial
+            .effective()
+            .rust_tls_allowed_roots()
+            .iter()
+            .map(PathBuf::from),
+    );
+    tls_roots.sort();
+    tls_roots.dedup();
+    let snapshots = SnapshotStore::new(tls_roots.clone())
+        .map_err(|error| format!("create snapshot store: {error}"))?;
+    let (etcd, election) = persistence_options(initial.as_ref(), process_id)?;
+    let module_options = ConfigModuleOptions {
+        etcd,
+        election,
+        persistence_factory: Some(Arc::new(config_persistence_client)),
+        ..base
+    };
+    let validator = Arc::new(ServingCandidateValidator::new(
+        snapshots.clone(),
         options.drain_grace,
-        options.health_port,
-        tls,
-        LogLevel::Info,
-        MetricsPolicy::default(),
+    ));
+    let (module, handle) = ConfigModule::load_with_validator(module_options, validator)
+        .map_err(|error| format!("load validated Rust config owner: {error}"))?;
+    if handle.source().current().config_checksum() != initial.config_checksum() {
+        return Err("config file changed while initializing Rust config owner".to_owned());
+    }
+    Ok(ConfigOwner {
+        module,
+        handle,
+        snapshots,
+        tls_roots,
+    })
+}
+
+fn persistence_options(
+    snapshot: &control_config::ConfigNamespaceSnapshot,
+    process_id: &str,
+) -> Result<(Option<EtcdClientConfig>, Option<ElectionConfig>), String> {
+    let client = config_persistence_client(snapshot.effective())?;
+    if client.is_none() {
+        return Ok((None, None));
+    }
+    let election = ElectionConfig::new(
+        "/tiproxy/config/owner",
+        process_id,
+        format!("/tiproxy/config/session/{process_id}"),
+        30,
     )
-    .map_err(|error| format!("validate in-process control config: {error}"))
+    .map_err(|error| format!("validate config election: {error}"))?;
+    Ok((client, Some(election)))
+}
+
+fn config_persistence_client(
+    effective: &control_config::EffectiveConfig,
+) -> Result<Option<EtcdClientConfig>, String> {
+    let Some(persistence) = effective.config_persistence() else {
+        return Ok(None);
+    };
+    let endpoints = persistence
+        .pd_addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let tls = etcd_tls(&persistence.cluster_tls)?;
+    let client = EtcdClientConfig::new(endpoints, tls)
+        .map_err(|error| format!("validate config persistence client: {error}"))?;
+    Ok(Some(client))
+}
+
+fn etcd_tls(config: &control_config::ClientTlsConfig) -> Result<Option<EtcdTlsConfig>, String> {
+    if config.skip_ca_verification {
+        return Err("config persistence does not support skip-ca-verification".to_owned());
+    }
+    let configured = config.ca_path.is_some()
+        || config.certificate_path.is_some()
+        || config.private_key_path.is_some();
+    if !configured {
+        return Ok(None);
+    }
+    let ca_path = config
+        .ca_path
+        .as_deref()
+        .ok_or_else(|| "config persistence TLS requires a CA".to_owned())?;
+    let ca = std::fs::read(ca_path).map_err(|_| "read config persistence TLS CA".to_owned())?;
+    let certificate = read_optional_tls(config.certificate_path.as_deref(), "certificate")?;
+    let key = read_optional_tls(config.private_key_path.as_deref(), "private key")?;
+    EtcdTlsConfig::new(ca, certificate, key, None)
+        .map(Some)
+        .map_err(|error| format!("validate config persistence TLS: {error}"))
+}
+
+fn read_optional_tls(
+    path: Option<&std::path::Path>,
+    kind: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    path.map(|path| std::fs::read(path).map_err(|_| format!("read config persistence TLS {kind}")))
+        .transpose()
 }
 
 /// Resolves on SIGTERM or SIGINT.
@@ -433,6 +627,7 @@ async fn wait_for_termination_signal() {
 
 fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut arguments = arguments.into_iter();
+    let mut config_file = env::var_os(CONFIG_FILE_ENV).map(PathBuf::from);
     let mut socket = env::var_os(CONTROL_SOCKET_ENV).map(PathBuf::from);
     let mut uid = env::var(CONTROL_UID_ENV)
         .ok()
@@ -441,13 +636,20 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let mut tls_roots: Vec<PathBuf> = env::var_os(TLS_ROOTS_ENV)
         .map(|value| env::split_paths(&value).collect())
         .unwrap_or_default();
-    let mut drain_grace = Duration::from_secs(30);
+    let mut drain_grace = None;
     let mut health_port: u16 = 0;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--version" | "-V" => return Ok(Command::Version),
             "--help" | "-h" => return Ok(Command::Help),
             "--integration-capabilities" => return Ok(Command::IntegrationCapabilities),
+            "--config" => {
+                config_file = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--config requires a path".to_owned())?,
+                ));
+            }
             "--control-socket" => {
                 socket =
                     Some(PathBuf::from(arguments.next().ok_or_else(|| {
@@ -487,7 +689,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                          (30 days), got {seconds}"
                     ));
                 }
-                drain_grace = Duration::from_secs(seconds);
+                drain_grace = Some(Duration::from_secs(seconds));
             }
             _ => return Err(format!("unknown argument {argument:?}")),
         }
@@ -501,6 +703,8 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         return Err("TLS allowlist roots must be absolute".to_owned());
     }
     Ok(Command::Run(Options {
+        config_file: config_file
+            .ok_or_else(|| format!("--config or {CONFIG_FILE_ENV} is required"))?,
         control_socket,
         control_uid: uid
             .ok_or_else(|| format!("--control-uid or {CONTROL_UID_ENV} is required"))?,
@@ -517,9 +721,9 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: tiproxy-rs --control-socket <absolute-path> --control-uid <uid> \
+    "Usage: tiproxy-rs --config <path> --control-socket <absolute-path> --control-uid <uid> \
      [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>]\n\
-     Environment: TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
+     Environment: TIPROXY_CONFIG, TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 
 fn version_output() -> String {
@@ -530,10 +734,14 @@ fn version_output() -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
+
     use super::{
         Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options,
-        initial_control_config, parse_options, session_loop_config, version_output,
+        config_persistence_client, parse_options, persistence_options, session_loop_config,
+        version_output,
     };
+    use crate::config_composition::control_config;
 
     #[test]
     fn version_output_labels_all_build_metadata() {
@@ -546,6 +754,8 @@ mod tests {
     #[test]
     fn parses_operational_cli() {
         let command = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
             "--control-socket".to_owned(),
             "/tmp/control.sock".to_owned(),
             "--control-uid".to_owned(),
@@ -559,10 +769,11 @@ mod tests {
         assert_eq!(
             options,
             Options {
+                config_file: PathBuf::from("/etc/tiproxy/tiproxy.toml"),
                 control_socket: PathBuf::from("/tmp/control.sock"),
                 control_uid: 42,
                 tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
-                drain_grace: std::time::Duration::from_secs(30),
+                drain_grace: None,
                 health_port: 0,
             }
         );
@@ -571,6 +782,8 @@ mod tests {
     #[test]
     fn drain_grace_is_the_session_drain_deadline() {
         let command = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
             "--control-socket".to_owned(),
             "/tmp/control.sock".to_owned(),
             "--control-uid".to_owned(),
@@ -581,9 +794,12 @@ mod tests {
         let Ok(Command::Run(options)) = command else {
             unreachable!("valid operational arguments")
         };
-        assert_eq!(options.drain_grace, std::time::Duration::from_secs(45));
         assert_eq!(
-            session_loop_config(options.drain_grace).drain_deadline,
+            options.drain_grace,
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert_eq!(
+            session_loop_config(options.drain_grace.unwrap_or_default()).drain_deadline,
             std::time::Duration::from_secs(45),
             "one lineage: the CLI grace is the per-session FSM deadline"
         );
@@ -612,23 +828,76 @@ mod tests {
     #[test]
     fn operational_cli_projects_into_rust_control_domain() {
         let options = Options {
+            config_file: PathBuf::from("/etc/tiproxy/tiproxy.toml"),
             control_socket: PathBuf::from("/tmp/control.sock"),
             control_uid: 42,
             tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
-            drain_grace: std::time::Duration::from_secs(45),
+            drain_grace: Some(std::time::Duration::from_secs(45)),
             health_port: 8081,
         };
-        let config = initial_control_config(&options)
-            .unwrap_or_else(|error| unreachable!("valid control config: {error}"));
+        let source = ConfigNamespaceStore::from_toml(
+            b"enable-traffic-replay = false\n",
+            None,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap_or_else(|error| unreachable!("valid source: {error}"));
+        let config = control_config(
+            source.current().as_ref(),
+            options.health_port,
+            &options.tls_roots,
+            options.drain_grace,
+        )
+        .unwrap_or_else(|error| unreachable!("valid control config: {error}"));
         assert_eq!(config.generation(), 1);
-        assert_eq!(config.drain_grace(), options.drain_grace);
+        assert_eq!(
+            config.drain_grace(),
+            options.drain_grace.unwrap_or_default()
+        );
         assert_eq!(config.health_port(), options.health_port);
         assert_eq!(config.tls().roots(), options.tls_roots);
     }
 
     #[test]
+    fn persistence_uses_restart_pinned_legacy_pd_addrs() {
+        let source = ConfigNamespaceStore::from_toml(
+            br#"
+[proxy]
+pd-addrs = "owner-pd:2379"
+
+[[proxy.backend-clusters]]
+name = "a-first"
+pd-addrs = "routing-pd:2379"
+"#,
+            None,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap_or_else(|error| unreachable!("valid source: {error}"));
+        let (client, election) = persistence_options(source.current().as_ref(), "process-a")
+            .unwrap_or_else(|error| unreachable!("valid persistence options: {error}"));
+        let client = client.unwrap_or_else(|| unreachable!("persistence is configured"));
+        assert_eq!(client.endpoints(), ["http://owner-pd:2379"]);
+        assert!(election.is_some());
+    }
+
+    #[test]
+    fn persistence_rejects_skip_ca_instead_of_silently_downgrading_to_plaintext() {
+        let source = ConfigNamespaceStore::from_toml(
+            b"[security.cluster-tls]\nskip-ca = true\n",
+            None,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap_or_else(|error| unreachable!("valid source model: {error}"));
+        assert!(
+            config_persistence_client(source.current().effective()).is_err(),
+            "skip-ca without a CA must not silently construct a plaintext etcd client"
+        );
+    }
+
+    #[test]
     fn parses_health_port() {
         let command = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
             "--control-socket".to_owned(),
             "/tmp/control.sock".to_owned(),
             "--control-uid".to_owned(),
@@ -642,6 +911,8 @@ mod tests {
         assert_eq!(options.health_port, 8081);
         assert!(
             parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
                 "--control-socket".to_owned(),
                 "/tmp/control.sock".to_owned(),
                 "--health-port".to_owned(),
@@ -654,6 +925,8 @@ mod tests {
     #[test]
     fn rejects_over_bound_drain_grace() {
         let Err(error) = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
             "--control-socket".to_owned(),
             "/tmp/control.sock".to_owned(),
             "--control-uid".to_owned(),
@@ -670,6 +943,8 @@ mod tests {
     fn rejects_relative_or_incomplete_cli() {
         assert!(
             parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
                 "--control-socket".to_owned(),
                 "control.sock".to_owned(),
                 "--control-uid".to_owned(),
@@ -679,6 +954,8 @@ mod tests {
         );
         assert!(
             parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
                 "--control-socket".to_owned(),
                 "/tmp/control.sock".to_owned(),
             ])

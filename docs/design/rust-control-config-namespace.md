@@ -87,10 +87,12 @@ semantics above are stable:
 
 - `generation` starts at one and is the sole consumer ordering key. It advances
   by exactly one only when a fully validated effective snapshot changes.
-- `file_revision` is a process-local accepted-file lineage. `etcd_revision` is
-  the highest observed etcd revision incorporated or deliberately rejected.
-  They are audit/recovery evidence only. Etcd revisions may skip and therefore
-  must never be fed to CP-001's immediate-successor `ConfigStore`.
+- Snapshot `file_revision` and `etcd_revision` identify only the sources
+  incorporated into that accepted immutable view. The store separately tracks
+  the highest observed file/etcd cursor, including rejected and no-op
+  candidates, for recovery diagnostics. Neither is a consumer ordering key.
+  Etcd revisions may skip and therefore must never be fed to CP-001's
+  immediate-successor `ConfigStore`.
 - A rejected file or etcd candidate records a bounded rejection event but does
   not publish, mutate the current view, or advance `generation`.
 - `current` plus `tokio::sync::watch` gives consumers a race-free pull/watch
@@ -110,6 +112,20 @@ current Go defaults (enable, interval, retry count/interval, dial timeout, and
 metrics interval/timeout); those values become ordinary validated fields if
 Go exposes them as user configuration later. `advertise_host`, `sql_port`, and
 `status_port` are the resolved equivalent of Go `Config.GetIPPort`.
+
+CP-CFG's own PD/etcd transport is intentionally separate and restart-pinned:
+its endpoint set uses legacy `proxy.pd-addrs`, matching Go's `InitEtcdClient`.
+An empty `proxy.pd-addrs` disables persistent config. The dynamic
+`proxy.backend-clusters` projection may change for CP-TOPO/CP-ROUTE, but it
+never silently redirects the running config election/watch session. Accepted
+`security.cluster-tls` path or content changes rebuild the PD client, stop the
+old reader/election, and campaign with the new transport; owner-fenced writes
+remain unavailable throughout the handoff. Transport construction participates
+in prospective candidate validation, so an unsupported replacement retains the
+last-good source generation instead of publishing and then failing. In
+particular, `cluster-tls.skip-ca = true` is rejected explicitly by the current
+safe Rust etcd transport; it can never silently downgrade the owner connection
+to plaintext.
 
 Binary/build/process facts are not configuration: the composition root passes
 `TopologyRuntimeIdentity` directly to the CP-TOPO constructor. CP-TOPO combines
@@ -177,8 +193,51 @@ Polling remains two seconds for Go parity.
 After startup, changes to restart-required fields fail closed as one atomic
 candidate. Dynamic fields are recomputed with the persistent overlay, fully
 validated, canonically encoded, and published only when bytes change. The
-field-level implementation table must classify every Go field as dynamic,
-restart-required, deferred with an explicit rejection, or removed with proof.
+field-level implementation table below is exhaustive for the current Go
+`lib/config.Config` shape. `Dynamic` means CP-CFG accepts and publishes a new
+immutable snapshot without restarting this process; it does not imply that the
+downstream module named in the final column has already landed. `Restart`
+means a post-generation-1 change rejects the whole candidate. `Unsupported`
+means the source value still round-trips canonically, but a candidate that
+would activate the value is rejected by the serving validator.
+
+| Go TOML field(s) | Class | #146 behavior / next consumer |
+| --- | --- | --- |
+| `workdir` | Restart | Modeled and checksummed; process/filesystem ownership is fixed at startup. |
+| `proxy.addr`, `proxy.advertise-addr`, `proxy.pd-addrs`, `proxy.port-range` | Restart | Modeled; SQL bind and topology identity are fixed at startup. |
+| `api.addr`, `api.proxy-protocol` | Restart | Modeled; CP-ADMIN will own the HTTP listener. |
+| `log.encoder`, `log.simple` | Restart | Modeled; encoder construction is fixed at startup. |
+| `balance.routing-rule` | Restart | Modeled; listener-group construction is fixed at startup. |
+| `ha.virtual-ip`, `ha.interface`, `ha.garp-burst-count`, `ha.garp-refresh-count` | Restart | Modeled; CP-HA consumes them at startup. |
+| `metering.type`, `region`, `bucket`, `prefix`, `endpoint`, `shared-pool-id`; every field below `metering.aws`, `.oss`, `.cos`, `.azure`, `.localfs` | Restart | Modeled with secret-safe debug output; CP-METER consumes them at startup. |
+| `rust-dataplane.enabled`, `.control-socket`, `.allowed-uid`, `.tls-allowed-roots` | Restart | Modeled; process/transport and TLS trust roots cannot change online. |
+| `proxy.max-connections`, `proxy.high-memory-usage-reject-threshold`, `proxy.conn-buffer-size` | Dynamic | Applied by the Rust SQL serving snapshot. |
+| all five fields `enabled`, `idle`, `cnt`, `intvl`, `timeout` below each of `proxy.frontend-keepalive`, `.backend-healthy-keepalive`, `.backend-unhealthy-keepalive` | Dynamic | Applied by the Rust SQL serving snapshot. |
+| `proxy.proxy-protocol`, `.graceful-wait-before-shutdown`, `.graceful-close-conn-timeout`, `.public-endpoints` | Dynamic | Applied by the Rust SQL serving snapshot, including the latest graceful-close value at process drain. |
+| every `name`, `pd-addrs`, `ns-servers` below `proxy.backend-clusters` | Dynamic | Projected in stable order for CP-TOPO. |
+| `proxy.fail-backend-list`, `proxy.failover-timeout` | Dynamic | Retained for CP-ROUTE; no effect is claimed before #147. |
+| `security.encryption-key-path` | Dynamic | Modeled and checksummed; CP-ADMIN consumes it. |
+| `security.require-backend-tls` | Dynamic | Applied by the Rust SQL serving snapshot. |
+| `cert`, `key`, `ca`, `min-tls-version`, `cert-allowed-cn`, `skip-ca` below each of `security.server-tls`, `.server-http-tls`, `.cluster-tls`, `.sql-tls` | Dynamic | All material is validated and content-watched atomically. SQL front/back is applied now; HTTP and cluster projections are ready for CP-ADMIN/CP-TOPO. `cluster-tls.skip-ca = true` is an explicit unsupported candidate while the Rust config owner uses the safe etcd transport. |
+| `auto-certs` below global `server-tls` / `server-http-tls` and namespace `frontend.security` | Unsupported | Canonically round-tripped, then rejected explicitly because #146 does not generate server certificates. |
+| `auto-certs` below global `cluster-tls` / `sql-tls` and namespace `backend.security` | Dynamic, inert | Canonically round-tripped; the legacy client-side shape has no serving meaning. |
+| `rsa-key-size`, `autocert-expire-duration` below every global TLS block | Dynamic, inert unless auto-certs | Canonically round-tripped; because auto-certs is unsupported, these fields do not generate material in #146. |
+| `log.level`, every `filename`, `max-size`, `max-days`, `max-backups` below `log.log-file` | Dynamic | Level is applied by CP-001; file sink changes are retained for CP-ADMIN/log ownership. |
+| `balance.label-name`, `.policy`, `.routing-policy`; `migrations-per-second` below `.status`, `.health`, `.memory`, `.cpu`, `.location`, `.conn-count`; `.conn-count.count-ratio-threshold` | Dynamic | Validated and retained for CP-ROUTE. |
+| every `labels.<key>` | Dynamic | Stable map projection for CP-TOPO/CP-ROUTE. |
+| `enable-traffic-replay` | Dynamic, only `false` supported | Canonically modeled and reloadable, but enabling it is rejected by the serving validator because traffic capture remains M2 CP-CAPTURE #151. |
+
+Namespace values have a separate, equally exact classification:
+
+| `/config/ns/<name>` field(s) | Class | Ownership |
+| --- | --- | --- |
+| `namespace`, `frontend.user` | Dynamic | CP-CFG persists identity and publishes immutable generations; CP-ROUTE owns listener/user binding and conflicts. |
+| every TLS field below `frontend.security` and `backend.security` | Dynamic, with auto-certs unsupported as above | CP-CFG validates and content-watches material; CP-ROUTE consumes it for new sessions. |
+| every entry in `backend.instances` | Dynamic | CP-CFG persists and orders it; CP-ROUTE owns backend binding. |
+
+There is deliberately no namespace `keyspace` field. CP-TOPO discovers
+keyspaces and CP-ROUTE #147 binds them to sessions; #146 neither invents nor
+infers that association.
 
 The config checksum is CRC32-IEEE over canonical TOML of the effective full
 config, matching Go. The namespace checksum is CRC32-IEEE over canonical JSON
@@ -201,6 +260,13 @@ without a lease. Namespace key mutations use the same owner-fenced persistent
 transaction. `ElectionSession::fenced_put` is not reused because it attaches
 the election lease and is intentionally ephemeral.
 
+A successful process-local mutation is optimistically applied to the source
+at the transaction response's exact etcd revision before its caller is
+acknowledged. That makes back-to-back mutations validate against the first
+committed value even if the watch delivery is still queued. The later full
+watch candidate is idempotent; any candidate older than the already-applied
+etcd revision is ignored and cannot roll the optimistic view back.
+
 CP-CFG extends `control-etcd` with a bounded owner-fenced persistent transaction
 primitive. It exposes neither a raw unaudited client nor a generic arbitrary
 transaction API. Losing election ownership before commit fails closed. Readers
@@ -219,9 +285,14 @@ later corrective revision can be accepted without replay loops.
 
 TLS paths must be absolute and under configured allowed roots. Certificate and
 key must be supplied together; minimum TLS is 1.2 or 1.3; allowed common names
-are bounded and canonicalized. A watcher loads a complete cert/key/CA set into
-a new connection factory before publishing it. Partial or unreadable material
-is rejected atomically. Existing sessions keep their prior `Arc`; only new
+are bounded and canonicalized. Candidate validation loads and parses every
+complete cert/key/CA set before publishing a source generation; the serving
+adapter then constructs and atomically swaps one complete immutable connection
+factory. Partial, unreadable, invalid, or expired material is rejected without
+publishing a partial set. A generation advances for an accepted
+config/namespace value change **or for a byte-level change to any referenced
+TLS material file**, even when every source revision and canonical config
+checksum is unchanged. Existing sessions keep their prior `Arc`; only new
 connections observe the new certificate generation.
 
 ## Migration and bridge accounting
@@ -230,16 +301,37 @@ CP-CFG first installs the Rust source and uses its accepted snapshot as the
 authoritative config/namespace input. While CP-TOPO is still landing, the
 legacy `StateSnapshot` adapter may continue to provide topology fields, but its
 config and namespace fields are ignored and cannot overwrite Rust-owned state.
+When capability `CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE` is negotiated, Go
+shrinks `StateSnapshot.config` to exactly `advertised_capability` and
+`server_version`, sends no `StateSnapshot.namespaces`, and retains
+`StateSnapshot.backends`. Rust consumes those two protocol/static config facts
+and the backend array; it ignores/replaces all of these former Go inputs:
+
+- `max_connections`, `high_memory_reject_threshold`,
+  `connection_buffer_bytes`, all three keepalive messages, `proxy_protocol`,
+  `require_backend_tls`, both graceful durations, `listeners`, `public_cidrs`,
+  `frontend_tls`, `backend_tls`, and `traffic_replay_enabled`;
+- every `NamespaceSnapshot` field (`name`, `users`, `backend_cluster`).
+
+The capability is required on the shrunken envelope, so an older Rust peer
+fails negotiation instead of accepting an incomplete snapshot. Without the
+capability, Go preserves the old complete wire shape.
+
+The legacy Go HTTP config/namespace endpoints remain part of CP-ADMIN #150,
+not a second CP-CFG generation authority. Until that slice migrates them, their
+process-local writes continue to feed only still-Go-owned managers; they cannot
+overwrite the Rust source or SQL-serving generation. The Rust
+`ConfigModuleHandle` is the sole owner-fenced persistent mutation surface and
+is intentionally process-local until CP-ADMIN binds the external API to it.
+
 After CP-TOPO rebases, an in-process composer combines CP-CFG and CP-TOPO
 snapshots for the dataplane. There is no shared source generation: the composer
 records `{config_generation, topology_generation}` and publishes exactly once
 per changed pair.
 
-The final #146 bridge delta must state exactly which `state_snapshot` fields are
-no longer consumed. The `state_snapshot`/`snapshot_result` message pair can be
-deleted only when no remaining topology or route field depends on it; until
-then the catalog records the remaining field-level bridge surface rather than
-claiming whole-message retirement.
+The `state_snapshot`/`snapshot_result` message pair cannot be deleted while its
+backend or protocol/static fields remain. The catalog therefore records this
+field-level residual surface rather than claiming whole-message retirement.
 
 ## Required evidence
 

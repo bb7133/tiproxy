@@ -234,6 +234,8 @@ impl ClientCertVerifier for CommonNameClientVerifier {
 #[derive(Debug)]
 pub struct ValidatedSnapshot {
     generation: u64,
+    composition_generation: u64,
+    source_raw: StateSnapshot,
     raw: StateSnapshot,
     /// Server TLS config captured by new frontend sessions.
     pub frontend_server_config: Option<Arc<ServerConfig>>,
@@ -250,10 +252,25 @@ impl ValidatedSnapshot {
         self.generation
     }
 
+    /// Returns the independent process-local generation used to compose this
+    /// serving view. Zero identifies the legacy one-source path.
+    #[must_use]
+    pub const fn composition_generation(&self) -> u64 {
+        self.composition_generation
+    }
+
     /// Returns the complete validated protobuf snapshot.
     #[must_use]
     pub const fn raw(&self) -> &StateSnapshot {
         &self.raw
+    }
+
+    /// Returns the bridge payload used for idempotence and generation
+    /// lineage. During field-level control-plane handoff this may differ from
+    /// [`Self::raw`], which is the composed Rust-owned serving view.
+    #[must_use]
+    pub const fn source_raw(&self) -> &StateSnapshot {
+        &self.source_raw
     }
 }
 
@@ -398,13 +415,14 @@ impl ApplyOutcome {
 }
 
 /// Validates candidates in isolation and atomically swaps only complete state.
+#[derive(Clone)]
 pub struct SnapshotStore {
     allowed_tls_roots: Vec<PathBuf>,
-    current: RwLock<Option<Arc<ValidatedSnapshot>>>,
+    current: Arc<RwLock<Option<Arc<ValidatedSnapshot>>>>,
     /// The committed snapshot's lineage. Written only under the writer
     /// reservation (commit), read only under it (stage), so the pair
     /// (current, lineage) is writer-consistent.
-    lineage: RwLock<Option<SnapshotLineage>>,
+    lineage: Arc<RwLock<Option<SnapshotLineage>>>,
     /// Serializes the whole two-phase apply: a [`Staged`] token holds
     /// this guard, so no other writer — `apply` included — can advance
     /// the committed state between `stage` and `commit`. A downstream
@@ -444,8 +462,8 @@ impl SnapshotStore {
         roots.dedup();
         Ok(Self {
             allowed_tls_roots: roots,
-            current: RwLock::new(None),
-            lineage: RwLock::new(None),
+            current: Arc::new(RwLock::new(None)),
+            lineage: Arc::new(RwLock::new(None)),
             writer: Arc::new(WriterReservation::default()),
         })
     }
@@ -502,6 +520,52 @@ impl SnapshotStore {
         now: UnixTime,
         lineage: SnapshotLineage,
     ) -> Result<Staged, SnapshotError> {
+        self.stage_with_source(generation, snapshot.clone(), snapshot, now, lineage)
+    }
+
+    /// Stages a bridge source payload and a separately composed effective
+    /// serving payload under one protocol generation. Equal-generation
+    /// idempotence compares the source payload, while validation and consumers
+    /// observe only the effective payload. This is the field-level migration
+    /// seam used while topology remains on the legacy bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stale, conflicting, validation, or internal errors as
+    /// [`Self::stage`].
+    pub fn stage_with_source(
+        &self,
+        generation: u64,
+        source_snapshot: StateSnapshot,
+        effective_snapshot: StateSnapshot,
+        now: UnixTime,
+        lineage: SnapshotLineage,
+    ) -> Result<Staged, SnapshotError> {
+        self.stage_composed(
+            generation,
+            source_snapshot,
+            effective_snapshot,
+            0,
+            now,
+            lineage,
+        )
+    }
+
+    /// Stages one source/effective pair and records its independent
+    /// process-local composition generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::stage_with_source`].
+    pub fn stage_composed(
+        &self,
+        generation: u64,
+        source_snapshot: StateSnapshot,
+        effective_snapshot: StateSnapshot,
+        composition_generation: u64,
+        now: UnixTime,
+        lineage: SnapshotLineage,
+    ) -> Result<Staged, SnapshotError> {
         let writer = self.writer.acquire()?;
         if generation == 0 {
             return Err(SnapshotError::invalid(
@@ -534,7 +598,7 @@ impl SnapshotStore {
                     )));
                 }
                 if generation == current.generation {
-                    if snapshot == current.raw {
+                    if source_snapshot == current.source_raw {
                         // Committed already — which implies the whole
                         // two-phase apply (downstream included)
                         // succeeded when it was committed.
@@ -550,12 +614,81 @@ impl SnapshotStore {
                 }
             }
         }
-        let candidate = Arc::new(self.validate(generation, snapshot, now)?);
+        let candidate = Arc::new(self.validate(
+            generation,
+            composition_generation,
+            source_snapshot,
+            effective_snapshot,
+            now,
+        )?);
         Ok(Staged {
             writer,
             state: StagedState::Validated(candidate),
             lineage,
         })
+    }
+
+    /// Validates a serving-only recomposition without changing bridge lineage
+    /// or the committed protocol generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same complete snapshot validation errors as [`Self::stage`].
+    pub fn validate_detached(
+        &self,
+        generation: u64,
+        snapshot: StateSnapshot,
+        now: UnixTime,
+    ) -> Result<Arc<ValidatedSnapshot>, SnapshotError> {
+        self.validate_composed(generation, 0, snapshot, now)
+    }
+
+    /// Validates a serving-only recomposition with its independent
+    /// process-local generation, without changing store state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::validate_detached`].
+    pub fn validate_composed(
+        &self,
+        generation: u64,
+        composition_generation: u64,
+        snapshot: StateSnapshot,
+        now: UnixTime,
+    ) -> Result<Arc<ValidatedSnapshot>, SnapshotError> {
+        if generation == 0 {
+            return Err(SnapshotError::invalid(
+                "snapshot generation must be nonzero",
+            ));
+        }
+        Ok(Arc::new(self.validate(
+            generation,
+            composition_generation,
+            snapshot.clone(),
+            snapshot,
+            now,
+        )?))
+    }
+
+    /// Validates one detached TLS material set without publishing snapshot state.
+    ///
+    /// This is used by process-local control modules whose TLS policy is not
+    /// represented in the temporary dataplane bridge snapshot (HTTP, topology,
+    /// and namespace policies). The same allowlist, file bounds, PEM parsing,
+    /// certificate-time checks, and client/server policy rules apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded snapshot error when policy or material is invalid.
+    pub fn validate_tls_material(
+        &self,
+        field: &str,
+        policy: &TlsPolicy,
+        now: UnixTime,
+        server_side: bool,
+    ) -> Result<(), SnapshotError> {
+        self.validate_tls(field, Some(policy), now, server_side)
+            .map(|_| ())
     }
 
     /// Phase two: publishes a staged snapshot. The staged token still
@@ -613,6 +746,8 @@ impl SnapshotStore {
     fn validate(
         &self,
         generation: u64,
+        composition_generation: u64,
+        source_raw: StateSnapshot,
         snapshot: StateSnapshot,
         now: UnixTime,
     ) -> Result<ValidatedSnapshot, SnapshotError> {
@@ -637,6 +772,8 @@ impl SnapshotStore {
         }
         Ok(ValidatedSnapshot {
             generation,
+            composition_generation,
+            source_raw,
             raw: snapshot,
             frontend_server_config,
             frontend_tls,

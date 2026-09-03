@@ -246,7 +246,8 @@ if [[ $mode == rust ]]; then
 		# its own allowlist of roots, mirroring the control plane's check.
 		rust_tls_args=(--tls-root "$run_dir/certs")
 	fi
-	"$rust_binary" --control-socket "$control_socket" --control-uid "$(id -u)" \
+	"$rust_binary" --config "$run_dir/tiproxy.toml" \
+		--control-socket "$control_socket" --control-uid "$(id -u)" \
 		--health-port "$RUST_HEALTH_PORT" \
 		${rust_tls_args[@]+"${rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs.log" 2>&1 &
@@ -1026,7 +1027,8 @@ if [[ $mode == rust ]]; then
 	if [[ $TLS_ENABLED == true ]]; then
 		ka_rust_tls_args=(--tls-root "$run_dir/certs")
 	fi
-	"$rust_binary" --control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
+	"$rust_binary" --config "$run_dir/tiproxy-ka.toml" \
+		--control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 		--health-port "$ka_health_port" \
 		${ka_rust_tls_args[@]+"${ka_rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
@@ -2197,8 +2199,10 @@ if [[ $ka_use_dropper == true ]]; then
 	echo "chain-d: dead session persists as a ghost (gauge=$cd_ghost) before the successor starts"
 	# Restart Rust on the same control socket (the dropper front) + health
 	# port; it reconnects with an empty inventory.
-	"$rust_binary" --control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
+	"$rust_binary" --config "$run_dir/tiproxy-ka.toml" \
+		--control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 		--health-port "$ka_health_port" \
+		${ka_rust_tls_args[@]+"${ka_rust_tls_args[@]}"} \
 		>>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
 	KA_RUST_PID=$!
 	printf 'KA_RUST_PID=%q\n' "$KA_RUST_PID" >>"$run_dir/state.env"
@@ -2466,8 +2470,10 @@ fi
 if [[ $mode == rust ]]; then
 	# The Rust operator-facing listener is the health endpoint, bound
 	# at startup before serving precisely so a bad port fails fast.
-	"$rust_binary" --control-socket "$run_dir/absent.sock" \
+	"$rust_binary" --config "$run_dir/tiproxy-conflict.toml" \
+		--control-socket "$run_dir/absent.sock" \
 		--control-uid "$(id -u)" --health-port "$conflict_port" \
+		${rust_tls_args[@]+"${rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs-conflict.out" 2>&1 &
 	RUST_CONFLICT_PID=$!
 	printf 'RUST_CONFLICT_PID=%q\n' "$RUST_CONFLICT_PID" >>"$run_dir/state.env"

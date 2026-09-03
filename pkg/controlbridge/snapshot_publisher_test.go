@@ -21,6 +21,7 @@ type snapshotSender struct {
 	nextID  uint64
 	sent    []*controlpb.ControlEnvelope
 	sendErr error
+	caps    map[uint64]bool
 }
 
 func (sender *snapshotSender) Send(_ context.Context, envelope *controlpb.ControlEnvelope) error {
@@ -38,8 +39,49 @@ func (sender *snapshotSender) Epoch() uint64 {
 	return sender.epoch
 }
 
-func (*snapshotSender) HasCapability(uint64) bool {
-	return true
+func (sender *snapshotSender) HasCapability(capability uint64) bool {
+	return sender.caps != nil && sender.caps[capability]
+}
+
+func TestSnapshotPublisherShrinksOnlyForRustConfigNamespaceCapability(t *testing.T) {
+	cfg := config.NewConfig()
+	builder, err := NewSnapshotBuilder(cfg, nil)
+	require.NoError(t, err)
+	publisher, err := NewSnapshotPublisher(SnapshotPublisherConfig{
+		Builder:              builder,
+		Initial:              cfg,
+		AdvertisedCapability: 123,
+		ServerVersion:        "test-server",
+		Topology: func() ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
+			return []*controlpb.BackendSnapshot{{
+				BackendId: "backend-1", Address: "127.0.0.1:4000",
+			}}, []*controlpb.NamespaceSnapshot{{Name: "default", Users: []string{"root"}}}
+		},
+	})
+	require.NoError(t, err)
+
+	legacy := &snapshotSender{epoch: 1, caps: map[uint64]bool{}}
+	require.NoError(t, publisher.Sync(t.Context(), legacy))
+	legacySnapshot := legacy.envelopes()[0].GetStateSnapshot()
+	require.NotZero(t, legacySnapshot.GetConfig().GetConnectionBufferBytes())
+	require.NotEmpty(t, legacySnapshot.GetConfig().GetListeners())
+	require.Len(t, legacySnapshot.GetNamespaces(), 1)
+	require.Empty(t, legacy.envelopes()[0].GetRequiredCapabilities())
+
+	require.NoError(t, publisher.HandleResult(legacy,
+		snapshotResultEnvelope(1, 1, 1, controlpb.ErrorCode_ERROR_CODE_OK)))
+	ownerCap := uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE)
+	owned := &snapshotSender{epoch: 2, caps: map[uint64]bool{ownerCap: true}}
+	require.NoError(t, publisher.Sync(t.Context(), owned))
+	ownedEnvelope := owned.envelopes()[0]
+	ownedSnapshot := ownedEnvelope.GetStateSnapshot()
+	require.Equal(t, uint32(123), ownedSnapshot.GetConfig().GetAdvertisedCapability())
+	require.Equal(t, "test-server", ownedSnapshot.GetConfig().GetServerVersion())
+	require.Zero(t, ownedSnapshot.GetConfig().GetConnectionBufferBytes())
+	require.Empty(t, ownedSnapshot.GetConfig().GetListeners())
+	require.Empty(t, ownedSnapshot.GetNamespaces())
+	require.Len(t, ownedSnapshot.GetBackends(), 1, "CP-TOPO still owns bridge retirement")
+	require.Equal(t, []uint64{ownerCap}, ownedEnvelope.GetRequiredCapabilities())
 }
 
 func (sender *snapshotSender) AllocateRequestID() (uint64, error) {

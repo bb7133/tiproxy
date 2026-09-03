@@ -143,6 +143,12 @@ const (
 	// snapshots and an explicit durable ACK. Without it the legacy delta-batch
 	// behavior applies.
 	ControlCapability_CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS ControlCapability = 4
+	// CP-CFG/NS: the Rust process owns configuration and namespace snapshots.
+	// When negotiated, Go sends only protocol/static handshake facts in
+	// ConfigSnapshot and no NamespaceSnapshot values; Rust composes the owned
+	// fields from its process-local revisioned source. Backends remain on the
+	// legacy bridge until CP-TOPO/CP-ROUTE retire them.
+	ControlCapability_CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE ControlCapability = 5
 )
 
 // Enum value maps for ControlCapability.
@@ -153,6 +159,7 @@ var (
 		2: "CONTROL_CAPABILITY_RECONCILE_CONNECTIONS",
 		3: "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION",
 		4: "CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS",
+		5: "CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE",
 	}
 	ControlCapability_value = map[string]int32{
 		"CONTROL_CAPABILITY_UNSPECIFIED":                   0,
@@ -160,6 +167,7 @@ var (
 		"CONTROL_CAPABILITY_RECONCILE_CONNECTIONS":         2,
 		"CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION": 3,
 		"CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS":   4,
+		"CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE":         5,
 	}
 )
 
@@ -4466,13 +4474,14 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fROLE_GO_CONTROL\x10\x01\x12\x17\n" +
-	"\x13ROLE_RUST_DATAPLANE\x10\x02*\xfc\x01\n" +
+	"\x13ROLE_RUST_DATAPLANE\x10\x02*\xaa\x02\n" +
 	"\x11ControlCapability\x12\"\n" +
 	"\x1eCONTROL_CAPABILITY_UNSPECIFIED\x10\x00\x12+\n" +
 	"'CONTROL_CAPABILITY_PER_CONNECTION_CLOSE\x10\x01\x12,\n" +
 	"(CONTROL_CAPABILITY_RECONCILE_CONNECTIONS\x10\x02\x124\n" +
 	"0CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION\x10\x03\x122\n" +
-	".CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS\x10\x04*v\n" +
+	".CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS\x10\x04\x12,\n" +
+	"(CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE\x10\x05*v\n" +
 	"\x11ProxyProtocolMode\x12#\n" +
 	"\x1fPROXY_PROTOCOL_MODE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cPROXY_PROTOCOL_MODE_DISABLED\x10\x01\x12\x1a\n" +

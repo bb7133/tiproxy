@@ -7,6 +7,7 @@ on:
       - "AGENTS.md"
       - "Makefile"
       - "docs/design/rust-control-plane-contracts.md"
+      - "docs/design/rust-control-config-namespace.md"
       - "lib/config/**"
       - "pkg/balance/**"
       - "pkg/controlbridge/**"
@@ -18,6 +19,7 @@ on:
       - "rust/Cargo.lock"
       - "rust/Cargo.toml"
       - "rust/crates/control-plane/**"
+      - "rust/crates/control-config/**"
       - "rust/crates/tiproxy-rs/**"
       - "tests/controlplane/**"
   push:
@@ -28,6 +30,7 @@ on:
       - "AGENTS.md"
       - "Makefile"
       - "docs/design/rust-control-plane-contracts.md"
+      - "docs/design/rust-control-config-namespace.md"
       - "lib/config/**"
       - "pkg/balance/**"
       - "pkg/controlbridge/**"
@@ -39,6 +42,7 @@ on:
       - "rust/Cargo.lock"
       - "rust/Cargo.toml"
       - "rust/crates/control-plane/**"
+      - "rust/crates/control-config/**"
       - "rust/crates/tiproxy-rs/**"
       - "tests/controlplane/**"
 

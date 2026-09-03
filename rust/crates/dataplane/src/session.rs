@@ -72,6 +72,10 @@ pub enum SessionControl {
     Redirect,
     /// Close gracefully at the next safe boundary.
     GracefulClose,
+    /// Close gracefully using a caller-supplied deadline. The process-local
+    /// shutdown coordinator uses this variant so already-admitted sessions
+    /// observe the latest accepted dynamic drain timeout.
+    GracefulCloseAfter(Duration),
     /// Close immediately.
     CloseImmediate,
 }
@@ -80,7 +84,7 @@ impl SessionControl {
     const fn session_event(self) -> SessionEvent {
         match self {
             Self::Redirect => SessionEvent::ControlRedirect,
-            Self::GracefulClose => SessionEvent::ControlGracefulClose,
+            Self::GracefulClose | Self::GracefulCloseAfter(_) => SessionEvent::ControlGracefulClose,
             Self::CloseImmediate => SessionEvent::ControlCloseImmediate,
         }
     }
@@ -214,6 +218,7 @@ pub struct SessionLoop<S, E> {
 
 enum LoopAction {
     Event(SessionEvent),
+    Control(SessionControl),
     /// The armed one-shot deadline fired.
     Deadline(SessionEvent),
     SourceExhausted,
@@ -337,7 +342,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 // the children drain in the terminal cleanup, under the
                 // single absolute budget, after the pump releases the
                 // transport.
-                self.apply(SessionEvent::TeardownComplete, &mut armed_deadline)
+                self.apply(SessionEvent::TeardownComplete, &mut armed_deadline, None)
                     .await;
                 continue;
             }
@@ -357,16 +362,24 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                         *probe = Instant::now() + self.config.backend_check_interval;
                     }
                     if probe_safe(self.fsm.state()) && !self.handler.backend_active().await {
-                        self.apply(SessionEvent::BackendIoError, &mut armed_deadline)
+                        self.apply(SessionEvent::BackendIoError, &mut armed_deadline, None)
                             .await;
                     }
                 }
                 LoopAction::Deadline(event) => {
                     armed_deadline = None;
-                    self.apply(event, &mut armed_deadline).await;
+                    self.apply(event, &mut armed_deadline, None).await;
                 }
                 LoopAction::Event(event) => {
-                    self.apply(event, &mut armed_deadline).await;
+                    self.apply(event, &mut armed_deadline, None).await;
+                }
+                LoopAction::Control(command) => {
+                    let drain_deadline = match command {
+                        SessionControl::GracefulCloseAfter(deadline) => Some(deadline),
+                        _ => None,
+                    };
+                    self.apply(command.session_event(), &mut armed_deadline, drain_deadline)
+                        .await;
                 }
             }
         }
@@ -396,7 +409,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 }
             }
             command = self.control.recv(), if !self.control_detached => match command {
-                Some(command) => LoopAction::Event(command.session_event()),
+                Some(command) => LoopAction::Control(command),
                 None => LoopAction::ControlDetached,
             },
             () = sleep_until(deadline_at), if armed_deadline.is_some() => {
@@ -421,13 +434,14 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         &mut self,
         event: SessionEvent,
         armed_deadline: &mut Option<(Instant, SessionEvent)>,
+        drain_deadline: Option<Duration>,
     ) {
         match self.fsm.on_event(event) {
             Ok(effects) => {
                 for effect in effects {
                     if effect == SessionEffect::BeginDrainTimer {
                         *armed_deadline = Some((
-                            Instant::now() + self.config.drain_deadline,
+                            Instant::now() + drain_deadline.unwrap_or(self.config.drain_deadline),
                             SessionEvent::DrainTimerExpired,
                         ));
                     }
@@ -459,10 +473,10 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
     async fn close_via_fsm(&mut self, close_event: SessionEvent) {
         let mut deadline = None;
         if self.fsm.state() != SessionState::Closed {
-            self.apply(close_event, &mut deadline).await;
+            self.apply(close_event, &mut deadline, None).await;
         }
         if self.fsm.state() != SessionState::Closed {
-            self.apply(SessionEvent::TeardownComplete, &mut deadline)
+            self.apply(SessionEvent::TeardownComplete, &mut deadline, None)
                 .await;
         }
     }

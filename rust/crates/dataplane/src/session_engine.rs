@@ -541,7 +541,7 @@ pub struct EngineSessionOwner {
     client: Arc<ControlClient>,
     namespace: Arc<str>,
     shutdown: watch::Receiver<bool>,
-    drain: watch::Receiver<bool>,
+    drain: watch::Receiver<Option<Duration>>,
     loop_config: SessionLoopConfig,
     metrics: MetricsRecorder,
     metering: Option<MeteringSourceRegistry>,
@@ -554,7 +554,7 @@ impl EngineSessionOwner {
         client: Arc<ControlClient>,
         namespace: impl Into<Arc<str>>,
         shutdown: watch::Receiver<bool>,
-        drain: watch::Receiver<bool>,
+        drain: watch::Receiver<Option<Duration>>,
         loop_config: SessionLoopConfig,
     ) -> Self {
         Self {
@@ -616,7 +616,7 @@ pub async fn run_bound_session(
     client: Arc<ControlClient>,
     namespace: String,
     shutdown: watch::Receiver<bool>,
-    drain: watch::Receiver<bool>,
+    drain: watch::Receiver<Option<Duration>>,
     loop_config: SessionLoopConfig,
 ) {
     run_bound_session_observed(
@@ -640,7 +640,7 @@ async fn run_bound_session_observed(
     client: Arc<ControlClient>,
     namespace: String,
     shutdown: watch::Receiver<bool>,
-    mut drain: watch::Receiver<bool>,
+    mut drain: watch::Receiver<Option<Duration>>,
     loop_config: SessionLoopConfig,
     metrics: MetricsRecorder,
     metering: Option<MeteringSourceRegistry>,
@@ -773,11 +773,14 @@ async fn run_bound_session_observed(
     if *owner_shutdown.borrow() {
         force_deadline = Some(tokio::time::Instant::now() + loop_config.cleanup_deadline);
     }
-    let mut drain_signaled = *drain.borrow();
-    if drain_signaled {
+    let initial_drain = *drain.borrow();
+    let mut drain_signaled = initial_drain.is_some();
+    if let Some(deadline) = initial_drain {
         // Admitted after stop-accept began: close at the first safe
         // boundary.
-        let _ = control_tx.send(SessionControl::GracefulClose).await;
+        let _ = control_tx
+            .send(SessionControl::GracefulCloseAfter(deadline))
+            .await;
     }
     let summary: Option<SessionSummary> = loop {
         tokio::select! {
@@ -791,13 +794,16 @@ async fn run_bound_session_observed(
                 }
             }
             changed = drain.changed(), if !drain_signaled => {
-                if changed.is_ok() && *drain.borrow() {
+                let deadline = if changed.is_ok() { *drain.borrow() } else { None };
+                if let Some(deadline) = deadline {
                     drain_signaled = true;
                     // Local coordinated shutdown: graceful close at the
-                    // next safe boundary; the loop's drain deadline is
-                    // the per-session force. No command token — this is
-                    // not a gate-admitted command.
-                    let _ = control_tx.send(SessionControl::GracefulClose).await;
+                    // next safe boundary using the latest accepted dynamic
+                    // drain deadline. No command token — this is not a
+                    // gate-admitted command.
+                    let _ = control_tx
+                        .send(SessionControl::GracefulCloseAfter(deadline))
+                        .await;
                 } else if changed.is_err() {
                     drain_signaled = true;
                 }

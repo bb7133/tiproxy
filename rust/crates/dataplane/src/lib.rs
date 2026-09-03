@@ -66,6 +66,7 @@ pub use route_control::{
 };
 pub use runtime_config::{
     DataplaneServingHandle, DataplaneSnapshotConsumer, GenerationStatus, GenerationStatusSnapshot,
+    ServingSnapshotComposer,
 };
 pub use server::{
     AcceptedConnection, BoundListenerInfo, ConnectionHandler, DataplaneHandle, DataplaneServer,

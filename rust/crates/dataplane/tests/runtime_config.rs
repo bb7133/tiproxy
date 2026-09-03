@@ -18,7 +18,7 @@
 use std::error::Error;
 use std::net::TcpListener as StdTcpListener;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use control_proto::control_transport::{ClientConfig, ControlClient};
@@ -32,11 +32,11 @@ use control_proto::v1::{
 use dataplane::control_dispatch::{
     ControlCommandHandler, ResponseKind, spawn_control_dispatch_with_handler,
 };
-use dataplane::control_runtime::SnapshotConsumer;
+use dataplane::control_runtime::{SnapshotComposition, SnapshotConsumer};
 use dataplane::{
     AcceptedConnection, BoundSessionHandler, ConnectionHandler, DataplaneServer,
     DataplaneSnapshotConsumer, DispatchConnectionHandler, MemoryProbe, MemoryProbeError,
-    MemorySample,
+    MemorySample, ServingSnapshotComposer,
 };
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -73,6 +73,19 @@ fn free_port() -> Result<u16, Box<dyn Error>> {
 }
 
 fn snapshot(generation: u64, port: u16) -> Result<Arc<ValidatedSnapshot>, Box<dyn Error>> {
+    let raw = raw_snapshot(port);
+    let store = SnapshotStore::new([])?;
+    Ok(store
+        .apply(
+            generation,
+            raw,
+            UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+            SnapshotLineage::for_tests("go-fixture"),
+        )?
+        .snapshot)
+}
+
+fn raw_snapshot(port: u16) -> StateSnapshot {
     let keepalive = KeepalivePolicy {
         enabled: true,
         idle_millis: 0,
@@ -80,7 +93,7 @@ fn snapshot(generation: u64, port: u16) -> Result<Arc<ValidatedSnapshot>, Box<dy
         interval_millis: 0,
         user_timeout_millis: 0,
     };
-    let raw = StateSnapshot {
+    StateSnapshot {
         config: Some(ConfigSnapshot {
             high_memory_reject_threshold: 0.9,
             connection_buffer_bytes: 4096,
@@ -99,16 +112,47 @@ fn snapshot(generation: u64, port: u16) -> Result<Arc<ValidatedSnapshot>, Box<dy
             ..ConfigSnapshot::default()
         }),
         ..StateSnapshot::default()
-    };
-    let store = SnapshotStore::new([])?;
-    Ok(store
-        .apply(
+    }
+}
+
+#[derive(Clone)]
+struct MutableComposer {
+    state: Arc<Mutex<(u64, u64, Option<u16>)>>,
+}
+
+impl MutableComposer {
+    fn set(&self, generation: u64, max_connections: u64, listener_port: Option<u16>) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (generation, max_connections, listener_port);
+    }
+}
+
+impl ServingSnapshotComposer for MutableComposer {
+    fn compose(
+        &self,
+        source: &StateSnapshot,
+    ) -> Result<SnapshotComposition, control_proto::snapshot::SnapshotError> {
+        let (generation, max_connections, listener_port) = *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut snapshot = source.clone();
+        let config = snapshot
+            .config
+            .as_mut()
+            .ok_or_else(|| control_proto::snapshot::SnapshotError::invalid("config is required"))?;
+        config.max_connections = max_connections;
+        if let Some(port) = listener_port {
+            config.listeners[0].port = u32::from(port);
+        }
+        Ok(SnapshotComposition {
+            snapshot,
             generation,
-            raw,
-            UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
-            SnapshotLineage::for_tests("go-fixture"),
-        )?
-        .snapshot)
+        })
+    }
 }
 
 #[tokio::test]
@@ -164,6 +208,101 @@ async fn first_bind_reload_reject_and_shutdown_keep_one_last_good_generation()
     drop((first, second, third));
     serving.shutdown().await?;
     assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_composition_advances_independently_and_rejects_atomically()
+-> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let other_port = free_port()?;
+    let composer = MutableComposer {
+        state: Arc::new(Mutex::new((1, 11, None))),
+    };
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let handler: Arc<dyn ConnectionHandler> = Arc::new(move |connection: AcceptedConnection| {
+        let seen_tx = seen_tx.clone();
+        async move {
+            let snapshot = connection.snapshot();
+            let config = snapshot.raw().config.as_ref();
+            let _ = seen_tx.send((
+                snapshot.generation(),
+                snapshot.composition_generation(),
+                config.map_or(0, |value| value.max_connections),
+            ));
+            std::future::pending::<()>().await;
+        }
+    });
+    let (mut consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
+        Arc::new(FixedMemory),
+        handler,
+        Arc::new(composer.clone()),
+    );
+    let store = SnapshotStore::new([])?;
+    let source = raw_snapshot(port);
+    let composition = consumer.compose(&source)?;
+    let staged = store.stage_composed(
+        7,
+        source,
+        composition.snapshot,
+        composition.generation,
+        UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+        SnapshotLineage::for_tests("go-fixture"),
+    )?;
+    consumer.apply(staged.snapshot(), &|| true).await?;
+    store.commit(staged)?;
+
+    let first = TcpStream::connect(("127.0.0.1", port)).await?;
+    assert_eq!(
+        timeout(Duration::from_secs(2), seen_rx.recv()).await?,
+        Some((7, 1, 11))
+    );
+
+    composer.set(2, 22, None);
+    assert!(
+        serving
+            .reload_composed(
+                &store,
+                UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_001)),
+            )
+            .await?
+    );
+    let second = TcpStream::connect(("127.0.0.1", port)).await?;
+    assert_eq!(
+        timeout(Duration::from_secs(2), seen_rx.recv()).await?,
+        Some((7, 2, 22)),
+        "local generation changes serving without advancing bridge generation"
+    );
+    let status = serving.status();
+    assert_eq!(status.applied_generation, 7);
+    assert_eq!(status.composition_generation, 2);
+    assert_eq!(status.composition_applied_total, 1);
+
+    composer.set(3, 33, Some(other_port));
+    let Err(error) = serving
+        .reload_composed(
+            &store,
+            UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_002)),
+        )
+        .await
+    else {
+        return Err("listener mutation was not rejected".into());
+    };
+    assert_eq!(error.kind(), SnapshotErrorKind::Unsupported);
+    let third = TcpStream::connect(("127.0.0.1", port)).await?;
+    assert_eq!(
+        timeout(Duration::from_secs(2), seen_rx.recv()).await?,
+        Some((7, 2, 22)),
+        "a rejected local generation preserves last-good serving state"
+    );
+    assert!(TcpStream::connect(("127.0.0.1", other_port)).await.is_err());
+    let status = serving.status();
+    assert_eq!(status.composition_generation, 2);
+    assert_eq!(status.rejected_composition_generation, 3);
+    assert_eq!(status.composition_rejected_total, 1);
+
+    drop((first, second, third));
+    serving.shutdown().await?;
     Ok(())
 }
 

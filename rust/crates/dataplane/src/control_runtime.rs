@@ -61,7 +61,7 @@ use control_proto::snapshot::{
     SnapshotError, SnapshotLineage, SnapshotStore, UnixTime, ValidatedSnapshot,
 };
 use control_proto::v1::control_envelope::Body;
-use control_proto::v1::{ControlEnvelope, Priority};
+use control_proto::v1::{ControlEnvelope, Priority, StateSnapshot};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -70,6 +70,16 @@ use crate::control_dispatch::{
     spawn_control_dispatch_with_handler, system_unix_millis,
 };
 
+/// One effective serving payload plus the independent Rust-owned source
+/// generation used to compose it.
+pub struct SnapshotComposition {
+    /// Complete serving payload.
+    pub snapshot: StateSnapshot,
+    /// Zero for the legacy one-source path; otherwise the Rust domain
+    /// generation that replaced bridge-owned fields.
+    pub generation: u64,
+}
+
 /// Applies each newly validated snapshot to the serving side (for
 /// example [`crate::server::DataplaneHandle::update_snapshot`], which
 /// enforces listener-set immutability). A rejection is answered to the
@@ -77,6 +87,21 @@ use crate::control_dispatch::{
 /// advanced: the previously applied snapshot stays in force and a
 /// replay re-runs this consumer.
 pub trait SnapshotConsumer: Send + 'static {
+    /// Composes the effective serving payload from one bridge source payload.
+    /// The default keeps the legacy one-source behavior. Field-level control
+    /// plane migrations replace only the domains they own and retain the
+    /// source payload separately for bridge generation idempotence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation class without staging or applying the source.
+    fn compose(&self, source: &StateSnapshot) -> Result<SnapshotComposition, SnapshotError> {
+        Ok(SnapshotComposition {
+            snapshot: source.clone(),
+            generation: 0,
+        })
+    }
+
     /// Applies one validated snapshot.
     ///
     /// `still_current` is a cheap synchronous check of whether the
@@ -395,7 +420,17 @@ pub async fn process_state_snapshot<C: SnapshotConsumer>(
     let generation = envelope.generation;
     let (result, applied) = match &envelope.body {
         Some(Body::StateSnapshot(snapshot)) => {
-            match store.stage(generation, snapshot.clone(), now, lineage) {
+            let effective = consumer.compose(snapshot);
+            match effective.and_then(|effective| {
+                store.stage_composed(
+                    generation,
+                    snapshot.clone(),
+                    effective.snapshot,
+                    effective.generation,
+                    now,
+                    lineage,
+                )
+            }) {
                 Ok(staged) => {
                     let consumer_verdict = if staged.is_changed() {
                         // The consumer calls this immediately before any

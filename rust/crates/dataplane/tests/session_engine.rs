@@ -1637,7 +1637,8 @@ struct Stack {
     sender: Arc<FakeSender>,
     _state_tx: watch::Sender<ConnectionState>,
     shutdown_tx: watch::Sender<bool>,
-    drain_tx: watch::Sender<bool>,
+    drain_tx: watch::Sender<Option<Duration>>,
+    drain_deadline: Duration,
     forwarder: Arc<dataplane::control_dispatch::InboundForwarder>,
     sql_port: u16,
     server_task: tokio::task::JoinHandle<()>,
@@ -1867,7 +1868,7 @@ async fn spawn_stack_configured_with_metering(
     let client = control_client();
     let (metrics, metrics_rx) = MetricsRecorder::channel(128);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (drain_tx, drain_rx) = watch::channel(false);
+    let (drain_tx, drain_rx) = watch::channel(None::<Duration>);
     let owner = EngineSessionOwner::new(
         Arc::clone(&client),
         "default",
@@ -1922,6 +1923,7 @@ async fn spawn_stack_configured_with_metering(
         _state_tx: state_tx,
         shutdown_tx,
         drain_tx,
+        drain_deadline,
         forwarder: Arc::new(forwarder),
         sql_port: sql_addr.port(),
         server_task,
@@ -3310,7 +3312,7 @@ async fn held_begin_commit_then_replay_error_lets_prepare_and_drain_close() {
         "the prepare after the closed transaction succeeds"
     );
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     let closed = wait_sent(
         &stack.sender,
         |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
@@ -5045,7 +5047,7 @@ async fn drain_waits_for_open_transaction_commit() {
     };
     assert!(client.query_ok("BEGIN").await);
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     let closed_early = stack
         .sender
@@ -5089,7 +5091,7 @@ async fn drain_waits_for_prepared_long_data_guard() {
     assert!(client.send_long_data(7).await);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     let closed_early = stack
         .sender
@@ -5210,7 +5212,7 @@ async fn stmt_prepare_register_replaces_stale_guard_and_unblocks_drain() {
     assert!(client.send_long_data(7).await);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     let closed_early = stack
         .sender
@@ -5265,7 +5267,7 @@ async fn prepare_inside_open_transaction_keeps_boundary(prepare_sql: &str, expec
     };
     assert!(client.query_ok("BEGIN").await, "the transaction opens");
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     let closed_after_begin = stack
         .sender
@@ -5393,7 +5395,7 @@ async fn execute_cursor_blocks_drain_until_last_row_fetch() {
         "the cursor execute completes"
     );
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         closed_event_count(&stack.sender),
@@ -5449,7 +5451,7 @@ async fn execute_cursor_guard_is_statement_specific_across_ids() {
     assert_eq!(client.stmt_execute(7, 0x01).await, Some(StmtResult::Ok));
     assert_eq!(client.stmt_execute(8, 0x01).await, Some(StmtResult::Ok));
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         closed_event_count(&stack.sender),
@@ -5494,7 +5496,7 @@ async fn non_cursor_execute_clears_prior_cursor_guard() {
         unreachable!("session established")
     };
     assert_eq!(client.stmt_execute(7, 0x01).await, Some(StmtResult::Ok));
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         closed_event_count(&stack.sender),
@@ -5540,7 +5542,7 @@ async fn execute_error_after_long_data_keeps_pending_guard() {
         "a pending long-data upload guards statement 7"
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         closed_event_count(&stack.sender),
@@ -5603,7 +5605,7 @@ async fn long_data_guards_are_statement_specific() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         closed_event_count(&stack.sender),
@@ -5659,7 +5661,7 @@ async fn reset_connection_clears_all_prepared_state() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         closed_event_count(&stack.sender),
@@ -6058,7 +6060,7 @@ async fn coordinated_shutdown_stops_accept_then_drains() {
 
     // Phase 2: graceful drain. The idle session closes at its safe
     // boundary and the CLOSED lifecycle event goes out.
-    stack.drain_tx.send_replace(true);
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
     let closed = wait_sent(
         &stack.sender,
         |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
