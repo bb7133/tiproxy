@@ -133,8 +133,12 @@ impl<'de> Deserialize<'de> for RawBackendInfo {
                             info.start_timestamp = value;
                         }
                     } else if key.eq_ignore_ascii_case("labels") {
-                        if let Some(value) = map.next_value::<Option<BTreeMap<String, String>>>()? {
-                            info.labels = value;
+                        // Go merges a repeated map into the existing one (old
+                        // keys kept, same keys overwritten) and treats a `null`
+                        // occurrence as clearing the map.
+                        match map.next_value::<Option<LabelMap>>()? {
+                            Some(LabelMap(labels)) => info.labels.extend(labels),
+                            None => info.labels.clear(),
                         }
                     } else {
                         let _ = map.next_value::<serde::de::IgnoredAny>()?;
@@ -145,6 +149,43 @@ impl<'de> Deserialize<'de> for RawBackendInfo {
         }
 
         deserializer.deserialize_map(RawBackendInfoVisitor)
+    }
+}
+
+/// A `labels` object, deserialized with Go `map[string]string` value
+/// semantics: a `null` value writes the string zero value (the key is still
+/// present) rather than failing, and a repeated key within one object keeps the
+/// last value.
+struct LabelMap(BTreeMap<String, String>);
+
+impl<'de> Deserialize<'de> for LabelMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LabelMapVisitor;
+
+        impl<'de> Visitor<'de> for LabelMapVisitor {
+            type Value = LabelMap;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a label map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<LabelMap, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut labels = BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value::<Option<String>>()?.unwrap_or_default();
+                    labels.insert(key, value);
+                }
+                Ok(LabelMap(labels))
+            }
+        }
+
+        deserializer.deserialize_map(LabelMapVisitor)
     }
 }
 
@@ -403,5 +444,29 @@ mod tests {
         // A later wrong-typed occurrence is still a type mismatch on a known
         // field, so the whole record is rejected.
         assert!(BackendInfo::from_info_json("a:1", "", br#"{"ip":"ok","ip":5}"#).is_none());
+    }
+
+    #[test]
+    fn duplicate_label_maps_merge_like_go() {
+        // Go merges repeated map fields into the existing map, keeping old keys.
+        let info =
+            BackendInfo::from_info_json("a:1", "", br#"{"labels":{"a":"1"},"labels":{"b":"2"}}"#)
+                .unwrap_or_else(|| unreachable!("merged labels parse"));
+        assert_eq!(info.labels.get("a").map(String::as_str), Some("1"));
+        assert_eq!(info.labels.get("b").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn null_label_map_clears_like_go() {
+        let info = BackendInfo::from_info_json("a:1", "", br#"{"labels":{"a":"1"},"labels":null}"#)
+            .unwrap_or_else(|| unreachable!("null map clears"));
+        assert!(info.labels.is_empty());
+    }
+
+    #[test]
+    fn null_label_value_becomes_empty_string_like_go() {
+        let info = BackendInfo::from_info_json("a:1", "", br#"{"labels":{"a":null}}"#)
+            .unwrap_or_else(|| unreachable!("null label value is accepted as empty"));
+        assert_eq!(info.labels.get("a").map(String::as_str), Some(""));
     }
 }
