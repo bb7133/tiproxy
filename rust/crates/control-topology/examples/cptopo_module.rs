@@ -21,8 +21,9 @@
 //! * generation 1 registers `info` + `ttl` under one lease;
 //! * an unrelated hot-reload is a no-op — the lease is unchanged (no flap);
 //! * a changed client (a rotation) rebuilds under a fresh lease;
-//! * lifecycle shutdown stops and joins the children (whether shutdown also
-//!   deregisters is a pending cleanup-semantics decision, so it is not asserted).
+//! * lifecycle shutdown stops and joins the children (this row only locks
+//!   children-joined; the exact-lease revoke cleanup is locked by `cptopo_live`
+//!   Row 4).
 //!
 //! The harness reads `CPTOPO_CONNECTION_FILE`.
 

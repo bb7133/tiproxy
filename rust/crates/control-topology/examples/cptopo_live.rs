@@ -185,13 +185,20 @@ async fn main() -> Result<(), AnyError> {
         rebuilt_lease != 0 && rebuilt_lease != info_lease,
         "rebuilt registration did not use a fresh lease",
     )?;
-    let (_, rebuilt_ttl) = get_key(&owner, &config, &ttl_key)
-        .await?
-        .ok_or("ttl missing after rebuild")?;
-    require(
-        rebuilt_ttl == rebuilt_lease,
-        "rebuilt info and ttl are not under the same lease",
-    )?;
+    // The rebuild re-puts info then ttl; wait for the ttl to settle under the
+    // same rebuilt lease rather than race the narrow window between the puts.
+    let ttl_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((_, ttl_lease_now)) = get_key(&owner, &config, &ttl_key).await?
+            && ttl_lease_now == rebuilt_lease
+        {
+            break;
+        }
+        if Instant::now() >= ttl_deadline {
+            return Err("rebuilt info and ttl did not settle under the same lease".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // --- Row 4: revoke-only cleanup revokes exactly this lease, ABA safe. ---
     // Pin a sentinel to the rebuilt (old) lease at a key OUTSIDE the topology
