@@ -532,7 +532,8 @@ const fn module_error(error_class: &'static str) -> ModuleError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildRunner, RejectionClass, TopologyClusterClient, TopologyModule, TopologyStatus,
+        ChildRunner, RegistrarError, RejectionClass, TopologyClusterClient, TopologyModule,
+        TopologyStatus,
     };
     use std::future::pending;
     use std::path::PathBuf;
@@ -861,9 +862,12 @@ mod tests {
         assert_rejected(Gen2::BuildFail, RejectionClass::ClientBuildFailed).await
     }
 
-    /// A factory that reads its CA bytes from a fixed path every build, so a
-    /// same-path A->B rotation is observed only because the material is re-read
-    /// and the plan compares bytes.
+    /// A factory that re-reads its CA bytes from one fixed path on every build.
+    /// This proves the module's own re-read-and-compare behaviour: a same-path
+    /// A->B rotation is observed only because the material is re-read and the
+    /// plan compares bytes. It uses a fixed factory path, not the production
+    /// `TopologyConfig.cluster_tls.ca_path` mapping, which the composition round
+    /// locks separately with a swap/delete test.
     struct FilePemFactory {
         path: PathBuf,
     }
@@ -917,27 +921,34 @@ mod tests {
         Ok(())
     }
 
-    /// A runner where the first child exits (or panics) on a trigger and the
-    /// sibling waits for its stop signal, so a single unexpected exit can be
-    /// checked to fail the module while the sibling is stopped and joined once.
+    /// A runner where the first child fails on a trigger (a real `Err` or, when
+    /// `panic` is set, a panic) and the sibling waits for its stop signal. This
+    /// lets one unexpected exit fail the module while the sibling is proven to
+    /// be stopped (it saw the signal) and joined (it ran to completion rather
+    /// than being aborted).
     fn one_fails_runner(
         fail: watch::Receiver<bool>,
         panic: bool,
         sibling_stops: Arc<AtomicUsize>,
+        sibling_completions: Arc<AtomicUsize>,
     ) -> ChildRunner {
         let call = Arc::new(AtomicUsize::new(0));
         Arc::new(move |_owner, _connector, _info, _timeout, mut shutdown| {
             let index = call.fetch_add(1, Ordering::SeqCst);
             let mut fail = fail.clone();
             let sibling_stops = Arc::clone(&sibling_stops);
+            let sibling_completions = Arc::clone(&sibling_completions);
             Box::pin(async move {
                 if index == 0 {
                     let _ = fail.changed().await;
-                    assert!(!panic, "injected child panic");
-                    Ok(())
+                    if panic {
+                        unreachable!("injected child panic")
+                    }
+                    Err(RegistrarError::Etcd("injected"))
                 } else {
                     let _ = shutdown.changed().await;
                     sibling_stops.fetch_add(1, Ordering::SeqCst);
+                    sibling_completions.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }
             })
@@ -948,13 +959,19 @@ mod tests {
         let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
         let (fail_tx, fail_rx) = watch::channel(false);
         let sibling_stops = Arc::new(AtomicUsize::new(0));
+        let sibling_completions = Arc::new(AtomicUsize::new(0));
         let runtime = runtime()?;
         let (task, mut handle) = spawn(
             store,
             Box::new(SwitchableFactory {
                 gen2: Arc::new(watch::channel(None).0),
             }),
-            one_fails_runner(fail_rx, panic, Arc::clone(&sibling_stops)),
+            one_fails_runner(
+                fail_rx,
+                panic,
+                Arc::clone(&sibling_stops),
+                Arc::clone(&sibling_completions),
+            ),
             &runtime,
         )?;
         wait_ready(&mut handle).await?;
@@ -966,10 +983,17 @@ mod tests {
         };
         assert_eq!(error.module, "control_topology");
         assert_eq!(error.error_class, "registration_child_exited");
+        // The module returned, so stop_children has joined the sibling: it saw
+        // its stop signal exactly once and ran to completion (was not aborted).
         assert_eq!(
             sibling_stops.load(Ordering::SeqCst),
             1,
-            "the sibling child is stopped and joined exactly once"
+            "the sibling child was stopped exactly once"
+        );
+        assert_eq!(
+            sibling_completions.load(Ordering::SeqCst),
+            1,
+            "the sibling child was joined (ran to completion) exactly once"
         );
 
         runtime.begin_shutdown(ShutdownReason::Requested)?;
@@ -989,13 +1013,28 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wedged_child_is_aborted_so_shutdown_completes() -> Result<(), TestError> {
+        /// Increments a counter when the wedged future is dropped, so an abort
+        /// (not just a return) can be proven.
+        struct DropGuard(Arc<AtomicUsize>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
         let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
-        let runner: ChildRunner = Arc::new(|_owner, _connector, _info, _timeout, _shutdown| {
-            Box::pin(async move {
-                pending::<()>().await;
-                Ok(())
+        let drops = Arc::new(AtomicUsize::new(0));
+        let runner: ChildRunner = {
+            let drops = Arc::clone(&drops);
+            Arc::new(move |_owner, _connector, _info, _timeout, _shutdown| {
+                let guard = DropGuard(Arc::clone(&drops));
+                Box::pin(async move {
+                    let _guard = guard;
+                    pending::<()>().await;
+                    Ok(())
+                })
             })
-        });
+        };
         let runtime = runtime()?;
         let (task, mut handle) = spawn(
             store,
@@ -1007,13 +1046,32 @@ mod tests {
         )?;
         wait_ready(&mut handle).await?;
 
+        // Even a wedged child must not prevent shutdown: it is aborted only after
+        // the bounded grace, so the module returns within grace plus a small
+        // margin and the aborted futures are dropped.
+        let grace = super::CHILD_STOP_GRACE;
+        let upper = grace.saturating_add(Duration::from_secs(3));
+        let lower = grace.saturating_sub(Duration::from_millis(500));
+        let start = tokio::time::Instant::now();
         runtime.begin_shutdown(ShutdownReason::Requested)?;
-        // Even a wedged child must not prevent shutdown: it is aborted after the
-        // bounded grace, so the module returns within grace plus slack.
-        let result = tokio::time::timeout(Duration::from_secs(15), task).await??;
+        let result = tokio::time::timeout(upper, task).await??;
+        let elapsed = start.elapsed();
         assert!(
             result.is_ok(),
             "a wedged child must not block a clean shutdown"
+        );
+        assert!(
+            elapsed >= lower,
+            "shutdown must wait the bounded grace before aborting"
+        );
+        assert!(
+            elapsed <= upper,
+            "shutdown must complete within the grace plus a small margin"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "both wedged children were aborted and dropped"
         );
         shutdown(&runtime)?;
         Ok(())
