@@ -74,6 +74,37 @@ pub struct EtcdTlsPolicy {
     pub skip_ca_verification: bool,
 }
 
+/// Maximum accepted common-name pins, matching the serving TLS contract.
+const MAX_TLS_COMMON_NAMES: usize = 1024;
+/// Maximum accepted length of one common-name pin.
+const MAX_TLS_COMMON_NAME_LEN: usize = 255;
+
+/// Trims, bounds, sorts, and de-duplicates the common-name allowlist.
+///
+/// # Errors
+///
+/// Rejects an over-count list or an entry that is empty or over-length after
+/// trimming.
+fn normalized_common_names(names: Vec<String>) -> Result<Vec<String>, EtcdConfigError> {
+    if names.len() > MAX_TLS_COMMON_NAMES {
+        return Err(EtcdConfigError::TooManyCommonNames);
+    }
+    let mut normalized = Vec::with_capacity(names.len());
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(EtcdConfigError::EmptyCommonName);
+        }
+        if trimmed.len() > MAX_TLS_COMMON_NAME_LEN {
+            return Err(EtcdConfigError::CommonNameTooLong);
+        }
+        normalized.push(trimmed.to_owned());
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 /// Validated mTLS material and verification policy for an etcd connection.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EtcdTlsConfig {
@@ -120,8 +151,13 @@ impl EtcdTlsConfig {
         domain_name: Option<String>,
         policy: EtcdTlsPolicy,
     ) -> Result<Self, EtcdConfigError> {
+        let EtcdTlsPolicy {
+            minimum_version,
+            allowed_common_names,
+            skip_ca_verification,
+        } = policy;
         let ca_certificate_pem = ca_certificate_pem.filter(|ca| !ca.is_empty());
-        if !policy.skip_ca_verification && ca_certificate_pem.is_none() {
+        if !skip_ca_verification && ca_certificate_pem.is_none() {
             return Err(EtcdConfigError::EmptyCaCertificate);
         }
         let identity = match (client_certificate_pem, client_key_pem) {
@@ -134,18 +170,16 @@ impl EtcdTlsConfig {
         if domain_name.as_deref().is_some_and(str::is_empty) {
             return Err(EtcdConfigError::EmptyDomainName);
         }
-        if policy
-            .allowed_common_names
-            .iter()
-            .any(|name| name.trim().is_empty())
-        {
-            return Err(EtcdConfigError::EmptyCommonName);
-        }
+        let allowed_common_names = normalized_common_names(allowed_common_names)?;
         Ok(Self {
             ca_certificate_pem,
             identity,
             domain_name,
-            policy,
+            policy: EtcdTlsPolicy {
+                minimum_version,
+                allowed_common_names,
+                skip_ca_verification,
+            },
         })
     }
 
@@ -319,6 +353,12 @@ pub enum EtcdConfigError {
     /// An allowed common name entry cannot be empty.
     #[error("etcd TLS allowed common name is empty")]
     EmptyCommonName,
+    /// An allowed common name entry exceeds its length bound.
+    #[error("etcd TLS allowed common name is too long")]
+    CommonNameTooLong,
+    /// The allowed common name list exceeds its count bound.
+    #[error("too many etcd TLS allowed common names")]
+    TooManyCommonNames,
     /// Timeout and keepalive values are bounded.
     #[error("invalid {name} duration {value:?}")]
     InvalidDuration {
@@ -627,6 +667,38 @@ mod tests {
         assert_eq!(
             EtcdTlsConfig::new(Some(vec![1]), None, None, None, policy),
             Err(EtcdConfigError::EmptyCommonName)
+        );
+    }
+
+    #[test]
+    fn allowed_common_names_are_bounded() {
+        let over_count = EtcdTlsPolicy {
+            allowed_common_names: vec!["cn".to_owned(); 1025],
+            ..EtcdTlsPolicy::default()
+        };
+        assert_eq!(
+            EtcdTlsConfig::new(Some(vec![1]), None, None, None, over_count),
+            Err(EtcdConfigError::TooManyCommonNames)
+        );
+        let over_length = EtcdTlsPolicy {
+            allowed_common_names: vec!["a".repeat(256)],
+            ..EtcdTlsPolicy::default()
+        };
+        assert_eq!(
+            EtcdTlsConfig::new(Some(vec![1]), None, None, None, over_length),
+            Err(EtcdConfigError::CommonNameTooLong)
+        );
+    }
+
+    #[test]
+    fn allowed_common_names_are_trimmed_sorted_and_deduped() {
+        assert_eq!(
+            super::normalized_common_names(vec![
+                " beta ".to_owned(),
+                "alpha".to_owned(),
+                "alpha".to_owned(),
+            ]),
+            Ok(vec!["alpha".to_owned(), "beta".to_owned()])
         );
     }
 

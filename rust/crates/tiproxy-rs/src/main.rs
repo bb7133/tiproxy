@@ -820,9 +820,10 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
     tls_roots.sort();
     tls_roots.dedup();
     // Shared, immutable allowed-roots list for every TLS-material read (topology
-    // cluster clients and config-persistence), matching the serving snapshot
-    // store's confinement.
-    let allowed_tls_roots: Arc<[PathBuf]> = Arc::from(tls_roots.clone());
+    // cluster clients and config-persistence), canonicalized once here and
+    // frozen so later reads confine against a stable, symlink-free set.
+    let allowed_tls_roots: Arc<[PathBuf]> =
+        Arc::from(tls_material::canonicalize_tls_roots(&tls_roots));
     let snapshots = SnapshotStore::new(tls_roots.clone())
         .map_err(|error| format!("create snapshot store: {error}"))?;
     let (etcd, election) = persistence_options(initial.as_ref(), process_id, &allowed_tls_roots)?;
@@ -1593,6 +1594,57 @@ pd-addrs = "routing-pd:2379"
         let client = client.unwrap_or_else(|| unreachable!("persistence is configured"));
         assert_eq!(client.endpoints(), ["http://owner-pd:2379"]);
         assert!(election.is_some());
+    }
+
+    #[test]
+    fn config_persistence_rejects_a_same_root_symlink_ca() {
+        // The persistence production path must use the safe read: a symlink CA is
+        // rejected. A bare read would follow the link and build a client.
+        let dir = std::env::temp_dir();
+        let real = dir.join(format!("cptopo-persist-real-{}.pem", std::process::id()));
+        std::fs::write(&real, b"ca").unwrap_or_else(|error| unreachable!("write: {error}"));
+        let link = dir.join(format!("cptopo-persist-link-{}.pem", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link)
+            .unwrap_or_else(|error| unreachable!("symlink: {error}"));
+        let toml = format!(
+            "[proxy]\npd-addrs = \"owner-pd:2379\"\n[security.cluster-tls]\nca = \"{}\"\n",
+            link.display()
+        );
+        let source =
+            ConfigNamespaceStore::from_toml(toml.as_bytes(), None, std::path::Path::new("/tmp"))
+                .unwrap_or_else(|error| unreachable!("valid source: {error}"));
+        let roots = crate::tls_material::canonicalize_tls_roots(&[dir]);
+        assert!(
+            config_persistence_client(source.current().effective(), &roots).is_err(),
+            "a symlink CA must be rejected by the persistence reader"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn config_persistence_rejects_an_oversize_ca() {
+        let dir = std::env::temp_dir();
+        let ca = dir.join(format!("cptopo-persist-big-{}.pem", std::process::id()));
+        let file =
+            std::fs::File::create(&ca).unwrap_or_else(|error| unreachable!("create: {error}"));
+        // A sparse file over the 16 MiB bound.
+        file.set_len(17 * 1024 * 1024)
+            .unwrap_or_else(|error| unreachable!("set_len: {error}"));
+        let toml = format!(
+            "[proxy]\npd-addrs = \"owner-pd:2379\"\n[security.cluster-tls]\nca = \"{}\"\n",
+            ca.display()
+        );
+        let source =
+            ConfigNamespaceStore::from_toml(toml.as_bytes(), None, std::path::Path::new("/tmp"))
+                .unwrap_or_else(|error| unreachable!("valid source: {error}"));
+        let roots = crate::tls_material::canonicalize_tls_roots(&[dir]);
+        assert!(
+            config_persistence_client(source.current().effective(), &roots).is_err(),
+            "an oversize CA must be rejected by the persistence reader"
+        );
+        let _ = std::fs::remove_file(&ca);
     }
 
     #[test]

@@ -284,9 +284,9 @@ ca = "{ca_path}"
             &config_toml(100, ca_str),
             None,
             &dir,
-            Arc::new(TopologyCandidateValidator::new(Arc::from(vec![
-                dir.clone(),
-            ]))),
+            Arc::new(TopologyCandidateValidator::new(Arc::from(
+                crate::tls_material::canonicalize_tls_roots(std::slice::from_ref(&dir)),
+            ))),
         )
         .unwrap_or_else(|error| unreachable!("generation 1: {error}"));
         let factory = ArtifactClusterFactory;
@@ -335,6 +335,36 @@ ca = "{ca_path}"
     }
 
     #[test]
+    fn a_same_root_symlink_ca_is_rejected_through_the_topology_validator() {
+        // Proves the topology production path uses the safe read: a symlink CA is
+        // rejected. Reverting cluster_tls_material to a bare read would follow the
+        // link and this would pass validation instead.
+        let dir = std::env::temp_dir();
+        let real = dir.join(format!("cptopo-prod-real-{}.pem", std::process::id()));
+        std::fs::write(&real, b"ca-bytes").unwrap_or_else(|error| unreachable!("write: {error}"));
+        let link = dir.join(format!("cptopo-prod-link-{}.pem", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link)
+            .unwrap_or_else(|error| unreachable!("symlink: {error}"));
+        let link_str = link
+            .to_str()
+            .unwrap_or_else(|| unreachable!("temp path is not utf-8"));
+        let roots = crate::tls_material::canonicalize_tls_roots(std::slice::from_ref(&dir));
+        let result = ConfigNamespaceStore::from_toml_with_validator(
+            &config_toml(100, link_str),
+            None,
+            &dir,
+            Arc::new(TopologyCandidateValidator::new(Arc::from(roots))),
+        );
+        assert!(
+            result.is_err(),
+            "a symlink CA must be rejected by the topology validator"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
     fn an_empty_artifact_is_rejected_by_the_factory() {
         // A generation whose published artifact is not a prepared cluster set
         // (here the accept-everything default) must fail closed, never register
@@ -378,9 +408,9 @@ ca = "{ca_path}"
             &config_toml_named(100, "", "cluster-x"),
             None,
             &dir,
-            Arc::new(TopologyCandidateValidator::new(Arc::from(vec![
-                dir.clone(),
-            ]))),
+            Arc::new(TopologyCandidateValidator::new(Arc::from(
+                crate::tls_material::canonicalize_tls_roots(std::slice::from_ref(&dir)),
+            ))),
         )
         .unwrap_or_else(|error| unreachable!("store a: {error}"));
         let topology_a = store_a
