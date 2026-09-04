@@ -846,7 +846,7 @@ mod tests {
             .is_ok(),
             "a 1.3 floor handshakes with a 1.3-only server"
         );
-        // Default (None) policy maps to [TLS12, TLS13].
+        // Default (None) policy maps to [TLS12, TLS13]: accepts both servers.
         assert!(
             do_handshake(
                 client_config(Some(&trusted_ca), None, &policy(false, &[], None)),
@@ -855,6 +855,43 @@ mod tests {
             )
             .is_ok(),
             "the default floor accepts a 1.2-only server"
+        );
+        assert!(
+            do_handshake(
+                client_config(Some(&trusted_ca), None, &policy(false, &[], None)),
+                server_tls13(),
+                "localhost",
+            )
+            .is_ok(),
+            "the default floor accepts a 1.3-only server (set is not narrowed to [TLS12])"
+        );
+        // V1_2 policy also maps to [TLS12, TLS13]: accepts both servers, proving
+        // it is not mis-mapped to [TLS13].
+        assert!(
+            do_handshake(
+                client_config(
+                    Some(&trusted_ca),
+                    None,
+                    &policy(false, &[], Some(EtcdTlsVersion::V1_2))
+                ),
+                server_tls12(),
+                "localhost",
+            )
+            .is_ok(),
+            "a 1.2 floor accepts a 1.2-only server"
+        );
+        assert!(
+            do_handshake(
+                client_config(
+                    Some(&trusted_ca),
+                    None,
+                    &policy(false, &[], Some(EtcdTlsVersion::V1_2))
+                ),
+                server_tls13(),
+                "localhost",
+            )
+            .is_ok(),
+            "a 1.2 floor accepts a 1.3-only server"
         );
     }
 
@@ -949,6 +986,29 @@ mod tests {
                 .verify_tls13_signature(message, &leaf, &forged)
                 .is_err(),
             "a forged TLS1.3 CertificateVerify signature must be rejected"
+        );
+
+        // The production skip+CN shape wraps the skip verifier in the CN-pin
+        // outer. Feed the same forged signature through the outer (with a
+        // matching CN) so an unconditional assertion in the outer's signature
+        // methods cannot pass unnoticed: the outer must delegate to the inner.
+        let outer = CommonNamePinnedServerVerifier {
+            inner: Arc::new(SkipServerVerification::new(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))),
+            allowed_common_names: ["etcd-server".to_owned()].into_iter().collect(),
+        };
+        assert!(
+            outer
+                .verify_tls12_signature(message, &leaf, &forged)
+                .is_err(),
+            "the CN-pin outer must delegate TLS1.2 signature checks to the skip inner"
+        );
+        assert!(
+            outer
+                .verify_tls13_signature(message, &leaf, &forged)
+                .is_err(),
+            "the CN-pin outer must delegate TLS1.3 signature checks to the skip inner"
         );
     }
 }
