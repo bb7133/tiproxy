@@ -141,37 +141,64 @@ struct MeteringSampler {
     shutdown: watch::Sender<bool>,
 }
 
-impl startup::Teardown for ControlRuntime {
-    fn teardown(self) -> startup::TeardownFuture {
-        Box::pin(async move {
-            self.shutdown();
-            let _ = self.join().await;
-        })
-    }
+/// A resource torn down in two explicit phases: a synchronous `stop` (signal the
+/// task to end) followed by an awaited `join` (wait for it to finish). Splitting
+/// the phases lets a fake exercise the exact production teardown sequence, so a
+/// dropped stop or join is caught by a test rather than silently detaching a
+/// task or hanging on a lease until its TTL.
+trait StopJoin: Send + 'static {
+    /// Signals the resource to stop.
+    fn stop(&self);
+    /// Joins the stopped resource to completion.
+    fn join(self) -> startup::TeardownFuture;
 }
 
-impl startup::Teardown for MetricsExporter {
+impl<T: StopJoin> startup::Teardown for T {
     fn teardown(self) -> startup::TeardownFuture {
         Box::pin(async move {
-            self.shutdown();
+            self.stop();
             self.join().await;
         })
     }
 }
 
-impl startup::Teardown for MeteringSampler {
-    fn teardown(self) -> startup::TeardownFuture {
+impl StopJoin for ControlRuntime {
+    fn stop(&self) {
+        self.shutdown();
+    }
+    fn join(self) -> startup::TeardownFuture {
         Box::pin(async move {
-            self.shutdown.send_replace(true);
+            let _ = ControlRuntime::join(self).await;
+        })
+    }
+}
+
+impl StopJoin for MetricsExporter {
+    fn stop(&self) {
+        self.shutdown();
+    }
+    fn join(self) -> startup::TeardownFuture {
+        Box::pin(MetricsExporter::join(self))
+    }
+}
+
+impl StopJoin for MeteringSampler {
+    fn stop(&self) {
+        self.shutdown.send_replace(true);
+    }
+    fn join(self) -> startup::TeardownFuture {
+        Box::pin(async move {
             let _ = self.task.await;
         })
     }
 }
 
-impl startup::Teardown for JoinHandle<()> {
-    fn teardown(self) -> startup::TeardownFuture {
+impl StopJoin for JoinHandle<()> {
+    fn stop(&self) {
+        self.abort();
+    }
+    fn join(self) -> startup::TeardownFuture {
         Box::pin(async move {
-            self.abort();
             let _ = self.await;
         })
     }
@@ -1021,15 +1048,19 @@ mod tests {
     };
     use crate::config_composition::control_config;
     use crate::startup::{Teardown, TeardownFuture};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::RunningProcess;
+    use super::{MeteringSampler, RunningProcess, StopJoin};
     use control_plane::{
         ControlConfig, ControlModule, ControlModuleSet, ControlRuntime as InProcessControlRuntime,
         JsonStderrSink, LifecyclePhase, LogLevel, MetricsPolicy, ModuleContext, ModuleFuture,
         OwnershipRegistry,
     };
+    use dataplane::metering::MeteringSamplerError;
+    use tokio::sync::watch;
+    use tokio::task::JoinHandle;
 
     type TeardownLog = Arc<Mutex<Vec<&'static str>>>;
 
@@ -1257,6 +1288,108 @@ mod tests {
                 "health_task",
             ],
             "every resource was transferred out of the guard by commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_teardown_sequence_signals_stop_then_awaits_join() {
+        // The shared two-phase adapter every production resource uses: dropping
+        // either the stop or the awaited join is caught here.
+        struct Probe {
+            stopped: Arc<AtomicBool>,
+            joined: Arc<AtomicBool>,
+        }
+        impl StopJoin for Probe {
+            fn stop(&self) {
+                self.stopped.store(true, Ordering::SeqCst);
+            }
+            fn join(self) -> TeardownFuture {
+                Box::pin(async move { self.joined.store(true, Ordering::SeqCst) })
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicBool::new(false));
+        Probe {
+            stopped: Arc::clone(&stopped),
+            joined: Arc::clone(&joined),
+        }
+        .teardown()
+        .await;
+        assert!(stopped.load(Ordering::SeqCst), "stop was signalled");
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "join was awaited (its body only runs when awaited)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_metering_sampler_teardown_signals_then_joins() {
+        // The task only finishes after the stop signal, and takes a bounded
+        // moment to do so, so a dropped stop hangs (caught by the timeout) and a
+        // dropped join returns before the task finishes (caught by the elapsed
+        // floor and completion flag).
+        let (shutdown, mut receiver) = watch::channel(false);
+        let joined = Arc::new(AtomicBool::new(false));
+        let joined_in_task = Arc::clone(&joined);
+        let task: JoinHandle<Result<(), MeteringSamplerError>> = tokio::spawn(async move {
+            while !*receiver.borrow_and_update() {
+                if receiver.changed().await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            joined_in_task.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let sampler = MeteringSampler { task, shutdown };
+
+        let start = Instant::now();
+        let Ok(()) = tokio::time::timeout(Duration::from_secs(5), sampler.teardown()).await else {
+            unreachable!("teardown must not hang: the stop signal was delivered");
+        };
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "the sampler task ran to completion (join awaited it)"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "teardown waited for the task rather than detaching it"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_health_task_teardown_aborts_then_joins() {
+        // A never-completing task with a drop flag: abort + await cancels it and
+        // joins it, so its guard drops. A dropped abort hangs (timeout); a
+        // dropped join returns before the cancellation completes, so on the
+        // single-threaded runtime the guard has not dropped yet.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = Arc::clone(&dropped);
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let task: JoinHandle<()> = tokio::spawn(async move {
+            let _guard = DropFlag(dropped_in_task);
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        // Ensure the task has run past constructing its guard before it is
+        // aborted, so the abort actually cancels a live guard.
+        let Ok(()) = wait_started.await else {
+            unreachable!("the health task started");
+        };
+
+        let Ok(()) = tokio::time::timeout(Duration::from_secs(5), task.teardown()).await else {
+            unreachable!("teardown must not hang: the task was aborted");
+        };
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the health task was aborted and joined (its guard dropped)"
         );
     }
 
