@@ -20,7 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_config::{
     CandidateValidator, ConfigNamespaceSnapshot, ConfigNamespaceSource, ConfigNamespaceStore,
-    EffectiveConfig, NamespaceConfig, ServingConfig, ServingKeepalive, ServingTlsConfig,
+    EffectiveConfig, NamespaceConfig, PreparedArtifact, ServingConfig, ServingKeepalive,
+    ServingTlsConfig,
 };
 use control_plane::{
     ConfigSource, ControlConfig, ControlModule, ControlRuntime as InProcessControlRuntime,
@@ -199,7 +200,7 @@ impl CandidateValidator for ServingCandidateValidator {
         &self,
         effective: &EffectiveConfig,
         namespaces: &[NamespaceConfig],
-    ) -> Result<(), &'static str> {
+    ) -> Result<PreparedArtifact, &'static str> {
         if effective.serving_auto_certs_enabled() {
             return Err("serving_auto_certs_unsupported");
         }
@@ -232,7 +233,7 @@ impl CandidateValidator for ServingCandidateValidator {
             )?;
             self.validate_material("namespace_backend_tls", namespace.backend_tls(), now, false)?;
         }
-        Ok(())
+        Ok(PreparedArtifact::empty())
     }
 }
 

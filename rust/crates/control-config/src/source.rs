@@ -14,7 +14,9 @@
 
 //! Atomic last-good config/namespace snapshots and canonical decoding.
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 use std::str;
 use std::sync::{Arc, RwLock};
@@ -87,12 +89,58 @@ pub enum StoreError {
     },
 }
 
+/// An opaque, type-erased artifact a [`CandidateValidator`] prepares once and
+/// that the store carries atomically with the snapshot it publishes.
+///
+/// `control-config` never inspects the contents; a consumer downcasts it to its
+/// own concrete type. It has no serialization surface and a redacted `Debug`,
+/// so no validated material (such as PEM bytes or endpoints) can leak through
+/// it. `Clone` clones only the `Arc`; equality is intentionally not derived —
+/// compare identity with [`PreparedArtifact::is_same_handle`].
+#[derive(Clone)]
+pub struct PreparedArtifact(Arc<dyn Any + Send + Sync>);
+
+impl PreparedArtifact {
+    /// Wraps an already-constructed prepared value.
+    #[must_use]
+    pub fn new(inner: Arc<dyn Any + Send + Sync>) -> Self {
+        Self(inner)
+    }
+
+    /// An empty artifact, for validators that prepare nothing.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self(Arc::new(()))
+    }
+
+    /// Downcasts to the concrete prepared type, or `None` on a type mismatch.
+    #[must_use]
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+
+    /// Whether two artifacts are the exact same `Arc` handle.
+    #[must_use]
+    pub fn is_same_handle(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl fmt::Debug for PreparedArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
 /// Process-composition validation performed before a generation is
 /// published. The core store owns syntax/domain validation; this hook covers
 /// serving concerns such as loading TLS material without adding protocol
-/// dependencies to `control-config`.
+/// dependencies to `control-config`. It prepares an opaque
+/// [`PreparedArtifact`] that the store then carries atomically with the
+/// published snapshot, so a consumer never re-reads that material.
 pub trait CandidateValidator: Send + Sync {
-    /// Validates a complete effective candidate and ordered namespace view.
+    /// Validates a complete effective candidate and ordered namespace view, and
+    /// prepares the artifact to publish with the snapshot.
     ///
     /// # Errors
     ///
@@ -102,18 +150,20 @@ pub trait CandidateValidator: Send + Sync {
         &self,
         effective: &EffectiveConfig,
         namespaces: &[NamespaceConfig],
-    ) -> Result<(), &'static str>;
+    ) -> Result<PreparedArtifact, &'static str>;
 }
 
 impl<F> CandidateValidator for F
 where
-    F: Fn(&EffectiveConfig, &[NamespaceConfig]) -> Result<(), &'static str> + Send + Sync,
+    F: Fn(&EffectiveConfig, &[NamespaceConfig]) -> Result<PreparedArtifact, &'static str>
+        + Send
+        + Sync,
 {
     fn validate(
         &self,
         effective: &EffectiveConfig,
         namespaces: &[NamespaceConfig],
-    ) -> Result<(), &'static str> {
+    ) -> Result<PreparedArtifact, &'static str> {
         self(effective, namespaces)
     }
 }
@@ -126,8 +176,8 @@ impl CandidateValidator for AcceptCandidate {
         &self,
         _effective: &EffectiveConfig,
         _namespaces: &[NamespaceConfig],
-    ) -> Result<(), &'static str> {
-        Ok(())
+    ) -> Result<PreparedArtifact, &'static str> {
+        Ok(PreparedArtifact::empty())
     }
 }
 
@@ -143,7 +193,7 @@ pub struct PersistentConfigSnapshot {
 }
 
 /// Immutable config/namespace state published to process-local consumers.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ConfigNamespaceSnapshot {
     generation: u64,
     source_revision: SourceRevision,
@@ -151,6 +201,21 @@ pub struct ConfigNamespaceSnapshot {
     namespace_checksum: u32,
     effective: Arc<EffectiveConfig>,
     namespaces: Arc<[NamespaceConfig]>,
+    prepared: PreparedArtifact,
+}
+
+impl PartialEq for ConfigNamespaceSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        // The prepared artifact is intentionally excluded: it is an opaque,
+        // per-generation handle, not part of the config identity, and the
+        // no-op-suppression comparison must not depend on it.
+        self.generation == other.generation
+            && self.source_revision == other.source_revision
+            && self.config_checksum == other.config_checksum
+            && self.namespace_checksum == other.namespace_checksum
+            && self.effective == other.effective
+            && self.namespaces == other.namespaces
+    }
 }
 
 impl ConfigNamespaceSnapshot {
@@ -188,6 +253,15 @@ impl ConfigNamespaceSnapshot {
     #[must_use]
     pub fn namespaces(&self) -> &[NamespaceConfig] {
         &self.namespaces
+    }
+
+    /// Returns the opaque artifact the validator prepared for this generation.
+    ///
+    /// A consumer downcasts it to its own concrete prepared type; the store
+    /// never inspects it.
+    #[must_use]
+    pub const fn prepared(&self) -> &PreparedArtifact {
+        &self.prepared
     }
 
     /// Returns the normalized CP-TOPO projection.
@@ -262,7 +336,7 @@ impl ConfigNamespaceStore {
         validator: Arc<dyn CandidateValidator>,
     ) -> Result<Self, StoreError> {
         let effective = effective.validated(current_dir)?;
-        validator
+        let prepared = validator
             .validate(&effective, &namespaces)
             .map_err(|class| StoreError::CandidateRejected { class })?;
         let snapshot = Arc::new(build_snapshot(
@@ -270,6 +344,7 @@ impl ConfigNamespaceStore {
             effective.clone(),
             namespaces.clone(),
             source_revision,
+            prepared,
         )?);
         let (updates, _) = watch::channel(Arc::clone(&snapshot));
         Ok(Self {
@@ -359,7 +434,7 @@ impl ConfigNamespaceStore {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         effective.check_reload_from(state.current.effective())?;
-        self.validate_candidate(&effective, &namespaces)?;
+        let prepared = self.validate_candidate(&effective, &namespaces)?;
         let persistent = PersistentConfigSnapshot {
             proxy: None,
             log: None,
@@ -371,6 +446,7 @@ impl ConfigNamespaceStore {
             effective.clone(),
             namespaces,
             source_revision,
+            prepared,
         )?;
         state.file_base = effective;
         state.file_revision = source_revision.file_revision;
@@ -404,7 +480,7 @@ impl ConfigNamespaceStore {
             .validated(current_dir)?;
         let effective = compose_effective(&file_base, &state.persistent).validated(current_dir)?;
         effective.check_reload_from(state.current.effective())?;
-        self.validate_candidate(&effective, &state.persistent.namespaces)?;
+        let prepared = self.validate_candidate(&effective, &state.persistent.namespaces)?;
         let etcd_revision = state.current.source_revision.etcd_revision;
         let published = publish_if_changed(
             &mut state,
@@ -414,6 +490,7 @@ impl ConfigNamespaceStore {
                 file_revision,
                 etcd_revision,
             },
+            prepared,
         )?;
         state.file_base = file_base;
         state.file_revision = file_revision;
@@ -454,13 +531,14 @@ impl ConfigNamespaceStore {
             etcd_revision,
         };
         let namespaces = persistent.namespaces.clone();
-        self.validate_candidate(&effective, &namespaces)?;
+        let prepared = self.validate_candidate(&effective, &namespaces)?;
         let published = publish_candidate(
             &mut state,
             &self.updates,
             effective,
             namespaces,
             source_revision,
+            prepared,
         )?;
         state.persistent = persistent;
         Ok(published)
@@ -485,7 +563,7 @@ impl ConfigNamespaceStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let effective = Arc::clone(state.current.effective());
         let namespaces = Arc::clone(&state.current.namespaces);
-        self.validate_candidate(&effective, &namespaces)?;
+        let prepared = self.validate_candidate(&effective, &namespaces)?;
         let next_generation = state
             .current
             .generation
@@ -496,6 +574,7 @@ impl ConfigNamespaceStore {
             effective.as_ref().clone(),
             namespaces.to_vec(),
             state.current.source_revision,
+            prepared,
         )?);
         state.current = Arc::clone(&candidate);
         self.updates.send_replace(Arc::clone(&candidate));
@@ -656,7 +735,7 @@ impl ConfigNamespaceStore {
         &self,
         effective: &EffectiveConfig,
         namespaces: &[NamespaceConfig],
-    ) -> Result<(), StoreError> {
+    ) -> Result<PreparedArtifact, StoreError> {
         self.validator
             .validate(effective, namespaces)
             .map_err(|class| StoreError::CandidateRejected { class })
@@ -681,7 +760,7 @@ impl ConfigNamespaceStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let effective = compose_effective(&state.file_base, &persistent).validated(current_dir)?;
         effective.check_reload_from(state.current.effective())?;
-        self.validate_candidate(&effective, &persistent.namespaces)?;
+        let prepared = self.validate_candidate(&effective, &persistent.namespaces)?;
         let generation = state
             .current
             .generation
@@ -692,6 +771,7 @@ impl ConfigNamespaceStore {
             effective,
             persistent.namespaces,
             state.current.source_revision,
+            prepared,
         )
         .map(|_| ())
     }
@@ -876,9 +956,10 @@ fn publish_if_changed(
     updates: &watch::Sender<Arc<ConfigNamespaceSnapshot>>,
     effective: EffectiveConfig,
     source_revision: SourceRevision,
+    prepared: PreparedArtifact,
 ) -> Result<Option<Arc<ConfigNamespaceSnapshot>>, StoreError> {
     let namespaces = state.persistent.namespaces.clone();
-    publish_candidate(state, updates, effective, namespaces, source_revision)
+    publish_candidate(state, updates, effective, namespaces, source_revision, prepared)
 }
 
 fn publish_candidate(
@@ -887,13 +968,14 @@ fn publish_candidate(
     effective: EffectiveConfig,
     namespaces: Vec<NamespaceConfig>,
     source_revision: SourceRevision,
+    prepared: PreparedArtifact,
 ) -> Result<Option<Arc<ConfigNamespaceSnapshot>>, StoreError> {
     let next_generation = state
         .current
         .generation
         .checked_add(1)
         .ok_or(StoreError::GenerationExhausted)?;
-    let candidate = build_snapshot(next_generation, effective, namespaces, source_revision)?;
+    let candidate = build_snapshot(next_generation, effective, namespaces, source_revision, prepared)?;
     if state.current.effective.as_ref() == candidate.effective.as_ref()
         && state.current.namespaces.as_ref() == candidate.namespaces.as_ref()
     {
@@ -910,6 +992,7 @@ fn build_snapshot(
     effective: EffectiveConfig,
     mut namespaces: Vec<NamespaceConfig>,
     source_revision: SourceRevision,
+    prepared: PreparedArtifact,
 ) -> Result<ConfigNamespaceSnapshot, StoreError> {
     namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
     let mut names = std::collections::BTreeSet::new();
@@ -933,6 +1016,7 @@ fn build_snapshot(
         namespace_checksum: crc32fast::hash(&namespace_data),
         effective: Arc::new(effective),
         namespaces: Arc::from(namespaces),
+        prepared,
     })
 }
 

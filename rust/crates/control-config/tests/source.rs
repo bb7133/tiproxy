@@ -15,13 +15,13 @@
 //! CP-CFG immutable-source, parity, and failure tests.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use control_config::{
     CandidateValidator, ConfigError, ConfigModule, ConfigModuleOptions, ConfigNamespaceSource,
     ConfigNamespaceStore, EffectiveConfig, NamespaceConfig, PersistentConfigSnapshot,
-    SourceRevision, StoreError, decode_persistent_entries,
+    PreparedArtifact, SourceRevision, StoreError, decode_persistent_entries,
 };
 use control_etcd::ElectionConfig;
 use control_external::EtcdClientConfig;
@@ -33,17 +33,106 @@ impl CandidateValidator for RejectableValidator {
         &self,
         _effective: &EffectiveConfig,
         _namespaces: &[NamespaceConfig],
-    ) -> Result<(), &'static str> {
+    ) -> Result<PreparedArtifact, &'static str> {
         if self.0.load(Ordering::SeqCst) {
             Err("test_material_rejected")
         } else {
-            Ok(())
+            Ok(PreparedArtifact::empty())
         }
+    }
+}
+
+/// A concrete prepared type so `downcast_ref` has something to recover.
+#[derive(Debug, PartialEq)]
+struct SerialArtifact(u64);
+
+/// Prepares a fresh, distinctly-serialized artifact per validation and records
+/// the exact handle it returned, so a test can assert the store carries that
+/// same handle without re-preparing.
+struct RecordingValidator {
+    next: AtomicU64,
+    last: Mutex<Option<PreparedArtifact>>,
+}
+
+impl RecordingValidator {
+    fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            last: Mutex::new(None),
+        }
+    }
+
+    fn last(&self) -> PreparedArtifact {
+        self.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| unreachable!("a validation must have recorded an artifact"))
+    }
+}
+
+impl CandidateValidator for RecordingValidator {
+    fn validate(
+        &self,
+        _effective: &EffectiveConfig,
+        _namespaces: &[NamespaceConfig],
+    ) -> Result<PreparedArtifact, &'static str> {
+        let serial = self.next.fetch_add(1, Ordering::SeqCst);
+        let artifact = PreparedArtifact::new(Arc::new(SerialArtifact(serial)));
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(artifact.clone());
+        Ok(artifact)
     }
 }
 
 fn current_dir() -> &'static Path {
     Path::new("/var/lib/tiproxy-test")
+}
+
+#[test]
+fn prepared_artifact_is_the_exact_validator_handle_and_is_fresh_per_generation() {
+    let validator = Arc::new(RecordingValidator::new());
+    let store = ConfigNamespaceStore::from_toml_with_validator(
+        &[],
+        None,
+        current_dir(),
+        Arc::clone(&validator) as Arc<dyn CandidateValidator>,
+    )
+    .unwrap_or_else(|error| unreachable!("initial config: {error}"));
+
+    // Generation one carries the exact handle the validator prepared — the
+    // store never re-prepares it — and it downcasts to the concrete type.
+    let gen_one = store.current();
+    let prepared_one = validator.last();
+    assert!(gen_one.prepared().is_same_handle(&prepared_one));
+    assert_eq!(
+        gen_one.prepared().downcast_ref::<SerialArtifact>(),
+        Some(&SerialArtifact(0))
+    );
+    // A wrong downcast target is a miss, never a panic.
+    assert!(gen_one.prepared().downcast_ref::<u64>().is_none());
+    // The artifact never leaks its contents through Debug.
+    assert_eq!(format!("{:?}", gen_one.prepared()), "<redacted>");
+
+    // A real change publishes a new generation carrying a distinct handle.
+    let gen_two = store
+        .apply_toml(b"[proxy]\nmax-connections = 20\n", None, 2, current_dir())
+        .unwrap_or_else(|error| unreachable!("changed candidate: {error}"))
+        .unwrap_or_else(|| unreachable!("a changed candidate publishes"));
+    assert!(gen_two.prepared().is_same_handle(&validator.last()));
+    assert!(!gen_two.prepared().is_same_handle(gen_one.prepared()));
+
+    // External-material refresh advances the artifact even though the config
+    // and namespace checksums are unchanged: a re-prepared handle rides it.
+    let refreshed = store
+        .refresh_external_material()
+        .unwrap_or_else(|error| unreachable!("material refresh: {error}"));
+    assert_eq!(refreshed.config_checksum(), gen_two.config_checksum());
+    assert_eq!(refreshed.namespace_checksum(), gen_two.namespace_checksum());
+    assert!(refreshed.prepared().is_same_handle(&validator.last()));
+    assert!(!refreshed.prepared().is_same_handle(gen_two.prepared()));
 }
 
 #[test]
