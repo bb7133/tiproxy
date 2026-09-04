@@ -51,6 +51,7 @@ struct SerialArtifact(u64);
 /// same handle without re-preparing.
 struct RecordingValidator {
     next: AtomicU64,
+    reject: AtomicBool,
     last: Mutex<Option<PreparedArtifact>>,
 }
 
@@ -58,8 +59,13 @@ impl RecordingValidator {
     fn new() -> Self {
         Self {
             next: AtomicU64::new(0),
+            reject: AtomicBool::new(false),
             last: Mutex::new(None),
         }
+    }
+
+    fn set_reject(&self, reject: bool) {
+        self.reject.store(reject, Ordering::SeqCst);
     }
 
     fn last(&self) -> PreparedArtifact {
@@ -77,12 +83,17 @@ impl CandidateValidator for RecordingValidator {
         _effective: &EffectiveConfig,
         _namespaces: &[NamespaceConfig],
     ) -> Result<PreparedArtifact, &'static str> {
+        // Prepare and record even on rejection, so a test can prove the failed
+        // product is not the one the store keeps or publishes.
         let serial = self.next.fetch_add(1, Ordering::SeqCst);
         let artifact = PreparedArtifact::new(Arc::new(SerialArtifact(serial)));
         *self
             .last
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(artifact.clone());
+        if self.reject.load(Ordering::SeqCst) {
+            return Err("recording_rejected");
+        }
         Ok(artifact)
     }
 }
@@ -133,6 +144,40 @@ fn prepared_artifact_is_the_exact_validator_handle_and_is_fresh_per_generation()
     assert_eq!(refreshed.namespace_checksum(), gen_two.namespace_checksum());
     assert!(refreshed.prepared().is_same_handle(&validator.last()));
     assert!(!refreshed.prepared().is_same_handle(gen_two.prepared()));
+}
+
+#[test]
+fn a_rejected_candidate_retains_the_prior_artifact_handle_and_does_not_publish_its_own() {
+    let validator = Arc::new(RecordingValidator::new());
+    let store = ConfigNamespaceStore::from_toml_with_validator(
+        &[],
+        None,
+        current_dir(),
+        Arc::clone(&validator) as Arc<dyn CandidateValidator>,
+    )
+    .unwrap_or_else(|error| unreachable!("initial config: {error}"));
+    let before = store.current();
+    let updates = store.subscribe();
+
+    // Now reject. Snapshot equality excludes the artifact, so it can no longer
+    // prove the prior artifact survived a rejection; assert the exact handle.
+    validator.set_reject(true);
+    let rejected = store.apply_toml(b"[proxy]\nmax-connections = 20\n", None, 2, current_dir());
+    assert!(matches!(
+        rejected,
+        Err(StoreError::CandidateRejected {
+            class: "recording_rejected"
+        })
+    ));
+    let after = store.current();
+    // The published snapshot is untouched: same generation and the exact same
+    // artifact Arc as before the rejection.
+    assert_eq!(after.generation(), before.generation());
+    assert!(after.prepared().is_same_handle(before.prepared()));
+    // The failed validation did prepare an artifact, but it was neither kept nor
+    // published — no half-published handle leaks out.
+    assert!(!after.prepared().is_same_handle(&validator.last()));
+    assert!(!updates.has_changed().unwrap_or(false));
 }
 
 #[test]
