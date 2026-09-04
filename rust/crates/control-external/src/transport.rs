@@ -14,8 +14,8 @@
 
 //! Owner-fenced custom `etcd-client` transport (B3 slice 2b-1).
 //!
-//! This module assembles the frozen tower stack that a later slice will hand to
-//! `Client::from_channel`:
+//! This module assembles the frozen tower stack that `EtcdConnector::connect`
+//! hands to `Client::from_channel` as the production etcd transport:
 //!
 //! ```text
 //! Channel::Custom(BoxCloneSyncService(
@@ -742,20 +742,16 @@ impl EndpointBlueprint {
     }
 }
 
-/// Builds the frozen owner-fenced custom `etcd-client` channel.
+/// Builds exactly one owner-fenced lazy service per configured endpoint.
 ///
-/// The returned [`etcd_client::Channel::Custom`] is **not** wired into the
-/// production connect path; it exists so a later slice can atomically switch
-/// production onto it.
-///
-/// # Errors
-///
-/// Returns an [`EtcdConfigError`] if any endpoint blueprint or tonic endpoint
-/// cannot be assembled.
-pub(crate) fn build_custom_channel(
+/// This is the production-mandatory seam for the endpoint set: [`build_custom_channel`]
+/// fans the balancer across precisely these services, so truncating or dropping
+/// an endpoint (a `.take(1)` / `.skip(1)` regression) changes the returned count
+/// and is caught by its unit test.
+fn build_endpoint_services(
     config: &EtcdClientConfig,
     owner: &OwnerToken,
-) -> Result<etcd_client::Channel, EtcdConfigError> {
+) -> Result<Vec<FailureBackoff<tonic::transport::Channel>>, EtcdConfigError> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let hooks: Arc<dyn StageHooks> = Arc::new(ProdStageHooks);
     let mut services = Vec::with_capacity(config.endpoints().len());
@@ -767,6 +763,25 @@ pub(crate) fn build_custom_channel(
             .connect_with_connector_lazy(dialer);
         services.push(FailureBackoff::new(channel, Arc::clone(&clock)));
     }
+    Ok(services)
+}
+
+/// Builds the frozen owner-fenced custom `etcd-client` channel.
+///
+/// The returned [`etcd_client::Channel::Custom`] is the production etcd
+/// transport: `EtcdConnector::connect` hands it to `Client::from_channel`. The
+/// custom endpoints are lazy, so no network I/O happens here — the owner-fenced
+/// DNS/TCP/TLS stages run on the first etcd operation.
+///
+/// # Errors
+///
+/// Returns an [`EtcdConfigError`] if any endpoint blueprint or tonic endpoint
+/// cannot be assembled.
+pub(crate) fn build_custom_channel(
+    config: &EtcdClientConfig,
+    owner: &OwnerToken,
+) -> Result<etcd_client::Channel, EtcdConfigError> {
+    let services = build_endpoint_services(config, owner)?;
     let balance = Balance::new(ServiceList::new::<TransportRequest>(services));
     let buffer = Buffer::new(balance, BUFFER_CAPACITY);
     let fenced = OwnerCallFence::new(buffer, owner.clone());
@@ -1501,6 +1516,21 @@ mod tests {
             matches!(channel, etcd_client::Channel::Custom(_)),
             "a TLS custom channel is built"
         );
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_services_builds_one_service_per_endpoint() {
+        let (_registry, lease) = owner();
+        let config = EtcdClientConfig::new(
+            ["127.0.0.1:2379".to_owned(), "127.0.0.1:2380".to_owned()],
+            None,
+        )
+        .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let services = super::build_endpoint_services(&config, &lease.token())
+            .unwrap_or_else(|error| unreachable!("services: {error}"));
+        // The balancer fans across exactly one service per configured endpoint;
+        // a dropped or truncated endpoint (`.take(1)`/`.skip(1)`) changes this.
+        assert_eq!(services.len(), 2, "one service per configured endpoint");
     }
 
     // ----- Fix 1: multi-address DNS fallback --------------------------------

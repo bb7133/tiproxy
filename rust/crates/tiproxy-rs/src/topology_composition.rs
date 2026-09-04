@@ -1155,6 +1155,43 @@ ns-servers = ["dns-a:53"]
         assert_eq!(fixture.range_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn d2c_mtls_rejects_a_client_without_an_identity() {
+        // The SAME require-client-cert server as the positive row, but the client
+        // config carries only the CA — no client identity. The handshake must fail
+        // and no Range must reach the server. Deleting the server's
+        // with_client_cert_verifier (accepting no client auth) makes this row red.
+        let (ca_pem, issuer) = make_ca("wiring-ca");
+        let (server_cert, server_key) = make_leaf(&issuer, "etcd-server", "127.0.0.1", true);
+        let acceptor = tls_acceptor(&server_cert, &server_key, Some(&ca_pem));
+        let fixture = spawn_fixture(Some(acceptor), KEY, VALUE);
+
+        let dir = material_dir("d2c-neg");
+        let ca_path = write_pem(&dir, "ca.pem", &ca_pem);
+        let toml = topology_toml(
+            &format!("127.0.0.1:{}", fixture.addr.port()),
+            &format!("[security.cluster-tls]\nca = \"{ca_path}\""),
+        );
+        let config = single_client(&toml, &dir);
+
+        let (_registry, lease) = owner();
+        // The rejected client may fail fast or its reconnect attempts may not
+        // converge; either way it must never complete a get, and no Range may
+        // reach the server. Bound it so a reconnecting client can't wedge CI.
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), connect_and_get(config, &lease, KEY))
+                .await;
+        assert!(
+            !matches!(outcome, Ok(Ok(_))),
+            "a server requiring a client certificate never lets a no-identity client complete a get"
+        );
+        assert_eq!(
+            fixture.range_calls.load(Ordering::SeqCst),
+            0,
+            "the mTLS-rejected client never reaches the Range handler"
+        );
+    }
+
     // ----- D-(3): multi-endpoint first-dead / second-live -------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1182,10 +1219,15 @@ ns-servers = ["dns-a:53"]
             unreachable!("connect must resolve within the deadline");
         };
 
-        // p2c de-prefers a failed endpoint via failure-load backoff, so a bounded
-        // retry converges on the live one; only the successful call reaches it.
+        // Caller-retry failover, not single-RPC transparent failover: a dispatched
+        // call is never replayed to another endpoint. At most two gets converge —
+        // p2c may pick the live endpoint first (immediate success), or the dead one
+        // first (that call fails, and failure-load backoff then de-prefers it so the
+        // second get is steered to the healthy live endpoint). The structural seam
+        // test (build_endpoint_services) separately locks that both endpoints enter
+        // the stack; this row asserts the composed semantic outcome.
         let mut response = None;
-        for _ in 0..16 {
+        for _ in 0..2 {
             let Ok(attempt) =
                 tokio::time::timeout(Duration::from_secs(5), run_get(&mut connection, KEY)).await
             else {
