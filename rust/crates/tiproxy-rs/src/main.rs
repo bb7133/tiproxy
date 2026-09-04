@@ -18,6 +18,7 @@
 
 mod config_composition;
 mod health;
+mod startup;
 mod topology_composition;
 
 use std::env;
@@ -36,8 +37,8 @@ use control_config::{
 use control_etcd::ElectionConfig;
 use control_external::{EtcdClientConfig, EtcdTlsConfig};
 use control_plane::{
-    ConfigSource, ControlModuleSet, ControlRuntime as InProcessControlRuntime, JsonStderrSink,
-    LifecyclePhase, OwnershipRegistry, ShutdownReason,
+    ConfigSource, ControlModule, ControlModuleSet, ControlRuntime as InProcessControlRuntime,
+    JsonStderrSink, LifecyclePhase, OwnershipRegistry, ShutdownReason,
 };
 use control_proto::CONTROL_PROTOCOL_V1;
 use control_proto::control_transport::ClientConfig;
@@ -45,16 +46,17 @@ use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
 use control_topology::{InterfaceAdvertiseResolver, TopologyModule};
-use dataplane::control_runtime::spawn_control_runtime_with_client_and_handler;
-use dataplane::metering::{MeteringSourceRegistry, run_metering_sampler};
+use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
+use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
-    MetricsRecorder, ServerError, SystemMemoryProbe, spawn_metrics_exporter,
+    MetricsExporter, MetricsRecorder, ServerError, SystemMemoryProbe, spawn_metrics_exporter,
 };
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use topology_composition::{
     ArtifactClusterFactory, CompositeCandidateValidator, TopologyCandidateValidator,
     interface_advertise_candidates,
@@ -129,6 +131,173 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+    }
+}
+
+/// The resources the steady-state supervisor takes ownership of after a
+/// successful startup, produced by [`StartupGuard::commit`].
+struct RunningProcess {
+    modules: ControlModuleSet,
+    runtime: ControlRuntime,
+    metrics_exporter: MetricsExporter,
+    metering_sampler: JoinHandle<Result<(), MeteringSamplerError>>,
+    health_task: Option<JoinHandle<()>>,
+}
+
+/// Owns every resource acquired after the first control module is spawned, so a
+/// startup failure stops and joins them in reverse order — each exactly once —
+/// instead of leaking abruptly aborted tasks (a registrar leak would hold a
+/// topology lease until its TTL).
+///
+/// The guard is armed on creation, before the first module is spawned. Every
+/// fallible startup step routes its error through [`StartupGuard::rollback`],
+/// which is the single failure exit; a successful startup ends with
+/// [`StartupGuard::commit`], which hands the resources to the supervisor. The
+/// embedded arm token makes dropping a half-constructed startup that did neither
+/// a loud bug.
+struct StartupGuard {
+    arm: startup::ArmToken,
+    in_process: Arc<InProcessControlRuntime>,
+    modules: ControlModuleSet,
+    metering_shutdown: watch::Sender<bool>,
+    runtime: Option<ControlRuntime>,
+    metrics_exporter: Option<MetricsExporter>,
+    metering_sampler: Option<JoinHandle<Result<(), MeteringSamplerError>>>,
+    health_task: Option<JoinHandle<()>>,
+}
+
+impl StartupGuard {
+    /// Arms the guard around the owner and the module set that already holds the
+    /// first (config owner) module. `metering_shutdown` stops the sampler during
+    /// rollback.
+    fn arm(
+        in_process: Arc<InProcessControlRuntime>,
+        modules: ControlModuleSet,
+        metering_shutdown: watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            arm: startup::ArmToken::armed(),
+            in_process,
+            modules,
+            metering_shutdown,
+            runtime: None,
+            metrics_exporter: None,
+            metering_sampler: None,
+            health_task: None,
+        }
+    }
+
+    /// Registers and starts one more control module under the guard.
+    fn spawn_module<M: ControlModule>(&mut self, module: M) -> Result<(), String> {
+        self.modules
+            .spawn(module)
+            .map_err(|error| error.to_string())
+    }
+
+    /// The legacy control runtime, once set, for wiring its dispatch handle and
+    /// stats before ownership passes to the supervisor.
+    fn runtime(&self) -> &ControlRuntime {
+        self.runtime
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("legacy runtime accessed before it was set"))
+    }
+
+    fn set_runtime(&mut self, runtime: ControlRuntime) {
+        self.runtime = Some(runtime);
+    }
+
+    fn set_metrics_exporter(&mut self, exporter: MetricsExporter) {
+        self.metrics_exporter = Some(exporter);
+    }
+
+    fn set_metering_sampler(&mut self, sampler: JoinHandle<Result<(), MeteringSamplerError>>) {
+        self.metering_sampler = Some(sampler);
+    }
+
+    fn set_health_task(&mut self, health_task: Option<JoinHandle<()>>) {
+        self.health_task = health_task;
+    }
+
+    /// Stops and joins every acquired resource in reverse order and returns the
+    /// original error unchanged.
+    async fn rollback(mut self, error: String) -> String {
+        // Registered in acquisition order; `run_teardowns_in_reverse` runs them
+        // latest-first. A resource absent at the failure point (its `Option` is
+        // `None`) is simply skipped.
+        let mut steps: Vec<(&'static str, startup::TeardownFuture)> = Vec::new();
+        if let Some(runtime) = self.runtime.take() {
+            steps.push((
+                "legacy_runtime",
+                Box::pin(async move {
+                    runtime.shutdown();
+                    let _ = runtime.join().await;
+                }),
+            ));
+        }
+        if let Some(exporter) = self.metrics_exporter.take() {
+            steps.push((
+                "metrics_exporter",
+                Box::pin(async move {
+                    exporter.shutdown();
+                    exporter.join().await;
+                }),
+            ));
+        }
+        if let Some(sampler) = self.metering_sampler.take() {
+            let shutdown = self.metering_shutdown.clone();
+            steps.push((
+                "metering_sampler",
+                Box::pin(async move {
+                    shutdown.send_replace(true);
+                    let _ = sampler.await;
+                }),
+            ));
+        }
+        if let Some(health_task) = self.health_task.take() {
+            steps.push((
+                "health_task",
+                Box::pin(async move {
+                    health_task.abort();
+                    let _ = health_task.await;
+                }),
+            ));
+        }
+        let _order = startup::run_teardowns_in_reverse(steps).await;
+        // The owner and its modules were acquired first, so they retire last.
+        // Make shutdown mandatory and advance to Stopping (so a topology module
+        // retires its registration at Stopping), then join every module and
+        // finish the owner.
+        self.in_process.fail("startup", "startup_failed");
+        let _ = self.in_process.advance_shutdown(LifecyclePhase::Draining);
+        let _ = self.in_process.advance_shutdown(LifecyclePhase::Stopping);
+        let _ = join_modules(&mut self.modules).await;
+        let _ = self.in_process.finish();
+        self.arm.disarm();
+        error
+    }
+
+    /// Hands every resource to the steady-state supervisor and disarms the guard.
+    fn commit(self) -> RunningProcess {
+        let StartupGuard {
+            mut arm,
+            in_process: _,
+            modules,
+            metering_shutdown: _,
+            runtime,
+            metrics_exporter,
+            metering_sampler,
+            health_task,
+        } = self;
+        arm.disarm();
+        RunningProcess {
+            modules,
+            runtime: runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set")),
+            metrics_exporter: metrics_exporter
+                .unwrap_or_else(|| unreachable!("commit before the metrics exporter was set")),
+            metering_sampler: metering_sampler
+                .unwrap_or_else(|| unreachable!("commit before the metering sampler was set")),
+            health_task,
+        }
     }
 }
 
@@ -231,25 +400,36 @@ async fn run(options: Options) -> Result<(), String> {
     let consumer =
         consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
     let runtime_handle = in_process.handle();
-    let mut modules = ControlModuleSet::new(&runtime_handle);
-    modules
-        .spawn(config_owner.module)
-        .map_err(|error| format!("start config owner module: {error}"))?;
+    let modules = ControlModuleSet::new(&runtime_handle);
+    // Arm the startup guard before the first module is spawned. From here every
+    // fallible acquisition routes its error through `guard.rollback` — the single
+    // failure exit — so a failure stops and joins everything already started
+    // (rather than leaking an aborted registrar that would hold a topology lease
+    // until its TTL); a successful startup ends with `guard.commit`.
+    let mut guard = StartupGuard::arm(
+        Arc::clone(&in_process),
+        modules,
+        metering_shutdown_tx.clone(),
+    );
+    // STARTUP-GUARD:ARMED
+    if let Err(error) = guard.spawn_module(config_owner.module) {
+        return Err(guard
+            .rollback(format!("start config owner module: {error}"))
+            .await);
+    }
     // Persistent `/config` is part of generation one. Do not let the legacy
     // bridge open SQL listeners against the file-only base while the initial
     // linearizable relist is still outstanding.
-    config_owner
-        .handle
-        .wait_ready()
-        .await
-        .map_err(|error| format!("initialize config owner: {error}"))?;
+    if let Err(error) = config_owner.handle.wait_ready().await {
+        return Err(guard
+            .rollback(format!("initialize config owner: {error}"))
+            .await);
+    }
     // CP-TOPO self-registration comes online before any SQL admission: register
     // this instance's SQL topology, then wait for its initial registration plan
     // and children to be installed. "Ready" here means the plan's children are
     // installed, not that PD has acknowledged the registration or that a
-    // discovery snapshot has been published. A failure after either module is
-    // spawned gracefully stops and joins both so a topology lease is revoked
-    // instead of an aborted task leaking it until its TTL expires.
+    // discovery snapshot has been published.
     let topology_identity = TopologyRuntimeIdentity {
         version: Arc::from(VERSION),
         git_hash: Arc::from(COMMIT),
@@ -267,23 +447,17 @@ async fn run(options: Options) -> Result<(), String> {
         ))),
         topology_identity,
     );
-    if let Err(error) = modules.spawn(topology_module) {
-        return Err(abort_startup(
-            &in_process,
-            &mut modules,
-            format!("start topology module: {error}"),
-        )
-        .await);
+    if let Err(error) = guard.spawn_module(topology_module) {
+        return Err(guard
+            .rollback(format!("start topology module: {error}"))
+            .await);
     }
     if let Err(error) = topology_handle.wait_ready().await {
-        return Err(abort_startup(
-            &in_process,
-            &mut modules,
-            format!("initialize topology module: {error}"),
-        )
-        .await);
+        return Err(guard
+            .rollback(format!("initialize topology module: {error}"))
+            .await);
     }
-    if let Err(error) = modules.spawn(ConfigServingAdapter::new(
+    if let Err(error) = guard.spawn_module(ConfigServingAdapter::new(
         config_owner.handle.source().clone(),
         serving.clone(),
         store.clone(),
@@ -292,40 +466,33 @@ async fn run(options: Options) -> Result<(), String> {
         config_owner.tls_roots,
         options.drain_grace,
     )) {
-        return Err(abort_startup(
-            &in_process,
-            &mut modules,
-            format!("start config serving adapter: {error}"),
-        )
-        .await);
+        return Err(guard
+            .rollback(format!("start config serving adapter: {error}"))
+            .await);
     }
-    let runtime = spawn_control_runtime_with_client_and_handler(
+    guard.set_runtime(spawn_control_runtime_with_client_and_handler(
         Arc::clone(&shared_client),
         Duration::from_millis(100),
         8,
         store.clone(),
         consumer,
         dispatch_handler,
-    );
-    if !installer.install(runtime.handle()) {
-        runtime.shutdown();
-        return Err(abort_startup(
-            &in_process,
-            &mut modules,
-            "install control dispatch handle exactly once".to_owned(),
-        )
-        .await);
+    ));
+    if !installer.install(guard.runtime().handle()) {
+        return Err(guard
+            .rollback("install control dispatch handle exactly once".to_owned())
+            .await);
     }
-    let metrics_exporter = spawn_metrics_exporter(
+    guard.set_metrics_exporter(spawn_metrics_exporter(
         Arc::clone(&shared_client),
         serving.clone(),
-        runtime.stats(),
+        guard.runtime().stats(),
         &metrics,
         observations,
         Duration::from_secs(1),
-    );
-    let metering_dispatch = runtime.handle();
-    let metering_sampler = tokio::spawn(async move {
+    ));
+    let metering_dispatch = guard.runtime().handle();
+    guard.set_metering_sampler(tokio::spawn(async move {
         run_metering_sampler(
             metering,
             metering_dispatch,
@@ -333,27 +500,28 @@ async fn run(options: Options) -> Result<(), String> {
             Duration::from_secs(1),
         )
         .await
-    });
+    }));
 
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
-    let health_task = match spawn_health(in_process_config.health_port(), serving.clone()).await {
-        Ok(task) => task,
-        Err(error) => {
-            runtime.shutdown();
-            return Err(abort_startup(&in_process, &mut modules, error).await);
-        }
-    };
-    if let Err(error) = in_process.mark_ready() {
-        runtime.shutdown();
-        return Err(abort_startup(
-            &in_process,
-            &mut modules,
-            format!("mark in-process control runtime ready: {error}"),
-        )
-        .await);
+    match spawn_health(in_process_config.health_port(), serving.clone()).await {
+        Ok(health_task) => guard.set_health_task(health_task),
+        Err(error) => return Err(guard.rollback(error).await),
     }
+    if let Err(error) = in_process.mark_ready() {
+        return Err(guard
+            .rollback(format!("mark in-process control runtime ready: {error}"))
+            .await);
+    }
+    // STARTUP-GUARD:COMMIT
+    let RunningProcess {
+        mut modules,
+        runtime,
+        metrics_exporter,
+        metering_sampler,
+        health_task,
+    } = guard.commit();
 
     // Supervise control and metering together. Either task disappearing must
     // wake this owner: otherwise a sampler panic could leave SQL serving
@@ -488,25 +656,6 @@ async fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Gracefully stops and joins already-started control modules when process
-/// startup fails after they were spawned. Making shutdown mandatory and
-/// advancing to `Stopping` lets each module see the lifecycle change and run its
-/// ordered teardown (a topology module revokes its exact lease and joins its
-/// children) instead of leaking abruptly aborted tasks. All steps are
-/// best-effort; the original startup error is returned unchanged.
-async fn abort_startup(
-    runtime: &InProcessControlRuntime,
-    modules: &mut ControlModuleSet,
-    error: String,
-) -> String {
-    runtime.fail("startup", "startup_failed");
-    let _ = runtime.advance_shutdown(LifecyclePhase::Draining);
-    let _ = runtime.advance_shutdown(LifecyclePhase::Stopping);
-    let _ = join_modules(modules).await;
-    let _ = runtime.finish();
-    error
-}
-
 async fn join_modules(modules: &mut ControlModuleSet) -> Result<(), String> {
     let mut result = Ok(());
     while let Some(exit) = modules.join_next().await {
@@ -553,7 +702,7 @@ async fn stop_drain_and_join_sessions(
 async fn spawn_health(
     port: u16,
     serving: DataplaneServingHandle,
-) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
+) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
     }
@@ -830,11 +979,102 @@ mod tests {
     use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
 
     use super::{
-        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options,
+        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options, StartupGuard,
         config_persistence_client, parse_options, persistence_options, session_loop_config,
         version_output,
     };
     use crate::config_composition::control_config;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use control_plane::{
+        ControlConfig, ControlModule, ControlModuleSet, ControlRuntime as InProcessControlRuntime,
+        JsonStderrSink, LifecyclePhase, LogLevel, MetricsPolicy, ModuleContext, ModuleFuture,
+        OwnershipRegistry, TlsPolicy,
+    };
+    use tokio::sync::watch;
+
+    /// A control module that runs until the runtime reaches `Stopping`, then
+    /// records that it ran to completion, so a test can prove the guard joined it
+    /// rather than aborting it.
+    struct StoppableModule {
+        completed: Arc<AtomicUsize>,
+    }
+
+    impl ControlModule for StoppableModule {
+        fn name(&self) -> &'static str {
+            "startup_guard_fake_module"
+        }
+
+        fn run(self: Box<Self>, context: ModuleContext) -> ModuleFuture {
+            Box::pin(async move {
+                let mut lifecycle = context.lifecycle();
+                while lifecycle.changed().await.is_ok() {
+                    if matches!(
+                        lifecycle.borrow().phase,
+                        LifecyclePhase::Stopping | LifecyclePhase::Stopped
+                    ) {
+                        break;
+                    }
+                }
+                self.completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cp_cfg_ready_failure_joins_the_config_module_and_finishes_the_owner() {
+        let registry = OwnershipRegistry::new();
+        let in_process = Arc::new(
+            InProcessControlRuntime::claim_process(
+                &registry,
+                "startup-guard-test".to_owned(),
+                ControlConfig::new(
+                    1,
+                    Duration::from_secs(30),
+                    0,
+                    TlsPolicy::default(),
+                    LogLevel::Info,
+                    MetricsPolicy::default(),
+                )
+                .unwrap_or_else(|error| unreachable!("control config: {error}")),
+                Arc::new(JsonStderrSink),
+            )
+            .unwrap_or_else(|error| unreachable!("claim process: {error}")),
+        );
+        let handle = in_process.handle();
+        let mut modules = ControlModuleSet::new(&handle);
+        let completed = Arc::new(AtomicUsize::new(0));
+        modules
+            .spawn(StoppableModule {
+                completed: Arc::clone(&completed),
+            })
+            .unwrap_or_else(|error| unreachable!("spawn config module: {error}"));
+        in_process
+            .mark_ready()
+            .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
+        let (metering_shutdown, _metering_rx) = watch::channel(false);
+        let guard = StartupGuard::arm(Arc::clone(&in_process), modules, metering_shutdown);
+
+        // The shape of a CP-CFG-ready failure: no optional resources were
+        // acquired, so rollback tears down only the module set and the owner.
+        let error = guard
+            .rollback("initialize config owner: injected".to_owned())
+            .await;
+        assert_eq!(error, "initialize config owner: injected");
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "the config module was joined (ran to completion), not abandoned"
+        );
+        // The owner was finished: a second finish is rejected.
+        assert!(
+            in_process.finish().is_err(),
+            "the owner was already finished by rollback"
+        );
+    }
 
     #[test]
     fn version_output_labels_all_build_metadata() {
@@ -842,6 +1082,45 @@ mod tests {
         assert!(output.starts_with("tiproxy-rs "));
         assert!(output.contains(" (commit "));
         assert!(output.contains(", built "));
+    }
+
+    #[test]
+    fn every_post_spawn_startup_failure_routes_through_the_one_rollback_seam() {
+        // A source contract for the composition root: between arming the startup
+        // guard and committing it, every failure must exit through
+        // `guard.rollback` and there must be no bare `?`/`.map_err(..)?` that
+        // bypasses it, so a new fallible acquisition cannot silently leak an
+        // already-started resource.
+        let source = include_str!("main.rs");
+        let armed = source
+            .find("// STARTUP-GUARD:ARMED")
+            .unwrap_or_else(|| unreachable!("armed marker present"));
+        let commit = source
+            .find("// STARTUP-GUARD:COMMIT")
+            .unwrap_or_else(|| unreachable!("commit marker present"));
+        assert!(commit > armed, "commit marker follows the armed marker");
+        let region = &source[armed..commit];
+
+        // Every failure exit in the guarded region goes through the single seam.
+        // (`.rollback(` is matched contiguously; `guard` may sit on the prior
+        // wrapped line.)
+        let returns = region.matches("return Err(").count();
+        let rollbacks = region.matches(".rollback(").count();
+        assert!(returns > 0, "the guarded region has failure exits");
+        assert_eq!(
+            returns, rollbacks,
+            "every guarded failure exit must call guard.rollback exactly once"
+        );
+
+        // No `?` operator may bypass the guard inside the region.
+        assert!(
+            !region.contains(")?"),
+            "no `?` operator may bypass the guard in the startup region"
+        );
+        assert!(
+            !region.contains("?;"),
+            "no `?` operator may bypass the guard in the startup region"
+        );
     }
 
     #[test]
@@ -887,13 +1166,10 @@ mod tests {
         let Ok(Command::Run(options)) = command else {
             unreachable!("valid operational arguments")
         };
-        assert_eq!(
-            options.drain_grace,
-            Some(std::time::Duration::from_secs(45))
-        );
+        assert_eq!(options.drain_grace, Some(Duration::from_secs(45)));
         assert_eq!(
             session_loop_config(options.drain_grace.unwrap_or_default()).drain_deadline,
-            std::time::Duration::from_secs(45),
+            Duration::from_secs(45),
             "one lineage: the CLI grace is the per-session FSM deadline"
         );
     }
@@ -925,7 +1201,7 @@ mod tests {
             control_socket: PathBuf::from("/tmp/control.sock"),
             control_uid: 42,
             tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
-            drain_grace: Some(std::time::Duration::from_secs(45)),
+            drain_grace: Some(Duration::from_secs(45)),
             health_port: 8081,
         };
         let source = ConfigNamespaceStore::from_toml(
