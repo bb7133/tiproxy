@@ -334,6 +334,7 @@ dependencies = [
  "control-plane",
  "etcd-client",
  "futures-util",
+ "h2",
  "http",
  "hyper-util",
  "prost",

@@ -83,6 +83,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(256);
 const KEEP_ALIVE_WHILE_IDLE: bool = false;
 /// Every dialed socket disables Nagle's algorithm (frozen policy).
 const TCP_NODELAY: bool = true;
+/// Upper bound on resolved addresses dialed for one endpoint within a single
+/// connect budget, mirroring legacy tonic/hyper's bounded multi-address
+/// fallback (a non-empty, order-preserving subset of the resolved set).
+const MAX_RESOLVED_ADDRS: usize = 8;
 
 /// The request type carried across the whole custom channel.
 type TransportRequest = http::Request<Body>;
@@ -403,8 +407,14 @@ pub(crate) struct TlsPlan {
 /// Injectable DNS/TCP/TLS stages, so tests can substitute barrier-blocking
 /// implementations while production uses [`ProdStageHooks`].
 pub(crate) trait StageHooks: Send + Sync + 'static {
-    /// Resolves `host:port` to a single socket address.
-    fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, Result<SocketAddr, DialError>>;
+    /// Resolves `host:port` to a bounded, non-empty, order-preserving set of
+    /// candidate socket addresses the dialer falls back across. Empty
+    /// resolution is an error.
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> BoxFuture<'static, Result<Vec<SocketAddr>, DialError>>;
 
     /// Opens a TCP connection with `TCP_NODELAY` and the configured keepalive.
     fn tcp_connect(
@@ -427,22 +437,37 @@ pub(crate) trait StageHooks: Send + Sync + 'static {
 pub(crate) struct ProdStageHooks;
 
 impl StageHooks for ProdStageHooks {
-    fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, Result<SocketAddr, DialError>> {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> BoxFuture<'static, Result<Vec<SocketAddr>, DialError>> {
         // 2b-1 resolves the literal authority only; ns_servers-based discovery
-        // fails closed to a later slice.
+        // fails closed to a later slice. Legacy tonic/hyper dials across the
+        // whole resolved set, so the bounded, order-preserving set is returned
+        // and the dialer falls back candidate by candidate.
         let authority = format!("{host}:{port}");
         Box::pin(async move {
             let resolved = tokio::task::spawn_blocking(move || authority.to_socket_addrs())
                 .await
                 .map_err(|error| DialError::Resolve(std::io::Error::other(error)))?
-                .map_err(DialError::Resolve)?
-                .next();
-            resolved.ok_or_else(|| {
-                DialError::Resolve(std::io::Error::new(
+                .map_err(DialError::Resolve)?;
+            let mut addrs: Vec<SocketAddr> = Vec::new();
+            for addr in resolved {
+                if addrs.len() >= MAX_RESOLVED_ADDRS {
+                    break;
+                }
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+            if addrs.is_empty() {
+                return Err(DialError::Resolve(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "no address for endpoint",
-                ))
-            })
+                )));
+            }
+            Ok(addrs)
         })
     }
 
@@ -518,9 +543,33 @@ impl Service<Uri> for OwnerFencedDialer {
         let hooks = Arc::clone(&self.hooks);
         Box::pin(async move {
             owner_fence(&owner)?; // pre-DNS
-            let addr = hooks.resolve(&host, port).await?;
+            let addrs = hooks.resolve(&host, port).await?;
             owner_fence(&owner)?; // post-DNS
-            let stream = hooks.tcp_connect(addr, keepalive).await?;
+            // Legacy tonic/hyper falls back across the resolved address set
+            // inside the single `Endpoint::connect_timeout` budget that already
+            // wraps this whole future: a healthy later candidate still connects
+            // when an earlier one is unreachable. No per-candidate timeout is
+            // added — the sequential attempts share that one budget. This is
+            // connection establishment, not RPC replay.
+            let mut last_error: Option<DialError> = None;
+            let mut connected: Option<TcpStream> = None;
+            for addr in addrs {
+                match hooks.tcp_connect(addr, keepalive).await {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            let Some(stream) = connected else {
+                return Err(last_error.unwrap_or_else(|| {
+                    DialError::Tcp(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "endpoint resolved to no dialable address",
+                    ))
+                }));
+            };
             owner_fence(&owner)?; // post-TCP
             let stream = match tls {
                 Some(plan) => hooks.tls_handshake(stream, plan).await?,
@@ -582,7 +631,17 @@ impl EndpointBlueprint {
         let uri: Uri = endpoint.parse().map_err(|_| malformed())?;
         let authority = uri.authority().ok_or_else(malformed)?.clone();
         let host = uri.host().ok_or_else(malformed)?.to_owned();
-        let port = uri.port_u16().ok_or_else(malformed)?;
+        // A normalized endpoint may omit the port (e.g. `http://host`). Default
+        // it by the endpoint's own scheme, exactly as legacy tonic does: the
+        // normalized scheme is always present and is `https` iff TLS, so this is
+        // zero-drift (443 under TLS, 80 for plaintext).
+        let port = uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            });
         let transport_uri = Uri::builder()
             .scheme("http")
             .authority(authority.clone())
@@ -718,13 +777,21 @@ mod tests {
         MaybeTlsStream, OwnerCallFence, StageHooks, StaleOwnerError, TlsPlan, build_custom_channel,
     };
     use crate::etcd::{EtcdClientConfig, EtcdTlsConfig, EtcdTlsPolicy};
-    use rustls_pki_types::ServerName;
+    use rustls::ServerConfig;
+    use rustls::server::{ClientHello, ResolvesServerCert};
+    use rustls::sign::CertifiedKey;
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use socket2::SockRef;
+    use std::fmt;
     use std::future::poll_fn;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
     use tokio::net::TcpStream;
+    use tokio::sync::oneshot;
+    use tokio_rustls::TlsAcceptor;
     use tower::balance::p2c::Balance;
     use tower::buffer::Buffer;
     use tower::discover::ServiceList;
@@ -874,7 +941,7 @@ mod tests {
             &self,
             _host: &str,
             _port: u16,
-        ) -> super::BoxFuture<'static, Result<SocketAddr, DialError>> {
+        ) -> super::BoxFuture<'static, Result<Vec<SocketAddr>, DialError>> {
             self.dns_calls.fetch_add(1, Ordering::SeqCst);
             let block = self.block == Stage::Dns;
             let entered = Arc::clone(&self.entered);
@@ -885,7 +952,7 @@ mod tests {
                     entered.notify_one();
                     release.notified().await;
                 }
-                Ok(addr)
+                Ok(vec![addr])
             })
         }
 
@@ -1294,14 +1361,15 @@ mod tests {
             .server_name
             .as_ref()
             .unwrap_or_else(|| unreachable!("a TLS endpoint carries an SNI name"));
-        assert!(
-            matches!(server_name, ServerName::DnsName(_)),
-            "SNI is a hostname, never an IP"
-        );
+        // The frozen invariant is that the SNI identity is the domain override
+        // or the logical host, NEVER a resolved IP — not that it is always a
+        // `DnsName` (an IP-literal logical host is a valid `IpAddress` identity;
+        // see `tls_sni_is_the_logical_identity_never_a_resolved_ip`). Here the
+        // override is a hostname, so the identity is exactly that override.
         assert_eq!(
             server_name.to_str(),
             "sni.override.example",
-            "the domain override is used"
+            "the domain override is used verbatim as the SNI identity"
         );
 
         // The endpoint assembles without HttpsUriWithoutTlsSupport (the http
@@ -1421,5 +1489,596 @@ mod tests {
             matches!(channel, etcd_client::Channel::Custom(_)),
             "a TLS custom channel is built"
         );
+    }
+
+    // ----- Fix 1: multi-address DNS fallback --------------------------------
+
+    /// Stage hooks that resolve to a scripted candidate list and dial each
+    /// candidate over a real socket, counting how often each stage runs. TLS is
+    /// short-circuited to a plaintext stream so the same hooks drive the h2
+    /// server tests below.
+    struct ScriptedHooks {
+        addrs: Vec<SocketAddr>,
+        resolve_calls: Arc<AtomicUsize>,
+        tcp_calls: Arc<AtomicUsize>,
+    }
+
+    impl StageHooks for ScriptedHooks {
+        fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> super::BoxFuture<'static, Result<Vec<SocketAddr>, DialError>> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            let addrs = self.addrs.clone();
+            Box::pin(async move { Ok(addrs) })
+        }
+
+        fn tcp_connect(
+            &self,
+            addr: SocketAddr,
+            _keepalive: Duration,
+        ) -> super::BoxFuture<'static, Result<TcpStream, DialError>> {
+            self.tcp_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { TcpStream::connect(addr).await.map_err(DialError::Tcp) })
+        }
+
+        fn tls_handshake(
+            &self,
+            stream: TcpStream,
+            _plan: TlsPlan,
+        ) -> super::BoxFuture<'static, Result<MaybeTlsStream, DialError>> {
+            Box::pin(async move { Ok(MaybeTlsStream::Plain(stream)) })
+        }
+    }
+
+    /// A bound-then-dropped local port that reliably refuses a connection.
+    async fn refused_addr() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("bind: {error}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"));
+        drop(listener);
+        addr
+    }
+
+    /// Builds a plaintext dialer over the scripted hooks and drives one dial.
+    async fn dial_over(
+        addrs: Vec<SocketAddr>,
+    ) -> (
+        Result<super::TokioIo<MaybeTlsStream>, DialError>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let (_registry, lease) = owner();
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let tcp_calls = Arc::new(AtomicUsize::new(0));
+        let hooks = Arc::new(ScriptedHooks {
+            addrs,
+            resolve_calls: Arc::clone(&resolve_calls),
+            tcp_calls: Arc::clone(&tcp_calls),
+        });
+        let config = EtcdClientConfig::new(["etcd.internal:2379".to_owned()], None)
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let blueprint = EndpointBlueprint::from_config(&config, 0, config.endpoints()[0].as_str())
+            .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
+        let mut dialer = blueprint.to_dialer(lease.token(), hooks as Arc<dyn StageHooks>);
+        poll_fn(|cx| dialer.poll_ready(cx))
+            .await
+            .unwrap_or_else(|error| unreachable!("ready: {error}"));
+        let uri = "http://etcd.internal:2379"
+            .parse()
+            .unwrap_or_else(|_| unreachable!("uri"));
+        let result = dialer.call(uri).await;
+        (result, resolve_calls, tcp_calls)
+    }
+
+    #[tokio::test]
+    async fn dialer_falls_back_to_a_live_candidate_after_a_dead_one() {
+        let live_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("listener: {error}"));
+        let live_addr = live_listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"));
+        let dead_addr = refused_addr().await;
+
+        let (result, resolve_calls, tcp_calls) = dial_over(vec![dead_addr, live_addr]).await;
+
+        assert!(
+            result.is_ok(),
+            "the dial falls back to the second, live candidate"
+        );
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            1,
+            "resolution runs exactly once for the whole fallback set"
+        );
+        assert_eq!(
+            tcp_calls.load(Ordering::SeqCst),
+            2,
+            "the dead candidate is tried, then the live one"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialer_surfaces_a_single_failure_when_every_candidate_fails() {
+        let dead_first = refused_addr().await;
+        let dead_second = refused_addr().await;
+
+        let (result, resolve_calls, tcp_calls) = dial_over(vec![dead_first, dead_second]).await;
+
+        // A single establishment failure surfaces from the TCP stage. Because
+        // the dialer never yields a stream, tonic never dispatches the request,
+        // so there is no RPC-level `Service::call` and no body replay: the
+        // failure is reported once, not retried into a storm.
+        assert!(
+            matches!(result, Err(DialError::Tcp(_))),
+            "every candidate failing yields one TCP establishment error"
+        );
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            1,
+            "resolution still runs exactly once, no retry storm"
+        );
+        assert_eq!(
+            tcp_calls.load(Ordering::SeqCst),
+            2,
+            "each candidate is dialed exactly once"
+        );
+    }
+
+    // ----- Fix 2: endpoints without an explicit port ------------------------
+
+    #[test]
+    fn endpoints_without_an_explicit_port_default_by_scheme() {
+        // Plaintext `http://host` (no port) defaults to 80.
+        let plain = EtcdClientConfig::new(["http://etcd.internal".to_owned()], None)
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let blueprint = EndpointBlueprint::from_config(&plain, 0, plain.endpoints()[0].as_str())
+            .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
+        assert_eq!(
+            (blueprint.host.as_str(), blueprint.port),
+            ("etcd.internal", 80),
+            "a plaintext endpoint with no port defaults to 80"
+        );
+
+        // TLS `https://host` (no port) defaults to 443.
+        let secure = EtcdClientConfig::new(["etcd.internal".to_owned()], Some(tls_config(None)))
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let blueprint = EndpointBlueprint::from_config(&secure, 0, secure.endpoints()[0].as_str())
+            .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
+        assert_eq!(
+            (blueprint.host.as_str(), blueprint.port),
+            ("etcd.internal", 443),
+            "a TLS endpoint with no port defaults to 443"
+        );
+    }
+
+    // ----- Fix 3c: the SNI identity is the logical host, never a resolved IP -
+
+    #[test]
+    fn tls_sni_is_the_logical_identity_never_a_resolved_ip() {
+        // An IPv4-literal logical host is a valid `IpAddress` identity for which
+        // no SNI is sent — it is not (and must not be forced into) a `DnsName`.
+        let ip_config =
+            EtcdClientConfig::new(["127.0.0.1:2379".to_owned()], Some(tls_config(None)))
+                .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let ip_blueprint =
+            EndpointBlueprint::from_config(&ip_config, 0, ip_config.endpoints()[0].as_str())
+                .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
+        let ip_name = ip_blueprint
+            .server_name
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("a TLS endpoint carries an identity"));
+        assert!(
+            matches!(ip_name, ServerName::IpAddress(_)),
+            "an IP-literal logical host is an IpAddress identity, never a DnsName"
+        );
+
+        // A hostname logical host keeps its DnsName identity, and the dialer's
+        // TlsPlan carries exactly that identity — never a resolved IP, even one
+        // that resolution would return in place of the host.
+        let host_config =
+            EtcdClientConfig::new(["etcd.internal:2379".to_owned()], Some(tls_config(None)))
+                .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let host_blueprint =
+            EndpointBlueprint::from_config(&host_config, 0, host_config.endpoints()[0].as_str())
+                .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
+        let (_registry, lease) = owner();
+        let dialer = host_blueprint.to_dialer(lease.token(), Arc::new(super::ProdStageHooks));
+        let plan = dialer
+            .tls
+            .clone()
+            .unwrap_or_else(|| unreachable!("a TLS endpoint carries a TlsPlan"));
+        assert!(
+            matches!(plan.server_name, ServerName::DnsName(_)),
+            "the identity for a hostname endpoint is a DnsName"
+        );
+        assert_eq!(
+            plan.server_name.to_str(),
+            "etcd.internal",
+            "the dialer's TlsPlan SNI is the logical host"
+        );
+        // A candidate IP that resolution could return is never the SNI.
+        assert_ne!(
+            plan.server_name.to_str(),
+            "203.0.113.7",
+            "the SNI is never a resolved IP address"
+        );
+    }
+
+    // ----- Fix 3a & Fix 4: an actual tonic Channel over an in-process h2 server
+
+    /// Accepts one h2 connection, records the first request's `:scheme` and
+    /// `:authority`, optionally delays, then answers a bare 200.
+    async fn run_capturing_h2_server(
+        listener: TcpListener,
+        captured: oneshot::Sender<(Option<String>, Option<String>)>,
+        response_delay: Duration,
+    ) {
+        let Ok((stream, _peer)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut connection) = h2::server::handshake(stream).await else {
+            return;
+        };
+        let mut captured = Some(captured);
+        while let Some(Ok((request, mut responder))) = connection.accept().await {
+            if let Some(sender) = captured.take() {
+                let scheme = request.uri().scheme_str().map(str::to_owned);
+                let authority = request
+                    .uri()
+                    .authority()
+                    .map(|authority| authority.as_str().to_owned());
+                let _ = sender.send((scheme, authority));
+            }
+            if !response_delay.is_zero() {
+                tokio::time::sleep(response_delay).await;
+            }
+            let _ = responder.send_response(http::Response::new(()), true);
+        }
+    }
+
+    /// Builds a TLS-origin channel whose dialer redirects (plaintext) to `addr`.
+    /// The caller owns the lease behind `token`, keeping it current for the dial.
+    fn channel_to(
+        addr: SocketAddr,
+        request_timeout: Option<Duration>,
+        token: control_plane::OwnerToken,
+    ) -> tonic::transport::Channel {
+        let mut config =
+            EtcdClientConfig::new(["etcd.internal:2379".to_owned()], Some(tls_config(None)))
+                .unwrap_or_else(|error| unreachable!("config: {error}"));
+        if let Some(timeout) = request_timeout {
+            config = config
+                .with_timeouts(
+                    Duration::from_secs(5),
+                    timeout,
+                    Duration::from_secs(10),
+                    Duration::from_secs(3),
+                    Duration::from_secs(30),
+                )
+                .unwrap_or_else(|error| unreachable!("timeouts: {error}"));
+        }
+        let blueprint = EndpointBlueprint::from_config(&config, 0, config.endpoints()[0].as_str())
+            .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
+        let hooks = Arc::new(ScriptedHooks {
+            addrs: vec![addr],
+            resolve_calls: Arc::new(AtomicUsize::new(0)),
+            tcp_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let dialer = blueprint.to_dialer(token, hooks as Arc<dyn StageHooks>);
+        blueprint
+            .to_endpoint(0)
+            .unwrap_or_else(|error| unreachable!("endpoint: {error}"))
+            .connect_with_connector_lazy(dialer)
+    }
+
+    fn grpc_request(path: &str) -> http::Request<super::Body> {
+        http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(super::Body::empty())
+            .unwrap_or_else(|error| unreachable!("request: {error}"))
+    }
+
+    #[tokio::test]
+    async fn tls_origin_drives_https_scheme_and_authority_over_the_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("listener: {error}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"));
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(run_capturing_h2_server(listener, sender, Duration::ZERO));
+
+        let (_registry, lease) = owner();
+        let mut channel = channel_to(addr, None, lease.token());
+        poll_fn(|cx| channel.poll_ready(cx))
+            .await
+            .unwrap_or_else(|error| unreachable!("ready: {error}"));
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            channel.call(grpc_request("https://etcd.internal:2379/svc/Method")),
+        )
+        .await;
+        let Ok(Ok(response)) = response else {
+            unreachable!("the call over the h2 server must complete");
+        };
+        assert_eq!(response.status(), 200, "the server answered 200");
+
+        let Ok(Ok((scheme, authority))) =
+            tokio::time::timeout(Duration::from_secs(5), receiver).await
+        else {
+            unreachable!("the server must have captured the request head");
+        };
+        // `.origin(https://...)` drives these pseudo-headers; deleting it makes
+        // tonic fall back to the `http://` transport URI and `:scheme` becomes
+        // `http`, turning this assertion RED.
+        assert_eq!(
+            scheme.as_deref(),
+            Some("https"),
+            "the https origin sets the request :scheme"
+        );
+        assert_eq!(
+            authority.as_deref(),
+            Some("etcd.internal:2379"),
+            "the origin sets the request :authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_fails_a_slow_response_but_not_a_fast_one() {
+        let request_timeout = Duration::from_millis(300);
+        let (_registry, lease) = owner();
+
+        // Slow: the response is delayed well past the request timeout, so the
+        // call must error. Deleting `.timeout(...)` lets the call wait out the
+        // delay and succeed, turning this assertion RED.
+        let slow_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("listener: {error}"));
+        let slow_addr = slow_listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"));
+        let (slow_tx, _slow_rx) = oneshot::channel();
+        tokio::spawn(run_capturing_h2_server(
+            slow_listener,
+            slow_tx,
+            Duration::from_millis(1_500),
+        ));
+        let mut slow_channel = channel_to(slow_addr, Some(request_timeout), lease.token());
+        poll_fn(|cx| slow_channel.poll_ready(cx))
+            .await
+            .unwrap_or_else(|error| unreachable!("ready: {error}"));
+        let slow = tokio::time::timeout(
+            Duration::from_secs(3),
+            slow_channel.call(grpc_request("https://etcd.internal:2379/svc/Method")),
+        )
+        .await;
+        let Ok(slow_result) = slow else {
+            unreachable!("the request timeout must trip well within 3s");
+        };
+        assert!(
+            slow_result.is_err(),
+            "a response slower than the request timeout fails the call"
+        );
+
+        // Fast: the same request timeout, but a prompt response, so the call
+        // succeeds — proving the timeout, not a broken connection, caused the
+        // failure above.
+        let fast_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("listener: {error}"));
+        let fast_addr = fast_listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"));
+        let (fast_tx, _fast_rx) = oneshot::channel();
+        tokio::spawn(run_capturing_h2_server(
+            fast_listener,
+            fast_tx,
+            Duration::ZERO,
+        ));
+        let mut fast_channel = channel_to(fast_addr, Some(request_timeout), lease.token());
+        poll_fn(|cx| fast_channel.poll_ready(cx))
+            .await
+            .unwrap_or_else(|error| unreachable!("ready: {error}"));
+        let fast = tokio::time::timeout(
+            Duration::from_secs(3),
+            fast_channel.call(grpc_request("https://etcd.internal:2379/svc/Method")),
+        )
+        .await;
+        let Ok(Ok(response)) = fast else {
+            unreachable!("a prompt response within the timeout must succeed");
+        };
+        assert_eq!(response.status(), 200, "the prompt response is delivered");
+    }
+
+    // ----- Fix 3b: a real local-TLS handshake carries the chosen SNI --------
+
+    /// A server certificate resolver that records the `ClientHello` SNI.
+    struct SniCapturingResolver {
+        observed: Arc<Mutex<Option<String>>>,
+        certified: Arc<CertifiedKey>,
+    }
+
+    impl fmt::Debug for SniCapturingResolver {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SniCapturingResolver")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ResolvesServerCert for SniCapturingResolver {
+        fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            *self
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                client_hello.server_name().map(str::to_owned);
+            Some(Arc::clone(&self.certified))
+        }
+    }
+
+    /// A self-signed server certificate (PEM) with `hostname` in its SAN.
+    fn self_signed_server_cert(hostname: &str) -> (String, String) {
+        let mut params = rcgen::CertificateParams::new(vec![hostname.to_owned()])
+            .unwrap_or_else(|error| unreachable!("cert params: {error}"));
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let key = rcgen::KeyPair::generate().unwrap_or_else(|error| unreachable!("key: {error}"));
+        let certificate = params
+            .self_signed(&key)
+            .unwrap_or_else(|error| unreachable!("self-signed: {error}"));
+        (certificate.pem(), key.serialize_pem())
+    }
+
+    /// Builds a rustls `TlsAcceptor` whose resolver records the negotiated SNI.
+    fn sni_capturing_acceptor(
+        cert_pem: &str,
+        key_pem: &str,
+        observed: Arc<Mutex<Option<String>>>,
+    ) -> TlsAcceptor {
+        let certificate = CertificateDer::from_pem_slice(cert_pem.as_bytes())
+            .unwrap_or_else(|error| unreachable!("cert: {error}"))
+            .into_owned();
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .unwrap_or_else(|error| unreachable!("key: {error}"));
+        let signing = rustls::crypto::ring::sign::any_supported_type(&key)
+            .unwrap_or_else(|error| unreachable!("signing key: {error}"));
+        let certified = Arc::new(CertifiedKey::new(vec![certificate], signing));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(rustls::ALL_VERSIONS)
+            .unwrap_or_else(|error| unreachable!("server versions: {error}"))
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SniCapturingResolver {
+                observed,
+                certified,
+            }));
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// Drives `ProdStageHooks::tls_handshake` against a real local TLS server
+    /// and asserts both the dialer's `TlsPlan` and the SNI observed on the wire.
+    async fn assert_prod_tls_sni(domain_override: Option<&str>, expected_sni: &str) {
+        let (cert_pem, key_pem) = self_signed_server_cert("etcd.internal");
+        let observed = Arc::new(Mutex::new(None));
+        let acceptor = sni_capturing_acceptor(&cert_pem, &key_pem, Arc::clone(&observed));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("listener: {error}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"));
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _peer)) = listener.accept().await {
+                let _ = acceptor.accept(stream).await;
+            }
+        });
+
+        let config = EtcdClientConfig::new(
+            ["etcd.internal:2379".to_owned()],
+            Some(tls_config(domain_override)),
+        )
+        .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let blueprint = EndpointBlueprint::from_config(&config, 0, config.endpoints()[0].as_str())
+            .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
+        let (_registry, lease) = owner();
+        let dialer = blueprint.to_dialer(lease.token(), Arc::new(super::ProdStageHooks));
+        let plan = dialer
+            .tls
+            .clone()
+            .unwrap_or_else(|| unreachable!("a TLS endpoint carries a TlsPlan"));
+        assert_eq!(
+            plan.server_name.to_str(),
+            expected_sni,
+            "the dialer's TlsPlan carries the chosen SNI identity"
+        );
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|error| unreachable!("connect: {error}"));
+        let handshaked = super::ProdStageHooks
+            .tls_handshake(stream, plan)
+            .await
+            .unwrap_or_else(|error| unreachable!("client handshake: {error}"));
+        assert!(
+            matches!(handshaked, MaybeTlsStream::Tls(_)),
+            "the handshake yields a TLS stream"
+        );
+        server
+            .await
+            .unwrap_or_else(|error| unreachable!("server task: {error}"));
+        let captured = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            captured.as_deref(),
+            Some(expected_sni),
+            "the server observed the chosen SNI on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_tls_handshake_sends_the_override_then_the_logical_host_sni() {
+        // (i) an explicit domain override is the SNI sent on the wire.
+        assert_prod_tls_sni(Some("sni.override.example"), "sni.override.example").await;
+        // (ii) absent an override, the logical host is the SNI.
+        assert_prod_tls_sni(None, "etcd.internal").await;
+    }
+
+    // ----- Fix 5: the dialer applies the socket knobs to a real socket ------
+
+    #[tokio::test]
+    async fn prod_tcp_connect_applies_nodelay_and_keepalive_to_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("listener: {error}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"));
+        let accept = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            // Hold the accepted connection open for the duration of the test.
+            std::future::pending::<()>().await;
+            drop(accepted);
+        });
+
+        // A non-default keepalive so the assertion cannot pass on a default.
+        let keepalive = Duration::from_secs(17);
+        let stream = super::ProdStageHooks
+            .tcp_connect(addr, keepalive)
+            .await
+            .unwrap_or_else(|error| unreachable!("tcp connect: {error}"));
+
+        assert!(
+            stream
+                .nodelay()
+                .unwrap_or_else(|error| unreachable!("nodelay: {error}")),
+            "the dialer disables Nagle on the socket"
+        );
+        let sock = SockRef::from(&stream);
+        assert!(
+            sock.keepalive()
+                .unwrap_or_else(|error| unreachable!("keepalive: {error}")),
+            "the dialer enables SO_KEEPALIVE on the socket"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let idle = sock
+                .tcp_keepalive_time()
+                .unwrap_or_else(|error| unreachable!("keepalive time: {error}"));
+            assert!(
+                idle >= Duration::from_secs(15) && idle <= Duration::from_secs(19),
+                "the keepalive idle time reflects the non-default 17s, got {idle:?}"
+            );
+        }
+        accept.abort();
     }
 }

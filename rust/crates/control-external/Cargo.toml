@@ -30,6 +30,7 @@ tower = { version = "=0.5.3", default-features = false, features = ["balance", "
 x509-parser.workspace = true
 
 [dev-dependencies]
+h2 = "=0.4.19"
 rcgen.workspace = true
 serde_json.workspace = true
 
