@@ -201,6 +201,25 @@ impl EtcdTlsConfig {
         }
         options
     }
+
+    /// Builds the client TLS configuration for the custom etcd transport from
+    /// the generation-bound material and verification policy (the advanced
+    /// `minimum_version` / `allowed_common_names` / `skip_ca_verification` that
+    /// the tonic `TlsOptions` path cannot express).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtcdConfigError::TlsSetup`] when the material cannot form a
+    /// client configuration.
+    pub fn client_config(&self) -> Result<std::sync::Arc<rustls::ClientConfig>, EtcdConfigError> {
+        crate::tls::build_client_config(
+            self.ca_certificate_pem.as_deref(),
+            self.identity
+                .as_ref()
+                .map(|(certificate, key)| (certificate.as_slice(), key.as_slice())),
+            &self.policy,
+        )
+    }
 }
 
 /// Validated production connection policy shared by later control modules.
@@ -359,6 +378,9 @@ pub enum EtcdConfigError {
     /// The allowed common name list exceeds its count bound.
     #[error("too many etcd TLS allowed common names")]
     TooManyCommonNames,
+    /// The TLS material and policy could not form a client configuration.
+    #[error("etcd TLS client configuration could not be built")]
+    TlsSetup,
     /// Timeout and keepalive values are bounded.
     #[error("invalid {name} duration {value:?}")]
     InvalidDuration {

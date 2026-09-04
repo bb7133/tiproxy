@@ -336,12 +336,16 @@ dependencies = [
  "futures-util",
  "http",
  "prost",
+ "rcgen",
  "reqwest",
+ "rustls",
+ "rustls-pki-types",
  "serde_json",
  "thiserror",
  "tokio",
  "tonic",
  "tonic-prost",
+ "x509-parser",
 ]
 
 [[package]]

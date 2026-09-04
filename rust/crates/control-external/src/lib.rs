@@ -25,6 +25,7 @@ pub mod dns;
 pub mod etcd;
 pub mod http;
 pub mod retry;
+mod tls;
 
 /// Minimal wire-compatible `kvproto` diagnostics service binding.
 #[allow(
