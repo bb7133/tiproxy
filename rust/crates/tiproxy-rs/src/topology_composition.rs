@@ -1192,14 +1192,14 @@ ns-servers = ["dns-a:53"]
         );
     }
 
-    // ----- D-(3): multi-endpoint first-dead / second-live -------------------
+    // ----- D-(3): multi-endpoint + caller retry -----------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn d3_multi_endpoint_falls_over_to_the_live_server_once() {
+    async fn d3_multi_endpoint_caller_retry_reaches_live_server_once() {
         let fixture = spawn_fixture(None, KEY, VALUE);
         let dead = dead_addr().await;
         let dir = material_dir("d3");
-        // First endpoint refuses; the second is the live fixture.
+        // One endpoint refuses and one is live; normalization may reorder them.
         let toml = topology_toml(
             &format!(
                 "127.0.0.1:{},127.0.0.1:{}",
