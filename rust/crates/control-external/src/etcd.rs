@@ -294,9 +294,11 @@ impl EtcdClientConfig {
     /// The list is a shared, immutable snapshot; the empty list means no explicit
     /// nameservers. Each entry must be a normalized `host:port` (or bracketed
     /// `[v6]:port`) with an explicit numeric port, matching the config layer's
-    /// `normalize_ns_server`. This slice validates and bounds the list but does
-    /// not yet consult it: the production dialer still resolves via the system
-    /// resolver until the `ns_servers` gate opens in a later slice.
+    /// `normalize_ns_server`. When non-empty, the connector resolves the target
+    /// host through the shared owner-fenced explicit-nameserver resolver over
+    /// these servers — never the system resolver; only a nameserver *hostname*
+    /// entry is bootstrapped through the system resolver. An empty list keeps the
+    /// system-resolver path for the target host.
     ///
     /// # Errors
     ///

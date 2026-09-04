@@ -1086,7 +1086,7 @@ fn insert_bounded(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
@@ -1098,6 +1098,7 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, SOA};
     use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+    use tokio::sync::Notify;
 
     use super::{
         BoxFut, Clock, DnsTransport, ExplicitResolver, MAX_CACHE_ENTRIES, ResolveError,
@@ -1166,6 +1167,15 @@ mod tests {
         // A one-shot clock advance applied when the first UDP query is sent, so a
         // test can make a lookup consume wall-clock time during the exchange.
         pre_send_advance: Mutex<Option<Duration>>,
+        // Total nameserver-hostname bootstrap attempts observed, so a test can
+        // prove a failed/stale bootstrap is NOT cached (a second resolve re-runs).
+        boot_count: AtomicUsize,
+        // Hostnames whose bootstrap fails with a timeout, no matter the boot map.
+        boot_fail: Mutex<HashSet<String>>,
+        // A gate parking the bootstrap await, plus a signal fired once a bootstrap
+        // is entered, so a test can retire the owner mid-bootstrap deterministically.
+        boot_gate: Arc<AtomicBool>,
+        boot_started: Arc<Notify>,
     }
 
     impl FakeTransport {
@@ -1181,7 +1191,34 @@ mod tests {
                 yield_first: AtomicBool::new(false),
                 gate_open: Arc::new(AtomicBool::new(true)),
                 pre_send_advance: Mutex::new(None),
+                boot_count: AtomicUsize::new(0),
+                boot_fail: Mutex::new(HashSet::new()),
+                boot_gate: Arc::new(AtomicBool::new(true)),
+                boot_started: Arc::new(Notify::new()),
             })
+        }
+
+        fn boot_count(&self) -> usize {
+            self.boot_count.load(Ordering::SeqCst)
+        }
+
+        fn fail_bootstrap(&self, host: &str) {
+            self.boot_fail
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(host.to_owned());
+        }
+
+        fn close_boot_gate(&self) {
+            self.boot_gate.store(false, Ordering::SeqCst);
+        }
+
+        fn open_boot_gate(&self) {
+            self.boot_gate.store(true, Ordering::SeqCst);
+        }
+
+        fn boot_started(&self) -> Arc<Notify> {
+            Arc::clone(&self.boot_started)
         }
 
         fn set_pre_send_advance(&self, delay: Duration) {
@@ -1315,13 +1352,32 @@ mod tests {
             _port: u16,
             _deadline: Instant,
         ) -> BoxFut<'static, Result<Vec<IpAddr>, TransportError>> {
+            self.boot_count.fetch_add(1, Ordering::SeqCst);
+            let fail = self
+                .boot_fail
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&*host);
             let out = self
                 .boot
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get(&*host)
                 .cloned();
-            Box::pin(async move { out.ok_or(TransportError::Unavailable) })
+            let gate = Arc::clone(&self.boot_gate);
+            let started = Arc::clone(&self.boot_started);
+            Box::pin(async move {
+                if fail {
+                    return Err(TransportError::Timeout);
+                }
+                // Signal entry, then park (yielding so the runtime can retire the
+                // owner) until the gate opens.
+                started.notify_one();
+                while !gate.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                out.ok_or(TransportError::Unavailable)
+            })
         }
     }
 
@@ -2645,6 +2701,96 @@ mod tests {
             Err(ResolveError::NoNameservers)
         );
         assert_eq!(transport.a_count(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // 11c. A bootstrap timeout is not cached: the next resolve re-bootstraps.
+    // ---------------------------------------------------------------------
+    #[tokio::test]
+    async fn bootstrap_timeout_is_not_cached_and_rebootstraps() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        transport.fail_bootstrap("ns.internal");
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns("ns.internal:53"),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.resolve("target.test").await,
+            Err(ResolveError::NoNameservers),
+            "a bootstrap timeout leaves no usable nameserver"
+        );
+        assert_eq!(
+            resolver.resolve("target.test").await,
+            Err(ResolveError::NoNameservers),
+            "the second resolve also fails closed"
+        );
+        assert_eq!(
+            transport.boot_count(),
+            2,
+            "the bootstrap failure was not cached, so the second resolve re-bootstraps"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 11d. Retiring the owner mid-bootstrap yields StaleOwner and caches nothing.
+    // ---------------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_stale_owner_writes_no_cache() {
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            let clock = ManualClock::new();
+            let transport = FakeTransport::new(&clock);
+            // The bootstrap WOULD succeed, but the gate parks it until the owner
+            // has been retired.
+            transport.set_bootstrap("ns.internal", vec![IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9))]);
+            transport.close_boot_gate();
+            let started = transport.boot_started();
+
+            let registry = OwnershipRegistry::new();
+            let lease = registry
+                .claim(OwnerScope::Process, "boot-owner")
+                .unwrap_or_else(|error| unreachable!("claim: {error}"));
+            let resolver = Arc::new(build_resolver(
+                lease.token(),
+                &ns("ns.internal:53"),
+                Arc::clone(&transport),
+                &clock,
+                Duration::from_secs(5),
+            ));
+
+            let task_resolver = Arc::clone(&resolver);
+            let handle = tokio::spawn(async move { task_resolver.resolve("target.test").await });
+
+            // Wait until the bootstrap is in flight, then retire the owner and
+            // release the gate so the (now stale) bootstrap completes.
+            started.notified().await;
+            lease.release();
+            transport.open_boot_gate();
+
+            let Ok(joined) = handle.await else {
+                unreachable!("resolve task must not panic");
+            };
+            assert_eq!(
+                joined,
+                Err(ResolveError::StaleOwner),
+                "a bootstrap that completes after the owner retired is discarded"
+            );
+            assert_eq!(
+                resolver.cache_len(),
+                0,
+                "a stale-owner bootstrap writes no cache entry for the target"
+            );
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "the retire-during-bootstrap row must finish within the deadline"
+        );
     }
 
     // --- pure-helper unit tests -----------------------------------------

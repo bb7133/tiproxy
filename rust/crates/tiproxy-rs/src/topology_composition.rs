@@ -1376,35 +1376,42 @@ ns-servers = []
         out
     }
 
-    /// Binds the loopback nameserver on `127.0.0.1:0` and detaches its loop.
+    /// The responder loop for one bound socket, shared by the v4 and v6 listeners.
+    async fn dns_responder(socket: tokio::net::UdpSocket, counter: Arc<AtomicUsize>) {
+        let mut buffer = vec![0u8; 2048];
+        loop {
+            let Ok((len, src)) = socket.recv_from(&mut buffer).await else {
+                return;
+            };
+            let Some((id, qtype, question)) = parse_dns_query(&buffer[..len]) else {
+                continue;
+            };
+            if qtype == 1 {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            let response = build_dns_response(id, qtype, question);
+            let _ = socket.send_to(&response, src).await;
+        }
+    }
+
+    /// Binds the loopback nameserver on `127.0.0.1:0`, learns the port, then also
+    /// binds `[::1]:P` best-effort so a hostname nameserver (`localhost` resolves
+    /// to both `127.0.0.1` and `::1`) is answered promptly on either family.
     async fn spawn_loopback_dns() -> LoopbackDns {
-        use std::net::Ipv4Addr;
+        use std::net::{Ipv4Addr, Ipv6Addr};
         use tokio::net::UdpSocket;
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        let v4 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap_or_else(|error| unreachable!("bind dns: {error}"));
-        let port = socket
+        let port = v4
             .local_addr()
             .unwrap_or_else(|error| unreachable!("dns addr: {error}"))
             .port();
         let a_queries = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&a_queries);
-        tokio::spawn(async move {
-            let mut buffer = vec![0u8; 2048];
-            loop {
-                let Ok((len, src)) = socket.recv_from(&mut buffer).await else {
-                    return;
-                };
-                let Some((id, qtype, question)) = parse_dns_query(&buffer[..len]) else {
-                    continue;
-                };
-                if qtype == 1 {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                }
-                let response = build_dns_response(id, qtype, question);
-                let _ = socket.send_to(&response, src).await;
-            }
-        });
+        tokio::spawn(dns_responder(v4, Arc::clone(&a_queries)));
+        if let Ok(v6) = UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).await {
+            tokio::spawn(dns_responder(v6, Arc::clone(&a_queries)));
+        }
         LoopbackDns { port, a_queries }
     }
 
@@ -1582,6 +1589,36 @@ ns-servers = [{ns_servers}]
         assert!(
             !authority.contains("127.0.0.1"),
             "the HTTP/2 :authority is never the resolved IP: {authority}"
+        );
+    }
+
+    // ----- Row 9: a HOSTNAME nameserver is bootstrapped in the KV pipeline ---
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn row9_hostname_nameserver_is_bootstrapped_in_the_pipeline() {
+        let fixture = spawn_fixture(None, KEY, VALUE);
+        let dns = spawn_loopback_dns().await;
+        let dir = material_dir("row9");
+        // The nameserver is a HOSTNAME ("localhost"), so the production dialer must
+        // run the real system bootstrap ("localhost" -> 127.0.0.1/::1) before it
+        // can reach the loopback DNS server; the target `etcd.invalid` is itself
+        // system-unresolvable and reachable only through that explicit nameserver.
+        let toml = topology_toml_ns(
+            &format!("etcd.invalid:{}", fixture.addr.port()),
+            &format!("\"localhost:{}\"", dns.port),
+            "",
+        );
+        let config = single_client(&toml, &dir);
+
+        let (_registry, lease) = owner();
+        let Ok(response) = connect_and_get(config, &lease, KEY).await else {
+            unreachable!("the get must succeed via the bootstrapped hostname nameserver");
+        };
+        assert_known_pair(&response, KEY, VALUE);
+        assert_eq!(fixture.range_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            dns.a_queries.load(Ordering::SeqCst) >= 1,
+            "the target's A query reached the bootstrapped localhost nameserver"
         );
     }
 }
