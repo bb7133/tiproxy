@@ -971,14 +971,24 @@ fn combine(
         return (Ok(addrs), cache);
     }
 
-    // No positive family. A soft failure (timeout/SERVFAIL/malformed/loop)
-    // suppresses negative caching entirely.
-    if matches!(a, FamilyOutcome::SoftError) || matches!(aaaa, FamilyOutcome::SoftError) {
+    // No positive family. A name-wide NXDOMAIN in EITHER family is authoritative
+    // for the whole name, so it wins over the other family's soft failure
+    // (timeout/SERVFAIL/malformed/loop): a soft failure must never downgrade a
+    // proven NXDOMAIN to a lookup error. Only when NEITHER family is NXDOMAIN does
+    // a soft failure suppress negative caching and downgrade any NODATA.
+    let a_nxdomain = matches!(a, FamilyOutcome::Negative(NegativeKind::NxDomain(_)));
+    let aaaa_nxdomain = matches!(aaaa, FamilyOutcome::Negative(NegativeKind::NxDomain(_)));
+    if !a_nxdomain
+        && !aaaa_nxdomain
+        && (matches!(a, FamilyOutcome::SoftError) || matches!(aaaa, FamilyOutcome::SoftError))
+    {
         return (Err(ResolveError::LookupFailed), None);
     }
 
-    // Both families are authoritative negatives; preserve the NXDOMAIN/NODATA
-    // distinction when deciding whether — and for how long — to cache.
+    // An authoritative negative. `negative_cache_ttl` encodes the kind-aware
+    // policy: a name-wide NXDOMAIN is cached by its SOA TTL when present
+    // (regardless of the other family), while a pure NODATA is cached only when
+    // both families are NODATA WITH an SOA.
     let cache = negative_cache_ttl(a, aaaa).map(|ttl| CacheEntry {
         result: CacheResult::Negative,
         expires_at: started + Duration::from_secs(u64::from(ttl)),
@@ -986,13 +996,16 @@ fn combine(
     (Err(ResolveError::NameResolution), cache)
 }
 
-/// Decides the negative-cache TTL for two authoritative negative families.
+/// Decides the negative-cache TTL for a pair of family outcomes that the caller
+/// has already resolved to an authoritative negative (a soft-failure family
+/// contributes no kind and is ignored here).
 ///
-/// A name-wide NXDOMAIN may be cached by its SOA TTL when an SOA is present. A
-/// pure NODATA is cached only when BOTH families are NODATA WITH an SOA (TTL =
-/// the minimum of the two per-family SOA TTLs). Any NODATA-without-SOA — or a
-/// NXDOMAIN with no SOA — yields no cache. Returns the capped TTL, or `None` when
-/// the pair must not be cached.
+/// A name-wide NXDOMAIN may be cached by its SOA TTL when an SOA is present,
+/// regardless of the other family (which may be a soft failure). A pure NODATA is
+/// cached only when BOTH families are NODATA WITH an SOA (TTL = the minimum of the
+/// two per-family SOA TTLs). Any NODATA-without-SOA — or a NXDOMAIN with no SOA —
+/// yields no cache. Returns the capped TTL, or `None` when the pair must not be
+/// cached.
 fn negative_cache_ttl(a: &FamilyOutcome, aaaa: &FamilyOutcome) -> Option<u32> {
     let a_kind = negative_kind(a);
     let aaaa_kind = negative_kind(aaaa);
@@ -2929,6 +2942,61 @@ mod tests {
             Err(ResolveError::NameResolution)
         );
         assert!(transport.a_count() > queried, "re-queries past the 5s cap");
+    }
+
+    #[tokio::test]
+    async fn nxdomain_with_other_family_timeout_is_name_wide_and_cached() {
+        // A returns an authoritative NXDOMAIN with an SOA; AAAA times out. A
+        // name-wide NXDOMAIN must not be downgraded by the other family's soft
+        // failure: the outcome is NameResolution (not LookupFailed) AND it is
+        // negatively cached by the SOA TTL. Reordering the soft-failure check
+        // ahead of the NXDOMAIN check turns this RED.
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        transport.set_udp(
+            "gone.test",
+            RecordType::A,
+            nxdomain_with_soa(name("gone.test"), 200, 5),
+        );
+        let timeout: UdpResponder = Arc::new(|_id, _n, _t, _s| Vec::new());
+        transport.set_udp("gone.test", RecordType::AAAA, timeout);
+        let (_registry, _lease, token) = owner();
+        // connect_timeout (2s) is below the SOA TTL (5s), so the budget the AAAA
+        // timeout consumes still leaves the NXDOMAIN cache entry live at
+        // completion (expiry is anchored at the leader start).
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            resolver.resolve("gone.test").await,
+            Err(ResolveError::NameResolution),
+            "an authoritative NXDOMAIN is name-wide even when the other family times out"
+        );
+        let queried = transport.a_count();
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            resolver.resolve("gone.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert_eq!(
+            transport.a_count(),
+            queried,
+            "the NXDOMAIN is negatively cached by its SOA TTL"
+        );
+        clock.advance(Duration::from_secs(4));
+        assert_eq!(
+            resolver.resolve("gone.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert!(
+            transport.a_count() > queried,
+            "re-queries once the SOA TTL expires"
+        );
     }
 
     #[tokio::test]
