@@ -431,6 +431,33 @@ pub(crate) trait StageHooks: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<MaybeTlsStream, DialError>>;
 }
 
+/// Collects a resolver's addresses into the bounded, order-preserving,
+/// de-duplicated, non-empty candidate set the dialer falls back across.
+///
+/// This is the single production seam for multi-address preservation, so any
+/// regression to a single address (a stray `.next()`/`.take(1)`) is caught by
+/// its unit tests rather than silently degrading the resolver.
+fn collect_candidates(
+    resolved: impl Iterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, DialError> {
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    for addr in resolved {
+        if addrs.len() >= MAX_RESOLVED_ADDRS {
+            break;
+        }
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    if addrs.is_empty() {
+        return Err(DialError::Resolve(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no address for endpoint",
+        )));
+    }
+    Ok(addrs)
+}
+
 /// The production stage implementation: literal `host:port` resolution, a
 /// `socket2`-configured TCP connect, and a `tokio-rustls` handshake.
 #[derive(Debug)]
@@ -452,22 +479,7 @@ impl StageHooks for ProdStageHooks {
                 .await
                 .map_err(|error| DialError::Resolve(std::io::Error::other(error)))?
                 .map_err(DialError::Resolve)?;
-            let mut addrs: Vec<SocketAddr> = Vec::new();
-            for addr in resolved {
-                if addrs.len() >= MAX_RESOLVED_ADDRS {
-                    break;
-                }
-                if !addrs.contains(&addr) {
-                    addrs.push(addr);
-                }
-            }
-            if addrs.is_empty() {
-                return Err(DialError::Resolve(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "no address for endpoint",
-                )));
-            }
-            Ok(addrs)
+            collect_candidates(resolved)
         })
     }
 
@@ -554,7 +566,12 @@ impl Service<Uri> for OwnerFencedDialer {
             let mut last_error: Option<DialError> = None;
             let mut connected: Option<TcpStream> = None;
             for addr in addrs {
-                match hooks.tcp_connect(addr, keepalive).await {
+                let result = hooks.tcp_connect(addr, keepalive).await;
+                // Fence after EVERY candidate's await, before interpreting the
+                // result or dialing the next one: a generation retired mid-attempt
+                // must not initiate another socket connect.
+                owner_fence(&owner)?;
+                match result {
                     Ok(stream) => {
                         connected = Some(stream);
                         break;
@@ -570,7 +587,8 @@ impl Service<Uri> for OwnerFencedDialer {
                     ))
                 }));
             };
-            owner_fence(&owner)?; // post-TCP
+            // The successful candidate's await was already fenced in the loop
+            // above, so no separate post-TCP fence is needed here.
             let stream = match tls {
                 Some(plan) => hooks.tls_handshake(stream, plan).await?,
                 None => MaybeTlsStream::Plain(stream),
@@ -1628,6 +1646,139 @@ mod tests {
             2,
             "each candidate is dialed exactly once"
         );
+    }
+
+    /// Hooks whose first candidate blocks in its `tcp_connect` await and then
+    /// fails, while later candidates would succeed — so a generation retired
+    /// during the first attempt must stop before the second candidate is dialed.
+    struct FenceProbeHooks {
+        addrs: Vec<SocketAddr>,
+        tcp_calls: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl StageHooks for FenceProbeHooks {
+        fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> super::BoxFuture<'static, Result<Vec<SocketAddr>, DialError>> {
+            let addrs = self.addrs.clone();
+            Box::pin(async move { Ok(addrs) })
+        }
+
+        fn tcp_connect(
+            &self,
+            addr: SocketAddr,
+            _keepalive: Duration,
+        ) -> super::BoxFuture<'static, Result<TcpStream, DialError>> {
+            let attempt = self.tcp_calls.fetch_add(1, Ordering::SeqCst);
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                if attempt == 0 {
+                    entered.notify_one();
+                    release.notified().await;
+                    return Err(DialError::Tcp(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "first candidate refused",
+                    )));
+                }
+                TcpStream::connect(addr).await.map_err(DialError::Tcp)
+            })
+        }
+
+        fn tls_handshake(
+            &self,
+            stream: TcpStream,
+            _plan: TlsPlan,
+        ) -> super::BoxFuture<'static, Result<MaybeTlsStream, DialError>> {
+            Box::pin(async move { Ok(MaybeTlsStream::Plain(stream)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn dialer_fences_between_tcp_candidates() {
+        let (_registry, lease) = owner();
+        // A healthy second candidate: without the per-candidate fence the loop
+        // would fall through and dial it after the owner retired.
+        let live = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("listener: {error}"));
+        let live_addr = live
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"));
+        let first_addr: SocketAddr = "127.0.0.1:9"
+            .parse()
+            .unwrap_or_else(|_| unreachable!("addr"));
+        let tcp_calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let hooks = Arc::new(FenceProbeHooks {
+            addrs: vec![first_addr, live_addr],
+            tcp_calls: Arc::clone(&tcp_calls),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let config = EtcdClientConfig::new(["etcd.internal:2379".to_owned()], None)
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let blueprint = EndpointBlueprint::from_config(&config, 0, config.endpoints()[0].as_str())
+            .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
+        let mut dialer = blueprint.to_dialer(lease.token(), hooks as Arc<dyn StageHooks>);
+        poll_fn(|cx| dialer.poll_ready(cx))
+            .await
+            .unwrap_or_else(|error| unreachable!("ready: {error}"));
+        let uri = "http://etcd.internal:2379"
+            .parse()
+            .unwrap_or_else(|_| unreachable!("uri"));
+        let handle = tokio::spawn(dialer.call(uri));
+
+        entered.notified().await; // the first candidate is blocked in its await
+        lease.release(); // retire the owner mid-attempt
+        release.notify_one(); // let the first attempt finish (it fails)
+        let result = handle
+            .await
+            .unwrap_or_else(|error| unreachable!("join: {error}"));
+
+        assert!(
+            matches!(result, Err(DialError::StaleOwner)),
+            "a per-candidate fence stops a retired generation"
+        );
+        assert_eq!(
+            tcp_calls.load(Ordering::SeqCst),
+            1,
+            "the second candidate is never dialed after the owner retired"
+        );
+    }
+
+    #[test]
+    fn collect_candidates_preserves_bounded_ordered_unique_addresses() {
+        let addr = |port: u16| -> SocketAddr {
+            format!("127.0.0.1:{port}")
+                .parse()
+                .unwrap_or_else(|_| unreachable!("addr"))
+        };
+        // More than one address is preserved in order (a `.next()`/`.take(1)`
+        // regression in the seam would fail here).
+        let ordered = super::collect_candidates([addr(1), addr(2), addr(3)].into_iter())
+            .unwrap_or_else(|error| unreachable!("collect: {error}"));
+        assert_eq!(ordered, vec![addr(1), addr(2), addr(3)]);
+        // Duplicates are removed, order preserved.
+        let deduped = super::collect_candidates([addr(1), addr(1), addr(2), addr(1)].into_iter())
+            .unwrap_or_else(|error| unreachable!("collect: {error}"));
+        assert_eq!(deduped, vec![addr(1), addr(2)]);
+        // The set is capped at MAX_RESOLVED_ADDRS, keeping the first N in order.
+        let many: Vec<SocketAddr> = (1..=12).map(addr).collect();
+        let capped = super::collect_candidates(many.clone().into_iter())
+            .unwrap_or_else(|error| unreachable!("collect: {error}"));
+        assert_eq!(capped.len(), super::MAX_RESOLVED_ADDRS);
+        assert_eq!(capped.as_slice(), &many[..super::MAX_RESOLVED_ADDRS]);
+        // An empty resolution fails closed.
+        assert!(matches!(
+            super::collect_candidates(std::iter::empty()),
+            Err(DialError::Resolve(_))
+        ));
     }
 
     // ----- Fix 2: endpoints without an explicit port ------------------------
