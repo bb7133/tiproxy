@@ -27,18 +27,22 @@ use std::sync::Arc;
 
 use control_config::{
     CandidateValidator, ClientTlsConfig, ConfigNamespaceSnapshot, EffectiveConfig, NamespaceConfig,
-    PreparedArtifact,
+    PreparedArtifact, TopologyConfig,
 };
 use control_external::{EtcdClientConfig, EtcdTlsConfig};
 use control_topology::{TopologyClientFactory, TopologyClusterClient};
 
-/// The concrete artifact a [`TopologyCandidateValidator`] prepares: one built
-/// etcd client per backend cluster, each with its TLS material already loaded.
+/// The concrete artifact a [`TopologyCandidateValidator`] prepares: the exact
+/// normalized topology projection it validated, plus one built etcd client per
+/// backend cluster with its TLS material already loaded.
 ///
-/// It is carried opaquely by the snapshot and recovered by
-/// [`ArtifactClusterFactory`]. It has no `Debug`, so the endpoints and material
-/// it holds never render.
+/// The bound [`TopologyConfig`] lets [`ArtifactClusterFactory`] confirm the
+/// artifact belongs to the exact snapshot it is handed (a typed exact compare,
+/// not a fingerprint), so a drifted or mismatched artifact fails closed rather
+/// than registering stale clients. It is carried opaquely by the snapshot and
+/// has no `Debug`, so the endpoints and material it holds never render.
 pub struct PreparedClusterSet {
+    topology: TopologyConfig,
     clusters: Vec<TopologyClusterClient>,
 }
 
@@ -76,6 +80,7 @@ impl CandidateValidator for TopologyCandidateValidator {
         }
         clusters.sort_by(|left, right| left.cluster_name.cmp(&right.cluster_name));
         Ok(PreparedArtifact::new(Arc::new(PreparedClusterSet {
+            topology,
             clusters,
         })))
     }
@@ -190,6 +195,18 @@ impl TopologyClientFactory for ArtifactClusterFactory {
             .prepared()
             .downcast_ref::<PreparedClusterSet>()
             .ok_or_else(|| "prepared topology cluster set missing".to_owned())?;
+        // Closed loop: the artifact must belong to exactly this snapshot. A
+        // same-type artifact bound to a different normalized projection (a
+        // drifted or mismatched generation) is rejected rather than registered
+        // with stale clients. This is a typed exact compare of the whole
+        // normalized projection — no fingerprint, so no field is missed and no
+        // collision or diagnostic leak is possible.
+        let projected = snapshot
+            .topology()
+            .map_err(|_| "topology projection".to_owned())?;
+        if projected != set.topology {
+            return Err("prepared cluster set does not match the snapshot topology".to_owned());
+        }
         Ok(set.clusters().to_vec())
     }
 }
@@ -205,6 +222,10 @@ mod tests {
     use control_topology::TopologyClientFactory;
 
     fn config_toml(max_connections: u64, ca_path: &str) -> Vec<u8> {
+        config_toml_named(max_connections, ca_path, "cluster-a")
+    }
+
+    fn config_toml_named(max_connections: u64, ca_path: &str, cluster: &str) -> Vec<u8> {
         format!(
             r#"
 [proxy]
@@ -215,7 +236,7 @@ max-connections = {max_connections}
 addr = "0.0.0.0:10080"
 
 [[proxy.backend-clusters]]
-name = "cluster-a"
+name = "{cluster}"
 pd-addrs = "pd-a:2379"
 ns-servers = ["dns-a:53"]
 
@@ -302,12 +323,67 @@ ca = "{ca_path}"
     }
 
     #[test]
+    fn a_same_type_artifact_bound_to_a_different_projection_is_rejected() {
+        use control_config::{
+            CandidateValidator, EffectiveConfig, NamespaceConfig, PreparedArtifact, TopologyConfig,
+        };
+
+        // A validator that prepares a well-typed cluster set bound to a foreign
+        // projection, to prove the factory rejects a same-type artifact that
+        // does not belong to the snapshot it is attached to.
+        struct MismatchValidator {
+            topology: TopologyConfig,
+        }
+        impl CandidateValidator for MismatchValidator {
+            fn validate(
+                &self,
+                _effective: &EffectiveConfig,
+                _namespaces: &[NamespaceConfig],
+            ) -> Result<PreparedArtifact, &'static str> {
+                Ok(PreparedArtifact::new(Arc::new(super::PreparedClusterSet {
+                    topology: self.topology.clone(),
+                    clusters: Vec::new(),
+                })))
+            }
+        }
+
+        let dir = std::env::temp_dir();
+        // Projection A comes from a config with a distinct cluster name.
+        let store_a = ConfigNamespaceStore::from_toml_with_validator(
+            &config_toml_named(100, "", "cluster-x"),
+            None,
+            &dir,
+            Arc::new(TopologyCandidateValidator),
+        )
+        .unwrap_or_else(|error| unreachable!("store a: {error}"));
+        let topology_a = store_a
+            .current()
+            .topology()
+            .unwrap_or_else(|error| unreachable!("topology a: {error}"));
+
+        // Store B publishes projection B, but its artifact carries projection A.
+        let store_b = ConfigNamespaceStore::from_toml_with_validator(
+            &config_toml_named(100, "", "cluster-a"),
+            None,
+            &dir,
+            Arc::new(MismatchValidator {
+                topology: topology_a,
+            }),
+        )
+        .unwrap_or_else(|error| unreachable!("store b: {error}"));
+
+        let factory = ArtifactClusterFactory;
+        assert!(factory.build(&store_b.current()).is_err());
+    }
+
+    #[test]
     fn the_interface_provider_extracts_addresses_safely() {
-        // A focused seam check: enumeration must return a bounded address list
-        // without panicking, whatever interfaces this host happens to have. The
-        // candidate-selection rules are asserted deterministically against the
-        // resolver's injectable fake in control-topology, not here.
-        let candidates = interface_advertise_candidates();
-        assert!(candidates.len() < 4096);
+        // A focused seam check: enumeration and IP extraction must not panic,
+        // whatever interfaces this host has. There is no fixed count to assert
+        // (it is host-dependent); the deterministic candidate-selection rules are
+        // asserted against the resolver's injectable fake in control-topology.
+        for candidate in interface_advertise_candidates() {
+            let _ = candidate.is_loopback();
+        }
     }
 }

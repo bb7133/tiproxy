@@ -207,11 +207,12 @@ async fn main() -> Result<(), AnyError> {
         "rotation did not produce a fresh lease",
     )?;
 
-    // Lifecycle shutdown stops and joins the children.
+    // Lifecycle shutdown stops and joins the children. The module retires its
+    // registration at Stopping, so advance there before joining the task.
     runtime.begin_shutdown(ShutdownReason::Requested)?;
-    tokio::time::timeout(Duration::from_secs(10), module_task).await???;
     runtime.advance_shutdown(LifecyclePhase::Draining)?;
     runtime.advance_shutdown(LifecyclePhase::Stopping)?;
+    tokio::time::timeout(Duration::from_secs(10), module_task).await???;
     runtime.finish()?;
 
     println!("CPTOPO_MODULE_OK");

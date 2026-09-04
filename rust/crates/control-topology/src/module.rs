@@ -21,10 +21,11 @@
 //! cluster (Go keeps one `InfoSyncer` per cluster), each publishing the same
 //! [`TopologyInfo`] under its own per-instance lease.
 //!
-//! This slice is a registration foundation: the binary does not yet add it to
-//! its [`control_plane::ControlModuleSet`], and topology discovery is not yet
-//! driven (see the scope note below). It is not a full topology mount and does
-//! not on its own make topology ready for routing.
+//! This module fans out self-registration only: the binary mounts it in its
+//! [`control_plane::ControlModuleSet`], but topology discovery is not yet driven
+//! (see the scope note below), so becoming ready means the initial registration
+//! plan's children are installed, not that discovery is published or routing is
+//! ready.
 //!
 //! # Generation fence
 //!
@@ -295,7 +296,12 @@ impl TopologyModule {
         loop {
             tokio::select! {
                 changed = lifecycle.changed() => {
-                    if changed.is_err() || shutdown_started(lifecycle.borrow().phase) {
+                    // Retire the registration only once the runtime reaches
+                    // Stopping (SQL sessions have already been joined), or if the
+                    // lifecycle channel closed so no later phase can arrive.
+                    // Quiescing/Draining keep the registration and lease refresh
+                    // alive so this instance stays discoverable during drain.
+                    if changed.is_err() || retire_requested(lifecycle.borrow().phase) {
                         stop_children(&mut children).await;
                         return Ok(());
                     }
@@ -516,16 +522,19 @@ async fn stop_children(children: &mut Children) {
     }
 }
 
-/// Whether a lifecycle phase means the process is shutting down.
-const fn shutdown_started(phase: LifecyclePhase) -> bool {
-    matches!(
-        phase,
-        LifecyclePhase::Quiescing
-            | LifecyclePhase::Draining
-            | LifecyclePhase::Stopping
-            | LifecyclePhase::Stopped
-            | LifecyclePhase::Failed
-    )
+/// Whether a lifecycle phase means the module must retire its registration.
+///
+/// Retirement deliberately waits for `Stopping` (or the terminal `Stopped`):
+/// the process keeps its topology registration and lease refresh alive through
+/// `Quiescing` and `Draining` so this instance stays discoverable while SQL
+/// sessions drain, mirroring Go's `clusterManager.Close()` retiring the
+/// `InfoSyncer` only after the serving layer is closed. A `Failed` runtime is
+/// still advanced through `Draining` to `Stopping` before its modules join, so
+/// it too retires at `Stopping`, after session join. A dropped lifecycle
+/// channel is handled separately by the run loop, since no later phase can
+/// arrive.
+const fn retire_requested(phase: LifecyclePhase) -> bool {
+    matches!(phase, LifecyclePhase::Stopping | LifecyclePhase::Stopped)
 }
 
 const fn module_error(error_class: &'static str) -> ModuleError {
@@ -702,6 +711,16 @@ mod tests {
         Ok(())
     }
 
+    /// Drives the runtime to `Stopping` (the phase at which the module retires
+    /// its registration) without calling `finish`, so a test can then join the
+    /// module task before finishing the runtime.
+    fn request_stop(runtime: &ControlRuntime) -> Result<(), TestError> {
+        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        runtime.advance_shutdown(LifecyclePhase::Draining)?;
+        runtime.advance_shutdown(LifecyclePhase::Stopping)?;
+        Ok(())
+    }
+
     /// Generation-2 factory behaviour, applied after the base generation.
     #[derive(Clone, Copy)]
     enum Gen2 {
@@ -804,9 +823,9 @@ mod tests {
             stops: counters.stops(),
         };
 
-        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        request_stop(&runtime)?;
         tokio::time::timeout(Duration::from_secs(10), task).await???;
-        shutdown(&runtime)?;
+        runtime.finish()?;
         Ok(outcome)
     }
 
@@ -926,9 +945,9 @@ mod tests {
         let spawns = counters.spawns();
         let stops = counters.stops();
 
-        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        request_stop(&runtime)?;
         tokio::time::timeout(Duration::from_secs(10), task).await???;
-        shutdown(&runtime)?;
+        runtime.finish()?;
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(
@@ -1071,7 +1090,7 @@ mod tests {
         let upper = grace.saturating_add(Duration::from_secs(3));
         let lower = grace.saturating_sub(Duration::from_millis(500));
         let start = tokio::time::Instant::now();
-        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        request_stop(&runtime)?;
         let result = tokio::time::timeout(upper, task).await??;
         let elapsed = start.elapsed();
         assert!(
@@ -1091,7 +1110,105 @@ mod tests {
             2,
             "both wedged children were aborted and dropped"
         );
-        shutdown(&runtime)?;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// A stable factory + counting runner, spawned and ready. Used by the
+    /// shutdown-ordering oracles.
+    async fn spawn_ready(
+        counters: &Counters,
+        runtime: &ControlRuntime,
+    ) -> Result<ModuleTask, TestError> {
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let (task, mut handle) = spawn(
+            store,
+            Box::new(SwitchableFactory {
+                gen2: Arc::new(watch::channel(None).0),
+            }),
+            counting_runner(counters),
+            runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        Ok(task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_survives_drain_and_is_retired_only_at_stopping() -> Result<(), TestError>
+    {
+        let counters = Counters::default();
+        let runtime = runtime()?;
+        let task = spawn_ready(&counters, &runtime).await?;
+        assert_eq!(counters.spawns(), 2);
+
+        // Quiescing then Draining must NOT retire the registration: the instance
+        // stays discoverable while SQL sessions drain.
+        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        runtime.advance_shutdown(LifecyclePhase::Draining)?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            counters.stops(),
+            0,
+            "registration must survive Quiescing and Draining"
+        );
+        assert!(
+            !task.is_finished(),
+            "the module must keep running through drain"
+        );
+
+        // Stopping retires it: the child stops and the module joins.
+        runtime.advance_shutdown(LifecyclePhase::Stopping)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        assert_eq!(
+            counters.stops(),
+            2,
+            "both clusters' registrations are retired, at Stopping"
+        );
+        runtime.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_runtime_still_retires_registration_only_at_stopping() -> Result<(), TestError>
+    {
+        let counters = Counters::default();
+        let runtime = runtime()?;
+        let task = spawn_ready(&counters, &runtime).await?;
+
+        // A failure makes shutdown mandatory but still advances through Draining
+        // (where SQL sessions join) before Stopping; the registration must not be
+        // retired until Stopping.
+        runtime.fail("test", "injected_failure");
+        runtime.advance_shutdown(LifecyclePhase::Draining)?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            counters.stops(),
+            0,
+            "a failed runtime must not retire registration before Stopping"
+        );
+
+        runtime.advance_shutdown(LifecyclePhase::Stopping)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        assert_eq!(counters.stops(), 2, "both retired, at Stopping");
+        runtime.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_lifecycle_channel_retires_registration() -> Result<(), TestError> {
+        let counters = Counters::default();
+        let runtime = runtime()?;
+        let task = spawn_ready(&counters, &runtime).await?;
+
+        // If the runtime disappears, no later phase can arrive; the module must
+        // still retire its registration rather than leak the child.
+        drop(runtime);
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        assert_eq!(
+            counters.stops(),
+            2,
+            "a dropped lifecycle channel retires the registration"
+        );
         Ok(())
     }
 
