@@ -102,26 +102,29 @@ pub struct TopologyClusterClient {
 
 /// Builds the per-cluster etcd client set for a configuration generation.
 ///
-/// The binary implements this: it reads the TLS PEM material referenced by the
-/// [`control_config::TopologyConfig`] paths and produces one
-/// [`EtcdClientConfig`] per backend cluster. Keeping it injectable keeps PEM
-/// file access in the composition root, out of this crate, and lets tests
-/// supply plain endpoints.
+/// The binary implements this by downcasting the snapshot's opaque
+/// [`control_config::PreparedArtifact`] to the cluster set already prepared
+/// (endpoints bound to their validated TLS material) at validation time, and
+/// returning one [`EtcdClientConfig`] per backend cluster — with no PEM re-read
+/// (closing the validate→apply TOCTOU). It receives the whole snapshot rather
+/// than the projection so it can reach that artifact. Keeping it injectable
+/// keeps PEM file access in the composition root, out of this crate, and lets
+/// tests supply plain endpoints.
 pub trait TopologyClientFactory: Send + Sync {
-    /// Produces the cluster clients for one topology configuration.
+    /// Produces the cluster clients for one published generation.
     ///
     /// Implementations should return the clusters ordered by name so a
     /// generation's fan-out is deterministic.
     ///
     /// # Errors
     ///
-    /// Returns a human-readable reason when the TLS material or endpoints are
-    /// unusable. On the initial generation the module treats this as a fatal
-    /// startup error; on a later generation it is a rejection that retains the
-    /// last-good registration.
+    /// Returns a human-readable reason when the prepared material or endpoints
+    /// are unusable. On the initial generation the module treats this as a
+    /// fatal startup error; on a later generation it is a rejection that
+    /// retains the last-good registration.
     fn build(
         &self,
-        config: &control_config::TopologyConfig,
+        snapshot: &ConfigNamespaceSnapshot,
     ) -> Result<Vec<TopologyClusterClient>, String>;
 }
 
@@ -361,9 +364,11 @@ impl TopologyModule {
             &self.identity.deploy_path.to_string_lossy(),
             self.identity.start_timestamp,
         );
-        // Build every generation: this reads the PEM material, so a rotation is
-        // observed here rather than swallowed by a path-only comparison.
-        let Ok(mut clusters) = self.factory.build(&topology) else {
+        // Build every generation from the snapshot's prepared artifact, so a
+        // rotation is observed here rather than swallowed by a path-only
+        // comparison, and the exact material validated for this generation is
+        // used without re-reading it.
+        let Ok(mut clusters) = self.factory.build(snapshot) else {
             return Err(RejectionClass::ClientBuildFailed);
         };
         clusters.sort_by(|left, right| left.cluster_name.cmp(&right.cluster_name));
@@ -541,7 +546,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use control_config::{ConfigNamespaceStore, TopologyConfig, TopologyRuntimeIdentity};
+    use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceStore, TopologyRuntimeIdentity};
     use control_external::{EtcdClientConfig, EtcdTlsConfig};
     use control_plane::{
         ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
@@ -713,7 +718,13 @@ mod tests {
     }
 
     impl TopologyClientFactory for SwitchableFactory {
-        fn build(&self, config: &TopologyConfig) -> Result<Vec<TopologyClusterClient>, String> {
+        fn build(
+            &self,
+            snapshot: &ConfigNamespaceSnapshot,
+        ) -> Result<Vec<TopologyClusterClient>, String> {
+            let config = snapshot
+                .topology()
+                .map_err(|_| "topology projection".to_owned())?;
             let names: Vec<Arc<str>> = config
                 .backend_clusters
                 .iter()
@@ -873,7 +884,13 @@ mod tests {
     }
 
     impl TopologyClientFactory for FilePemFactory {
-        fn build(&self, config: &TopologyConfig) -> Result<Vec<TopologyClusterClient>, String> {
+        fn build(
+            &self,
+            snapshot: &ConfigNamespaceSnapshot,
+        ) -> Result<Vec<TopologyClusterClient>, String> {
+            let config = snapshot
+                .topology()
+                .map_err(|_| "topology projection".to_owned())?;
             let ca = std::fs::read(&self.path).map_err(|error| format!("read pem: {error}"))?;
             Ok(config
                 .backend_clusters

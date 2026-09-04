@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use control_config::{ConfigNamespaceStore, TopologyConfig, TopologyRuntimeIdentity};
+use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceStore, TopologyRuntimeIdentity};
 use control_external::{EtcdClientConfig, EtcdConnector};
 use control_plane::{
     ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
@@ -60,7 +60,13 @@ struct RotatingFactory {
 }
 
 impl TopologyClientFactory for RotatingFactory {
-    fn build(&self, config: &TopologyConfig) -> Result<Vec<TopologyClusterClient>, String> {
+    fn build(
+        &self,
+        snapshot: &ConfigNamespaceSnapshot,
+    ) -> Result<Vec<TopologyClusterClient>, String> {
+        let config = snapshot
+            .topology()
+            .map_err(|_| "topology projection".to_owned())?;
         // Vary the request timeout to simulate a rotation: the built
         // EtcdClientConfig differs, so the registration plan differs and
         // rebuilds, while the endpoint still points at the live fixture.
