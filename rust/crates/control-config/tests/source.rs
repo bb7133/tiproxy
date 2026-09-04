@@ -46,9 +46,9 @@ impl CandidateValidator for RejectableValidator {
 #[derive(Debug, PartialEq)]
 struct SerialArtifact(u64);
 
-/// Prepares a fresh, distinctly-serialized artifact per validation and records
-/// the exact handle it returned, so a test can assert the store carries that
-/// same handle without re-preparing.
+/// Prepares a fresh, distinctly serial-numbered artifact per validation and
+/// records the exact handle it returned, so a test can assert the store carries
+/// that same handle without re-preparing.
 struct RecordingValidator {
     next: AtomicU64,
     reject: AtomicBool,

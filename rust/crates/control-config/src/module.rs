@@ -37,8 +37,8 @@ use tokio::task::JoinHandle;
 use crate::model::{EffectiveConfig, LogOnlineConfig, NamespaceConfig, ProxyOnlineConfig};
 use crate::source::{
     CONFIG_PREFIX, CandidateValidator, ConfigNamespaceSource, ConfigNamespaceStore, LOG_CONFIG_KEY,
-    PreparedArtifact,
-    NAMESPACE_CONFIG_PREFIX, PROXY_CONFIG_KEY, StoreError, decode_persistent_entries,
+    NAMESPACE_CONFIG_PREFIX, PROXY_CONFIG_KEY, PreparedArtifact, StoreError,
+    decode_persistent_entries,
 };
 
 const FILE_POLL_INTERVAL: Duration = Duration::from_secs(2);

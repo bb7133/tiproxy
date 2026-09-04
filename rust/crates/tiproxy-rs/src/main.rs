@@ -18,9 +18,10 @@
 
 mod config_composition;
 mod health;
+mod topology_composition;
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +31,7 @@ use config_composition::{
 };
 use control_config::{
     ConfigModule, ConfigModuleHandle, ConfigModuleOptions, ConfigNamespaceSource,
+    TopologyRuntimeIdentity,
 };
 use control_etcd::ElectionConfig;
 use control_external::{EtcdClientConfig, EtcdTlsConfig};
@@ -42,6 +44,7 @@ use control_proto::control_transport::ClientConfig;
 use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
+use control_topology::{InterfaceAdvertiseResolver, TopologyModule};
 use dataplane::control_runtime::spawn_control_runtime_with_client_and_handler;
 use dataplane::metering::{MeteringSourceRegistry, run_metering_sampler};
 use dataplane::session::SessionLoopConfig;
@@ -52,6 +55,10 @@ use dataplane::{
     MetricsRecorder, ServerError, SystemMemoryProbe, spawn_metrics_exporter,
 };
 use tokio::sync::watch;
+use topology_composition::{
+    ArtifactClusterFactory, CompositeCandidateValidator, TopologyCandidateValidator,
+    interface_advertise_candidates,
+};
 
 const VERSION: &str = env!("TIPROXY_BUILD_VERSION");
 const COMMIT: &str = env!("TIPROXY_BUILD_COMMIT");
@@ -236,17 +243,62 @@ async fn run(options: Options) -> Result<(), String> {
         .wait_ready()
         .await
         .map_err(|error| format!("initialize config owner: {error}"))?;
-    modules
-        .spawn(ConfigServingAdapter::new(
-            config_owner.handle.source().clone(),
-            serving.clone(),
-            store.clone(),
-            Arc::clone(&in_process),
-            options.health_port,
-            config_owner.tls_roots,
-            options.drain_grace,
-        ))
-        .map_err(|error| format!("start config serving adapter: {error}"))?;
+    // CP-TOPO self-registration comes online before any SQL admission: register
+    // this instance's SQL topology, then wait for its initial registration plan
+    // and children to be installed. "Ready" here means the plan's children are
+    // installed, not that PD has acknowledged the registration or that a
+    // discovery snapshot has been published. A failure after either module is
+    // spawned gracefully stops and joins both so a topology lease is revoked
+    // instead of an aborted task leaking it until its TTL expires.
+    let topology_identity = TopologyRuntimeIdentity {
+        version: Arc::from(VERSION),
+        git_hash: Arc::from(COMMIT),
+        deploy_path: env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from(".")),
+        start_timestamp: i64::try_from(process_started_unix_millis / 1000).unwrap_or(i64::MAX),
+    };
+    let (topology_module, mut topology_handle) = TopologyModule::new(
+        Arc::new(config_owner.handle.source().clone()),
+        Box::new(ArtifactClusterFactory),
+        Arc::new(InterfaceAdvertiseResolver::new(Arc::new(
+            interface_advertise_candidates,
+        ))),
+        topology_identity,
+    );
+    if let Err(error) = modules.spawn(topology_module) {
+        return Err(abort_startup(
+            &in_process,
+            &mut modules,
+            format!("start topology module: {error}"),
+        )
+        .await);
+    }
+    if let Err(error) = topology_handle.wait_ready().await {
+        return Err(abort_startup(
+            &in_process,
+            &mut modules,
+            format!("initialize topology module: {error}"),
+        )
+        .await);
+    }
+    if let Err(error) = modules.spawn(ConfigServingAdapter::new(
+        config_owner.handle.source().clone(),
+        serving.clone(),
+        store.clone(),
+        Arc::clone(&in_process),
+        options.health_port,
+        config_owner.tls_roots,
+        options.drain_grace,
+    )) {
+        return Err(abort_startup(
+            &in_process,
+            &mut modules,
+            format!("start config serving adapter: {error}"),
+        )
+        .await);
+    }
     let runtime = spawn_control_runtime_with_client_and_handler(
         Arc::clone(&shared_client),
         Duration::from_millis(100),
@@ -257,7 +309,12 @@ async fn run(options: Options) -> Result<(), String> {
     );
     if !installer.install(runtime.handle()) {
         runtime.shutdown();
-        return Err("install control dispatch handle exactly once".to_owned());
+        return Err(abort_startup(
+            &in_process,
+            &mut modules,
+            "install control dispatch handle exactly once".to_owned(),
+        )
+        .await);
     }
     let metrics_exporter = spawn_metrics_exporter(
         Arc::clone(&shared_client),
@@ -281,10 +338,22 @@ async fn run(options: Options) -> Result<(), String> {
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
-    let health_task = spawn_health(in_process_config.health_port(), serving.clone()).await?;
-    in_process
-        .mark_ready()
-        .map_err(|error| format!("mark in-process control runtime ready: {error}"))?;
+    let health_task = match spawn_health(in_process_config.health_port(), serving.clone()).await {
+        Ok(task) => task,
+        Err(error) => {
+            runtime.shutdown();
+            return Err(abort_startup(&in_process, &mut modules, error).await);
+        }
+    };
+    if let Err(error) = in_process.mark_ready() {
+        runtime.shutdown();
+        return Err(abort_startup(
+            &in_process,
+            &mut modules,
+            format!("mark in-process control runtime ready: {error}"),
+        )
+        .await);
+    }
 
     // Supervise control and metering together. Either task disappearing must
     // wake this owner: otherwise a sampler panic could leave SQL serving
@@ -419,6 +488,25 @@ async fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+/// Gracefully stops and joins already-started control modules when process
+/// startup fails after they were spawned. Making shutdown mandatory and
+/// advancing to `Stopping` lets each module see the lifecycle change and run its
+/// ordered teardown (a topology module revokes its exact lease and joins its
+/// children) instead of leaking abruptly aborted tasks. All steps are
+/// best-effort; the original startup error is returned unchanged.
+async fn abort_startup(
+    runtime: &InProcessControlRuntime,
+    modules: &mut ControlModuleSet,
+    error: String,
+) -> String {
+    runtime.fail("startup", "startup_failed");
+    let _ = runtime.advance_shutdown(LifecyclePhase::Draining);
+    let _ = runtime.advance_shutdown(LifecyclePhase::Stopping);
+    let _ = join_modules(modules).await;
+    let _ = runtime.finish();
+    error
+}
+
 async fn join_modules(modules: &mut ControlModuleSet) -> Result<(), String> {
     let mut result = Ok(());
     while let Some(exit) = modules.join_next().await {
@@ -527,9 +615,17 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
         persistence_factory: Some(Arc::new(config_persistence_client)),
         ..base
     };
-    let validator = Arc::new(ServingCandidateValidator::new(
+    // Every accepted generation funnels through one composite validator in a
+    // fixed order: serving first (fails a bad TLS/protocol candidate before any
+    // topology material is read), then topology (prepares the per-cluster etcd
+    // clients that ride the published snapshot as its opaque artifact).
+    let serving = Arc::new(ServingCandidateValidator::new(
         snapshots.clone(),
         options.drain_grace,
+    ));
+    let validator = Arc::new(CompositeCandidateValidator::new(
+        serving,
+        Arc::new(TopologyCandidateValidator),
     ));
     let (module, handle) = ConfigModule::load_with_validator(module_options, validator)
         .map_err(|error| format!("load validated Rust config owner: {error}"))?;
@@ -601,10 +697,7 @@ fn etcd_tls(config: &control_config::ClientTlsConfig) -> Result<Option<EtcdTlsCo
         .map_err(|error| format!("validate config persistence TLS: {error}"))
 }
 
-fn read_optional_tls(
-    path: Option<&std::path::Path>,
-    kind: &str,
-) -> Result<Option<Vec<u8>>, String> {
+fn read_optional_tls(path: Option<&Path>, kind: &str) -> Result<Option<Vec<u8>>, String> {
     path.map(|path| std::fs::read(path).map_err(|_| format!("read config persistence TLS {kind}")))
         .transpose()
 }

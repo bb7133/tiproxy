@@ -93,6 +93,7 @@ fn default_child_runner() -> ChildRunner {
 
 /// One backend cluster's connection material, produced by a
 /// [`TopologyClientFactory`].
+#[derive(Clone)]
 pub struct TopologyClusterClient {
     /// Stable cluster name, used only for deterministic ordering and diagnostics.
     pub cluster_name: Arc<str>,

@@ -959,7 +959,14 @@ fn publish_if_changed(
     prepared: PreparedArtifact,
 ) -> Result<Option<Arc<ConfigNamespaceSnapshot>>, StoreError> {
     let namespaces = state.persistent.namespaces.clone();
-    publish_candidate(state, updates, effective, namespaces, source_revision, prepared)
+    publish_candidate(
+        state,
+        updates,
+        effective,
+        namespaces,
+        source_revision,
+        prepared,
+    )
 }
 
 fn publish_candidate(
@@ -975,7 +982,13 @@ fn publish_candidate(
         .generation
         .checked_add(1)
         .ok_or(StoreError::GenerationExhausted)?;
-    let candidate = build_snapshot(next_generation, effective, namespaces, source_revision, prepared)?;
+    let candidate = build_snapshot(
+        next_generation,
+        effective,
+        namespaces,
+        source_revision,
+        prepared,
+    )?;
     if state.current.effective.as_ref() == candidate.effective.as_ref()
         && state.current.namespaces.as_ref() == candidate.namespaces.as_ref()
     {
