@@ -819,11 +819,10 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
     );
     tls_roots.sort();
     tls_roots.dedup();
-    // Shared, immutable allowed-roots list for every TLS-material read (topology
-    // cluster clients and config-persistence), canonicalized once here and
-    // frozen so later reads confine against a stable, symlink-free set.
-    let allowed_tls_roots: Arc<[PathBuf]> =
-        Arc::from(tls_material::canonicalize_tls_roots(&tls_roots));
+    // Shared allowed TLS roots, each opened once here into a frozen directory
+    // capability so every later TLS-material read (topology cluster clients and
+    // config-persistence) is confined beneath it.
+    let allowed_tls_roots = Arc::new(tls_material::open_tls_roots(&tls_roots));
     let snapshots = SnapshotStore::new(tls_roots.clone())
         .map_err(|error| format!("create snapshot store: {error}"))?;
     let (etcd, election) = persistence_options(initial.as_ref(), process_id, &allowed_tls_roots)?;
@@ -868,7 +867,7 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
 fn persistence_options(
     snapshot: &control_config::ConfigNamespaceSnapshot,
     process_id: &str,
-    allowed_tls_roots: &[PathBuf],
+    allowed_tls_roots: &tls_material::TlsRoots,
 ) -> Result<(Option<EtcdClientConfig>, Option<ElectionConfig>), String> {
     let client = config_persistence_client(snapshot.effective(), allowed_tls_roots)?;
     if client.is_none() {
@@ -886,7 +885,7 @@ fn persistence_options(
 
 fn config_persistence_client(
     effective: &control_config::EffectiveConfig,
-    allowed_tls_roots: &[PathBuf],
+    allowed_tls_roots: &tls_material::TlsRoots,
 ) -> Result<Option<EtcdClientConfig>, String> {
     let Some(persistence) = effective.config_persistence() else {
         return Ok(None);
@@ -904,7 +903,7 @@ fn config_persistence_client(
 
 fn etcd_tls(
     config: &control_config::ClientTlsConfig,
-    allowed_tls_roots: &[PathBuf],
+    allowed_tls_roots: &tls_material::TlsRoots,
 ) -> Result<Option<EtcdTlsConfig>, String> {
     if config.skip_ca_verification {
         return Err("config persistence does not support skip-ca-verification".to_owned());
@@ -936,7 +935,7 @@ fn etcd_tls(
 
 fn read_optional_tls(
     path: Option<&Path>,
-    allowed_tls_roots: &[PathBuf],
+    allowed_tls_roots: &tls_material::TlsRoots,
 ) -> Result<Option<Vec<u8>>, String> {
     path.map(|path| {
         tls_material::read_tls_material(path, allowed_tls_roots)
@@ -1589,8 +1588,12 @@ pd-addrs = "routing-pd:2379"
             std::path::Path::new("/tmp"),
         )
         .unwrap_or_else(|error| unreachable!("valid source: {error}"));
-        let (client, election) = persistence_options(source.current().as_ref(), "process-a", &[])
-            .unwrap_or_else(|error| unreachable!("valid persistence options: {error}"));
+        let (client, election) = persistence_options(
+            source.current().as_ref(),
+            "process-a",
+            &crate::tls_material::open_tls_roots(&[]),
+        )
+        .unwrap_or_else(|error| unreachable!("valid persistence options: {error}"));
         let client = client.unwrap_or_else(|| unreachable!("persistence is configured"));
         assert_eq!(client.endpoints(), ["http://owner-pd:2379"]);
         assert!(election.is_some());
@@ -1614,7 +1617,7 @@ pd-addrs = "routing-pd:2379"
         let source =
             ConfigNamespaceStore::from_toml(toml.as_bytes(), None, std::path::Path::new("/tmp"))
                 .unwrap_or_else(|error| unreachable!("valid source: {error}"));
-        let roots = crate::tls_material::canonicalize_tls_roots(&[dir]);
+        let roots = crate::tls_material::open_tls_roots(&[dir]);
         assert!(
             config_persistence_client(source.current().effective(), &roots).is_err(),
             "a symlink CA must be rejected by the persistence reader"
@@ -1639,7 +1642,7 @@ pd-addrs = "routing-pd:2379"
         let source =
             ConfigNamespaceStore::from_toml(toml.as_bytes(), None, std::path::Path::new("/tmp"))
                 .unwrap_or_else(|error| unreachable!("valid source: {error}"));
-        let roots = crate::tls_material::canonicalize_tls_roots(&[dir]);
+        let roots = crate::tls_material::open_tls_roots(&[dir]);
         assert!(
             config_persistence_client(source.current().effective(), &roots).is_err(),
             "an oversize CA must be rejected by the persistence reader"
@@ -1656,7 +1659,11 @@ pd-addrs = "routing-pd:2379"
         )
         .unwrap_or_else(|error| unreachable!("valid source model: {error}"));
         assert!(
-            config_persistence_client(source.current().effective(), &[]).is_err(),
+            config_persistence_client(
+                source.current().effective(),
+                &crate::tls_material::open_tls_roots(&[])
+            )
+            .is_err(),
             "skip-ca without a CA must not silently construct a plaintext etcd client"
         );
     }

@@ -12,89 +12,185 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Safe TLS-material (PEM) reads in the composition root.
+//! Safe, capability-confined TLS-material (PEM) reads in the composition root.
 //!
 //! This is the single read that binds a TLS file's bytes into a generation's
-//! prepared artifact, so it must not be tricked into reading a different file
-//! than the one validated.
+//! prepared artifact, so it must not be tricked into reading a file outside the
+//! allowed roots.
 //!
-//! `allowed_roots` are canonicalized once at startup and frozen (see
-//! [`canonicalize_tls_roots`]). A read then: canonicalizes the configured path
-//! and confines it to a frozen root *before* opening; opens the exact path with
-//! `O_NOFOLLOW` so a symlink final component is rejected even when it points
-//! back inside a root; binds the opened descriptor to the root-checked target by
-//! comparing their `(dev, ino)` (a parent-component swap between the check and
-//! the open opens a different inode, which this rejects); and reads a bounded
-//! prefix from that descriptor so a concurrent grow cannot cause an unbounded
-//! read. `unsafe`-free, so it uses the `(dev, ino)` binding rather than
-//! per-segment `openat`.
+//! Each allowed root is opened once at startup into a frozen directory
+//! capability by walking its canonical components from `/` with `NOFOLLOW` (see
+//! [`open_tls_roots`]). A read then selects the capability whose canonical
+//! directory contains the material's canonical *parent* (only the parent is
+//! canonicalized, so a final-component symlink is never resolved away), and
+//! traverses the root-relative parent components from that frozen capability
+//! with `openat(.., NOFOLLOW)`, opening the final basename `NOFOLLOW`. The raw
+//! path is never opened ambiently, so a parent-directory swapped for a symlink
+//! after the root was selected is rejected by `NOFOLLOW` rather than followed
+//! out of the root. The final descriptor is checked to be a regular file and
+//! only a bounded prefix is read. It uses `rustix::fs::openat` (a safe,
+//! cross-platform API), so it needs no `unsafe`.
 
-use std::fs::{File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::path::{Component, Path, PathBuf};
+
+use rustix::fs::{Mode, OFlags, open, openat};
 
 /// Upper bound on one TLS material file, matching CP-CFG's serving reader.
 const MAX_TLS_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Canonicalizes and freezes the allowed TLS roots once, at startup. A root that
-/// cannot be canonicalized (missing or unreadable) is dropped, so later reads
-/// compare against a stable, symlink-free set rather than re-resolving roots on
-/// every read.
+/// A frozen directory capability for one allowed TLS root.
+struct Root {
+    canonical: PathBuf,
+    capability: OwnedFd,
+}
+
+/// The allowed TLS roots, each held as an open directory capability frozen at
+/// startup. Not `Clone`: share it behind an `Arc`.
+pub struct TlsRoots {
+    roots: Vec<Root>,
+}
+
+/// Opens each allowed root as a frozen directory capability. A root that cannot
+/// be canonicalized or opened (or whose path contains a symlink component) is
+/// dropped, so later reads confine against stable, symlink-free capabilities.
 #[must_use]
-pub fn canonicalize_tls_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
-    roots
-        .iter()
-        .filter_map(|root| std::fs::canonicalize(root).ok())
-        .collect()
+pub fn open_tls_roots(roots: &[PathBuf]) -> TlsRoots {
+    let mut opened = Vec::new();
+    for root in roots {
+        if let Ok(canonical) = std::fs::canonicalize(root)
+            && let Ok(capability) = open_dir_capability(&canonical)
+        {
+            opened.push(Root {
+                canonical,
+                capability,
+            });
+        }
+    }
+    TlsRoots { roots: opened }
+}
+
+/// Opens a canonical (absolute, symlink-free) directory into a capability by
+/// walking each component from `/` with `NOFOLLOW`.
+fn open_dir_capability(canonical_dir: &Path) -> Result<OwnedFd, &'static str> {
+    let mut fd = open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| "tls root is unavailable")?;
+    for component in canonical_dir.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                fd = openat(
+                    &fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|_| "tls root component is a symlink or unavailable")?;
+            }
+            _ => return Err("tls root path is not canonical"),
+        }
+    }
+    Ok(fd)
 }
 
 /// Reads one TLS material file safely and returns its bytes.
 ///
-/// `canonical_allowed_roots` must already be canonicalized (see
-/// [`canonicalize_tls_roots`]).
-///
 /// # Errors
 ///
 /// Returns a bounded, payload-free reason (never the path or the material) when
-/// the path is not absolute, resolves outside the roots, is a symlink, changed
-/// during open, is not a regular file, or exceeds 16 MiB.
-pub fn read_tls_material(
-    path: &Path,
-    canonical_allowed_roots: &[PathBuf],
-) -> Result<Vec<u8>, &'static str> {
+/// the path is not absolute, resolves outside the roots, has a symlink
+/// component, is not a regular file, or exceeds 16 MiB.
+pub fn read_tls_material(path: &Path, roots: &TlsRoots) -> Result<Vec<u8>, &'static str> {
+    let selection = select_root(path, roots)?;
+    traverse_and_read(&selection)
+}
+
+/// The frozen root plus the root-relative parent components and the
+/// (uncanonicalized) final basename that a read will traverse.
+struct Selection<'a> {
+    root: &'a Root,
+    relative_parent: Vec<OsString>,
+    basename: OsString,
+}
+
+/// Selects the frozen root capability whose canonical directory contains the
+/// material's canonical parent. Only the parent is canonicalized, so the final
+/// component's symlink status is preserved for the `NOFOLLOW` open.
+fn select_root<'a>(path: &Path, roots: &'a TlsRoots) -> Result<Selection<'a>, &'static str> {
     if !path.is_absolute() {
         return Err("tls material path is not absolute");
     }
-    // Resolve and confine the configured path to a frozen root *before* opening,
-    // so the root decision is made against the exact target the read is then
-    // bound to.
-    let canonical = std::fs::canonicalize(path).map_err(|_| "tls material is unavailable")?;
-    if !canonical_allowed_roots
-        .iter()
-        .any(|root| canonical.starts_with(root))
-    {
-        return Err("tls material is outside the configured TLS roots");
+    let parent = path.parent().ok_or("tls material path has no parent")?;
+    let basename = path
+        .file_name()
+        .ok_or("tls material path has no file name")?;
+    let canonical_parent =
+        std::fs::canonicalize(parent).map_err(|_| "tls material parent is unavailable")?;
+    for root in &roots.roots {
+        let Ok(relative) = canonical_parent.strip_prefix(&root.canonical) else {
+            continue;
+        };
+        let mut relative_parent = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(name) => relative_parent.push(name.to_os_string()),
+                _ => return Err("tls material parent is not canonical"),
+            }
+        }
+        return Ok(Selection {
+            root,
+            relative_parent,
+            basename: basename.to_os_string(),
+        });
     }
-    let target = std::fs::metadata(&canonical).map_err(|_| "tls material is unavailable")?;
-    if !target.is_file() {
+    Err("tls material is outside the configured TLS roots")
+}
+
+/// Traverses the parent components from the frozen root capability with
+/// `NOFOLLOW`, opens the final basename `NOFOLLOW`, verifies a regular file, and
+/// reads a bounded prefix. The raw path is never opened ambiently.
+fn traverse_and_read(selection: &Selection<'_>) -> Result<Vec<u8>, &'static str> {
+    let mut walked: Option<OwnedFd> = None;
+    for component in &selection.relative_parent {
+        let parent_fd = current_fd(selection.root, walked.as_ref());
+        let child = openat(
+            parent_fd,
+            component.as_os_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| "tls material component is a symlink or unavailable")?;
+        walked = Some(child);
+    }
+    let parent_fd = current_fd(selection.root, walked.as_ref());
+    // NONBLOCK avoids hanging if the final component was raced into a FIFO; the
+    // regular-file check below then fails closed.
+    let file_fd = openat(
+        parent_fd,
+        selection.basename.as_os_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| "tls material is a symlink or unavailable")?;
+    let mut file = File::from(file_fd);
+    let metadata = file.metadata().map_err(|_| "tls material is unavailable")?;
+    if !metadata.is_file() {
         return Err("tls material must be a regular file");
     }
-    // Open the exact configured path without following a final symlink.
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| "tls material is unavailable or is a symlink")?;
-    let opened = file.metadata().map_err(|_| "tls material is unavailable")?;
-    // Bind the opened descriptor to the root-checked target: if a parent
-    // component was swapped between the containment check and the open, the open
-    // resolved a different inode, which this rejects. Every later step reads
-    // from this descriptor.
-    if !opened.is_file() || opened.dev() != target.dev() || opened.ino() != target.ino() {
-        return Err("tls material changed during open");
-    }
     read_bounded_prefix(&mut file)
+}
+
+/// The directory fd to open the next component from: the walked child if any,
+/// else the frozen root capability.
+fn current_fd<'a>(root: &'a Root, walked: Option<&'a OwnedFd>) -> BorrowedFd<'a> {
+    walked.map_or_else(|| root.capability.as_fd(), AsFd::as_fd)
 }
 
 /// Reads at most `MAX_TLS_FILE_BYTES + 1` bytes from an already-opened
@@ -113,7 +209,9 @@ fn read_bounded_prefix(file: &mut File) -> Result<Vec<u8>, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TLS_FILE_BYTES, canonicalize_tls_roots, read_tls_material};
+    use super::{
+        MAX_TLS_FILE_BYTES, open_tls_roots, read_tls_material, select_root, traverse_and_read,
+    };
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -136,7 +234,7 @@ mod tests {
         let dir = unique_dir("ok");
         let path = dir.join("ca.pem");
         write(&path, b"ca-bytes");
-        let roots = canonicalize_tls_roots(&[dir]);
+        let roots = open_tls_roots(std::slice::from_ref(&dir));
         let bytes =
             read_tls_material(&path, &roots).unwrap_or_else(|error| unreachable!("read: {error}"));
         assert_eq!(bytes, b"ca-bytes");
@@ -144,7 +242,8 @@ mod tests {
 
     #[test]
     fn a_relative_path_is_rejected() {
-        assert!(read_tls_material(std::path::Path::new("ca.pem"), &[]).is_err());
+        let roots = open_tls_roots(&[]);
+        assert!(read_tls_material(std::path::Path::new("ca.pem"), &roots).is_err());
     }
 
     #[test]
@@ -152,48 +251,83 @@ mod tests {
         let dir = unique_dir("outside-file");
         let path = dir.join("ca.pem");
         write(&path, b"ca-bytes");
-        // An allowed root that exists but does not contain the file.
-        let roots = canonicalize_tls_roots(&[unique_dir("outside-root")]);
+        let roots = open_tls_roots(std::slice::from_ref(&unique_dir("outside-root")));
         assert!(read_tls_material(&path, &roots).is_err());
     }
 
     #[test]
     fn a_same_root_final_symlink_is_rejected() {
-        // A symlink whose target is itself inside the allowed root must still be
-        // rejected: opening the original path with O_NOFOLLOW fails.
         let dir = unique_dir("symlink");
         let real = dir.join("real.pem");
         write(&real, b"ca-bytes");
         let link = dir.join("link.pem");
         std::os::unix::fs::symlink(&real, &link)
             .unwrap_or_else(|error| unreachable!("symlink: {error}"));
-        let roots = canonicalize_tls_roots(&[dir]);
+        let roots = open_tls_roots(std::slice::from_ref(&dir));
         assert!(
             read_tls_material(&link, &roots).is_err(),
             "a same-root final symlink must be rejected"
         );
-        // The real file still reads.
         assert!(read_tls_material(&real, &roots).is_ok());
     }
 
     #[test]
     fn a_directory_is_rejected_as_non_regular() {
         let dir = unique_dir("dir");
-        let roots = canonicalize_tls_roots(std::slice::from_ref(&dir));
-        assert!(read_tls_material(&dir, &roots).is_err());
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap_or_else(|error| unreachable!("mkdir: {error}"));
+        let roots = open_tls_roots(std::slice::from_ref(&dir));
+        assert!(read_tls_material(&sub, &roots).is_err());
     }
 
     #[test]
     fn a_file_larger_than_the_limit_is_rejected() {
         let dir = unique_dir("toobig");
         let path = dir.join("ca.pem");
-        // A sparse file one byte over the limit; the bounded read stops at
-        // MAX + 1 rather than allocating the whole file.
         let file =
             std::fs::File::create(&path).unwrap_or_else(|error| unreachable!("create: {error}"));
         file.set_len(MAX_TLS_FILE_BYTES + 2)
             .unwrap_or_else(|error| unreachable!("set_len: {error}"));
-        let roots = canonicalize_tls_roots(&[dir]);
+        let roots = open_tls_roots(std::slice::from_ref(&dir));
         assert!(read_tls_material(&path, &roots).is_err());
+    }
+
+    #[test]
+    fn a_parent_swapped_to_an_outside_symlink_after_selection_never_escapes() {
+        // Deterministic capability test: select the root and root-relative parent
+        // against the real directory, then swap the parent directory for a symlink
+        // pointing outside the root. The traversal walks from the frozen root
+        // capability with NOFOLLOW, so it rejects the swapped-in symlink component
+        // and never returns the outside sentinel.
+        let root = unique_dir("swap-root");
+        let inside = root.join("d");
+        std::fs::create_dir_all(&inside).unwrap_or_else(|error| unreachable!("mkdir: {error}"));
+        write(&inside.join("ca.pem"), b"inside-bytes");
+        let outside = unique_dir("swap-outside");
+        let outside_d = outside.join("d");
+        std::fs::create_dir_all(&outside_d).unwrap_or_else(|error| unreachable!("mkdir: {error}"));
+        write(&outside_d.join("ca.pem"), b"OUTSIDE-SENTINEL");
+
+        let roots = open_tls_roots(std::slice::from_ref(&root));
+        let material = inside.join("ca.pem");
+        let selection =
+            select_root(&material, &roots).unwrap_or_else(|error| unreachable!("select: {error}"));
+
+        // Swap root/d (a real dir) for a symlink to outside/d.
+        std::fs::remove_dir_all(&inside).unwrap_or_else(|error| unreachable!("rm: {error}"));
+        std::os::unix::fs::symlink(&outside_d, &inside)
+            .unwrap_or_else(|error| unreachable!("symlink: {error}"));
+
+        let result = traverse_and_read(&selection);
+        assert!(
+            result.is_err(),
+            "a parent swapped to an outside symlink must be rejected"
+        );
+        if let Ok(bytes) = result {
+            assert_ne!(
+                bytes, b"OUTSIDE-SENTINEL",
+                "must never read outside the root"
+            );
+        }
     }
 }

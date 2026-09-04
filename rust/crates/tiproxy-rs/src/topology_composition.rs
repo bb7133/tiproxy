@@ -23,7 +23,6 @@
 //! generation registers with (closing the validate->apply TOCTOU).
 
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use control_config::{
@@ -33,7 +32,7 @@ use control_config::{
 use control_external::{EtcdClientConfig, EtcdTlsConfig, EtcdTlsPolicy};
 use control_topology::{TopologyClientFactory, TopologyClusterClient};
 
-use crate::tls_material::read_tls_material;
+use crate::tls_material::{TlsRoots, read_tls_material};
 
 /// The concrete artifact a [`TopologyCandidateValidator`] prepares: the exact
 /// normalized topology projection it validated, plus one built etcd client per
@@ -60,16 +59,16 @@ impl PreparedClusterSet {
 /// Reads backend-cluster TLS material and prepares the per-cluster etcd clients
 /// for the candidate generation. TLS files are read through the safe seam,
 /// confined to the process's allowed TLS roots.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TopologyCandidateValidator {
-    allowed_tls_roots: Arc<[PathBuf]>,
+    allowed_tls_roots: Arc<TlsRoots>,
 }
 
 impl TopologyCandidateValidator {
     /// Creates a validator that reads TLS material only from within
     /// `allowed_tls_roots`.
     #[must_use]
-    pub fn new(allowed_tls_roots: Arc<[PathBuf]>) -> Self {
+    pub fn new(allowed_tls_roots: Arc<TlsRoots>) -> Self {
         Self { allowed_tls_roots }
     }
 }
@@ -113,7 +112,7 @@ impl CandidateValidator for TopologyCandidateValidator {
 /// rejected rather than silently ignored.
 fn cluster_tls_material(
     config: &ClientTlsConfig,
-    allowed_tls_roots: &[PathBuf],
+    allowed_tls_roots: &TlsRoots,
 ) -> Result<Option<EtcdTlsConfig>, &'static str> {
     if config.skip_ca_verification {
         return Err("cluster_tls_skip_ca_unsupported");
@@ -284,8 +283,8 @@ ca = "{ca_path}"
             &config_toml(100, ca_str),
             None,
             &dir,
-            Arc::new(TopologyCandidateValidator::new(Arc::from(
-                crate::tls_material::canonicalize_tls_roots(std::slice::from_ref(&dir)),
+            Arc::new(TopologyCandidateValidator::new(Arc::new(
+                crate::tls_material::open_tls_roots(std::slice::from_ref(&dir)),
             ))),
         )
         .unwrap_or_else(|error| unreachable!("generation 1: {error}"));
@@ -349,12 +348,12 @@ ca = "{ca_path}"
         let link_str = link
             .to_str()
             .unwrap_or_else(|| unreachable!("temp path is not utf-8"));
-        let roots = crate::tls_material::canonicalize_tls_roots(std::slice::from_ref(&dir));
+        let roots = crate::tls_material::open_tls_roots(std::slice::from_ref(&dir));
         let result = ConfigNamespaceStore::from_toml_with_validator(
             &config_toml(100, link_str),
             None,
             &dir,
-            Arc::new(TopologyCandidateValidator::new(Arc::from(roots))),
+            Arc::new(TopologyCandidateValidator::new(Arc::new(roots))),
         );
         assert!(
             result.is_err(),
@@ -408,8 +407,8 @@ ca = "{ca_path}"
             &config_toml_named(100, "", "cluster-x"),
             None,
             &dir,
-            Arc::new(TopologyCandidateValidator::new(Arc::from(
-                crate::tls_material::canonicalize_tls_roots(std::slice::from_ref(&dir)),
+            Arc::new(TopologyCandidateValidator::new(Arc::new(
+                crate::tls_material::open_tls_roots(std::slice::from_ref(&dir)),
             ))),
         )
         .unwrap_or_else(|error| unreachable!("store a: {error}"));

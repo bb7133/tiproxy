@@ -21,6 +21,7 @@ control-topology.workspace = true
 dataplane.workspace = true
 if-addrs.workspace = true
 libc.workspace = true
+rustix.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
 [lints]

@@ -49,6 +49,7 @@ session-core = { path = "crates/session-core", version = "0.1.0" }
 prost = { version = "=0.14.1", default-features = false, features = ["derive", "std"] }
 rcgen = { version = "=0.14.9", default-features = false, features = ["pem", "ring"] }
 reqwest = { version = "=0.12.24", default-features = false, features = ["rustls-tls-manual-roots", "stream"] }
+rustix = { version = "=0.38.44", default-features = false, features = ["fs", "std"] }
 rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "=1.14.1", default-features = false, features = ["alloc", "std"] }
 socket2 = { version = "=0.6.1", default-features = false, features = ["all"] }
