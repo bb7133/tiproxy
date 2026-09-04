@@ -23,6 +23,7 @@
 
 pub mod dns;
 pub mod etcd;
+pub mod explicit_dns;
 pub mod http;
 pub mod retry;
 mod tls;

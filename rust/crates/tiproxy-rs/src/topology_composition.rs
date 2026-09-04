@@ -86,6 +86,7 @@ impl CandidateValidator for TopologyCandidateValidator {
         for cluster in topology.backend_clusters.iter() {
             let endpoints = cluster.pd_addrs.iter().map(ToString::to_string);
             let client = EtcdClientConfig::new(endpoints, tls.clone())
+                .and_then(|config| config.with_ns_servers(Arc::clone(&cluster.ns_servers)))
                 .map_err(|_| "cluster_client_build")?;
             clusters.push(TopologyClusterClient {
                 cluster_name: Arc::clone(&cluster.name),

@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use control_plane::OwnerToken;
@@ -29,6 +30,8 @@ use thiserror::Error;
 pub const MAX_ETCD_ENDPOINTS: usize = 32;
 /// Maximum byte length of one configured endpoint.
 pub const MAX_ETCD_ENDPOINT_BYTES: usize = 2_048;
+/// Maximum explicit nameservers threaded into one cluster client.
+pub const MAX_NS_SERVERS: usize = 32;
 const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The minimum accepted TLS protocol version for an etcd connection.
@@ -103,6 +106,32 @@ fn normalized_common_names(names: Vec<String>) -> Result<Vec<String>, EtcdConfig
     normalized.sort();
     normalized.dedup();
     Ok(normalized)
+}
+
+/// Returns whether `value` is a normalized `host:port` (or bracketed
+/// `[v6]:port`) with a non-empty host and an explicit numeric port, matching the
+/// shape produced by the config layer's `normalize_ns_server`.
+fn is_normalized_host_port(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[<addr>]:<port>`.
+        let Some((addr, port)) = rest.split_once("]:") else {
+            return false;
+        };
+        (addr, port)
+    } else {
+        let Some((host, port)) = value.rsplit_once(':') else {
+            return false;
+        };
+        if host.contains(':') {
+            // Unbracketed multi-colon host is not a normalized form.
+            return false;
+        }
+        (host, port)
+    };
+    !host.is_empty() && !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 /// Validated mTLS material and verification policy for an etcd connection.
@@ -192,7 +221,7 @@ impl EtcdTlsConfig {
     ///
     /// Returns [`EtcdConfigError::TlsSetup`] when the material cannot form a
     /// client configuration.
-    pub fn client_config(&self) -> Result<std::sync::Arc<rustls::ClientConfig>, EtcdConfigError> {
+    pub fn client_config(&self) -> Result<Arc<rustls::ClientConfig>, EtcdConfigError> {
         crate::tls::build_client_config(
             self.ca_certificate_pem.as_deref(),
             self.identity
@@ -218,6 +247,7 @@ pub struct EtcdClientConfig {
     keep_alive_timeout: Duration,
     tcp_keep_alive: Duration,
     tls: Option<EtcdTlsConfig>,
+    ns_servers: Arc<[Arc<str>]>,
 }
 
 impl EtcdClientConfig {
@@ -244,7 +274,39 @@ impl EtcdClientConfig {
             keep_alive_timeout: Duration::from_secs(3),
             tcp_keep_alive: Duration::from_secs(30),
             tls,
+            ns_servers: Arc::from([]),
         })
+    }
+
+    /// Threads the cluster's explicit, already-normalized nameservers onto this
+    /// config, preserving Go's stable lexicographic order and its duplicates.
+    ///
+    /// The list is a shared, immutable snapshot; the empty list means no explicit
+    /// nameservers. Each entry must be a normalized `host:port` (or bracketed
+    /// `[v6]:port`) with an explicit numeric port, matching the config layer's
+    /// `normalize_ns_server`. This slice validates and bounds the list but does
+    /// not yet consult it: the production dialer still resolves via the system
+    /// resolver until the `ns_servers` gate opens in a later slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtcdConfigError::TooManyNsServers`] when the list exceeds
+    /// [`MAX_NS_SERVERS`], or [`EtcdConfigError::InvalidNsServer`] when an entry
+    /// is not a normalized `host:port`.
+    pub fn with_ns_servers(mut self, ns_servers: Arc<[Arc<str>]>) -> Result<Self, EtcdConfigError> {
+        if ns_servers.len() > MAX_NS_SERVERS {
+            return Err(EtcdConfigError::TooManyNsServers {
+                count: ns_servers.len(),
+                maximum: MAX_NS_SERVERS,
+            });
+        }
+        for (index, server) in ns_servers.iter().enumerate() {
+            if !is_normalized_host_port(server) {
+                return Err(EtcdConfigError::InvalidNsServer { index });
+            }
+        }
+        self.ns_servers = ns_servers;
+        Ok(self)
     }
 
     /// Replaces all bounded timeout and keepalive values.
@@ -287,6 +349,13 @@ impl EtcdClientConfig {
     #[must_use]
     pub fn endpoints(&self) -> &[String] {
         &self.endpoints
+    }
+
+    /// Returns the validated explicit nameservers in their frozen, duplicate-
+    /// preserving order (empty when none are configured).
+    #[must_use]
+    pub fn ns_servers(&self) -> &[Arc<str>] {
+        &self.ns_servers
     }
 
     /// Returns the per-operation request deadline.
@@ -387,6 +456,20 @@ pub enum EtcdConfigError {
     /// The allowed common name list exceeds its count bound.
     #[error("too many etcd TLS allowed common names")]
     TooManyCommonNames,
+    /// The configured nameserver count is bounded.
+    #[error("too many nameservers: {count} exceeds {maximum}")]
+    TooManyNsServers {
+        /// Observed nameserver count.
+        count: usize,
+        /// Maximum nameserver count.
+        maximum: usize,
+    },
+    /// One nameserver is not a normalized `host:port`.
+    #[error("invalid nameserver at index {index}")]
+    InvalidNsServer {
+        /// Zero-based nameserver index.
+        index: usize,
+    },
     /// The TLS material and policy could not form a client configuration.
     #[error("etcd TLS client configuration could not be built")]
     TlsSetup,
@@ -826,6 +909,44 @@ mod tests {
         assert!(matches!(
             connector.connect().await,
             Err(super::EtcdConnectError::StaleOwner)
+        ));
+    }
+
+    #[test]
+    fn ns_servers_are_bounded_validated_and_order_preserving() {
+        use std::sync::Arc;
+
+        let base = EtcdClientConfig::new(["127.0.0.1:2379".to_owned()], None)
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        assert!(base.ns_servers().is_empty());
+
+        // Frozen lexicographic order with duplicates preserved (not de-duped).
+        let servers: Arc<[Arc<str>]> = Arc::from([
+            Arc::from("10.0.0.1:53"),
+            Arc::from("10.0.0.1:53"),
+            Arc::from("[2001:db8::1]:53"),
+            Arc::from("dns.internal:5353"),
+        ]);
+        let threaded = base
+            .clone()
+            .with_ns_servers(Arc::clone(&servers))
+            .unwrap_or_else(|error| unreachable!("ns: {error}"));
+        assert_eq!(threaded.ns_servers(), &*servers);
+
+        // Over-bound list is rejected.
+        let too_many: Arc<[Arc<str>]> = (0..=super::MAX_NS_SERVERS)
+            .map(|index| Arc::from(format!("10.0.0.{}:53", index % 250)))
+            .collect();
+        assert!(matches!(
+            base.clone().with_ns_servers(too_many),
+            Err(EtcdConfigError::TooManyNsServers { .. })
+        ));
+
+        // A non-normalized entry (missing explicit port) is rejected.
+        let bad: Arc<[Arc<str>]> = Arc::from([Arc::from("no-port-host")]);
+        assert!(matches!(
+            base.with_ns_servers(bad),
+            Err(EtcdConfigError::InvalidNsServer { index: 0 })
         ));
     }
 }
