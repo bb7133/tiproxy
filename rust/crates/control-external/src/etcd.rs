@@ -31,39 +31,97 @@ pub const MAX_ETCD_ENDPOINTS: usize = 32;
 pub const MAX_ETCD_ENDPOINT_BYTES: usize = 2_048;
 const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Validated mTLS material for an etcd connection.
+/// The minimum accepted TLS protocol version for an etcd connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EtcdTlsVersion {
+    /// TLS 1.2.
+    V1_2,
+    /// TLS 1.3.
+    V1_3,
+}
+
+impl EtcdTlsVersion {
+    /// Parses the CP-CFG `minimum-version` value: `""` (no floor), `"1.2"`, or
+    /// `"1.3"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtcdConfigError::UnsupportedTlsVersion`] for any other value.
+    pub fn parse(value: &str) -> Result<Option<Self>, EtcdConfigError> {
+        match value {
+            "" => Ok(None),
+            "1.2" => Ok(Some(Self::V1_2)),
+            "1.3" => Ok(Some(Self::V1_3)),
+            _ => Err(EtcdConfigError::UnsupportedTlsVersion),
+        }
+    }
+}
+
+/// Advanced TLS verification policy for an etcd connection, mirroring the frozen
+/// backend `cluster-tls` fields. The default verifies the server against the
+/// configured CA with no version floor and no name pinning — the behavior the
+/// config-persistence and election owners rely on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EtcdTlsPolicy {
+    /// Minimum accepted TLS protocol version, or `None` for the default floor.
+    pub minimum_version: Option<EtcdTlsVersion>,
+    /// Exact-match allowlist of accepted server-certificate common names. Empty
+    /// disables common-name pinning.
+    pub allowed_common_names: Vec<String>,
+    /// Skip CA-chain and hostname trust while still performing the TLS handshake
+    /// signature check (mirrors Go `skip-ca`). A CA is not required when set;
+    /// any configured `allowed_common_names` is still enforced.
+    pub skip_ca_verification: bool,
+}
+
+/// Validated mTLS material and verification policy for an etcd connection.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EtcdTlsConfig {
-    ca_certificate_pem: Vec<u8>,
+    ca_certificate_pem: Option<Vec<u8>>,
     identity: Option<(Vec<u8>, Vec<u8>)>,
     domain_name: Option<String>,
+    policy: EtcdTlsPolicy,
 }
 
 impl fmt::Debug for EtcdTlsConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("EtcdTlsConfig")
-            .field("ca_certificate_pem", &"<redacted>")
+            .field(
+                "ca_certificate_configured",
+                &self.ca_certificate_pem.is_some(),
+            )
             .field("client_identity_configured", &self.identity.is_some())
             .field("domain_name", &self.domain_name)
+            .field("minimum_version", &self.policy.minimum_version)
+            .field("common_name_pins", &self.policy.allowed_common_names.len())
+            .field("skip_ca_verification", &self.policy.skip_ca_verification)
             .finish()
     }
 }
 
 impl EtcdTlsConfig {
-    /// Creates TLS options from one CA bundle and an optional client identity.
+    /// Creates TLS material and policy from an optional CA bundle, an optional
+    /// client identity, an optional explicit server name, and a verification
+    /// policy.
+    ///
+    /// A CA bundle is required unless [`EtcdTlsPolicy::skip_ca_verification`] is
+    /// set; when it is set, the connection still performs the TLS handshake and
+    /// enforces any `allowed_common_names`.
     ///
     /// # Errors
     ///
-    /// Rejects empty CA material, incomplete client identities, and empty
-    /// explicit domain names.
+    /// Rejects a missing CA when CA verification is required, incomplete client
+    /// identities, empty explicit domain names, and empty common-name entries.
     pub fn new(
-        ca_certificate_pem: Vec<u8>,
+        ca_certificate_pem: Option<Vec<u8>>,
         client_certificate_pem: Option<Vec<u8>>,
         client_key_pem: Option<Vec<u8>>,
         domain_name: Option<String>,
+        policy: EtcdTlsPolicy,
     ) -> Result<Self, EtcdConfigError> {
-        if ca_certificate_pem.is_empty() {
+        let ca_certificate_pem = ca_certificate_pem.filter(|ca| !ca.is_empty());
+        if !policy.skip_ca_verification && ca_certificate_pem.is_none() {
             return Err(EtcdConfigError::EmptyCaCertificate);
         }
         let identity = match (client_certificate_pem, client_key_pem) {
@@ -76,16 +134,31 @@ impl EtcdTlsConfig {
         if domain_name.as_deref().is_some_and(str::is_empty) {
             return Err(EtcdConfigError::EmptyDomainName);
         }
+        if policy
+            .allowed_common_names
+            .iter()
+            .any(|name| name.trim().is_empty())
+        {
+            return Err(EtcdConfigError::EmptyCommonName);
+        }
         Ok(Self {
             ca_certificate_pem,
             identity,
             domain_name,
+            policy,
         })
     }
 
     fn connect_options(&self) -> TlsOptions {
-        let mut options = TlsOptions::new()
-            .ca_certificate(Certificate::from_pem(self.ca_certificate_pem.clone()));
+        // NOTE: the advanced policy (minimum version, common-name pinning,
+        // skip-CA) is not yet expressed here — `TlsOptions` (tonic
+        // `ClientTlsConfig`) cannot carry it. It is consumed by the custom
+        // rustls transport that replaces this path; today only the default
+        // policy (CA verification, no floor, no pinning) reaches this builder.
+        let mut options = TlsOptions::new();
+        if let Some(ca_certificate_pem) = &self.ca_certificate_pem {
+            options = options.ca_certificate(Certificate::from_pem(ca_certificate_pem.clone()));
+        }
         if let Some((certificate, key)) = &self.identity {
             options = options.identity(Identity::from_pem(certificate.clone(), key.clone()));
         }
@@ -231,7 +304,7 @@ pub enum EtcdConfigError {
         /// Zero-based endpoint index.
         index: usize,
     },
-    /// TLS requires at least one trust anchor.
+    /// TLS requires at least one trust anchor unless CA verification is skipped.
     #[error("etcd TLS CA certificate is empty")]
     EmptyCaCertificate,
     /// Client certificate and key must be configured together.
@@ -240,6 +313,12 @@ pub enum EtcdConfigError {
     /// An explicit TLS server name cannot be empty.
     #[error("etcd TLS domain name is empty")]
     EmptyDomainName,
+    /// The minimum TLS version must be unset, `1.2`, or `1.3`.
+    #[error("unsupported etcd TLS minimum version")]
+    UnsupportedTlsVersion,
+    /// An allowed common name entry cannot be empty.
+    #[error("etcd TLS allowed common name is empty")]
+    EmptyCommonName,
     /// Timeout and keepalive values are bounded.
     #[error("invalid {name} duration {value:?}")]
     InvalidDuration {
@@ -435,7 +514,7 @@ mod tests {
 
     use control_plane::{OwnerScope, OwnershipRegistry};
 
-    use super::{EtcdClientConfig, EtcdConfigError, EtcdTlsConfig};
+    use super::{EtcdClientConfig, EtcdConfigError, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion};
 
     #[test]
     fn endpoints_are_bounded_normalized_and_tls_consistent() {
@@ -470,11 +549,17 @@ mod tests {
     #[test]
     fn tls_and_timeout_material_is_complete() {
         assert_eq!(
-            EtcdTlsConfig::new(Vec::new(), None, None, None),
+            EtcdTlsConfig::new(None, None, None, None, EtcdTlsPolicy::default()),
             Err(EtcdConfigError::EmptyCaCertificate)
         );
         assert_eq!(
-            EtcdTlsConfig::new(vec![1], Some(vec![2]), None, None),
+            EtcdTlsConfig::new(
+                Some(vec![1]),
+                Some(vec![2]),
+                None,
+                None,
+                EtcdTlsPolicy::default()
+            ),
             Err(EtcdConfigError::IncompleteClientIdentity)
         );
         let config =
@@ -494,12 +579,75 @@ mod tests {
     }
 
     #[test]
+    fn minimum_tls_version_parses_only_the_frozen_values() {
+        assert_eq!(EtcdTlsVersion::parse(""), Ok(None));
+        assert_eq!(EtcdTlsVersion::parse("1.2"), Ok(Some(EtcdTlsVersion::V1_2)));
+        assert_eq!(EtcdTlsVersion::parse("1.3"), Ok(Some(EtcdTlsVersion::V1_3)));
+        assert_eq!(
+            EtcdTlsVersion::parse("1.1"),
+            Err(EtcdConfigError::UnsupportedTlsVersion)
+        );
+        assert_eq!(
+            EtcdTlsVersion::parse("tls1.3"),
+            Err(EtcdConfigError::UnsupportedTlsVersion)
+        );
+    }
+
+    #[test]
+    fn skip_ca_verification_allows_a_tls_config_without_a_ca() {
+        // skip-CA still enables TLS but does not require a trust anchor.
+        let policy = EtcdTlsPolicy {
+            skip_ca_verification: true,
+            ..EtcdTlsPolicy::default()
+        };
+        assert!(EtcdTlsConfig::new(None, None, None, None, policy.clone()).is_ok());
+        // An empty CA is treated as absent, which is fine when skipping.
+        assert!(EtcdTlsConfig::new(Some(Vec::new()), None, None, None, policy).is_ok());
+    }
+
+    #[test]
+    fn a_ca_is_required_when_not_skipping_verification() {
+        // Default policy verifies the CA, so a missing or empty CA is rejected.
+        assert_eq!(
+            EtcdTlsConfig::new(None, None, None, None, EtcdTlsPolicy::default()),
+            Err(EtcdConfigError::EmptyCaCertificate)
+        );
+        assert_eq!(
+            EtcdTlsConfig::new(Some(Vec::new()), None, None, None, EtcdTlsPolicy::default()),
+            Err(EtcdConfigError::EmptyCaCertificate)
+        );
+    }
+
+    #[test]
+    fn an_empty_allowed_common_name_is_rejected() {
+        let policy = EtcdTlsPolicy {
+            allowed_common_names: vec!["good".to_owned(), "  ".to_owned()],
+            ..EtcdTlsPolicy::default()
+        };
+        assert_eq!(
+            EtcdTlsConfig::new(Some(vec![1]), None, None, None, policy),
+            Err(EtcdConfigError::EmptyCommonName)
+        );
+    }
+
+    #[test]
+    fn a_full_policy_with_ca_and_pins_is_accepted() {
+        let policy = EtcdTlsPolicy {
+            minimum_version: Some(EtcdTlsVersion::V1_3),
+            allowed_common_names: vec!["etcd-server".to_owned()],
+            skip_ca_verification: false,
+        };
+        assert!(EtcdTlsConfig::new(Some(vec![1, 2, 3]), None, None, None, policy).is_ok());
+    }
+
+    #[test]
     fn tls_debug_redacts_certificate_and_private_key_material() {
         let tls = EtcdTlsConfig::new(
-            b"secret-ca-certificate".to_vec(),
+            Some(b"secret-ca-certificate".to_vec()),
             Some(b"secret-client-certificate".to_vec()),
             Some(b"secret-private-key".to_vec()),
             Some("etcd.internal".to_owned()),
+            EtcdTlsPolicy::default(),
         )
         .unwrap_or_else(|error| unreachable!("TLS policy: {error}"));
         let rendered = format!("{tls:?}");

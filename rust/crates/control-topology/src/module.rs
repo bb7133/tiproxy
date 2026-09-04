@@ -557,7 +557,7 @@ mod tests {
     use std::time::Duration;
 
     use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceStore, TopologyRuntimeIdentity};
-    use control_external::{EtcdClientConfig, EtcdTlsConfig};
+    use control_external::{EtcdClientConfig, EtcdTlsConfig, EtcdTlsPolicy};
     use control_plane::{
         ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
         MetricsPolicy, ModuleError, OwnershipRegistry, RuntimeEvent, ShutdownReason, TlsPolicy,
@@ -594,8 +594,14 @@ mod tests {
     }
 
     fn client(timeout_ms: u64, ca: &[u8]) -> EtcdClientConfig {
-        let tls = EtcdTlsConfig::new(ca.to_vec(), None, None, Some("cluster.local".to_owned()))
-            .unwrap_or_else(|_| unreachable!("non-empty CA is valid"));
+        let tls = EtcdTlsConfig::new(
+            Some(ca.to_vec()),
+            None,
+            None,
+            Some("cluster.local".to_owned()),
+            EtcdTlsPolicy::default(),
+        )
+        .unwrap_or_else(|_| unreachable!("non-empty CA is valid"));
         EtcdClientConfig::new(["127.0.0.1:1".to_owned()], Some(tls))
             .unwrap_or_else(|_| unreachable!("static endpoint is valid"))
             .with_timeouts(

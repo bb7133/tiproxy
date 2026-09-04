@@ -23,14 +23,17 @@
 //! generation registers with (closing the validate->apply TOCTOU).
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use control_config::{
     CandidateValidator, ClientTlsConfig, ConfigNamespaceSnapshot, EffectiveConfig, NamespaceConfig,
     PreparedArtifact, TopologyConfig,
 };
-use control_external::{EtcdClientConfig, EtcdTlsConfig};
+use control_external::{EtcdClientConfig, EtcdTlsConfig, EtcdTlsPolicy};
 use control_topology::{TopologyClientFactory, TopologyClusterClient};
+
+use crate::tls_material::read_tls_material;
 
 /// The concrete artifact a [`TopologyCandidateValidator`] prepares: the exact
 /// normalized topology projection it validated, plus one built etcd client per
@@ -55,9 +58,21 @@ impl PreparedClusterSet {
 }
 
 /// Reads backend-cluster TLS material and prepares the per-cluster etcd clients
-/// for the candidate generation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TopologyCandidateValidator;
+/// for the candidate generation. TLS files are read through the safe seam,
+/// confined to the process's allowed TLS roots.
+#[derive(Clone, Debug)]
+pub struct TopologyCandidateValidator {
+    allowed_tls_roots: Arc<[PathBuf]>,
+}
+
+impl TopologyCandidateValidator {
+    /// Creates a validator that reads TLS material only from within
+    /// `allowed_tls_roots`.
+    #[must_use]
+    pub fn new(allowed_tls_roots: Arc<[PathBuf]>) -> Self {
+        Self { allowed_tls_roots }
+    }
+}
 
 impl CandidateValidator for TopologyCandidateValidator {
     fn validate(
@@ -67,7 +82,7 @@ impl CandidateValidator for TopologyCandidateValidator {
     ) -> Result<PreparedArtifact, &'static str> {
         let topology = effective.topology().map_err(|_| "topology_projection")?;
         // Read the shared cluster TLS material once for this generation.
-        let tls = cluster_tls_material(&topology.cluster_tls)?;
+        let tls = cluster_tls_material(&topology.cluster_tls, &self.allowed_tls_roots)?;
         let mut clusters = Vec::with_capacity(topology.backend_clusters.len());
         for cluster in topology.backend_clusters.iter() {
             let endpoints = cluster.pd_addrs.iter().map(ToString::to_string);
@@ -87,11 +102,19 @@ impl CandidateValidator for TopologyCandidateValidator {
 }
 
 /// Loads the optional client mTLS material referenced by a normalized
-/// [`ClientTlsConfig`], reading each PEM exactly once.
+/// [`ClientTlsConfig`], reading each PEM once through the safe seam.
 ///
 /// Returns payload-free failure classes: no path or material ever appears in the
 /// error.
-fn cluster_tls_material(config: &ClientTlsConfig) -> Result<Option<EtcdTlsConfig>, &'static str> {
+///
+/// The advanced policy (`minimum_version` / `allowed_common_names` /
+/// `skip_ca_verification`) is not yet threaded here — it lands with the custom
+/// TLS transport that consumes it; for now `skip_ca_verification` is still
+/// rejected rather than silently ignored.
+fn cluster_tls_material(
+    config: &ClientTlsConfig,
+    allowed_tls_roots: &[PathBuf],
+) -> Result<Option<EtcdTlsConfig>, &'static str> {
     if config.skip_ca_verification {
         return Err("cluster_tls_skip_ca_unsupported");
     }
@@ -102,20 +125,20 @@ fn cluster_tls_material(config: &ClientTlsConfig) -> Result<Option<EtcdTlsConfig
         return Ok(None);
     }
     let ca_path = config.ca_path.as_deref().ok_or("cluster_tls_requires_ca")?;
-    let ca = std::fs::read(ca_path).map_err(|_| "cluster_tls_read_ca")?;
+    let ca = read_tls_material(ca_path, allowed_tls_roots).map_err(|_| "cluster_tls_read_ca")?;
     let certificate = config
         .certificate_path
         .as_deref()
-        .map(std::fs::read)
+        .map(|path| read_tls_material(path, allowed_tls_roots))
         .transpose()
         .map_err(|_| "cluster_tls_read_certificate")?;
     let key = config
         .private_key_path
         .as_deref()
-        .map(std::fs::read)
+        .map(|path| read_tls_material(path, allowed_tls_roots))
         .transpose()
         .map_err(|_| "cluster_tls_read_key")?;
-    EtcdTlsConfig::new(ca, certificate, key, None)
+    EtcdTlsConfig::new(Some(ca), certificate, key, None, EtcdTlsPolicy::default())
         .map(Some)
         .map_err(|_| "cluster_tls_invalid")
 }
@@ -261,7 +284,9 @@ ca = "{ca_path}"
             &config_toml(100, ca_str),
             None,
             &dir,
-            Arc::new(TopologyCandidateValidator),
+            Arc::new(TopologyCandidateValidator::new(Arc::from(vec![
+                dir.clone(),
+            ]))),
         )
         .unwrap_or_else(|error| unreachable!("generation 1: {error}"));
         let factory = ArtifactClusterFactory;
@@ -353,7 +378,9 @@ ca = "{ca_path}"
             &config_toml_named(100, "", "cluster-x"),
             None,
             &dir,
-            Arc::new(TopologyCandidateValidator),
+            Arc::new(TopologyCandidateValidator::new(Arc::from(vec![
+                dir.clone(),
+            ]))),
         )
         .unwrap_or_else(|error| unreachable!("store a: {error}"));
         let topology_a = store_a

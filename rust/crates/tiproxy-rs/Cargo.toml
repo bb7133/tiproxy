@@ -20,6 +20,7 @@ control-proto.workspace = true
 control-topology.workspace = true
 dataplane.workspace = true
 if-addrs.workspace = true
+libc.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
 [lints]

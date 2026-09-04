@@ -1938,6 +1938,7 @@ dependencies = [
  "control-topology",
  "dataplane",
  "if-addrs",
+ "libc",
  "tokio",
 ]
 

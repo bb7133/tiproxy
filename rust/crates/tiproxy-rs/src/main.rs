@@ -19,6 +19,7 @@
 mod config_composition;
 mod health;
 mod startup;
+mod tls_material;
 mod topology_composition;
 
 use std::env;
@@ -818,13 +819,22 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
     );
     tls_roots.sort();
     tls_roots.dedup();
+    // Shared, immutable allowed-roots list for every TLS-material read (topology
+    // cluster clients and config-persistence), matching the serving snapshot
+    // store's confinement.
+    let allowed_tls_roots: Arc<[PathBuf]> = Arc::from(tls_roots.clone());
     let snapshots = SnapshotStore::new(tls_roots.clone())
         .map_err(|error| format!("create snapshot store: {error}"))?;
-    let (etcd, election) = persistence_options(initial.as_ref(), process_id)?;
+    let (etcd, election) = persistence_options(initial.as_ref(), process_id, &allowed_tls_roots)?;
+    let persistence_roots = Arc::clone(&allowed_tls_roots);
     let module_options = ConfigModuleOptions {
         etcd,
         election,
-        persistence_factory: Some(Arc::new(config_persistence_client)),
+        persistence_factory: Some(Arc::new(
+            move |effective: &control_config::EffectiveConfig| {
+                config_persistence_client(effective, &persistence_roots)
+            },
+        )),
         ..base
     };
     // Every accepted generation funnels through one composite validator in a
@@ -837,7 +847,9 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
     ));
     let validator = Arc::new(CompositeCandidateValidator::new(
         serving,
-        Arc::new(TopologyCandidateValidator),
+        Arc::new(TopologyCandidateValidator::new(Arc::clone(
+            &allowed_tls_roots,
+        ))),
     ));
     let (module, handle) = ConfigModule::load_with_validator(module_options, validator)
         .map_err(|error| format!("load validated Rust config owner: {error}"))?;
@@ -855,8 +867,9 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
 fn persistence_options(
     snapshot: &control_config::ConfigNamespaceSnapshot,
     process_id: &str,
+    allowed_tls_roots: &[PathBuf],
 ) -> Result<(Option<EtcdClientConfig>, Option<ElectionConfig>), String> {
-    let client = config_persistence_client(snapshot.effective())?;
+    let client = config_persistence_client(snapshot.effective(), allowed_tls_roots)?;
     if client.is_none() {
         return Ok((None, None));
     }
@@ -872,6 +885,7 @@ fn persistence_options(
 
 fn config_persistence_client(
     effective: &control_config::EffectiveConfig,
+    allowed_tls_roots: &[PathBuf],
 ) -> Result<Option<EtcdClientConfig>, String> {
     let Some(persistence) = effective.config_persistence() else {
         return Ok(None);
@@ -881,13 +895,16 @@ fn config_persistence_client(
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let tls = etcd_tls(&persistence.cluster_tls)?;
+    let tls = etcd_tls(&persistence.cluster_tls, allowed_tls_roots)?;
     let client = EtcdClientConfig::new(endpoints, tls)
         .map_err(|error| format!("validate config persistence client: {error}"))?;
     Ok(Some(client))
 }
 
-fn etcd_tls(config: &control_config::ClientTlsConfig) -> Result<Option<EtcdTlsConfig>, String> {
+fn etcd_tls(
+    config: &control_config::ClientTlsConfig,
+    allowed_tls_roots: &[PathBuf],
+) -> Result<Option<EtcdTlsConfig>, String> {
     if config.skip_ca_verification {
         return Err("config persistence does not support skip-ca-verification".to_owned());
     }
@@ -901,17 +918,30 @@ fn etcd_tls(config: &control_config::ClientTlsConfig) -> Result<Option<EtcdTlsCo
         .ca_path
         .as_deref()
         .ok_or_else(|| "config persistence TLS requires a CA".to_owned())?;
-    let ca = std::fs::read(ca_path).map_err(|_| "read config persistence TLS CA".to_owned())?;
-    let certificate = read_optional_tls(config.certificate_path.as_deref(), "certificate")?;
-    let key = read_optional_tls(config.private_key_path.as_deref(), "private key")?;
-    EtcdTlsConfig::new(ca, certificate, key, None)
-        .map(Some)
-        .map_err(|error| format!("validate config persistence TLS: {error}"))
+    let ca = tls_material::read_tls_material(ca_path, allowed_tls_roots)
+        .map_err(|_| "read config persistence TLS CA".to_owned())?;
+    let certificate = read_optional_tls(config.certificate_path.as_deref(), allowed_tls_roots)?;
+    let key = read_optional_tls(config.private_key_path.as_deref(), allowed_tls_roots)?;
+    EtcdTlsConfig::new(
+        Some(ca),
+        certificate,
+        key,
+        None,
+        control_external::EtcdTlsPolicy::default(),
+    )
+    .map(Some)
+    .map_err(|error| format!("validate config persistence TLS: {error}"))
 }
 
-fn read_optional_tls(path: Option<&Path>, kind: &str) -> Result<Option<Vec<u8>>, String> {
-    path.map(|path| std::fs::read(path).map_err(|_| format!("read config persistence TLS {kind}")))
-        .transpose()
+fn read_optional_tls(
+    path: Option<&Path>,
+    allowed_tls_roots: &[PathBuf],
+) -> Result<Option<Vec<u8>>, String> {
+    path.map(|path| {
+        tls_material::read_tls_material(path, allowed_tls_roots)
+            .map_err(|reason| format!("read config persistence TLS material: {reason}"))
+    })
+    .transpose()
 }
 
 /// Resolves on SIGTERM or SIGINT.
@@ -1558,7 +1588,7 @@ pd-addrs = "routing-pd:2379"
             std::path::Path::new("/tmp"),
         )
         .unwrap_or_else(|error| unreachable!("valid source: {error}"));
-        let (client, election) = persistence_options(source.current().as_ref(), "process-a")
+        let (client, election) = persistence_options(source.current().as_ref(), "process-a", &[])
             .unwrap_or_else(|error| unreachable!("valid persistence options: {error}"));
         let client = client.unwrap_or_else(|| unreachable!("persistence is configured"));
         assert_eq!(client.endpoints(), ["http://owner-pd:2379"]);
@@ -1574,7 +1604,7 @@ pd-addrs = "routing-pd:2379"
         )
         .unwrap_or_else(|error| unreachable!("valid source model: {error}"));
         assert!(
-            config_persistence_client(source.current().effective()).is_err(),
+            config_persistence_client(source.current().effective(), &[]).is_err(),
             "skip-ca without a CA must not silently construct a plaintext etcd client"
         );
     }

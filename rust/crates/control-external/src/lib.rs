@@ -41,7 +41,7 @@ pub mod diagnostics {
 pub use dns::{DnsError, DnsResolver, MAX_RESOLVED_ADDRESSES};
 pub use etcd::{
     EtcdClientConfig, EtcdConfigError, EtcdConnectError, EtcdConnection, EtcdConnector,
-    EtcdOperationError, EtcdTlsConfig,
+    EtcdOperationError, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion,
 };
 pub use http::{BoundedHttpClient, HttpClientConfig, HttpConfigError, HttpError, HttpTlsConfig};
 pub use retry::{RetryDecision, RetryError, RetryPolicy, RetryPolicyError, retry_bounded};
