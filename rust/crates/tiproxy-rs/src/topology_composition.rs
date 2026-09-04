@@ -887,7 +887,7 @@ addr = "0.0.0.0:10080"
 [[proxy.backend-clusters]]
 name = "cluster-a"
 pd-addrs = "{pd_addrs}"
-ns-servers = ["dns-a:53"]
+ns-servers = []
 {cluster_tls}
 "#
         )

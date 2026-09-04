@@ -108,30 +108,38 @@ fn normalized_common_names(names: Vec<String>) -> Result<Vec<String>, EtcdConfig
     Ok(normalized)
 }
 
-/// Returns whether `value` is a normalized `host:port` (or bracketed
-/// `[v6]:port`) with a non-empty host and an explicit numeric port, matching the
-/// shape produced by the config layer's `normalize_ns_server`.
-fn is_normalized_host_port(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
-    }
+/// Splits a normalized `host:port` (or bracketed `[<ip>]:port`) entry into its
+/// host and port, enforcing exactly the shape produced by the config layer's
+/// `normalize_ns_server`/`split_host_port`: a non-empty host, an explicit numeric
+/// port that is not zero, and a bracketed host that is a valid IP literal (never
+/// a bracketed name). Returns the inner host (brackets stripped).
+///
+/// This is the single spec shared by the two direct-API validators — this
+/// config's [`EtcdClientConfig::with_ns_servers`] and the resolver's
+/// `NsEntry::parse` — so both reject the same malformed inputs as the config
+/// projection.
+pub(crate) fn split_normalized_host_port(value: &str) -> Option<(&str, u16)> {
     let (host, port) = if let Some(rest) = value.strip_prefix('[') {
-        // Bracketed IPv6 literal: `[<addr>]:<port>`.
-        let Some((addr, port)) = rest.split_once("]:") else {
-            return false;
-        };
-        (addr, port)
+        // Bracketed form must wrap a valid IP literal, mirroring the config.
+        let (host, port) = rest.split_once("]:")?;
+        if host.parse::<std::net::IpAddr>().is_err() {
+            return None;
+        }
+        (host, port)
     } else {
-        let Some((host, port)) = value.rsplit_once(':') else {
-            return false;
-        };
+        let (host, port) = value.rsplit_once(':')?;
         if host.contains(':') {
             // Unbracketed multi-colon host is not a normalized form.
-            return false;
+            return None;
         }
         (host, port)
     };
-    !host.is_empty() && !port.is_empty() && port.parse::<u16>().is_ok()
+    if host.is_empty() {
+        return None;
+    }
+    // An explicit numeric port that is not zero, matching `split_host_port`.
+    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+    Some((host, port))
 }
 
 /// Validated mTLS material and verification policy for an etcd connection.
@@ -301,7 +309,7 @@ impl EtcdClientConfig {
             });
         }
         for (index, server) in ns_servers.iter().enumerate() {
-            if !is_normalized_host_port(server) {
+            if split_normalized_host_port(server).is_none() {
                 return Err(EtcdConfigError::InvalidNsServer { index });
             }
         }
@@ -470,6 +478,12 @@ pub enum EtcdConfigError {
         /// Zero-based nameserver index.
         index: usize,
     },
+    /// Explicit `ns_servers` resolution is configured but not yet wired into the
+    /// transport, so the connection fails closed rather than silently resolving
+    /// the target host through the system resolver. Removed when the explicit
+    /// resolver is injected.
+    #[error("explicit nameserver resolution is not yet supported")]
+    ExplicitNsServersNotWired,
     /// The TLS material and policy could not form a client configuration.
     #[error("etcd TLS client configuration could not be built")]
     TlsSetup,
@@ -942,11 +956,18 @@ mod tests {
             Err(EtcdConfigError::TooManyNsServers { .. })
         ));
 
-        // A non-normalized entry (missing explicit port) is rejected.
-        let bad: Arc<[Arc<str>]> = Arc::from([Arc::from("no-port-host")]);
-        assert!(matches!(
-            base.with_ns_servers(bad),
-            Err(EtcdConfigError::InvalidNsServer { index: 0 })
-        ));
+        // Non-normalized entries are rejected, matching the config layer's
+        // `normalize_ns_server`: a missing port, a zero port, and a bracketed
+        // host that is not an IP literal.
+        for bad in ["no-port-host", "dns.example:0", "[dns.example]:53"] {
+            let entry: Arc<[Arc<str>]> = Arc::from([Arc::from(bad)]);
+            assert!(
+                matches!(
+                    base.clone().with_ns_servers(entry),
+                    Err(EtcdConfigError::InvalidNsServer { index: 0 })
+                ),
+                "must reject {bad}"
+            );
+        }
     }
 }

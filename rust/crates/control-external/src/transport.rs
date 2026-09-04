@@ -781,6 +781,14 @@ pub(crate) fn build_custom_channel(
     config: &EtcdClientConfig,
     owner: &OwnerToken,
 ) -> Result<etcd_client::Channel, EtcdConfigError> {
+    // 2c-1 fail-closed gate: the explicit-nameserver resolver is built and tested
+    // but not yet consulted by the dialer, so a cluster that configures custom
+    // `ns_servers` must fail here rather than silently resolving its target host
+    // through the system resolver (`ProdStageHooks::resolve`'s `to_socket_addrs`).
+    // 2c-2 removes this rejection atomically with the real resolver injection.
+    if !config.ns_servers().is_empty() {
+        return Err(EtcdConfigError::ExplicitNsServersNotWired);
+    }
     let services = build_endpoint_services(config, owner)?;
     let balance = Balance::new(ServiceList::new::<TransportRequest>(services));
     let buffer = Buffer::new(balance, BUFFER_CAPACITY);
@@ -1531,6 +1539,25 @@ mod tests {
         // The balancer fans across exactly one service per configured endpoint;
         // a dropped or truncated endpoint (`.take(1)`/`.skip(1)`) changes this.
         assert_eq!(services.len(), 2, "one service per configured endpoint");
+    }
+
+    #[tokio::test]
+    async fn a_config_with_ns_servers_fails_closed_until_the_resolver_is_wired() {
+        let (_registry, lease) = owner();
+        // A cluster that configures explicit nameservers must NOT silently fall
+        // back to the system resolver for its target host: the connector build
+        // fails closed until the explicit resolver is wired (2c-2).
+        let config = EtcdClientConfig::new(["etcd.internal:2379".to_owned()], None)
+            .and_then(|config| config.with_ns_servers(["10.0.0.53:53".into()].into()))
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let result = build_custom_channel(&config, &lease.token());
+        assert!(
+            matches!(
+                result,
+                Err(crate::etcd::EtcdConfigError::ExplicitNsServersNotWired)
+            ),
+            "explicit ns_servers must fail closed at the connector build"
+        );
     }
 
     // ----- Fix 1: multi-address DNS fallback --------------------------------

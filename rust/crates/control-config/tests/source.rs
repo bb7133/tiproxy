@@ -307,6 +307,80 @@ addr = "127.0.0.1:7000"
 }
 
 #[test]
+fn ns_servers_are_normalized_sorted_stably_with_duplicates_preserved() {
+    let build = |list: &str| {
+        let toml = format!(
+            "[proxy]\npd-addrs = \"pd-a:2379\"\n\n[[proxy.backend-clusters]]\nname = \"c\"\npd-addrs = \"pd-a:2379\"\nns-servers = {list}\n"
+        );
+        let store = ConfigNamespaceStore::from_toml(toml.as_bytes(), None, current_dir())
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let topology = store
+            .current()
+            .topology()
+            .unwrap_or_else(|error| unreachable!("topology: {error}"));
+        topology.backend_clusters[0]
+            .ns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+    // Go `normalizeCluster` sorts the RAW input strings, THEN normalizes each in
+    // that order (`:53` appended), preserving duplicates.
+    let expected = vec![
+        "dns-a:53".to_owned(),
+        "dns-a:53".to_owned(),
+        "dns-b:53".to_owned(),
+        "dns-c:53".to_owned(),
+    ];
+    assert_eq!(build(r#"["dns-c", "dns-a", "dns-a", "dns-b"]"#), expected);
+    // A reversed input of the same set yields the identical projection, so an
+    // order-only config change cannot churn the artifact or shift the resolver's
+    // round-robin start.
+    assert_eq!(build(r#"["dns-b", "dns-a", "dns-c", "dns-a"]"#), expected);
+
+    // A bare IPv6 literal with no port normalizes to `[<ip>]:53` (Go's
+    // `net.JoinHostPort` fallback); an explicit bracketed port is preserved.
+    assert_eq!(
+        build(r#"["2001:db8::1"]"#),
+        vec!["[2001:db8::1]:53".to_owned()]
+    );
+    assert_eq!(
+        build(r#"["[2001:db8::1]:2379"]"#),
+        vec!["[2001:db8::1]:2379".to_owned()]
+    );
+    // A bracketed hostname is legal Go input (`net.SplitHostPort`) and normalizes
+    // to the UNBRACKETED form (brackets are kept only for IPv6 literals).
+    assert_eq!(
+        build(r#"["[dns.example]:53"]"#),
+        vec!["dns.example:53".to_owned()]
+    );
+
+    // Mixed families: the RAW strings sort first (so the bare IPv6 sorts by its
+    // raw `2...` key, not its normalized `[...` key), then normalize in place.
+    assert_eq!(
+        build(r#"["dns-b", "2001:db8::1", "10.0.0.1", "dns-a", "2001:db8::1"]"#),
+        vec![
+            "10.0.0.1:53".to_owned(),
+            "[2001:db8::1]:53".to_owned(),
+            "[2001:db8::1]:53".to_owned(),
+            "dns-a:53".to_owned(),
+            "dns-b:53".to_owned(),
+        ]
+    );
+    // A distinguishing case: raw sort places `2001:db8::1` before `5.5.5.5`
+    // before `aaa`; a normalize-then-sort would instead order the bracketed
+    // `[2001:db8::1]:53` after `5.5.5.5:53`, so this asserts raw-sort parity.
+    assert_eq!(
+        build(r#"["aaa", "5.5.5.5", "2001:db8::1"]"#),
+        vec![
+            "[2001:db8::1]:53".to_owned(),
+            "5.5.5.5:53".to_owned(),
+            "aaa:53".to_owned(),
+        ]
+    );
+}
+
+#[test]
 fn topology_projection_normalizes_clusters_tls_and_health_defaults() {
     let store = ConfigNamespaceStore::from_toml(
         br#"

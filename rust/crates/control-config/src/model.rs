@@ -653,9 +653,19 @@ impl EffectiveConfig {
             if pd_addrs.is_empty() {
                 return invalid("proxy.backend-clusters.pd-addrs", "empty");
             }
-            let ns_servers = cluster
-                .ns_servers
-                .iter()
+            // Mirror Go `normalizeCluster` exactly: it runs
+            // `sort.Strings(cluster.NSServers)` on the RAW input strings FIRST,
+            // and only THEN normalizes each entry. Sorting the raw strings (not
+            // the normalized ones) matters because a bare IPv6 literal normalizes
+            // to a bracketed `[..]:53` whose sort key differs from its raw key, so
+            // sort-after-normalize would reorder relative to Go and shift the
+            // resolver's round-robin start. Duplicates are preserved (Go does not
+            // de-duplicate).
+            let mut raw_ns_servers: Vec<&str> =
+                cluster.ns_servers.iter().map(String::as_str).collect();
+            raw_ns_servers.sort_unstable();
+            let ns_servers = raw_ns_servers
+                .into_iter()
                 .map(|server| normalize_ns_server(server).map(Arc::<str>::from))
                 .collect::<Result<Vec<_>, _>>()?;
             normalized.push(BackendClusterConfig {
@@ -2082,24 +2092,58 @@ fn split_host_port(value: &str, field: &'static str) -> Result<(String, u16), Co
 }
 
 fn normalize_ns_server(value: &str) -> Result<String, ConfigError> {
+    const FIELD: &str = "proxy.backend-clusters.ns-servers";
     let value = value.trim();
     if value.is_empty() {
-        return invalid("proxy.backend-clusters.ns-servers", "empty_host");
+        return invalid(FIELD, "empty_host");
     }
-    if value.contains(':') || value.starts_with('[') {
-        let (host, port) = split_host_port(value, "proxy.backend-clusters.ns-servers")?;
+    // Bracketed `[host]:port`. Go `net.SplitHostPort` accepts a bracketed
+    // hostname, and `net.JoinHostPort` re-brackets ONLY when the host contains a
+    // colon (an IPv6 literal); a bracketed hostname therefore normalizes to the
+    // UNBRACKETED `host:port`. This widens only this raw-config face — the strict
+    // downstream validators still reject `[hostname]:port`.
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            return invalid(FIELD, "invalid_address");
+        };
         if host.is_empty() {
-            return invalid("proxy.backend-clusters.ns-servers", "empty_host");
+            return invalid(FIELD, "empty_host");
         }
+        let port = normalize_port(port, FIELD)?;
         if host.contains(':') {
             return Ok(format!("[{host}]:{port}"));
         }
         return Ok(format!("{host}:{port}"));
     }
+    // A bare IPv6 literal has no port (Go `SplitHostPort` fails), so Go falls back
+    // to `net.JoinHostPort(server, "53")` → `[<ip>]:53`.
+    if value.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Ok(format!("[{value}]:53"));
+    }
+    // Plain `host:port` (hostname or IPv4).
+    if value.contains(':') {
+        let (host, port) = split_host_port(value, FIELD)?;
+        if host.is_empty() {
+            return invalid(FIELD, "empty_host");
+        }
+        return Ok(format!("{host}:{port}"));
+    }
+    // Bare hostname / IPv4 literal → default port 53.
     if value.contains(['[', ']']) {
-        return invalid("proxy.backend-clusters.ns-servers", "invalid_host");
+        return invalid(FIELD, "invalid_host");
     }
     Ok(format!("{value}:53"))
+}
+
+/// Parses an explicit numeric port that is not zero, matching `split_host_port`.
+fn normalize_port(port: &str, field: &'static str) -> Result<u16, ConfigError> {
+    port.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or(ConfigError::InvalidField {
+            field,
+            class: "invalid_port",
+        })
 }
 
 fn invalid<T>(field: &'static str, class: &'static str) -> Result<T, ConfigError> {

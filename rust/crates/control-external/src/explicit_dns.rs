@@ -238,35 +238,21 @@ enum NsEntry {
 }
 
 impl NsEntry {
-    /// Parses one normalized `host:port` nameserver entry.
+    /// Parses one normalized `host:port` nameserver entry, enforcing the same
+    /// spec as the config layer via [`crate::etcd::split_normalized_host_port`]
+    /// (non-empty host, explicit non-zero port, bracketed host must be an IP
+    /// literal). A host that is an IP literal becomes a resolved [`Self::Literal`];
+    /// any other host becomes a [`Self::Host`] needing bootstrap.
     fn parse(raw: &str) -> Option<Self> {
-        if let Ok(addr) = raw.parse::<SocketAddr>() {
-            return Some(Self::Literal(addr));
+        let (host, port) = crate::etcd::split_normalized_host_port(raw)?;
+        match host.parse::<IpAddr>() {
+            Ok(ip) => Some(Self::Literal(SocketAddr::new(ip, port))),
+            Err(_) => Some(Self::Host {
+                host: Arc::from(host),
+                port,
+            }),
         }
-        let (host, port) = split_host_port(raw)?;
-        Some(Self::Host {
-            host: Arc::from(host),
-            port,
-        })
     }
-}
-
-/// Splits a normalized `host:port` (or bracketed `[v6]:port`) entry.
-fn split_host_port(raw: &str) -> Option<(&str, u16)> {
-    let (host, port) = if let Some(rest) = raw.strip_prefix('[') {
-        rest.split_once("]:")?
-    } else {
-        let (host, port) = raw.rsplit_once(':')?;
-        if host.contains(':') {
-            return None;
-        }
-        (host, port)
-    };
-    if host.is_empty() {
-        return None;
-    }
-    let port = port.parse::<u16>().ok()?;
-    Some((host, port))
 }
 
 /// The cached resolution result for one canonical host.
@@ -295,6 +281,18 @@ impl CacheEntry {
     }
 }
 
+/// The kind of an authoritative negative answer, preserved so combining can
+/// treat a name-wide NXDOMAIN differently from a type-specific NODATA.
+#[derive(Clone, Copy)]
+enum NegativeKind {
+    /// Name-wide NXDOMAIN. `cache_ttl` is the SOA-derived TTL, or `None` when no
+    /// SOA is present.
+    NxDomain(Option<u32>),
+    /// Type-specific NODATA (the name exists but has no records of this type).
+    /// `cache_ttl` is the SOA-derived TTL, or `None` without an SOA.
+    NoData(Option<u32>),
+}
+
 /// The per-family authoritative resolution outcome.
 enum FamilyOutcome {
     /// At least one valid address of this family, with the chain/RR minimum TTL.
@@ -304,11 +302,8 @@ enum FamilyOutcome {
         /// The minimum TTL across the CNAME chain and address RRs.
         ttl: u32,
     },
-    /// An authoritative negative answer; `cache_ttl` is `Some` when cacheable.
-    Negative {
-        /// The negative cache TTL, or `None` when the answer is not cacheable.
-        cache_ttl: Option<u32>,
-    },
+    /// An authoritative negative answer, carrying its NXDOMAIN/NODATA kind.
+    Negative(NegativeKind),
     /// A soft failure (timeout, SERVFAIL/REFUSED/FORMERR, malformed, CNAME
     /// loop/depth): never cached.
     SoftError,
@@ -416,16 +411,17 @@ impl ExplicitResolver {
     /// nameservers, over-inflight, an authoritative negative result, or a soft
     /// lookup failure.
     pub async fn resolve(&self, host: &str) -> Outcome {
+        // A stale owner wins BEFORE any input or resolution work — the 2c freeze
+        // lets a literal IP bypass DNS/NS, never the owner fence.
+        if !self.inner.owner.is_current() {
+            return Err(ResolveError::StaleOwner);
+        }
         // 1. Literal-IP bypass: emit directly, no wire query, no cache.
         if let Some(ip) = parse_ip_literal(host) {
             return Ok(vec![ip]);
         }
         let key = canonical_key(host);
         let name = build_qname(&key)?;
-
-        if !self.inner.owner.is_current() {
-            return Err(ResolveError::StaleOwner);
-        }
 
         let shared = {
             let mut state = lock(&self.inner.state);
@@ -457,6 +453,25 @@ impl ExplicitResolver {
     }
 }
 
+#[cfg(test)]
+impl ExplicitResolver {
+    /// Expands the configured nameservers exactly as a leader resolution would,
+    /// so tests can assert the flattened, per-entry-ordered socket set directly.
+    pub(crate) async fn flatten_ns_for_test(&self) -> Vec<SocketAddr> {
+        let deadline = self.inner.clock.now() + self.inner.budget;
+        self.inner
+            .resolve_ns_servers(deadline)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Returns the number of live cache entries, so tests can assert that a
+    /// fenced or uncacheable resolution wrote nothing.
+    pub(crate) fn cache_len(&self) -> usize {
+        lock(&self.inner.state).cache.len()
+    }
+}
+
 /// Builds the shared leader future for one canonical host, capturing a `Weak`
 /// core to avoid a reference cycle through the in-flight table.
 fn make_leader(inner: &Arc<Inner>, key: String, name: Name) -> SharedResolve {
@@ -475,7 +490,12 @@ impl Inner {
     /// bootstraps nameservers, resolves A and AAAA concurrently, owner-fences,
     /// combines, writes the cache once, and clears the in-flight slot.
     async fn resolve_once(&self, key: String, name: Name) -> Arc<Outcome> {
-        let deadline = self.clock.now() + self.budget;
+        // Anchor BOTH the single absolute deadline and every cache expiry to the
+        // leader's start instant (Go `lookupNetIP` takes `now` before the
+        // lookup). Time elapsed during the query is not refilled into the cached
+        // TTL, matching the single-deadline-no-refill rule.
+        let started = self.clock.now();
+        let deadline = started + self.budget;
 
         let servers = match self.resolve_ns_servers(deadline).await {
             Ok(servers) if !servers.is_empty() => servers,
@@ -502,29 +522,46 @@ impl Inner {
             Err(error) => return self.finish(&key, Err(error), None),
         };
 
-        let now = self.clock.now();
-        let (outcome, cache) = combine(&a, &aaaa, now);
+        let (outcome, cache) = combine(&a, &aaaa, started);
         self.finish(&key, outcome, cache)
     }
 
     /// Clears the in-flight slot, writes the bounded cache when directed, and
     /// returns the shared outcome.
+    ///
+    /// An entry whose start-anchored expiry has already elapsed (the lookup
+    /// consumed its whole TTL) is still returned to the caller but never cached.
     fn finish(&self, key: &str, outcome: Outcome, cache: Option<CacheEntry>) -> Arc<Outcome> {
         let mut state = lock(&self.state);
         state.inflight.remove(key);
         if let Some(entry) = cache {
             let now = self.clock.now();
-            insert_bounded(&mut state.cache, key.to_owned(), entry, now);
+            if entry.expires_at > now {
+                insert_bounded(&mut state.cache, key.to_owned(), entry, now);
+            }
         }
         Arc::new(outcome)
     }
 
-    /// Bootstraps every nameserver into a bounded, sorted, de-duplicated set of
-    /// socket addresses within the single deadline. A hostname bootstrap failure
-    /// fails closed for that nameserver.
+    /// Expands the configured nameservers into a bounded flattened socket set
+    /// within the single deadline, preserving config entry order.
+    ///
+    /// The config projection already sorts entries by their normalized entry
+    /// string and keeps duplicates for rotation weight, so this expands each
+    /// entry IN ENTRY ORDER: a literal entry is itself, and a hostname entry's
+    /// bootstrap addresses are sorted, de-duplicated, and capped to
+    /// [`MAX_NS_HOST_ADDRS`] WITHIN that entry only (so the kept set is
+    /// independent of the system resolver's return order). Entries are then
+    /// flattened in order and the total capped to [`MAX_NS_SOCKET_ADDRS`] with NO
+    /// cross-entry sort and NO cross-entry dedup, so duplicate nameserver entries
+    /// survive and keep their extra rotation weight. A hostname bootstrap failure
+    /// fails closed for that entry.
     async fn resolve_ns_servers(&self, deadline: Instant) -> Result<Vec<SocketAddr>, ResolveError> {
         let mut out: Vec<SocketAddr> = Vec::new();
         for entry in self.ns.iter() {
+            if out.len() >= MAX_NS_SOCKET_ADDRS {
+                break;
+            }
             match entry {
                 NsEntry::Literal(addr) => out.push(*addr),
                 NsEntry::Host { host, port } => {
@@ -542,15 +579,20 @@ impl Inner {
                         if !self.owner.is_current() {
                             return Err(ResolveError::StaleOwner);
                         }
-                        for ip in addrs.into_iter().take(MAX_NS_HOST_ADDRS) {
-                            out.push(SocketAddr::new(ip, *port));
-                        }
+                        // Per-entry ordering: sort + dedup + cap WITHIN this entry
+                        // only, never across entries.
+                        let mut entry_addrs: Vec<SocketAddr> = addrs
+                            .into_iter()
+                            .map(|ip| SocketAddr::new(ip, *port))
+                            .collect();
+                        entry_addrs.sort_unstable();
+                        entry_addrs.dedup();
+                        entry_addrs.truncate(MAX_NS_HOST_ADDRS);
+                        out.extend(entry_addrs);
                     }
                 }
             }
         }
-        out.sort_unstable();
-        out.dedup();
         out.truncate(MAX_NS_SOCKET_ADDRS);
         Ok(out)
     }
@@ -582,18 +624,18 @@ impl Inner {
             if !self.owner.is_current() {
                 return Err(ResolveError::StaleOwner);
             }
-            match message.response_code {
-                ResponseCode::NXDomain => {
-                    return Ok(FamilyOutcome::Negative {
-                        cache_ttl: negative_ttl(&message),
-                    });
-                }
-                ResponseCode::NoError => {}
-                _ => return Ok(FamilyOutcome::SoftError),
+            // Only authoritative NOERROR/NXDOMAIN answers are interpreted; a
+            // SERVFAIL/REFUSED/FORMERR is a soft failure.
+            let rcode = message.response_code;
+            if !matches!(rcode, ResponseCode::NoError | ResponseCode::NXDomain) {
+                return Ok(FamilyOutcome::SoftError);
             }
 
-            // Walk the CNAME chain within this message, growing the accepted
-            // owner set and enforcing loop/depth bounds.
+            // Walk the CNAME chain within this message FIRST — for both NOERROR
+            // and NXDOMAIN — growing the accepted owner set, accumulating the
+            // chain TTL, and enforcing loop/depth bounds. The negative SOA (for a
+            // cross-zone NXDOMAIN/NODATA) is validated against the chain TERMINAL,
+            // not the starting alias.
             let mut accepted: Vec<Name> = vec![current.clone()];
             let mut terminal = current.clone();
             loop {
@@ -611,6 +653,14 @@ impl Inner {
                 accepted.push(target.clone());
                 visited.push(target.clone());
                 terminal = target;
+            }
+
+            if rcode == ResponseCode::NXDomain {
+                // The terminal name authoritatively does not exist. Cache by the
+                // min of the CNAME chain TTL and the terminal-anchored SOA TTL.
+                return Ok(FamilyOutcome::Negative(NegativeKind::NxDomain(
+                    chain_negative_ttl(&message, &terminal, chain_ttl),
+                )));
             }
 
             // Anti-poisoning: accept only A/AAAA owned by a chain name.
@@ -632,10 +682,11 @@ impl Inner {
             }
 
             if terminal == current {
-                // No CNAME to follow: an empty NOERROR answer is NODATA.
-                return Ok(FamilyOutcome::Negative {
-                    cache_ttl: negative_ttl(&message),
-                });
+                // No CNAME to follow: an empty NOERROR answer is NODATA, cached by
+                // the min of the chain TTL and the terminal-anchored SOA TTL.
+                return Ok(FamilyOutcome::Negative(NegativeKind::NoData(
+                    chain_negative_ttl(&message, &terminal, chain_ttl),
+                )));
             }
             // The terminal is in another zone; query it next under the same
             // deadline. Loop and depth were already enforced above.
@@ -758,6 +809,11 @@ impl Inner {
         if !validate(&message, name, rtype, id) {
             return Ok(None);
         }
+        // A TCP response must be complete: a still-truncated reply is not a valid
+        // full answer, so its (partial) records are neither used nor cached.
+        if message.truncation {
+            return Ok(None);
+        }
         Ok(Some(message))
     }
 }
@@ -850,11 +906,19 @@ fn rdata_ip(data: &RData) -> Option<IpAddr> {
     }
 }
 
-/// Derives the negative-cache TTL from an SOA in the authority section, capped
-/// at [`NEGATIVE_TTL_CAP_SECS`]; `None` when uncacheable.
-fn negative_ttl(message: &Message) -> Option<u32> {
+/// Derives the negative-cache TTL from a trustworthy SOA in the authority
+/// section, capped at [`NEGATIVE_TTL_CAP_SECS`]; `None` when uncacheable.
+///
+/// Anti-poisoning: an SOA is only usable when it is IN class AND its owner is the
+/// enclosing zone of `qname` — i.e. the owner is `qname` itself or a DNS-label
+/// ancestor. A wrong-class SOA (e.g. CH) or an unrelated/non-ancestor owner
+/// (e.g. `evil.test`) is ignored, so the response is treated as uncacheable.
+fn negative_ttl(message: &Message, qname: &Name) -> Option<u32> {
     for record in &message.authorities {
-        if let RData::SOA(soa) = &record.data {
+        if record.dns_class == DNSClass::IN
+            && record.name.zone_of(qname)
+            && let RData::SOA(soa) = &record.data
+        {
             let ttl = record.ttl.min(soa.minimum).min(NEGATIVE_TTL_CAP_SECS);
             return (ttl > 0).then_some(ttl);
         }
@@ -862,9 +926,25 @@ fn negative_ttl(message: &Message) -> Option<u32> {
     None
 }
 
+/// Combines the terminal-anchored SOA TTL with the CNAME chain TTL for a
+/// negative answer: the cached TTL is `min(chain TTL, SOA-derived TTL)`, so the
+/// original host key is never cached longer than any CNAME in the chain permits.
+/// Returns `None` (uncacheable) when there is no usable SOA or the combined TTL
+/// is zero.
+fn chain_negative_ttl(message: &Message, terminal: &Name, chain_ttl: u32) -> Option<u32> {
+    negative_ttl(message, terminal).and_then(|soa_ttl| {
+        let combined = soa_ttl.min(chain_ttl);
+        (combined > 0).then_some(combined)
+    })
+}
+
 /// Combines the per-family outcomes into the public result and an optional cache
-/// entry.
-fn combine(a: &FamilyOutcome, aaaa: &FamilyOutcome, now: Instant) -> (Outcome, Option<CacheEntry>) {
+/// entry whose expiry is anchored at `started` (the leader's start instant).
+fn combine(
+    a: &FamilyOutcome,
+    aaaa: &FamilyOutcome,
+    started: Instant,
+) -> (Outcome, Option<CacheEntry>) {
     let (v4, a_ttl) = match a {
         FamilyOutcome::Positive { addrs, ttl } => (addrs.clone(), Some(*ttl)),
         _ => (Vec::new(), None),
@@ -886,32 +966,66 @@ fn combine(a: &FamilyOutcome, aaaa: &FamilyOutcome, now: Instant) -> (Outcome, O
         let ttl = ttl.min(POSITIVE_TTL_CAP_SECS);
         let cache = (ttl > 0 && !addrs.is_empty()).then(|| CacheEntry {
             result: CacheResult::Positive(addrs.clone()),
-            expires_at: now + Duration::from_secs(u64::from(ttl)),
+            expires_at: started + Duration::from_secs(u64::from(ttl)),
         });
         return (Ok(addrs), cache);
     }
 
-    // No positive family. A soft failure suppresses negative caching.
+    // No positive family. A soft failure (timeout/SERVFAIL/malformed/loop)
+    // suppresses negative caching entirely.
     if matches!(a, FamilyOutcome::SoftError) || matches!(aaaa, FamilyOutcome::SoftError) {
         return (Err(ResolveError::LookupFailed), None);
     }
 
-    let mut neg_ttl = u32::MAX;
-    let mut cacheable = false;
-    for outcome in [a, aaaa] {
-        if let FamilyOutcome::Negative {
-            cache_ttl: Some(ttl),
-        } = outcome
-        {
-            neg_ttl = neg_ttl.min(*ttl);
-            cacheable = true;
-        }
-    }
-    let cache = cacheable.then(|| CacheEntry {
+    // Both families are authoritative negatives; preserve the NXDOMAIN/NODATA
+    // distinction when deciding whether — and for how long — to cache.
+    let cache = negative_cache_ttl(a, aaaa).map(|ttl| CacheEntry {
         result: CacheResult::Negative,
-        expires_at: now + Duration::from_secs(u64::from(neg_ttl.min(NEGATIVE_TTL_CAP_SECS))),
+        expires_at: started + Duration::from_secs(u64::from(ttl)),
     });
     (Err(ResolveError::NameResolution), cache)
+}
+
+/// Decides the negative-cache TTL for two authoritative negative families.
+///
+/// A name-wide NXDOMAIN may be cached by its SOA TTL when an SOA is present. A
+/// pure NODATA is cached only when BOTH families are NODATA WITH an SOA (TTL =
+/// the minimum of the two per-family SOA TTLs). Any NODATA-without-SOA — or a
+/// NXDOMAIN with no SOA — yields no cache. Returns the capped TTL, or `None` when
+/// the pair must not be cached.
+fn negative_cache_ttl(a: &FamilyOutcome, aaaa: &FamilyOutcome) -> Option<u32> {
+    let a_kind = negative_kind(a);
+    let aaaa_kind = negative_kind(aaaa);
+    let is_nxdomain = |kind: &Option<NegativeKind>| matches!(kind, Some(NegativeKind::NxDomain(_)));
+
+    if is_nxdomain(&a_kind) || is_nxdomain(&aaaa_kind) {
+        // At least one family is a name-wide NXDOMAIN: cache by the smallest
+        // available NXDOMAIN SOA TTL, or not at all when no SOA is present.
+        return [a_kind, aaaa_kind]
+            .into_iter()
+            .flatten()
+            .filter_map(|kind| match kind {
+                NegativeKind::NxDomain(ttl) => ttl,
+                NegativeKind::NoData(_) => None,
+            })
+            .min()
+            .map(|ttl| ttl.min(NEGATIVE_TTL_CAP_SECS));
+    }
+    // Pure NODATA on both families: cache only when both carry an SOA TTL.
+    match (a_kind, aaaa_kind) {
+        (Some(NegativeKind::NoData(Some(a_ttl))), Some(NegativeKind::NoData(Some(aaaa_ttl)))) => {
+            Some(a_ttl.min(aaaa_ttl).min(NEGATIVE_TTL_CAP_SECS))
+        }
+        _ => None,
+    }
+}
+
+/// Returns the negative kind of a family outcome, if it is a negative.
+fn negative_kind(outcome: &FamilyOutcome) -> Option<NegativeKind> {
+    match outcome {
+        FamilyOutcome::Negative(kind) => Some(*kind),
+        _ => None,
+    }
 }
 
 /// Interleaves A then AAAA addresses in RR order, de-duplicates preserving first
@@ -970,7 +1084,7 @@ mod tests {
     use futures_util::future::join_all;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, SOA};
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
     use super::{
         BoxFut, Clock, DnsTransport, ExplicitResolver, MAX_CACHE_ENTRIES, ResolveError,
@@ -1033,8 +1147,12 @@ mod tests {
         boot: Mutex<HashMap<String, Vec<IpAddr>>>,
         a_count: AtomicUsize,
         aaaa_count: AtomicUsize,
+        tcp_count: AtomicUsize,
         yield_first: AtomicBool,
         gate_open: Arc<AtomicBool>,
+        // A one-shot clock advance applied when the first UDP query is sent, so a
+        // test can make a lookup consume wall-clock time during the exchange.
+        pre_send_advance: Mutex<Option<Duration>>,
     }
 
     impl FakeTransport {
@@ -1046,9 +1164,18 @@ mod tests {
                 boot: Mutex::new(HashMap::new()),
                 a_count: AtomicUsize::new(0),
                 aaaa_count: AtomicUsize::new(0),
+                tcp_count: AtomicUsize::new(0),
                 yield_first: AtomicBool::new(false),
                 gate_open: Arc::new(AtomicBool::new(true)),
+                pre_send_advance: Mutex::new(None),
             })
+        }
+
+        fn set_pre_send_advance(&self, delay: Duration) {
+            *self
+                .pre_send_advance
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(delay);
         }
 
         fn set_udp(&self, host: &str, rtype: RecordType, responder: UdpResponder) {
@@ -1080,10 +1207,23 @@ mod tests {
             self.aaaa_count.load(Ordering::SeqCst)
         }
 
+        fn tcp_count(&self) -> usize {
+            self.tcp_count.load(Ordering::SeqCst)
+        }
+
         fn plan_udp(&self, server: SocketAddr, query: &[u8]) -> Vec<UdpDatagram> {
             let Some((id, name, rtype)) = decode_query(query) else {
                 return Vec::new();
             };
+            // A one-shot wall-clock cost for the first query of a lookup.
+            if let Some(delay) = self
+                .pre_send_advance
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                self.clock.advance(delay);
+            }
             match rtype {
                 RecordType::A => {
                     self.a_count.fetch_add(1, Ordering::SeqCst);
@@ -1151,6 +1291,7 @@ mod tests {
             query: Vec<u8>,
             _deadline: Instant,
         ) -> BoxFut<'static, Result<Vec<u8>, TransportError>> {
+            self.tcp_count.fetch_add(1, Ordering::SeqCst);
             let out = self.plan_tcp(server, &query);
             Box::pin(async move { out.ok_or(TransportError::Unavailable) })
         }
@@ -2350,6 +2491,8 @@ mod tests {
         transport.gate_open.store(false, Ordering::SeqCst);
         let server = ns_socket();
         let host = name("fenced.test");
+        // A TRUNCATED UDP answer, so that — absent the fence — the resolver would
+        // proceed to a TCP retry. The post-await fence must stop before that.
         transport.set_udp(
             "fenced.test",
             RecordType::A,
@@ -2363,9 +2506,25 @@ mod tests {
                         ResponseCode::NoError,
                         &[a_record(&host, [192, 0, 2, 61], 30)],
                         &[],
-                        false,
+                        true,
                     ),
                 )]
+            }),
+        );
+        let tcp_host = name("fenced.test");
+        transport.set_tcp(
+            "fenced.test",
+            RecordType::A,
+            Arc::new(move |id, qname, _t, _s| {
+                Some(encode(
+                    id,
+                    qname,
+                    RecordType::A,
+                    ResponseCode::NoError,
+                    &[a_record(&tcp_host, [192, 0, 2, 62], 30)],
+                    &[],
+                    false,
+                ))
             }),
         );
         let registry = OwnershipRegistry::new();
@@ -2397,6 +2556,18 @@ mod tests {
             }
         };
         assert_eq!(outcome, Err(ResolveError::StaleOwner));
+        // The fence fired before the truncation-triggered TCP retry, and nothing
+        // was written to the cache.
+        assert_eq!(
+            transport.tcp_count(),
+            0,
+            "a retired owner must not start a TCP retry"
+        );
+        assert_eq!(
+            resolver.cache_len(),
+            0,
+            "a retired owner must cache nothing"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -2483,5 +2654,972 @@ mod tests {
         assert_eq!(out[0], v4[0]);
         assert_eq!(out[1], v6[0]);
         assert_eq!(out[2], v4[1]);
+    }
+
+    // --- negative-response responder helpers -----------------------------
+
+    fn sock(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::new(ipv4(ip), port)
+    }
+
+    fn nodata_with_soa(owner: Name, class: DNSClass, minimum: u32, ttl: u32) -> UdpResponder {
+        Arc::new(move |id, qname, rtype, server| {
+            let mut soa = soa_record(&owner, minimum, ttl);
+            soa.dns_class = class;
+            vec![datagram(
+                server,
+                encode(id, qname, rtype, ResponseCode::NoError, &[], &[soa], false),
+            )]
+        })
+    }
+
+    fn nodata_no_soa() -> UdpResponder {
+        Arc::new(move |id, qname, rtype, server| {
+            vec![datagram(
+                server,
+                encode(id, qname, rtype, ResponseCode::NoError, &[], &[], false),
+            )]
+        })
+    }
+
+    fn nxdomain_with_soa(owner: Name, minimum: u32, ttl: u32) -> UdpResponder {
+        Arc::new(move |id, qname, rtype, server| {
+            vec![datagram(
+                server,
+                encode(
+                    id,
+                    qname,
+                    rtype,
+                    ResponseCode::NXDomain,
+                    &[],
+                    &[soa_record(&owner, minimum, ttl)],
+                    false,
+                ),
+            )]
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocker 3: per-entry NS flatten (order preserved, per-entry sort/dedup/cap,
+    // duplicate entries survive, global cap 32, no cross-entry sort/dedup).
+    // ---------------------------------------------------------------------
+    #[tokio::test]
+    async fn flatten_expands_hostname_entry_sorted_deduped_capped() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        // Out-of-order with a duplicate and more than eight distinct addresses.
+        transport.set_bootstrap(
+            "dns.internal",
+            [9u8, 3, 3, 1, 7, 5, 2, 8, 4, 6]
+                .into_iter()
+                .map(|n| IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+                .collect(),
+        );
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns("dns.internal:53"),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        let flattened = resolver.flatten_ns_for_test().await;
+        let expected: Vec<SocketAddr> = (1u8..=8).map(|n| sock([10, 0, 0, n], 53)).collect();
+        assert_eq!(flattened, expected);
+    }
+
+    #[tokio::test]
+    async fn flatten_preserves_duplicate_entries_and_config_order() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        // Entries in a fixed (config-projected) order, including a duplicate.
+        let servers: Vec<Arc<str>> = vec![
+            Arc::from("10.0.0.2:53"),
+            Arc::from("10.0.0.1:53"),
+            Arc::from("10.0.0.2:53"),
+        ];
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &servers,
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        let flattened = resolver.flatten_ns_for_test().await;
+        // Entry order is preserved, the duplicate survives, and there is no
+        // cross-entry numeric sort or dedup.
+        assert_eq!(
+            flattened,
+            vec![
+                sock([10, 0, 0, 2], 53),
+                sock([10, 0, 0, 1], 53),
+                sock([10, 0, 0, 2], 53),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn flatten_caps_total_across_entries_to_32() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let mut servers: Vec<Arc<str>> = Vec::new();
+        for entry in 0u8..5 {
+            let host = format!("host{entry}.internal");
+            transport.set_bootstrap(
+                &host,
+                (0u8..8)
+                    .map(|n| IpAddr::V4(Ipv4Addr::new(10, entry, 0, n)))
+                    .collect(),
+            );
+            servers.push(Arc::from(format!("{host}:53")));
+        }
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &servers,
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        let flattened = resolver.flatten_ns_for_test().await;
+        // Five entries * eight = 40 capped to 32; the fifth entry is dropped.
+        assert_eq!(flattened.len(), super::MAX_NS_SOCKET_ADDRS);
+        assert!(
+            flattened.iter().all(|addr| match addr.ip() {
+                IpAddr::V4(v4) => v4.octets()[1] < 4,
+                IpAddr::V6(_) => false,
+            }),
+            "the fifth entry's addresses must be dropped by the global cap"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocker 4: direct-API validation matches config normalize_ns_server.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn ns_entry_parse_rejects_malformed_and_accepts_normalized() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let (_registry, _lease, token) = owner();
+        let build = |server: &str| {
+            ExplicitResolver::new(
+                token.clone(),
+                &[Arc::from(server)],
+                Arc::clone(&transport) as Arc<dyn DnsTransport>,
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+                Duration::from_secs(5),
+            )
+        };
+        for rejected in ["dns.example:0", "10.0.0.1:0", "[dns.example]:53"] {
+            assert_eq!(
+                build(rejected).err(),
+                Some(ResolveError::InvalidNsServer { index: 0 }),
+                "must reject {rejected}"
+            );
+        }
+        for accepted in ["dns.example:53", "10.0.0.1:53", "[2001:db8::1]:53"] {
+            assert!(build(accepted).is_ok(), "must accept {accepted}");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocker 5: NXDOMAIN vs NODATA kind + SOA class/owner anti-poisoning.
+    // ---------------------------------------------------------------------
+    #[tokio::test]
+    async fn nodata_with_soa_on_both_families_is_cached_and_expires() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let responder = nodata_with_soa(name("nd.test"), DNSClass::IN, 200, 3);
+        transport.set_udp("nd.test", RecordType::A, responder.clone());
+        transport.set_udp("nd.test", RecordType::AAAA, responder);
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.resolve("nd.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        let queried = transport.a_count();
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            resolver.resolve("nd.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert_eq!(transport.a_count(), queried, "cached within the SOA TTL");
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            resolver.resolve("nd.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert!(transport.a_count() > queried, "re-queries after TTL expiry");
+    }
+
+    #[tokio::test]
+    async fn nodata_without_soa_on_one_family_is_not_cached() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        transport.set_udp(
+            "mix.test",
+            RecordType::A,
+            nodata_with_soa(name("mix.test"), DNSClass::IN, 200, 5),
+        );
+        transport.set_udp("mix.test", RecordType::AAAA, nodata_no_soa());
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.resolve("mix.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        let first = transport.a_count();
+        assert_eq!(
+            resolver.resolve("mix.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert!(
+            transport.a_count() > first,
+            "a NODATA-without-SOA family must block negative caching"
+        );
+    }
+
+    #[tokio::test]
+    async fn nxdomain_negative_ttl_is_soa_capped() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        // SOA minimum/TTL far above the 5s cap.
+        let responder = nxdomain_with_soa(name("void.test"), 100_000, 100_000);
+        transport.set_udp("void.test", RecordType::A, responder.clone());
+        transport.set_udp("void.test", RecordType::AAAA, responder);
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.resolve("void.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        let queried = transport.a_count();
+        clock.advance(Duration::from_secs(4));
+        assert_eq!(
+            resolver.resolve("void.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert_eq!(transport.a_count(), queried, "cached within the 5s cap");
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            resolver.resolve("void.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert!(transport.a_count() > queried, "re-queries past the 5s cap");
+    }
+
+    #[tokio::test]
+    async fn nodata_soa_wrong_class_is_not_cached() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        // A CH-class SOA must not be trusted for the IN negative cache.
+        let responder = nodata_with_soa(name("chaos.test"), DNSClass::CH, 200, 5);
+        transport.set_udp("chaos.test", RecordType::A, responder.clone());
+        transport.set_udp("chaos.test", RecordType::AAAA, responder);
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.resolve("chaos.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        let first = transport.a_count();
+        assert_eq!(
+            resolver.resolve("chaos.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert!(
+            transport.a_count() > first,
+            "CH-class SOA must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn nodata_soa_unrelated_owner_is_not_cached() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        // The SOA owner is unrelated to the queried name.
+        let responder = nodata_with_soa(name("evil.test"), DNSClass::IN, 200, 5);
+        transport.set_udp("victim.test", RecordType::A, responder.clone());
+        transport.set_udp("victim.test", RecordType::AAAA, responder);
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.resolve("victim.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        let first = transport.a_count();
+        assert_eq!(
+            resolver.resolve("victim.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert!(
+            transport.a_count() > first,
+            "an unrelated SOA owner must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn nodata_soa_ancestor_owner_is_cached() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        // The SOA owner is the enclosing zone of the queried name.
+        let responder = nodata_with_soa(name("zone.test"), DNSClass::IN, 200, 5);
+        transport.set_udp("host.zone.test", RecordType::A, responder.clone());
+        transport.set_udp("host.zone.test", RecordType::AAAA, responder);
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.resolve("host.zone.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        let queried = transport.a_count();
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            resolver.resolve("host.zone.test").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert_eq!(
+            transport.a_count(),
+            queried,
+            "an ancestor-owned IN SOA is cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_zone_nxdomain_soa_is_validated_against_the_terminal() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let server = ns_socket();
+        let missing = name("missing.other.test");
+        let soa_owner = name("other.test");
+        // Same-packet cross-zone NXDOMAIN: alias CNAME missing.other.test (chain
+        // TTL 2), plus an `other.test` SOA (TTL 5). The SOA is an ancestor of the
+        // TERMINAL, not of the starting alias, and the cached TTL is min(2, 5).
+        let responder: UdpResponder = Arc::new(move |id, qname, rtype, _s| {
+            vec![datagram(
+                server,
+                encode(
+                    id,
+                    qname,
+                    rtype,
+                    ResponseCode::NXDomain,
+                    &[cname_record(qname, &missing, 2)],
+                    &[soa_record(&soa_owner, 100, 5)],
+                    false,
+                ),
+            )]
+        });
+        transport.set_udp("alias.example", RecordType::A, responder.clone());
+        transport.set_udp("alias.example", RecordType::AAAA, responder);
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(30),
+        );
+
+        assert_eq!(
+            resolver.resolve("alias.example").await,
+            Err(ResolveError::NameResolution)
+        );
+        let queried = transport.a_count();
+        // Within the min(chain=2, soa=5) TTL: served from the negative cache —
+        // proving the SOA was validated against the terminal (else uncached).
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            resolver.resolve("alias.example").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert_eq!(transport.a_count(), queried, "cached at the terminal SOA");
+        // Past the CNAME chain TTL (2) but within the SOA TTL (5): must re-query,
+        // proving the chain TTL (not just the SOA TTL) bounds the cache.
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            resolver.resolve("alias.example").await,
+            Err(ResolveError::NameResolution)
+        );
+        assert!(
+            transport.a_count() > queried,
+            "the CNAME chain TTL must bound the negative cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_expiry_is_anchored_at_leader_start() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        // The lookup consumes 4s of wall-clock time during the exchange; the
+        // positive TTL is 5s, so a start-anchored entry expires at t0+5.
+        transport.set_pre_send_advance(Duration::from_secs(4));
+        let server = ns_socket();
+        transport.set_udp(
+            "anchor.test",
+            RecordType::A,
+            Arc::new(move |id, qname, _t, _s| {
+                vec![datagram(
+                    server,
+                    encode(
+                        id,
+                        qname,
+                        RecordType::A,
+                        ResponseCode::NoError,
+                        &[a_record(qname, [192, 0, 2, 99], 5)],
+                        &[],
+                        false,
+                    ),
+                )]
+            }),
+        );
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(30),
+        );
+
+        // First lookup finishes at t0+4; the entry expires at the start-anchored
+        // t0+5, not the completion-anchored t0+9.
+        assert_eq!(
+            resolver.resolve("anchor.test").await,
+            Ok(vec![ipv4([192, 0, 2, 99])])
+        );
+        let queried = transport.a_count();
+        // Now at t0+6: past the start-anchored expiry, so the next resolve must
+        // re-query. A completion-time anchor would still be valid (t0+9) here.
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            resolver.resolve("anchor.test").await,
+            Ok(vec![ipv4([192, 0, 2, 99])])
+        );
+        assert!(
+            transport.a_count() > queried,
+            "a start-anchored TTL must not be refilled by query time"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Missing-evidence rows.
+    // ---------------------------------------------------------------------
+    #[tokio::test]
+    async fn cname_chain_over_max_depth_fails_closed() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        // Nine CNAME hops (n0 -> n1 -> ... -> n9): one over MAX_CNAME_DEPTH.
+        for index in 0..9 {
+            let owner = name(&format!("n{index}.test"));
+            let target = name(&format!("n{}.test", index + 1));
+            transport.set_udp(
+                &format!("n{index}.test"),
+                RecordType::A,
+                Arc::new(move |id, qname, _t, s| {
+                    vec![datagram(
+                        s,
+                        encode(
+                            id,
+                            qname,
+                            RecordType::A,
+                            ResponseCode::NoError,
+                            &[cname_record(&owner, &target, 40)],
+                            &[],
+                            false,
+                        ),
+                    )]
+                }),
+            );
+        }
+        let terminal = name("n9.test");
+        transport.set_udp(
+            "n9.test",
+            RecordType::A,
+            Arc::new(move |id, qname, _t, s| {
+                vec![datagram(
+                    s,
+                    encode(
+                        id,
+                        qname,
+                        RecordType::A,
+                        ResponseCode::NoError,
+                        &[a_record(&terminal, [192, 0, 2, 90], 40)],
+                        &[],
+                        false,
+                    ),
+                )]
+            }),
+        );
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            resolver.resolve("n0.test").await,
+            Err(ResolveError::LookupFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_udp_datagram_is_rejected_and_next_ns_used() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let servers: Vec<Arc<str>> = vec![Arc::from("10.0.0.1:53"), Arc::from("10.0.0.2:53")];
+        let bad = sock([10, 0, 0, 1], 53);
+        let good = name("host.test");
+        transport.set_udp(
+            "host.test",
+            RecordType::A,
+            Arc::new(move |id, qname, _t, server| {
+                if server == bad {
+                    // Over the 1232 advertise: must be rejected, never parsed.
+                    vec![datagram(server, oversize_response(id, qname, [6, 6, 6, 6]))]
+                } else {
+                    vec![datagram(
+                        server,
+                        encode(
+                            id,
+                            qname,
+                            RecordType::A,
+                            ResponseCode::NoError,
+                            &[a_record(&good, [192, 0, 2, 95], 30)],
+                            &[],
+                            false,
+                        ),
+                    )]
+                }
+            }),
+        );
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &servers,
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            resolver.resolve("host.test").await,
+            Ok(vec![ipv4([192, 0, 2, 95])])
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_is_not_negatively_cached() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let timeout: UdpResponder = Arc::new(|_id, _n, _t, _s| Vec::new());
+        transport.set_udp("slow.test", RecordType::A, timeout.clone());
+        transport.set_udp("slow.test", RecordType::AAAA, timeout);
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            resolver.resolve("slow.test").await,
+            Err(ResolveError::LookupFailed)
+        );
+        let first = transport.a_count();
+        assert_eq!(
+            resolver.resolve("slow.test").await,
+            Err(ResolveError::LookupFailed)
+        );
+        assert!(
+            transport.a_count() > first,
+            "a timeout must not be negatively cached"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Owner fence wins before any input/resolution work (even literal-IP).
+    // ---------------------------------------------------------------------
+    #[tokio::test]
+    async fn stale_owner_wins_before_literal_ip_and_invalid_host() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "dns-owner")
+            .unwrap_or_else(|e| unreachable!("claim: {e}"));
+        let resolver = build_resolver(
+            lease.token(),
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        lease.release();
+
+        // A literal IP would otherwise bypass to Ok(ip); the fence wins first.
+        assert_eq!(
+            resolver.resolve("198.51.100.9").await,
+            Err(ResolveError::StaleOwner)
+        );
+        // An invalid host would otherwise be InvalidHost; the fence wins first.
+        assert_eq!(resolver.resolve("").await, Err(ResolveError::StaleOwner));
+        assert_eq!(transport.a_count(), 0);
+        assert_eq!(transport.aaaa_count(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Response header + question validation (QR / opcode / qtype / qclass).
+    // ---------------------------------------------------------------------
+    #[allow(clippy::too_many_arguments)]
+    fn build_response(
+        id: u16,
+        question: &Name,
+        q_type: RecordType,
+        q_class: DNSClass,
+        message_type: MessageType,
+        op_code: OpCode,
+        answers: &[Record],
+        truncated: bool,
+    ) -> Vec<u8> {
+        let mut message = Message::new(id, message_type, op_code);
+        message.metadata.response_code = ResponseCode::NoError;
+        message.metadata.truncation = truncated;
+        let mut query = Query::query(question.clone(), q_type);
+        query.set_query_class(q_class);
+        message.add_query(query);
+        for record in answers {
+            message.add_answer(record.clone());
+        }
+        message
+            .to_vec()
+            .unwrap_or_else(|e| unreachable!("encode: {e}"))
+    }
+
+    #[tokio::test]
+    async fn response_header_and_question_validation_drops_malformed() {
+        let cases: Vec<(&str, Malform)> = vec![
+            (
+                "qr_bit_is_a_query",
+                Box::new(move |id, q| {
+                    build_response(
+                        id,
+                        q,
+                        RecordType::A,
+                        DNSClass::IN,
+                        MessageType::Query,
+                        OpCode::Query,
+                        &[a_record(q, [10, 10, 10, 10], 30)],
+                        false,
+                    )
+                }),
+            ),
+            (
+                "opcode_not_query",
+                Box::new(move |id, q| {
+                    build_response(
+                        id,
+                        q,
+                        RecordType::A,
+                        DNSClass::IN,
+                        MessageType::Response,
+                        OpCode::Status,
+                        &[a_record(q, [10, 10, 10, 10], 30)],
+                        false,
+                    )
+                }),
+            ),
+            (
+                "question_qtype_mismatch",
+                Box::new(move |id, q| {
+                    build_response(
+                        id,
+                        q,
+                        RecordType::AAAA,
+                        DNSClass::IN,
+                        MessageType::Response,
+                        OpCode::Query,
+                        &[a_record(q, [10, 10, 10, 10], 30)],
+                        false,
+                    )
+                }),
+            ),
+            (
+                "question_qclass_not_in",
+                Box::new(move |id, q| {
+                    build_response(
+                        id,
+                        q,
+                        RecordType::A,
+                        DNSClass::CH,
+                        MessageType::Response,
+                        OpCode::Query,
+                        &[a_record(q, [10, 10, 10, 10], 30)],
+                        false,
+                    )
+                }),
+            ),
+        ];
+
+        for (label, malform) in cases {
+            assert_udp_reply_dropped(label, malform).await;
+        }
+    }
+
+    /// A boxed builder producing one malformed response for a given id and name.
+    type Malform = Box<dyn Fn(u16, &Name) -> Vec<u8> + Send + Sync>;
+
+    /// Asserts a malformed first datagram is dropped and the genuine reply wins.
+    async fn assert_udp_reply_dropped(label: &str, malform: Malform) {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let server = ns_socket();
+        let good = name("host.test");
+        transport.set_udp(
+            "host.test",
+            RecordType::A,
+            Arc::new(move |id, qname, _t, _s| {
+                vec![
+                    datagram(server, malform(id, qname)),
+                    datagram(
+                        server,
+                        encode(
+                            id,
+                            qname,
+                            RecordType::A,
+                            ResponseCode::NoError,
+                            &[a_record(&good, [192, 0, 2, 77], 30)],
+                            &[],
+                            false,
+                        ),
+                    ),
+                ]
+            }),
+        );
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &ns(NS_ADDR),
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            resolver.resolve("host.test").await,
+            Ok(vec![ipv4([192, 0, 2, 77])]),
+            "case {label}: malformed response must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_malformed_reply_is_dropped_then_next_ns_used() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let servers: Vec<Arc<str>> = vec![Arc::from("10.0.0.1:53"), Arc::from("10.0.0.2:53")];
+        let bad = sock([10, 0, 0, 1], 53);
+        let good = name("host.test");
+        transport.set_udp(
+            "host.test",
+            RecordType::A,
+            Arc::new(move |id, qname, _t, server| {
+                if server == bad {
+                    // Truncated UDP forces a TCP retry against the same ns.
+                    vec![datagram(
+                        server,
+                        encode(
+                            id,
+                            qname,
+                            RecordType::A,
+                            ResponseCode::NoError,
+                            &[a_record(qname, [10, 10, 10, 10], 30)],
+                            &[],
+                            true,
+                        ),
+                    )]
+                } else {
+                    vec![datagram(
+                        server,
+                        encode(
+                            id,
+                            qname,
+                            RecordType::A,
+                            ResponseCode::NoError,
+                            &[a_record(&good, [192, 0, 2, 88], 30)],
+                            &[],
+                            false,
+                        ),
+                    )]
+                }
+            }),
+        );
+        // The TCP reply for the first ns is malformed (wrong opcode) and must be
+        // dropped by the shared validate, moving on to the second ns.
+        transport.set_tcp(
+            "host.test",
+            RecordType::A,
+            Arc::new(|id, qname, _t, _s| {
+                Some(build_response(
+                    id,
+                    qname,
+                    RecordType::A,
+                    DNSClass::IN,
+                    MessageType::Response,
+                    OpCode::Status,
+                    &[a_record(qname, [10, 10, 10, 10], 30)],
+                    false,
+                ))
+            }),
+        );
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &servers,
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            resolver.resolve("host.test").await,
+            Ok(vec![ipv4([192, 0, 2, 88])])
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_truncated_reply_is_rejected_then_next_ns_used() {
+        let clock = ManualClock::new();
+        let transport = FakeTransport::new(&clock);
+        let servers: Vec<Arc<str>> = vec![Arc::from("10.0.0.1:53"), Arc::from("10.0.0.2:53")];
+        let bad = sock([10, 0, 0, 1], 53);
+        let good = name("host.test");
+        transport.set_udp(
+            "host.test",
+            RecordType::A,
+            Arc::new(move |id, qname, _t, server| {
+                if server == bad {
+                    vec![datagram(
+                        server,
+                        encode(
+                            id,
+                            qname,
+                            RecordType::A,
+                            ResponseCode::NoError,
+                            &[a_record(qname, [10, 10, 10, 10], 30)],
+                            &[],
+                            true,
+                        ),
+                    )]
+                } else {
+                    vec![datagram(
+                        server,
+                        encode(
+                            id,
+                            qname,
+                            RecordType::A,
+                            ResponseCode::NoError,
+                            &[a_record(&good, [192, 0, 2, 89], 30)],
+                            &[],
+                            false,
+                        ),
+                    )]
+                }
+            }),
+        );
+        // The TCP reply is ALSO truncated (partial): a TCP answer must be
+        // complete, so it is rejected and the next ns is used.
+        transport.set_tcp(
+            "host.test",
+            RecordType::A,
+            Arc::new(|id, qname, _t, _s| {
+                Some(encode(
+                    id,
+                    qname,
+                    RecordType::A,
+                    ResponseCode::NoError,
+                    &[a_record(qname, [10, 10, 10, 10], 30)],
+                    &[],
+                    true,
+                ))
+            }),
+        );
+        let (_registry, _lease, token) = owner();
+        let resolver = build_resolver(
+            token,
+            &servers,
+            Arc::clone(&transport),
+            &clock,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            resolver.resolve("host.test").await,
+            Ok(vec![ipv4([192, 0, 2, 89])])
+        );
+    }
+
+    fn oversize_response(id: u16, qname: &Name, poison: [u8; 4]) -> Vec<u8> {
+        let mut answers = vec![a_record(qname, poison, 30)];
+        let mut index = 0u32;
+        loop {
+            let bytes = encode(
+                id,
+                qname,
+                RecordType::A,
+                ResponseCode::NoError,
+                &answers,
+                &[],
+                false,
+            );
+            if bytes.len() > super::MAX_UDP_PAYLOAD_BYTES {
+                return bytes;
+            }
+            let pad = name(&format!("pad{index}.example"));
+            answers.push(a_record(&pad, [10, 0, 0, 1], 30));
+            index += 1;
+        }
     }
 }
