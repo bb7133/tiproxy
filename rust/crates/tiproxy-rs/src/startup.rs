@@ -33,6 +33,18 @@ use std::pin::Pin;
 /// A teardown future for one acquired resource: stops and joins it.
 pub type TeardownFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// One acquired startup resource that can be stopped and joined exactly once.
+///
+/// The concrete [`crate::StartupGuard`] is generic over the resources in its
+/// optional slots via this trait, so production wires the real handles (the
+/// legacy control runtime, metrics exporter, metering sampler, health task) and
+/// a test wires recording fakes into the *same* rollback code — the slot-to-
+/// teardown mapping is never duplicated in the test.
+pub trait Teardown: Send + 'static {
+    /// Consumes the resource, stopping and joining it.
+    fn teardown(self) -> TeardownFuture;
+}
+
 /// Runs the registered teardown futures in reverse of registration order —
 /// latest-acquired resource first — awaiting each exactly once.
 ///

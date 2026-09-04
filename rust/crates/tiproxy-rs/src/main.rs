@@ -134,14 +134,57 @@ async fn main() -> ExitCode {
     }
 }
 
+/// The metering sampler task plus the signal that stops it, owned together so
+/// the startup guard can stop and join it as one resource.
+struct MeteringSampler {
+    task: JoinHandle<Result<(), MeteringSamplerError>>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl startup::Teardown for ControlRuntime {
+    fn teardown(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            self.shutdown();
+            let _ = self.join().await;
+        })
+    }
+}
+
+impl startup::Teardown for MetricsExporter {
+    fn teardown(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            self.shutdown();
+            self.join().await;
+        })
+    }
+}
+
+impl startup::Teardown for MeteringSampler {
+    fn teardown(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            self.shutdown.send_replace(true);
+            let _ = self.task.await;
+        })
+    }
+}
+
+impl startup::Teardown for JoinHandle<()> {
+    fn teardown(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            self.abort();
+            let _ = self.await;
+        })
+    }
+}
+
 /// The resources the steady-state supervisor takes ownership of after a
 /// successful startup, produced by [`StartupGuard::commit`].
-struct RunningProcess {
+struct RunningProcess<R, E, S, H> {
     modules: ControlModuleSet,
-    runtime: ControlRuntime,
-    metrics_exporter: MetricsExporter,
-    metering_sampler: JoinHandle<Result<(), MeteringSamplerError>>,
-    health_task: Option<JoinHandle<()>>,
+    runtime: R,
+    metrics_exporter: E,
+    metering_sampler: S,
+    health_task: Option<H>,
 }
 
 /// Owns every resource acquired after the first control module is spawned, so a
@@ -149,37 +192,38 @@ struct RunningProcess {
 /// instead of leaking abruptly aborted tasks (a registrar leak would hold a
 /// topology lease until its TTL).
 ///
-/// The guard is armed on creation, before the first module is spawned. Every
-/// fallible startup step routes its error through [`StartupGuard::rollback`],
-/// which is the single failure exit; a successful startup ends with
-/// [`StartupGuard::commit`], which hands the resources to the supervisor. The
-/// embedded arm token makes dropping a half-constructed startup that did neither
-/// a loud bug.
-struct StartupGuard {
+/// The optional resources are generic over [`startup::Teardown`] so production
+/// wires the real handles and a test wires recording fakes into the *same*
+/// rollback code. The guard is armed on creation, before the first module is
+/// spawned. Every fallible startup step routes its error through
+/// [`StartupGuard::rollback`], the single failure exit; a successful startup
+/// ends with [`StartupGuard::commit`], which hands the resources to the
+/// supervisor. The embedded arm token makes dropping a half-constructed startup
+/// that did neither a loud bug.
+struct StartupGuard<R, E, S, H> {
     arm: startup::ArmToken,
     in_process: Arc<InProcessControlRuntime>,
     modules: ControlModuleSet,
-    metering_shutdown: watch::Sender<bool>,
-    runtime: Option<ControlRuntime>,
-    metrics_exporter: Option<MetricsExporter>,
-    metering_sampler: Option<JoinHandle<Result<(), MeteringSamplerError>>>,
-    health_task: Option<JoinHandle<()>>,
+    runtime: Option<R>,
+    metrics_exporter: Option<E>,
+    metering_sampler: Option<S>,
+    health_task: Option<H>,
 }
 
-impl StartupGuard {
+impl<R, E, S, H> StartupGuard<R, E, S, H>
+where
+    R: startup::Teardown,
+    E: startup::Teardown,
+    S: startup::Teardown,
+    H: startup::Teardown,
+{
     /// Arms the guard around the owner and the module set that already holds the
-    /// first (config owner) module. `metering_shutdown` stops the sampler during
-    /// rollback.
-    fn arm(
-        in_process: Arc<InProcessControlRuntime>,
-        modules: ControlModuleSet,
-        metering_shutdown: watch::Sender<bool>,
-    ) -> Self {
+    /// first (config owner) module.
+    fn arm(in_process: Arc<InProcessControlRuntime>, modules: ControlModuleSet) -> Self {
         Self {
             arm: startup::ArmToken::armed(),
             in_process,
             modules,
-            metering_shutdown,
             runtime: None,
             metrics_exporter: None,
             metering_sampler: None,
@@ -194,28 +238,28 @@ impl StartupGuard {
             .map_err(|error| error.to_string())
     }
 
-    /// The legacy control runtime, once set, for wiring its dispatch handle and
-    /// stats before ownership passes to the supervisor.
-    fn runtime(&self) -> &ControlRuntime {
-        self.runtime
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("legacy runtime accessed before it was set"))
+    fn set_runtime(&mut self, runtime: R) {
+        if self.runtime.replace(runtime).is_some() {
+            unreachable!("the legacy runtime was set twice");
+        }
     }
 
-    fn set_runtime(&mut self, runtime: ControlRuntime) {
-        self.runtime = Some(runtime);
+    fn set_metrics_exporter(&mut self, exporter: E) {
+        if self.metrics_exporter.replace(exporter).is_some() {
+            unreachable!("the metrics exporter was set twice");
+        }
     }
 
-    fn set_metrics_exporter(&mut self, exporter: MetricsExporter) {
-        self.metrics_exporter = Some(exporter);
+    fn set_metering_sampler(&mut self, sampler: S) {
+        if self.metering_sampler.replace(sampler).is_some() {
+            unreachable!("the metering sampler was set twice");
+        }
     }
 
-    fn set_metering_sampler(&mut self, sampler: JoinHandle<Result<(), MeteringSamplerError>>) {
-        self.metering_sampler = Some(sampler);
-    }
-
-    fn set_health_task(&mut self, health_task: Option<JoinHandle<()>>) {
-        self.health_task = health_task;
+    fn set_health_task(&mut self, health_task: H) {
+        if self.health_task.replace(health_task).is_some() {
+            unreachable!("the health task was set twice");
+        }
     }
 
     /// Stops and joins every acquired resource in reverse order and returns the
@@ -226,41 +270,16 @@ impl StartupGuard {
         // `None`) is simply skipped.
         let mut steps: Vec<(&'static str, startup::TeardownFuture)> = Vec::new();
         if let Some(runtime) = self.runtime.take() {
-            steps.push((
-                "legacy_runtime",
-                Box::pin(async move {
-                    runtime.shutdown();
-                    let _ = runtime.join().await;
-                }),
-            ));
+            steps.push(("legacy_runtime", runtime.teardown()));
         }
         if let Some(exporter) = self.metrics_exporter.take() {
-            steps.push((
-                "metrics_exporter",
-                Box::pin(async move {
-                    exporter.shutdown();
-                    exporter.join().await;
-                }),
-            ));
+            steps.push(("metrics_exporter", exporter.teardown()));
         }
         if let Some(sampler) = self.metering_sampler.take() {
-            let shutdown = self.metering_shutdown.clone();
-            steps.push((
-                "metering_sampler",
-                Box::pin(async move {
-                    shutdown.send_replace(true);
-                    let _ = sampler.await;
-                }),
-            ));
+            steps.push(("metering_sampler", sampler.teardown()));
         }
         if let Some(health_task) = self.health_task.take() {
-            steps.push((
-                "health_task",
-                Box::pin(async move {
-                    health_task.abort();
-                    let _ = health_task.await;
-                }),
-            ));
+            steps.push(("health_task", health_task.teardown()));
         }
         let _order = startup::run_teardowns_in_reverse(steps).await;
         // The owner and its modules were acquired first, so they retire last.
@@ -277,25 +296,32 @@ impl StartupGuard {
     }
 
     /// Hands every resource to the steady-state supervisor and disarms the guard.
-    fn commit(self) -> RunningProcess {
+    ///
+    /// The required slots are taken and validated *before* the arm token is
+    /// disarmed, so a missing slot (a wiring bug) panics while the guard is still
+    /// armed — the drop bomb then also fires — rather than after disarming, which
+    /// would silently drop the remaining handles.
+    fn commit(self) -> RunningProcess<R, E, S, H> {
         let StartupGuard {
             mut arm,
             in_process: _,
             modules,
-            metering_shutdown: _,
             runtime,
             metrics_exporter,
             metering_sampler,
             health_task,
         } = self;
+        let runtime = runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set"));
+        let metrics_exporter = metrics_exporter
+            .unwrap_or_else(|| unreachable!("commit before the metrics exporter was set"));
+        let metering_sampler = metering_sampler
+            .unwrap_or_else(|| unreachable!("commit before the metering sampler was set"));
         arm.disarm();
         RunningProcess {
             modules,
-            runtime: runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set")),
-            metrics_exporter: metrics_exporter
-                .unwrap_or_else(|| unreachable!("commit before the metrics exporter was set")),
-            metering_sampler: metering_sampler
-                .unwrap_or_else(|| unreachable!("commit before the metering sampler was set")),
+            runtime,
+            metrics_exporter,
+            metering_sampler,
             health_task,
         }
     }
@@ -406,11 +432,7 @@ async fn run(options: Options) -> Result<(), String> {
     // failure exit — so a failure stops and joins everything already started
     // (rather than leaking an aborted registrar that would hold a topology lease
     // until its TTL); a successful startup ends with `guard.commit`.
-    let mut guard = StartupGuard::arm(
-        Arc::clone(&in_process),
-        modules,
-        metering_shutdown_tx.clone(),
-    );
+    let mut guard = StartupGuard::arm(Arc::clone(&in_process), modules);
     // STARTUP-GUARD:ARMED
     if let Err(error) = guard.spawn_module(config_owner.module) {
         return Err(guard
@@ -470,15 +492,22 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("start config serving adapter: {error}"))
             .await);
     }
-    guard.set_runtime(spawn_control_runtime_with_client_and_handler(
+    let runtime = spawn_control_runtime_with_client_and_handler(
         Arc::clone(&shared_client),
         Duration::from_millis(100),
         8,
         store.clone(),
         consumer,
         dispatch_handler,
-    ));
-    if !installer.install(guard.runtime().handle()) {
+    );
+    // Take the dispatch handles and stats before the runtime moves into the
+    // guard; from then on the guard owns it (and tears it down on any later
+    // failure).
+    let install_handle = runtime.handle();
+    let metering_dispatch = runtime.handle();
+    let runtime_stats = runtime.stats();
+    guard.set_runtime(runtime);
+    if !installer.install(install_handle) {
         return Err(guard
             .rollback("install control dispatch handle exactly once".to_owned())
             .await);
@@ -486,27 +515,30 @@ async fn run(options: Options) -> Result<(), String> {
     guard.set_metrics_exporter(spawn_metrics_exporter(
         Arc::clone(&shared_client),
         serving.clone(),
-        guard.runtime().stats(),
+        runtime_stats,
         &metrics,
         observations,
         Duration::from_secs(1),
     ));
-    let metering_dispatch = guard.runtime().handle();
-    guard.set_metering_sampler(tokio::spawn(async move {
-        run_metering_sampler(
-            metering,
-            metering_dispatch,
-            metering_shutdown_rx,
-            Duration::from_secs(1),
-        )
-        .await
-    }));
+    guard.set_metering_sampler(MeteringSampler {
+        task: tokio::spawn(async move {
+            run_metering_sampler(
+                metering,
+                metering_dispatch,
+                metering_shutdown_rx,
+                Duration::from_secs(1),
+            )
+            .await
+        }),
+        shutdown: metering_shutdown_tx.clone(),
+    });
 
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
     match spawn_health(in_process_config.health_port(), serving.clone()).await {
-        Ok(health_task) => guard.set_health_task(health_task),
+        Ok(Some(health_task)) => guard.set_health_task(health_task),
+        Ok(None) => {}
         Err(error) => return Err(guard.rollback(error).await),
     }
     if let Err(error) = in_process.mark_ready() {
@@ -519,7 +551,11 @@ async fn run(options: Options) -> Result<(), String> {
         mut modules,
         runtime,
         metrics_exporter,
-        metering_sampler,
+        metering_sampler:
+            MeteringSampler {
+                task: metering_sampler,
+                shutdown: _,
+            },
         health_task,
     } = guard.commit();
 
@@ -984,22 +1020,52 @@ mod tests {
         version_output,
     };
     use crate::config_composition::control_config;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::startup::{Teardown, TeardownFuture};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use super::RunningProcess;
     use control_plane::{
         ControlConfig, ControlModule, ControlModuleSet, ControlRuntime as InProcessControlRuntime,
         JsonStderrSink, LifecyclePhase, LogLevel, MetricsPolicy, ModuleContext, ModuleFuture,
-        OwnershipRegistry, TlsPolicy,
+        OwnershipRegistry,
     };
-    use tokio::sync::watch;
+
+    type TeardownLog = Arc<Mutex<Vec<&'static str>>>;
+
+    fn record(log: &TeardownLog, label: &'static str) {
+        log.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(label);
+    }
+
+    /// A fake optional resource that records its slot label when torn down, so a
+    /// test can drive the *real* `StartupGuard::rollback` and assert the exact
+    /// reverse teardown order and that each resource is torn down once.
+    struct FakeResource {
+        label: &'static str,
+        log: TeardownLog,
+    }
+
+    impl Teardown for FakeResource {
+        fn teardown(self) -> TeardownFuture {
+            Box::pin(async move { record(&self.log, self.label) })
+        }
+    }
+
+    fn fake(label: &'static str, log: &TeardownLog) -> FakeResource {
+        FakeResource {
+            label,
+            log: Arc::clone(log),
+        }
+    }
 
     /// A control module that runs until the runtime reaches `Stopping`, then
-    /// records that it ran to completion, so a test can prove the guard joined it
-    /// rather than aborting it.
+    /// records "modules", so a test can prove the guard joined it (rather than
+    /// aborting it) after the optional resources and before the owner is
+    /// finished.
     struct StoppableModule {
-        completed: Arc<AtomicUsize>,
+        log: TeardownLog,
     }
 
     impl ControlModule for StoppableModule {
@@ -1018,16 +1084,17 @@ mod tests {
                         break;
                     }
                 }
-                self.completed.fetch_add(1, Ordering::SeqCst);
+                record(&self.log, "modules");
                 Ok(())
             })
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cp_cfg_ready_failure_joins_the_config_module_and_finishes_the_owner() {
+    /// A `Starting` owner (never marked ready — the real state at an early
+    /// startup failure).
+    fn armed_owner() -> Arc<InProcessControlRuntime> {
         let registry = OwnershipRegistry::new();
-        let in_process = Arc::new(
+        Arc::new(
             InProcessControlRuntime::claim_process(
                 &registry,
                 "startup-guard-test".to_owned(),
@@ -1035,7 +1102,7 @@ mod tests {
                     1,
                     Duration::from_secs(30),
                     0,
-                    TlsPolicy::default(),
+                    control_plane::TlsPolicy::default(),
                     LogLevel::Info,
                     MetricsPolicy::default(),
                 )
@@ -1043,36 +1110,153 @@ mod tests {
                 Arc::new(JsonStderrSink),
             )
             .unwrap_or_else(|error| unreachable!("claim process: {error}")),
-        );
+        )
+    }
+
+    fn modules_with_stoppable(
+        in_process: &Arc<InProcessControlRuntime>,
+        log: &TeardownLog,
+    ) -> ControlModuleSet {
         let handle = in_process.handle();
         let mut modules = ControlModuleSet::new(&handle);
-        let completed = Arc::new(AtomicUsize::new(0));
         modules
             .spawn(StoppableModule {
-                completed: Arc::clone(&completed),
+                log: Arc::clone(log),
             })
             .unwrap_or_else(|error| unreachable!("spawn config module: {error}"));
-        in_process
-            .mark_ready()
-            .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
-        let (metering_shutdown, _metering_rx) = watch::channel(false);
-        let guard = StartupGuard::arm(Arc::clone(&in_process), modules, metering_shutdown);
+        modules
+    }
 
-        // The shape of a CP-CFG-ready failure: no optional resources were
-        // acquired, so rollback tears down only the module set and the owner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cp_cfg_ready_failure_joins_the_module_then_finishes_the_owner() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        let modules = modules_with_stoppable(&in_process, &log);
+        // No optional resource is set (the failure is before any was acquired):
+        // give the four generic slots a concrete type.
+        let guard = StartupGuard::<FakeResource, FakeResource, FakeResource, FakeResource>::arm(
+            Arc::clone(&in_process),
+            modules,
+        );
+
         let error = guard
             .rollback("initialize config owner: injected".to_owned())
             .await;
         assert_eq!(error, "initialize config owner: injected");
         assert_eq!(
-            completed.load(Ordering::SeqCst),
-            1,
-            "the config module was joined (ran to completion), not abandoned"
+            *log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["modules"],
+            "only the module set is torn down; it is joined, not abandoned"
         );
-        // The owner was finished: a second finish is rejected.
         assert!(
             in_process.finish().is_err(),
             "the owner was already finished by rollback"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_bind_failure_rolls_back_optionals_without_health_then_module_and_owner() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        // The health task was never spawned, so annotate the unset fourth slot.
+        let mut guard = StartupGuard::<FakeResource, FakeResource, FakeResource, FakeResource>::arm(
+            Arc::clone(&in_process),
+            modules_with_stoppable(&in_process, &log),
+        );
+        // A health-bind failure: the runtime, exporter, and sampler are live, but
+        // the health task was never spawned.
+        guard.set_runtime(fake("legacy_runtime", &log));
+        guard.set_metrics_exporter(fake("metrics_exporter", &log));
+        guard.set_metering_sampler(fake("metering_sampler", &log));
+
+        let error = guard
+            .rollback("bind health endpoint: injected".to_owned())
+            .await;
+        assert_eq!(error, "bind health endpoint: injected");
+        assert_eq!(
+            *log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                "metering_sampler",
+                "metrics_exporter",
+                "legacy_runtime",
+                "modules"
+            ],
+            "optionals retire latest-first (no health), then the module, then the owner"
+        );
+        assert!(in_process.finish().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mark_ready_failure_rolls_back_every_resource_in_reverse_order() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        let mut guard = StartupGuard::arm(
+            Arc::clone(&in_process),
+            modules_with_stoppable(&in_process, &log),
+        );
+        // A mark-ready failure: every optional resource is live.
+        guard.set_runtime(fake("legacy_runtime", &log));
+        guard.set_metrics_exporter(fake("metrics_exporter", &log));
+        guard.set_metering_sampler(fake("metering_sampler", &log));
+        guard.set_health_task(fake("health_task", &log));
+
+        let error = guard.rollback("mark ready: injected".to_owned()).await;
+        assert_eq!(error, "mark ready: injected");
+        assert_eq!(
+            *log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                "health_task",
+                "metering_sampler",
+                "metrics_exporter",
+                "legacy_runtime",
+                "modules",
+            ],
+            "all optionals retire latest-first, then the module, then the owner"
+        );
+        assert!(in_process.finish().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_normal_commit_transfers_every_resource_and_disarms() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        let modules = ControlModuleSet::new(&in_process.handle());
+        let mut guard = StartupGuard::arm(Arc::clone(&in_process), modules);
+        guard.set_runtime(fake("legacy_runtime", &log));
+        guard.set_metrics_exporter(fake("metrics_exporter", &log));
+        guard.set_metering_sampler(fake("metering_sampler", &log));
+        guard.set_health_task(fake("health_task", &log));
+
+        // Commit hands every resource out (and disarms cleanly — no drop bomb).
+        let RunningProcess {
+            modules: _modules,
+            runtime,
+            metrics_exporter,
+            metering_sampler,
+            health_task,
+        } = guard.commit();
+        // Tearing the transferred handles down proves they were moved out of the
+        // guard rather than dropped by commit.
+        runtime.teardown().await;
+        metrics_exporter.teardown().await;
+        metering_sampler.teardown().await;
+        health_task
+            .unwrap_or_else(|| unreachable!("health task transferred"))
+            .teardown()
+            .await;
+        assert_eq!(
+            *log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                "legacy_runtime",
+                "metrics_exporter",
+                "metering_sampler",
+                "health_task",
+            ],
+            "every resource was transferred out of the guard by commit"
         );
     }
 
