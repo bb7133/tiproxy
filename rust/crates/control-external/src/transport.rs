@@ -24,10 +24,9 @@
 //!             Balance(ServiceList(Vec<FailureBackoff<tonic::transport::Channel>>))))))
 //! ```
 //!
-//! The construct is deliberately **unreachable from production**:
-//! [`EtcdConnector::connect`](crate::etcd::EtcdConnector::connect) still uses the
-//! legacy `Client::connect` path. Only [`build_custom_channel`] wires this stack,
-//! and nothing in the production path calls it.
+//! [`EtcdConnector::connect`](crate::etcd::EtcdConnector::connect) builds this
+//! stack through [`build_custom_channel`] and hands it to
+//! `Client::from_channel`, so it is the production etcd transport.
 //!
 //! Two owner fences guard the stack against a retired control generation:
 //! [`OwnerCallFence`] sits *outside* the outer [`Buffer`] and fails a call closed
@@ -35,11 +34,6 @@
 //! [`OwnerFencedDialer`] re-checks the owner after every awaited connect stage so
 //! a connection completed by a stale generation is dropped rather than handed to
 //! tonic.
-//!
-//! Because slice 2b-1 wires but does not *call* this construct from production,
-//! its items are unreachable in a non-test build; `dead_code` is allowed only
-//! there, while the test build exercises every path under full lints.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::future::Future;
 use std::net::SocketAddr;

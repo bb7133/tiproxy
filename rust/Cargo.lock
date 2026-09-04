@@ -1946,10 +1946,19 @@ dependencies = [
  "control-proto",
  "control-topology",
  "dataplane",
+ "hyper",
+ "hyper-util",
  "if-addrs",
  "libc",
+ "prost",
+ "rcgen",
  "rustix",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

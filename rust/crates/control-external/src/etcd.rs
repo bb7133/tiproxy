@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use control_plane::OwnerToken;
-use etcd_client::{Certificate, Client, ConnectOptions, Identity, TlsOptions};
+use etcd_client::Client;
 use http::Uri;
 use thiserror::Error;
 
@@ -183,25 +183,6 @@ impl EtcdTlsConfig {
         })
     }
 
-    fn connect_options(&self) -> TlsOptions {
-        // NOTE: the advanced policy (minimum version, common-name pinning,
-        // skip-CA) is not yet expressed here — `TlsOptions` (tonic
-        // `ClientTlsConfig`) cannot carry it. It is consumed by the custom
-        // rustls transport that replaces this path; today only the default
-        // policy (CA verification, no floor, no pinning) reaches this builder.
-        let mut options = TlsOptions::new();
-        if let Some(ca_certificate_pem) = &self.ca_certificate_pem {
-            options = options.ca_certificate(Certificate::from_pem(ca_certificate_pem.clone()));
-        }
-        if let Some((certificate, key)) = &self.identity {
-            options = options.identity(Identity::from_pem(certificate.clone(), key.clone()));
-        }
-        if let Some(domain_name) = &self.domain_name {
-            options = options.domain_name(domain_name.clone());
-        }
-        options
-    }
-
     /// Builds the client TLS configuration for the custom etcd transport from
     /// the generation-bound material and verification policy (the advanced
     /// `minimum_version` / `allowed_common_names` / `skip_ca_verification` that
@@ -340,17 +321,14 @@ impl EtcdClientConfig {
         self.tls.as_ref()
     }
 
-    fn connect_options(&self) -> ConnectOptions {
-        let mut options = ConnectOptions::new()
-            .with_connect_timeout(self.connect_timeout)
-            .with_timeout(self.request_timeout)
-            .with_keep_alive(self.keep_alive_interval, self.keep_alive_timeout)
-            .with_keep_alive_while_idle(false)
-            .with_tcp_keepalive(self.tcp_keep_alive);
-        if let Some(tls) = &self.tls {
-            options = options.with_tls(tls.connect_options());
-        }
-        options
+    /// Returns the advanced TLS verification policy, if TLS is configured.
+    ///
+    /// Exposed so the composition root can assert the topology→transport policy
+    /// mapping (skip-CA, common-name pins, minimum version) that
+    /// [`EtcdConnector::connect`] threads into the custom transport.
+    #[must_use]
+    pub fn tls_policy(&self) -> Option<&EtcdTlsPolicy> {
+        self.tls.as_ref().map(|tls| &tls.policy)
     }
 }
 
@@ -425,15 +403,31 @@ pub enum EtcdConfigError {
     KeepAliveTimeoutExceedsInterval,
 }
 
+/// The dependency-layer cause behind an [`EtcdConnectError::Dependency`].
+///
+/// The custom owner-fenced transport is assembled from the validated config
+/// before the client is created, so a connection failure can originate either in
+/// that assembly (a configuration fault) or in the external client itself.
+#[derive(Debug, Error)]
+pub enum EtcdConnectSource {
+    /// The external etcd client rejected or could not reach the endpoint set.
+    #[error("etcd client connection failed")]
+    Client(#[source] etcd_client::Error),
+    /// The owner-fenced custom transport could not be built from the config.
+    #[error("etcd transport configuration is invalid")]
+    Configuration(#[source] EtcdConfigError),
+}
+
 /// Runtime connection failure with stable public classes.
 #[derive(Debug, Error)]
 pub enum EtcdConnectError {
     /// The originating control owner is no longer current.
     #[error("stale control owner")]
     StaleOwner,
-    /// The external client rejected or could not reach the endpoint set.
+    /// The external client rejected or could not reach the endpoint set, or the
+    /// custom transport could not be built from the validated configuration.
     #[error("etcd dependency connection failed")]
-    Dependency(#[source] etcd_client::Error),
+    Dependency(#[source] EtcdConnectSource),
 }
 
 /// A fenced semantic etcd operation failure.
@@ -461,23 +455,41 @@ impl EtcdConnector {
         Self { owner, config }
     }
 
-    /// Connects to PD's etcd API and rechecks the owner after the await point.
+    /// Binds the owner-fenced custom transport to a raw etcd client for the
+    /// exact owner generation, rechecking the owner across each step.
+    ///
+    /// This does **not** establish the network. The custom endpoints built by
+    /// [`crate::transport::build_custom_channel`] are lazy, and
+    /// [`Client::from_channel`] with no credentials sends no RPC, so DNS, TCP,
+    /// and TLS only happen on the first etcd operation — where they are covered
+    /// by the owner-fenced dialer and the outer [`EtcdConnection::execute`]
+    /// fence. Ownership is rechecked before interpreting each fallible step so a
+    /// retired generation always wins over a build or client error: the fence
+    /// sits *before* the `?` on both the transport build and the client
+    /// creation.
     ///
     /// # Errors
     ///
-    /// Returns [`EtcdConnectError::StaleOwner`] before or after connection if
-    /// the exact generation was released; otherwise returns the typed client
-    /// error without retrying forever.
+    /// Returns [`EtcdConnectError::StaleOwner`] whenever the exact generation
+    /// was released; otherwise returns [`EtcdConnectError::Dependency`] carrying
+    /// the transport-configuration or client cause without retrying forever.
     pub async fn connect(&self) -> Result<EtcdConnection, EtcdConnectError> {
         if !self.owner.is_current() {
             return Err(EtcdConnectError::StaleOwner);
         }
-        let result =
-            Client::connect(self.config.endpoints(), Some(self.config.connect_options())).await;
+        let built = crate::transport::build_custom_channel(&self.config, &self.owner);
         if !self.owner.is_current() {
             return Err(EtcdConnectError::StaleOwner);
         }
-        let client = result.map_err(EtcdConnectError::Dependency)?;
+        let channel = built.map_err(|error| {
+            EtcdConnectError::Dependency(EtcdConnectSource::Configuration(error))
+        })?;
+        let result = Client::from_channel(channel, None).await;
+        if !self.owner.is_current() {
+            return Err(EtcdConnectError::StaleOwner);
+        }
+        let client = result
+            .map_err(|error| EtcdConnectError::Dependency(EtcdConnectSource::Client(error)))?;
         Ok(EtcdConnection {
             owner: self.owner.clone(),
             client,
