@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dns;
+mod dns_transport;
 pub mod etcd;
 pub mod explicit_dns;
 pub mod http;

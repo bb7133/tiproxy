@@ -63,7 +63,9 @@ use tower::load::Load;
 use tower::util::BoxCloneSyncService;
 use tower::{BoxError, Service};
 
+use crate::dns_transport::TokioDnsTransport;
 use crate::etcd::{EtcdClientConfig, EtcdConfigError};
+use crate::explicit_dns::{DnsTransport, ExplicitResolver, ResolveError};
 
 /// Outer [`Buffer`] capacity: the frozen tonic/etcd default of 1024 in-flight
 /// requests. This is the sole net-new request-side literal.
@@ -101,6 +103,10 @@ pub(crate) enum DialError {
     /// Endpoint address resolution failed.
     #[error("etcd endpoint address resolution failed")]
     Resolve(#[source] std::io::Error),
+    /// The explicit-nameserver resolver failed. The [`ResolveError`] source is
+    /// payload-free (it carries no host or address).
+    #[error("etcd explicit nameserver resolution failed")]
+    Resolver(#[source] ResolveError),
     /// The TCP connection could not be established.
     #[error("etcd TCP connection failed")]
     Tcp(#[source] std::io::Error),
@@ -452,10 +458,16 @@ fn collect_candidates(
     Ok(addrs)
 }
 
-/// The production stage implementation: literal `host:port` resolution, a
+/// The production stage implementation: host resolution (the shared explicit
+/// resolver when `ns_servers` are configured, otherwise the system resolver), a
 /// `socket2`-configured TCP connect, and a `tokio-rustls` handshake.
-#[derive(Debug)]
-pub(crate) struct ProdStageHooks;
+pub(crate) struct ProdStageHooks {
+    /// The shared explicit-nameserver resolver, present only when the cluster
+    /// configures `ns_servers`. One resolver is built per channel/generation
+    /// (before the endpoint loop) and shared across every endpoint dialer, so
+    /// concurrent endpoints for one host observe a single A/AAAA wire query.
+    resolver: Option<Arc<ExplicitResolver>>,
+}
 
 impl StageHooks for ProdStageHooks {
     fn resolve(
@@ -463,18 +475,33 @@ impl StageHooks for ProdStageHooks {
         host: &str,
         port: u16,
     ) -> BoxFuture<'static, Result<Vec<SocketAddr>, DialError>> {
-        // 2b-1 resolves the literal authority only; ns_servers-based discovery
-        // fails closed to a later slice. Legacy tonic/hyper dials across the
-        // whole resolved set, so the bounded, order-preserving set is returned
-        // and the dialer falls back candidate by candidate.
-        let authority = format!("{host}:{port}");
-        Box::pin(async move {
-            let resolved = tokio::task::spawn_blocking(move || authority.to_socket_addrs())
-                .await
-                .map_err(|error| DialError::Resolve(std::io::Error::other(error)))?
-                .map_err(DialError::Resolve)?;
-            collect_candidates(resolved)
-        })
+        // Legacy tonic/hyper dials across the whole resolved set, so a bounded,
+        // order-preserving candidate set is returned and the dialer falls back
+        // candidate by candidate.
+        if let Some(resolver) = &self.resolver {
+            // Explicit nameservers: resolve the logical host through the shared
+            // resolver, never the system resolver. The logical host stays the
+            // authority/SNI; only the dial target uses the resolved address.
+            let resolver = Arc::clone(resolver);
+            let host = host.to_owned();
+            Box::pin(async move {
+                let addresses = resolver.resolve(&host).await.map_err(|error| match error {
+                    ResolveError::StaleOwner => DialError::StaleOwner,
+                    other => DialError::Resolver(other),
+                })?;
+                collect_candidates(addresses.into_iter().map(|ip| SocketAddr::new(ip, port)))
+            })
+        } else {
+            // No explicit nameservers: the unchanged system-resolver path.
+            let authority = format!("{host}:{port}");
+            Box::pin(async move {
+                let resolved = tokio::task::spawn_blocking(move || authority.to_socket_addrs())
+                    .await
+                    .map_err(|error| DialError::Resolve(std::io::Error::other(error)))?
+                    .map_err(DialError::Resolve)?;
+                collect_candidates(resolved)
+            })
+        }
     }
 
     fn tcp_connect(
@@ -753,7 +780,12 @@ fn build_endpoint_services(
     owner: &OwnerToken,
 ) -> Result<Vec<FailureBackoff<tonic::transport::Channel>>, EtcdConfigError> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let hooks: Arc<dyn StageHooks> = Arc::new(ProdStageHooks);
+    // One shared explicit-nameserver resolver per channel/generation, built
+    // BEFORE the endpoint loop so every endpoint dialer shares it (a single
+    // A/AAAA wire query per host). Empty `ns_servers` keeps `resolver = None`
+    // and the zero-drift system-resolver path.
+    let resolver = build_shared_resolver(config, owner)?;
+    let hooks: Arc<dyn StageHooks> = Arc::new(ProdStageHooks { resolver });
     let mut services = Vec::with_capacity(config.endpoints().len());
     for (index, endpoint) in config.endpoints().iter().enumerate() {
         let blueprint = EndpointBlueprint::from_config(config, index, endpoint)?;
@@ -764,6 +796,30 @@ fn build_endpoint_services(
         services.push(FailureBackoff::new(channel, Arc::clone(&clock)));
     }
     Ok(services)
+}
+
+/// Builds the shared explicit-nameserver resolver for the channel, or `None`
+/// when the cluster configures no `ns_servers` (the zero-drift system-resolver
+/// path). The resolver captures the endpoint owner token and uses the connect
+/// timeout as its single absolute resolution budget.
+fn build_shared_resolver(
+    config: &EtcdClientConfig,
+    owner: &OwnerToken,
+) -> Result<Option<Arc<ExplicitResolver>>, EtcdConfigError> {
+    if config.ns_servers().is_empty() {
+        return Ok(None);
+    }
+    let transport: Arc<dyn DnsTransport> = Arc::new(TokioDnsTransport);
+    let clock: Arc<dyn crate::explicit_dns::Clock> = Arc::new(crate::explicit_dns::SystemClock);
+    let resolver = ExplicitResolver::new(
+        owner.clone(),
+        config.ns_servers(),
+        transport,
+        clock,
+        config.connect_timeout(),
+    )
+    .map_err(EtcdConfigError::ExplicitResolver)?;
+    Ok(Some(Arc::new(resolver)))
 }
 
 /// Builds the frozen owner-fenced custom `etcd-client` channel.
@@ -781,14 +837,11 @@ pub(crate) fn build_custom_channel(
     config: &EtcdClientConfig,
     owner: &OwnerToken,
 ) -> Result<etcd_client::Channel, EtcdConfigError> {
-    // 2c-1 fail-closed gate: the explicit-nameserver resolver is built and tested
-    // but not yet consulted by the dialer, so a cluster that configures custom
-    // `ns_servers` must fail here rather than silently resolving its target host
-    // through the system resolver (`ProdStageHooks::resolve`'s `to_socket_addrs`).
-    // 2c-2 removes this rejection atomically with the real resolver injection.
-    if !config.ns_servers().is_empty() {
-        return Err(EtcdConfigError::ExplicitNsServersNotWired);
-    }
+    // A cluster that configures explicit `ns_servers` resolves its target host
+    // through the shared owner-fenced [`ExplicitResolver`] injected into the
+    // endpoint dialers by `build_endpoint_services`; an empty `ns_servers` keeps
+    // the zero-drift system-resolver path. Either way the logical host remains
+    // the authority/SNI — only the dial target uses the resolved address.
     let services = build_endpoint_services(config, owner)?;
     let balance = Balance::new(ServiceList::new::<TransportRequest>(services));
     let buffer = Buffer::new(balance, BUFFER_CAPACITY);
@@ -1484,7 +1537,10 @@ mod tests {
         );
 
         let (_registry, lease) = owner();
-        let dialer = blueprint.to_dialer(lease.token(), Arc::new(super::ProdStageHooks));
+        let dialer = blueprint.to_dialer(
+            lease.token(),
+            Arc::new(super::ProdStageHooks { resolver: None }),
+        );
         assert_eq!(
             dialer.keepalive, tcp_keep,
             "the socket keepalive mirrors tcp_keep_alive"
@@ -1539,25 +1595,6 @@ mod tests {
         // The balancer fans across exactly one service per configured endpoint;
         // a dropped or truncated endpoint (`.take(1)`/`.skip(1)`) changes this.
         assert_eq!(services.len(), 2, "one service per configured endpoint");
-    }
-
-    #[tokio::test]
-    async fn a_config_with_ns_servers_fails_closed_until_the_resolver_is_wired() {
-        let (_registry, lease) = owner();
-        // A cluster that configures explicit nameservers must NOT silently fall
-        // back to the system resolver for its target host: the connector build
-        // fails closed until the explicit resolver is wired (2c-2).
-        let config = EtcdClientConfig::new(["etcd.internal:2379".to_owned()], None)
-            .and_then(|config| config.with_ns_servers(["10.0.0.53:53".into()].into()))
-            .unwrap_or_else(|error| unreachable!("config: {error}"));
-        let result = build_custom_channel(&config, &lease.token());
-        assert!(
-            matches!(
-                result,
-                Err(crate::etcd::EtcdConfigError::ExplicitNsServersNotWired)
-            ),
-            "explicit ns_servers must fail closed at the connector build"
-        );
     }
 
     // ----- Fix 1: multi-address DNS fallback --------------------------------
@@ -1890,7 +1927,10 @@ mod tests {
             EndpointBlueprint::from_config(&host_config, 0, host_config.endpoints()[0].as_str())
                 .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
         let (_registry, lease) = owner();
-        let dialer = host_blueprint.to_dialer(lease.token(), Arc::new(super::ProdStageHooks));
+        let dialer = host_blueprint.to_dialer(
+            lease.token(),
+            Arc::new(super::ProdStageHooks { resolver: None }),
+        );
         let plan = dialer
             .tls
             .clone()
@@ -2191,7 +2231,10 @@ mod tests {
         let blueprint = EndpointBlueprint::from_config(&config, 0, config.endpoints()[0].as_str())
             .unwrap_or_else(|error| unreachable!("blueprint: {error}"));
         let (_registry, lease) = owner();
-        let dialer = blueprint.to_dialer(lease.token(), Arc::new(super::ProdStageHooks));
+        let dialer = blueprint.to_dialer(
+            lease.token(),
+            Arc::new(super::ProdStageHooks { resolver: None }),
+        );
         let plan = dialer
             .tls
             .clone()
@@ -2205,7 +2248,7 @@ mod tests {
         let stream = TcpStream::connect(addr)
             .await
             .unwrap_or_else(|error| unreachable!("connect: {error}"));
-        let handshaked = super::ProdStageHooks
+        let handshaked = super::ProdStageHooks { resolver: None }
             .tls_handshake(stream, plan)
             .await
             .unwrap_or_else(|error| unreachable!("client handshake: {error}"));
@@ -2254,7 +2297,7 @@ mod tests {
 
         // A non-default keepalive so the assertion cannot pass on a default.
         let keepalive = Duration::from_secs(17);
-        let stream = super::ProdStageHooks
+        let stream = super::ProdStageHooks { resolver: None }
             .tcp_connect(addr, keepalive)
             .await
             .unwrap_or_else(|error| unreachable!("tcp connect: {error}"));
@@ -2282,5 +2325,152 @@ mod tests {
             );
         }
         accept.abort();
+    }
+
+    // ----- Row 6: one shared explicit resolver across two endpoints ---------
+
+    /// A running loopback UDP nameserver for the shared-resolver row: it answers
+    /// `A svc.test -> 127.0.0.1` and `AAAA` NODATA, counting each family so the
+    /// row can assert the whole channel issued exactly one A and one AAAA query.
+    struct RowSixDns {
+        /// The read-back UDP port the resolver is pointed at.
+        port: u16,
+        /// Observed `A` queries.
+        a: Arc<AtomicUsize>,
+        /// Observed `AAAA` queries.
+        aaaa: Arc<AtomicUsize>,
+    }
+
+    /// Binds the loopback nameserver and detaches its responder loop.
+    async fn spawn_row_six_dns() -> RowSixDns {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record, RecordType};
+        use std::net::Ipv4Addr;
+        use tokio::net::UdpSocket;
+
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|error| unreachable!("bind dns: {error}"));
+        let port = socket
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("dns addr: {error}"))
+            .port();
+        let a = Arc::new(AtomicUsize::new(0));
+        let aaaa = Arc::new(AtomicUsize::new(0));
+        let a_task = Arc::clone(&a);
+        let aaaa_task = Arc::clone(&aaaa);
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 2048];
+            loop {
+                let Ok((len, src)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                let Ok(message) = Message::from_vec(&buffer[..len]) else {
+                    continue;
+                };
+                let Some(query) = message.queries.first() else {
+                    continue;
+                };
+                let qname = query.name().clone();
+                let qtype = query.query_type();
+                let mut response = Message::new(message.id, MessageType::Response, OpCode::Query);
+                response.metadata.authoritative = true;
+                response.metadata.response_code = ResponseCode::NoError;
+                response.add_query(Query::query(qname.clone(), qtype));
+                if qtype == RecordType::A {
+                    a_task.fetch_add(1, Ordering::SeqCst);
+                    response.add_answer(Record::from_rdata(
+                        qname,
+                        30,
+                        RData::A(A::new(127, 0, 0, 1)),
+                    ));
+                } else if qtype == RecordType::AAAA {
+                    aaaa_task.fetch_add(1, Ordering::SeqCst);
+                }
+                let Ok(bytes) = response.to_vec() else {
+                    continue;
+                };
+                let _ = socket.send_to(&bytes, src).await;
+            }
+        });
+        RowSixDns { port, a, aaaa }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_endpoint_services_shares_one_resolver_across_endpoints() {
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            let dns = spawn_row_six_dns().await;
+
+            // Two h2 servers on DISTINCT ports for the SAME logical host, so the
+            // config is unique per endpoint while the resolved host is shared.
+            let listener0 = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|error| unreachable!("listener0: {error}"));
+            let port0 = listener0
+                .local_addr()
+                .unwrap_or_else(|error| unreachable!("addr0: {error}"))
+                .port();
+            let listener1 = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|error| unreachable!("listener1: {error}"));
+            let port1 = listener1
+                .local_addr()
+                .unwrap_or_else(|error| unreachable!("addr1: {error}"))
+                .port();
+            let (sender0, _receiver0) = oneshot::channel();
+            let (sender1, _receiver1) = oneshot::channel();
+            tokio::spawn(run_capturing_h2_server(listener0, sender0, Duration::ZERO));
+            tokio::spawn(run_capturing_h2_server(listener1, sender1, Duration::ZERO));
+
+            let ns: Arc<[Arc<str>]> =
+                Arc::from([Arc::<str>::from(format!("127.0.0.1:{}", dns.port).as_str())]);
+            let config = EtcdClientConfig::new(
+                vec![format!("svc.test:{port0}"), format!("svc.test:{port1}")],
+                None,
+            )
+            .and_then(|config| config.with_ns_servers(ns))
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+
+            let (_registry, lease) = owner();
+            let mut services = super::build_endpoint_services(&config, &lease.token())
+                .unwrap_or_else(|error| unreachable!("services: {error}"));
+            assert_eq!(services.len(), 2, "one service per configured endpoint");
+
+            // Deterministically drive BOTH endpoints' first connect (not p2c luck):
+            // each call runs the dialer's resolve -> tcp -> h2 stages against its
+            // own server, exercising the shared resolver from both dialers.
+            for (index, service) in services.iter_mut().enumerate() {
+                poll_fn(|cx| service.poll_ready(cx))
+                    .await
+                    .unwrap_or_else(|error| unreachable!("ready {index}: {error}"));
+                let request = grpc_request("http://svc.test/etcdserverpb.KV/Range");
+                let call =
+                    tokio::time::timeout(Duration::from_secs(5), service.call(request)).await;
+                let Ok(Ok(response)) = call else {
+                    unreachable!("endpoint {index} must complete its call");
+                };
+                assert_eq!(
+                    response.status(),
+                    200,
+                    "endpoint {index} reached its h2 server"
+                );
+            }
+
+            // The shared resolver caches svc.test after the first endpoint dials,
+            // so the whole channel issues exactly one A and one AAAA wire query.
+            assert_eq!(
+                dns.a.load(Ordering::SeqCst),
+                1,
+                "one shared A query across the whole channel"
+            );
+            assert_eq!(
+                dns.aaaa.load(Ordering::SeqCst),
+                1,
+                "one shared AAAA query across the whole channel"
+            );
+        })
+        .await;
+        assert!(finished.is_ok(), "row6 must finish within the deadline");
     }
 }

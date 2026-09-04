@@ -26,6 +26,8 @@ use etcd_client::Client;
 use http::Uri;
 use thiserror::Error;
 
+use crate::explicit_dns::ResolveError;
+
 /// Maximum configured PD endpoints for one client.
 pub const MAX_ETCD_ENDPOINTS: usize = 32;
 /// Maximum byte length of one configured endpoint.
@@ -478,12 +480,11 @@ pub enum EtcdConfigError {
         /// Zero-based nameserver index.
         index: usize,
     },
-    /// Explicit `ns_servers` resolution is configured but not yet wired into the
-    /// transport, so the connection fails closed rather than silently resolving
-    /// the target host through the system resolver. Removed when the explicit
-    /// resolver is injected.
-    #[error("explicit nameserver resolution is not yet supported")]
-    ExplicitNsServersNotWired,
+    /// The explicit-nameserver resolver could not be constructed for a cluster
+    /// that configures `ns_servers`. The payload-free [`ResolveError`] source
+    /// carries the class without leaking any host or address.
+    #[error("explicit nameserver resolver could not be built")]
+    ExplicitResolver(#[source] ResolveError),
     /// The TLS material and policy could not form a client configuration.
     #[error("etcd TLS client configuration could not be built")]
     TlsSetup,

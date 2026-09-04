@@ -19,8 +19,8 @@
 //! nameservers — never the system resolver for the target host. It is a pure
 //! state machine over an injectable [`DnsTransport`] and an injectable [`Clock`]
 //! so it can be exhaustively unit-tested with a fake nameserver returning raw
-//! bytes and a manually advanced clock; the real socket transport arrives in a
-//! later slice.
+//! bytes and a manually advanced clock. The production socket transport lives in
+//! [`crate::dns_transport`].
 //!
 //! hickory-proto is used strictly as the DNS wire codec (building/encoding a
 //! query [`Message`] and decoding responses). Compression pointers, label
@@ -132,8 +132,8 @@ pub trait UdpExchange: Send {
 }
 
 /// The injectable DNS transport: UDP send/receive, TCP exchange, and nameserver
-/// hostname bootstrap. Production wires real sockets in a later slice; tests
-/// substitute a fake nameserver returning raw bytes.
+/// hostname bootstrap. Production wires real sockets in [`crate::dns_transport`];
+/// tests substitute a fake nameserver returning raw bytes.
 pub trait DnsTransport: Send + Sync + 'static {
     /// Sends `query` to `server` over a connected UDP socket and yields a handle
     /// the resolver receives replies from.

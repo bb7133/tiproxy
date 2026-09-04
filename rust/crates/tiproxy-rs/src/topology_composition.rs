@@ -481,8 +481,8 @@ mod advanced_tls_wiring {
     use std::convert::Infallible;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
@@ -496,7 +496,8 @@ mod advanced_tls_wiring {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::service::TowerToHyperService;
     use rustls::ServerConfig;
-    use rustls::server::WebPkiClientVerifier;
+    use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+    use rustls::sign::CertifiedKey;
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use tokio::net::{TcpListener, TcpStream};
@@ -577,6 +578,9 @@ mod advanced_tls_wiring {
         expected_key: Vec<u8>,
         response_value: Vec<u8>,
         range_calls: Arc<AtomicUsize>,
+        /// The first request's HTTP/2 `:authority`, recorded for the logical-host
+        /// identity row; other rows leave it unread.
+        authority: Arc<Mutex<Option<String>>>,
     }
 
     /// The `Range` unary handler: it decodes the request, asserts the key,
@@ -632,6 +636,15 @@ mod advanced_tls_wiring {
         }
 
         fn call(&mut self, request: http::Request<Incoming>) -> Self::Future {
+            if let Some(authority) = request.uri().authority() {
+                let mut slot = self
+                    .authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.is_none() {
+                    *slot = Some(authority.to_string());
+                }
+            }
             let fixture = self.clone();
             Box::pin(async move {
                 let response = if request.uri().path() == RANGE_PATH {
@@ -666,10 +679,12 @@ mod advanced_tls_wiring {
         response
     }
 
-    /// A running fixture: its bound address and the shared `Range` counter.
+    /// A running fixture: its bound address, the shared `Range` counter, and the
+    /// captured `:authority` of the first request.
     struct Fixture {
         addr: SocketAddr,
         range_calls: Arc<AtomicUsize>,
+        authority: Arc<Mutex<Option<String>>>,
     }
 
     /// Binds a loopback listener and serves the single-route KV adapter over each
@@ -681,10 +696,12 @@ mod advanced_tls_wiring {
         response_value: &[u8],
     ) -> Fixture {
         let range_calls = Arc::new(AtomicUsize::new(0));
+        let authority = Arc::new(Mutex::new(None));
         let fixture = KvFixture {
             expected_key: expected_key.to_vec(),
             response_value: response_value.to_vec(),
             range_calls: Arc::clone(&range_calls),
+            authority: Arc::clone(&authority),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         tokio::spawn(async move {
@@ -709,7 +726,11 @@ mod advanced_tls_wiring {
         let addr = rx
             .recv()
             .unwrap_or_else(|error| unreachable!("fixture bind: {error}"));
-        Fixture { addr, range_calls }
+        Fixture {
+            addr,
+            range_calls,
+            authority,
+        }
     }
 
     /// Feeds one accepted connection (plain or after a TLS handshake) into the
@@ -1292,6 +1313,275 @@ ns-servers = []
             fixture.range_calls.load(Ordering::SeqCst),
             0,
             "no request ever reached the server"
+        );
+    }
+
+    // ----- Rows 7 & 8: explicit-nameserver resolution in the KV pipeline -----
+
+    /// A running loopback UDP nameserver. tiproxy-rs carries no DNS dependency, so
+    /// the wire codec is hand-rolled: every `A` query is answered `127.0.0.1` and
+    /// every other qtype (the concurrent `AAAA`) is NODATA. Observed `A` queries
+    /// are counted so a row can prove the target went through this nameserver.
+    struct LoopbackDns {
+        /// The read-back UDP port the cluster's `ns-servers` point at.
+        port: u16,
+        /// Observed `A` queries.
+        a_queries: Arc<AtomicUsize>,
+    }
+
+    /// Parses a query into `(id, qtype, question_bytes)`; the question section
+    /// begins at offset 12 and is echoed verbatim into the response.
+    fn parse_dns_query(buffer: &[u8]) -> Option<(u16, u16, &[u8])> {
+        if buffer.len() < 12 {
+            return None;
+        }
+        let id = u16::from_be_bytes([buffer[0], buffer[1]]);
+        let mut cursor = 12;
+        loop {
+            let label_len = usize::from(*buffer.get(cursor)?);
+            if label_len == 0 {
+                break;
+            }
+            cursor += 1 + label_len;
+        }
+        // `cursor` indexes the zero-length root label; QTYPE/QCLASS follow it.
+        let qtype = u16::from_be_bytes([*buffer.get(cursor + 1)?, *buffer.get(cursor + 2)?]);
+        let question_end = cursor + 5;
+        if question_end > buffer.len() {
+            return None;
+        }
+        Some((id, qtype, &buffer[12..question_end]))
+    }
+
+    /// Builds an authoritative response echoing the question. An `A` query
+    /// (qtype 1) carries one `127.0.0.1` answer; anything else is NODATA.
+    fn build_dns_response(id: u16, qtype: u16, question: &[u8]) -> Vec<u8> {
+        const QTYPE_A: u16 = 1;
+        let mut out = Vec::with_capacity(28 + question.len());
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&[0x84, 0x00]); // QR=1, AA=1, RCODE=NoError
+        out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        out.extend_from_slice(&u16::from(qtype == QTYPE_A).to_be_bytes()); // ANCOUNT
+        out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        out.extend_from_slice(question);
+        if qtype == QTYPE_A {
+            out.extend_from_slice(&[0xC0, 0x0C]); // NAME: pointer to the question
+            out.extend_from_slice(&QTYPE_A.to_be_bytes()); // TYPE A
+            out.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+            out.extend_from_slice(&30u32.to_be_bytes()); // TTL
+            out.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+            out.extend_from_slice(&[127, 0, 0, 1]); // RDATA 127.0.0.1
+        }
+        out
+    }
+
+    /// Binds the loopback nameserver on `127.0.0.1:0` and detaches its loop.
+    async fn spawn_loopback_dns() -> LoopbackDns {
+        use std::net::Ipv4Addr;
+        use tokio::net::UdpSocket;
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|error| unreachable!("bind dns: {error}"));
+        let port = socket
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("dns addr: {error}"))
+            .port();
+        let a_queries = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&a_queries);
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 2048];
+            loop {
+                let Ok((len, src)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                let Some((id, qtype, question)) = parse_dns_query(&buffer[..len]) else {
+                    continue;
+                };
+                if qtype == 1 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                let response = build_dns_response(id, qtype, question);
+                let _ = socket.send_to(&response, src).await;
+            }
+        });
+        LoopbackDns { port, a_queries }
+    }
+
+    /// Like [`topology_toml`] but with explicit `ns-servers` on the cluster.
+    fn topology_toml_ns(pd_addrs: &str, ns_servers: &str, cluster_tls: &str) -> Vec<u8> {
+        format!(
+            r#"
+[proxy]
+addr = "0.0.0.0:6000"
+max-connections = 100
+
+[api]
+addr = "0.0.0.0:10080"
+
+[[proxy.backend-clusters]]
+name = "cluster-a"
+pd-addrs = "{pd_addrs}"
+ns-servers = [{ns_servers}]
+{cluster_tls}
+"#
+        )
+        .into_bytes()
+    }
+
+    /// A self-signed server certificate (PEM chain + key) with `hostname` in SAN.
+    fn self_signed_server_cert(hostname: &str) -> (String, String) {
+        let mut params = rcgen::CertificateParams::new(vec![hostname.to_owned()])
+            .unwrap_or_else(|error| unreachable!("cert params: {error}"));
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2100, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap_or_else(|error| unreachable!("key: {error}"));
+        let certificate = params
+            .self_signed(&key)
+            .unwrap_or_else(|error| unreachable!("self-signed: {error}"));
+        (certificate.pem(), key.serialize_pem())
+    }
+
+    /// A server certificate resolver that records the observed `ClientHello` SNI.
+    struct SniRecorder {
+        observed: Arc<Mutex<Option<String>>>,
+        certified: Arc<CertifiedKey>,
+    }
+
+    impl std::fmt::Debug for SniRecorder {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("SniRecorder")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ResolvesServerCert for SniRecorder {
+        fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            *self
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                client_hello.server_name().map(str::to_owned);
+            Some(Arc::clone(&self.certified))
+        }
+    }
+
+    /// Builds a TLS acceptor whose resolver records the negotiated SNI.
+    fn sni_recording_acceptor(
+        cert_pem: &str,
+        key_pem: &str,
+        observed: Arc<Mutex<Option<String>>>,
+    ) -> TlsAcceptor {
+        let certificate = CertificateDer::from_pem_slice(cert_pem.as_bytes())
+            .unwrap_or_else(|error| unreachable!("cert: {error}"))
+            .into_owned();
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .unwrap_or_else(|error| unreachable!("key: {error}"));
+        let signing = rustls::crypto::ring::sign::any_supported_type(&key)
+            .unwrap_or_else(|error| unreachable!("signing key: {error}"));
+        let certified = Arc::new(CertifiedKey::new(vec![certificate], signing));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(rustls::ALL_VERSIONS)
+            .unwrap_or_else(|error| unreachable!("server versions: {error}"))
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SniRecorder {
+                observed,
+                certified,
+            }));
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    // ----- Row 7: system-DNS-unresolvable target reached via explicit NS -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn row7_target_resolves_through_the_explicit_nameserver() {
+        let fixture = spawn_fixture(None, KEY, VALUE);
+        let dns = spawn_loopback_dns().await;
+        let dir = material_dir("row7");
+        // `etcd.invalid` never resolves through the system resolver (RFC 6761), so
+        // the only path to the fixture is the explicit loopback nameserver.
+        let toml = topology_toml_ns(
+            &format!("etcd.invalid:{}", fixture.addr.port()),
+            &format!("\"127.0.0.1:{}\"", dns.port),
+            "",
+        );
+        let config = single_client(&toml, &dir);
+
+        let (_registry, lease) = owner();
+        let Ok(response) = connect_and_get(config, &lease, KEY).await else {
+            unreachable!("the get must succeed via the explicit nameserver");
+        };
+        assert_known_pair(&response, KEY, VALUE);
+        assert_eq!(fixture.range_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            dns.a_queries.load(Ordering::SeqCst) >= 1,
+            "the explicit nameserver received the target's A query"
+        );
+    }
+
+    // ----- Row 8: logical host drives SNI + :authority, never the resolved IP -
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn row8_logical_host_drives_sni_and_authority_not_the_resolved_ip() {
+        let (cert_pem, key_pem) = self_signed_server_cert("etcd.internal");
+        let observed_sni = Arc::new(Mutex::new(None));
+        let acceptor = sni_recording_acceptor(&cert_pem, &key_pem, Arc::clone(&observed_sni));
+        let fixture = spawn_fixture(Some(acceptor), KEY, VALUE);
+        let dns = spawn_loopback_dns().await;
+        let dir = material_dir("row8");
+        // The explicit nameserver maps the logical host `etcd.internal` to
+        // 127.0.0.1, but the logical host must remain the SNI and :authority.
+        let toml = topology_toml_ns(
+            &format!("etcd.internal:{}", fixture.addr.port()),
+            &format!("\"127.0.0.1:{}\"", dns.port),
+            "[security.cluster-tls]\nskip-ca = true",
+        );
+        let config = single_client(&toml, &dir);
+        assert!(
+            config
+                .tls_policy()
+                .is_some_and(|policy| policy.skip_ca_verification),
+            "skip-ca upgrades this cluster to TLS"
+        );
+
+        let (_registry, lease) = owner();
+        let Ok(response) = connect_and_get(config, &lease, KEY).await else {
+            unreachable!("the TLS get must succeed via the explicit nameserver");
+        };
+        assert_known_pair(&response, KEY, VALUE);
+        assert_eq!(fixture.range_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            dns.a_queries.load(Ordering::SeqCst) >= 1,
+            "the explicit nameserver resolved etcd.internal"
+        );
+
+        let sni = observed_sni
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            sni.as_deref(),
+            Some("etcd.internal"),
+            "the ClientHello SNI is the logical host, not the resolved IP"
+        );
+
+        let authority = fixture
+            .authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let authority =
+            authority.unwrap_or_else(|| unreachable!("the server recorded an :authority"));
+        assert!(
+            authority.contains("etcd.internal"),
+            "the HTTP/2 :authority is the logical host: {authority}"
+        );
+        assert!(
+            !authority.contains("127.0.0.1"),
+            "the HTTP/2 :authority is never the resolved IP: {authority}"
         );
     }
 }
