@@ -220,6 +220,11 @@ impl EtcdTlsConfig {
             &self.policy,
         )
     }
+
+    /// Returns the explicit TLS server-name override used for SNI, if set.
+    pub(crate) fn domain_name(&self) -> Option<&str> {
+        self.domain_name.as_deref()
+    }
 }
 
 /// Validated production connection policy shared by later control modules.
@@ -307,6 +312,32 @@ impl EtcdClientConfig {
     #[must_use]
     pub const fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    /// Returns the whole-connection establishment budget for the custom
+    /// transport (single DNS + TCP + TLS deadline per endpoint).
+    pub(crate) const fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Returns the HTTP/2 keepalive ping interval for the custom transport.
+    pub(crate) const fn keep_alive_interval(&self) -> Duration {
+        self.keep_alive_interval
+    }
+
+    /// Returns the HTTP/2 keepalive ping timeout for the custom transport.
+    pub(crate) const fn keep_alive_timeout(&self) -> Duration {
+        self.keep_alive_timeout
+    }
+
+    /// Returns the TCP keepalive idle time applied to each dialed socket.
+    pub(crate) const fn tcp_keep_alive(&self) -> Duration {
+        self.tcp_keep_alive
+    }
+
+    /// Returns the validated TLS material and policy, if TLS is configured.
+    pub(crate) fn tls(&self) -> Option<&EtcdTlsConfig> {
+        self.tls.as_ref()
     }
 
     fn connect_options(&self) -> ConnectOptions {
