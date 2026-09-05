@@ -42,6 +42,7 @@ mod module;
 mod register;
 mod registrar;
 mod resolver;
+mod routing_snapshot;
 
 pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
 pub use discovery_publish::{DiscoveryError, DiscoveryHandle, EpochResult};
@@ -60,4 +61,8 @@ pub use register::{
 pub use registrar::{RegistrarError, run};
 pub use resolver::{
     AdvertiseEndpointResolver, InterfaceAdvertiseResolver, StaticAdvertiseResolver,
+};
+pub use routing_snapshot::{
+    GenerationOverflow, PublishOutcome, RoutingSnapshot, RoutingSnapshotHandle,
+    RoutingSnapshotPublisher, RoutingSourceClosed,
 };
