@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 mod discovery;
+mod merge;
 mod model;
 mod module;
 mod register;
@@ -42,6 +43,9 @@ mod registrar;
 mod resolver;
 
 pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
+pub use merge::{
+    ClusterTopologyFetch, MergedBackend, MergedTopology, TopologyUnavailable, merge_tidb_topology,
+};
 pub use model::{BackendInfo, PrometheusInfo, TopologySnapshot, parse_tidb_topology};
 pub use module::{
     RejectionClass, TopologyClientFactory, TopologyClusterClient, TopologyModule,
