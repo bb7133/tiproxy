@@ -130,7 +130,7 @@ impl PrometheusFetch for ConnectionFetch<'_> {
     }
 
     fn owner_is_current(&self) -> bool {
-        self.0.owner_is_current()
+        self.0.is_current()
     }
 }
 

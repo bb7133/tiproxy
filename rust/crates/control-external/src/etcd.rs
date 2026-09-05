@@ -19,6 +19,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use control_plane::OwnerToken;
@@ -593,14 +594,64 @@ impl EtcdConnector {
         Ok(EtcdConnection {
             owner: self.owner.clone(),
             client,
+            gate: None,
         })
     }
 }
 
-/// An etcd client that cannot be borrowed after its owner becomes stale.
+/// A revocable generation gate an [`EtcdConnection`] can carry in addition to its
+/// process [`OwnerToken`].
+///
+/// The `OwnerToken` isolates process owners but not successive configuration
+/// generations inside one process. A caller that reuses one long-lived channel
+/// across configuration generations installs this gate on the connections it
+/// hands out and revokes it when that generation is retired, so an in-flight
+/// operation on a retired generation is fenced even while the process owner is
+/// still current.
+///
+/// `Default` is hand-written to equal [`GenerationGate::new`] (a **live** gate);
+/// it is deliberately NOT derived, because a derived `Default` would build from
+/// `AtomicBool::default() == false` and be born already revoked (rejecting all
+/// I/O).
+#[derive(Clone, Debug)]
+pub struct GenerationGate {
+    live: Arc<AtomicBool>,
+}
+
+impl Default for GenerationGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GenerationGate {
+    /// Creates a live gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Revokes the gate. Every connection carrying it is retired at once, and any
+    /// in-flight operation is fenced at its next ownership check.
+    pub fn revoke(&self) {
+        self.live.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the gate is still live.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
+    }
+}
+
+/// An etcd client that cannot be borrowed after its owner — or its optional
+/// generation gate — becomes stale.
 pub struct EtcdConnection {
     owner: OwnerToken,
     client: Client,
+    gate: Option<GenerationGate>,
 }
 
 impl EtcdConnection {
@@ -623,24 +674,50 @@ impl EtcdConnection {
             Box<dyn Future<Output = Result<T, etcd_client::Error>> + Send + 'client>,
         >,
     {
-        if !self.owner.is_current() {
+        if !self.is_current() {
             return Err(EtcdOperationError::StaleOwner);
         }
         let result = operation(&mut self.client).await;
-        if !self.owner.is_current() {
+        if !self.is_current() {
             return Err(EtcdOperationError::StaleOwner);
         }
         result.map_err(EtcdOperationError::Dependency)
     }
 
-    /// Whether the owner generation that produced this connection is still
-    /// current. Callers that impose their own deadline around an operation (which
-    /// drops the [`Self::execute`] future before its post-await fence can run)
-    /// use this to re-check ownership in their timeout branch, so a retired
-    /// generation is not mistaken for a plain timeout.
+    /// Whether this connection is still authorized to issue I/O: its process
+    /// owner is current AND its optional generation gate (if any) is still live.
+    ///
+    /// Callers that impose their own deadline around an operation (which drops
+    /// the [`Self::execute`] future before its post-await fence can run) use this
+    /// to re-check authorization in their timeout branch, so a retired owner or a
+    /// revoked generation is not mistaken for a plain timeout.
     #[must_use]
-    pub fn owner_is_current(&self) -> bool {
-        self.owner.is_current()
+    pub fn is_current(&self) -> bool {
+        self.owner.is_current() && self.gate.as_ref().is_none_or(GenerationGate::is_live)
+    }
+
+    /// Clones this connection, sharing the same long-lived channel (so DNS
+    /// cache, load balancing, and backoff state are preserved) and the same
+    /// owner and generation gate.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        Self {
+            owner: self.owner.clone(),
+            client: self.client.clone(),
+            gate: self.gate.clone(),
+        }
+    }
+
+    /// Clones this connection under a generation gate: the fork shares the same
+    /// long-lived channel and owner but is additionally retired the moment
+    /// `gate` is revoked, even while the process owner remains current.
+    #[must_use]
+    pub fn fork_with_gate(&self, gate: GenerationGate) -> Self {
+        Self {
+            owner: self.owner.clone(),
+            client: self.client.clone(),
+            gate: Some(gate),
+        }
     }
 }
 
@@ -729,7 +806,29 @@ mod tests {
 
     use control_plane::{OwnerScope, OwnershipRegistry};
 
-    use super::{EtcdClientConfig, EtcdConfigError, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion};
+    use super::{
+        EtcdClientConfig, EtcdConfigError, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion,
+        GenerationGate,
+    };
+
+    #[test]
+    fn a_new_generation_gate_is_live_and_revoke_propagates_to_clones() {
+        let gate = GenerationGate::new();
+        assert!(gate.is_live(), "a fresh gate is live");
+        assert!(
+            GenerationGate::default().is_live(),
+            "the hand-written Default is a live gate, not a born-revoked one"
+        );
+        let clone = gate.clone();
+        assert!(clone.is_live());
+        // Revoking either handle retires all clones (shared flag).
+        gate.revoke();
+        assert!(!gate.is_live());
+        assert!(
+            !clone.is_live(),
+            "revoke propagates to a clone sharing the gate"
+        );
+    }
 
     #[test]
     fn endpoints_are_bounded_normalized_and_tls_consistent() {

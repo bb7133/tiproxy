@@ -1622,3 +1622,431 @@ ns-servers = [{ns_servers}]
         );
     }
 }
+
+/// Same-epoch discovery wiring: the real pipeline
+/// `TopologyCandidateValidator -> ArtifactClusterFactory -> TopologyModule ->
+/// DiscoveryHandle` must surface a discovered `TiDB` backend AND the seeded
+/// Prometheus endpoint at the SAME source client epoch.
+///
+/// The fixture is the same hand-rolled single-route tonic etcd v3 `KV.Range`
+/// adapter used elsewhere, but with real prefix-range semantics (mirroring
+/// `control-topology/tests/prometheus_etcd.rs`): an empty `range_end` is an
+/// exact get, otherwise a half-open `key <= k < range_end`, sorted ascending.
+/// It serves the `/topology/tidb/` + `/keyspaces/tidb/` topology reads and the
+/// `/topology/prometheus` read from one seeded key space, so both discovery
+/// polls resolve against the exact same published epoch's connection.
+///
+/// The module is driven through its real self-registration path: the registrar
+/// child retries harmlessly against a Range-only fixture (its lease `Grant`/`Put`
+/// are `unimplemented`), and because that child only exits on owner loss, its
+/// failing writes never fail the module — it stays ready and its discovery
+/// publication is live.
+#[cfg(test)]
+mod discovery_same_epoch {
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use control_config::{ConfigNamespaceSource, ConfigNamespaceStore, TopologyRuntimeIdentity};
+    use control_plane::{
+        ControlConfig, ControlModule, ControlRuntime, EventSink, LogLevel, MetricsPolicy,
+        OwnershipRegistry, RuntimeEvent, TlsPolicy,
+    };
+    use control_topology::{StaticAdvertiseResolver, TopologyModule};
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::service::TowerToHyperService;
+    use tokio::net::{TcpListener, TcpStream};
+    use tonic::codegen::{BoxFuture, Context, Poll, Service, http};
+    use tonic::server::{Grpc, NamedService, UnaryService};
+    use tonic_prost::ProstCodec;
+
+    use super::{ArtifactClusterFactory, TopologyCandidateValidator};
+    use crate::tls_material::open_tls_roots;
+
+    /// The etcd v3 `Range` unary gRPC method path the pinned client calls.
+    const RANGE_PATH: &str = "/etcdserverpb.KV/Range";
+    /// The gRPC service name the pinned client routes against.
+    const KV_SERVICE_NAME: &str = "etcdserverpb.KV";
+    /// The backend cluster name shared by the config, the discovery poll, and the
+    /// Prometheus poll.
+    const CLUSTER_NAME: &str = "cluster-a";
+    /// The seeded `TiDB` backend's SQL address (its `/topology/tidb/<addr>` key).
+    const TIDB_ADDR: &str = "10.0.0.9:4000";
+
+    // ----- Wire-compatible etcd v3 messages (etcd 0.20.0 field tags) --------
+
+    /// `etcdserverpb.RangeRequest`: both `key` (tag 1) and `range_end` (tag 2)
+    /// are read so the fixture evaluates real range semantics.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct RangeRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        key: Vec<u8>,
+        #[prost(bytes = "vec", tag = "2")]
+        range_end: Vec<u8>,
+    }
+
+    /// `etcdserverpb.ResponseHeader`.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct ResponseHeader {
+        #[prost(uint64, tag = "1")]
+        cluster_id: u64,
+        #[prost(uint64, tag = "2")]
+        member_id: u64,
+        #[prost(int64, tag = "3")]
+        revision: i64,
+        #[prost(uint64, tag = "4")]
+        raft_term: u64,
+    }
+
+    /// `mvccpb.KeyValue`.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct KeyValue {
+        #[prost(bytes = "vec", tag = "1")]
+        key: Vec<u8>,
+        #[prost(int64, tag = "2")]
+        create_revision: i64,
+        #[prost(int64, tag = "3")]
+        mod_revision: i64,
+        #[prost(int64, tag = "4")]
+        version: i64,
+        #[prost(bytes = "vec", tag = "5")]
+        value: Vec<u8>,
+        #[prost(int64, tag = "6")]
+        lease: i64,
+    }
+
+    /// `etcdserverpb.RangeResponse`.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct RangeResponse {
+        #[prost(message, optional, tag = "1")]
+        header: Option<ResponseHeader>,
+        #[prost(message, repeated, tag = "2")]
+        kvs: Vec<KeyValue>,
+        #[prost(bool, tag = "3")]
+        more: bool,
+        #[prost(int64, tag = "4")]
+        count: i64,
+    }
+
+    // ----- The single-route etcd v3 KV fixture with real range semantics ----
+
+    /// Shared fixture state: the seeded key/value pairs the `Range` handler
+    /// filters with real prefix-range semantics.
+    #[derive(Clone)]
+    struct KvFixture {
+        seeded: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
+    }
+
+    /// Evaluates enough etcd `Range` semantics for the pipeline: an empty
+    /// `range_end` is an exact get (`k == key`), otherwise a half-open range
+    /// (`key <= k < range_end`). Matches are returned ascending by key.
+    fn range_scan(
+        seeded: &[(Vec<u8>, Vec<u8>)],
+        key: &[u8],
+        range_end: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut hits: Vec<(Vec<u8>, Vec<u8>)> = seeded
+            .iter()
+            .filter(|(k, _)| {
+                if range_end.is_empty() {
+                    k.as_slice() == key
+                } else {
+                    k.as_slice() >= key && k.as_slice() < range_end
+                }
+            })
+            .cloned()
+            .collect();
+        hits.sort_by(|(a, _), (b, _)| a.cmp(b));
+        hits
+    }
+
+    /// The `Range` unary handler: it answers the seeded key/values selected by
+    /// real range semantics, ascending by key.
+    struct RangeHandler {
+        fixture: KvFixture,
+    }
+
+    impl UnaryService<RangeRequest> for RangeHandler {
+        type Response = RangeResponse;
+        type Future = BoxFuture<tonic::Response<RangeResponse>, tonic::Status>;
+
+        fn call(&mut self, request: tonic::Request<RangeRequest>) -> Self::Future {
+            let fixture = self.fixture.clone();
+            Box::pin(async move {
+                let message = request.into_inner();
+                let matches = range_scan(&fixture.seeded, &message.key, &message.range_end);
+                let count = i64::try_from(matches.len()).unwrap_or(i64::MAX);
+                let kvs = matches
+                    .into_iter()
+                    .map(|(key, value)| KeyValue {
+                        key,
+                        value,
+                        ..KeyValue::default()
+                    })
+                    .collect();
+                let header = ResponseHeader {
+                    cluster_id: 7,
+                    member_id: 11,
+                    revision: 42,
+                    raft_term: 3,
+                };
+                Ok(tonic::Response::new(RangeResponse {
+                    header: Some(header),
+                    kvs,
+                    more: false,
+                    count,
+                }))
+            })
+        }
+    }
+
+    /// The `Range` route uses a prost codec; any other path (the registrar's
+    /// lease `Grant`/`Put`) returns tonic's `unimplemented` reply, so the child
+    /// retries harmlessly without ever fixing a write.
+    impl Service<http::Request<Incoming>> for KvFixture {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Infallible>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<Incoming>) -> Self::Future {
+            let fixture = self.clone();
+            Box::pin(async move {
+                let response = if request.uri().path() == RANGE_PATH {
+                    let mut grpc = Grpc::new(ProstCodec::<RangeResponse, RangeRequest>::default());
+                    grpc.unary(RangeHandler { fixture }, request).await
+                } else {
+                    unimplemented_reply()
+                };
+                Ok(response)
+            })
+        }
+    }
+
+    impl NamedService for KvFixture {
+        const NAME: &'static str = KV_SERVICE_NAME;
+    }
+
+    /// The `unimplemented` gRPC reply for an unrouted path: HTTP 200 with a
+    /// `grpc-status: 12` header and the gRPC content type.
+    fn unimplemented_reply() -> http::Response<tonic::body::Body> {
+        let mut response = http::Response::new(tonic::body::Body::default());
+        let headers = response.headers_mut();
+        headers.insert(
+            tonic::Status::GRPC_STATUS,
+            http::HeaderValue::from_static("12"),
+        );
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            tonic::metadata::GRPC_CONTENT_TYPE,
+        );
+        response
+    }
+
+    /// Binds a loopback listener and serves the single-route KV adapter over each
+    /// accepted plaintext connection. The accept loop is detached; the test
+    /// process bounds its lifetime.
+    async fn spawn_fixture(seeded: Vec<(Vec<u8>, Vec<u8>)>) -> Option<SocketAddr> {
+        let fixture = KvFixture {
+            seeded: Arc::new(seeded),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let addr = listener.local_addr().ok()?;
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(serve_connection(stream, fixture.clone()));
+            }
+        });
+        Some(addr)
+    }
+
+    /// Feeds one accepted plaintext connection into the single-route KV adapter
+    /// via hyper's HTTP/2 server, so tonic owns the gRPC framing and trailers.
+    async fn serve_connection(stream: TcpStream, fixture: KvFixture) {
+        let service = TowerToHyperService::new(fixture);
+        let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        let _ = builder
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    }
+
+    fn kv(key: &str, value: &str) -> (Vec<u8>, Vec<u8>) {
+        (key.as_bytes().to_vec(), value.as_bytes().to_vec())
+    }
+
+    /// An `EventSink` that drops every event, keeping test output clean.
+    struct NullSink;
+    impl EventSink for NullSink {
+        fn record(&self, _event: &RuntimeEvent) {}
+    }
+
+    fn identity() -> TopologyRuntimeIdentity {
+        TopologyRuntimeIdentity {
+            version: Arc::from("v-test"),
+            git_hash: Arc::from("hash-test"),
+            deploy_path: PathBuf::from("/deploy/test"),
+            start_timestamp: 1_700_000_000,
+        }
+    }
+
+    /// A fresh, unique temp directory used as both the TLS root and the config
+    /// current directory.
+    fn material_dir() -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cptopo-same-epoch-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|error| unreachable!("mkdir: {error}"));
+        dir
+    }
+
+    /// A one-backend-cluster topology TOML whose PD points at the fixture,
+    /// plaintext (no `security.cluster-tls`).
+    fn topology_toml(pd_addrs: &str) -> Vec<u8> {
+        format!(
+            r#"
+[proxy]
+addr = "0.0.0.0:6000"
+max-connections = 100
+
+[api]
+addr = "0.0.0.0:10080"
+
+[[proxy.backend-clusters]]
+name = "{CLUSTER_NAME}"
+pd-addrs = "{pd_addrs}"
+ns-servers = []
+"#
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tidb_and_prometheus_discovery_share_the_source_epoch() {
+        let body = async {
+            // One key space serves both the TiDB topology (info + a live ttl
+            // sibling) and the Prometheus endpoint, so both polls read the same
+            // published epoch's connection.
+            let seeded = vec![
+                kv(
+                    &format!("/topology/tidb/{TIDB_ADDR}/info"),
+                    r#"{"ip":"10.0.0.9","status_port":10080,"version":"v8","git_hash":"abc","deploy_path":"/d","start_timestamp":42,"labels":{"zone":"z1"}}"#,
+                ),
+                kv(&format!("/topology/tidb/{TIDB_ADDR}/ttl"), "173000000000"),
+                kv("/topology/prometheus/x", r#"{"ip":"1.2.3.4","port":9090}"#),
+            ];
+            let Some(addr) = spawn_fixture(seeded).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+
+            // The REAL pipeline: validator -> factory -> module. The config's PD
+            // points at the fixture; validation prepares the plaintext client set,
+            // the factory downcasts it, and the module publishes epoch 0.
+            let dir = material_dir();
+            let toml = topology_toml(&format!("127.0.0.1:{}", addr.port()));
+            let roots = open_tls_roots(std::slice::from_ref(&dir));
+            let store = ConfigNamespaceStore::from_toml_with_validator(
+                &toml,
+                None,
+                &dir,
+                Arc::new(TopologyCandidateValidator::new(Arc::new(roots))),
+            )
+            .unwrap_or_else(|error| unreachable!("pipeline validation: {error}"));
+
+            let registry = Box::leak(Box::new(OwnershipRegistry::new()));
+            let config = ControlConfig::new(
+                1,
+                Duration::from_secs(30),
+                0,
+                TlsPolicy::default(),
+                LogLevel::Info,
+                MetricsPolicy::default(),
+            )
+            .unwrap_or_else(|error| unreachable!("control config: {error}"));
+            let runtime = ControlRuntime::claim_process(
+                registry,
+                "cptopo-same-epoch",
+                config,
+                Arc::new(NullSink),
+            )
+            .unwrap_or_else(|error| unreachable!("claim process: {error}"));
+
+            let source: Arc<dyn ConfigNamespaceSource> = Arc::new(store);
+            let (module, mut handle) = TopologyModule::new(
+                source,
+                Box::new(ArtifactClusterFactory),
+                Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+                identity(),
+            );
+            let context = runtime.handle().module_context();
+            runtime
+                .mark_ready()
+                .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
+            let task = tokio::spawn(Box::new(module).run(context));
+
+            // The registrar child cannot write to a Range-only fixture, but that
+            // never fails the module: readiness means the plan's children are
+            // installed and the discovery epoch is published.
+            handle
+                .wait_ready()
+                .await
+                .unwrap_or_else(|error| unreachable!("module ready: {error}"));
+            assert!(
+                !task.is_finished(),
+                "the module stays ready despite the registrar retrying its writes"
+            );
+
+            let discovery = handle.discovery_handle();
+
+            // TiDB discovery: the real merged-topology poll finds the seeded,
+            // liveness-gated backend under this cluster.
+            let merged = discovery
+                .poll_merged_topology()
+                .await
+                .unwrap_or_else(|error| unreachable!("merged topology poll: {error:?}"));
+            assert_eq!(merged.value.backends.len(), 1, "one backend is discovered");
+            let backend = &merged.value.backends[0];
+            assert_eq!(backend.cluster_name.as_ref(), CLUSTER_NAME);
+            assert_eq!(backend.backend.addr, TIDB_ADDR);
+            assert_eq!(backend.backend.ip, "10.0.0.9");
+            assert_eq!(backend.backend.status_port, 10080);
+
+            // Prometheus discovery: the real prometheus poll on the SAME cluster
+            // finds the seeded endpoint.
+            let prom = discovery
+                .poll_prometheus(CLUSTER_NAME)
+                .await
+                .unwrap_or_else(|error| unreachable!("prometheus poll: {error:?}"));
+            assert_eq!(prom.value.ip, "1.2.3.4");
+            assert_eq!(prom.value.port, 9090);
+
+            // The load-bearing assertion: both reads came from the same source
+            // client epoch, so a consumer can never mix two epochs' data.
+            assert_eq!(
+                merged.client_epoch, prom.client_epoch,
+                "the TiDB and Prometheus discovery reads share one source epoch"
+            );
+
+            task.abort();
+        };
+        if tokio::time::timeout(Duration::from_secs(5), body)
+            .await
+            .is_err()
+        {
+            unreachable!("the same-epoch discovery pipeline completes within the deadline");
+        }
+    }
+}

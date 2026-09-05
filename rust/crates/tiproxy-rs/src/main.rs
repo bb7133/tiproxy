@@ -475,11 +475,12 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("initialize config owner: {error}"))
             .await);
     }
-    // CP-TOPO self-registration comes online before any SQL admission: register
-    // this instance's SQL topology, then wait for its initial registration plan
-    // and children to be installed. "Ready" here means the plan's children are
-    // installed, not that PD has acknowledged the registration or that a
-    // discovery snapshot has been published.
+    // CP-TOPO self-registration and discovery publication come online before any
+    // SQL admission: register this instance's SQL topology and publish the
+    // initial discovery generation, then wait for both to be installed. "Ready"
+    // here means the registration children are installed and the initial
+    // discovery set is published, not that PD has acknowledged the registration or
+    // that any topology has yet been fetched through the discovery handle.
     let topology_identity = TopologyRuntimeIdentity {
         version: Arc::from(VERSION),
         git_hash: Arc::from(COMMIT),
