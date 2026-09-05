@@ -12,17 +12,28 @@ default = []
 
 [dependencies]
 control-plane.workspace = true
-etcd-client.workspace = true
+etcd-client = { workspace = true, features = ["raw-channel"] }
 futures-util.workspace = true
+getrandom.workspace = true
+hickory-proto = { version = "=0.26.2", default-features = false }
 http.workspace = true
+hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"] }
 prost.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+tower = { version = "=0.5.3", default-features = false, features = ["balance", "buffer", "util"] }
+x509-parser.workspace = true
 
 [dev-dependencies]
+h2 = "=0.4.19"
+rcgen.workspace = true
 serde_json.workspace = true
 
 [lints]

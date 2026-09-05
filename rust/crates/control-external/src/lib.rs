@@ -22,9 +22,13 @@
 #![forbid(unsafe_code)]
 
 pub mod dns;
+mod dns_transport;
 pub mod etcd;
+pub mod explicit_dns;
 pub mod http;
 pub mod retry;
+mod tls;
+mod transport;
 
 /// Minimal wire-compatible `kvproto` diagnostics service binding.
 #[allow(
@@ -40,8 +44,8 @@ pub mod diagnostics {
 
 pub use dns::{DnsError, DnsResolver, MAX_RESOLVED_ADDRESSES};
 pub use etcd::{
-    EtcdClientConfig, EtcdConfigError, EtcdConnectError, EtcdConnection, EtcdConnector,
-    EtcdOperationError, EtcdTlsConfig,
+    EtcdClientConfig, EtcdConfigError, EtcdConnectError, EtcdConnectSource, EtcdConnection,
+    EtcdConnector, EtcdOperationError, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion,
 };
 pub use http::{BoundedHttpClient, HttpClientConfig, HttpConfigError, HttpError, HttpTlsConfig};
 pub use retry::{RetryDecision, RetryError, RetryPolicy, RetryPolicyError, retry_bounded};

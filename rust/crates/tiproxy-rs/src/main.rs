@@ -18,9 +18,12 @@
 
 mod config_composition;
 mod health;
+mod startup;
+mod tls_material;
+mod topology_composition;
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,28 +33,35 @@ use config_composition::{
 };
 use control_config::{
     ConfigModule, ConfigModuleHandle, ConfigModuleOptions, ConfigNamespaceSource,
+    TopologyRuntimeIdentity,
 };
 use control_etcd::ElectionConfig;
 use control_external::{EtcdClientConfig, EtcdTlsConfig};
 use control_plane::{
-    ConfigSource, ControlModuleSet, ControlRuntime as InProcessControlRuntime, JsonStderrSink,
-    LifecyclePhase, OwnershipRegistry, ShutdownReason,
+    ConfigSource, ControlModule, ControlModuleSet, ControlRuntime as InProcessControlRuntime,
+    JsonStderrSink, LifecyclePhase, OwnershipRegistry, ShutdownReason,
 };
 use control_proto::CONTROL_PROTOCOL_V1;
 use control_proto::control_transport::ClientConfig;
 use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
-use dataplane::control_runtime::spawn_control_runtime_with_client_and_handler;
-use dataplane::metering::{MeteringSourceRegistry, run_metering_sampler};
+use control_topology::{InterfaceAdvertiseResolver, TopologyModule};
+use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
+use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
-    MetricsRecorder, ServerError, SystemMemoryProbe, spawn_metrics_exporter,
+    MetricsExporter, MetricsRecorder, ServerError, SystemMemoryProbe, spawn_metrics_exporter,
 };
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use topology_composition::{
+    ArtifactClusterFactory, CompositeCandidateValidator, TopologyCandidateValidator,
+    interface_advertise_candidates,
+};
 
 const VERSION: &str = env!("TIPROXY_BUILD_VERSION");
 const COMMIT: &str = env!("TIPROXY_BUILD_COMMIT");
@@ -122,6 +132,226 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+    }
+}
+
+/// The metering sampler task plus the signal that stops it, owned together so
+/// the startup guard can stop and join it as one resource.
+struct MeteringSampler {
+    task: JoinHandle<Result<(), MeteringSamplerError>>,
+    shutdown: watch::Sender<bool>,
+}
+
+/// A resource torn down in two explicit phases: a synchronous `stop` (signal the
+/// task to end) followed by an awaited `join` (wait for it to finish). Splitting
+/// the phases lets a fake exercise the exact production teardown sequence, so a
+/// dropped stop or join is caught by a test rather than silently detaching a
+/// task or hanging on a lease until its TTL.
+trait StopJoin: Send + 'static {
+    /// Signals the resource to stop.
+    fn stop(&self);
+    /// Joins the stopped resource to completion.
+    fn join(self) -> startup::TeardownFuture;
+}
+
+impl<T: StopJoin> startup::Teardown for T {
+    fn teardown(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            self.stop();
+            self.join().await;
+        })
+    }
+}
+
+impl StopJoin for ControlRuntime {
+    fn stop(&self) {
+        self.shutdown();
+    }
+    fn join(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            let _ = ControlRuntime::join(self).await;
+        })
+    }
+}
+
+impl StopJoin for MetricsExporter {
+    fn stop(&self) {
+        self.shutdown();
+    }
+    fn join(self) -> startup::TeardownFuture {
+        Box::pin(MetricsExporter::join(self))
+    }
+}
+
+impl StopJoin for MeteringSampler {
+    fn stop(&self) {
+        self.shutdown.send_replace(true);
+    }
+    fn join(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            let _ = self.task.await;
+        })
+    }
+}
+
+impl StopJoin for JoinHandle<()> {
+    fn stop(&self) {
+        self.abort();
+    }
+    fn join(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            let _ = self.await;
+        })
+    }
+}
+
+/// The resources the steady-state supervisor takes ownership of after a
+/// successful startup, produced by [`StartupGuard::commit`].
+struct RunningProcess<R, E, S, H> {
+    modules: ControlModuleSet,
+    runtime: R,
+    metrics_exporter: E,
+    metering_sampler: S,
+    health_task: Option<H>,
+}
+
+/// Owns every resource acquired after the first control module is spawned, so a
+/// startup failure stops and joins them in reverse order — each exactly once —
+/// instead of leaking abruptly aborted tasks (a registrar leak would hold a
+/// topology lease until its TTL).
+///
+/// The optional resources are generic over [`startup::Teardown`] so production
+/// wires the real handles and a test wires recording fakes into the *same*
+/// rollback code. The guard is armed on creation, before the first module is
+/// spawned. Every fallible startup step routes its error through
+/// [`StartupGuard::rollback`], the single failure exit; a successful startup
+/// ends with [`StartupGuard::commit`], which hands the resources to the
+/// supervisor. The embedded arm token makes dropping a half-constructed startup
+/// that did neither a loud bug.
+struct StartupGuard<R, E, S, H> {
+    arm: startup::ArmToken,
+    in_process: Arc<InProcessControlRuntime>,
+    modules: ControlModuleSet,
+    runtime: Option<R>,
+    metrics_exporter: Option<E>,
+    metering_sampler: Option<S>,
+    health_task: Option<H>,
+}
+
+impl<R, E, S, H> StartupGuard<R, E, S, H>
+where
+    R: startup::Teardown,
+    E: startup::Teardown,
+    S: startup::Teardown,
+    H: startup::Teardown,
+{
+    /// Arms the guard around the owner and the module set that already holds the
+    /// first (config owner) module.
+    fn arm(in_process: Arc<InProcessControlRuntime>, modules: ControlModuleSet) -> Self {
+        Self {
+            arm: startup::ArmToken::armed(),
+            in_process,
+            modules,
+            runtime: None,
+            metrics_exporter: None,
+            metering_sampler: None,
+            health_task: None,
+        }
+    }
+
+    /// Registers and starts one more control module under the guard.
+    fn spawn_module<M: ControlModule>(&mut self, module: M) -> Result<(), String> {
+        self.modules
+            .spawn(module)
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_runtime(&mut self, runtime: R) {
+        if self.runtime.replace(runtime).is_some() {
+            unreachable!("the legacy runtime was set twice");
+        }
+    }
+
+    fn set_metrics_exporter(&mut self, exporter: E) {
+        if self.metrics_exporter.replace(exporter).is_some() {
+            unreachable!("the metrics exporter was set twice");
+        }
+    }
+
+    fn set_metering_sampler(&mut self, sampler: S) {
+        if self.metering_sampler.replace(sampler).is_some() {
+            unreachable!("the metering sampler was set twice");
+        }
+    }
+
+    fn set_health_task(&mut self, health_task: H) {
+        if self.health_task.replace(health_task).is_some() {
+            unreachable!("the health task was set twice");
+        }
+    }
+
+    /// Stops and joins every acquired resource in reverse order and returns the
+    /// original error unchanged.
+    async fn rollback(mut self, error: String) -> String {
+        // Registered in acquisition order; `run_teardowns_in_reverse` runs them
+        // latest-first. A resource absent at the failure point (its `Option` is
+        // `None`) is simply skipped.
+        let mut steps: Vec<(&'static str, startup::TeardownFuture)> = Vec::new();
+        if let Some(runtime) = self.runtime.take() {
+            steps.push(("legacy_runtime", runtime.teardown()));
+        }
+        if let Some(exporter) = self.metrics_exporter.take() {
+            steps.push(("metrics_exporter", exporter.teardown()));
+        }
+        if let Some(sampler) = self.metering_sampler.take() {
+            steps.push(("metering_sampler", sampler.teardown()));
+        }
+        if let Some(health_task) = self.health_task.take() {
+            steps.push(("health_task", health_task.teardown()));
+        }
+        let _order = startup::run_teardowns_in_reverse(steps).await;
+        // The owner and its modules were acquired first, so they retire last.
+        // Make shutdown mandatory and advance to Stopping (so a topology module
+        // retires its registration at Stopping), then join every module and
+        // finish the owner.
+        self.in_process.fail("startup", "startup_failed");
+        let _ = self.in_process.advance_shutdown(LifecyclePhase::Draining);
+        let _ = self.in_process.advance_shutdown(LifecyclePhase::Stopping);
+        let _ = join_modules(&mut self.modules).await;
+        let _ = self.in_process.finish();
+        self.arm.disarm();
+        error
+    }
+
+    /// Hands every resource to the steady-state supervisor and disarms the guard.
+    ///
+    /// The required slots are taken and validated *before* the arm token is
+    /// disarmed, so a missing slot (a wiring bug) panics while the guard is still
+    /// armed — the drop bomb then also fires — rather than after disarming, which
+    /// would silently drop the remaining handles.
+    fn commit(self) -> RunningProcess<R, E, S, H> {
+        let StartupGuard {
+            mut arm,
+            in_process: _,
+            modules,
+            runtime,
+            metrics_exporter,
+            metering_sampler,
+            health_task,
+        } = self;
+        let runtime = runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set"));
+        let metrics_exporter = metrics_exporter
+            .unwrap_or_else(|| unreachable!("commit before the metrics exporter was set"));
+        let metering_sampler = metering_sampler
+            .unwrap_or_else(|| unreachable!("commit before the metering sampler was set"));
+        arm.disarm();
+        RunningProcess {
+            modules,
+            runtime,
+            metrics_exporter,
+            metering_sampler,
+            health_task,
+        }
     }
 }
 
@@ -224,29 +454,72 @@ async fn run(options: Options) -> Result<(), String> {
     let consumer =
         consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
     let runtime_handle = in_process.handle();
-    let mut modules = ControlModuleSet::new(&runtime_handle);
-    modules
-        .spawn(config_owner.module)
-        .map_err(|error| format!("start config owner module: {error}"))?;
+    let modules = ControlModuleSet::new(&runtime_handle);
+    // Arm the startup guard before the first module is spawned. From here every
+    // fallible acquisition routes its error through `guard.rollback` — the single
+    // failure exit — so a failure stops and joins everything already started
+    // (rather than leaking an aborted registrar that would hold a topology lease
+    // until its TTL); a successful startup ends with `guard.commit`.
+    let mut guard = StartupGuard::arm(Arc::clone(&in_process), modules);
+    // STARTUP-GUARD:ARMED
+    if let Err(error) = guard.spawn_module(config_owner.module) {
+        return Err(guard
+            .rollback(format!("start config owner module: {error}"))
+            .await);
+    }
     // Persistent `/config` is part of generation one. Do not let the legacy
     // bridge open SQL listeners against the file-only base while the initial
     // linearizable relist is still outstanding.
-    config_owner
-        .handle
-        .wait_ready()
-        .await
-        .map_err(|error| format!("initialize config owner: {error}"))?;
-    modules
-        .spawn(ConfigServingAdapter::new(
-            config_owner.handle.source().clone(),
-            serving.clone(),
-            store.clone(),
-            Arc::clone(&in_process),
-            options.health_port,
-            config_owner.tls_roots,
-            options.drain_grace,
-        ))
-        .map_err(|error| format!("start config serving adapter: {error}"))?;
+    if let Err(error) = config_owner.handle.wait_ready().await {
+        return Err(guard
+            .rollback(format!("initialize config owner: {error}"))
+            .await);
+    }
+    // CP-TOPO self-registration comes online before any SQL admission: register
+    // this instance's SQL topology, then wait for its initial registration plan
+    // and children to be installed. "Ready" here means the plan's children are
+    // installed, not that PD has acknowledged the registration or that a
+    // discovery snapshot has been published.
+    let topology_identity = TopologyRuntimeIdentity {
+        version: Arc::from(VERSION),
+        git_hash: Arc::from(COMMIT),
+        deploy_path: env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from(".")),
+        start_timestamp: i64::try_from(process_started_unix_millis / 1000).unwrap_or(i64::MAX),
+    };
+    let (topology_module, mut topology_handle) = TopologyModule::new(
+        Arc::new(config_owner.handle.source().clone()),
+        Box::new(ArtifactClusterFactory),
+        Arc::new(InterfaceAdvertiseResolver::new(Arc::new(
+            interface_advertise_candidates,
+        ))),
+        topology_identity,
+    );
+    if let Err(error) = guard.spawn_module(topology_module) {
+        return Err(guard
+            .rollback(format!("start topology module: {error}"))
+            .await);
+    }
+    if let Err(error) = topology_handle.wait_ready().await {
+        return Err(guard
+            .rollback(format!("initialize topology module: {error}"))
+            .await);
+    }
+    if let Err(error) = guard.spawn_module(ConfigServingAdapter::new(
+        config_owner.handle.source().clone(),
+        serving.clone(),
+        store.clone(),
+        Arc::clone(&in_process),
+        options.health_port,
+        config_owner.tls_roots,
+        options.drain_grace,
+    )) {
+        return Err(guard
+            .rollback(format!("start config serving adapter: {error}"))
+            .await);
+    }
     let runtime = spawn_control_runtime_with_client_and_handler(
         Arc::clone(&shared_client),
         Duration::from_millis(100),
@@ -255,36 +528,64 @@ async fn run(options: Options) -> Result<(), String> {
         consumer,
         dispatch_handler,
     );
-    if !installer.install(runtime.handle()) {
-        runtime.shutdown();
-        return Err("install control dispatch handle exactly once".to_owned());
+    // Take the dispatch handles and stats before the runtime moves into the
+    // guard; from then on the guard owns it (and tears it down on any later
+    // failure).
+    let install_handle = runtime.handle();
+    let metering_dispatch = runtime.handle();
+    let runtime_stats = runtime.stats();
+    guard.set_runtime(runtime);
+    if !installer.install(install_handle) {
+        return Err(guard
+            .rollback("install control dispatch handle exactly once".to_owned())
+            .await);
     }
-    let metrics_exporter = spawn_metrics_exporter(
+    guard.set_metrics_exporter(spawn_metrics_exporter(
         Arc::clone(&shared_client),
         serving.clone(),
-        runtime.stats(),
+        runtime_stats,
         &metrics,
         observations,
         Duration::from_secs(1),
-    );
-    let metering_dispatch = runtime.handle();
-    let metering_sampler = tokio::spawn(async move {
-        run_metering_sampler(
-            metering,
-            metering_dispatch,
-            metering_shutdown_rx,
-            Duration::from_secs(1),
-        )
-        .await
+    ));
+    guard.set_metering_sampler(MeteringSampler {
+        task: tokio::spawn(async move {
+            run_metering_sampler(
+                metering,
+                metering_dispatch,
+                metering_shutdown_rx,
+                Duration::from_secs(1),
+            )
+            .await
+        }),
+        shutdown: metering_shutdown_tx.clone(),
     });
 
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
-    let health_task = spawn_health(in_process_config.health_port(), serving.clone()).await?;
-    in_process
-        .mark_ready()
-        .map_err(|error| format!("mark in-process control runtime ready: {error}"))?;
+    match spawn_health(in_process_config.health_port(), serving.clone()).await {
+        Ok(Some(health_task)) => guard.set_health_task(health_task),
+        Ok(None) => {}
+        Err(error) => return Err(guard.rollback(error).await),
+    }
+    if let Err(error) = in_process.mark_ready() {
+        return Err(guard
+            .rollback(format!("mark in-process control runtime ready: {error}"))
+            .await);
+    }
+    // STARTUP-GUARD:COMMIT
+    let RunningProcess {
+        mut modules,
+        runtime,
+        metrics_exporter,
+        metering_sampler:
+            MeteringSampler {
+                task: metering_sampler,
+                shutdown: _,
+            },
+        health_task,
+    } = guard.commit();
 
     // Supervise control and metering together. Either task disappearing must
     // wake this owner: otherwise a sampler panic could leave SQL serving
@@ -465,7 +766,7 @@ async fn stop_drain_and_join_sessions(
 async fn spawn_health(
     port: u16,
     serving: DataplaneServingHandle,
-) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
+) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
     }
@@ -518,18 +819,37 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
     );
     tls_roots.sort();
     tls_roots.dedup();
+    // Shared allowed TLS roots, each opened once here into a frozen directory
+    // capability so every later TLS-material read (topology cluster clients and
+    // config-persistence) is confined beneath it.
+    let allowed_tls_roots = Arc::new(tls_material::open_tls_roots(&tls_roots));
     let snapshots = SnapshotStore::new(tls_roots.clone())
         .map_err(|error| format!("create snapshot store: {error}"))?;
-    let (etcd, election) = persistence_options(initial.as_ref(), process_id)?;
+    let (etcd, election) = persistence_options(initial.as_ref(), process_id, &allowed_tls_roots)?;
+    let persistence_roots = Arc::clone(&allowed_tls_roots);
     let module_options = ConfigModuleOptions {
         etcd,
         election,
-        persistence_factory: Some(Arc::new(config_persistence_client)),
+        persistence_factory: Some(Arc::new(
+            move |effective: &control_config::EffectiveConfig| {
+                config_persistence_client(effective, &persistence_roots)
+            },
+        )),
         ..base
     };
-    let validator = Arc::new(ServingCandidateValidator::new(
+    // Every accepted generation funnels through one composite validator in a
+    // fixed order: serving first (fails a bad TLS/protocol candidate before any
+    // topology material is read), then topology (prepares the per-cluster etcd
+    // clients that ride the published snapshot as its opaque artifact).
+    let serving = Arc::new(ServingCandidateValidator::new(
         snapshots.clone(),
         options.drain_grace,
+    ));
+    let validator = Arc::new(CompositeCandidateValidator::new(
+        serving,
+        Arc::new(TopologyCandidateValidator::new(Arc::clone(
+            &allowed_tls_roots,
+        ))),
     ));
     let (module, handle) = ConfigModule::load_with_validator(module_options, validator)
         .map_err(|error| format!("load validated Rust config owner: {error}"))?;
@@ -547,8 +867,9 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
 fn persistence_options(
     snapshot: &control_config::ConfigNamespaceSnapshot,
     process_id: &str,
+    allowed_tls_roots: &tls_material::TlsRoots,
 ) -> Result<(Option<EtcdClientConfig>, Option<ElectionConfig>), String> {
-    let client = config_persistence_client(snapshot.effective())?;
+    let client = config_persistence_client(snapshot.effective(), allowed_tls_roots)?;
     if client.is_none() {
         return Ok((None, None));
     }
@@ -564,6 +885,7 @@ fn persistence_options(
 
 fn config_persistence_client(
     effective: &control_config::EffectiveConfig,
+    allowed_tls_roots: &tls_material::TlsRoots,
 ) -> Result<Option<EtcdClientConfig>, String> {
     let Some(persistence) = effective.config_persistence() else {
         return Ok(None);
@@ -573,13 +895,16 @@ fn config_persistence_client(
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let tls = etcd_tls(&persistence.cluster_tls)?;
+    let tls = etcd_tls(&persistence.cluster_tls, allowed_tls_roots)?;
     let client = EtcdClientConfig::new(endpoints, tls)
         .map_err(|error| format!("validate config persistence client: {error}"))?;
     Ok(Some(client))
 }
 
-fn etcd_tls(config: &control_config::ClientTlsConfig) -> Result<Option<EtcdTlsConfig>, String> {
+fn etcd_tls(
+    config: &control_config::ClientTlsConfig,
+    allowed_tls_roots: &tls_material::TlsRoots,
+) -> Result<Option<EtcdTlsConfig>, String> {
     if config.skip_ca_verification {
         return Err("config persistence does not support skip-ca-verification".to_owned());
     }
@@ -593,20 +918,30 @@ fn etcd_tls(config: &control_config::ClientTlsConfig) -> Result<Option<EtcdTlsCo
         .ca_path
         .as_deref()
         .ok_or_else(|| "config persistence TLS requires a CA".to_owned())?;
-    let ca = std::fs::read(ca_path).map_err(|_| "read config persistence TLS CA".to_owned())?;
-    let certificate = read_optional_tls(config.certificate_path.as_deref(), "certificate")?;
-    let key = read_optional_tls(config.private_key_path.as_deref(), "private key")?;
-    EtcdTlsConfig::new(ca, certificate, key, None)
-        .map(Some)
-        .map_err(|error| format!("validate config persistence TLS: {error}"))
+    let ca = tls_material::read_tls_material(ca_path, allowed_tls_roots)
+        .map_err(|_| "read config persistence TLS CA".to_owned())?;
+    let certificate = read_optional_tls(config.certificate_path.as_deref(), allowed_tls_roots)?;
+    let key = read_optional_tls(config.private_key_path.as_deref(), allowed_tls_roots)?;
+    EtcdTlsConfig::new(
+        Some(ca),
+        certificate,
+        key,
+        None,
+        control_external::EtcdTlsPolicy::default(),
+    )
+    .map(Some)
+    .map_err(|error| format!("validate config persistence TLS: {error}"))
 }
 
 fn read_optional_tls(
-    path: Option<&std::path::Path>,
-    kind: &str,
+    path: Option<&Path>,
+    allowed_tls_roots: &tls_material::TlsRoots,
 ) -> Result<Option<Vec<u8>>, String> {
-    path.map(|path| std::fs::read(path).map_err(|_| format!("read config persistence TLS {kind}")))
-        .transpose()
+    path.map(|path| {
+        tls_material::read_tls_material(path, allowed_tls_roots)
+            .map_err(|reason| format!("read config persistence TLS material: {reason}"))
+    })
+    .transpose()
 }
 
 /// Resolves on SIGTERM or SIGINT.
@@ -737,11 +1072,356 @@ mod tests {
     use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
 
     use super::{
-        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options,
+        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options, StartupGuard,
         config_persistence_client, parse_options, persistence_options, session_loop_config,
         version_output,
     };
     use crate::config_composition::control_config;
+    use crate::startup::{Teardown, TeardownFuture};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::{MeteringSampler, RunningProcess, StopJoin};
+    use control_plane::{
+        ControlConfig, ControlModule, ControlModuleSet, ControlRuntime as InProcessControlRuntime,
+        JsonStderrSink, LifecyclePhase, LogLevel, MetricsPolicy, ModuleContext, ModuleFuture,
+        OwnershipRegistry,
+    };
+    use dataplane::metering::MeteringSamplerError;
+    use tokio::sync::watch;
+    use tokio::task::JoinHandle;
+
+    type TeardownLog = Arc<Mutex<Vec<&'static str>>>;
+
+    fn record(log: &TeardownLog, label: &'static str) {
+        log.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(label);
+    }
+
+    /// A fake optional resource that records its slot label when torn down, so a
+    /// test can drive the *real* `StartupGuard::rollback` and assert the exact
+    /// reverse teardown order and that each resource is torn down once.
+    struct FakeResource {
+        label: &'static str,
+        log: TeardownLog,
+    }
+
+    impl Teardown for FakeResource {
+        fn teardown(self) -> TeardownFuture {
+            Box::pin(async move { record(&self.log, self.label) })
+        }
+    }
+
+    fn fake(label: &'static str, log: &TeardownLog) -> FakeResource {
+        FakeResource {
+            label,
+            log: Arc::clone(log),
+        }
+    }
+
+    /// A control module that runs until the runtime reaches `Stopping`, then
+    /// records "modules", so a test can prove the guard joined it (rather than
+    /// aborting it) after the optional resources and before the owner is
+    /// finished.
+    struct StoppableModule {
+        log: TeardownLog,
+    }
+
+    impl ControlModule for StoppableModule {
+        fn name(&self) -> &'static str {
+            "startup_guard_fake_module"
+        }
+
+        fn run(self: Box<Self>, context: ModuleContext) -> ModuleFuture {
+            Box::pin(async move {
+                let mut lifecycle = context.lifecycle();
+                while lifecycle.changed().await.is_ok() {
+                    if matches!(
+                        lifecycle.borrow().phase,
+                        LifecyclePhase::Stopping | LifecyclePhase::Stopped
+                    ) {
+                        break;
+                    }
+                }
+                record(&self.log, "modules");
+                Ok(())
+            })
+        }
+    }
+
+    /// A `Starting` owner (never marked ready — the real state at an early
+    /// startup failure).
+    fn armed_owner() -> Arc<InProcessControlRuntime> {
+        let registry = OwnershipRegistry::new();
+        Arc::new(
+            InProcessControlRuntime::claim_process(
+                &registry,
+                "startup-guard-test".to_owned(),
+                ControlConfig::new(
+                    1,
+                    Duration::from_secs(30),
+                    0,
+                    control_plane::TlsPolicy::default(),
+                    LogLevel::Info,
+                    MetricsPolicy::default(),
+                )
+                .unwrap_or_else(|error| unreachable!("control config: {error}")),
+                Arc::new(JsonStderrSink),
+            )
+            .unwrap_or_else(|error| unreachable!("claim process: {error}")),
+        )
+    }
+
+    fn modules_with_stoppable(
+        in_process: &Arc<InProcessControlRuntime>,
+        log: &TeardownLog,
+    ) -> ControlModuleSet {
+        let handle = in_process.handle();
+        let mut modules = ControlModuleSet::new(&handle);
+        modules
+            .spawn(StoppableModule {
+                log: Arc::clone(log),
+            })
+            .unwrap_or_else(|error| unreachable!("spawn config module: {error}"));
+        modules
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cp_cfg_ready_failure_joins_the_module_then_finishes_the_owner() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        let modules = modules_with_stoppable(&in_process, &log);
+        // No optional resource is set (the failure is before any was acquired):
+        // give the four generic slots a concrete type.
+        let guard = StartupGuard::<FakeResource, FakeResource, FakeResource, FakeResource>::arm(
+            Arc::clone(&in_process),
+            modules,
+        );
+
+        let error = guard
+            .rollback("initialize config owner: injected".to_owned())
+            .await;
+        assert_eq!(error, "initialize config owner: injected");
+        assert_eq!(
+            *log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["modules"],
+            "only the module set is torn down; it is joined, not abandoned"
+        );
+        assert!(
+            in_process.finish().is_err(),
+            "the owner was already finished by rollback"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_bind_failure_rolls_back_optionals_without_health_then_module_and_owner() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        // The health task was never spawned, so annotate the unset fourth slot.
+        let mut guard = StartupGuard::<FakeResource, FakeResource, FakeResource, FakeResource>::arm(
+            Arc::clone(&in_process),
+            modules_with_stoppable(&in_process, &log),
+        );
+        // A health-bind failure: the runtime, exporter, and sampler are live, but
+        // the health task was never spawned.
+        guard.set_runtime(fake("legacy_runtime", &log));
+        guard.set_metrics_exporter(fake("metrics_exporter", &log));
+        guard.set_metering_sampler(fake("metering_sampler", &log));
+
+        let error = guard
+            .rollback("bind health endpoint: injected".to_owned())
+            .await;
+        assert_eq!(error, "bind health endpoint: injected");
+        assert_eq!(
+            *log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                "metering_sampler",
+                "metrics_exporter",
+                "legacy_runtime",
+                "modules"
+            ],
+            "optionals retire latest-first (no health), then the module, then the owner"
+        );
+        assert!(in_process.finish().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mark_ready_failure_rolls_back_every_resource_in_reverse_order() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        let mut guard = StartupGuard::arm(
+            Arc::clone(&in_process),
+            modules_with_stoppable(&in_process, &log),
+        );
+        // A mark-ready failure: every optional resource is live.
+        guard.set_runtime(fake("legacy_runtime", &log));
+        guard.set_metrics_exporter(fake("metrics_exporter", &log));
+        guard.set_metering_sampler(fake("metering_sampler", &log));
+        guard.set_health_task(fake("health_task", &log));
+
+        let error = guard.rollback("mark ready: injected".to_owned()).await;
+        assert_eq!(error, "mark ready: injected");
+        assert_eq!(
+            *log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                "health_task",
+                "metering_sampler",
+                "metrics_exporter",
+                "legacy_runtime",
+                "modules",
+            ],
+            "all optionals retire latest-first, then the module, then the owner"
+        );
+        assert!(in_process.finish().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_normal_commit_transfers_every_resource_and_disarms() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        let modules = ControlModuleSet::new(&in_process.handle());
+        let mut guard = StartupGuard::arm(Arc::clone(&in_process), modules);
+        guard.set_runtime(fake("legacy_runtime", &log));
+        guard.set_metrics_exporter(fake("metrics_exporter", &log));
+        guard.set_metering_sampler(fake("metering_sampler", &log));
+        guard.set_health_task(fake("health_task", &log));
+
+        // Commit hands every resource out (and disarms cleanly — no drop bomb).
+        let RunningProcess {
+            modules: _modules,
+            runtime,
+            metrics_exporter,
+            metering_sampler,
+            health_task,
+        } = guard.commit();
+        // Tearing the transferred handles down proves they were moved out of the
+        // guard rather than dropped by commit.
+        runtime.teardown().await;
+        metrics_exporter.teardown().await;
+        metering_sampler.teardown().await;
+        health_task
+            .unwrap_or_else(|| unreachable!("health task transferred"))
+            .teardown()
+            .await;
+        assert_eq!(
+            *log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                "legacy_runtime",
+                "metrics_exporter",
+                "metering_sampler",
+                "health_task",
+            ],
+            "every resource was transferred out of the guard by commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_teardown_sequence_signals_stop_then_awaits_join() {
+        // The shared two-phase adapter every production resource uses: dropping
+        // either the stop or the awaited join is caught here.
+        struct Probe {
+            stopped: Arc<AtomicBool>,
+            joined: Arc<AtomicBool>,
+        }
+        impl StopJoin for Probe {
+            fn stop(&self) {
+                self.stopped.store(true, Ordering::SeqCst);
+            }
+            fn join(self) -> TeardownFuture {
+                Box::pin(async move { self.joined.store(true, Ordering::SeqCst) })
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicBool::new(false));
+        Probe {
+            stopped: Arc::clone(&stopped),
+            joined: Arc::clone(&joined),
+        }
+        .teardown()
+        .await;
+        assert!(stopped.load(Ordering::SeqCst), "stop was signalled");
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "join was awaited (its body only runs when awaited)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_metering_sampler_teardown_signals_then_joins() {
+        // The task only finishes after the stop signal, and takes a bounded
+        // moment to do so, so a dropped stop hangs (caught by the timeout) and a
+        // dropped join returns before the task finishes (caught by the elapsed
+        // floor and completion flag).
+        let (shutdown, mut receiver) = watch::channel(false);
+        let joined = Arc::new(AtomicBool::new(false));
+        let joined_in_task = Arc::clone(&joined);
+        let task: JoinHandle<Result<(), MeteringSamplerError>> = tokio::spawn(async move {
+            while !*receiver.borrow_and_update() {
+                if receiver.changed().await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            joined_in_task.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let sampler = MeteringSampler { task, shutdown };
+
+        let start = Instant::now();
+        let Ok(()) = tokio::time::timeout(Duration::from_secs(5), sampler.teardown()).await else {
+            unreachable!("teardown must not hang: the stop signal was delivered");
+        };
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "the sampler task ran to completion (join awaited it)"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "teardown waited for the task rather than detaching it"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_health_task_teardown_aborts_then_joins() {
+        // A never-completing task with a drop flag: abort + await cancels it and
+        // joins it, so its guard drops. A dropped abort hangs (timeout); a
+        // dropped join returns before the cancellation completes, so on the
+        // single-threaded runtime the guard has not dropped yet.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = Arc::clone(&dropped);
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let task: JoinHandle<()> = tokio::spawn(async move {
+            let _guard = DropFlag(dropped_in_task);
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        // Ensure the task has run past constructing its guard before it is
+        // aborted, so the abort actually cancels a live guard.
+        let Ok(()) = wait_started.await else {
+            unreachable!("the health task started");
+        };
+
+        let Ok(()) = tokio::time::timeout(Duration::from_secs(5), task.teardown()).await else {
+            unreachable!("teardown must not hang: the task was aborted");
+        };
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the health task was aborted and joined (its guard dropped)"
+        );
+    }
 
     #[test]
     fn version_output_labels_all_build_metadata() {
@@ -749,6 +1429,45 @@ mod tests {
         assert!(output.starts_with("tiproxy-rs "));
         assert!(output.contains(" (commit "));
         assert!(output.contains(", built "));
+    }
+
+    #[test]
+    fn every_post_spawn_startup_failure_routes_through_the_one_rollback_seam() {
+        // A source contract for the composition root: between arming the startup
+        // guard and committing it, every failure must exit through
+        // `guard.rollback` and there must be no bare `?`/`.map_err(..)?` that
+        // bypasses it, so a new fallible acquisition cannot silently leak an
+        // already-started resource.
+        let source = include_str!("main.rs");
+        let armed = source
+            .find("// STARTUP-GUARD:ARMED")
+            .unwrap_or_else(|| unreachable!("armed marker present"));
+        let commit = source
+            .find("// STARTUP-GUARD:COMMIT")
+            .unwrap_or_else(|| unreachable!("commit marker present"));
+        assert!(commit > armed, "commit marker follows the armed marker");
+        let region = &source[armed..commit];
+
+        // Every failure exit in the guarded region goes through the single seam.
+        // (`.rollback(` is matched contiguously; `guard` may sit on the prior
+        // wrapped line.)
+        let returns = region.matches("return Err(").count();
+        let rollbacks = region.matches(".rollback(").count();
+        assert!(returns > 0, "the guarded region has failure exits");
+        assert_eq!(
+            returns, rollbacks,
+            "every guarded failure exit must call guard.rollback exactly once"
+        );
+
+        // No `?` operator may bypass the guard inside the region.
+        assert!(
+            !region.contains(")?"),
+            "no `?` operator may bypass the guard in the startup region"
+        );
+        assert!(
+            !region.contains("?;"),
+            "no `?` operator may bypass the guard in the startup region"
+        );
     }
 
     #[test]
@@ -794,13 +1513,10 @@ mod tests {
         let Ok(Command::Run(options)) = command else {
             unreachable!("valid operational arguments")
         };
-        assert_eq!(
-            options.drain_grace,
-            Some(std::time::Duration::from_secs(45))
-        );
+        assert_eq!(options.drain_grace, Some(Duration::from_secs(45)));
         assert_eq!(
             session_loop_config(options.drain_grace.unwrap_or_default()).drain_deadline,
-            std::time::Duration::from_secs(45),
+            Duration::from_secs(45),
             "one lineage: the CLI grace is the per-session FSM deadline"
         );
     }
@@ -832,7 +1548,7 @@ mod tests {
             control_socket: PathBuf::from("/tmp/control.sock"),
             control_uid: 42,
             tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
-            drain_grace: Some(std::time::Duration::from_secs(45)),
+            drain_grace: Some(Duration::from_secs(45)),
             health_port: 8081,
         };
         let source = ConfigNamespaceStore::from_toml(
@@ -872,11 +1588,66 @@ pd-addrs = "routing-pd:2379"
             std::path::Path::new("/tmp"),
         )
         .unwrap_or_else(|error| unreachable!("valid source: {error}"));
-        let (client, election) = persistence_options(source.current().as_ref(), "process-a")
-            .unwrap_or_else(|error| unreachable!("valid persistence options: {error}"));
+        let (client, election) = persistence_options(
+            source.current().as_ref(),
+            "process-a",
+            &crate::tls_material::open_tls_roots(&[]),
+        )
+        .unwrap_or_else(|error| unreachable!("valid persistence options: {error}"));
         let client = client.unwrap_or_else(|| unreachable!("persistence is configured"));
         assert_eq!(client.endpoints(), ["http://owner-pd:2379"]);
         assert!(election.is_some());
+    }
+
+    #[test]
+    fn config_persistence_rejects_a_same_root_symlink_ca() {
+        // The persistence production path must use the safe read: a symlink CA is
+        // rejected. A bare read would follow the link and build a client.
+        let dir = std::env::temp_dir();
+        let real = dir.join(format!("cptopo-persist-real-{}.pem", std::process::id()));
+        std::fs::write(&real, b"ca").unwrap_or_else(|error| unreachable!("write: {error}"));
+        let link = dir.join(format!("cptopo-persist-link-{}.pem", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link)
+            .unwrap_or_else(|error| unreachable!("symlink: {error}"));
+        let toml = format!(
+            "[proxy]\npd-addrs = \"owner-pd:2379\"\n[security.cluster-tls]\nca = \"{}\"\n",
+            link.display()
+        );
+        let source =
+            ConfigNamespaceStore::from_toml(toml.as_bytes(), None, std::path::Path::new("/tmp"))
+                .unwrap_or_else(|error| unreachable!("valid source: {error}"));
+        let roots = crate::tls_material::open_tls_roots(&[dir]);
+        assert!(
+            config_persistence_client(source.current().effective(), &roots).is_err(),
+            "a symlink CA must be rejected by the persistence reader"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn config_persistence_rejects_an_oversize_ca() {
+        let dir = std::env::temp_dir();
+        let ca = dir.join(format!("cptopo-persist-big-{}.pem", std::process::id()));
+        let file =
+            std::fs::File::create(&ca).unwrap_or_else(|error| unreachable!("create: {error}"));
+        // A sparse file over the 16 MiB bound.
+        file.set_len(17 * 1024 * 1024)
+            .unwrap_or_else(|error| unreachable!("set_len: {error}"));
+        let toml = format!(
+            "[proxy]\npd-addrs = \"owner-pd:2379\"\n[security.cluster-tls]\nca = \"{}\"\n",
+            ca.display()
+        );
+        let source =
+            ConfigNamespaceStore::from_toml(toml.as_bytes(), None, std::path::Path::new("/tmp"))
+                .unwrap_or_else(|error| unreachable!("valid source: {error}"));
+        let roots = crate::tls_material::open_tls_roots(&[dir]);
+        assert!(
+            config_persistence_client(source.current().effective(), &roots).is_err(),
+            "an oversize CA must be rejected by the persistence reader"
+        );
+        let _ = std::fs::remove_file(&ca);
     }
 
     #[test]
@@ -888,7 +1659,11 @@ pd-addrs = "routing-pd:2379"
         )
         .unwrap_or_else(|error| unreachable!("valid source model: {error}"));
         assert!(
-            config_persistence_client(source.current().effective()).is_err(),
+            config_persistence_client(
+                source.current().effective(),
+                &crate::tls_material::open_tls_roots(&[])
+            )
+            .is_err(),
             "skip-ca without a CA must not silently construct a plaintext etcd client"
         );
     }

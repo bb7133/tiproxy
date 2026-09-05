@@ -33,5 +33,6 @@ pub use module::{
 pub use source::{
     CONFIG_PREFIX, CandidateValidator, ConfigNamespaceSnapshot, ConfigNamespaceSource,
     ConfigNamespaceStore, LOG_CONFIG_KEY, NAMESPACE_CONFIG_PREFIX, PROXY_CONFIG_KEY,
-    PersistentConfigSnapshot, StoreError, decode_persistent_entries, encode_canonical_config,
+    PersistentConfigSnapshot, PreparedArtifact, StoreError, decode_persistent_entries,
+    encode_canonical_config,
 };

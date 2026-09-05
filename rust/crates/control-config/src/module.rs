@@ -37,7 +37,8 @@ use tokio::task::JoinHandle;
 use crate::model::{EffectiveConfig, LogOnlineConfig, NamespaceConfig, ProxyOnlineConfig};
 use crate::source::{
     CONFIG_PREFIX, CandidateValidator, ConfigNamespaceSource, ConfigNamespaceStore, LOG_CONFIG_KEY,
-    NAMESPACE_CONFIG_PREFIX, PROXY_CONFIG_KEY, StoreError, decode_persistent_entries,
+    NAMESPACE_CONFIG_PREFIX, PROXY_CONFIG_KEY, PreparedArtifact, StoreError,
+    decode_persistent_entries,
 };
 
 const FILE_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -95,16 +96,20 @@ impl CandidateValidator for ModuleCandidateValidator {
         &self,
         effective: &EffectiveConfig,
         namespaces: &[NamespaceConfig],
-    ) -> Result<(), &'static str> {
-        if let Some(candidate) = &self.candidate {
-            candidate.validate(effective, namespaces)?;
-        }
+    ) -> Result<PreparedArtifact, &'static str> {
+        // The inner candidate owns the prepared artifact; the persistence probe
+        // is a side validation that prepares nothing.
+        let prepared = if let Some(candidate) = &self.candidate {
+            candidate.validate(effective, namespaces)?
+        } else {
+            PreparedArtifact::empty()
+        };
         if let Some(persistence) = &self.persistence {
             persistence
                 .build(effective)
                 .map_err(|_| "persistence_transport_rejected")?;
         }
-        Ok(())
+        Ok(prepared)
     }
 }
 

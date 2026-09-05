@@ -1,0 +1,24 @@
+[package]
+name = "control-topology"
+description = "TiProxy self-registration and TiDB/keyspace topology discovery for the Rust control plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+control-config.workspace = true
+control-external.workspace = true
+control-plane.workspace = true
+etcd-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

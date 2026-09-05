@@ -17,8 +17,26 @@ control-etcd.workspace = true
 control-external.workspace = true
 control-plane.workspace = true
 control-proto.workspace = true
+control-topology.workspace = true
 dataplane.workspace = true
+if-addrs.workspace = true
+libc.workspace = true
+rustix.workspace = true
 tokio = { workspace = true, features = ["signal"] }
+
+[dev-dependencies]
+# The etcd v3 KV service fixture is hand-rolled from a single-route tonic
+# adapter + hand-defined wire-compatible prost messages, so it needs no
+# `etcd-client` `build-server` feature (which would pull a second `syn` major).
+hyper = { version = "=1.11.1", default-features = false, features = ["http2", "server"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["service", "tokio"] }
+prost.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
 
 [lints]
 workspace = true

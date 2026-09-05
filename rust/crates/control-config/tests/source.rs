@@ -15,13 +15,13 @@
 //! CP-CFG immutable-source, parity, and failure tests.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use control_config::{
     CandidateValidator, ConfigError, ConfigModule, ConfigModuleOptions, ConfigNamespaceSource,
     ConfigNamespaceStore, EffectiveConfig, NamespaceConfig, PersistentConfigSnapshot,
-    SourceRevision, StoreError, decode_persistent_entries,
+    PreparedArtifact, SourceRevision, StoreError, decode_persistent_entries,
 };
 use control_etcd::ElectionConfig;
 use control_external::EtcdClientConfig;
@@ -33,17 +33,151 @@ impl CandidateValidator for RejectableValidator {
         &self,
         _effective: &EffectiveConfig,
         _namespaces: &[NamespaceConfig],
-    ) -> Result<(), &'static str> {
+    ) -> Result<PreparedArtifact, &'static str> {
         if self.0.load(Ordering::SeqCst) {
             Err("test_material_rejected")
         } else {
-            Ok(())
+            Ok(PreparedArtifact::empty())
         }
+    }
+}
+
+/// A concrete prepared type so `downcast_ref` has something to recover.
+#[derive(Debug, PartialEq)]
+struct SerialArtifact(u64);
+
+/// Prepares a fresh, distinctly serial-numbered artifact per validation and
+/// records the exact handle it returned, so a test can assert the store carries
+/// that same handle without re-preparing.
+struct RecordingValidator {
+    next: AtomicU64,
+    reject: AtomicBool,
+    last: Mutex<Option<PreparedArtifact>>,
+}
+
+impl RecordingValidator {
+    fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            reject: AtomicBool::new(false),
+            last: Mutex::new(None),
+        }
+    }
+
+    fn set_reject(&self, reject: bool) {
+        self.reject.store(reject, Ordering::SeqCst);
+    }
+
+    fn last(&self) -> PreparedArtifact {
+        self.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| unreachable!("a validation must have recorded an artifact"))
+    }
+}
+
+impl CandidateValidator for RecordingValidator {
+    fn validate(
+        &self,
+        _effective: &EffectiveConfig,
+        _namespaces: &[NamespaceConfig],
+    ) -> Result<PreparedArtifact, &'static str> {
+        // Prepare and record even on rejection, so a test can prove the failed
+        // product is not the one the store keeps or publishes.
+        let serial = self.next.fetch_add(1, Ordering::SeqCst);
+        let artifact = PreparedArtifact::new(Arc::new(SerialArtifact(serial)));
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(artifact.clone());
+        if self.reject.load(Ordering::SeqCst) {
+            return Err("recording_rejected");
+        }
+        Ok(artifact)
     }
 }
 
 fn current_dir() -> &'static Path {
     Path::new("/var/lib/tiproxy-test")
+}
+
+#[test]
+fn prepared_artifact_is_the_exact_validator_handle_and_is_fresh_per_generation() {
+    let validator = Arc::new(RecordingValidator::new());
+    let store = ConfigNamespaceStore::from_toml_with_validator(
+        &[],
+        None,
+        current_dir(),
+        Arc::clone(&validator) as Arc<dyn CandidateValidator>,
+    )
+    .unwrap_or_else(|error| unreachable!("initial config: {error}"));
+
+    // Generation one carries the exact handle the validator prepared — the
+    // store never re-prepares it — and it downcasts to the concrete type.
+    let gen_one = store.current();
+    let prepared_one = validator.last();
+    assert!(gen_one.prepared().is_same_handle(&prepared_one));
+    assert_eq!(
+        gen_one.prepared().downcast_ref::<SerialArtifact>(),
+        Some(&SerialArtifact(0))
+    );
+    // A wrong downcast target is a miss, never a panic.
+    assert!(gen_one.prepared().downcast_ref::<u64>().is_none());
+    // The artifact never leaks its contents through Debug.
+    assert_eq!(format!("{:?}", gen_one.prepared()), "<redacted>");
+
+    // A real change publishes a new generation carrying a distinct handle.
+    let gen_two = store
+        .apply_toml(b"[proxy]\nmax-connections = 20\n", None, 2, current_dir())
+        .unwrap_or_else(|error| unreachable!("changed candidate: {error}"))
+        .unwrap_or_else(|| unreachable!("a changed candidate publishes"));
+    assert!(gen_two.prepared().is_same_handle(&validator.last()));
+    assert!(!gen_two.prepared().is_same_handle(gen_one.prepared()));
+
+    // External-material refresh advances the artifact even though the config
+    // and namespace checksums are unchanged: a re-prepared handle rides it.
+    let refreshed = store
+        .refresh_external_material()
+        .unwrap_or_else(|error| unreachable!("material refresh: {error}"));
+    assert_eq!(refreshed.config_checksum(), gen_two.config_checksum());
+    assert_eq!(refreshed.namespace_checksum(), gen_two.namespace_checksum());
+    assert!(refreshed.prepared().is_same_handle(&validator.last()));
+    assert!(!refreshed.prepared().is_same_handle(gen_two.prepared()));
+}
+
+#[test]
+fn a_rejected_candidate_retains_the_prior_artifact_handle_and_does_not_publish_its_own() {
+    let validator = Arc::new(RecordingValidator::new());
+    let store = ConfigNamespaceStore::from_toml_with_validator(
+        &[],
+        None,
+        current_dir(),
+        Arc::clone(&validator) as Arc<dyn CandidateValidator>,
+    )
+    .unwrap_or_else(|error| unreachable!("initial config: {error}"));
+    let before = store.current();
+    let updates = store.subscribe();
+
+    // Now reject. Snapshot equality excludes the artifact, so it can no longer
+    // prove the prior artifact survived a rejection; assert the exact handle.
+    validator.set_reject(true);
+    let rejected = store.apply_toml(b"[proxy]\nmax-connections = 20\n", None, 2, current_dir());
+    assert!(matches!(
+        rejected,
+        Err(StoreError::CandidateRejected {
+            class: "recording_rejected"
+        })
+    ));
+    let after = store.current();
+    // The published snapshot is untouched: same generation and the exact same
+    // artifact Arc as before the rejection.
+    assert_eq!(after.generation(), before.generation());
+    assert!(after.prepared().is_same_handle(before.prepared()));
+    // The failed validation did prepare an artifact, but it was neither kept nor
+    // published — no half-published handle leaks out.
+    assert!(!after.prepared().is_same_handle(&validator.last()));
+    assert!(!updates.has_changed().unwrap_or(false));
 }
 
 #[test]
@@ -65,9 +199,9 @@ max-connections = 10
         initial
             .topology()
             .unwrap_or_else(|error| unreachable!("topology: {error}"))
-            .advertise_host
-            .as_ref(),
-        "proxy.example"
+            .advertise_host_override
+            .as_deref(),
+        Some("proxy.example")
     );
 
     let updates = store.subscribe();
@@ -170,6 +304,80 @@ addr = "127.0.0.1:7000"
     ));
     assert_eq!(store.current().generation(), 1);
     assert_eq!(store.observed_source_revision().file_revision, 3);
+}
+
+#[test]
+fn ns_servers_are_normalized_sorted_stably_with_duplicates_preserved() {
+    let build = |list: &str| {
+        let toml = format!(
+            "[proxy]\npd-addrs = \"pd-a:2379\"\n\n[[proxy.backend-clusters]]\nname = \"c\"\npd-addrs = \"pd-a:2379\"\nns-servers = {list}\n"
+        );
+        let store = ConfigNamespaceStore::from_toml(toml.as_bytes(), None, current_dir())
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        let topology = store
+            .current()
+            .topology()
+            .unwrap_or_else(|error| unreachable!("topology: {error}"));
+        topology.backend_clusters[0]
+            .ns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+    // Go `normalizeCluster` sorts the RAW input strings, THEN normalizes each in
+    // that order (`:53` appended), preserving duplicates.
+    let expected = vec![
+        "dns-a:53".to_owned(),
+        "dns-a:53".to_owned(),
+        "dns-b:53".to_owned(),
+        "dns-c:53".to_owned(),
+    ];
+    assert_eq!(build(r#"["dns-c", "dns-a", "dns-a", "dns-b"]"#), expected);
+    // A reversed input of the same set yields the identical projection, so an
+    // order-only config change cannot churn the artifact or shift the resolver's
+    // round-robin start.
+    assert_eq!(build(r#"["dns-b", "dns-a", "dns-c", "dns-a"]"#), expected);
+
+    // A bare IPv6 literal with no port normalizes to `[<ip>]:53` (Go's
+    // `net.JoinHostPort` fallback); an explicit bracketed port is preserved.
+    assert_eq!(
+        build(r#"["2001:db8::1"]"#),
+        vec!["[2001:db8::1]:53".to_owned()]
+    );
+    assert_eq!(
+        build(r#"["[2001:db8::1]:2379"]"#),
+        vec!["[2001:db8::1]:2379".to_owned()]
+    );
+    // A bracketed hostname is legal Go input (`net.SplitHostPort`) and normalizes
+    // to the UNBRACKETED form (brackets are kept only for IPv6 literals).
+    assert_eq!(
+        build(r#"["[dns.example]:53"]"#),
+        vec!["dns.example:53".to_owned()]
+    );
+
+    // Mixed families: the RAW strings sort first (so the bare IPv6 sorts by its
+    // raw `2...` key, not its normalized `[...` key), then normalize in place.
+    assert_eq!(
+        build(r#"["dns-b", "2001:db8::1", "10.0.0.1", "dns-a", "2001:db8::1"]"#),
+        vec![
+            "10.0.0.1:53".to_owned(),
+            "[2001:db8::1]:53".to_owned(),
+            "[2001:db8::1]:53".to_owned(),
+            "dns-a:53".to_owned(),
+            "dns-b:53".to_owned(),
+        ]
+    );
+    // A distinguishing case: raw sort places `2001:db8::1` before `5.5.5.5`
+    // before `aaa`; a normalize-then-sort would instead order the bracketed
+    // `[2001:db8::1]:53` after `5.5.5.5:53`, so this asserts raw-sort parity.
+    assert_eq!(
+        build(r#"["aaa", "5.5.5.5", "2001:db8::1"]"#),
+        vec![
+            "[2001:db8::1]:53".to_owned(),
+            "5.5.5.5:53".to_owned(),
+            "aaa:53".to_owned(),
+        ]
+    );
 }
 
 #[test]

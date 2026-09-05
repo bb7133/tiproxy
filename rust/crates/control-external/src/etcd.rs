@@ -18,52 +18,185 @@ use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use control_plane::OwnerToken;
-use etcd_client::{Certificate, Client, ConnectOptions, Identity, TlsOptions};
+use etcd_client::Client;
 use http::Uri;
 use thiserror::Error;
+
+use crate::explicit_dns::ResolveError;
 
 /// Maximum configured PD endpoints for one client.
 pub const MAX_ETCD_ENDPOINTS: usize = 32;
 /// Maximum byte length of one configured endpoint.
 pub const MAX_ETCD_ENDPOINT_BYTES: usize = 2_048;
+/// Maximum explicit nameservers threaded into one cluster client.
+pub const MAX_NS_SERVERS: usize = 32;
 const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Validated mTLS material for an etcd connection.
+/// The minimum accepted TLS protocol version for an etcd connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EtcdTlsVersion {
+    /// TLS 1.2.
+    V1_2,
+    /// TLS 1.3.
+    V1_3,
+}
+
+impl EtcdTlsVersion {
+    /// Parses the CP-CFG `minimum-version` value: `""` (no floor), `"1.2"`, or
+    /// `"1.3"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtcdConfigError::UnsupportedTlsVersion`] for any other value.
+    pub fn parse(value: &str) -> Result<Option<Self>, EtcdConfigError> {
+        match value {
+            "" => Ok(None),
+            "1.2" => Ok(Some(Self::V1_2)),
+            "1.3" => Ok(Some(Self::V1_3)),
+            _ => Err(EtcdConfigError::UnsupportedTlsVersion),
+        }
+    }
+}
+
+/// Advanced TLS verification policy for an etcd connection, mirroring the frozen
+/// backend `cluster-tls` fields. The default verifies the server against the
+/// configured CA with no version floor and no name pinning — the behavior the
+/// config-persistence and election owners rely on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EtcdTlsPolicy {
+    /// Minimum accepted TLS protocol version, or `None` for the default floor.
+    pub minimum_version: Option<EtcdTlsVersion>,
+    /// Exact-match allowlist of accepted server-certificate common names. Empty
+    /// disables common-name pinning.
+    pub allowed_common_names: Vec<String>,
+    /// Skip CA-chain and hostname trust while still performing the TLS handshake
+    /// signature check (mirrors Go `skip-ca`). A CA is not required when set;
+    /// any configured `allowed_common_names` is still enforced.
+    pub skip_ca_verification: bool,
+}
+
+/// Maximum accepted common-name pins, matching the serving TLS contract.
+const MAX_TLS_COMMON_NAMES: usize = 1024;
+/// Maximum accepted length of one common-name pin.
+const MAX_TLS_COMMON_NAME_LEN: usize = 255;
+
+/// Trims, bounds, sorts, and de-duplicates the common-name allowlist.
+///
+/// # Errors
+///
+/// Rejects an over-count list or an entry that is empty or over-length after
+/// trimming.
+fn normalized_common_names(names: Vec<String>) -> Result<Vec<String>, EtcdConfigError> {
+    if names.len() > MAX_TLS_COMMON_NAMES {
+        return Err(EtcdConfigError::TooManyCommonNames);
+    }
+    let mut normalized = Vec::with_capacity(names.len());
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(EtcdConfigError::EmptyCommonName);
+        }
+        if trimmed.len() > MAX_TLS_COMMON_NAME_LEN {
+            return Err(EtcdConfigError::CommonNameTooLong);
+        }
+        normalized.push(trimmed.to_owned());
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+/// Splits a normalized `host:port` (or bracketed `[<ip>]:port`) entry into its
+/// host and port, enforcing exactly the shape produced by the config layer's
+/// `normalize_ns_server`/`split_host_port`: a non-empty host, an explicit numeric
+/// port that is not zero, and a bracketed host that is a valid IP literal (never
+/// a bracketed name). Returns the inner host (brackets stripped).
+///
+/// This is the single spec shared by the two direct-API validators — this
+/// config's [`EtcdClientConfig::with_ns_servers`] and the resolver's
+/// `NsEntry::parse` — so both reject the same malformed inputs as the config
+/// projection.
+pub(crate) fn split_normalized_host_port(value: &str) -> Option<(&str, u16)> {
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        // Bracketed form must wrap a valid IP literal, mirroring the config.
+        let (host, port) = rest.split_once("]:")?;
+        if host.parse::<std::net::IpAddr>().is_err() {
+            return None;
+        }
+        (host, port)
+    } else {
+        let (host, port) = value.rsplit_once(':')?;
+        if host.contains(':') {
+            // Unbracketed multi-colon host is not a normalized form.
+            return None;
+        }
+        (host, port)
+    };
+    if host.is_empty() {
+        return None;
+    }
+    // An explicit numeric port that is not zero, matching `split_host_port`.
+    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+    Some((host, port))
+}
+
+/// Validated mTLS material and verification policy for an etcd connection.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EtcdTlsConfig {
-    ca_certificate_pem: Vec<u8>,
+    ca_certificate_pem: Option<Vec<u8>>,
     identity: Option<(Vec<u8>, Vec<u8>)>,
     domain_name: Option<String>,
+    policy: EtcdTlsPolicy,
 }
 
 impl fmt::Debug for EtcdTlsConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("EtcdTlsConfig")
-            .field("ca_certificate_pem", &"<redacted>")
+            .field(
+                "ca_certificate_configured",
+                &self.ca_certificate_pem.is_some(),
+            )
             .field("client_identity_configured", &self.identity.is_some())
             .field("domain_name", &self.domain_name)
+            .field("minimum_version", &self.policy.minimum_version)
+            .field("common_name_pins", &self.policy.allowed_common_names.len())
+            .field("skip_ca_verification", &self.policy.skip_ca_verification)
             .finish()
     }
 }
 
 impl EtcdTlsConfig {
-    /// Creates TLS options from one CA bundle and an optional client identity.
+    /// Creates TLS material and policy from an optional CA bundle, an optional
+    /// client identity, an optional explicit server name, and a verification
+    /// policy.
+    ///
+    /// A CA bundle is required unless [`EtcdTlsPolicy::skip_ca_verification`] is
+    /// set; when it is set, the connection still performs the TLS handshake and
+    /// enforces any `allowed_common_names`.
     ///
     /// # Errors
     ///
-    /// Rejects empty CA material, incomplete client identities, and empty
-    /// explicit domain names.
+    /// Rejects a missing CA when CA verification is required, incomplete client
+    /// identities, empty explicit domain names, and empty common-name entries.
     pub fn new(
-        ca_certificate_pem: Vec<u8>,
+        ca_certificate_pem: Option<Vec<u8>>,
         client_certificate_pem: Option<Vec<u8>>,
         client_key_pem: Option<Vec<u8>>,
         domain_name: Option<String>,
+        policy: EtcdTlsPolicy,
     ) -> Result<Self, EtcdConfigError> {
-        if ca_certificate_pem.is_empty() {
+        let EtcdTlsPolicy {
+            minimum_version,
+            allowed_common_names,
+            skip_ca_verification,
+        } = policy;
+        let ca_certificate_pem = ca_certificate_pem.filter(|ca| !ca.is_empty());
+        if !skip_ca_verification && ca_certificate_pem.is_none() {
             return Err(EtcdConfigError::EmptyCaCertificate);
         }
         let identity = match (client_certificate_pem, client_key_pem) {
@@ -76,23 +209,41 @@ impl EtcdTlsConfig {
         if domain_name.as_deref().is_some_and(str::is_empty) {
             return Err(EtcdConfigError::EmptyDomainName);
         }
+        let allowed_common_names = normalized_common_names(allowed_common_names)?;
         Ok(Self {
             ca_certificate_pem,
             identity,
             domain_name,
+            policy: EtcdTlsPolicy {
+                minimum_version,
+                allowed_common_names,
+                skip_ca_verification,
+            },
         })
     }
 
-    fn connect_options(&self) -> TlsOptions {
-        let mut options = TlsOptions::new()
-            .ca_certificate(Certificate::from_pem(self.ca_certificate_pem.clone()));
-        if let Some((certificate, key)) = &self.identity {
-            options = options.identity(Identity::from_pem(certificate.clone(), key.clone()));
-        }
-        if let Some(domain_name) = &self.domain_name {
-            options = options.domain_name(domain_name.clone());
-        }
-        options
+    /// Builds the client TLS configuration for the custom etcd transport from
+    /// the generation-bound material and verification policy (the advanced
+    /// `minimum_version` / `allowed_common_names` / `skip_ca_verification` that
+    /// the tonic `TlsOptions` path cannot express).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtcdConfigError::TlsSetup`] when the material cannot form a
+    /// client configuration.
+    pub fn client_config(&self) -> Result<Arc<rustls::ClientConfig>, EtcdConfigError> {
+        crate::tls::build_client_config(
+            self.ca_certificate_pem.as_deref(),
+            self.identity
+                .as_ref()
+                .map(|(certificate, key)| (certificate.as_slice(), key.as_slice())),
+            &self.policy,
+        )
+    }
+
+    /// Returns the explicit TLS server-name override used for SNI, if set.
+    pub(crate) fn domain_name(&self) -> Option<&str> {
+        self.domain_name.as_deref()
     }
 }
 
@@ -106,6 +257,7 @@ pub struct EtcdClientConfig {
     keep_alive_timeout: Duration,
     tcp_keep_alive: Duration,
     tls: Option<EtcdTlsConfig>,
+    ns_servers: Arc<[Arc<str>]>,
 }
 
 impl EtcdClientConfig {
@@ -132,7 +284,41 @@ impl EtcdClientConfig {
             keep_alive_timeout: Duration::from_secs(3),
             tcp_keep_alive: Duration::from_secs(30),
             tls,
+            ns_servers: Arc::from([]),
         })
+    }
+
+    /// Threads the cluster's explicit, already-normalized nameservers onto this
+    /// config, preserving Go's stable lexicographic order and its duplicates.
+    ///
+    /// The list is a shared, immutable snapshot; the empty list means no explicit
+    /// nameservers. Each entry must be a normalized `host:port` (or bracketed
+    /// `[v6]:port`) with an explicit numeric port, matching the config layer's
+    /// `normalize_ns_server`. When non-empty, the connector resolves the target
+    /// host through the shared owner-fenced explicit-nameserver resolver over
+    /// these servers — never the system resolver; only a nameserver *hostname*
+    /// entry is bootstrapped through the system resolver. An empty list keeps the
+    /// system-resolver path for the target host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtcdConfigError::TooManyNsServers`] when the list exceeds
+    /// [`MAX_NS_SERVERS`], or [`EtcdConfigError::InvalidNsServer`] when an entry
+    /// is not a normalized `host:port`.
+    pub fn with_ns_servers(mut self, ns_servers: Arc<[Arc<str>]>) -> Result<Self, EtcdConfigError> {
+        if ns_servers.len() > MAX_NS_SERVERS {
+            return Err(EtcdConfigError::TooManyNsServers {
+                count: ns_servers.len(),
+                maximum: MAX_NS_SERVERS,
+            });
+        }
+        for (index, server) in ns_servers.iter().enumerate() {
+            if split_normalized_host_port(server).is_none() {
+                return Err(EtcdConfigError::InvalidNsServer { index });
+            }
+        }
+        self.ns_servers = ns_servers;
+        Ok(self)
     }
 
     /// Replaces all bounded timeout and keepalive values.
@@ -177,23 +363,53 @@ impl EtcdClientConfig {
         &self.endpoints
     }
 
+    /// Returns the validated explicit nameservers in their frozen, duplicate-
+    /// preserving order (empty when none are configured).
+    #[must_use]
+    pub fn ns_servers(&self) -> &[Arc<str>] {
+        &self.ns_servers
+    }
+
     /// Returns the per-operation request deadline.
     #[must_use]
     pub const fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
 
-    fn connect_options(&self) -> ConnectOptions {
-        let mut options = ConnectOptions::new()
-            .with_connect_timeout(self.connect_timeout)
-            .with_timeout(self.request_timeout)
-            .with_keep_alive(self.keep_alive_interval, self.keep_alive_timeout)
-            .with_keep_alive_while_idle(false)
-            .with_tcp_keepalive(self.tcp_keep_alive);
-        if let Some(tls) = &self.tls {
-            options = options.with_tls(tls.connect_options());
-        }
-        options
+    /// Returns the whole-connection establishment budget for the custom
+    /// transport (single DNS + TCP + TLS deadline per endpoint).
+    pub(crate) const fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Returns the HTTP/2 keepalive ping interval for the custom transport.
+    pub(crate) const fn keep_alive_interval(&self) -> Duration {
+        self.keep_alive_interval
+    }
+
+    /// Returns the HTTP/2 keepalive ping timeout for the custom transport.
+    pub(crate) const fn keep_alive_timeout(&self) -> Duration {
+        self.keep_alive_timeout
+    }
+
+    /// Returns the TCP keepalive idle time applied to each dialed socket.
+    pub(crate) const fn tcp_keep_alive(&self) -> Duration {
+        self.tcp_keep_alive
+    }
+
+    /// Returns the validated TLS material and policy, if TLS is configured.
+    pub(crate) fn tls(&self) -> Option<&EtcdTlsConfig> {
+        self.tls.as_ref()
+    }
+
+    /// Returns the advanced TLS verification policy, if TLS is configured.
+    ///
+    /// Exposed so the composition root can assert the topology→transport policy
+    /// mapping (skip-CA, common-name pins, minimum version) that
+    /// [`EtcdConnector::connect`] threads into the custom transport.
+    #[must_use]
+    pub fn tls_policy(&self) -> Option<&EtcdTlsPolicy> {
+        self.tls.as_ref().map(|tls| &tls.policy)
     }
 }
 
@@ -231,7 +447,7 @@ pub enum EtcdConfigError {
         /// Zero-based endpoint index.
         index: usize,
     },
-    /// TLS requires at least one trust anchor.
+    /// TLS requires at least one trust anchor unless CA verification is skipped.
     #[error("etcd TLS CA certificate is empty")]
     EmptyCaCertificate,
     /// Client certificate and key must be configured together.
@@ -240,6 +456,40 @@ pub enum EtcdConfigError {
     /// An explicit TLS server name cannot be empty.
     #[error("etcd TLS domain name is empty")]
     EmptyDomainName,
+    /// The minimum TLS version must be unset, `1.2`, or `1.3`.
+    #[error("unsupported etcd TLS minimum version")]
+    UnsupportedTlsVersion,
+    /// An allowed common name entry cannot be empty.
+    #[error("etcd TLS allowed common name is empty")]
+    EmptyCommonName,
+    /// An allowed common name entry exceeds its length bound.
+    #[error("etcd TLS allowed common name is too long")]
+    CommonNameTooLong,
+    /// The allowed common name list exceeds its count bound.
+    #[error("too many etcd TLS allowed common names")]
+    TooManyCommonNames,
+    /// The configured nameserver count is bounded.
+    #[error("too many nameservers: {count} exceeds {maximum}")]
+    TooManyNsServers {
+        /// Observed nameserver count.
+        count: usize,
+        /// Maximum nameserver count.
+        maximum: usize,
+    },
+    /// One nameserver is not a normalized `host:port`.
+    #[error("invalid nameserver at index {index}")]
+    InvalidNsServer {
+        /// Zero-based nameserver index.
+        index: usize,
+    },
+    /// The explicit-nameserver resolver could not be constructed for a cluster
+    /// that configures `ns_servers`. The payload-free [`ResolveError`] source
+    /// carries the class without leaking any host or address.
+    #[error("explicit nameserver resolver could not be built")]
+    ExplicitResolver(#[source] ResolveError),
+    /// The TLS material and policy could not form a client configuration.
+    #[error("etcd TLS client configuration could not be built")]
+    TlsSetup,
     /// Timeout and keepalive values are bounded.
     #[error("invalid {name} duration {value:?}")]
     InvalidDuration {
@@ -253,15 +503,31 @@ pub enum EtcdConfigError {
     KeepAliveTimeoutExceedsInterval,
 }
 
+/// The dependency-layer cause behind an [`EtcdConnectError::Dependency`].
+///
+/// The custom owner-fenced transport is assembled from the validated config
+/// before the client is created, so a connection failure can originate either in
+/// that assembly (a configuration fault) or in the external client itself.
+#[derive(Debug, Error)]
+pub enum EtcdConnectSource {
+    /// The external etcd client rejected or could not reach the endpoint set.
+    #[error("etcd client connection failed")]
+    Client(#[source] etcd_client::Error),
+    /// The owner-fenced custom transport could not be built from the config.
+    #[error("etcd transport configuration is invalid")]
+    Configuration(#[source] EtcdConfigError),
+}
+
 /// Runtime connection failure with stable public classes.
 #[derive(Debug, Error)]
 pub enum EtcdConnectError {
     /// The originating control owner is no longer current.
     #[error("stale control owner")]
     StaleOwner,
-    /// The external client rejected or could not reach the endpoint set.
+    /// The external client rejected or could not reach the endpoint set, or the
+    /// custom transport could not be built from the validated configuration.
     #[error("etcd dependency connection failed")]
-    Dependency(#[source] etcd_client::Error),
+    Dependency(#[source] EtcdConnectSource),
 }
 
 /// A fenced semantic etcd operation failure.
@@ -289,23 +555,41 @@ impl EtcdConnector {
         Self { owner, config }
     }
 
-    /// Connects to PD's etcd API and rechecks the owner after the await point.
+    /// Binds the owner-fenced custom transport to a raw etcd client for the
+    /// exact owner generation, rechecking the owner across each step.
+    ///
+    /// This does **not** establish the network. The custom endpoints built by
+    /// [`crate::transport::build_custom_channel`] are lazy, and
+    /// [`Client::from_channel`] with no credentials sends no RPC, so DNS, TCP,
+    /// and TLS only happen on the first etcd operation — where they are covered
+    /// by the owner-fenced dialer and the outer [`EtcdConnection::execute`]
+    /// fence. Ownership is rechecked before interpreting each fallible step so a
+    /// retired generation always wins over a build or client error: the fence
+    /// sits *before* the `?` on both the transport build and the client
+    /// creation.
     ///
     /// # Errors
     ///
-    /// Returns [`EtcdConnectError::StaleOwner`] before or after connection if
-    /// the exact generation was released; otherwise returns the typed client
-    /// error without retrying forever.
+    /// Returns [`EtcdConnectError::StaleOwner`] whenever the exact generation
+    /// was released; otherwise returns [`EtcdConnectError::Dependency`] carrying
+    /// the transport-configuration or client cause without retrying forever.
     pub async fn connect(&self) -> Result<EtcdConnection, EtcdConnectError> {
         if !self.owner.is_current() {
             return Err(EtcdConnectError::StaleOwner);
         }
-        let result =
-            Client::connect(self.config.endpoints(), Some(self.config.connect_options())).await;
+        let built = crate::transport::build_custom_channel(&self.config, &self.owner);
         if !self.owner.is_current() {
             return Err(EtcdConnectError::StaleOwner);
         }
-        let client = result.map_err(EtcdConnectError::Dependency)?;
+        let channel = built.map_err(|error| {
+            EtcdConnectError::Dependency(EtcdConnectSource::Configuration(error))
+        })?;
+        let result = Client::from_channel(channel, None).await;
+        if !self.owner.is_current() {
+            return Err(EtcdConnectError::StaleOwner);
+        }
+        let client = result
+            .map_err(|error| EtcdConnectError::Dependency(EtcdConnectSource::Client(error)))?;
         Ok(EtcdConnection {
             owner: self.owner.clone(),
             client,
@@ -435,7 +719,7 @@ mod tests {
 
     use control_plane::{OwnerScope, OwnershipRegistry};
 
-    use super::{EtcdClientConfig, EtcdConfigError, EtcdTlsConfig};
+    use super::{EtcdClientConfig, EtcdConfigError, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion};
 
     #[test]
     fn endpoints_are_bounded_normalized_and_tls_consistent() {
@@ -470,11 +754,17 @@ mod tests {
     #[test]
     fn tls_and_timeout_material_is_complete() {
         assert_eq!(
-            EtcdTlsConfig::new(Vec::new(), None, None, None),
+            EtcdTlsConfig::new(None, None, None, None, EtcdTlsPolicy::default()),
             Err(EtcdConfigError::EmptyCaCertificate)
         );
         assert_eq!(
-            EtcdTlsConfig::new(vec![1], Some(vec![2]), None, None),
+            EtcdTlsConfig::new(
+                Some(vec![1]),
+                Some(vec![2]),
+                None,
+                None,
+                EtcdTlsPolicy::default()
+            ),
             Err(EtcdConfigError::IncompleteClientIdentity)
         );
         let config =
@@ -494,12 +784,107 @@ mod tests {
     }
 
     #[test]
+    fn minimum_tls_version_parses_only_the_frozen_values() {
+        assert_eq!(EtcdTlsVersion::parse(""), Ok(None));
+        assert_eq!(EtcdTlsVersion::parse("1.2"), Ok(Some(EtcdTlsVersion::V1_2)));
+        assert_eq!(EtcdTlsVersion::parse("1.3"), Ok(Some(EtcdTlsVersion::V1_3)));
+        assert_eq!(
+            EtcdTlsVersion::parse("1.1"),
+            Err(EtcdConfigError::UnsupportedTlsVersion)
+        );
+        assert_eq!(
+            EtcdTlsVersion::parse("tls1.3"),
+            Err(EtcdConfigError::UnsupportedTlsVersion)
+        );
+    }
+
+    #[test]
+    fn skip_ca_verification_allows_a_tls_config_without_a_ca() {
+        // skip-CA still enables TLS but does not require a trust anchor.
+        let policy = EtcdTlsPolicy {
+            skip_ca_verification: true,
+            ..EtcdTlsPolicy::default()
+        };
+        assert!(EtcdTlsConfig::new(None, None, None, None, policy.clone()).is_ok());
+        // An empty CA is treated as absent, which is fine when skipping.
+        assert!(EtcdTlsConfig::new(Some(Vec::new()), None, None, None, policy).is_ok());
+    }
+
+    #[test]
+    fn a_ca_is_required_when_not_skipping_verification() {
+        // Default policy verifies the CA, so a missing or empty CA is rejected.
+        assert_eq!(
+            EtcdTlsConfig::new(None, None, None, None, EtcdTlsPolicy::default()),
+            Err(EtcdConfigError::EmptyCaCertificate)
+        );
+        assert_eq!(
+            EtcdTlsConfig::new(Some(Vec::new()), None, None, None, EtcdTlsPolicy::default()),
+            Err(EtcdConfigError::EmptyCaCertificate)
+        );
+    }
+
+    #[test]
+    fn an_empty_allowed_common_name_is_rejected() {
+        let policy = EtcdTlsPolicy {
+            allowed_common_names: vec!["good".to_owned(), "  ".to_owned()],
+            ..EtcdTlsPolicy::default()
+        };
+        assert_eq!(
+            EtcdTlsConfig::new(Some(vec![1]), None, None, None, policy),
+            Err(EtcdConfigError::EmptyCommonName)
+        );
+    }
+
+    #[test]
+    fn allowed_common_names_are_bounded() {
+        let over_count = EtcdTlsPolicy {
+            allowed_common_names: vec!["cn".to_owned(); 1025],
+            ..EtcdTlsPolicy::default()
+        };
+        assert_eq!(
+            EtcdTlsConfig::new(Some(vec![1]), None, None, None, over_count),
+            Err(EtcdConfigError::TooManyCommonNames)
+        );
+        let over_length = EtcdTlsPolicy {
+            allowed_common_names: vec!["a".repeat(256)],
+            ..EtcdTlsPolicy::default()
+        };
+        assert_eq!(
+            EtcdTlsConfig::new(Some(vec![1]), None, None, None, over_length),
+            Err(EtcdConfigError::CommonNameTooLong)
+        );
+    }
+
+    #[test]
+    fn allowed_common_names_are_trimmed_sorted_and_deduped() {
+        assert_eq!(
+            super::normalized_common_names(vec![
+                " beta ".to_owned(),
+                "alpha".to_owned(),
+                "alpha".to_owned(),
+            ]),
+            Ok(vec!["alpha".to_owned(), "beta".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_full_policy_with_ca_and_pins_is_accepted() {
+        let policy = EtcdTlsPolicy {
+            minimum_version: Some(EtcdTlsVersion::V1_3),
+            allowed_common_names: vec!["etcd-server".to_owned()],
+            skip_ca_verification: false,
+        };
+        assert!(EtcdTlsConfig::new(Some(vec![1, 2, 3]), None, None, None, policy).is_ok());
+    }
+
+    #[test]
     fn tls_debug_redacts_certificate_and_private_key_material() {
         let tls = EtcdTlsConfig::new(
-            b"secret-ca-certificate".to_vec(),
+            Some(b"secret-ca-certificate".to_vec()),
             Some(b"secret-client-certificate".to_vec()),
             Some(b"secret-private-key".to_vec()),
             Some("etcd.internal".to_owned()),
+            EtcdTlsPolicy::default(),
         )
         .unwrap_or_else(|error| unreachable!("TLS policy: {error}"));
         let rendered = format!("{tls:?}");
@@ -542,5 +927,50 @@ mod tests {
             connector.connect().await,
             Err(super::EtcdConnectError::StaleOwner)
         ));
+    }
+
+    #[test]
+    fn ns_servers_are_bounded_validated_and_order_preserving() {
+        use std::sync::Arc;
+
+        let base = EtcdClientConfig::new(["127.0.0.1:2379".to_owned()], None)
+            .unwrap_or_else(|error| unreachable!("config: {error}"));
+        assert!(base.ns_servers().is_empty());
+
+        // Frozen lexicographic order with duplicates preserved (not de-duped).
+        let servers: Arc<[Arc<str>]> = Arc::from([
+            Arc::from("10.0.0.1:53"),
+            Arc::from("10.0.0.1:53"),
+            Arc::from("[2001:db8::1]:53"),
+            Arc::from("dns.internal:5353"),
+        ]);
+        let threaded = base
+            .clone()
+            .with_ns_servers(Arc::clone(&servers))
+            .unwrap_or_else(|error| unreachable!("ns: {error}"));
+        assert_eq!(threaded.ns_servers(), &*servers);
+
+        // Over-bound list is rejected.
+        let too_many: Arc<[Arc<str>]> = (0..=super::MAX_NS_SERVERS)
+            .map(|index| Arc::from(format!("10.0.0.{}:53", index % 250)))
+            .collect();
+        assert!(matches!(
+            base.clone().with_ns_servers(too_many),
+            Err(EtcdConfigError::TooManyNsServers { .. })
+        ));
+
+        // Non-normalized entries are rejected, matching the config layer's
+        // `normalize_ns_server`: a missing port, a zero port, and a bracketed
+        // host that is not an IP literal.
+        for bad in ["no-port-host", "dns.example:0", "[dns.example]:53"] {
+            let entry: Arc<[Arc<str>]> = Arc::from([Arc::from(bad)]);
+            assert!(
+                matches!(
+                    base.clone().with_ns_servers(entry),
+                    Err(EtcdConfigError::InvalidNsServer { index: 0 })
+                ),
+                "must reject {bad}"
+            );
+        }
     }
 }

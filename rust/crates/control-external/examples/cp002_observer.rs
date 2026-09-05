@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use control_external::{
     BoundedHttpClient, DnsResolver, EtcdClientConfig, EtcdConnection, EtcdConnector, EtcdTlsConfig,
-    HttpClientConfig,
+    EtcdTlsPolicy, HttpClientConfig,
 };
 use control_plane::{OwnerScope, OwnershipRegistry};
 use serde_json::{Value, json};
@@ -105,10 +105,11 @@ async fn observe_dependencies(
     };
     let tls = if std::env::var_os("CP002_MUTATE_TLS").is_some() {
         Some(EtcdTlsConfig::new(
-            b"not-a-valid-ca-certificate".to_vec(),
+            Some(b"not-a-valid-ca-certificate".to_vec()),
             None,
             None,
             None,
+            EtcdTlsPolicy::default(),
         )?)
     } else {
         None
