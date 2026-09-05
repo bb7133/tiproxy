@@ -2050,3 +2050,683 @@ ns-servers = []
         }
     }
 }
+
+/// Real-composition proof of the #214 routing-generation semantics.
+///
+/// Drives the FULL public path only — `TopologyCandidateValidator` →
+/// `ConfigNamespaceStore` → `ControlRuntime` → `TopologyModule::new` (real
+/// `ArtifactClusterFactory` + real connector + registrar + the 214-2 refresh
+/// loop) → `ControlModule::run` → `TopologyModuleHandle` — and observes the
+/// routing source ONLY through `handle.routing_handle()`. The initial snapshot
+/// comes from the refresh loop's own `wait_first`, never a hand poll.
+///
+/// The KV fixture is mutable (its served `/topology/tidb/...` keys are swappable
+/// at runtime) and counts + signals each `TiDB`-prefix Range, so the paused-clock
+/// drain is structured (waits on a real Range event and the observed routing
+/// generation), never a sleep or yield count.
+#[cfg(test)]
+mod routing_generation_semantics {
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
+
+    use control_config::{ConfigNamespaceSource, ConfigNamespaceStore, TopologyRuntimeIdentity};
+    use control_plane::{
+        ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
+        MetricsPolicy, ModuleError, OwnershipRegistry, RuntimeEvent, ShutdownReason, TlsPolicy,
+    };
+    use control_topology::{
+        RoutingSnapshot, RoutingSnapshotHandle, StaticAdvertiseResolver, TopologyModule,
+        TopologyModuleHandle, TopologyStatus,
+    };
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::service::TowerToHyperService;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{Notify, watch};
+    use tonic::codegen::{BoxFuture, Context, Poll, Service, http};
+    use tonic::server::{Grpc, NamedService, UnaryService};
+    use tonic_prost::ProstCodec;
+
+    use super::{ArtifactClusterFactory, TopologyCandidateValidator};
+    use crate::tls_material::open_tls_roots;
+
+    const RANGE_PATH: &str = "/etcdserverpb.KV/Range";
+    const KV_SERVICE_NAME: &str = "etcdserverpb.KV";
+    const CLUSTER_NAME: &str = "cluster-a";
+    const ADDR_A: &str = "10.0.0.1:4000";
+    const ADDR_B: &str = "10.0.0.2:4000";
+    /// The classic `TiDB` topology prefix a merged poll reads first.
+    const TIDB_PREFIX: &[u8] = b"/topology/tidb/";
+    /// Mirrors the private production `ROUTING_REFRESH_INTERVAL` (3s); advancing
+    /// the paused clock by it fires the refresh loop's next tick.
+    const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+    // ----- Wire-compatible etcd v3 messages (etcd 0.20.0 field tags) --------
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct RangeRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        key: Vec<u8>,
+        #[prost(bytes = "vec", tag = "2")]
+        range_end: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct ResponseHeader {
+        #[prost(uint64, tag = "1")]
+        cluster_id: u64,
+        #[prost(uint64, tag = "2")]
+        member_id: u64,
+        #[prost(int64, tag = "3")]
+        revision: i64,
+        #[prost(uint64, tag = "4")]
+        raft_term: u64,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct KeyValue {
+        #[prost(bytes = "vec", tag = "1")]
+        key: Vec<u8>,
+        #[prost(int64, tag = "2")]
+        create_revision: i64,
+        #[prost(int64, tag = "3")]
+        mod_revision: i64,
+        #[prost(int64, tag = "4")]
+        version: i64,
+        #[prost(bytes = "vec", tag = "5")]
+        value: Vec<u8>,
+        #[prost(int64, tag = "6")]
+        lease: i64,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct RangeResponse {
+        #[prost(message, optional, tag = "1")]
+        header: Option<ResponseHeader>,
+        #[prost(message, repeated, tag = "2")]
+        kvs: Vec<KeyValue>,
+        #[prost(bool, tag = "3")]
+        more: bool,
+        #[prost(int64, tag = "4")]
+        count: i64,
+    }
+
+    // ----- The mutable, per-prefix-counting KV fixture ----------------------
+
+    /// A seeded etcd key space (raw key/value bytes).
+    type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// A KV fixture whose served keys are swappable at runtime; each `TiDB`-prefix
+    /// Range bumps a counter and fires `served`, so a structured drain can wait on
+    /// a real refresh poll.
+    #[derive(Clone)]
+    struct KvFixture {
+        seeded: Arc<Mutex<KvPairs>>,
+        tidb_ranges: Arc<AtomicUsize>,
+        served: Arc<Notify>,
+    }
+
+    impl KvFixture {
+        fn swap(&self, new: KvPairs) {
+            *self.seeded.lock().unwrap_or_else(PoisonError::into_inner) = new;
+        }
+
+        fn tidb_range_count(&self) -> usize {
+            self.tidb_ranges.load(Ordering::SeqCst)
+        }
+    }
+
+    fn range_scan(
+        seeded: &[(Vec<u8>, Vec<u8>)],
+        key: &[u8],
+        range_end: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut hits: Vec<(Vec<u8>, Vec<u8>)> = seeded
+            .iter()
+            .filter(|(k, _)| {
+                if range_end.is_empty() {
+                    k.as_slice() == key
+                } else {
+                    k.as_slice() >= key && k.as_slice() < range_end
+                }
+            })
+            .cloned()
+            .collect();
+        hits.sort_by(|(a, _), (b, _)| a.cmp(b));
+        hits
+    }
+
+    struct RangeHandler {
+        fixture: KvFixture,
+    }
+
+    impl UnaryService<RangeRequest> for RangeHandler {
+        type Response = RangeResponse;
+        type Future = BoxFuture<tonic::Response<RangeResponse>, tonic::Status>;
+
+        fn call(&mut self, request: tonic::Request<RangeRequest>) -> Self::Future {
+            let fixture = self.fixture.clone();
+            Box::pin(async move {
+                let message = request.into_inner();
+                // Snapshot the (mutable) seeded set under the lock, then release it
+                // before any further work — the lock is never held across an await.
+                let snapshot = {
+                    fixture
+                        .seeded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone()
+                };
+                if message.key.as_slice() == TIDB_PREFIX {
+                    fixture.tidb_ranges.fetch_add(1, Ordering::SeqCst);
+                    fixture.served.notify_one();
+                }
+                let matches = range_scan(&snapshot, &message.key, &message.range_end);
+                let count = i64::try_from(matches.len()).unwrap_or(i64::MAX);
+                let kvs = matches
+                    .into_iter()
+                    .map(|(key, value)| KeyValue {
+                        key,
+                        value,
+                        ..KeyValue::default()
+                    })
+                    .collect();
+                let header = ResponseHeader {
+                    cluster_id: 7,
+                    member_id: 11,
+                    revision: 42,
+                    raft_term: 3,
+                };
+                Ok(tonic::Response::new(RangeResponse {
+                    header: Some(header),
+                    kvs,
+                    more: false,
+                    count,
+                }))
+            })
+        }
+    }
+
+    impl Service<http::Request<Incoming>> for KvFixture {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Infallible>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<Incoming>) -> Self::Future {
+            let fixture = self.clone();
+            Box::pin(async move {
+                let response = if request.uri().path() == RANGE_PATH {
+                    let mut grpc = Grpc::new(ProstCodec::<RangeResponse, RangeRequest>::default());
+                    grpc.unary(RangeHandler { fixture }, request).await
+                } else {
+                    // The registrar's lease Grant/Put land here and retry harmlessly.
+                    unimplemented_reply()
+                };
+                Ok(response)
+            })
+        }
+    }
+
+    impl NamedService for KvFixture {
+        const NAME: &'static str = KV_SERVICE_NAME;
+    }
+
+    fn unimplemented_reply() -> http::Response<tonic::body::Body> {
+        let mut response = http::Response::new(tonic::body::Body::default());
+        let headers = response.headers_mut();
+        headers.insert(
+            tonic::Status::GRPC_STATUS,
+            http::HeaderValue::from_static("12"),
+        );
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            tonic::metadata::GRPC_CONTENT_TYPE,
+        );
+        response
+    }
+
+    /// Binds a loopback listener and serves the mutable fixture over each accepted
+    /// plaintext connection. Returns the fixture handle (for runtime swaps) and the
+    /// bound address.
+    async fn spawn_fixture(seeded: Vec<(Vec<u8>, Vec<u8>)>) -> Option<(KvFixture, SocketAddr)> {
+        let fixture = KvFixture {
+            seeded: Arc::new(Mutex::new(seeded)),
+            tidb_ranges: Arc::new(AtomicUsize::new(0)),
+            served: Arc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let addr = listener.local_addr().ok()?;
+        let serving = fixture.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(serve_connection(stream, serving.clone()));
+            }
+        });
+        Some((fixture, addr))
+    }
+
+    async fn serve_connection(stream: TcpStream, fixture: KvFixture) {
+        let service = TowerToHyperService::new(fixture);
+        let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        let _ = builder
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    }
+
+    fn kv(key: &str, value: &str) -> (Vec<u8>, Vec<u8>) {
+        (key.as_bytes().to_vec(), value.as_bytes().to_vec())
+    }
+
+    /// The `info` + live `ttl` pair for one backend at `addr` advertising `ip`.
+    fn backend_kvs(addr: &str, ip: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            kv(
+                &format!("/topology/tidb/{addr}/info"),
+                &format!(r#"{{"ip":"{ip}","status_port":10080,"version":"v8"}}"#),
+            ),
+            kv(&format!("/topology/tidb/{addr}/ttl"), "173000000000"),
+        ]
+    }
+
+    /// The seeded key space for the given backends (`(addr, ip)` pairs).
+    fn seed(backends: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        backends
+            .iter()
+            .flat_map(|(addr, ip)| backend_kvs(addr, ip))
+            .collect()
+    }
+
+    /// The discovered backend addresses of a routing snapshot, in published order.
+    fn addrs(snapshot: &RoutingSnapshot) -> Vec<String> {
+        snapshot
+            .backends
+            .backends
+            .iter()
+            .map(|b| b.backend.addr.clone())
+            .collect()
+    }
+
+    struct NullSink;
+    impl EventSink for NullSink {
+        fn record(&self, _event: &RuntimeEvent) {}
+    }
+
+    fn identity() -> TopologyRuntimeIdentity {
+        TopologyRuntimeIdentity {
+            version: Arc::from("v-test"),
+            git_hash: Arc::from("hash-test"),
+            deploy_path: PathBuf::from("/deploy/test"),
+            start_timestamp: 1_700_000_000,
+        }
+    }
+
+    fn material_dir() -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cptopo-routing-gen-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|error| unreachable!("mkdir: {error}"));
+        dir
+    }
+
+    /// A one-cluster topology TOML with the given PD address and `ns-servers`
+    /// literal list (empty string for none).
+    fn topology_toml(pd_addrs: &str, ns_servers: &str) -> Vec<u8> {
+        format!(
+            r#"
+[proxy]
+addr = "0.0.0.0:6000"
+max-connections = 100
+
+[api]
+addr = "0.0.0.0:10080"
+
+[[proxy.backend-clusters]]
+name = "{CLUSTER_NAME}"
+pd-addrs = "{pd_addrs}"
+ns-servers = [{ns_servers}]
+"#
+        )
+        .into_bytes()
+    }
+
+    /// A live composition, driven ONLY through the real public path.
+    struct Composition {
+        handle: TopologyModuleHandle,
+        routing: RoutingSnapshotHandle,
+        store: ConfigNamespaceStore,
+        dir: PathBuf,
+        task: tokio::task::JoinHandle<Result<(), ModuleError>>,
+        runtime: ControlRuntime,
+    }
+
+    /// Builds the real pipeline against `addr` and waits for module readiness.
+    async fn build_composition(addr: SocketAddr, ns_servers: &str) -> Composition {
+        let dir = material_dir();
+        let toml = topology_toml(&format!("127.0.0.1:{}", addr.port()), ns_servers);
+        let roots = open_tls_roots(std::slice::from_ref(&dir));
+        let store = ConfigNamespaceStore::from_toml_with_validator(
+            &toml,
+            None,
+            &dir,
+            Arc::new(TopologyCandidateValidator::new(Arc::new(roots))),
+        )
+        .unwrap_or_else(|error| unreachable!("pipeline validation: {error}"));
+
+        let registry = Box::leak(Box::new(OwnershipRegistry::new()));
+        let config = ControlConfig::new(
+            1,
+            Duration::from_secs(30),
+            0,
+            TlsPolicy::default(),
+            LogLevel::Info,
+            MetricsPolicy::default(),
+        )
+        .unwrap_or_else(|error| unreachable!("control config: {error}"));
+        let runtime = ControlRuntime::claim_process(
+            registry,
+            "cptopo-routing-gen",
+            config,
+            Arc::new(NullSink),
+        )
+        .unwrap_or_else(|error| unreachable!("claim process: {error}"));
+
+        let source: Arc<dyn ConfigNamespaceSource> = Arc::new(store.clone());
+        let (module, mut handle) = TopologyModule::new(
+            source,
+            Box::new(ArtifactClusterFactory),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+        );
+        let context = runtime.handle().module_context();
+        runtime
+            .mark_ready()
+            .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
+        let task = tokio::spawn(Box::new(module).run(context));
+        handle
+            .wait_ready()
+            .await
+            .unwrap_or_else(|error| unreachable!("module ready: {error}"));
+        let routing = handle.routing_handle();
+        Composition {
+            handle,
+            routing,
+            store,
+            dir,
+            task,
+            runtime,
+        }
+    }
+
+    /// A structured, paused-clock drain.
+    ///
+    /// It fires the refresh loop's next tick with a SINGLE `advance` (kicking the
+    /// loop off its parked timer without straddling a poll's internal per-cluster
+    /// budget), then waits — event-driven, on the fixture's real `served` Range
+    /// signal — re-checking the published routing snapshot until `done` holds.
+    /// Any further ticks needed come from the paused runtime's own idle
+    /// auto-advance, which fires one timer at a time so each poll's real I/O
+    /// completes before its budget; the drain never issues a second blanket
+    /// `advance` that could cancel an in-flight poll. The drain waits on both a
+    /// real Range being served AND the observed generation — never a sleep or a
+    /// yield count. The iteration cap is a pure deadlock guard.
+    async fn drain_until<F>(
+        routing: &RoutingSnapshotHandle,
+        fixture: &KvFixture,
+        mut done: F,
+    ) -> Arc<RoutingSnapshot>
+    where
+        F: FnMut(&RoutingSnapshot) -> bool,
+    {
+        if let Some(snapshot) = routing.current()
+            && done(&snapshot)
+        {
+            return snapshot;
+        }
+        // Kick the parked refresh loop into its next tick exactly once.
+        let before = fixture.tidb_range_count();
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        for _ in 0..1024 {
+            // Wake on a real refresh poll's TiDB Range, then re-check the published
+            // generation. Subsequent ticks arrive via the runtime's idle
+            // auto-advance (one timer at a time), so no in-flight poll is cancelled.
+            fixture.served.notified().await;
+            // Structured: require BOTH a fresh real Range served this drain AND the
+            // handle observing the target generation.
+            if fixture.tidb_range_count() > before
+                && let Some(snapshot) = routing.current()
+                && done(&snapshot)
+            {
+                return snapshot;
+            }
+        }
+        unreachable!("the routing generation did not reach the target within the refresh budget");
+    }
+
+    /// Waits until the module's observable status reaches `applied` — an
+    /// event-driven wait on the real status watch.
+    async fn wait_applied(status: &mut watch::Receiver<TopologyStatus>, applied: u64) {
+        while status.borrow_and_update().applied_generation < applied {
+            if status.changed().await.is_err() {
+                unreachable!("the status source must not close before the generation applies");
+            }
+        }
+    }
+
+    // ----- Row 1: same client_epoch, content change -> generation +1 --------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_content_change_at_the_same_epoch_advances_the_routing_generation() {
+        let body = async {
+            let Some((fixture, addr)) = spawn_fixture(seed(&[(ADDR_A, "10.0.0.1")])).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let comp = build_composition(addr, "").await;
+
+            // The refresh loop's OWN first publication.
+            let s1 =
+                comp.routing.wait_first().await.unwrap_or_else(|_| {
+                    unreachable!("the refresh loop publishes a first snapshot")
+                });
+            assert_eq!(s1.generation, 1, "the first snapshot is generation 1");
+            assert_eq!(
+                addrs(&s1),
+                vec![ADDR_A.to_owned()],
+                "it discovers backend A"
+            );
+            let e0 = s1.client_epoch;
+
+            // Swap the served backends to [A, B] with the CONFIG COMPLETELY
+            // UNCHANGED: the client epoch cannot move, only the content.
+            fixture.swap(seed(&[(ADDR_A, "10.0.0.1"), (ADDR_B, "10.0.0.2")]));
+            let s2 = drain_until(&comp.routing, &fixture, |s| s.generation >= 2).await;
+
+            assert_eq!(
+                s2.client_epoch, e0,
+                "a content-only change keeps the SAME discovery client epoch"
+            );
+            assert_eq!(
+                s2.generation, 2,
+                "the routing generation advances EXACTLY by one"
+            );
+            assert_eq!(
+                addrs(&s2),
+                vec![ADDR_A.to_owned(), ADDR_B.to_owned()],
+                "the content changed to exactly [A, B]"
+            );
+            assert!(
+                !Arc::ptr_eq(&s1, &s2),
+                "a real change swaps in a new snapshot Arc"
+            );
+            assert!(
+                !comp.routing.still_current(&s1),
+                "the superseded snapshot is no longer current via the real handle"
+            );
+
+            comp.task.abort();
+            drop(comp.runtime);
+        };
+        if tokio::time::timeout(Duration::from_secs(120), body)
+            .await
+            .is_err()
+        {
+            unreachable!("row 1 completes within the deadlock watchdog");
+        }
+    }
+
+    // ----- Row 2: equal-content epoch rotation -> generation +1 -------------
+
+    #[tokio::test(start_paused = true)]
+    async fn an_epoch_rotation_at_equal_content_advances_the_routing_generation() {
+        let body = async {
+            let Some((fixture, addr)) = spawn_fixture(seed(&[(ADDR_A, "10.0.0.1")])).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let comp = build_composition(addr, "").await;
+
+            let s1 =
+                comp.routing.wait_first().await.unwrap_or_else(|_| {
+                    unreachable!("the refresh loop publishes a first snapshot")
+                });
+            assert_eq!(addrs(&s1), vec![ADDR_A.to_owned()]);
+            let e0 = s1.client_epoch;
+            let g1 = s1.generation;
+
+            // Rotate the cluster MATERIAL through a real next TOML revision: add a
+            // literal nameserver. The PD endpoint stays a literal IP, so the
+            // resolver bypasses DNS and the fixture stays reachable — only the
+            // discovery client material (and thus the client epoch) changes.
+            let mut status = comp.handle.status();
+            comp.store
+                .apply_toml(
+                    &topology_toml(&format!("127.0.0.1:{}", addr.port()), "\"203.0.113.9:53\""),
+                    None,
+                    2,
+                    &comp.dir,
+                )
+                .unwrap_or_else(|error| unreachable!("apply revision 2: {error}"));
+            // FIRST confirm the config applied (so the discovery epoch is committed)
+            // through the real status watch.
+            wait_applied(&mut status, 2).await;
+
+            // THEN drain the next refresh tick and observe the new publication.
+            let s2 = drain_until(&comp.routing, &fixture, |s| s.generation > g1).await;
+
+            assert_eq!(
+                s2.backends, s1.backends,
+                "the backends are byte-identical across an equal-content epoch rotation"
+            );
+            assert_eq!(
+                s2.client_epoch,
+                e0 + 1,
+                "the discovery client epoch rotated E0 -> E1"
+            );
+            assert_eq!(
+                s2.generation,
+                g1 + 1,
+                "the routing generation advances EXACTLY by one on the epoch rotation"
+            );
+            assert!(
+                !Arc::ptr_eq(&s1, &s2),
+                "the provenance swap installs a new snapshot Arc"
+            );
+            assert!(
+                !comp.routing.still_current(&s1),
+                "the superseded provenance is no longer current"
+            );
+
+            comp.task.abort();
+            drop(comp.runtime);
+        };
+        if tokio::time::timeout(Duration::from_secs(120), body)
+            .await
+            .is_err()
+        {
+            unreachable!("row 2 completes within the deadlock watchdog");
+        }
+    }
+
+    // ----- Row 3: old Arc fail-closed at BOTH the swap seam and teardown ----
+
+    #[tokio::test(start_paused = true)]
+    async fn a_superseded_and_the_final_snapshot_both_fail_closed() {
+        let body = async {
+            let Some((fixture, addr)) = spawn_fixture(seed(&[(ADDR_A, "10.0.0.1")])).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let comp = build_composition(addr, "").await;
+
+            let s1 =
+                comp.routing.wait_first().await.unwrap_or_else(|_| {
+                    unreachable!("the refresh loop publishes a first snapshot")
+                });
+
+            // (a) A replacement (content change) supersedes s1 at the swap seam: the
+            // old Arc must be reported not-current via the SAME public handle.
+            fixture.swap(seed(&[(ADDR_A, "10.0.0.1"), (ADDR_B, "10.0.0.2")]));
+            let s2 = drain_until(&comp.routing, &fixture, |s| s.generation >= 2).await;
+            assert!(
+                !comp.routing.still_current(&s1),
+                "the superseded snapshot is fail-closed at the swap-time revoke"
+            );
+            assert!(
+                comp.routing.still_current(&s2),
+                "the live snapshot is still current before teardown"
+            );
+
+            // (b) A legal lifecycle teardown (Ready -> Quiescing -> Draining ->
+            // Stopping) must withdraw the routing source: the LATEST Arc is also
+            // fail-closed AND the handle publishes nothing.
+            comp.runtime
+                .begin_shutdown(ShutdownReason::Requested)
+                .unwrap_or_else(|error| unreachable!("begin shutdown: {error}"));
+            comp.runtime
+                .advance_shutdown(LifecyclePhase::Draining)
+                .unwrap_or_else(|error| unreachable!("advance draining: {error}"));
+            comp.runtime
+                .advance_shutdown(LifecyclePhase::Stopping)
+                .unwrap_or_else(|error| unreachable!("advance stopping: {error}"));
+            let result = comp
+                .task
+                .await
+                .unwrap_or_else(|error| unreachable!("module task join: {error}"));
+            assert!(
+                matches!(result, Ok(())),
+                "the module retires cleanly at Stopping"
+            );
+
+            assert!(
+                !comp.routing.still_current(&s2),
+                "the final snapshot is fail-closed after the terminal withdraw"
+            );
+            assert!(
+                comp.routing.current().is_none(),
+                "the routing handle publishes nothing after teardown"
+            );
+
+            comp.runtime
+                .finish()
+                .unwrap_or_else(|error| unreachable!("finish: {error}"));
+        };
+        if tokio::time::timeout(Duration::from_secs(120), body)
+            .await
+            .is_err()
+        {
+            unreachable!("row 3 completes within the deadlock watchdog");
+        }
+    }
+}
