@@ -134,6 +134,11 @@ struct StallControl {
     prefix: Vec<u8>,
     arrived: Arc<Notify>,
     release: Arc<Notify>,
+    /// Gate: the stall is inert until the test arms it. The module's refresh child
+    /// polls `poll_merged_topology` once at t=0; that poll must drain (disarmed)
+    /// before the fence oracle arms, so only the test's explicit parked poll is
+    /// observed.
+    armed: Arc<AtomicBool>,
     stalled: Arc<AtomicBool>,
     error_after_release: bool,
 }
@@ -187,9 +192,12 @@ impl UnaryService<RangeRequest> for RangeHandler {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(message.key.clone());
 
-            // Park the first Range for the chosen prefix, then (optionally) fail it
-            // so a caller without the gate fence would retry.
+            // Park the first Range for the chosen prefix once armed, then
+            // (optionally) fail it so a caller without the gate fence would retry.
+            // `armed` is checked first so a disarmed refresh poll never consumes
+            // the one-shot `stalled` swap.
             if let Some(stall) = &fixture.stall
+                && stall.armed.load(Ordering::SeqCst)
                 && message.key == stall.prefix
                 && !stall.stalled.swap(true, Ordering::SeqCst)
             {
@@ -273,6 +281,7 @@ fn unimplemented_reply() -> http::Response<tonic::body::Body> {
 struct Fixture {
     addr: SocketAddr,
     observed: Arc<Mutex<Vec<Vec<u8>>>>,
+    armed: Arc<AtomicBool>,
     arrived: Arc<Notify>,
     release: Arc<Notify>,
 }
@@ -287,6 +296,21 @@ impl Fixture {
             .filter(|key| key.as_slice() == prefix)
             .count()
     }
+
+    /// Clears the observed Range log, discarding the initial refresh poll's reads
+    /// so the fence oracle counts only the test's explicit parked poll.
+    fn reset_observed(&self) {
+        self.observed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Arms the stall so the next matching Range parks (after the initial refresh
+    /// poll has drained disarmed).
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Binds a loopback listener and serves the gated KV adapter over each accepted
@@ -298,6 +322,7 @@ async fn spawn_fixture(
     error_after_release: bool,
 ) -> Option<Fixture> {
     let observed = Arc::new(Mutex::new(Vec::new()));
+    let armed = Arc::new(AtomicBool::new(false));
     let arrived = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let fixture = KvFixture {
@@ -307,6 +332,7 @@ async fn spawn_fixture(
             prefix: stall_prefix.to_vec(),
             arrived: Arc::clone(&arrived),
             release: Arc::clone(&release),
+            armed: Arc::clone(&armed),
             stalled: Arc::new(AtomicBool::new(false)),
             error_after_release,
         }),
@@ -324,6 +350,7 @@ async fn spawn_fixture(
     Some(Fixture {
         addr,
         observed,
+        armed,
         arrived,
         release,
     })
@@ -495,6 +522,26 @@ async fn rotate_material(harness: &Harness) {
     );
 }
 
+/// Drains the module's initial refresh poll, then resets the fixture counters and
+/// arms the stall — so the fence oracle observes ONLY the test's explicit parked
+/// poll.
+///
+/// The refresh child (production, unconditional) polls `poll_merged_topology` once
+/// immediately at t=0 and publishes a first routing snapshot. Waiting on
+/// [`RoutingSnapshotHandle::wait_first`] proves that poll fully drained; its next
+/// tick is a full [`ROUTING_REFRESH_INTERVAL`] (3s) away, far beyond this
+/// sub-millisecond critical path, so it never races the armed oracle.
+async fn drain_initial_refresh(harness: &Harness, fixture: &Fixture) {
+    let routing = harness.handle.routing_handle();
+    let Ok(Ok(_snapshot)) =
+        tokio::time::timeout(Duration::from_secs(5), routing.wait_first()).await
+    else {
+        unreachable!("the refresh loop publishes a first routing snapshot before the oracle arms");
+    };
+    fixture.reset_observed();
+    fixture.arm();
+}
+
 // ----- 1 — TiDB mid-poll gate + still_current fence ---------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -515,6 +562,9 @@ async fn tidb_poll_revoked_mid_read_aborts_before_the_second_prefix_and_is_stale
         let Some(harness) = spawn_module(fixture.addr).await else {
             unreachable!("the module becomes ready against the fixture");
         };
+        // Let the module's own refresh poll drain, then arm the stall so only the
+        // test's explicit poll is observed.
+        drain_initial_refresh(&harness, &fixture).await;
         let discovery = harness.handle.discovery_handle();
 
         // Park a merged poll inside its first (classic) TiDB Range.
@@ -584,6 +634,10 @@ async fn prometheus_poll_revoked_mid_read_sends_no_retry_and_is_stale() {
         let Some(harness) = spawn_module(fixture.addr).await else {
             unreachable!("the module becomes ready against the fixture");
         };
+        // Let the module's own refresh poll drain, then arm the stall. (The refresh
+        // loop only polls merged topology, never Prometheus, so it cannot touch the
+        // Prometheus prefix — but draining keeps the harness uniform and robust.)
+        drain_initial_refresh(&harness, &fixture).await;
         let discovery = harness.handle.discovery_handle();
 
         // Park a Prometheus poll inside its first Range attempt.

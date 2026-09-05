@@ -29,6 +29,11 @@ tokio.workspace = true
 hyper = { version = "=1.11.1", default-features = false, features = ["http2", "server"] }
 hyper-util = { version = "=0.1.20", default-features = false, features = ["service", "tokio"] }
 prost.workspace = true
+# `test-util` (paused clock + `tokio::time::advance`) drives the routing-refresh
+# loop's Skip-cadence and teardown-ordering rows deterministically. It is a
+# feature flag on the already-resolved `tokio` crate (dataplane already enables
+# it), so it adds no new package to Cargo.lock.
+tokio = { workspace = true, features = ["test-util"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 
