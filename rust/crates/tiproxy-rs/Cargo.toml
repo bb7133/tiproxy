@@ -34,6 +34,11 @@ prost.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+# `test-util` (paused clock + `tokio::time::advance`) drives the routing-refresh
+# loop's generation-semantics rows deterministically. It is a feature flag on the
+# already-resolved `tokio` crate (dataplane already enables it), so it adds no new
+# package to Cargo.lock.
+tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls.workspace = true
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
