@@ -632,6 +632,16 @@ impl EtcdConnection {
         }
         result.map_err(EtcdOperationError::Dependency)
     }
+
+    /// Whether the owner generation that produced this connection is still
+    /// current. Callers that impose their own deadline around an operation (which
+    /// drops the [`Self::execute`] future before its post-await fence can run)
+    /// use this to re-check ownership in their timeout branch, so a retired
+    /// generation is not mistaken for a plain timeout.
+    #[must_use]
+    pub fn owner_is_current(&self) -> bool {
+        self.owner.is_current()
+    }
 }
 
 fn normalize_endpoints(

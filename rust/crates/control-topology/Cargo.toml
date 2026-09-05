@@ -20,5 +20,17 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+# The `poll_prometheus` live-range integration test drives the real
+# `EtcdConnection` against an in-process etcd v3 KV fixture hand-rolled from a
+# single-route tonic adapter plus hand-defined wire-compatible prost messages
+# (no `etcd-client` `build-server` feature). All specs mirror `tiproxy-rs`'s
+# proven KvFixture so no new resolved package is introduced.
+hyper = { version = "=1.11.1", default-features = false, features = ["http2", "server"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["service", "tokio"] }
+prost.workspace = true
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
 [lints]
 workspace = true
