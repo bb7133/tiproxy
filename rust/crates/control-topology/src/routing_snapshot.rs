@@ -67,6 +67,16 @@ pub struct RoutingSnapshot {
     gate: GenerationGate,
 }
 
+impl RoutingSnapshot {
+    /// This generation's revocable source authority, so a policy layer (e.g. the
+    /// #213 health probe) fences its I/O on the exact `Arc` the snapshot was
+    /// published under. Crate-internal: a diagnostic accessor with no semantic
+    /// change to the published snapshot.
+    pub(crate) fn source_gate(&self) -> &GenerationGate {
+        &self.gate
+    }
+}
+
 /// The outcome of a [`RoutingSnapshotPublisher::publish`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishOutcome {

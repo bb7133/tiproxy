@@ -34,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+mod backend_health;
 mod discovery;
 mod discovery_publish;
 mod merge;
@@ -44,6 +45,7 @@ mod registrar;
 mod resolver;
 mod routing_snapshot;
 
+pub use backend_health::{BackendHealth, ClusterHealthNetwork};
 pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
 pub use discovery_publish::{DiscoveryError, DiscoveryHandle, EpochResult};
 pub use merge::{
