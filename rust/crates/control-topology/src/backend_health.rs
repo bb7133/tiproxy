@@ -20,9 +20,11 @@
 //! (`pkg/balance/observer/health_check.go`):
 //!
 //! * a static backend (empty `ip`) is healthy this stage with no network I/O;
-//! * otherwise up to `max_retries=3` **retries** after the initial attempt (four
-//!   attempts total), a fixed 1s apart, retrying ONLY a retryable
-//!   [`ClusterHttpError`] — any terminal class stops immediately as unhealthy;
+//! * otherwise up to `max_retries` **retries** after the initial attempt
+//!   (`max_retries + 1` attempts total), a fixed `retry_interval` apart, retrying
+//!   ONLY a retryable [`ClusterHttpError`] — any terminal class stops immediately
+//!   as unhealthy; the retry budget is threaded in from the #213-2 policy (Go
+//!   defaults: 3 retries, 1s apart);
 //! * the first HTTP 200 is decoded as the typed status body (`{connections,
 //!   version, git_hash}`) with Go `encoding/json` semantics (unknown ignored,
 //!   missing → zero, wrong type rejects the whole record); only `version` feeds
@@ -49,9 +51,13 @@ use crate::merge::MergedBackend;
 use crate::routing_snapshot::{RoutingSnapshot, RoutingSnapshotHandle};
 
 /// Go `healthCheckMaxRetries`: retries AFTER the initial attempt (four attempts
-/// total).
+/// total). The value is threaded into [`ClusterHealthNetwork::probe_backend`] by
+/// the #213-2 policy; this default is retained as the tests' reference value.
+#[cfg(test)]
 const MAX_RETRIES: u32 = 3;
-/// Go `healthCheckRetryInterval`: the fixed delay between attempts.
+/// Go `healthCheckRetryInterval`: the fixed delay between attempts, threaded in
+/// by the #213-2 policy; retained as the tests' reference value.
+#[cfg(test)]
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The health-relevant projection of one backend, for this slice.
@@ -194,17 +200,25 @@ impl ClusterHealthNetwork {
     /// sibling-cluster network is rejected before any I/O. A static backend
     /// (`ip == ""`) is then healthy with no network I/O; the `u64` status port is
     /// guarded (a value beyond `u16` is terminally unhealthy, never truncated);
-    /// then up to four attempts (1s apart) run against
+    /// then up to `max_retries` retries (each `retry_interval` apart, for
+    /// `max_retries + 1` attempts total) run against
     /// [`ClusterHttpClient::get_once`], retrying only a retryable
     /// [`ClusterHttpError`](control_external::ClusterHttpError). The first HTTP 200
     /// is decoded (only `version` feeds health, a malformed body terminal), with
     /// `still_current` re-checked at each attempt admission, after each backoff,
     /// and before accepting a healthy result.
+    ///
+    /// `max_retries` and `retry_interval` are threaded in from the #213-2
+    /// [`HealthPolicy`](crate::health_loop) (Go defaults: 3 retries, 1s apart);
+    /// the retry classification, the JSON decode, and the exact-source fence are
+    /// unchanged by the parameterization.
     pub async fn probe_backend(
         &self,
         handle: &RoutingSnapshotHandle,
         source: &Arc<RoutingSnapshot>,
         backend: &MergedBackend,
+        max_retries: u32,
+        retry_interval: Duration,
     ) -> BackendHealth {
         // Exact-source authority FIRST: no return (static, mismatch, or port) may
         // precede it.
@@ -232,7 +246,7 @@ impl ClusterHealthNetwork {
             return BackendHealth::unhealthy();
         };
 
-        let mut retries_remaining = MAX_RETRIES;
+        let mut retries_remaining = max_retries;
         loop {
             // Exact-source authority: admit each attempt only for the live source.
             if !handle.still_current(source) {
@@ -261,7 +275,7 @@ impl ClusterHealthNetwork {
                     }
                     if error.is_retryable() && retries_remaining > 0 {
                         retries_remaining -= 1;
-                        tokio::time::sleep(RETRY_INTERVAL).await;
+                        tokio::time::sleep(retry_interval).await;
                         // Re-validate the source after the backoff, before retrying.
                         if !handle.still_current(source) {
                             return BackendHealth::unhealthy();
@@ -287,7 +301,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::{BackendHealth, ClusterHealthNetwork, MAX_RETRIES, decode_status_version};
+    use super::{
+        BackendHealth, ClusterHealthNetwork, MAX_RETRIES, RETRY_INTERVAL, decode_status_version,
+    };
     use crate::discovery_publish::EpochResult;
     use crate::merge::{MergedBackend, MergedTopology};
     use crate::model::BackendInfo;
@@ -430,7 +446,13 @@ mod tests {
         status_port: u64,
     ) -> BackendHealth {
         network
-            .probe_backend(handle, source, &merged_backend(CLUSTER, ip, status_port))
+            .probe_backend(
+                handle,
+                source,
+                &merged_backend(CLUSTER, ip, status_port),
+                MAX_RETRIES,
+                RETRY_INTERVAL,
+            )
             .await
     }
 
@@ -763,7 +785,9 @@ mod tests {
         // A backend from a DIFFERENT cluster than the network's stamp: the wrong
         // DNS/TLS material must never be used against it.
         let backend = merged_backend("cluster-b", "127.0.0.1", u64::from(port));
-        let health = network.probe_backend(&handle, &source, &backend).await;
+        let health = network
+            .probe_backend(&handle, &source, &backend, MAX_RETRIES, RETRY_INTERVAL)
+            .await;
         assert!(
             !health.healthy,
             "a sibling-cluster backend is rejected by the cluster stamp"
@@ -805,6 +829,8 @@ mod tests {
                 &handle_task,
                 &source_task,
                 &merged_backend(CLUSTER, "127.0.0.1", u64::from(port)),
+                MAX_RETRIES,
+                RETRY_INTERVAL,
             )
             .await
         });
