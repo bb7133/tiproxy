@@ -153,6 +153,10 @@ async fn main() -> Result<(), AnyError> {
 
     let store = ConfigNamespaceStore::from_toml(&config_gen(100), None, &std::env::current_dir()?)?;
     let rotated = Arc::new(AtomicUsize::new(0));
+    // The restart-pinned health config is a process input, not a config
+    // generation: the composition root passes the Go-compatible default directly
+    // (`TiProxy` exposes no user-facing health-check config).
+    let health = control_config::HealthCheckConfig::default();
     let (module, mut handle) = TopologyModule::new(
         Arc::new(store.clone()),
         Box::new(RotatingFactory {
@@ -161,7 +165,8 @@ async fn main() -> Result<(), AnyError> {
         }),
         Arc::new(StaticAdvertiseResolver::new(ADVERTISE_HOST)),
         identity(),
-    );
+        health,
+    )?;
 
     let context = runtime.handle().module_context();
     runtime.mark_ready()?;

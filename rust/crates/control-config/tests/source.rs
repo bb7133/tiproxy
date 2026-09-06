@@ -381,7 +381,7 @@ fn ns_servers_are_normalized_sorted_stably_with_duplicates_preserved() {
 }
 
 #[test]
-fn topology_projection_normalizes_clusters_tls_and_health_defaults() {
+fn topology_projection_normalizes_clusters_and_tls() {
     let store = ConfigNamespaceStore::from_toml(
         br#"
 [proxy]
@@ -420,7 +420,6 @@ key = "/etc/tiproxy/client-key.pem"
         topology.cluster_tls.ca_path.as_deref(),
         Some(Path::new("/etc/tiproxy/ca.pem"))
     );
-    assert_eq!(topology.health.max_retries, 3);
 
     let persistence = store
         .current()

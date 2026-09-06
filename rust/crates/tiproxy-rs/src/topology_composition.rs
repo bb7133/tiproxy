@@ -1990,7 +1990,9 @@ ns-servers = []
                 Box::new(ArtifactClusterFactory),
                 Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
                 identity(),
-            );
+                control_config::HealthCheckConfig::default(),
+            )
+            .unwrap_or_else(|error| unreachable!("pinned health config is valid: {error}"));
             let context = runtime.handle().module_context();
             runtime
                 .mark_ready()
@@ -2451,7 +2453,9 @@ ns-servers = [{ns_servers}]
             Box::new(ArtifactClusterFactory),
             Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
             identity(),
-        );
+            control_config::HealthCheckConfig::default(),
+        )
+        .unwrap_or_else(|error| unreachable!("pinned health config is valid: {error}"));
         let context = runtime.handle().module_context();
         runtime
             .mark_ready()

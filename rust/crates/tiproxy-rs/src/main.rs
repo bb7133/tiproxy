@@ -33,7 +33,7 @@ use config_composition::{
 };
 use control_config::{
     ConfigModule, ConfigModuleHandle, ConfigModuleOptions, ConfigNamespaceSource,
-    TopologyRuntimeIdentity,
+    HealthCheckConfig, TopologyRuntimeIdentity,
 };
 use control_etcd::ElectionConfig;
 use control_external::{EtcdClientConfig, EtcdTlsConfig};
@@ -490,14 +490,29 @@ async fn run(options: Options) -> Result<(), String> {
             .unwrap_or_else(|| PathBuf::from(".")),
         start_timestamp: i64::try_from(process_started_unix_millis / 1000).unwrap_or(i64::MAX),
     };
-    let (topology_module, mut topology_handle) = TopologyModule::new(
+    // The health-check policy is a restart-pinned PROCESS input, not a
+    // configuration generation. TiProxy exposes no user-facing health-check
+    // config (Go builds it from `NewDefaultHealthCheckConfig()` directly), so the
+    // module is handed the Go-compatible default once at construction; the checked
+    // constructor validates it (an invalid policy rolls back through the armed
+    // startup guard) and owns it immutably thereafter — there is no runtime
+    // reload path.
+    let (topology_module, mut topology_handle) = match TopologyModule::new(
         Arc::new(config_owner.handle.source().clone()),
         Box::new(ArtifactClusterFactory),
         Arc::new(InterfaceAdvertiseResolver::new(Arc::new(
             interface_advertise_candidates,
         ))),
         topology_identity,
-    );
+        HealthCheckConfig::default(),
+    ) {
+        Ok(parts) => parts,
+        Err(error) => {
+            return Err(guard
+                .rollback(format!("invalid pinned health config: {error}"))
+                .await);
+        }
+    };
     if let Err(error) = guard.spawn_module(topology_module) {
         return Err(guard
             .rollback(format!("start topology module: {error}"))

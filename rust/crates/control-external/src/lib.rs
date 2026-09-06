@@ -44,7 +44,7 @@ pub mod diagnostics {
 }
 
 pub use cluster_http::{
-    ClusterHttpClient, ClusterHttpConfigError, ClusterHttpError, HttpProbePolicy,
+    ClusterHttpClient, ClusterHttpConfigError, ClusterHttpError, HEALTH_BODY_CAP, HttpProbePolicy,
 };
 pub use dns::{DnsError, DnsResolver, MAX_RESOLVED_ADDRESSES};
 pub use etcd::{

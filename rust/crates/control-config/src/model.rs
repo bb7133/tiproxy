@@ -154,8 +154,6 @@ pub struct TopologyConfig {
     pub backend_clusters: Arc<[BackendClusterConfig]>,
     /// Complete client TLS material for PD/etcd connections.
     pub cluster_tls: ClientTlsConfig,
-    /// Backend health observer policy.
-    pub health: HealthCheckConfig,
 }
 
 /// Process/build facts passed from the binary to CP-TOPO.
@@ -458,7 +456,6 @@ impl EffectiveConfig {
             ha_virtual_ip: Arc::from(self.ha.virtual_ip.as_str()),
             backend_clusters: Arc::from(backend_clusters),
             cluster_tls: client_tls(&self.security.cluster_tls),
-            health: HealthCheckConfig::default(),
         })
     }
 

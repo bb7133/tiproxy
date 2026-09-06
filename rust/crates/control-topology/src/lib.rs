@@ -37,16 +37,12 @@
 mod backend_health;
 mod discovery;
 mod discovery_publish;
-// CP-TOPO #213-2 health-round loop + generation-fenced overlay. Its scheduling
-// surface (publisher, generation, policy, `run_health_{round,loop}`) is wired
-// into the module by CP-TOPO #213-3; until then only the two public overlay
-// types below are reachable and the not-yet-wired pub(crate) surface is exercised
-// by this crate's tests, so it is allowed dead here.
-#[allow(dead_code)]
+// CP-TOPO #213-2 health-round loop + generation-fenced overlay, composed into the
+// module lifecycle by CP-TOPO #213-3 (config → runtime, owner-fenced feed, and the
+// generation-fenced overlay surfaced through the module handle).
+mod health_config;
 mod health_feed;
-#[allow(dead_code)]
 mod health_loop;
-#[allow(dead_code)]
 mod health_overlay;
 mod merge;
 mod model;
@@ -59,6 +55,7 @@ mod routing_snapshot;
 pub use backend_health::{BackendHealth, ClusterHealthNetwork};
 pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
 pub use discovery_publish::{DiscoveryError, DiscoveryHandle, EpochResult};
+pub use health_config::HealthConfigError;
 pub use health_overlay::{HealthOverlayHandle, HealthSnapshot};
 pub use merge::{
     ClusterTopologyFetch, MergedBackend, MergedTopology, TopologyUnavailable, merge_tidb_topology,
