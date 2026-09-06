@@ -298,6 +298,18 @@ pub(crate) struct PreparedDiscovery {
     connections: Vec<(Arc<str>, EtcdConnection)>,
 }
 
+impl PreparedDiscovery {
+    /// The exact discovery epoch reserved for this prepared generation.
+    ///
+    /// Read by the module wiring to stamp the health material for the SAME epoch
+    /// BEFORE the prepared value is moved into [`DiscoveryPublisher::commit`], so
+    /// the health artifact and the discovery generation share one epoch and the
+    /// stamp never has to reach into an already-committed publisher.
+    pub(crate) fn client_epoch(&self) -> u64 {
+        self.client_epoch
+    }
+}
+
 /// Why a discovery generation could not be prepared. Both are raised BEFORE any
 /// state is mutated, so the caller retains the last-good registration and
 /// discovery.

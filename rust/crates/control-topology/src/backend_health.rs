@@ -166,10 +166,65 @@ pub struct ClusterHealthNetwork {
     cluster_name: Arc<str>,
 }
 
+/// A cluster health network whose fallible transport is already built but whose
+/// discovery `client_epoch` is not yet stamped (CP-TOPO #213-3).
+///
+/// The module wiring builds every cluster's [`ClusterHttpClient`] — the ONLY
+/// fallible step (resolver, TLS, policy) — from the candidate discovery material
+/// BEFORE the discovery publisher reserves an epoch, so a health-material failure
+/// rejects the whole config generation without burning an epoch. The reserved
+/// epoch is then bound infallibly with [`Self::bind`]. It is deliberately not
+/// `Clone`: one prepared network is bound exactly once.
+pub struct PreparedClusterHealthNetwork {
+    client: ClusterHttpClient,
+    cluster_name: Arc<str>,
+}
+
+impl PreparedClusterHealthNetwork {
+    /// Builds the fallible transport for one cluster from its etcd client
+    /// material, the process owner token, and an already-validated probe policy,
+    /// without stamping any discovery epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ClusterHttpConfigError`] from
+    /// [`ClusterHttpClient::from_cluster_material`] (invalid policy, unbuildable
+    /// resolver, or a TLS cluster whose material fails closed at construction).
+    pub fn build(
+        config: &EtcdClientConfig,
+        owner: OwnerToken,
+        policy: HttpProbePolicy,
+        cluster_name: Arc<str>,
+    ) -> Result<Self, ClusterHttpConfigError> {
+        Ok(Self {
+            client: ClusterHttpClient::from_cluster_material(config, owner, policy)?,
+            cluster_name,
+        })
+    }
+
+    /// Stamps the reserved discovery `client_epoch` onto this prepared network,
+    /// producing the bound [`ClusterHealthNetwork`]. Infallible: the epoch/cluster
+    /// stamp is a plain field assignment, so it can run in the no-await commit
+    /// window after the discovery publisher has reserved the epoch.
+    #[must_use]
+    pub fn bind(self, client_epoch: u64) -> ClusterHealthNetwork {
+        ClusterHealthNetwork {
+            client: self.client,
+            client_epoch,
+            cluster_name: self.cluster_name,
+        }
+    }
+}
+
 impl ClusterHealthNetwork {
     /// Builds the health network from one cluster's etcd client material, the
     /// process owner token, and the probe policy, stamped with the discovery
     /// `client_epoch` and `cluster_name` the material was prepared under.
+    ///
+    /// This is the fallible build ([`PreparedClusterHealthNetwork::build`]) and
+    /// the infallible epoch stamp ([`PreparedClusterHealthNetwork::bind`]) in one
+    /// step; the module wiring uses the two-phase form so the fallible build
+    /// precedes the discovery epoch reservation.
     ///
     /// # Errors
     ///
@@ -183,11 +238,10 @@ impl ClusterHealthNetwork {
         client_epoch: u64,
         cluster_name: Arc<str>,
     ) -> Result<Self, ClusterHttpConfigError> {
-        Ok(Self {
-            client: ClusterHttpClient::from_cluster_material(config, owner, policy)?,
-            client_epoch,
-            cluster_name,
-        })
+        Ok(
+            PreparedClusterHealthNetwork::build(config, owner, policy, cluster_name)?
+                .bind(client_epoch),
+        )
     }
 
     /// Probes one backend's `/status` port and returns its health verdict.

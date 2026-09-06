@@ -124,8 +124,10 @@ impl HealthOverlayHandle {
     ///
     /// A candidate is yielded IFF a snapshot is published whose `source` is
     /// `Arc`-identical to `r`, whose own round gate is live, whose feed gate is
-    /// live (a feed transition revokes it synchronously), and whose paired routing
-    /// source `r` is itself still live. This is only a candidate: the caller must
+    /// live (a feed transition revokes it synchronously), whose producing process
+    /// owner is still current (a lease release fails it closed synchronously), and
+    /// whose paired routing source `r` is itself still live. This is only a
+    /// candidate: the caller must
     /// still pass it (with `r`) through
     /// [`still_current_for`](Self::still_current_for) at its side-effect boundary,
     /// since the answer can be invalidated the instant after it returns.
@@ -153,9 +155,11 @@ impl HealthOverlayHandle {
     /// (never a foreign or superseded snapshot that merely shares a source or a
     /// generation number), `h`'s `source` is `Arc`-identical to `r`, the paired
     /// routing generation is still current
-    /// ([`RoutingSnapshotHandle::still_current`]), `h`'s own round gate is live, and
-    /// `h`'s feed gate is live (revoked synchronously by a feed transition). The
-    /// published-identity is resolved first and the gates read last, mirroring
+    /// ([`RoutingSnapshotHandle::still_current`]), `h`'s own round gate is live,
+    /// `h`'s feed gate is live (revoked synchronously by a feed transition), and
+    /// `h`'s producing process owner is still current (a lease release fails it
+    /// closed synchronously). The published-identity is resolved first and the
+    /// gates read last, mirroring
     /// [`RoutingSnapshotHandle::still_current`], so a revoke landing in the
     /// revoke-before-swap window fails closed. This deliberately does **not**
     /// re-check only the routing source: a retained `h` superseded by a newer
@@ -224,7 +228,9 @@ impl HealthOverlayPublisher {
         )
     }
 
-    /// A fresh handle onto this publisher, for an additional consumer.
+    /// A fresh handle onto this publisher, for an additional consumer. Test-only:
+    /// production surfaces the single handle minted alongside the publisher.
+    #[cfg(test)]
     pub(crate) fn handle(&self) -> HealthOverlayHandle {
         HealthOverlayHandle {
             published: self.published.subscribe(),

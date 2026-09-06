@@ -56,13 +56,18 @@ use crate::routing_snapshot::{RoutingSnapshot, RoutingSnapshotHandle};
 /// instant, so a large fleet can never spawn an unbounded burst of tasks.
 pub(crate) const HEALTH_CONCURRENCY: usize = 100;
 
-/// Go `healthCheckInterval`: the default start-to-start round cadence.
+/// Go `healthCheckInterval`: the default start-to-start round cadence. Production
+/// derives the cadence from the restart-pinned config (whose default matches);
+/// this literal is used only by the test-only [`HealthPolicy::go_defaults`].
+#[cfg(test)]
 pub(crate) const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Go `healthCheckMaxRetries`: the default retries after the initial attempt.
+#[cfg(test)]
 pub(crate) const HEALTH_MAX_RETRIES: u32 = 3;
 
 /// Go `healthCheckRetryInterval`: the default fixed delay between attempts.
+#[cfg(test)]
 pub(crate) const HEALTH_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often the loop polls the process owner while parked or waiting.
@@ -127,7 +132,9 @@ impl HealthPolicy {
     }
 
     /// The Go-default policy (3s cadence, 3 retries 1s apart), which is
-    /// known-valid.
+    /// known-valid. Test-only: production builds the policy from the restart-pinned
+    /// config through [`crate::health_config::HealthRuntime`].
+    #[cfg(test)]
     pub(crate) fn go_defaults() -> Self {
         Self {
             interval: HEALTH_CHECK_INTERVAL,
@@ -152,7 +159,13 @@ pub(crate) struct HealthGeneration {
     /// The exact routing generation these probes belong to.
     pub(crate) source: Arc<RoutingSnapshot>,
     /// The per-cluster probe networks, or `None` when health is disabled.
-    pub(crate) networks: Option<HashMap<Arc<str>, ClusterHealthNetwork>>,
+    ///
+    /// Held behind an `Arc` so several routing generations that share one exact
+    /// discovery `client_epoch` (a same-epoch topology content refresh mints a new
+    /// `Arc<RoutingSnapshot>` without rotating the material) reuse ONE resolver /
+    /// TLS client set rather than rebuilding it per routing `Arc`. This is a
+    /// #213-3 private composition shape; the round logic reads it identically.
+    pub(crate) networks: Option<Arc<HashMap<Arc<str>, ClusterHealthNetwork>>>,
 }
 
 /// Whether the current owner and the exact routing source are both still live, so
@@ -554,8 +567,6 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
                 }
                 // Cadence: next round anchored `interval` after this round started;
                 // an over-run makes the sleep already-elapsed so it fires at once.
-                // Cadence: next round anchored `interval` after this round started;
-                // an over-run makes the sleep already-elapsed so it fires at once.
                 // The wait also polls the owner, so a retirement during a long
                 // cadence sleep terminates the loop within OWNER_POLL_INTERVAL rather
                 // than only when the sleep expires.
@@ -760,7 +771,7 @@ mod tests {
     fn generation(source: &Arc<RoutingSnapshot>, enabled: bool) -> Arc<HealthGeneration> {
         Arc::new(HealthGeneration {
             source: Arc::clone(source),
-            networks: enabled.then(HashMap::new),
+            networks: enabled.then(|| Arc::new(HashMap::new())),
         })
     }
 
@@ -945,7 +956,7 @@ mod tests {
         // map complete.
         let health_gen = Arc::new(HealthGeneration {
             source: Arc::clone(&source),
-            networks: Some(HashMap::new()),
+            networks: Some(Arc::new(HashMap::new())),
         });
         let probe = probe_backend_in_generation;
         let config = HealthRoundConfig {
@@ -990,7 +1001,7 @@ mod tests {
             published_backends(vec![static_backend(u64::from(port)), merged_backend(1)]);
         let health_gen = Arc::new(HealthGeneration {
             source: Arc::clone(&source),
-            networks: Some(HashMap::new()),
+            networks: Some(Arc::new(HashMap::new())),
         });
         let probe = probe_backend_in_generation;
         let config = HealthRoundConfig {

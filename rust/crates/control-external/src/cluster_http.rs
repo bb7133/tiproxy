@@ -64,6 +64,10 @@ const MAX_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CANDIDATES: usize = 8;
 /// The origin-form request target for a backend status probe.
 const STATUS_PATH: &str = "/status";
+/// The fixed production response-body cap for a status probe: 64 KiB, well under
+/// the shared 16 MiB [`MAX_HTTP_RESPONSE_BYTES`] ceiling. The ceiling is only the
+/// unbreakable maximum; this is the value production actually enforces.
+pub const HEALTH_BODY_CAP: usize = 64 * 1024;
 
 /// The validated per-probe policy: one absolute attempt deadline and a hard
 /// response-body cap.
@@ -78,6 +82,27 @@ pub struct HttpProbePolicy {
 }
 
 impl HttpProbePolicy {
+    /// Builds a validated policy with the fixed 64 KiB production body cap
+    /// ([`HEALTH_BODY_CAP`]) and the given attempt (dial) timeout.
+    ///
+    /// This is the single shared entry point that a caller with no cluster to
+    /// build still uses to reject an invalid dial timeout: a zero-cluster or a
+    /// disabled health runtime validates its dial timeout here rather than
+    /// relying on a per-cluster construction to catch it, so there is one source
+    /// of truth for the attempt-timeout bound (no duplicated ceiling constant).
+    ///
+    /// # Errors
+    /// Returns [`ClusterHttpConfigError::InvalidAttemptTimeout`] when
+    /// `attempt_timeout` is zero or above the five-minute bound.
+    pub fn validated(attempt_timeout: Duration) -> Result<Self, ClusterHttpConfigError> {
+        let policy = Self {
+            attempt_timeout,
+            max_response_bytes: HEALTH_BODY_CAP,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     /// Validates the policy: a non-zero attempt timeout no larger than five
     /// minutes and a non-zero body cap.
     fn validate(&self) -> Result<(), ClusterHttpConfigError> {
@@ -571,7 +596,10 @@ mod tests {
     use tokio::sync::Notify;
     use tokio_rustls::TlsAcceptor;
 
-    use super::{ClusterHttpClient, ClusterHttpConfigError, ClusterHttpError, HttpProbePolicy};
+    use super::{
+        ClusterHttpClient, ClusterHttpConfigError, ClusterHttpError, HEALTH_BODY_CAP,
+        HttpProbePolicy,
+    };
     use crate::etcd::{
         EtcdClientConfig, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion, GenerationGate,
     };
@@ -986,6 +1014,34 @@ mod tests {
         // The in-bound values (16 bytes and exactly the ceiling) still build.
         assert!(build(policy(Duration::from_secs(2), 16)).is_ok());
         assert!(build(policy(Duration::from_secs(2), MAX_HTTP_RESPONSE_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn validated_rejects_zero_and_overbound_timeouts_and_stamps_the_body_cap() {
+        // The single shared entry point a zero-cluster or disabled runtime uses to
+        // reject an invalid dial timeout: zero and just over five minutes are
+        // rejected as `InvalidAttemptTimeout`.
+        assert!(matches!(
+            HttpProbePolicy::validated(Duration::ZERO),
+            Err(ClusterHttpConfigError::InvalidAttemptTimeout(_))
+        ));
+        assert!(matches!(
+            HttpProbePolicy::validated(Duration::from_secs(301)),
+            Err(ClusterHttpConfigError::InvalidAttemptTimeout(_))
+        ));
+        // A valid timeout builds and carries EXACTLY the fixed 64 KiB production
+        // body cap (never the 16 MiB ceiling).
+        let policy = match HttpProbePolicy::validated(Duration::from_secs(2)) {
+            Ok(policy) => policy,
+            Err(error) => unreachable!("a two-second attempt timeout is valid: {error}"),
+        };
+        assert_eq!(policy.attempt_timeout, Duration::from_secs(2));
+        assert_eq!(
+            policy.max_response_bytes, HEALTH_BODY_CAP,
+            "validated stamps the fixed 64 KiB body cap"
+        );
+        // The five-minute bound itself is inclusive.
+        assert!(HttpProbePolicy::validated(Duration::from_secs(300)).is_ok());
     }
 
     #[test]

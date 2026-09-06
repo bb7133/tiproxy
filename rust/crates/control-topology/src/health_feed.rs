@@ -133,7 +133,11 @@ impl HealthGenerationFeeder {
     }
 
     /// Terminally closes the feed. Idempotent; also invoked by `Drop`.
-    fn close(&self) {
+    ///
+    /// The module runtime calls this explicitly in its terminal fence (after
+    /// revoking routing and discovery) so a retained health overlay loses its feed
+    /// gate synchronously, before the health task is aborted.
+    pub(crate) fn close(&self) {
         let mut slot = self.lock();
         if slot.closed {
             return;

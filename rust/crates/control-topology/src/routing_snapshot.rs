@@ -317,6 +317,28 @@ impl RoutingSnapshotHandle {
         identity && candidate.gate.is_live()
     }
 
+    /// Resolves once the published routing generation changes, so the module's
+    /// single `run_inner` select can re-pair the health feed with each new exact
+    /// `Arc<RoutingSnapshot>` the refresh loop publishes.
+    ///
+    /// This is a crate-private observer seam: it advances this handle's own
+    /// watch cursor and never exposes the raw `watch::Receiver`, so the public API
+    /// gains no channel surface. A `changed()` on a fresh handle also fires on the
+    /// initial value, which is why the caller reads [`current`](Self::current)
+    /// after each wake rather than trusting the wake alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutingSourceClosed`] when the publisher is dropped, so the module
+    /// fails loud (a closed routing observer must not leave it ready-and-silent)
+    /// rather than parking forever.
+    pub(crate) async fn changed(&mut self) -> Result<(), RoutingSourceClosed> {
+        self.published
+            .changed()
+            .await
+            .map_err(|_| RoutingSourceClosed)
+    }
+
     /// Resolves once a routable (live-gated) snapshot has been published, returning
     /// it. Distinct from the module's `wait_ready`, which only signals discovery
     /// installation and does not wait on any actual topology pull.
