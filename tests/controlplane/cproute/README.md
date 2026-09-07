@@ -173,3 +173,25 @@ sixteen selector mutations, both locally and in the hosted Rust workflow.
 Also run `make lint`, `make rust-lint`, `make rust-test`, `make rust-build`, and Go
 router/bridge/factor package tests. The mutation runner uses a separate target
 directory and never changes repository source.
+
+## Health-round locality (head 220-3 B1)
+
+The health product carries Go `BackendHealth.Local`. `run_health_round` reads the
+proxy `zone` label from its `ProxyZoneSource` exactly once at round start (Go
+`checkHealth` reads the config once before the fan-out) and stamps every verdict
+after collection with Go's `setLocal` rule: no/empty proxy zone marks every
+backend local; otherwise only an exact `labels["zone"]` match is local. A
+disabled health check publishes all-healthy with `Local=false`. Selectors consume
+locality with the exact H; nothing recomputes it from the current config.
+
+- `locality/rounds.json`: 12 config-history steps (nil labels, empty table,
+  zone set/omitted/other-label/upper-case/empty, disabled rounds in between)
+  over 7 backends, through the real Go `ConfigManager` + `DefaultBackendObserver.
+  checkHealth` (`pkg/balance/observer/cproute_locality_evidence_test.go`) versus
+  the production `run_health_round` + `ConfigNamespaceStore` zone read
+  (`health_loop::tests::shared_go_locality_observation`), compared byte-for-byte.
+- `locality/mutations.py`: six compiling mutations of `health_loop.rs` that a
+  runtime test must kill — disabled round marks local, empty zone compared as a
+  zone, case-insensitive compare, unlabelled backend local under a set zone,
+  zone read after the round, zone re-read at each probe construction (killed by
+  the concurrency-1 held fan-out row L7). Each run asserts the fresh Go output.

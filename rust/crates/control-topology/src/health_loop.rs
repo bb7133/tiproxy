@@ -301,12 +301,16 @@ pub(crate) struct HealthRoundConfig<'ctx, Probe> {
 /// panics/returns a [`JoinError`](tokio::task::JoinError), or the owner/source
 /// goes stale mid-round, the whole set is aborted and drained and `None` is
 /// returned — never a partial map.
+///
+/// The proxy zone is read from `locality` exactly ONCE, at round start before the
+/// fan-out (Go `checkHealth` reads the config once per round), and every verdict
+/// of the round is stamped from that capture after collection (Go `setLocal`).
 pub(crate) async fn run_health_round<Probe, Fut>(
     config: &HealthRoundConfig<'_, Probe>,
     source: &Arc<RoutingSnapshot>,
     generation: &Arc<HealthGeneration>,
     set: &mut JoinSet<(Arc<str>, BackendHealth)>,
-    proxy_zone: Option<&str>,
+    locality: &dyn ProxyZoneSource,
 ) -> Option<HashMap<Arc<str>, BackendHealth>>
 where
     Probe: Fn(
@@ -323,6 +327,8 @@ where
     let policy = config.policy;
     let concurrency = config.concurrency;
     let probe = config.probe;
+    // Captured ONCE, before any probe is constructed (Go `checkHealth`).
+    let proxy_zone = locality.proxy_zone();
     // DISABLED: a whole-map all-healthy verdict with zero network/spawn/socket.
     if generation.networks.is_none() {
         let health = source
@@ -400,7 +406,7 @@ where
     // from the zone captured at round start, never from a later config read.
     for backend in &source.backends.backends {
         if let Some(verdict) = health.get_mut(&backend.backend_id) {
-            verdict.local = is_local(proxy_zone, &backend.backend.labels);
+            verdict.local = is_local(proxy_zone.as_deref(), &backend.backend.labels);
         }
     }
     Some(health)
@@ -574,15 +580,7 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
         // Run the round, racing a feed change and an owner poll so a rotation or an
         // owner retirement preempts it.
         let event = {
-            // Captured ONCE before the fan-out (Go reads the config once per round).
-            let proxy_zone = locality.proxy_zone();
-            let round = run_health_round(
-                &config,
-                &source,
-                &generation,
-                &mut guard.set,
-                proxy_zone.as_deref(),
-            );
+            let round = run_health_round(&config, &source, &generation, &mut guard.set, &locality);
             tokio::pin!(round);
             loop {
                 tokio::select! {
@@ -945,7 +943,7 @@ mod tests {
 
         let map = tokio::time::timeout(
             Duration::from_secs(5),
-            run_health_round(&config, &source, &health_gen, &mut set, None),
+            run_health_round(&config, &source, &health_gen, &mut set, &TestZone::none()),
         )
         .await
         .unwrap_or_else(|_| unreachable!("the round completes once probes are released"))
@@ -1010,7 +1008,7 @@ mod tests {
         };
         let mut set: JoinSet<(Arc<str>, BackendHealth)> = JoinSet::new();
 
-        let map = run_health_round(&config, &source, &health_gen, &mut set, None)
+        let map = run_health_round(&config, &source, &health_gen, &mut set, &TestZone::none())
             .await
             .unwrap_or_else(|| unreachable!("a disabled round yields a whole map"));
 
@@ -1058,7 +1056,7 @@ mod tests {
         };
         let mut set: JoinSet<(Arc<str>, BackendHealth)> = JoinSet::new();
 
-        let map = run_health_round(&config, &source, &health_gen, &mut set, None)
+        let map = run_health_round(&config, &source, &health_gen, &mut set, &TestZone::none())
             .await
             .unwrap_or_else(|| unreachable!("a missing-network round still yields a whole map"));
         assert_eq!(map.len(), 4, "the map is complete");
@@ -1103,7 +1101,7 @@ mod tests {
         };
         let mut set: JoinSet<(Arc<str>, BackendHealth)> = JoinSet::new();
 
-        let map = run_health_round(&config, &source, &health_gen, &mut set, None)
+        let map = run_health_round(&config, &source, &health_gen, &mut set, &TestZone::none())
             .await
             .unwrap_or_else(|| unreachable!("a static+dynamic round yields a whole map"));
         assert_eq!(map.len(), 2, "the map is complete (static + dynamic)");
@@ -1166,7 +1164,8 @@ mod tests {
         };
         let mut set: JoinSet<(Arc<str>, BackendHealth)> = JoinSet::new();
 
-        let outcome = run_health_round(&config, &source, &health_gen, &mut set, None).await;
+        let outcome =
+            run_health_round(&config, &source, &health_gen, &mut set, &TestZone::none()).await;
         assert!(
             outcome.is_none(),
             "a probe panic discards the whole round (never a partial map)"
@@ -2230,7 +2229,8 @@ mod tests {
             probe: &probe,
         };
         let mut set: JoinSet<(Arc<str>, BackendHealth)> = JoinSet::new();
-        let map = run_health_round(&config, &source, &health_gen, &mut set, proxy_zone)
+        let zone = proxy_zone.map_or_else(TestZone::none, TestZone::fixed);
+        let map = run_health_round(&config, &source, &health_gen, &mut set, &zone)
             .await
             .unwrap_or_else(|| unreachable!("a locality round yields a whole map"));
         assert_eq!(map.len(), source.backends.backends.len(), "complete map");
@@ -2411,5 +2411,202 @@ mod tests {
             "round 2 publishes the new zone's verdict without any R rotation"
         );
         task.abort();
+    }
+
+    // L7: the capture is per ROUND, not per probe. With concurrency 1 and two
+    // backends, the zone flips after the first probe started and before the
+    // second probe is constructed; the whole round still stamps the zone captured
+    // at its start (a per-probe re-read would mark the second backend not local).
+    #[tokio::test]
+    async fn a_held_fan_out_stamps_every_backend_from_the_round_start_zone() {
+        let (_registry, lease) = owner_lease();
+        let owner = lease.token();
+        let (_publisher, routing, source) = published_backends(vec![
+            zoned_backend(1, Some("az-1")),
+            zoned_backend(2, Some("az-1")),
+        ]);
+
+        let permits = Arc::new(Semaphore::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let permits = Arc::clone(&permits);
+            let started = Arc::clone(&started);
+            move |_generation: Arc<HealthGeneration>,
+                  _source: Arc<RoutingSnapshot>,
+                  _routing: RoutingSnapshotHandle,
+                  _backend: MergedBackend,
+                  _policy: HealthPolicy| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let permits = Arc::clone(&permits);
+                Box::pin(async move {
+                    permits
+                        .acquire()
+                        .await
+                        .unwrap_or_else(|_| unreachable!("the semaphore is never closed"))
+                        .forget();
+                    BackendHealth {
+                        healthy: true,
+                        server_version: None,
+                        local: false,
+                    }
+                }) as BoxedProbe
+            }
+        };
+        let zone = TestZone::fixed("az-1");
+        let config = HealthRoundConfig {
+            routing: &routing,
+            owner: &owner,
+            policy: HealthPolicy::go_defaults(),
+            concurrency: 1,
+            probe: &probe,
+        };
+        let mut set: JoinSet<(Arc<str>, BackendHealth)> = JoinSet::new();
+        let health_gen = generation(&source, true);
+        let round = run_health_round(&config, &source, &health_gen, &mut set, &zone);
+        tokio::pin!(round);
+
+        // Drive the round until the FIRST probe exists (concurrency 1 holds the
+        // second back), flip the zone, then release probes one at a time.
+        let driver = std::future::poll_fn(|cx| {
+            if started.load(Ordering::SeqCst) >= 1 {
+                return std::task::Poll::Ready(());
+            }
+            let _ = round.as_mut().poll(cx);
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        });
+        driver.await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "only one probe is in flight"
+        );
+        zone.set(Some("az-2"));
+        permits.add_permits(1);
+        let second = std::future::poll_fn(|cx| {
+            if started.load(Ordering::SeqCst) >= 2 {
+                return std::task::Poll::Ready(());
+            }
+            let _ = round.as_mut().poll(cx);
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        });
+        second.await;
+        permits.add_permits(1);
+        let map: HashMap<Arc<str>, bool> = round
+            .await
+            .unwrap_or_else(|| unreachable!("the held fan-out round completes"))
+            .into_iter()
+            .map(|(id, verdict)| (id, verdict.local))
+            .collect();
+        assert!(
+            local_of(&map, 1),
+            "the first backend uses the round-start zone"
+        );
+        assert!(
+            local_of(&map, 2),
+            "the second backend, constructed after the flip, still uses the round-start zone"
+        );
+    }
+
+    // L6 (shared Go observation): the SAME fixture drives Go `checkHealth` +
+    // `setLocal` through the real ConfigManager (tests/controlplane/cproute/
+    // locality) and the production `run_health_round` through the real
+    // `ConfigNamespaceStore` zone read. Compared byte-for-byte by run.sh.
+    #[tokio::test]
+    async fn shared_go_locality_observation() {
+        fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+            result.unwrap_or_else(|error| unreachable!("fixture: {error:?}"))
+        }
+        fn text(value: &serde_json::Value) -> &str {
+            value.as_str().unwrap_or_else(|| unreachable!("string"))
+        }
+        let Ok(input) = std::env::var("CPROUTE_LOCALITY_FIXTURE") else {
+            return;
+        };
+        let fixture: serde_json::Value = must(serde_json::from_slice(&must(std::fs::read(input))));
+        let entries = |key: &str| {
+            fixture[key]
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| unreachable!("array {key}"))
+        };
+
+        let store = must(control_config::ConfigNamespaceStore::from_toml(
+            b"[balance]\npolicy=\"connection\"",
+            None,
+            std::path::Path::new("/tmp"),
+        ));
+        let zone_source: Arc<dyn control_config::ConfigNamespaceSource> = Arc::new(store.clone());
+        let backends: Vec<MergedBackend> = entries("backends")
+            .iter()
+            .map(|entry| {
+                let mut backend = merged_backend(0);
+                let addr = text(&entry["addr"]);
+                backend.backend_id = Arc::from(format!("{CLUSTER}/{addr}").as_str());
+                backend.backend.addr = addr.to_owned();
+                backend.backend.labels = must(serde_json::from_value(entry["labels"].clone()));
+                backend
+            })
+            .collect();
+        let (_registry, lease) = owner_lease();
+        let owner = lease.token();
+        let (_publisher, routing, source) = published_backends(backends);
+        let probe = healthy_probe;
+        let config = HealthRoundConfig {
+            routing: &routing,
+            owner: &owner,
+            policy: HealthPolicy::go_defaults(),
+            concurrency: super::HEALTH_CONCURRENCY,
+            probe: &probe,
+        };
+
+        let mut output = String::new();
+        for (index, step) in entries("steps").iter().enumerate() {
+            let toml = text(&step["toml"]);
+            if !toml.is_empty() {
+                must(store.apply_toml(
+                    toml.as_bytes(),
+                    None,
+                    u64::try_from(index).unwrap_or_else(|_| unreachable!("index")) + 2,
+                    std::path::Path::new("/tmp"),
+                ));
+            }
+            let enabled = step["enabled"].as_bool().unwrap_or(false);
+            let mut set: JoinSet<(Arc<str>, BackendHealth)> = JoinSet::new();
+            let map = run_health_round(
+                &config,
+                &source,
+                &generation(&source, enabled),
+                &mut set,
+                &zone_source,
+            )
+            .await
+            .unwrap_or_else(|| unreachable!("a locality round yields a whole map"));
+            let mut fields: Vec<String> = source
+                .backends
+                .backends
+                .iter()
+                .map(|backend| {
+                    let verdict = map
+                        .get(&backend.backend_id)
+                        .unwrap_or_else(|| unreachable!("every backend is keyed"));
+                    assert!(verdict.healthy, "every fixture backend is healthy");
+                    format!("{}={}", backend.backend.addr, verdict.local)
+                })
+                .collect();
+            fields.sort();
+            must(std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!("{}\t{}\n", text(&step["name"]), fields.join(",")),
+            ));
+        }
+        if let Ok(expected) = std::env::var("CPROUTE_LOCALITY_EXPECTED") {
+            assert_eq!(output, must(std::fs::read_to_string(expected)));
+        }
+        must(std::fs::write(
+            must(std::env::var("CPROUTE_LOCALITY_OUTPUT")),
+            output,
+        ));
     }
 }
