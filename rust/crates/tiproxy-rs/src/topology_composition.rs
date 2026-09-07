@@ -2099,7 +2099,6 @@ mod routing_generation_semantics {
     const CLUSTER_NAME: &str = "cluster-a";
     const ADDR_A: &str = "10.0.0.1:4000";
     const ADDR_B: &str = "10.0.0.2:4000";
-    const ADDR_C: &str = "10.0.0.3:4000";
     /// The classic `TiDB` topology prefix a merged poll reads first.
     const TIDB_PREFIX: &[u8] = b"/topology/tidb/";
     /// Mirrors the private production `ROUTING_REFRESH_INTERVAL` (3s); advancing
@@ -2500,18 +2499,21 @@ ns-servers = [{ns_servers}]
     /// `done`, deterministically, without `sleep`/`yield` and without a spin budget.
     ///
     /// The paused clock is used for exactly one thing: `advance` wakes the parked
-    /// refresh ticker so the next poll starts. The poll's real loopback I/O then runs
-    /// under REAL time (`resume`) for the rest of the drain — with the clock resumed
-    /// the runtime never auto-advances, so the production per-cluster timeout inside
-    /// `merge_tidb_topology` cannot beat the fixture's response (the race CI hit).
+    /// refresh ticker so the target poll starts. The poll's real loopback I/O then
+    /// runs under REAL time (`resume`) until the drain exits — with the clock
+    /// resumed the runtime never auto-advances, so the production per-cluster
+    /// timeout inside `merge_tidb_topology` cannot beat the fixture's response (the
+    /// race CI hit). The clock is paused again only on exit.
     ///
     /// Observation is structured on real Range events. The handler's `served` fires
     /// at ENTRY, before the response or the client's publication, so the target may
-    /// not be visible after Range #1. `run_refresh` is serial: Range #2 can only begin
-    /// once poll #1 has fully completed and published, so the target must be visible
-    /// then — if it is not, that poll genuinely failed and the drain fails outright
-    /// rather than looping. Never pause while a poll is in flight (that would put its
-    /// inner timeout back on virtual time): the clock is paused again only on exit.
+    /// not be visible after Range #1. Range #2 is the previous round's completion
+    /// fence: `run_refresh` is serial, so poll #2 can only be entered once poll #1
+    /// has fully completed and published — the target must be visible then, and if
+    /// it is not, that poll genuinely failed and the drain fails outright rather
+    /// than looping. The successor poll entered at Range #2 is itself still in
+    /// flight when the drain exits; every row tears its composition down
+    /// immediately afterward, which cancels it.
     async fn drain_until<F>(
         routing: &RoutingSnapshotHandle,
         fixture: &KvFixture,
@@ -2533,8 +2535,9 @@ ns-servers = [{ns_servers}]
         snapshot
     }
 
-    /// The real-time half of [`drain_until`]: Range #1 (this poll entered), then, if
-    /// the target is not yet visible, Range #2 (this poll has completed + published).
+    /// The real-time half of [`drain_until`]: Range #1 (the target poll entered),
+    /// then, if the target is not yet visible, Range #2 (the completion fence: the
+    /// target poll has completed + published; its successor is now in flight).
     async fn drain_in_real_time<F>(
         routing: &RoutingSnapshotHandle,
         fixture: &KvFixture,
@@ -2694,84 +2697,90 @@ ns-servers = [{ns_servers}]
     }
 
     /// The mechanism oracle for the determinism fix, deterministic on every
-    /// platform (no wall sleep, no thread scheduling). A `TiDB` Range handler parks
-    /// on a test-controlled gate after ENTRY (after it is counted and `served`
-    /// fires), holding a poll in flight with the response withheld.
+    /// platform (no wall sleep, no thread scheduling). Each half stands up its OWN
+    /// fixture + composition and tears it down at the end, so the two conclusions
+    /// share no connection, stream, or successor-poll state. A `TiDB` Range handler
+    /// parks on a test-controlled gate after ENTRY (after it is counted and `served`
+    /// fires), holding one poll in flight with its response withheld.
     ///
-    /// Real time first (the fix): with the clock resumed there is no auto-advance,
-    /// so opening the gate after entry lets that in-flight poll complete and
-    /// publish. Paused clock last (the bug): holding the gate closed leaves the
-    /// runtime nothing runnable, so it auto-advances straight to the production
-    /// per-cluster timeout inside the poll — Ranges are served, yet nothing is
-    /// published. The paused half runs last because a poll it times out leaves a
-    /// dangling handler on a reset h2 stream, which would poison a later poll on
-    /// the shared connection (observed: the next gated poll fails and only the one
-    /// after it publishes) — nothing after the paused half needs a poll to succeed.
+    /// Real time (the fix): with the clock resumed there is no auto-advance, so
+    /// opening the gate after entry lets the in-flight poll complete and publish.
+    /// Paused clock (the bug): holding the gate closed leaves the runtime nothing
+    /// runnable, so it auto-advances straight to the production per-cluster timeout
+    /// inside the poll — Ranges are served, yet nothing is published.
     #[tokio::test(start_paused = true)]
     async fn a_paused_clock_lets_the_inner_timeout_beat_a_served_range_but_real_time_does_not() {
         let body = async {
-            let Some((fixture, addr)) = spawn_fixture(seed(&[(ADDR_A, "10.0.0.1")])).await else {
-                unreachable!("the fixture binds an ephemeral loopback port");
-            };
-            let comp = build_composition(addr, "").await;
-            let s1 = wait_first_real(&comp.routing).await;
-            assert_eq!(s1.generation, 1, "the first snapshot is generation 1");
+            // Real time (the fix), on a fresh fixture + composition.
+            {
+                let Some((fixture, addr)) = spawn_fixture(seed(&[(ADDR_A, "10.0.0.1")])).await
+                else {
+                    unreachable!("the fixture binds an ephemeral loopback port");
+                };
+                let comp = build_composition(addr, "").await;
+                let s1 = wait_first_real(&comp.routing).await;
+                assert_eq!(s1.generation, 1, "the first snapshot is generation 1");
+                // A content change makes the next successful poll publish generation
+                // 2. Gate that poll after entry, resume, then open the gate: it
+                // completes and publishes; Range #2 (its completion fence) proves it.
+                fixture.swap(seed(&[(ADDR_A, "10.0.0.1"), (ADDR_B, "10.0.0.2")]));
+                fixture.close_gate();
+                let before = fixture.tidb_range_count();
+                tokio::time::advance(REFRESH_INTERVAL).await;
+                wait_range_past(&fixture, before).await;
+                tokio::time::resume();
+                fixture.open_gate();
+                wait_range_past(&fixture, before + 1).await;
+                let published = comp
+                    .routing
+                    .current()
+                    .unwrap_or_else(|| unreachable!("a routing source is published"));
+                assert_eq!(
+                    published.generation, 2,
+                    "under real time the gate-released poll completes and publishes"
+                );
+                tokio::time::pause();
+                comp.task.abort();
+                drop(comp.runtime);
+            }
 
-            // REAL time (the fix). A content change makes the next successful poll
-            // publish generation 2. Gate the poll after entry, resume, then open the
-            // gate: the in-flight poll completes and publishes. Range #2 (serial
-            // refresh) proves that poll is done before we read.
-            fixture.swap(seed(&[(ADDR_A, "10.0.0.1"), (ADDR_B, "10.0.0.2")]));
-            fixture.close_gate();
-            let before = fixture.tidb_range_count();
-            tokio::time::advance(REFRESH_INTERVAL).await;
-            wait_range_past(&fixture, before).await;
-            tokio::time::resume();
-            fixture.open_gate();
-            wait_range_past(&fixture, before + 1).await;
-            let published = comp
-                .routing
-                .current()
-                .unwrap_or_else(|| unreachable!("a routing source is published"));
-            assert_eq!(
-                published.generation, 2,
-                "under real time the gate-released poll completes and publishes"
-            );
-            tokio::time::pause();
-
-            // PAUSED clock (the bug). Another content change would publish generation
-            // 3 on a successful poll. Hold the gate closed across the poll: it is
-            // entered (Range served), then the only pending work is timers, so the
-            // paused runtime auto-advances — the poll's inner timeout fires (the poll
-            // fails), the ticker fires, the next poll is entered, and NOTHING is
-            // published.
-            fixture.swap(seed(&[
-                (ADDR_A, "10.0.0.1"),
-                (ADDR_B, "10.0.0.2"),
-                (ADDR_C, "10.0.0.3"),
-            ]));
-            fixture.close_gate();
-            let before = fixture.tidb_range_count();
-            tokio::time::advance(REFRESH_INTERVAL).await;
-            wait_range_past(&fixture, before).await;
-            wait_range_past(&fixture, before + 1).await;
-            let stuck = comp
-                .routing
-                .current()
-                .unwrap_or_else(|| unreachable!("a routing source is published"));
-            assert_eq!(
-                stuck.generation, 2,
-                "Ranges were served, but the paused clock let the inner timeout beat the \
-                 response: nothing was published"
-            );
-            assert!(
-                fixture.tidb_range_count() >= before + 2,
-                "at least two Ranges were served while nothing published"
-            );
-            fixture.open_gate();
-
-            comp.task.abort();
-            drop(comp.runtime);
+            // Paused clock (the bug), on another fresh fixture + composition.
+            {
+                let Some((fixture, addr)) = spawn_fixture(seed(&[(ADDR_A, "10.0.0.1")])).await
+                else {
+                    unreachable!("the fixture binds an ephemeral loopback port");
+                };
+                let comp = build_composition(addr, "").await;
+                let s1 = wait_first_real(&comp.routing).await;
+                assert_eq!(s1.generation, 1, "the first snapshot is generation 1");
+                // The same content change; hold the gate closed across the poll. It is
+                // entered (Range served), then the only pending work is timers, so the
+                // paused runtime auto-advances: the poll's inner timeout fires (the
+                // poll fails), the ticker fires, the next poll is entered — and
+                // NOTHING is published.
+                fixture.swap(seed(&[(ADDR_A, "10.0.0.1"), (ADDR_B, "10.0.0.2")]));
+                fixture.close_gate();
+                let before = fixture.tidb_range_count();
+                tokio::time::advance(REFRESH_INTERVAL).await;
+                wait_range_past(&fixture, before).await;
+                wait_range_past(&fixture, before + 1).await;
+                let stuck = comp
+                    .routing
+                    .current()
+                    .unwrap_or_else(|| unreachable!("a routing source is published"));
+                assert_eq!(
+                    stuck.generation, 1,
+                    "Ranges were served, but the paused clock let the inner timeout beat \
+                     the response: nothing was published"
+                );
+                assert!(
+                    fixture.tidb_range_count() >= before + 2,
+                    "at least two Ranges were served while nothing published"
+                );
+                fixture.open_gate();
+                comp.task.abort();
+                drop(comp.runtime);
+            }
         };
         with_real_wall_clock_watchdog(body).await;
     }
