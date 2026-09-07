@@ -914,7 +914,9 @@ async fn persist_put(
 
 const fn map_mutation_error(error: &ElectionError) -> ConfigMutationError {
     match error {
-        ElectionError::StaleOwner | ElectionError::NotLeader => ConfigMutationError::NotLeader,
+        ElectionError::StaleOwner | ElectionError::StaleScope | ElectionError::NotLeader => {
+            ConfigMutationError::NotLeader
+        }
         ElectionError::InvalidTransactionInput | ElectionError::InvalidResponse { .. } => {
             ConfigMutationError::Invalid
         }

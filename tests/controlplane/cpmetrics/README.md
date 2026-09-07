@@ -94,3 +94,72 @@ test failures do not count; a restored baseline must pass. The existing 152 Go
 observations/17 core mutations and all CP-ROUTE evidence remain separate required
 gates. Actual collector scheduling, mixed Go/Rust owner enumeration/history HTTP,
 listener readiness and factor/router composition remain subsequent slices.
+
+
+## 221-2C collector and owner service
+
+`make controlplane-cpmetrics-collector-evidence` runs seven collector unit tests,
+five required real-runtime groups and compiling production mutations followed by
+the restored baseline. The separate mandatory Rust CI job has a 30-minute budget;
+the existing CP-METRICS 152 observations / 17 mutants, applied-material 16 mutants,
+CP-ETCD authority eight mutants and CP-ROUTE 46 mutants remain unchanged.
+
+The collector is an opt-in `ControlModule`. `MetricCollector::bind` binds the real
+in-process HTTP socket before an owner can advertise it. Only `run` activates
+serving under its original process owner. No binary/production composition is
+enabled here. The later composition slice must use the authorized same-process
+endpoint and deployment TLS policy; this staged standalone listener is plain HTTP.
+
+The immediate first round and restart-pinned interval use applied cluster material.
+Every Prom round re-reads the endpoint, captures one range end, tries job then
+component afresh and records each completed query's real update time. Successful
+empty results select Prom. Backend rounds use full topology independently of H,
+join at most 100 active backend tasks, merge peer history, decide any-rule missing
+fallback before purge, and export only originally owner-selected addresses.
+Completed backend HTTP/parse failures represent missing observations. Aggregate
+completed peer/topology failures still replace the backend map before preserving
+the selected reader; panic/cancel/stale/incomplete joins cannot publish a round.
+
+Owner campaigns retain the original process token and exact applied etcd material.
+A monotonic source/material/serving scope fences normal RPCs and escaped streams;
+it never includes the session's own work permit. Scope expiry directly invalidates
+retained authority and becomes terminal local retirement when processed. Private
+cleanup remains fenced by the original process owner and still resigns/revokes the
+actual acquired session after local scope withdrawal. A canceled campaign that has
+not returned an acquired session can leave its unacquired lease to the existing
+TTL expiry path; tests distinguish recipe creation from committed owner export.
+
+Local data retains opaque `ElectionAuthority`; new work needs a confirmed interval
+permit. Copied lease/revision/member diagnostics can only reject a contradiction
+with an actual etcd observation; they never create authority. Peer records retain
+full key/value/lease/create-revision tuples selected by Go's prefix parsing and
+minimum revision per zone, with address deduplication. Actual Go and Rust owners
+use `<prefix>[/cluster][/zone]/owner/<lease-hex>` with status host:port values and
+TTL 15; Rust session presence keys are outside `/tiproxy/metric_reader`.
+
+Backend history cold-starts on applied source/material changes and locally observed
+local/peer owner replacement. Normal H refresh preserves history. A remote change
+cannot retire a peer until it is locally observed; a second enumeration after the
+HTTP fetch rejects a response from a replaced identity. Prom-selected data remains
+independent of unused backend owners. Zone is read from committed config at backend
+round entry, including zone-only updates and valid zone updates whose cluster
+candidate was rejected. Old scope is withdrawn before awaiting election cleanup.
+The live groups also hold real Prom and backend responses across material
+withdrawal and reject their rounds without publishing obsolete history or retries.
+
+Every captured metric snapshot and HTTP body carries source/result/serving and
+selected owner provenance. Short synchronous uses lock binding, source feed, peer
+observation/scope/role, local retained authority (or work permit), then overlay or
+socket write. Phase uncertainty accepts already-committed HTTP output but rejects
+new work; recovery cannot resurrect a prior permit. Listener exit and module Drop
+withdraw eligibility before child cancellation. Bound request headers are at most
+8 KiB, decoded query values 4 KiB, HTTP histories 16 MiB, and at most 100 requests
+are active with a five-second handler budget. Owner enumeration caps 10,000 records,
+2 KiB keys, 256-byte advertised values and 16 MiB total key/value bytes.
+
+`collector.py` starts a fresh embedded-etcd proxy and a compiled real Go
+`BackendReader` test peer for each live observation, then tears both down. The
+Go peer's control API only drives test inputs and calls the existing election,
+owner enumeration, backend history producer and owner HTTP consumer. Histories
+cross real TCP in both directions. Logs report payload-free invariant names;
+connection descriptions and ports remain in owned temporary directories.

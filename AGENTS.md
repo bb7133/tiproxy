@@ -80,6 +80,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/control-router/` - Staged namespace-scoped routing selection, exact config/topology/health capture, and reservation accounting. Production dataplane/binary wiring remains prohibited until full routing parity is complete.
 - `rust/crates/control-routing/` - Protocol-independent route values and pure group matching/port-conflict primitives; it owns no reservation or production selector yet and carries no wire payloads.
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
+- `rust/crates/control-topology/src/metric_collector/` - Opt-in in-process metrics rounds, scoped owner tasks, qualified overlay and bounded real owner HTTP service; production composition remains off until the control-plane integration slice.
 - `rust/crates/control-topology/src/metrics/` - Bounded query/history data core for staged backend resource metrics; runtime source/election authority is supplied separately by the collector.
 - `rust/crates/control-plane/` - Process-local Rust control-domain types, ownership fencing, config/TLS views, lifecycle/shutdown, and bounded observability; it must not depend on `control-proto`.
 - `rust/crates/control-external/` - Fenced, bounded Rust clients for control-plane external dependencies plus the minimal diagnostics gRPC binding; generated etcd protobuf types stay private to `etcd-client`.

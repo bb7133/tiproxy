@@ -32,6 +32,7 @@ struct State {
 
 struct Shared {
     owner: OwnerToken,
+    scope: Arc<dyn control_external::IoFence>,
     retirement: GenerationGate,
     state: Mutex<State>,
 }
@@ -42,7 +43,8 @@ impl Shared {
     }
 
     fn is_live(&self) -> bool {
-        self.owner.is_current() && self.retirement.is_live()
+        let base_live = self.owner.is_current() && self.retirement.is_live();
+        base_live && self.scope.is_live()
     }
 }
 
@@ -58,10 +60,16 @@ pub struct ElectionAuthority {
 }
 
 impl ElectionAuthority {
+    #[cfg(test)]
     pub(crate) fn new(owner: OwnerToken) -> Self {
+        Self::with_scope(owner, Arc::new(GenerationGate::new()))
+    }
+
+    pub(crate) fn with_scope(owner: OwnerToken, scope: Arc<dyn control_external::IoFence>) -> Self {
         Self {
             shared: Arc::new(Shared {
                 owner,
+                scope,
                 retirement: GenerationGate::new(),
                 state: Mutex::new(State {
                     phase: ElectionState::Campaigning,
@@ -81,6 +89,23 @@ impl ElectionAuthority {
                 state.phase,
                 ElectionState::Leader | ElectionState::Uncertain
             )
+    }
+
+    /// Writes an already-committed result while retained ownership is live.
+    /// Unlike a new-work permit, this accepts uncertainty. The closure must be
+    /// short and synchronous and must not re-enter this authority. Lock order
+    /// remains source feed → session authority → result overlay or socket write.
+    pub fn with_retained<T>(&self, write: impl FnOnce() -> T) -> Option<T> {
+        let state = self.shared.lock();
+        if !self.shared.is_live()
+            || !matches!(
+                state.phase,
+                ElectionState::Leader | ElectionState::Uncertain
+            )
+        {
+            return None;
+        }
+        Some(write())
     }
 
     /// Captures permission to finish new owner work in this confirmed interval.
@@ -211,6 +236,32 @@ mod tests {
         authority.transition(ElectionState::Leader);
         assert!(!authority.retains_local_ownership());
         assert!(authority.capture_work().is_none());
+    }
+
+    #[test]
+    fn scoped_retained_results_stop_without_polling_the_session() {
+        let registry = OwnershipRegistry::new();
+        let owner = registry
+            .claim(OwnerScope::Process, "scoped-authority")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let scope = GenerationGate::new();
+        let authority = ElectionAuthority::with_scope(owner.token(), Arc::new(scope.clone()));
+        authority.transition(ElectionState::Leader);
+        let work = authority.capture_work().unwrap_or_else(|| unreachable!());
+        authority.transition(ElectionState::Uncertain);
+        assert_eq!(authority.with_retained(|| 7), Some(7));
+        assert!(!work.still_current());
+        scope.revoke();
+        assert!(
+            !authority.retains_local_ownership(),
+            "SCOPED_RETAINED_REVOKED"
+        );
+        assert_eq!(authority.with_retained(|| 8), None, "SCOPED_EXPORT_REVOKED");
+        authority.transition(ElectionState::Leader);
+        assert!(
+            authority.capture_work().is_none(),
+            "SCOPED_RECOVERY_CANNOT_REVIVE"
+        );
     }
 
     #[test]

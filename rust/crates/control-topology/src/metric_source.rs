@@ -113,6 +113,8 @@ impl MetricRuntimePolicy {
 pub(crate) struct PreparedMetricNetworks {
     policy: MetricRuntimePolicy,
     clusters: HashMap<Arc<str>, ClusterHttpClient>,
+    election_material: HashMap<Arc<str>, control_external::EtcdClientConfig>,
+    owner: OwnerToken,
     prom: ClusterHttpClient,
 }
 
@@ -127,6 +129,7 @@ impl PreparedMetricNetworks {
             max_response_bytes: control_external::http::MAX_HTTP_RESPONSE_BYTES,
         };
         let mut networks = HashMap::with_capacity(clusters.len());
+        let mut election_material = HashMap::with_capacity(clusters.len());
         for cluster in clusters {
             let network = ClusterHttpClient::from_cluster_material(
                 &cluster.client,
@@ -134,11 +137,14 @@ impl PreparedMetricNetworks {
                 http_policy(policy.backend_timeout),
             )?;
             networks.insert(Arc::clone(&cluster.cluster_name), network);
+            election_material.insert(Arc::clone(&cluster.cluster_name), cluster.client.clone());
         }
         let prom = ClusterHttpClient::system_http(owner.clone(), http_policy(policy.prom_timeout))?;
         Ok(Self {
             policy,
             clusters: networks,
+            election_material,
+            owner: owner.clone(),
             prom,
         })
     }
@@ -488,6 +494,54 @@ impl MetricCapture {
         Some(publish())
     }
 
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation, &other.generation) && Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    // Kept inside the crate: callers never receive client config or raw clients.
+    pub(crate) async fn campaign_metric_owner(
+        &self,
+        cluster: &str,
+        election: control_etcd::ElectionConfig,
+        scope: Arc<dyn IoFence>,
+    ) -> Result<control_etcd::ElectionSession, control_etcd::ElectionError> {
+        if !self.still_current() || !scope.is_live() {
+            return Err(control_etcd::ElectionError::StaleScope);
+        }
+        let networks = &self.generation.material.networks;
+        let material = networks.election_material.get(cluster).ok_or(
+            control_etcd::ElectionError::InvalidResponse {
+                class: "unknown_metric_cluster",
+            },
+        )?;
+        control_etcd::ElectionSession::campaign_with_scope(
+            networks.owner.clone(),
+            material.clone(),
+            election,
+            Arc::new(MetricCampaignFence {
+                capture: self.clone(),
+                extra: scope,
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn poll_metric_owners(
+        &self,
+        cluster: &str,
+        prefix: &str,
+    ) -> Result<Vec<crate::metric_owner::OwnerRecord>, MetricReadError> {
+        self.check()?;
+        let result = self
+            .generation
+            .material
+            .discovery
+            .poll_metric_owners_fenced(cluster, prefix, Arc::new(self.clone()))
+            .await;
+        self.check()?;
+        result.map_err(MetricReadError::Discovery)
+    }
+
     fn check(&self) -> Result<(), MetricReadError> {
         if self.still_current() {
             Ok(())
@@ -583,5 +637,15 @@ impl MetricCapture {
         result
             .map(|bytes| bytes.to_vec())
             .map_err(MetricReadError::Http)
+    }
+}
+
+struct MetricCampaignFence {
+    capture: MetricCapture,
+    extra: Arc<dyn IoFence>,
+}
+impl IoFence for MetricCampaignFence {
+    fn is_live(&self) -> bool {
+        self.capture.still_current() && self.extra.is_live()
     }
 }

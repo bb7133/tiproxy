@@ -395,6 +395,15 @@ impl ReaderState {
         }
     }
 
+    /// Discards backend state after an observed owner identity replacement.
+    /// A selected Prometheus map remains independent of unused backend owners.
+    pub fn reset_backend(&mut self) {
+        self.backend.clear();
+        if self.source == Source::Backend {
+            self.source = Source::None;
+        }
+    }
+
     /// Reads a result only from the selected source.
     #[must_use]
     pub fn get(&self, rule: QueryId) -> Option<&QueryResult> {

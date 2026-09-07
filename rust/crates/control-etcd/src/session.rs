@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use control_external::{
     EtcdClientConfig, EtcdConnectError, EtcdConnection, EtcdConnector, EtcdOperationError,
+    GenerationGate, IoFence,
 };
 use control_plane::OwnerToken;
 use etcd_client::{
@@ -69,6 +71,8 @@ pub enum RetirementReason {
     OwnerChanged,
     /// The containing Rust process-owner generation was released.
     ProcessOwnerLost,
+    /// The additional material or serving scope was revoked.
+    ScopeRevoked,
     /// The caller explicitly stopped this session.
     Shutdown,
 }
@@ -81,6 +85,7 @@ impl RetirementReason {
             Self::LeaseNotFound => "lease_not_found",
             Self::OwnerChanged => "owner_changed",
             Self::ProcessOwnerLost => "process_owner_lost",
+            Self::ScopeRevoked => "scope_revoked",
             Self::Shutdown => "shutdown",
         }
     }
@@ -211,6 +216,9 @@ pub enum ElectionError {
     /// The containing process owner is no longer current.
     #[error("stale control owner")]
     StaleOwner,
+    /// The additional material or serving scope is no longer live.
+    #[error("stale election scope")]
+    StaleScope,
     /// Initial or reconnecting etcd transport construction failed.
     #[error("etcd election connection failed")]
     Connect(#[source] EtcdConnectError),
@@ -263,11 +271,15 @@ pub enum ElectionError {
 /// the exact lease, value, and creation revision before returning to `Leader`.
 pub struct ElectionSession {
     owner: OwnerToken,
+    scope: Arc<dyn IoFence>,
     authority: ElectionAuthority,
     connector: EtcdConnector,
     config: ElectionConfig,
     request_timeout: Duration,
     connection: EtcdConnection,
+    // Private cleanup path retains the original process owner, but can resign
+    // and revoke after normal material/serving admission has been withdrawn.
+    cleanup_connection: Box<EtcdConnection>,
     lease_keeper: Option<LeaseKeeper>,
     keep_alive_stream: Option<LeaseKeepAliveStream>,
     watch_stream: Option<WatchStream>,
@@ -291,9 +303,30 @@ impl ElectionSession {
         client_config: EtcdClientConfig,
         config: ElectionConfig,
     ) -> Result<Self, ElectionError> {
-        if !owner.is_current() {
-            return Err(ElectionError::StaleOwner);
-        }
+        Box::pin(Self::campaign_with_scope(
+            owner,
+            client_config,
+            config,
+            Arc::new(GenerationGate::new()),
+        ))
+        .await
+    }
+
+    /// Campaigns under the original process owner and an additional monotonic
+    /// material/serving scope, independent of this session (never one of its
+    /// own `ElectionWorkPermit`s). Revocation invalidates retained authority directly
+    /// and fences normal RPCs and stream work. Explicit shutdown still cleans up
+    /// the exact lease through a private process-owner-only connection.
+    ///
+    /// # Errors
+    /// Returns the same bounded errors as [`Self::campaign`], or `StaleScope`.
+    pub async fn campaign_with_scope(
+        owner: OwnerToken,
+        client_config: EtcdClientConfig,
+        config: ElectionConfig,
+        scope: Arc<dyn IoFence>,
+    ) -> Result<Self, ElectionError> {
+        check_scope(&owner, scope.as_ref())?;
         if client_config.request_timeout()
             >= Duration::from_secs(config.session_ttl_seconds().try_into().unwrap_or(u64::MAX))
         {
@@ -302,7 +335,10 @@ impl ElectionSession {
             });
         }
         let connector = EtcdConnector::new(owner.clone(), client_config.clone());
-        let mut connection = connector.connect().await.map_err(map_connect_error)?;
+        let connected = connector.connect().await;
+        check_scope(&owner, scope.as_ref())?;
+        let cleanup_connection = Box::new(connected.map_err(map_connect_error)?);
+        let mut connection = cleanup_connection.fork_with_fence(Arc::clone(&scope));
         let ttl = config.session_ttl_seconds();
         let grant = connection
             .execute(move |client| Box::pin(client.lease_grant(ttl, None)))
@@ -321,6 +357,7 @@ impl ElectionSession {
             .map_err(|source| map_operation_error("lease_keep_alive", source))?;
         let keep_alive = send_keep_alive(
             &owner,
+            scope.as_ref(),
             &mut lease_keeper,
             &mut keep_alive_stream,
             client_config.request_timeout(),
@@ -333,6 +370,7 @@ impl ElectionSession {
         let (leader_key, campaign_revision) = {
             let mut campaign_io = CampaignIo {
                 owner: &owner,
+                scope: scope.as_ref(),
                 connection: &mut connection,
                 lease_keeper: &mut lease_keeper,
                 keep_alive_stream: &mut keep_alive_stream,
@@ -354,14 +392,16 @@ impl ElectionSession {
             retirement_reason: None,
         };
         let (snapshot_tx, _) = watch::channel(snapshot);
-        let authority = ElectionAuthority::new(owner.clone());
+        let authority = ElectionAuthority::with_scope(owner.clone(), Arc::clone(&scope));
         let mut session = Self {
             owner,
+            scope,
             authority,
             connector,
             config,
             request_timeout: client_config.request_timeout(),
             connection,
+            cleanup_connection,
             lease_keeper: Some(lease_keeper),
             keep_alive_stream: Some(keep_alive_stream),
             watch_stream: None,
@@ -423,8 +463,14 @@ impl ElectionSession {
             .ok_or(ElectionError::InvalidResponse {
                 class: "missing_keep_alive_stream",
             })?;
-        let result =
-            send_keep_alive(&self.owner, &mut keeper, &mut stream, self.request_timeout).await;
+        let result = send_keep_alive(
+            &self.owner,
+            self.scope.as_ref(),
+            &mut keeper,
+            &mut stream,
+            self.request_timeout,
+        )
+        .await;
         self.lease_keeper = Some(keeper);
         self.keep_alive_stream = Some(stream);
         match result {
@@ -459,7 +505,9 @@ impl ElectionSession {
             return Ok(RecoveryOutcome::Retired(reason));
         }
         self.mark_uncertain();
-        let mut connection = match self.connector.connect().await {
+        let connected = self.connector.connect().await;
+        self.ensure_process_owner()?;
+        let cleanup_connection = match connected {
             Ok(connection) => connection,
             Err(source) => {
                 let error = map_connect_error(source);
@@ -467,9 +515,11 @@ impl ElectionSession {
                 return Err(error);
             }
         };
+        let mut connection = cleanup_connection.fork_with_fence(Arc::clone(&self.scope));
         let lease_id = self.snapshot().lease_id;
         let verification = self.verify_recovery(&mut connection, lease_id).await?;
         self.connection = connection;
+        self.cleanup_connection = Box::new(cleanup_connection);
         let (lease_keeper, keep_alive_stream) = match verification {
             RecoveryVerification::Active(handles) => *handles,
             RecoveryVerification::Retired(reason) => {
@@ -563,6 +613,7 @@ impl ElectionSession {
         };
         let response = match send_keep_alive(
             &self.owner,
+            self.scope.as_ref(),
             &mut lease_keeper,
             &mut keep_alive_stream,
             self.request_timeout,
@@ -969,14 +1020,17 @@ impl ElectionSession {
     pub async fn shutdown(mut self) -> Result<(), ElectionError> {
         // Capture cleanup eligibility BEFORE invalidating local authority. The
         // early fence must not suppress remote Resign/LeaseRevoke cleanup.
-        let clean_up = self.owner.is_current() && self.snapshot().retains_local_ownership();
+        let snapshot = self.snapshot();
+        let clean_up = self.owner.is_current()
+            && (snapshot.retains_local_ownership()
+                || snapshot.retirement_reason == Some(RetirementReason::ScopeRevoked));
         self.authority.retire();
         let mut first_error = None;
         if clean_up {
             if let Some(leader_key) = self.leader_key.take() {
                 let options = ResignOptions::new().with_leader(leader_key);
                 if let Err(source) = self
-                    .connection
+                    .cleanup_connection
                     .execute(move |client| Box::pin(client.resign(Some(options))))
                     .await
                 {
@@ -986,7 +1040,7 @@ impl ElectionSession {
             let lease_id = self.snapshot().lease_id;
             if lease_id != 0
                 && let Err(source) = self
-                    .connection
+                    .cleanup_connection
                     .execute(move |client| Box::pin(client.lease_revoke(lease_id)))
                     .await
             {
@@ -1097,12 +1151,16 @@ impl ElectionSession {
     }
 
     fn ensure_process_owner(&mut self) -> Result<(), ElectionError> {
-        if self.owner.is_current() {
-            return Ok(());
+        if let Err(error) = check_scope(&self.owner, self.scope.as_ref()) {
+            self.clear_transport_handles();
+            self.retire_local(if self.owner.is_current() {
+                RetirementReason::ScopeRevoked
+            } else {
+                RetirementReason::ProcessOwnerLost
+            });
+            return Err(error);
         }
-        self.clear_transport_handles();
-        self.retire_local(RetirementReason::ProcessOwnerLost);
-        Err(ElectionError::StaleOwner)
+        Ok(())
     }
 
     fn mark_uncertain(&mut self) {
@@ -1115,18 +1173,30 @@ impl ElectionSession {
     }
 
     fn record_runtime_failure(&mut self, error: &ElectionError) {
-        if matches!(error, ElectionError::StaleOwner) {
+        if matches!(error, ElectionError::StaleOwner | ElectionError::StaleScope)
+            || !self.scope.is_live()
+        {
             self.clear_transport_handles();
-            self.retire_local(RetirementReason::ProcessOwnerLost);
+            self.retire_local(if self.owner.is_current() && !self.scope.is_live() {
+                RetirementReason::ScopeRevoked
+            } else {
+                RetirementReason::ProcessOwnerLost
+            });
         } else {
             self.mark_uncertain();
         }
     }
 
     fn retire_if_stale(&mut self, error: &ElectionError) {
-        if matches!(error, ElectionError::StaleOwner) {
+        if matches!(error, ElectionError::StaleOwner | ElectionError::StaleScope)
+            || !self.scope.is_live()
+        {
             self.clear_transport_handles();
-            self.retire_local(RetirementReason::ProcessOwnerLost);
+            self.retire_local(if self.owner.is_current() && !self.scope.is_live() {
+                RetirementReason::ScopeRevoked
+            } else {
+                RetirementReason::ProcessOwnerLost
+            });
         }
     }
 
@@ -1184,6 +1254,7 @@ enum RecoveryVerification {
 
 struct CampaignIo<'a> {
     owner: &'a OwnerToken,
+    scope: &'a dyn IoFence,
     connection: &'a mut EtcdConnection,
     lease_keeper: &'a mut LeaseKeeper,
     keep_alive_stream: &'a mut LeaseKeepAliveStream,
@@ -1210,6 +1281,7 @@ async fn campaign_candidate(
     loop {
         let response = send_keep_alive(
             io.owner,
+            io.scope,
             io.lease_keeper,
             io.keep_alive_stream,
             io.request_timeout,
@@ -1307,9 +1379,7 @@ async fn wait_for_predecessor_delete(
     loop {
         tokio::select! {
             response = stream.message() => {
-                if !io.owner.is_current() {
-                    return Err(ElectionError::StaleOwner);
-                }
+                check_scope(io.owner, io.scope)?;
                 let response = response
                     .map_err(|source| ElectionError::Stream {
                         operation: "campaign_watch",
@@ -1336,6 +1406,7 @@ async fn wait_for_predecessor_delete(
             () = tokio::time::sleep(io.heartbeat_interval) => {
                 let response = send_keep_alive(
                     io.owner,
+                    io.scope,
                     io.lease_keeper,
                     io.keep_alive_stream,
                     io.request_timeout,
@@ -1358,22 +1429,21 @@ fn campaign_heartbeat_interval(session_ttl_seconds: i64) -> Duration {
 
 async fn send_keep_alive(
     owner: &OwnerToken,
+    scope: &dyn IoFence,
     keeper: &mut LeaseKeeper,
     stream: &mut LeaseKeepAliveStream,
     timeout: Duration,
 ) -> Result<etcd_client::LeaseKeepAliveResponse, ElectionError> {
-    if !owner.is_current() {
-        return Err(ElectionError::StaleOwner);
-    }
-    keeper
-        .keep_alive()
-        .await
-        .map_err(|source| ElectionError::Stream {
-            operation: "keep_alive_send",
-            source,
-        })?;
-    let response = tokio::time::timeout(timeout, stream.message())
-        .await
+    check_scope(owner, scope)?;
+    let sent = keeper.keep_alive().await;
+    check_scope(owner, scope)?;
+    sent.map_err(|source| ElectionError::Stream {
+        operation: "keep_alive_send",
+        source,
+    })?;
+    let received = tokio::time::timeout(timeout, stream.message()).await;
+    check_scope(owner, scope)?;
+    let response = received
         .map_err(|_| ElectionError::Timeout {
             operation: "keep_alive_receive",
         })?
@@ -1384,10 +1454,17 @@ async fn send_keep_alive(
         .ok_or(ElectionError::InvalidResponse {
             class: "closed_keep_alive_stream",
         })?;
-    if !owner.is_current() {
-        return Err(ElectionError::StaleOwner);
-    }
     Ok(response)
+}
+
+fn check_scope(owner: &OwnerToken, scope: &dyn IoFence) -> Result<(), ElectionError> {
+    if !owner.is_current() {
+        Err(ElectionError::StaleOwner)
+    } else if !scope.is_live() {
+        Err(ElectionError::StaleScope)
+    } else {
+        Ok(())
+    }
 }
 
 fn verify_keep_alive(
