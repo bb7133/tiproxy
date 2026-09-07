@@ -5,6 +5,7 @@ members = [
     "crates/control-external",
     "crates/control-plane",
     "crates/control-proto",
+    "crates/control-router",
     "crates/control-routing",
     "crates/control-topology",
     "crates/dataplane",
@@ -32,6 +33,7 @@ control-external = { path = "crates/control-external", version = "0.1.0" }
 control-etcd = { path = "crates/control-etcd", version = "0.1.0" }
 control-plane = { path = "crates/control-plane", version = "0.1.0" }
 control-proto = { path = "crates/control-proto", version = "0.1.0" }
+control-router = { path = "crates/control-router", version = "0.1.0" }
 control-routing = { path = "crates/control-routing", version = "0.1.0" }
 control-topology = { path = "crates/control-topology", version = "0.1.0" }
 criterion = { version = "=0.8.2", default-features = false }

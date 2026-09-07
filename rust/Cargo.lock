@@ -393,6 +393,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "control-router"
+version = "0.1.0"
+dependencies = [
+ "control-config",
+ "control-external",
+ "control-plane",
+ "control-routing",
+ "control-topology",
+ "futures-util",
+ "prost",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "control-routing"
 version = "0.1.0"
 

@@ -1,0 +1,255 @@
+// Copyright 2026 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Independent config and exact topology/health authority at the reserve boundary.
+
+use std::sync::Arc;
+
+use control_config::{
+    ConfigNamespaceSnapshot, ConfigNamespaceSource, RoutingBalancePolicy, RoutingConfig,
+    RoutingNamespace,
+};
+use control_plane::{LifecyclePhase, LifecycleSnapshot, ModuleContext, OwnerToken};
+use control_topology::{
+    HealthOverlayHandle, HealthSnapshot, RoutingSnapshot, RoutingSnapshotHandle,
+    TopologyModuleHandle,
+};
+use tokio::sync::watch;
+
+use crate::ledger::LedgerError;
+
+/// Routing capability intentionally unavailable before the final selector head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unsupported {
+    /// Resource metrics/factors are not yet composed into this selector.
+    ResourcePolicy,
+    /// Locality-first factors are not yet composed into this selector.
+    LocationPolicy,
+    /// Zone-derived assignment metadata needs the later health composition.
+    ZoneMetadata,
+    /// Business label isolation requires the later factor head.
+    LabelIsolation,
+    /// Failed-backend group policy requires the later composition head.
+    FailedBackends,
+    /// Static fallback needs its own authoritative health source.
+    StaticFallback,
+}
+
+/// Typed, payload-free route failure before an assignment is reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteError {
+    /// The current accepted configuration cannot be projected.
+    InvalidConfig,
+    /// The named namespace does not exist in the current source.
+    NamespaceMissing,
+    /// This namespace router has been replaced and cannot admit new work.
+    NamespaceReplaced,
+    /// The process owner, lifecycle, or a topology/health source is unavailable.
+    ControlUnavailable,
+    /// A retained candidate lost authority or belongs to a different router.
+    StaleCandidate,
+    /// No eligible healthy backend remains in the client's group.
+    NoBackend,
+    /// Multiple clusters claim the same listener port.
+    PortConflict,
+    /// A temporary unsupported capability is required, with no silent fallback.
+    Unsupported(Unsupported),
+    /// The caller's session was not minted by this router or has closed.
+    InvalidSession,
+    /// An initial assignment is already active on this session.
+    AlreadyActive,
+    /// A bounded live-session table is full.
+    Capacity,
+    /// A never-reused identity or connection counter cannot advance.
+    Exhausted,
+}
+
+impl From<LedgerError> for RouteError {
+    fn from(error: LedgerError) -> Self {
+        match error {
+            LedgerError::ForeignSession
+            | LedgerError::ClosedSession
+            | LedgerError::ForeignAccount => Self::InvalidSession,
+            LedgerError::AlreadyActive => Self::AlreadyActive,
+            LedgerError::Exhausted => Self::Exhausted,
+            LedgerError::Capacity => Self::Capacity,
+        }
+    }
+}
+
+/// An opaque candidate, valid only when rechecked by its producing router.
+///
+/// Retaining this value never retains routing authority. Config, routing and
+/// health remain separate immutable sources and are all checked at reserve.
+#[derive(Clone)]
+pub struct Candidate {
+    pub(crate) bundle: Arc<()>,
+    pub(crate) config: Arc<ConfigNamespaceSnapshot>,
+    pub(crate) routing: Arc<RoutingSnapshot>,
+    pub(crate) health: Arc<HealthSnapshot>,
+    pub(crate) policy: RoutingConfig,
+}
+
+pub(crate) struct Sources {
+    identity: Arc<()>,
+    source: Arc<dyn ConfigNamespaceSource>,
+    routing: RoutingSnapshotHandle,
+    health: HealthOverlayHandle,
+    owner: OwnerToken,
+    lifecycle: watch::Receiver<LifecycleSnapshot>,
+    namespace: RoutingNamespace,
+    namespace_origin: Arc<ConfigNamespaceSnapshot>,
+}
+
+impl Sources {
+    pub(crate) fn new(
+        source: Arc<dyn ConfigNamespaceSource>,
+        topology: &TopologyModuleHandle,
+        context: &ModuleContext,
+        namespace: &str,
+    ) -> Result<Self, RouteError> {
+        let current = source.current();
+        let namespace = current
+            .namespaces()
+            .iter()
+            .find(|ns| ns.namespace == namespace)
+            .ok_or(RouteError::NamespaceMissing)?
+            .routing();
+        Ok(Self {
+            identity: Arc::new(()),
+            source,
+            routing: topology.routing_handle(),
+            health: topology.health_overlay_handle(),
+            owner: context.owner().clone(),
+            lifecycle: context.lifecycle(),
+            namespace,
+            namespace_origin: current,
+        })
+    }
+
+    pub(crate) fn admit(&self) -> Result<Arc<ConfigNamespaceSnapshot>, RouteError> {
+        self.live()?;
+        let config = self.source.current();
+        self.namespace_current(&config)?;
+        Ok(config)
+    }
+
+    fn live(&self) -> Result<(), RouteError> {
+        if self.owner.is_current()
+            && self.lifecycle.has_changed().is_ok()
+            && self.lifecycle.borrow().phase == LifecyclePhase::Ready
+        {
+            Ok(())
+        } else {
+            Err(RouteError::ControlUnavailable)
+        }
+    }
+
+    fn namespace_current(&self, config: &ConfigNamespaceSnapshot) -> Result<(), RouteError> {
+        let namespace = config
+            .namespaces()
+            .iter()
+            .find(|ns| ns.namespace == self.namespace.name.as_ref())
+            .ok_or(RouteError::NamespaceMissing)?;
+        if namespace.routing() != self.namespace
+            || !self
+                .namespace_origin
+                .same_namespace_incarnation(config, self.namespace.name.as_ref())
+        {
+            return Err(RouteError::NamespaceReplaced);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture(&self) -> Result<Candidate, RouteError> {
+        let config = self.admit()?;
+        let policy = config
+            .effective()
+            .routing()
+            .map_err(|_| RouteError::InvalidConfig)?;
+        supported(&config, &policy)?;
+        let routing = self
+            .routing
+            .current()
+            .ok_or(RouteError::ControlUnavailable)?;
+        let health = self
+            .health
+            .current_for(&routing)
+            .ok_or(RouteError::ControlUnavailable)?;
+        let candidate = Candidate {
+            bundle: Arc::clone(&self.identity),
+            config,
+            routing,
+            health,
+            policy,
+        };
+        self.validate(&candidate)?;
+        Ok(candidate)
+    }
+
+    pub(crate) fn validate(&self, candidate: &Candidate) -> Result<(), RouteError> {
+        self.live()?;
+        // C is independent of topology's accepted material. Comparing C's
+        // generation/epoch to R would wrongly block new policy on old backends.
+        if !Arc::ptr_eq(&candidate.bundle, &self.identity)
+            || !Arc::ptr_eq(&candidate.config, &self.source.current())
+            || !self
+                .health
+                .still_current_for(&candidate.health, &candidate.routing, &self.routing)
+        {
+            return Err(RouteError::StaleCandidate);
+        }
+        self.namespace_current(&candidate.config)
+    }
+
+    pub(crate) fn current_config(&self, config: &Arc<ConfigNamespaceSnapshot>) -> bool {
+        self.live().is_ok()
+            && Arc::ptr_eq(config, &self.source.current())
+            && self.namespace_current(config).is_ok()
+    }
+}
+
+fn supported(config: &ConfigNamespaceSnapshot, policy: &RoutingConfig) -> Result<(), RouteError> {
+    match policy.balance_policy {
+        RoutingBalancePolicy::Connection => (),
+        RoutingBalancePolicy::Resource => {
+            return Err(RouteError::Unsupported(Unsupported::ResourcePolicy));
+        }
+        RoutingBalancePolicy::Location => {
+            return Err(RouteError::Unsupported(Unsupported::LocationPolicy));
+        }
+    }
+    if policy
+        .proxy_labels
+        .iter()
+        .any(|(key, value)| key.as_ref() == "zone" && !value.is_empty())
+    {
+        return Err(RouteError::Unsupported(Unsupported::ZoneMetadata));
+    }
+    if !policy.label_name.is_empty() {
+        return Err(RouteError::Unsupported(Unsupported::LabelIsolation));
+    }
+    if !policy.failed_backends.is_empty() {
+        return Err(RouteError::Unsupported(Unsupported::FailedBackends));
+    }
+    if config
+        .topology()
+        .map_err(|_| RouteError::InvalidConfig)?
+        .backend_clusters
+        .is_empty()
+    {
+        return Err(RouteError::Unsupported(Unsupported::StaticFallback));
+    }
+    Ok(())
+}

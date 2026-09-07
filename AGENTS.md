@@ -77,6 +77,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/mysql-wire/` - MySQL wire-format types and codec boundaries; it does not own sockets or routing decisions.
 - `rust/crates/proxy-io/` - Client/backend transport ownership, including future TLS, compression, and PROXY protocol support.
 - `rust/crates/session-core/` - Protocol-independent session lifecycle and migration state.
+- `rust/crates/control-router/` - Staged namespace-scoped routing selection, exact config/topology/health capture, and reservation accounting. Production dataplane/binary wiring remains prohibited until full routing parity is complete.
 - `rust/crates/control-routing/` - Protocol-independent route values and pure group matching/port-conflict primitives; it owns no reservation or production selector yet and carries no wire payloads.
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
 - `rust/crates/control-plane/` - Process-local Rust control-domain types, ownership fencing, config/TLS views, lifecycle/shutdown, and bounded observability; it must not depend on `control-proto`.

@@ -22,8 +22,14 @@ trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 cd "$repo_root"
 
 if grep -R -n -E 'control_proto|control-proto' \
-    rust/crates/control-routing rust/crates/dataplane/src/route.rs; then
+    rust/crates/control-routing rust/crates/control-router rust/crates/dataplane/src/route.rs; then
     echo "CP-ROUTE domain leaks the legacy protocol dependency" >&2
+    exit 1
+fi
+# Temporary selector capability gaps must never reach production callers.
+if grep -n -E 'control-router|control_router' \
+    rust/crates/dataplane/Cargo.toml rust/crates/tiproxy-rs/Cargo.toml; then
+    echo "CP-ROUTE staged selector is prematurely wired to production" >&2
     exit 1
 fi
 while IFS= read -r file; do
@@ -65,3 +71,41 @@ cargo run --locked --quiet --manifest-path rust/Cargo.toml -p control-routing \
 cmp "$tmp_dir/go-groups.tsv" "$tmp_dir/rust-groups.tsv"
 python3 tests/controlplane/cproute/groups/mutations.py "$tmp_dir/go-groups.tsv"
 echo "CP-ROUTE group matching and port-conflict evidence passed"
+
+CPROUTE_LEDGER_FIXTURE="$repo_root/tests/controlplane/cproute/ledger/events.tsv" \
+CPROUTE_LEDGER_OUTPUT="$tmp_dir/go-ledger.tsv" \
+    go test ./pkg/controlbridge -run '^TestCPRouteLedgerObservation$' -count=1
+CPROUTE_LEDGER_FIXTURE="$repo_root/tests/controlplane/cproute/ledger/events.tsv" \
+CPROUTE_LEDGER_OUTPUT="$tmp_dir/rust-ledger.tsv" \
+    cargo test --locked --quiet --manifest-path rust/Cargo.toml -p control-router \
+        ledger::tests::shared_go_ledger_observation -- --exact
+cmp "$tmp_dir/go-ledger.tsv" "$tmp_dir/rust-ledger.tsv"
+echo "CP-ROUTE reservation accounting evidence passed"
+
+# Inject deterministic ticks into a temporary copy of the actual Go selector.
+# No selection, scoring or weight calculation is replaced by an oracle.
+python3 - "$repo_root" "$tmp_dir" <<'PY'
+import json
+from pathlib import Path
+import sys
+root, temp = map(Path, sys.argv[1:])
+source = root / 'pkg/balance/factor/factor_balance.go'
+original = source.read_text()
+assert original.count('time.Now().UnixMicro()') == 2
+copy = temp / 'factor_balance.go'
+copy.write_text(original.replace('time.Now().UnixMicro()', 'cprouteTicket'))
+(temp / 'overlay.json').write_text(json.dumps({'Replace': {str(source): str(copy)}}))
+PY
+CPROUTE_CLOCK_OVERLAY=1 \
+CPROUTE_CHOICE_FIXTURE="$repo_root/tests/controlplane/cproute/choice/weights.tsv" \
+CPROUTE_CHOICE_OUTPUT="$tmp_dir/go-choice.tsv" \
+    go test -overlay "$tmp_dir/overlay.json" ./pkg/balance/factor -run '^TestCPRouteChoiceObservation$' -count=1
+CPROUTE_CHOICE_FIXTURE="$repo_root/tests/controlplane/cproute/choice/weights.tsv" \
+CPROUTE_CHOICE_OUTPUT="$tmp_dir/rust-choice.tsv" \
+    cargo test --locked --quiet --manifest-path rust/Cargo.toml -p control-router \
+        selector::tests::shared_go_choice_observation -- --exact
+cmp "$tmp_dir/go-choice.tsv" "$tmp_dir/rust-choice.tsv"
+echo "CP-ROUTE connection policy candidate and weight evidence passed"
+
+python3 tests/controlplane/cproute/mutations.py
+echo "CP-ROUTE selector authority and accounting mutation evidence passed"

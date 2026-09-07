@@ -201,6 +201,7 @@ pub struct ConfigNamespaceSnapshot {
     namespace_checksum: u32,
     effective: Arc<EffectiveConfig>,
     namespaces: Arc<[NamespaceConfig]>,
+    namespace_identities: BTreeMap<String, Arc<()>>,
     prepared: PreparedArtifact,
 }
 
@@ -253,6 +254,34 @@ impl ConfigNamespaceSnapshot {
     #[must_use]
     pub fn namespaces(&self) -> &[NamespaceConfig] {
         &self.namespaces
+    }
+
+    /// Whether a namespace has remained continuously present and unchanged
+    /// between these snapshots of the same store. Removal followed by identical
+    /// re-creation is a new incarnation. Global config/material updates preserve
+    /// this identity; a namespace change replaces it. Numeric generations and
+    /// equal namespace content alone cannot authorize an old namespace owner.
+    #[must_use]
+    pub fn same_namespace_incarnation(&self, other: &Self, name: &str) -> bool {
+        self.namespace_identities
+            .get(name)
+            .zip(other.namespace_identities.get(name))
+            .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
+    }
+
+    fn retain_namespace_identities(&mut self, previous: &Self) {
+        for namespace in self.namespaces.iter() {
+            if previous
+                .namespaces
+                .binary_search_by(|old| old.namespace.cmp(&namespace.namespace))
+                .ok()
+                .is_some_and(|index| previous.namespaces[index] == *namespace)
+                && let Some(identity) = previous.namespace_identities.get(&namespace.namespace)
+            {
+                self.namespace_identities
+                    .insert(namespace.namespace.clone(), Arc::clone(identity));
+            }
+        }
     }
 
     /// Returns the opaque artifact the validator prepared for this generation.
@@ -569,13 +598,15 @@ impl ConfigNamespaceStore {
             .generation
             .checked_add(1)
             .ok_or(StoreError::GenerationExhausted)?;
-        let candidate = Arc::new(build_snapshot(
+        let mut candidate = build_snapshot(
             next_generation,
             effective.as_ref().clone(),
             namespaces.to_vec(),
             state.current.source_revision,
             prepared,
-        )?);
+        )?;
+        candidate.retain_namespace_identities(&state.current);
+        let candidate = Arc::new(candidate);
         state.current = Arc::clone(&candidate);
         self.updates.send_replace(Arc::clone(&candidate));
         Ok(candidate)
@@ -982,7 +1013,7 @@ fn publish_candidate(
         .generation
         .checked_add(1)
         .ok_or(StoreError::GenerationExhausted)?;
-    let candidate = build_snapshot(
+    let mut candidate = build_snapshot(
         next_generation,
         effective,
         namespaces,
@@ -994,6 +1025,7 @@ fn publish_candidate(
     {
         return Ok(None);
     }
+    candidate.retain_namespace_identities(&state.current);
     let candidate = Arc::new(candidate);
     state.current = Arc::clone(&candidate);
     updates.send_replace(Arc::clone(&candidate));
@@ -1028,6 +1060,10 @@ fn build_snapshot(
         config_checksum: crc32fast::hash(config_data.as_bytes()),
         namespace_checksum: crc32fast::hash(&namespace_data),
         effective: Arc::new(effective),
+        namespace_identities: namespaces
+            .iter()
+            .map(|namespace| (namespace.namespace.clone(), Arc::new(())))
+            .collect(),
         namespaces: Arc::from(namespaces),
         prepared,
     })
