@@ -51,6 +51,7 @@ mod register;
 mod registrar;
 mod resolver;
 mod routing_snapshot;
+mod static_source;
 
 pub use backend_health::{BackendHealth, ClusterHealthNetwork};
 pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
@@ -77,3 +78,4 @@ pub use routing_snapshot::{
     GenerationOverflow, PublishOutcome, RoutingSnapshot, RoutingSnapshotHandle,
     RoutingSnapshotPublisher, RoutingSourceClosed,
 };
+pub use static_source::{BackendSourceHandle, BackendSourceMode, BackendSourceSnapshot, ModeEpoch};

@@ -127,6 +127,16 @@ impl ClusterConnector {
         Ok(Self { owner, resolver })
     }
 
+    /// Builds Go's empty-cluster default connector (`NetworkRouter.defaultDial`
+    /// for a backend with no `ClusterName`): the system resolver and plain TCP,
+    /// owner-fenced like every cluster connector, with no cluster material at all.
+    pub(crate) fn system_default(owner: OwnerToken) -> Self {
+        Self {
+            owner,
+            resolver: None,
+        }
+    }
+
     /// Returns `Ok` only while the process owner AND the source generation are
     /// both current. A stale check is a terminal [`ClusterConnectError::Fenced`].
     ///

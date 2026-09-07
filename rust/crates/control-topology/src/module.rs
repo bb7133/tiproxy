@@ -77,6 +77,10 @@ use crate::health_overlay::{HealthOverlayHandle, HealthOverlayPublisher};
 use crate::registrar::RegistrarError;
 use crate::resolver::AdvertiseEndpointResolver;
 use crate::routing_snapshot::{RoutingSnapshotHandle, RoutingSnapshotPublisher};
+use crate::static_source::{
+    BackendSourceHandle, BackendSourceMode, ModeEpoch, ModePublisher, StaticProducers,
+    StaticRegistry,
+};
 
 /// Grace period for a retired generation's children to deregister before they
 /// are aborted, so a wedged child can never block a reconfigure or shutdown.
@@ -247,6 +251,12 @@ pub struct TopologyModule {
     /// publisher into the health task, feeder into the [`ModuleRuntime`] guard) at
     /// startup. `None` only after that move.
     health: Option<HealthParts>,
+    /// The applied backend-source mode (CP-ROUTE 220-3 B2): Static IFF the
+    /// applied registration plan has no cluster. Its epoch gate is revoked
+    /// before a new plan/commit is published and a fresh epoch published after.
+    mode: ModePublisher,
+    /// The readers' registry of live static producers, by namespace.
+    statics: Arc<StaticRegistry>,
     #[cfg(test)]
     refresh_override: Option<RefreshFactory>,
     #[cfg(test)]
@@ -328,6 +338,9 @@ pub struct TopologyModuleHandle {
     discovery: DiscoveryHandle,
     routing: RoutingSnapshotHandle,
     health: HealthOverlayHandle,
+    source: Arc<dyn ConfigNamespaceSource>,
+    mode: watch::Receiver<Arc<ModeEpoch>>,
+    statics: Arc<StaticRegistry>,
 }
 
 impl TopologyModuleHandle {
@@ -389,6 +402,21 @@ impl TopologyModuleHandle {
     #[must_use]
     pub fn health_overlay_handle(&self) -> HealthOverlayHandle {
         self.health.clone()
+    }
+
+    /// Binds a [`BackendSourceHandle`] to `namespace`'s CURRENT incarnation
+    /// (CP-ROUTE 220-3 B2), or `None` when the namespace is absent from the
+    /// committed config or its static producer is not (yet, or any longer)
+    /// registered — fail-closed until the run loop has reconciled it.
+    #[must_use]
+    pub fn backend_source(&self, namespace: &str) -> Option<BackendSourceHandle> {
+        BackendSourceHandle::bind(
+            namespace,
+            Arc::clone(&self.source),
+            self.mode.clone(),
+            (self.routing.clone(), self.health.clone()),
+            &self.statics,
+        )
     }
 }
 
@@ -466,7 +494,7 @@ impl TopologyModule {
     /// a discovery connector, so a test can count and gate the per-cluster
     /// discovery connections a generation builds. Not compiled into production.
     #[cfg(test)]
-    fn new_with_child_runner_and_connector(
+    pub(crate) fn new_with_child_runner_and_connector(
         source: Arc<dyn ConfigNamespaceSource>,
         factory: Box<dyn TopologyClientFactory>,
         resolver: Arc<dyn AdvertiseEndpointResolver>,
@@ -528,9 +556,12 @@ impl TopologyModule {
         let routing = Arc::new(routing_publisher);
         let (feeder, feed) = HealthGenerationFeeder::new();
         let (publisher, health_overlay) = HealthOverlayPublisher::new();
+        let mode = ModePublisher::new();
+        let mode_reader = mode.subscribe();
+        let statics = Arc::new(StaticRegistry::default());
         Ok((
             Self {
-                source,
+                source: Arc::clone(&source),
                 factory,
                 resolver,
                 identity,
@@ -547,6 +578,8 @@ impl TopologyModule {
                     feed,
                     publisher,
                 }),
+                mode,
+                statics: Arc::clone(&statics),
                 #[cfg(test)]
                 refresh_override: None,
                 #[cfg(test)]
@@ -558,6 +591,9 @@ impl TopologyModule {
                 discovery: discovery_handle,
                 routing: routing_handle,
                 health: health_overlay,
+                source,
+                mode: mode_reader,
+                statics,
             },
         ))
     }
@@ -599,6 +635,8 @@ impl TopologyModule {
             feeder,
             health: None,
             refresh: None,
+            mode: &self.mode,
+            statics: StaticProducers::new(Arc::clone(&self.statics)),
         };
 
         // Apply the current generation once (including generation 1), then wait
@@ -617,6 +655,7 @@ impl TopologyModule {
                     &initial,
                     &owner,
                     &mut health,
+                    &mut runtime.statics,
                 )
                 .await
             {
@@ -668,6 +707,7 @@ impl TopologyModule {
                             &snapshot,
                             &owner,
                             &mut health,
+                            &mut runtime.statics,
                         )
                         .await;
                 }
@@ -920,6 +960,17 @@ impl TopologyModule {
         // Commit registration first (fence: retire the previous generation before
         // the new one publishes), then commit discovery (revoke the old gate,
         // publish the new epoch).
+        // Mode transition, step 1 of 2: revoke the outgoing epoch BEFORE the new
+        // plan, discovery commit or mode are visible to any reader.
+        let next_mode = if plan.clusters.is_empty() {
+            BackendSourceMode::Static
+        } else {
+            BackendSourceMode::Dynamic
+        };
+        let mode_changes = self.mode.applied() != Some(next_mode);
+        if mode_changes {
+            self.mode.revoke();
+        }
         if !registration_unchanged {
             stop_children(children).await;
             for cluster in clusters {
@@ -953,6 +1004,10 @@ impl TopologyModule {
             self.discovery.commit(prepared);
             *health.active = candidate_health;
             reconcile_health_feed(health.feeder, health.active.as_ref(), health.routing);
+        }
+        // Mode transition, step 2 of 2: a fresh live epoch for the applied plan.
+        if mode_changes {
+            self.mode.publish(next_mode);
         }
         Ok(())
     }
@@ -999,11 +1054,23 @@ impl TopologyModule {
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
         health: &mut HealthReconcile<'_>,
+        statics: &mut StaticProducers,
     ) -> bool {
         let generation = snapshot.generation();
+        // Namespaces follow the committed config (Go `CommitNamespaces`),
+        // independently of whether this generation's cluster material applies.
+        statics.reconcile(
+            snapshot,
+            owner,
+            &self.health_runtime,
+            &self.source,
+            self.mode.applied(),
+        );
         let outcome = self
             .reconfigure(children, active_plan, snapshot, owner, health)
             .await;
+        // Probe static sources only while the applied mode is Static.
+        statics.apply_mode(self.mode.applied());
         self.status.send_modify(|status| {
             status.observed_generation = generation;
             match outcome {
@@ -1182,13 +1249,17 @@ struct ModuleRuntime<'module> {
     feeder: HealthGenerationFeeder,
     health: Option<JoinHandle<()>>,
     refresh: Option<JoinHandle<()>>,
+    mode: &'module ModePublisher,
+    statics: StaticProducers,
 }
 
 impl ModuleRuntime<'_> {
-    fn terminal_fence(&self) {
+    fn terminal_fence(&mut self) {
+        self.mode.revoke();
         self.routing.revoke_and_clear();
         self.discovery.revoke();
         self.feeder.close();
+        self.statics.revoke_all();
     }
 
     async fn retire(mut self) {
@@ -1225,9 +1296,9 @@ impl Drop for ModuleRuntime<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildRunner, HealthFactory, ModuleRuntime, ROUTING_REFRESH_INTERVAL, RefreshFactory,
-        RegistrarError, RejectionClass, TopologyClusterClient, TopologyModule, TopologyStatus,
-        run_refresh,
+        ChildRunner, HealthFactory, ModePublisher, ModuleRuntime, ROUTING_REFRESH_INTERVAL,
+        RefreshFactory, RegistrarError, RejectionClass, StaticProducers, StaticRegistry,
+        TopologyClusterClient, TopologyModule, TopologyStatus, run_refresh,
     };
     use std::future::pending;
     use std::path::PathBuf;
@@ -3256,12 +3327,15 @@ ns-servers = ["dns-a:53"]
         // discovery revoked, then the feed closed), exactly as `ModuleRuntime`
         // does on teardown. A bare feeder (its feed dropped) is fine here: this
         // unit exercises only the routing-first fence ordering, not the feed.
-        let owner = ModuleRuntime {
+        let mode = ModePublisher::new();
+        let mut owner = ModuleRuntime {
             routing: Arc::clone(&routing),
             discovery: &publisher,
             feeder: HealthGenerationFeeder::new().0,
             health: None,
             refresh: None,
+            mode: &mode,
+            statics: StaticProducers::new(Arc::new(StaticRegistry::default())),
         };
         owner.terminal_fence();
 

@@ -269,6 +269,22 @@ impl ConfigNamespaceSnapshot {
             .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
     }
 
+    /// Returns the opaque incarnation identity of a namespace in this snapshot,
+    /// or `None` when the namespace is absent.
+    ///
+    /// The value is a capability for keying per-namespace owners (CP-ROUTE
+    /// 220-3 B2): it is comparable only by [`NamespaceIncarnation::same_as`],
+    /// carries no content, and — like the identity map it wraps — takes no part
+    /// in equality, checksums or projections. Holding it never keeps a namespace
+    /// current: authority is re-checked against the store's current snapshot with
+    /// [`Self::same_namespace_incarnation`].
+    #[must_use]
+    pub fn namespace_incarnation(&self, name: &str) -> Option<NamespaceIncarnation> {
+        self.namespace_identities
+            .get(name)
+            .map(|identity| NamespaceIncarnation(Arc::clone(identity)))
+    }
+
     fn retain_namespace_identities(&mut self, previous: &Self) {
         for namespace in self.namespaces.iter() {
             if previous
@@ -301,6 +317,20 @@ impl ConfigNamespaceSnapshot {
     /// formed from the accepted full configuration.
     pub fn topology(&self) -> Result<TopologyConfig, ConfigError> {
         self.effective.topology()
+    }
+}
+
+/// The opaque identity of one namespace incarnation (see
+/// [`ConfigNamespaceSnapshot::namespace_incarnation`]).
+#[derive(Clone, Debug)]
+pub struct NamespaceIncarnation(Arc<()>);
+
+impl NamespaceIncarnation {
+    /// Whether both values name the very same incarnation (pointer identity;
+    /// equal namespace content after a removal is a different incarnation).
+    #[must_use]
+    pub fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
