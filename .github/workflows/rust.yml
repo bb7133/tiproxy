@@ -48,7 +48,10 @@ jobs:
   quality:
     name: Format, lint, and test
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The CP-ROUTE evidence step compiles and runs 28 isolated production
+    # mutations (group, selector, health-round locality) before the unit
+    # tests; 20 minutes no longer fits on the hosted runner.
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

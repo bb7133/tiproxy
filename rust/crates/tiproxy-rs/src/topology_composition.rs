@@ -3296,8 +3296,18 @@ ns-servers = [{ns_servers}]
         ns_servers: &str,
         health: control_config::HealthCheckConfig,
     ) -> Composition {
-        let dir = material_dir();
         let toml = topology_toml(&format!("127.0.0.1:{}", addr.port()), ns_servers);
+        build_composition_from_toml(toml, health).await
+    }
+
+    /// Builds the real pipeline from an explicit initial TOML (a row that needs
+    /// more than the cluster block, e.g. the proxy `[labels]`) with a checked
+    /// health config, through the SAME public `TopologyModule::new`.
+    async fn build_composition_from_toml(
+        toml: Vec<u8>,
+        health: control_config::HealthCheckConfig,
+    ) -> Composition {
+        let dir = material_dir();
         let roots = open_tls_roots(std::slice::from_ref(&dir));
         let store = ConfigNamespaceStore::from_toml_with_validator(
             &toml,
@@ -3450,6 +3460,11 @@ ns-servers = [{ns_servers}]
             assert!(
                 verdict.server_version.is_none(),
                 "a disabled runtime carries no version for {}",
+                backend.backend_id
+            );
+            assert!(
+                !verdict.local,
+                "a disabled runtime never computes locality for {} (Go Local=false)",
                 backend.backend_id
             );
         }
@@ -3879,6 +3894,183 @@ ns-servers = [{ns_servers}]
             assert!(
                 !overlay.still_current_for(&h_err, &r, &comp.routing),
                 "the ERR overlay is de-authorized once the recovered round publishes"
+            );
+
+            comp.task.abort();
+            drop(comp.runtime);
+        };
+        with_real_wall_clock_watchdog(body).await;
+    }
+
+    // ----- Row R5: locality rides the per-round captured proxy zone ---------
+
+    /// The cluster TOML plus the proxy's own `[labels]` zone (CP-ROUTE 220-3 B1).
+    ///
+    /// `apply_toml` is a PARTIAL patch over the accepted file base (like Go's
+    /// incremental config merge, an omitted `[labels]` table keeps the prior
+    /// labels), so a row "unsets" the zone by writing an empty value, which is
+    /// exactly Go's `self zone == ""` local-everywhere case.
+    fn topology_toml_zoned(pd_addrs: &str, zone: &str) -> Vec<u8> {
+        let mut toml = topology_toml(pd_addrs, "");
+        toml.extend_from_slice(format!("\n[labels]\nzone = \"{zone}\"\n").as_bytes());
+        toml
+    }
+
+    /// One backend at `addr` whose topology info carries a `zone` label.
+    fn backend_kvs_zoned(addr: &str, port: u16, zone: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            kv(
+                &format!("/topology/tidb/{addr}/info"),
+                &format!(
+                    r#"{{"ip":"127.0.0.1","status_port":{port},"version":"v-loc","labels":{{"zone":"{zone}"}}}}"#
+                ),
+            ),
+            kv(&format!("/topology/tidb/{addr}/ttl"), "173000000000"),
+        ]
+    }
+
+    /// Waits, round by round, for a NEW healthy overlay under the exact `r` whose
+    /// verdict for `backend_id` carries `expected_local`. A round that captured
+    /// its zone BEFORE a config update legitimately publishes the old locality
+    /// first; each such overlay becomes the next `prev_h` so the wait only ever
+    /// returns a genuinely newer round.
+    async fn wait_local(
+        overlay: &HealthOverlayHandle,
+        routing: &RoutingSnapshotHandle,
+        r: &Arc<RoutingSnapshot>,
+        backend_id: &str,
+        expected_local: bool,
+        server: &StatusServer,
+        mut prev_h: Arc<HealthSnapshot>,
+    ) -> Arc<HealthSnapshot> {
+        loop {
+            let h = wait_health(
+                overlay,
+                routing,
+                r,
+                backend_id,
+                true,
+                Some("v-loc"),
+                server.request_count(),
+                1,
+                server,
+                Some(&prev_h),
+            )
+            .await;
+            if h.get(backend_id).local == expected_local {
+                break h;
+            }
+            prev_h = h;
+        }
+    }
+
+    /// Locality on the REAL pipeline (CP-ROUTE 220-3 B1): a backend labelled
+    /// `zone=az-1` reads local under a proxy `[labels] zone = "az-1"`, flips to
+    /// not-local on a zone-only config update to `az-2` WITHOUT any routing
+    /// rotation (the same exact R stays current; only a new H replaces the old),
+    /// and reads local again once the proxy zone is removed (Go: empty self zone
+    /// => local). Each verdict is produced by the health round, never recomputed
+    /// by a reader from the current config.
+    #[tokio::test]
+    async fn a_backend_locality_follows_the_zone_captured_per_health_round() {
+        let body = async {
+            let server = spawn_status_server(StatusBehavior::Ok200("v-loc".to_owned())).await;
+            let greeter = spawn_sql_greeter(Greeting::V10).await;
+            let backend_id = backend_id(greeter.port);
+            let Some((_fixture, addr)) =
+                spawn_fixture(backend_kvs_zoned(&sql_addr(&greeter), server.port, "az-1")).await
+            else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let pd = format!("127.0.0.1:{}", addr.port());
+            let comp = build_composition_from_toml(
+                topology_toml_zoned(&pd, "az-1"),
+                control_config::HealthCheckConfig::default(),
+            )
+            .await;
+            let overlay = comp.handle.health_overlay_handle();
+            let r = first_snapshot(&comp.routing).await;
+            let labelled = r
+                .backends
+                .backends
+                .iter()
+                .find(|backend| backend.backend_id.as_ref() == backend_id.as_str())
+                .unwrap_or_else(|| unreachable!("the labelled backend is discovered"));
+            assert_eq!(
+                labelled.backend.labels.get("zone").map(String::as_str),
+                Some("az-1"),
+                "the backend's zone label reaches the routing snapshot"
+            );
+
+            // Same zone: the first healthy round reads local.
+            let h1 = wait_health(
+                &overlay,
+                &comp.routing,
+                &r,
+                backend_id.as_str(),
+                true,
+                Some("v-loc"),
+                0,
+                1,
+                &server,
+                None,
+            )
+            .await;
+            assert!(h1.get(backend_id.as_str()).local, "same zone reads local");
+
+            // A zone-only update (az-2): accepted as a no-op for topology, so R
+            // does not rotate and H is not withdrawn; the next round publishes
+            // not-local under the SAME exact R.
+            let mut status = comp.handle.status();
+            comp.store
+                .apply_toml(&topology_toml_zoned(&pd, "az-2"), None, 2, &comp.dir)
+                .unwrap_or_else(|error| unreachable!("apply revision 2: {error}"));
+            wait_applied(&mut status, 2).await;
+            let h2 = wait_local(
+                &overlay,
+                &comp.routing,
+                &r,
+                backend_id.as_str(),
+                false,
+                &server,
+                h1,
+            )
+            .await;
+            assert!(
+                comp.routing
+                    .current()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &r)),
+                "a zone-only update rotates no routing source"
+            );
+            assert!(
+                overlay.still_current_for(&h2, &r, &comp.routing),
+                "the not-local overlay is authoritative for the unchanged R"
+            );
+
+            // An empty proxy zone: every backend is local again (Go rule).
+            comp.store
+                .apply_toml(&topology_toml_zoned(&pd, ""), None, 3, &comp.dir)
+                .unwrap_or_else(|error| unreachable!("apply revision 3: {error}"));
+            wait_applied(&mut status, 3).await;
+            let h3 = wait_local(
+                &overlay,
+                &comp.routing,
+                &r,
+                backend_id.as_str(),
+                true,
+                &server,
+                h2,
+            )
+            .await;
+            assert!(
+                h3.get(backend_id.as_str()).local,
+                "no proxy zone reads local"
+            );
+            assert!(
+                comp.routing
+                    .current()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &r)),
+                "still no routing rotation across two zone-only updates"
             );
 
             comp.task.abort();

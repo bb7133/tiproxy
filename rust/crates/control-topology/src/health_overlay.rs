@@ -90,6 +90,7 @@ impl HealthSnapshot {
             .unwrap_or(BackendHealth {
                 healthy: false,
                 server_version: None,
+                local: false,
             })
     }
 }
@@ -403,6 +404,7 @@ mod tests {
                     BackendHealth {
                         healthy: true,
                         server_version: Some("v8".to_owned()),
+                        local: false,
                     },
                 )
             })

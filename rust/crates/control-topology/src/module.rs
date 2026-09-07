@@ -767,6 +767,7 @@ impl TopologyModule {
             owner,
             HEALTH_CONCURRENCY,
             probe_backend_in_generation,
+            Arc::clone(&self.source),
         ))
     }
 

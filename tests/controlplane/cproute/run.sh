@@ -129,3 +129,19 @@ echo "CP-ROUTE retry cycle and port-conflict evidence passed"
 
 python3 tests/controlplane/cproute/mutations.py
 echo "CP-ROUTE selector authority and accounting mutation evidence passed"
+
+# CP-ROUTE 220-3 B1: the health round's locality (Go checkHealth + setLocal
+# through the real ConfigManager) versus the production run_health_round with
+# the real ConfigNamespaceStore zone read, over one shared config history.
+CPROUTE_LOCALITY_FIXTURE="$repo_root/tests/controlplane/cproute/locality/rounds.json" \
+CPROUTE_LOCALITY_OUTPUT="$tmp_dir/go-locality.tsv" \
+    go test ./pkg/balance/observer -run '^TestCPRouteLocalityObservation$' -count=1
+CPROUTE_LOCALITY_FIXTURE="$repo_root/tests/controlplane/cproute/locality/rounds.json" \
+CPROUTE_LOCALITY_OUTPUT="$tmp_dir/rust-locality.tsv" \
+    cargo test --locked --quiet --manifest-path rust/Cargo.toml -p control-topology \
+        health_loop::tests::shared_go_locality_observation -- --exact
+cmp "$tmp_dir/go-locality.tsv" "$tmp_dir/rust-locality.tsv"
+echo "CP-ROUTE health-round locality evidence passed"
+
+python3 tests/controlplane/cproute/locality/mutations.py "$tmp_dir/go-locality.tsv"
+echo "CP-ROUTE health-round locality mutation evidence passed"
