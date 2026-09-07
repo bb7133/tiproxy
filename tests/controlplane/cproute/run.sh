@@ -56,3 +56,12 @@ if [[ "$status" -eq 0 ]]; then
 fi
 
 echo "CP-ROUTE config and namespace projection evidence passed"
+
+CPROUTE_GROUP_FIXTURES="$repo_root/tests/controlplane/cproute/groups" \
+    CPROUTE_GROUP_OUTPUT="$tmp_dir/go-groups.tsv" \
+    go test ./pkg/balance/router -run '^TestCPRouteGroupObservation$' -count=1
+cargo run --locked --quiet --manifest-path rust/Cargo.toml -p control-routing \
+    --example group_observer -- tests/controlplane/cproute/groups >"$tmp_dir/rust-groups.tsv"
+cmp "$tmp_dir/go-groups.tsv" "$tmp_dir/rust-groups.tsv"
+python3 tests/controlplane/cproute/groups/mutations.py "$tmp_dir/go-groups.tsv"
+echo "CP-ROUTE group matching and port-conflict evidence passed"

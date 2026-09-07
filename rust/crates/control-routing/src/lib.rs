@@ -19,6 +19,8 @@
 //! metadata: no transport envelope, protobuf type, or `MySQL` payload can cross
 //! this crate's public API. Wire conversion stays at the bridge edge.
 
+pub mod group;
+
 /// Stable route outcome codes understood by the routing domain.
 ///
 /// The variants mirror the control contract's semantic vocabulary while
