@@ -202,7 +202,8 @@ locality with the exact H; nothing recomputes it from the current config.
 into the reservation, matching Go `RouterAdapter.sendAssignmentLocked` reading
 `backend.Local()`. The actual Go health rule is covered by the shared locality
 observation above. A proxy zone is now supported for connection policy; resource
-and location factors and static fallback remain separately unsupported.
+and location factors remain separately unsupported. Static source routing is
+covered by the namespace source composition below.
 
 `control-router/src/tests/locality.rs` composes the real config source, topology
 module, health loop, and selector. Disabled health always assigns `Local=false`,
@@ -234,9 +235,7 @@ re-activation, and is revoked synchronously on replacement/removal/teardown.
 Consumers hold an opaque `BackendSourceHandle` and capture a
 `BackendSourceSnapshot` (handle identity, exact mode epoch, R, H) that is
 re-checked — together with the namespace incarnation at the config source —
-at every side-effect boundary; `current()` ends with that same check. Router
-consumption of the handle (lifting `Unsupported::StaticFallback`) is the
-follow-up head.
+at every side-effect boundary; `current()` ends with that same check.
 
 - `static/modes.json`: six cluster-configuration steps through the real Go
   `Manager.syncClusters`/`HasBackendClusters` + `FallbackFetcher` +
@@ -274,3 +273,40 @@ follow-up head.
   the source; inactive static keeps probing; empty dynamic discovery falls
   back to static; producer reused across incarnations; static health
   fabricated without a probe; static backend runs the status stage.
+
+
+### Router consumption of the applied source
+
+`control-router` binds a `BackendSourceHandle` to its namespace incarnation and
+retains the opaque `BackendSourceSnapshot` in each candidate. It checks source
+authority at capture completion, after acquiring the real ledger mutex, and
+immediately before reserving. Current C, router identity, namespace incarnation,
+owner and lifecycle remain independent checks. The raw config cluster list no
+longer blocks capture, and `Unsupported::StaticFallback` is removed. A newly
+replaced namespace must have its producer reconciled before a new router binds.
+Resource/location factors and production dataplane wiring remain gated.
+
+`control-router/src/tests/sources.rs` uses real topology/health producers:
+static greeting failure/recovery changes actual reservation eligibility;
+disabled health uses no SQL I/O and keeps identical raw IDs isolated between
+namespaces; pending/rejected cluster material keeps the applied static source
+with current policy; empty applied Dynamic never falls back; mode cycles create
+fresh H and old reservations settle only their original accounts. A skipped
+static namespace removal/recreation while the ledger is locked rejects the old
+router, preserves the other namespace, and produces a fresh router/source.
+
+The mode commit-window row establishes a real registration lease through tonic
+LeaseGrant, streaming LeaseKeepAlive and KV Put, then holds LeaseRevoke inside
+`stop_children`. C_new is captured before delivering the module notification.
+The outgoing mode is revoked while that same C and old dynamic R/H remain
+current, verified both before and after the reserve worker runs. Releasing the
+real ledger mutex inside this window must refuse the candidate without creating
+an accounting record. A private test signal marks the actual lock attempt, so
+moving validation before the lock cannot pass due to thread scheduling.
+
+Four additional compiling selector mutations must fail these rows: omit mode
+validation while retaining R/H checks; validate only before the ledger lock;
+use raw C emptiness to block the still-applied Dynamic source; bind every
+namespace to the default source. The first two must fail the real lease-revoke
+window row specifically. The full entry contains 46 mutations (6 group,
+23 selector/source, 6 locality, 11 static-producer).

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Independent config and exact topology/health authority at the reserve boundary.
+//! Independent config and namespace backend-source authority at reserve.
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use control_config::{
 };
 use control_plane::{LifecyclePhase, LifecycleSnapshot, ModuleContext, OwnerToken};
 use control_topology::{
-    HealthOverlayHandle, HealthSnapshot, RoutingSnapshot, RoutingSnapshotHandle,
+    BackendSourceHandle, BackendSourceSnapshot, HealthSnapshot, RoutingSnapshot,
     TopologyModuleHandle,
 };
 use tokio::sync::watch;
@@ -36,8 +36,6 @@ pub enum Unsupported {
     ResourcePolicy,
     /// Locality-first factors are not yet composed into this selector.
     LocationPolicy,
-    /// Static fallback needs its own authoritative health source.
-    StaticFallback,
 }
 
 /// Typed, payload-free route failure before an assignment is reserved.
@@ -85,11 +83,13 @@ impl From<LedgerError> for RouteError {
 /// An opaque candidate, valid only when rechecked by its producing router.
 ///
 /// Retaining this value never retains routing authority. Config, routing and
-/// health remain separate immutable sources and are all checked at reserve.
+/// health remain separate immutable sources. Their applied source mode and
+/// namespace authority are also checked at reserve.
 #[derive(Clone)]
 pub struct Candidate {
     pub(crate) bundle: Arc<()>,
     pub(crate) config: Arc<ConfigNamespaceSnapshot>,
+    pub(crate) backend: BackendSourceSnapshot,
     pub(crate) routing: Arc<RoutingSnapshot>,
     pub(crate) health: Arc<HealthSnapshot>,
     pub(crate) policy: RoutingConfig,
@@ -98,8 +98,7 @@ pub struct Candidate {
 pub(crate) struct Sources {
     identity: Arc<()>,
     source: Arc<dyn ConfigNamespaceSource>,
-    routing: RoutingSnapshotHandle,
-    health: HealthOverlayHandle,
+    backend: BackendSourceHandle,
     owner: OwnerToken,
     lifecycle: watch::Receiver<LifecycleSnapshot>,
     namespace: RoutingNamespace,
@@ -123,8 +122,9 @@ impl Sources {
         Ok(Self {
             identity: Arc::new(()),
             source,
-            routing: topology.routing_handle(),
-            health: topology.health_overlay_handle(),
+            backend: topology
+                .backend_source(namespace.name.as_ref())
+                .ok_or(RouteError::ControlUnavailable)?,
             owner: context.owner().clone(),
             lifecycle: context.lifecycle(),
             namespace,
@@ -172,20 +172,17 @@ impl Sources {
             .effective()
             .routing()
             .map_err(|_| RouteError::InvalidConfig)?;
-        supported(&config, &policy)?;
-        let routing = self
-            .routing
+        supported(&policy)?;
+        let backend = self
+            .backend
             .current()
-            .ok_or(RouteError::ControlUnavailable)?;
-        let health = self
-            .health
-            .current_for(&routing)
             .ok_or(RouteError::ControlUnavailable)?;
         let candidate = Candidate {
             bundle: Arc::clone(&self.identity),
             config,
-            routing,
-            health,
+            routing: Arc::clone(backend.routing()),
+            health: Arc::clone(backend.health()),
+            backend,
             policy,
         };
         self.validate(&candidate)?;
@@ -198,9 +195,7 @@ impl Sources {
         // generation/epoch to R would wrongly block new policy on old backends.
         if !Arc::ptr_eq(&candidate.bundle, &self.identity)
             || !Arc::ptr_eq(&candidate.config, &self.source.current())
-            || !self
-                .health
-                .still_current_for(&candidate.health, &candidate.routing, &self.routing)
+            || !self.backend.still_current(&candidate.backend)
         {
             return Err(RouteError::StaleCandidate);
         }
@@ -214,7 +209,7 @@ impl Sources {
     }
 }
 
-fn supported(config: &ConfigNamespaceSnapshot, policy: &RoutingConfig) -> Result<(), RouteError> {
+fn supported(policy: &RoutingConfig) -> Result<(), RouteError> {
     match policy.balance_policy {
         RoutingBalancePolicy::Connection => (),
         RoutingBalancePolicy::Resource => {
@@ -223,14 +218,6 @@ fn supported(config: &ConfigNamespaceSnapshot, policy: &RoutingConfig) -> Result
         RoutingBalancePolicy::Location => {
             return Err(RouteError::Unsupported(Unsupported::LocationPolicy));
         }
-    }
-    if config
-        .topology()
-        .map_err(|_| RouteError::InvalidConfig)?
-        .backend_clusters
-        .is_empty()
-    {
-        return Err(RouteError::Unsupported(Unsupported::StaticFallback));
     }
     Ok(())
 }
