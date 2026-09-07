@@ -49,6 +49,8 @@ use crate::{Candidate, Reservation, RouteError, Router, Settlement, Unsupported}
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 mod locality;
+mod registration;
+mod sources;
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
     result.unwrap_or_else(|error| unreachable!("fixture: {error:?}"))
@@ -86,6 +88,7 @@ struct RangeResponse {
 #[derive(Clone)]
 struct KvService {
     records: Arc<Mutex<Vec<KeyValue>>>,
+    registration: Option<registration::Registration>,
     release: watch::Sender<bool>,
     calls: watch::Sender<u64>,
 }
@@ -133,6 +136,13 @@ impl Service<http::Request<Body>> for KvService {
                 Grpc::new(ProstCodec::<RangeResponse, RangeRequest>::default())
                     .unary(handler, request)
                     .await
+            } else if request.uri().path() == "/etcdserverpb.KV/Put" {
+                Grpc::new(ProstCodec::<
+                    registration::PutResponse,
+                    registration::PutRequest,
+                >::default())
+                .unary(handler, request)
+                .await
             } else {
                 let mut response = http::Response::new(Body::default());
                 response
@@ -164,10 +174,17 @@ impl Drop for KvFixture {
 }
 impl KvFixture {
     async fn new() -> TestResult<Self> {
+        Self::with_registration(None).await
+    }
+
+    async fn with_registration(
+        registration: Option<registration::Registration>,
+    ) -> TestResult<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = listener.local_addr()?.to_string();
         let service = KvService {
             records: Arc::new(Mutex::new(Vec::new())),
+            registration: registration.clone(),
             release: watch::channel(true).0,
             calls: watch::channel(0).0,
         };
@@ -179,6 +196,7 @@ impl KvFixture {
             });
             let _ = tonic::transport::Server::builder()
                 .add_service(svc)
+                .add_optional_service(registration.map(registration::LeaseService))
                 .serve_with_incoming(incoming)
                 .await;
         });
@@ -322,7 +340,25 @@ impl Harness {
         health: HealthCheckConfig,
         proxy_zone: &str,
     ) -> TestResult<Self> {
-        let fixture = KvFixture::new().await?;
+        Self::with_fixture(
+            rule,
+            policy,
+            backends,
+            health,
+            proxy_zone,
+            KvFixture::new().await?,
+        )
+        .await
+    }
+
+    async fn with_fixture(
+        rule: &str,
+        policy: &str,
+        backends: &[(&str, &[(&str, &str)])],
+        health: HealthCheckConfig,
+        proxy_zone: &str,
+        fixture: KvFixture,
+    ) -> TestResult<Self> {
         // Enabled rows use real SQL greeting probes. Empty IP selects the
         // production skip-HTTP path; no health verdict is fabricated here.
         fixture.backends_with_ip(backends, if health.enabled { "" } else { "127.0.0.1" });
@@ -650,7 +686,8 @@ async fn namespace_revocation_and_owner_retirement_allow_only_old_settlement() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn default_resource_and_static_fallback_are_typed_unsupported() -> TestResult {
+async fn resource_is_unsupported_and_pending_empty_clusters_keep_the_applied_source() -> TestResult
+{
     let harness = Harness::new("", "resource").await?;
     assert!(matches!(
         harness.router.capture(),
@@ -660,10 +697,26 @@ async fn default_resource_and_static_fallback_are_typed_unsupported() -> TestRes
         "[proxy]\nbackend-clusters = []\n[balance]\npolicy = \"connection\"",
         3,
     );
+    let pending = harness.ready().await;
+    assert_eq!(
+        pending.backend.mode(),
+        control_topology::BackendSourceMode::Dynamic
+    );
+    harness.source.deliver();
+    harness.applied().await;
+    let applied = harness.ready().await;
+    assert_eq!(
+        applied.backend.mode(),
+        control_topology::BackendSourceMode::Static
+    );
+    let session = must(harness.router.open());
     assert!(matches!(
-        harness.router.capture(),
-        Err(RouteError::Unsupported(Unsupported::StaticFallback))
+        harness
+            .router
+            .reserve(&session, &applied, ClientInfo::default(), "", &[]),
+        Err(RouteError::NoBackend)
     ));
+    harness.router.close(&session);
     assert!(
         harness
             .router
@@ -815,6 +868,20 @@ async fn skipped_namespace_removal_and_recreation_cannot_revive_an_old_router() 
         harness.router.capture(),
         Err(RouteError::NamespaceReplaced)
     ));
+    // The new namespace capability cannot bind to the old producer, even
+    // when both namespace contents are identical and watch delivery was held.
+    assert!(matches!(
+        Router::new(
+            Arc::new(harness.source.clone()),
+            &harness.topology,
+            &harness.runtime.handle().module_context(),
+            "default",
+            100,
+        ),
+        Err(RouteError::ControlUnavailable)
+    ));
+    harness.source.deliver();
+    harness.applied().await;
     let replacement = must(Router::new(
         Arc::new(harness.source.clone()),
         &harness.topology,

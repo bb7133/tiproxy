@@ -55,6 +55,8 @@ struct State {
 pub struct Router {
     sources: Sources,
     state: Mutex<State>,
+    #[cfg(test)]
+    next_lock: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl Router {
@@ -63,7 +65,8 @@ impl Router {
     /// backend. A removed namespace requires a new router incarnation.
     ///
     /// # Errors
-    /// Returns [`RouteError::NamespaceMissing`] if the namespace is absent.
+    /// Returns [`RouteError::NamespaceMissing`] if the namespace is absent, or
+    /// [`RouteError::ControlUnavailable`] until its backend producer is registered.
     pub fn new(
         source: Arc<dyn ConfigNamespaceSource>,
         topology: &TopologyModuleHandle,
@@ -73,6 +76,8 @@ impl Router {
     ) -> Result<Self, RouteError> {
         Ok(Self {
             sources: Sources::new(source, topology, context, namespace)?,
+            #[cfg(test)]
+            next_lock: Mutex::new(None),
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
                 backends: BTreeMap::new(),
@@ -85,12 +90,33 @@ impl Router {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
+        // Pin the actual lock attempt, so a regression moving validation ahead
+        // of the lock cannot pass a barrier test by arriving after publication.
+        #[cfg(test)]
+        if let Some(signal) = self
+            .next_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = signal.send(());
+        }
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[cfg(test)]
     pub(crate) fn hold_lock_for_test(&self) -> impl Drop + '_ {
         self.lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_next_lock_for_test(&self) -> std::sync::mpsc::Receiver<()> {
+        let (signal, attempted) = std::sync::mpsc::channel();
+        *self
+            .next_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(signal);
+        attempted
     }
 
     /// Admits a new session under the current namespace incarnation.

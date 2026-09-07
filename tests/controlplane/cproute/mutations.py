@@ -37,12 +37,23 @@ def main():
                 raise RuntimeError("isolated baseline failed:\n" + result.stdout)
         baseline()
         base = root / "rust/crates/control-router/src"
-        originals = {name: (base / name).read_text() for name in ["authority.rs", "ledger.rs", "selector.rs", "policy.rs", "retry.rs"]}
+        originals = {name: (base / name).read_text() for name in ["authority.rs", "ledger.rs", "selector.rs", "policy.rs", "retry.rs", "../../control-topology/src/static_source.rs"]}
         cases = [
+            ("source-mode-validation-skipped", "../../control-topology/src/static_source.rs", [
+                ('if !Arc::ptr_eq(&snapshot.epoch, &current) || !snapshot.epoch.is_live()', 'if false')]),
+            ("reserve-validates-only-before-lock", "selector.rs", [
+                ('        self.sources.validate(candidate)?;\n', ''),
+                ('    ) -> Result<Reservation, RouteError> {\n        let mut state = self.lock();',
+                 '    ) -> Result<Reservation, RouteError> {\n        self.sources.validate(candidate)?;\n        let mut state = self.lock();')]),
+            ("raw-config-blocks-pending-dynamic-source", "authority.rs", [
+                ('        supported(&policy)?;',
+                 '        supported(&policy)?; if config.topology().map_err(|_| RouteError::InvalidConfig)?.backend_clusters.is_empty() { return Err(RouteError::ControlUnavailable); }')]),
+            ("all-namespaces-bind-default-source", "authority.rs", [
+                ('.backend_source(namespace.name.as_ref())', '.backend_source("default")')]),
             ("skip-current-config", "authority.rs", [
                 ('|| !Arc::ptr_eq(&candidate.config, &self.source.current())', '')]),
-            ("skip-current-health", "authority.rs", [
-                ('|| !self\n                .health\n                .still_current_for(&candidate.health, &candidate.routing, &self.routing)', '')]),
+            ("skip-current-source", "authority.rs", [
+                ('|| !self.backend.still_current(&candidate.backend)', '')]),
             ("reset-account-on-source-refresh", "selector.rs", [
                 ('backend.source = source.clone();', 'backend.account = self.ledger.add_account()?; backend.source = source.clone();')]),
             ("terminal-selects-latest-owner", "ledger.rs", [
@@ -93,6 +104,10 @@ def main():
             tested = run([])
             if tested.returncode != 101 or "test result: FAILED" not in tested.stdout:
                 raise RuntimeError(f"mutation survived or did not complete regression tests: {name}\n{tested.stdout}")
+            if name in {"source-mode-validation-skipped", "reserve-validates-only-before-lock"}:
+                required = "tests::sources::revoked_mode_inside_real_registration_shutdown_prevents_locked_reservation ... FAILED"
+                if required not in tested.stdout:
+                    raise RuntimeError(f"mutation missed the real commit-window row: {name}\n{tested.stdout}")
             (base / filename).write_text(originals[filename])
             print(f"CP-ROUTE selector mutation killed: {name}", flush=True)
         baseline()
