@@ -948,16 +948,6 @@ async fn unsupported_factor_inputs_remain_valid_config_but_never_reserve() -> Te
     for (revision, patch, expected) in [
         (3, "[labels]\nzone = \"az-a\"", Unsupported::ZoneMetadata),
         (
-            4,
-            "[labels]\nzone = \"\"\n[balance]\nlabel-name = \"tenant\"",
-            Unsupported::LabelIsolation,
-        ),
-        (
-            5,
-            "[balance]\nlabel-name = \"\"\n[proxy]\nfail-backend-list = [\"tidb\"]",
-            Unsupported::FailedBackends,
-        ),
-        (
             6,
             "[proxy]\nfail-backend-list = []\n[balance]\npolicy = \"location\"",
             Unsupported::LocationPolicy,
@@ -1009,5 +999,130 @@ async fn equal_listener_ports_in_different_clusters_block_reservation() -> TestR
         );
     }
     harness.router.close(&session);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_go_retry_observation() -> TestResult {
+    use std::fmt::Write;
+    let Ok(input) = std::env::var("CPROUTE_RETRY_FIXTURE") else {
+        return Ok(());
+    };
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(input)?)?;
+    let harness = Harness::with_backends(
+        "port",
+        "connection",
+        &[("127.0.0.1:4000", &[("tiproxy-port", "6000")])],
+    )
+    .await?;
+    let mut prior = harness.ready().await;
+    let second = KvFixture::new().await?;
+    second.backends(&[("127.0.0.1:4009", &[("tiproxy-port", "6000")])]);
+    let mut selector = must(harness.router.selector());
+    let mut output = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        let addresses: Vec<String> = serde_json::from_value(row["backends"].clone())?;
+        let labels = [("tiproxy-port", "6000")];
+        let backends: Vec<(&str, &[(&str, &str)])> = addresses
+            .iter()
+            .map(|addr| (addr.as_str(), labels.as_slice()))
+            .collect();
+        harness.fixture.backends(&backends);
+        let mut config = format!(
+            "[[proxy.backend-clusters]]\nname=\"default\"\npd-addrs=\"{}\"\n",
+            harness.fixture.endpoint
+        );
+        if row["conflict"].as_bool() == Some(true) {
+            write!(
+                config,
+                "[[proxy.backend-clusters]]\nname=\"second\"\npd-addrs=\"{}\"\n",
+                second.endpoint
+            )?;
+        }
+        harness.patch(&config, index as u64 + 3);
+        harness.source.deliver();
+        harness.applied().await;
+        prior = if index == 0 {
+            harness.ready().await
+        } else {
+            harness.changed_r(&prior).await
+        };
+        let result = match selector.next_candidate(&prior, ClientInfo::default(), "6000") {
+            Ok(attempt) => {
+                assert_eq!(selector.finish(&attempt, false), Settlement::Applied);
+                attempt.assignment().backend_id.clone()
+            }
+            Err(RouteError::PortConflict) => "conflict".into(),
+            Err(RouteError::NoBackend) => "none".into(),
+            Err(error) => unreachable!("route: {error:?}"),
+        };
+        writeln!(
+            output,
+            "{}\t{result}\t{}",
+            row["name"].as_str().unwrap_or_default(),
+            selector.exclusions().join(",")
+        )?;
+    }
+    if let Ok(expected) = std::env::var("CPROUTE_RETRY_EXPECTED") {
+        assert_eq!(output, std::fs::read_to_string(expected)?);
+    }
+    std::fs::write(std::env::var("CPROUTE_RETRY_OUTPUT")?, output)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn label_fail_list_and_retry_preserve_exact_attempts_and_current_policy() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[
+            ("127.0.0.1:4000", &[("tenant", "red")]),
+            ("127.0.0.1:4001", &[("tenant", "blue")]),
+            ("127.0.0.1:4002", &[("tenant", "red")]),
+        ],
+    )
+    .await?;
+    let original = harness.ready().await;
+    harness.patch("[balance]\nlabel-name=\"tenant\"\n[labels]\ntenant=\"red\"\n[proxy]\nfail-backend-list=[\"127.0.0.1:4002\"]", 3);
+    let red = must(harness.router.capture());
+    assert!(Arc::ptr_eq(&original.routing, &red.routing));
+    let mut selector = must(harness.router.selector());
+    let first = must(selector.next_candidate(&red, ClientInfo::default(), ""));
+    assert_eq!(first.assignment().backend_address, "127.0.0.1:4000");
+    let repeated = must(selector.next_candidate(&red, ClientInfo::default(), ""));
+    assert_eq!(first.assignment(), repeated.assignment());
+    assert_eq!(selector.exclusions().len(), 1);
+    assert_eq!(selector.finish(&first, false), Settlement::Applied);
+    harness.patch("[proxy]\nfail-backend-list=[]", 4);
+    // A stale candidate must preserve the exclusions, without resetting them.
+    assert!(matches!(
+        selector.next_candidate(&red, ClientInfo::default(), ""),
+        Err(RouteError::StaleCandidate)
+    ));
+    assert_eq!(selector.exclusions().len(), 1);
+    let fresh = must(harness.router.capture());
+    let next = must(selector.next_candidate(&fresh, ClientInfo::default(), ""));
+    assert_eq!(next.assignment().backend_address, "127.0.0.1:4002");
+    assert_eq!(selector.finish(&first, true), Settlement::Ignored);
+    let foreign = must(harness.router.selector());
+    assert_eq!(foreign.finish(&next, false), Settlement::Ignored);
+    assert_eq!(
+        harness
+            .router
+            .accounting(&next.assignment().backend_id)
+            .map(super::ledger::Accounting::reserved),
+        Some(1)
+    );
+    assert_eq!(selector.finish(&next, true), Settlement::Applied);
+    assert_eq!(selector.finish(&repeated, false), Settlement::Ignored);
+    drop(selector);
+    assert_eq!(
+        harness
+            .router
+            .accounting(&next.assignment().backend_id)
+            .map(super::ledger::Accounting::connection_score),
+        Some(0)
+    );
+    assert_eq!(harness.router.finish(&next, true), Settlement::Ignored);
     Ok(())
 }

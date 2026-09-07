@@ -78,6 +78,11 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    pub(crate) fn belongs_to(&self, session: &Session) -> bool {
+        Arc::ptr_eq(&self.session.ledger, &session.ledger)
+            && self.session.sequence == session.sequence
+    }
+
     /// Assignment metadata, independent of its private settlement identity.
     #[must_use]
     pub const fn assignment(&self) -> &RouteAssignment {

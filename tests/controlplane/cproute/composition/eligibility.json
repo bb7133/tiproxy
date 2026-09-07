@@ -1,0 +1,203 @@
+{
+  "scenarios": [
+    {
+      "backends": [
+        {
+          "id": "alpha/opaque",
+          "addr": "tidb-0.peer.ns:4000",
+          "labels": {
+            "tenant": "red"
+          },
+          "healthy": true,
+          "group": 1
+        },
+        {
+          "id": "beta/opaque",
+          "addr": "tidb-0.peer.ns:4000",
+          "labels": {
+            "tenant": "blue"
+          },
+          "healthy": true,
+          "group": 1
+        },
+        {
+          "id": "other",
+          "addr": "tidb-1.peer.ns:4000",
+          "labels": {
+            "tenant": "red"
+          },
+          "healthy": true,
+          "group": 1
+        },
+        {
+          "id": "dead",
+          "addr": "dead.peer:4000",
+          "labels": {
+            "tenant": "red"
+          },
+          "healthy": false,
+          "group": 1
+        },
+        {
+          "id": "isolated",
+          "addr": "solo.peer:4000",
+          "labels": {
+            "tenant": "red"
+          },
+          "healthy": true,
+          "group": 2
+        }
+      ],
+      "steps": [
+        {
+          "name": "initial-nil-self",
+          "toml": "[balance]\nlabel-name=\"tenant\"",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "empty-table-self",
+          "toml": "[labels]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "strict-red",
+          "toml": "[labels]\ntenant=\"red\"",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "empty-table-preserves-map",
+          "toml": "[labels]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "omitted-labels-retains-value",
+          "toml": "[balance]\nrouting-policy=\"random\"",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "fail-pod-both-clusters",
+          "toml": "[proxy]\nfail-backend-list=[\"tidb-0\"]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "opaque-id-does-not-match",
+          "toml": "[proxy]\nfail-backend-list=[\"alpha/opaque\"]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "substring-does-not-match",
+          "toml": "[proxy]\nfail-backend-list=[\"tidb\"]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "fail-exact-address",
+          "toml": "[proxy]\nfail-backend-list=[\"tidb-0.peer.ns:4000\"]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "all-routeable-failed-ignores-blue-dead",
+          "toml": "[proxy]\nfail-backend-list=[\"tidb-0\", \"tidb-1\"]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "all-failed-respects-retry",
+          "toml": "",
+          "excluded": [
+            "alpha/opaque",
+            "other"
+          ],
+          "group": 1
+        },
+        {
+          "name": "retry-not-in-safeguard-denominator",
+          "toml": "[proxy]\nfail-backend-list=[\"tidb-0\"]",
+          "excluded": [
+            "other"
+          ],
+          "group": 1
+        },
+        {
+          "name": "single-group-all-failed",
+          "toml": "[proxy]\nfail-backend-list=[\"solo\"]",
+          "excluded": [],
+          "group": 2
+        },
+        {
+          "name": "other-group-unaffected",
+          "toml": "",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "empty-self-disables-isolation",
+          "toml": "[labels]\ntenant=\"\"\n[proxy]\nfail-backend-list=[]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "renamed-missing-self",
+          "toml": "[balance]\nlabel-name=\"business\"",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "renamed-no-match",
+          "toml": "[labels]\nbusiness=\"red\"",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "disabled-label",
+          "toml": "[balance]\nlabel-name=\"\"",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "re-enabled-label",
+          "toml": "[balance]\nlabel-name=\"tenant\"\n[labels]\ntenant=\"blue\"",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "one-routeable-failed-ignored",
+          "toml": "[proxy]\nfail-backend-list=[\"tidb-0\"]",
+          "excluded": [],
+          "group": 1
+        },
+        {
+          "name": "explicit-exclusion-is-opaque",
+          "toml": "",
+          "excluded": [
+            "beta/opaque"
+          ],
+          "group": 1
+        }
+      ]
+    }
+  ],
+  "pods": [
+    "127.0.0.1:4000",
+    "[::1]:4000",
+    "[::ffff:192.0.2.1]:mysql",
+    "[fe80::1%en0.1]:4000",
+    "pod.ns:",
+    "pod.ns:mysql",
+    "pod.ns",
+    "[pod.ns]:4000",
+    "[broken.ns:4000",
+    "a:b:c.d",
+    ":4000",
+    "[::1]",
+    "001.2.3.4:4000"
+  ]
+}

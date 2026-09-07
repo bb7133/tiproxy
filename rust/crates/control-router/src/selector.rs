@@ -26,9 +26,11 @@ use control_topology::{HealthSnapshot, MergedBackend, RoutingSnapshot, TopologyM
 
 use crate::authority::{Candidate, RouteError, Sources};
 use crate::ledger::{AccountIdentity, Accounting, Ledger, Reservation, Session, Settlement};
+use crate::policy::{RoutingIdentity, label_matches};
 
 struct Backend {
     source: MergedBackend,
+    routing_identity: RoutingIdentity,
     account: Arc<AccountIdentity>,
     healthy: bool,
     group: Option<u64>,
@@ -46,7 +48,7 @@ struct State {
 /// One namespace router incarnation, with a single lock for selection/accounting.
 ///
 /// This staged API is intentionally not wired to the production dataplane.
-/// Resource/locality factors, fail-list handling and static health composition
+/// Resource/locality factors and static health composition
 /// must be completed before that wiring. Unsupported policy is a typed error.
 /// Replacing/removing this router's namespace rejects new work; already minted
 /// reservations can still settle their original accounting owner.
@@ -118,7 +120,7 @@ impl Router {
     ///
     /// The wall-clock ticket follows Go's `UnixMicro` modulo rule; it is not a
     /// cryptographic random source. Exclusions refer to opaque backend IDs. This
-    /// is one selection attempt, not the later retry/exclusion orchestration.
+    /// is one selection attempt; [`crate::Selector`] owns a retry cycle.
     ///
     /// # Errors
     /// Stale/foreign sources, retired admission, unsupported policy, invalid
@@ -167,21 +169,7 @@ impl Router {
                 .map(|(id, _)| *id)
         }
         .ok_or(RouteError::NoBackend)?;
-        let mut choices: Vec<(&Backend, u64)> = state
-            .backends
-            .values()
-            .filter(|backend| {
-                backend.group == Some(group)
-                    && backend.healthy
-                    && !excluded.contains(&backend.source.backend_id.as_ref())
-            })
-            .filter_map(|backend| {
-                state
-                    .ledger
-                    .counts(&backend.account)
-                    .map(|counts| (backend, counts.connection_score()))
-            })
-            .collect();
+        let mut choices = state.routeable(group, &candidate.policy, excluded);
         // Go leaves exact ordering of ties unspecified. This owner chooses a
         // stable opaque-ID order; the score clamp and ticket weights are exact.
         choices.sort_by_key(|(_, score)| (*score).min(u64::from(u16::MAX)));
@@ -272,6 +260,38 @@ fn group_values(backend: &MergedBackend, rule: MatchType) -> Vec<String> {
 }
 
 impl State {
+    fn routeable(
+        &self,
+        group: u64,
+        policy: &RoutingConfig,
+        excluded: &[&str],
+    ) -> Vec<(&Backend, u64)> {
+        let mut choices: Vec<(&Backend, u64)> = self
+            .backends
+            .values()
+            .filter(|backend| {
+                backend.group == Some(group)
+                    && backend.healthy
+                    && label_matches(policy, &backend.source.backend.labels)
+            })
+            .filter_map(|backend| {
+                self.ledger
+                    .counts(&backend.account)
+                    .map(|counts| (backend, counts.connection_score()))
+            })
+            .collect();
+        // The fail-list safeguard counts otherwise routeable observed members
+        // in this group. Retry exclusions must not change that denominator.
+        let ignore_failed = choices
+            .iter()
+            .all(|(backend, _)| backend.routing_identity.failed(policy));
+        choices.retain(|(backend, _)| {
+            (ignore_failed || !backend.routing_identity.failed(policy))
+                && !excluded.contains(&backend.source.backend_id.as_ref())
+        });
+        choices
+    }
+
     fn refresh(&mut self, candidate: &Candidate) -> Result<(), RouteError> {
         if self.observed.as_ref().is_some_and(|(r, h)| {
             Arc::ptr_eq(r, &candidate.routing) && Arc::ptr_eq(h, &candidate.health)
@@ -292,6 +312,7 @@ impl State {
                     Arc::clone(&source.backend_id),
                     Backend {
                         source: source.clone(),
+                        routing_identity: RoutingIdentity::new(&source.backend.addr),
                         account,
                         healthy,
                         group: None,
@@ -504,3 +525,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "composition_tests.rs"]
+mod composition_tests;

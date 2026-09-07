@@ -1,0 +1,60 @@
+[
+  {
+    "name": "first",
+    "backends": [
+      "127.0.0.1:4000"
+    ],
+    "conflict": false
+  },
+  {
+    "name": "second",
+    "backends": [
+      "127.0.0.1:4000",
+      "127.0.0.1:4001"
+    ],
+    "conflict": false
+  },
+  {
+    "name": "removed-and-reset",
+    "backends": [
+      "127.0.0.1:4000"
+    ],
+    "conflict": false
+  },
+  {
+    "name": "reappeared",
+    "backends": [
+      "127.0.0.1:4000",
+      "127.0.0.1:4001"
+    ],
+    "conflict": false
+  },
+  {
+    "name": "port-conflict",
+    "backends": [
+      "127.0.0.1:4000",
+      "127.0.0.1:4001"
+    ],
+    "conflict": true
+  },
+  {
+    "name": "after-conflict",
+    "backends": [
+      "127.0.0.1:4001",
+      "127.0.0.1:4002"
+    ],
+    "conflict": false
+  },
+  {
+    "name": "empty-resets",
+    "backends": [],
+    "conflict": false
+  },
+  {
+    "name": "return-after-empty",
+    "backends": [
+      "127.0.0.1:4000"
+    ],
+    "conflict": false
+  }
+]

@@ -16,10 +16,13 @@
 
 mod authority;
 mod ledger;
+mod policy;
+mod retry;
 mod selector;
 
 pub use authority::{Candidate, RouteError, Unsupported};
 pub use ledger::{Accounting, Reservation, Session, Settlement};
+pub use retry::Selector;
 pub use selector::Router;
 
 #[cfg(test)]

@@ -15,6 +15,18 @@ def main():
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
         environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+        # Fresh actual-Go observations are asserted inside the Rust runtime
+        # tests, so new policy mutations must compile and fail a real test.
+        for kind, fixture in [("COMPOSITION", "eligibility"), ("RETRY", "retry")]:
+            environment[f"CPROUTE_{kind}_FIXTURE"] = str(repo / f"tests/controlplane/cproute/composition/{fixture}.json")
+            environment[f"CPROUTE_{kind}_OUTPUT"] = str(root / f"go-{kind}.tsv")
+        observed = subprocess.run(["go", "test", "./pkg/balance/router", "-run", "^TestCPRoute(Composition|Retry)Observation$", "-count=1"],
+            cwd=repo, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+        if observed.returncode:
+            raise RuntimeError("Go composition observation failed:\n" + observed.stdout)
+        for kind in ["COMPOSITION", "RETRY"]:
+            environment[f"CPROUTE_{kind}_EXPECTED"] = environment[f"CPROUTE_{kind}_OUTPUT"]
+            environment[f"CPROUTE_{kind}_OUTPUT"] = str(root / f"rust-{kind}.tsv")
         command = ["cargo", "test", "--locked", "--offline", "--manifest-path", str(root / "rust/Cargo.toml"), "-p", "control-router", "--lib"]
         def run(arguments):
             result = subprocess.run(command + arguments, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
@@ -25,7 +37,7 @@ def main():
                 raise RuntimeError("isolated baseline failed:\n" + result.stdout)
         baseline()
         base = root / "rust/crates/control-router/src"
-        originals = {name: (base / name).read_text() for name in ["authority.rs", "ledger.rs", "selector.rs"]}
+        originals = {name: (base / name).read_text() for name in ["authority.rs", "ledger.rs", "selector.rs", "policy.rs", "retry.rs"]}
         cases = [
             ("skip-current-config", "authority.rs", [
                 ('|| !Arc::ptr_eq(&candidate.config, &self.source.current())', '')]),
@@ -44,6 +56,22 @@ def main():
                 ('return Err(RouteError::Unsupported(Unsupported::ResourcePolicy));', '')]),
             ("namespace-content-as-identity", "authority.rs", [
                 ('|| !self\n                .namespace_origin\n                .same_namespace_incarnation(config, self.namespace.name.as_ref())', '')]),
+            ("label-isolation-skipped", "policy.rs", [
+                ('policy.label_name.is_empty()', 'true || policy.label_name.is_empty()')]),
+            ("pod-name-is-full-address", "policy.rs", [
+                ('pod: pod_name(address).into()', 'pod: address.into()')]),
+            ("fail-list-safeguard-always-ignores", "selector.rs", [
+                ('(ignore_failed || !backend.routing_identity.failed(policy))', '(true || ignore_failed || !backend.routing_identity.failed(policy))')]),
+            ("fail-list-all-failed-safeguard-removed", "selector.rs", [
+                ('(ignore_failed || !backend.routing_identity.failed(policy))', '(false || !backend.routing_identity.failed(policy))')]),
+            ("retry-exclusions-in-fail-list-denominator", "selector.rs", [
+                ('&& label_matches(policy, &backend.source.backend.labels)', '&& label_matches(policy, &backend.source.backend.labels) && !excluded.contains(&backend.source.backend_id.as_ref())')]),
+            ("status-filter-skipped", "selector.rs", [
+                ('&& backend.healthy', '&& true')]),
+            ("port-conflict-resets-retry-cycle", "retry.rs", [
+                ('Err(RouteError::NoBackend)', 'Err(RouteError::NoBackend | RouteError::PortConflict)')]),
+            ("selector-settles-other-session", "retry.rs", [
+                ('if !reservation.belongs_to(&self.session)', 'if false')]),
         ]
         for name, filename, replacements in cases:
             changed = originals[filename]

@@ -107,5 +107,25 @@ CPROUTE_CHOICE_OUTPUT="$tmp_dir/rust-choice.tsv" \
 cmp "$tmp_dir/go-choice.tsv" "$tmp_dir/rust-choice.tsv"
 echo "CP-ROUTE connection policy candidate and weight evidence passed"
 
+CPROUTE_COMPOSITION_FIXTURE="$repo_root/tests/controlplane/cproute/composition/eligibility.json" \
+CPROUTE_COMPOSITION_OUTPUT="$tmp_dir/go-composition.tsv" \
+    go test ./pkg/balance/router -run '^TestCPRouteCompositionObservation$' -count=1
+CPROUTE_COMPOSITION_FIXTURE="$repo_root/tests/controlplane/cproute/composition/eligibility.json" \
+CPROUTE_COMPOSITION_OUTPUT="$tmp_dir/rust-composition.tsv" \
+    cargo test --locked --quiet --manifest-path rust/Cargo.toml -p control-router \
+        selector::composition_tests::shared_go_composition_observation -- --exact
+cmp "$tmp_dir/go-composition.tsv" "$tmp_dir/rust-composition.tsv"
+echo "CP-ROUTE label/status/fail-list composition evidence passed"
+
+CPROUTE_RETRY_FIXTURE="$repo_root/tests/controlplane/cproute/composition/retry.json" \
+CPROUTE_RETRY_OUTPUT="$tmp_dir/go-retry.tsv" \
+    go test ./pkg/balance/router -run '^TestCPRouteRetryObservation$' -count=1
+CPROUTE_RETRY_FIXTURE="$repo_root/tests/controlplane/cproute/composition/retry.json" \
+CPROUTE_RETRY_OUTPUT="$tmp_dir/rust-retry.tsv" \
+    cargo test --locked --quiet --manifest-path rust/Cargo.toml -p control-router \
+        tests::shared_go_retry_observation -- --exact
+cmp "$tmp_dir/go-retry.tsv" "$tmp_dir/rust-retry.tsv"
+echo "CP-ROUTE retry cycle and port-conflict evidence passed"
+
 python3 tests/controlplane/cproute/mutations.py
 echo "CP-ROUTE selector authority and accounting mutation evidence passed"
