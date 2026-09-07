@@ -20,9 +20,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-locality-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
+        # Keep the isolated build under the repository target directory so the
+        # dependency artifacts are reused across runs (and by the CI cache); the
+        # mutated sources themselves live only in the temporary copy.
+        target = repo / "rust/target/cproute-locality-mutations"
         environment = dict(
             os.environ,
-            CARGO_TARGET_DIR=str(root / "target"),
+            CARGO_TARGET_DIR=str(target),
             CPROUTE_LOCALITY_FIXTURE=str(repo / "tests/controlplane/cproute/locality/rounds.json"),
             CPROUTE_LOCALITY_EXPECTED=str(expected),
             CPROUTE_LOCALITY_OUTPUT=str(root / "rust-locality.tsv"),
