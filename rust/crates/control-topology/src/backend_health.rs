@@ -92,6 +92,12 @@ pub struct BackendHealth {
     pub healthy: bool,
     /// The backend build version from a successful `/status` decode, if any.
     pub server_version: Option<String>,
+    /// Go `BackendHealth.Local`: whether the backend is in the same zone as this
+    /// proxy, per the ROUND's captured proxy zone (CP-ROUTE 220-3 B1). A probe never
+    /// decides this; the health round stamps it after the verdict — an enabled
+    /// round uses Go's `setLocal` rule (no proxy zone → `true`; equal `zone`
+    /// labels → `true`; otherwise `false`), a disabled round leaves it `false`.
+    pub local: bool,
 }
 
 impl BackendHealth {
@@ -100,6 +106,7 @@ impl BackendHealth {
         Self {
             healthy: false,
             server_version: None,
+            local: false,
         }
     }
 }
@@ -310,6 +317,7 @@ impl ClusterHealthNetwork {
             BackendHealth {
                 healthy: false,
                 server_version: status.server_version,
+                local: false,
             }
         }
     }
@@ -364,6 +372,7 @@ impl ClusterHealthNetwork {
             return BackendHealth {
                 healthy: true,
                 server_version: None,
+                local: false,
             };
         }
         // Guard the u64 -> u16 port narrowing rather than silently truncating.
@@ -390,6 +399,7 @@ impl ClusterHealthNetwork {
                     return BackendHealth {
                         healthy: true,
                         server_version: Some(version),
+                        local: false,
                     };
                 }
                 Err(error) => {
@@ -740,7 +750,8 @@ mod tests {
             health,
             BackendHealth {
                 healthy: true,
-                server_version: None
+                server_version: None,
+                local: false,
             },
             "a static backend (empty ip) skips the status stage (no version) and is \
              healthy through its SQL greeting"
@@ -804,7 +815,8 @@ mod tests {
             health,
             BackendHealth {
                 healthy: true,
-                server_version: Some("v8.1.0".to_owned())
+                server_version: Some("v8.1.0".to_owned()),
+                local: false,
             }
         );
         assert_eq!(
@@ -936,7 +948,8 @@ mod tests {
             health,
             BackendHealth {
                 healthy: true,
-                server_version: Some("v9".to_owned())
+                server_version: Some("v9".to_owned()),
+                local: false,
             },
             "the probe recovers on the third attempt"
         );
@@ -1590,7 +1603,8 @@ mod tests {
             health,
             BackendHealth {
                 healthy: false,
-                server_version: Some("v8.1.0".to_owned())
+                server_version: Some("v8.1.0".to_owned()),
+                local: false,
             },
             "an ERR greeting fails the backend but the status stage's version is retained (Go)"
         );
@@ -1659,7 +1673,8 @@ mod tests {
             health,
             BackendHealth {
                 healthy: false,
-                server_version: Some("v8.1.0".to_owned())
+                server_version: Some("v8.1.0".to_owned()),
+                local: false,
             },
             "a refused SQL port fails the backend, version retained"
         );
