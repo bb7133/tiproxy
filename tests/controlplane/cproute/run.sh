@@ -145,3 +145,20 @@ echo "CP-ROUTE health-round locality evidence passed"
 
 python3 tests/controlplane/cproute/locality/mutations.py "$tmp_dir/go-locality.tsv"
 echo "CP-ROUTE health-round locality mutation evidence passed"
+
+# CP-ROUTE 220-3 B2: backend-source mode (Go backendcluster.Manager applied
+# map + FallbackFetcher + StaticFetcher over real embedded etcd) versus the real
+# TopologyModule's applied plan and static producer, over one shared step
+# fixture that also records the accepted Go/Rust divergence step.
+CPROUTE_STATIC_FIXTURE="$repo_root/tests/controlplane/cproute/static/modes.json" \
+CPROUTE_STATIC_OUTPUT="$tmp_dir/go-static.tsv" \
+    go test ./pkg/manager/backendcluster -run '^TestCPRouteStaticModeObservation$' -count=1
+CPROUTE_STATIC_FIXTURE="$repo_root/tests/controlplane/cproute/static/modes.json" \
+CPROUTE_STATIC_OUTPUT="$tmp_dir/rust-static.tsv" \
+    cargo test --locked --quiet --manifest-path rust/Cargo.toml -p control-topology \
+        static_source::tests::shared_go_static_mode_observation -- --exact
+cmp "$tmp_dir/go-static.tsv" "$tmp_dir/rust-static.tsv"
+echo "CP-ROUTE backend-source mode evidence passed"
+
+python3 tests/controlplane/cproute/static/mutations.py "$tmp_dir/go-static.tsv"
+echo "CP-ROUTE backend-source mode mutation evidence passed"

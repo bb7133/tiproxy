@@ -2075,14 +2075,17 @@ mod routing_generation_semantics {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
-    use control_config::{ConfigNamespaceSource, ConfigNamespaceStore, TopologyRuntimeIdentity};
+    use control_config::{
+        ConfigNamespaceSource, ConfigNamespaceStore, NamespaceConfig, SourceRevision,
+        TopologyRuntimeIdentity,
+    };
     use control_plane::{
         ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
         MetricsPolicy, ModuleError, OwnershipRegistry, RuntimeEvent, ShutdownReason, TlsPolicy,
     };
     use control_topology::{
-        RoutingSnapshot, RoutingSnapshotHandle, StaticAdvertiseResolver, TopologyModule,
-        TopologyModuleHandle, TopologyStatus,
+        BackendSourceMode, RoutingSnapshot, RoutingSnapshotHandle, StaticAdvertiseResolver,
+        TopologyModule, TopologyModuleHandle, TopologyStatus,
     };
     use hyper::body::Incoming;
     use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -4071,6 +4074,156 @@ ns-servers = [{ns_servers}]
                     .current()
                     .is_some_and(|current| Arc::ptr_eq(&current, &r)),
                 "still no routing rotation across two zone-only updates"
+            );
+
+            comp.task.abort();
+            drop(comp.runtime);
+        };
+        with_real_wall_clock_watchdog(body).await;
+    }
+
+    // ----- Row R6: static source vs REAL dynamic discovery (220-3 B2) -------
+
+    /// Applies `toml` plus `namespaces` as one accepted generation.
+    fn apply_with_namespaces(
+        comp: &Composition,
+        toml: &[u8],
+        namespaces: Vec<NamespaceConfig>,
+        revision: u64,
+    ) {
+        let scratch = ConfigNamespaceStore::from_toml(toml, None, &comp.dir)
+            .unwrap_or_else(|error| unreachable!("scratch parse: {error}"));
+        let effective = (**scratch.current().effective()).clone();
+        comp.store
+            .apply(
+                effective,
+                namespaces,
+                SourceRevision {
+                    file_revision: revision,
+                    etcd_revision: 0,
+                },
+                &comp.dir,
+            )
+            .unwrap_or_else(|error| unreachable!("apply revision {revision}: {error}"));
+    }
+
+    fn static_namespace(instances: &[&str]) -> NamespaceConfig {
+        let mut config = NamespaceConfig {
+            namespace: "default".to_owned(),
+            ..NamespaceConfig::default()
+        };
+        config.backend.instances = instances.iter().map(|s| (*s).to_owned()).collect();
+        config
+    }
+
+    fn zero_cluster_toml() -> Vec<u8> {
+        b"\n[proxy]\naddr = \"0.0.0.0:6000\"\npd-addrs = \"\"\n\n[api]\naddr = \"0.0.0.0:10080\"\n"
+            .to_vec()
+    }
+
+    /// One real cluster at `pd_addrs`; `pd-addrs` stays empty in `[proxy]` (a
+    /// restart-locked field) so the two shapes differ only in the cluster list.
+    fn one_cluster_toml(pd_addrs: &str) -> Vec<u8> {
+        format!(
+            "\n[proxy]\naddr = \"0.0.0.0:6000\"\npd-addrs = \"\"\n\n[api]\naddr = \"0.0.0.0:10080\"\n\n[[proxy.backend-clusters]]\nname = \"{CLUSTER_NAME}\"\npd-addrs = \"{pd_addrs}\"\nns-servers = []\n"
+        )
+        .into_bytes()
+    }
+
+    async fn wait_source(
+        handle: &TopologyModuleHandle,
+        accept: impl Fn(&control_topology::BackendSourceSnapshot) -> bool,
+    ) -> (
+        control_topology::BackendSourceHandle,
+        control_topology::BackendSourceSnapshot,
+    ) {
+        // Real-clock polling (the producer's round is a real task); the wall
+        // watchdog bounds a genuine hang.
+        for _ in 0..2_000 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if let Some(source) = handle.backend_source("default")
+                && let Some(snapshot) = source.current()
+                && accept(&snapshot)
+            {
+                return (source, snapshot);
+            }
+        }
+        unreachable!("the backend source was not served within the budget");
+    }
+
+    /// The mode follows the APPLIED cluster runtime with REAL discovery: a
+    /// zero-cluster config serves the namespace's static list; introducing a
+    /// cluster whose real discovery finds NO backend serves an EMPTY dynamic
+    /// source (never the static list) and refuses the old static snapshot;
+    /// removing the cluster serves the static list again through a fresh
+    /// round, refusing the dynamic snapshot. Health is disabled so the rows are
+    /// about source authority, not probe I/O.
+    #[tokio::test]
+    async fn a_configured_cluster_with_empty_discovery_never_falls_back_to_static() {
+        let body = async {
+            let Some((_fixture, addr)) = spawn_fixture(Vec::new()).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let health = control_config::HealthCheckConfig {
+                enabled: false,
+                ..control_config::HealthCheckConfig::default()
+            };
+            let comp = build_composition_from_toml(zero_cluster_toml(), health).await;
+            let mut status = comp.handle.status();
+            let namespace = || static_namespace(&["10.0.0.7:4000", "10.0.0.8:4000"]);
+            apply_with_namespaces(&comp, &zero_cluster_toml(), vec![namespace()], 2);
+            wait_applied(&mut status, 2).await;
+
+            let (source, stationary) =
+                wait_source(&comp.handle, |s| s.mode() == BackendSourceMode::Static).await;
+            let ids: Vec<&str> = stationary
+                .routing()
+                .backends
+                .backends
+                .iter()
+                .map(|b| b.backend_id.as_ref())
+                .collect();
+            assert_eq!(ids, vec!["10.0.0.7:4000", "10.0.0.8:4000"]);
+            assert!(source.still_current(&stationary));
+
+            // Introduce a real cluster whose discovery finds nothing.
+            let pd = format!("127.0.0.1:{}", addr.port());
+            apply_with_namespaces(&comp, &one_cluster_toml(&pd), vec![namespace()], 3);
+            wait_applied(&mut status, 3).await;
+            assert!(
+                !source.still_current(&stationary),
+                "the Static epoch is revoked by the applied cluster"
+            );
+            let (_, dynamic) =
+                wait_source(&comp.handle, |s| s.mode() == BackendSourceMode::Dynamic).await;
+            assert!(
+                dynamic.routing().backends.backends.is_empty(),
+                "empty real discovery is served empty, never as the static list"
+            );
+            assert!(
+                comp.routing
+                    .current()
+                    .is_some_and(|r| Arc::ptr_eq(&r, dynamic.routing())),
+                "the dynamic side IS the module's live routing source"
+            );
+
+            // Remove the cluster: static again, through a fresh H; the dynamic
+            // snapshot is refused.
+            apply_with_namespaces(&comp, &zero_cluster_toml(), vec![namespace()], 4);
+            wait_applied(&mut status, 4).await;
+            let (again, restored) =
+                wait_source(&comp.handle, |s| s.mode() == BackendSourceMode::Static).await;
+            assert!(
+                !again.still_current(&dynamic),
+                "the Dynamic epoch is revoked"
+            );
+            assert!(
+                !again.still_current(&stationary),
+                "the first Static epoch stays dead"
+            );
+            assert!(
+                !Arc::ptr_eq(restored.health(), stationary.health()),
+                "re-activation publishes a fresh round"
             );
 
             comp.task.abort();

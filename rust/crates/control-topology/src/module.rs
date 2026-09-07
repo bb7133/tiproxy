@@ -404,6 +404,14 @@ impl TopologyModuleHandle {
         self.health.clone()
     }
 
+    /// The live applied backend-source mode, or `None` before the first
+    /// applied plan / after teardown (diagnostics and evidence only).
+    #[cfg(test)]
+    pub(crate) fn applied_mode(&self) -> Option<BackendSourceMode> {
+        let epoch = self.mode.borrow();
+        epoch.is_live().then(|| epoch.mode())
+    }
+
     /// Binds a [`BackendSourceHandle`] to `namespace`'s CURRENT incarnation
     /// (CP-ROUTE 220-3 B2), or `None` when the namespace is absent from the
     /// committed config or its static producer is not (yet, or any longer)

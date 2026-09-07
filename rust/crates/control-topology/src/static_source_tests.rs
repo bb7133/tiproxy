@@ -4,6 +4,7 @@
 //! CP-ROUTE 220-3 B2 rows on the REAL `TopologyModule` with real loopback SQL
 //! greeters (real clock: the rounds are real loopback I/O).
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,10 +34,6 @@ use crate::routing_snapshot::RoutingSnapshotPublisher;
 use crate::static_source::{RegisteredProducer, StaticRegistry};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
-    result.unwrap_or_else(|error| unreachable!("fixture: {error:?}"))
-}
 
 struct NullSink;
 impl EventSink for NullSink {
@@ -501,7 +498,10 @@ async fn namespaces_sharing_an_address_are_isolated_by_source_not_by_id() -> Tes
 // identical re-creation is a new incarnation with a fresh producer (ABA).
 // ================================================================
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// current_thread: between `apply` and the assertions below there is no await,
+// so the module task provably has NOT reconciled yet — the refusal can only
+// come from the source-side incarnation check.
+#[tokio::test]
 async fn a_removed_namespace_fails_closed_at_the_source_and_recreation_is_new() -> TestResult {
     let greeter = Greeter::spawn(Greeting::V10, false).await?;
     let store = store_with(
@@ -684,30 +684,80 @@ async fn a_rejected_cluster_generation_keeps_the_mode_but_reconciles_namespaces(
 // refuses the first-epoch snapshot; revoke-before-publish closes the window.
 // ================================================================
 
-#[tokio::test]
-async fn mode_identity_is_the_exact_epoch_not_the_mode_value() -> TestResult {
-    let store = store_with(
-        &zero_cluster_config(),
-        vec![namespace("default", &["10.0.0.1:4000"])],
-    )?;
-    let config: Arc<dyn ConfigNamespaceSource> = Arc::new(store.clone());
-    let mode = ModePublisher::new();
-    let (dyn_routing, dyn_handle) = RoutingSnapshotPublisher::new();
-    let (dyn_overlay, dyn_health) = HealthOverlayPublisher::new();
-    let (st_routing, st_handle) = RoutingSnapshotPublisher::new();
-    let (st_overlay, st_health) = HealthOverlayPublisher::new();
-    let _ = st_routing.publish(EpochResult {
-        client_epoch: 0,
-        value: MergedTopology {
-            backends: super::static_backends(&["10.0.0.1:4000".to_owned()]),
-        },
-    });
-    let st_source = must(st_handle.current().ok_or("static source"));
-    let registry_lease = OwnershipRegistry::new();
-    let lease = must(registry_lease.claim(OwnerScope::Process, "mode-handle-row"));
-    let owner = lease.token();
-    let publish_static_round = || {
-        let map = st_source
+/// A handle over injected dynamic/static sides and a test-owned mode publisher.
+struct ModeHandleFixture {
+    mode: ModePublisher,
+    handle: BackendSourceHandle,
+    owner: control_plane::OwnerToken,
+    _lease: control_plane::OwnerLease,
+    dyn_routing: RoutingSnapshotPublisher,
+    dyn_handle: crate::routing_snapshot::RoutingSnapshotHandle,
+    dyn_overlay: HealthOverlayPublisher,
+    _st_routing: RoutingSnapshotPublisher,
+    st_overlay: HealthOverlayPublisher,
+    st_source: Arc<crate::routing_snapshot::RoutingSnapshot>,
+}
+
+impl ModeHandleFixture {
+    fn build() -> TestResult<Self> {
+        let store = store_with(
+            &zero_cluster_config(),
+            vec![namespace("default", &["10.0.0.1:4000"])],
+        )?;
+        let config: Arc<dyn ConfigNamespaceSource> = Arc::new(store.clone());
+        let mode = ModePublisher::new();
+        let (dyn_routing, dyn_handle) = RoutingSnapshotPublisher::new();
+        let (dyn_overlay, dyn_health) = HealthOverlayPublisher::new();
+        let (st_routing, st_handle) = RoutingSnapshotPublisher::new();
+        let (st_overlay, st_health) = HealthOverlayPublisher::new();
+        let _ = st_routing.publish(EpochResult {
+            client_epoch: 0,
+            value: MergedTopology {
+                backends: super::static_backends(&["10.0.0.1:4000".to_owned()]),
+            },
+        });
+        let st_source = st_handle.current().ok_or("static source")?;
+        let registry_lease = Box::leak(Box::new(OwnershipRegistry::new()));
+        let lease = registry_lease.claim(OwnerScope::Process, "mode-handle-row")?;
+        let owner = lease.token();
+        let registry = StaticRegistry::default();
+        registry.insert(
+            "default".to_owned(),
+            RegisteredProducer {
+                incarnation: store
+                    .current()
+                    .namespace_incarnation("default")
+                    .ok_or("incarnation")?,
+                routing: st_handle,
+                health: st_health,
+            },
+        );
+        let handle = BackendSourceHandle::bind(
+            "default",
+            config,
+            mode.subscribe(),
+            (dyn_handle.clone(), dyn_health),
+            &registry,
+        )
+        .ok_or("bind")?;
+        Ok(Self {
+            mode,
+            handle,
+            owner,
+            _lease: lease,
+            dyn_routing,
+            dyn_handle,
+            dyn_overlay,
+            _st_routing: st_routing,
+            st_overlay,
+            st_source,
+        })
+    }
+
+    /// Publishes one all-healthy/local round on the static side.
+    fn publish_static_round(&self) {
+        let map = self
+            .st_source
             .backends
             .backends
             .iter()
@@ -722,45 +772,46 @@ async fn mode_identity_is_the_exact_epoch_not_the_mode_value() -> TestResult {
                 )
             })
             .collect();
-        st_overlay.publish_round(&st_source, map, GenerationGate::new(), &owner);
-    };
-    publish_static_round();
-    let registry = StaticRegistry::default();
-    registry.insert(
-        "default".to_owned(),
-        RegisteredProducer {
-            incarnation: must(
-                store
-                    .current()
-                    .namespace_incarnation("default")
-                    .ok_or("inc"),
-            ),
-            routing: st_handle.clone(),
-            health: st_health.clone(),
-        },
-    );
-    let handle = must(
-        BackendSourceHandle::bind(
-            "default",
-            Arc::clone(&config),
-            mode.subscribe(),
-            (dyn_handle.clone(), dyn_health.clone()),
-            &registry,
-        )
-        .ok_or("bind"),
-    );
+        self.st_overlay
+            .publish_round(&self.st_source, map, GenerationGate::new(), &self.owner);
+    }
+
+    /// Publishes an EMPTY dynamic R and its (empty) H.
+    fn publish_empty_dynamic(&self) -> TestResult {
+        let _ = self.dyn_routing.publish(EpochResult {
+            client_epoch: 1,
+            value: MergedTopology {
+                backends: Vec::new(),
+            },
+        });
+        let source = self.dyn_handle.current().ok_or("dynamic source")?;
+        self.dyn_overlay.publish_round(
+            &source,
+            std::collections::HashMap::new(),
+            GenerationGate::new(),
+            &self.owner,
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn mode_identity_is_the_exact_epoch_not_the_mode_value() -> TestResult {
+    let fixture = ModeHandleFixture::build()?;
+    fixture.publish_static_round();
+    let handle = &fixture.handle;
     assert!(
         handle.current().is_none(),
         "no applied epoch yet: fail closed"
     );
 
-    mode.publish(BackendSourceMode::Static);
-    let first = must(handle.current().ok_or("static snapshot"));
+    fixture.mode.publish(BackendSourceMode::Static);
+    let first = handle.current().ok_or("static snapshot")?;
     assert_eq!(first.mode(), BackendSourceMode::Static);
     assert!(handle.still_current(&first));
 
     // Step 1 of a transition: revoke before anything new is published.
-    mode.revoke();
+    fixture.mode.revoke();
     assert!(
         !handle.still_current(&first),
         "revoked epoch refuses at once"
@@ -769,12 +820,12 @@ async fn mode_identity_is_the_exact_epoch_not_the_mode_value() -> TestResult {
         handle.current().is_none(),
         "no live epoch: nothing is captured"
     );
-    mode.publish(BackendSourceMode::Dynamic);
-    assert!(handle.current().is_none(), "Dynamic side has no R/H here");
+    fixture.mode.publish(BackendSourceMode::Dynamic);
+    assert!(handle.current().is_none(), "Dynamic side has no R/H yet");
 
     // Back to Static WITHOUT touching the static R/H: same Arcs, new epoch.
-    mode.publish(BackendSourceMode::Static);
-    let second = must(handle.current().ok_or("second static snapshot"));
+    fixture.mode.publish(BackendSourceMode::Static);
+    let second = handle.current().ok_or("second static snapshot")?;
     assert!(Arc::ptr_eq(second.routing(), first.routing()));
     assert!(Arc::ptr_eq(second.health(), first.health()));
     assert_eq!(second.mode(), first.mode(), "same mode VALUE");
@@ -783,6 +834,136 @@ async fn mode_identity_is_the_exact_epoch_not_the_mode_value() -> TestResult {
         !handle.still_current(&first),
         "same R/H and same mode value, different epoch: refused"
     );
-    drop((dyn_routing, dyn_overlay, st_routing, st_overlay));
+    Ok(())
+}
+
+// An EMPTY dynamic R/H under Dynamic mode is served as the (empty) dynamic
+// snapshot; it never falls back to the static side (Go: configured clusters
+// with no discovered backend route nothing, not the static list).
+#[tokio::test]
+async fn an_empty_dynamic_discovery_is_served_empty_never_as_the_static_list() -> TestResult {
+    let fixture = ModeHandleFixture::build()?;
+    fixture.publish_static_round();
+    fixture.mode.publish(BackendSourceMode::Dynamic);
+    assert!(fixture.handle.current().is_none(), "no dynamic R/H yet");
+    fixture.publish_empty_dynamic()?;
+    let empty = fixture.handle.current().ok_or("empty dynamic snapshot")?;
+    assert_eq!(empty.mode(), BackendSourceMode::Dynamic);
+    assert!(
+        empty.routing().backends.backends.is_empty(),
+        "empty dynamic discovery is served as empty, never as the static list"
+    );
+    assert!(fixture.handle.still_current(&empty));
+    Ok(())
+}
+
+// ================================================================
+// S8 (shared Go observation): the SAME step fixture drives Go's real
+// backendcluster.Manager + FallbackFetcher + StaticFetcher and the real
+// TopologyModule here; compared byte-for-byte by run.sh, including the
+// recorded Go/Rust divergence step.
+// ================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_go_static_mode_observation() -> TestResult {
+    let Ok(input) = std::env::var("CPROUTE_STATIC_FIXTURE") else {
+        return Ok(());
+    };
+    let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(input)?)?;
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_owned();
+    let instances: Vec<String> = fixture["instances"]
+        .as_array()
+        .ok_or("instances")?
+        .iter()
+        .map(text)
+        .collect();
+    let steps = fixture["steps"].as_array().ok_or("steps")?.clone();
+    let config_for = |clusters: &[String]| -> Vec<u8> {
+        let mut toml = String::from(
+            "\n[proxy]\naddr = \"0.0.0.0:6000\"\npd-addrs = \"\"\n\n[api]\naddr = \"0.0.0.0:10080\"\n",
+        );
+        for name in clusters {
+            let cluster = format!("cluster-{}", name.trim_end_matches('2'));
+            let _ = write!(
+                toml,
+                "\n[[proxy.backend-clusters]]\nname = \"{cluster}\"\npd-addrs = \"pd-{name}:2379\"\nns-servers = []\n"
+            );
+        }
+        toml.into_bytes()
+    };
+    let refs: Vec<&str> = instances.iter().map(String::as_str).collect();
+    let first: Vec<String> = steps[0]["clusters"]
+        .as_array()
+        .ok_or("clusters")?
+        .iter()
+        .map(text)
+        .collect();
+    let store = store_with(&config_for(&first), vec![namespace("default", &refs)])?;
+    let observed = store.clone();
+    // Health disabled: the fixture addresses are identity inputs, not hosts.
+    let module = spawn_module(store, health(false)).await?;
+    let mut output = String::new();
+    for (index, step) in steps.iter().enumerate() {
+        let clusters: Vec<String> = step["clusters"]
+            .as_array()
+            .ok_or("clusters")?
+            .iter()
+            .map(text)
+            .collect();
+        let fail = step["fail"].as_bool().unwrap_or(false);
+        if index > 0 {
+            module.reject.store(fail, Ordering::SeqCst);
+            let revision = u64::try_from(index)? + 2;
+            apply(
+                &observed,
+                &config_for(&clusters),
+                vec![namespace("default", &refs)],
+                revision,
+            )?;
+            wait_applied(&module, revision).await?;
+        }
+        let mode = module.handle.applied_mode().ok_or("applied mode")?;
+        let name = text(&step["name"]);
+        let divergence = text(&step["divergence"]);
+        if !divergence.is_empty() {
+            assert_eq!(
+                mode,
+                BackendSourceMode::Dynamic,
+                "Rust rejects the whole generation and retains the last-good plan"
+            );
+            let _ = writeln!(output, "{name}\tDIVERGENCE\t{divergence}");
+            continue;
+        }
+        match mode {
+            BackendSourceMode::Static => {
+                let handle = wait_handle(&module, "default").await?;
+                let snapshot = wait_snapshot(&handle, |_| true).await?;
+                let mut ids: Vec<&str> = snapshot
+                    .routing()
+                    .backends
+                    .backends
+                    .iter()
+                    .map(|b| b.backend_id.as_ref())
+                    .collect();
+                ids.sort_unstable();
+                let _ = writeln!(output, "{name}\tstatic\t{}", ids.join(","));
+            }
+            BackendSourceMode::Dynamic => {
+                assert!(
+                    module
+                        .handle
+                        .backend_source("default")
+                        .is_some_and(|h| h.current().is_none()),
+                    "the static side is not served in Dynamic mode"
+                );
+                let _ = writeln!(output, "{name}\tdynamic\t-");
+            }
+        }
+    }
+    if let Ok(expected) = std::env::var("CPROUTE_STATIC_EXPECTED") {
+        assert_eq!(output, std::fs::read_to_string(expected)?);
+    }
+    std::fs::write(std::env::var("CPROUTE_STATIC_OUTPUT")?, output)?;
+    drop(module);
     Ok(())
 }
