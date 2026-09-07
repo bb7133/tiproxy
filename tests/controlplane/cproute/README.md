@@ -94,8 +94,16 @@ Supported selection is connection balance with prefer-idle/random, group
 matching and one-attempt opaque-ID exclusions. Go's clamped connection factor,
 raw-count migration advice, candidate set and clock-ticket weights are retained.
 Production tickets use Unix microseconds with the original modulo rules; a
-private seam exists solely for deterministic evidence. Exact tie order is not
-promised across languages; tests compare eligible sets and weights.
+private seam exists solely for deterministic evidence. Rust uses stable opaque-ID
+order for equal clamped scores; this is an implementation choice, not Go-exact
+ordering (`sort.Slice` is unstable). Tests compare eligible sets and weights,
+not the identity of a particular tied representative.
+
+Admission and reserve intentionally require the Ready lifecycle phase;
+Quiescing/Draining stop new work while existing handles can still settle. Group
+and port tables are refreshed under the ledger lock only when the observed R/H
+pair changes. Their cost, plus per-selection sorting, needs workload measurement
+before production composition in 220-3.
 
 The new API is **not wired to dataplane or tiproxy-rs**; the evidence gate rejects
 those manifest dependencies. Resource (including the global default), location,
@@ -127,7 +135,8 @@ Evidence layers:
   CIDR rejection/refresh, retained owners, prune/reappearance, port conflicts,
   opaque exclusions and close/success races. Health is produced by the real
   module's explicitly disabled-probe policy, never fabricated from a namespace.
-- `python3 tests/controlplane/cproute/mutations.py` copies the Rust workspace to
+- The evidence gate invokes `python3 tests/controlplane/cproute/mutations.py`,
+  which copies the Rust workspace to
   an isolated directory and changes production authority/ledger/selector code.
   Eight regressions must compile and complete with failed runtime tests: skipping
   C/H checks, resetting accounting on refresh, settling the latest owner,
@@ -135,7 +144,8 @@ Evidence layers:
   and namespace-content identity. Compilation errors or process crashes do not
   count as a kill. Baseline and restored sources must pass.
 
-Run the main evidence gate and the mutation runner above, plus `make lint`,
-`make rust-lint`, `make rust-test`, `make rust-build`, and Go router/bridge/factor
-package tests. The mutation runner uses a separate target directory and never
-changes repository source.
+`make controlplane-cproute-evidence` requires every layer above, including all
+eight selector mutations, both locally and in the hosted Rust workflow.
+Also run `make lint`, `make rust-lint`, `make rust-test`, `make rust-build`, and Go
+router/bridge/factor package tests. The mutation runner uses a separate target
+directory and never changes repository source.

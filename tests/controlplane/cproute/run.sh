@@ -106,3 +106,6 @@ CPROUTE_CHOICE_OUTPUT="$tmp_dir/rust-choice.tsv" \
         selector::tests::shared_go_choice_observation -- --exact
 cmp "$tmp_dir/go-choice.tsv" "$tmp_dir/rust-choice.tsv"
 echo "CP-ROUTE connection policy candidate and weight evidence passed"
+
+python3 tests/controlplane/cproute/mutations.py
+echo "CP-ROUTE selector authority and accounting mutation evidence passed"
