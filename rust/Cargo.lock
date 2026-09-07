@@ -418,12 +418,14 @@ name = "control-topology"
 version = "0.1.0"
 dependencies = [
  "control-config",
+ "control-etcd",
  "control-external",
  "control-plane",
  "etcd-client",
  "hyper",
  "hyper-util",
  "prost",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

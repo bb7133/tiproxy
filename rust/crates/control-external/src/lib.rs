@@ -28,6 +28,7 @@ mod dns_transport;
 pub mod etcd;
 pub mod explicit_dns;
 pub mod http;
+mod io_fence;
 #[cfg(test)]
 mod probe_test_support;
 pub mod retry;
@@ -49,6 +50,7 @@ pub mod diagnostics {
 
 pub use cluster_http::{
     ClusterHttpClient, ClusterHttpConfigError, ClusterHttpError, HEALTH_BODY_CAP, HttpProbePolicy,
+    HttpTarget,
 };
 pub use dns::{DnsError, DnsResolver, MAX_RESOLVED_ADDRESSES};
 pub use etcd::{
@@ -57,6 +59,7 @@ pub use etcd::{
     GenerationGate,
 };
 pub use http::{BoundedHttpClient, HttpClientConfig, HttpConfigError, HttpError, HttpTlsConfig};
+pub use io_fence::{CombinedFence, IoFence};
 pub use retry::{RetryDecision, RetryError, RetryPolicy, RetryPolicyError, retry_bounded};
 pub use sql_greeting::{SqlGreetingConfigError, SqlGreetingError, SqlGreetingProbe};
 

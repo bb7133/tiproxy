@@ -34,3 +34,63 @@ Rust bounds intentionally reject unsupported oversized/malformed input instead o
 The data-state core distinguishes selected source from each reader's result map. Backend aggregate errors may retain source while replacing a completed map; successful empty Prom does not trigger backend. Missing means no active rule has Step2, before purge. History merge replaces each entire step only if its last timestamp is newer and does not filter unknown backends by current topology. Those data rules do not grant stale ownership permission.
 
 At collection integration, use opaque retained discovery/material authority and a synchronously revocable CP-ETCD session capability. Clear authority before abort/join or slow resign/revoke; do not use copied numeric epochs/watch snapshots as the sole fence. Consume actual health only from H and preserve the existing ledger's two locked checks. No Resource/Location enablement, owner election/HTTP service, legacy-bridge expansion, manifest lift, or closure of #221/#220/#147 is part of this PR.
+
+## Applied material and bounded transport (#221-2B)
+
+Run `make controlplane-cpmetrics-applied-evidence`. The separate mandatory Rust
+`Applied metrics material and transport evidence` CI job runs it alongside the
+unchanged quality job. Its dedicated embedded-etcd fixture and isolated Cargo
+mutation target have no production identity or shared mutable build output.
+
+`TopologyModule::with_metrics()` opts into passive preparation/publication only.
+The module's unique writer builds HTTP clients from the same validated cluster
+bytes before any live mutation or discovery epoch reservation. After successful
+preparation it withdraws metrics authority **before** the first registration
+cleanup await. Health retains its existing withdrawal order. The resulting
+`MetricCapture` retains exact R, mode, applied material, original owner and actual
+`DiscoveryCapture` identities. A no-op preserves the feed; a replacement makes
+old captures permanently stale, including same-content replacements. An H-only
+refresh never re-feeds metrics. The later collector must reset histories on this
+feed transition; this slice does not start that collector.
+
+`DiscoveryCapture` exposes bounded full-cluster topology and Prometheus reads,
+without exposing its etcd client. Every metric discovery RPC/retry carries the
+additional material/source fence, including while the original discovery set
+remains published during slow registration cleanup. `EtcdConnection` forks
+preserve their original owner/generation and all extra fences conjunctively.
+Current proxy zone comes from committed `routing().proxy_labels["zone"]`, even
+when applying the candidate cluster material fails. Static mode publishes no
+synthetic etcd reader; empty factor captures remain #221-3.
+
+`HttpTarget` admits bounded ASCII origin-form paths/encoded queries. The existing
+`get_once` still uses `/status`; metric targets share its explicit DNS, candidate
+dial, cluster TLS, logical-host SNI, deadline and body fences. Prom HTTP uses the
+system resolver without synthetic cluster/TLS material. A supplied backend work
+or peer fence is checked together with material/source at every effect boundary;
+this reusable transport does not itself mint election/publication authority.
+Normal completion aborts and joins its HTTP connection driver, and cancellation
+aborts it through a Drop guard. Metric bodies remain capped at 16 MiB and health
+bodies at 64 KiB.
+
+The gate covers:
+
+- Real HTTP target, DNS/TLS/SNI, large bounded body, cancellation and independent
+  source/work revocation against coincident DNS/TLS/body failures; no new attempt
+  after retirement. A real `ElectionWorkPermit` is also exercised against HTTP.
+- Actual feed identity/ABA, serialized final publication, writer Drop, revision
+  overflow/waiting, mode/source/original-owner fences and additive etcd forks.
+- Real module opt-in, H refresh, rejected client retention with no burned epoch,
+  zone-only and rejected-cluster-plus-zone changes, static transition and abort.
+- Held KV Range with discovery rotation/Drop/owner loss, and independently held
+  applied material/R with discovery kept live: no second prefix or Prom retry.
+- A real module registrar blocked in the CP003 protobuf proxy's `LeaseRevoke`:
+  R, H, process owner, Dynamic mode, discovery and work remain live while old
+  metrics captures and delayed Prom/backend/peer responses are already stale.
+  Releasing cleanup removes the old remote lease and permits a fresh pairing.
+
+The isolated mutation runner requires 16 production mutants to compile and fail
+their named live/boundary assertions. Compile failures, timeouts and unrelated
+test failures do not count; a restored baseline must pass. The existing 152 Go
+observations/17 core mutations and all CP-ROUTE evidence remain separate required
+gates. Actual collector scheduling, mixed Go/Rust owner enumeration/history HTTP,
+listener readiness and factor/router composition remain subsequent slices.

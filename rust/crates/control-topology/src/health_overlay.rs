@@ -120,6 +120,12 @@ pub struct HealthOverlayHandle {
 }
 
 impl HealthOverlayHandle {
+    /// Test waits observe actual publication instead of counting scheduler yields.
+    #[cfg(test)]
+    pub(crate) async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
+        self.published.changed().await
+    }
+
     /// The currently published overlay **candidate** for routing source `r`, or
     /// `None`.
     ///

@@ -43,6 +43,6 @@ for part, count in expected.items():
         names.add(row["name"])
 print(f"CP-METRICS generated {len(names)} unique actual-Go observations")
 PYCOUNTS
-cargo test --locked --manifest-path rust/Cargo.toml -p control-topology --lib metrics:: -- --nocapture
+cargo test --locked --manifest-path rust/Cargo.toml -p control-topology --lib metrics::tests:: -- --nocapture
 python3 tests/controlplane/cpmetrics/mutations.py
 echo "CP-METRICS query/history evidence passed (staged data core; no runtime authority)"

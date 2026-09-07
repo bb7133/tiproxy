@@ -140,6 +140,12 @@ pub struct ElectionWorkPermit {
     interval: Arc<Interval>,
 }
 
+impl control_external::IoFence for ElectionWorkPermit {
+    fn is_live(&self) -> bool {
+        self.still_current()
+    }
+}
+
 impl ElectionWorkPermit {
     /// Checks permission at admission or after an asynchronous operation.
     /// Use [`Self::with_current`] for the final synchronous publication boundary.

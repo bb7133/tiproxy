@@ -33,7 +33,7 @@
 //! attempt deadline, the SQL probe under Go's per-stage `DialTimeout`), so no
 //! caller outside this crate can ever await it unbounded or pair it with a
 //! mismatched resolver budget. Every awaited stage is fenced against the process
-//! [`OwnerToken`] AND the caller's source [`GenerationGate`] before and after it
+//! [`OwnerToken`] AND the caller's source [`IoFence`] before and after it
 //! runs; a fence failure is TERMINAL and wins over any coincident DNS or I/O
 //! error, so a retired owner or a superseded routing source is never reported as
 //! a retryable transport failure.
@@ -46,8 +46,9 @@ use control_plane::OwnerToken;
 use thiserror::Error;
 use tokio::net::TcpStream;
 
+use crate::IoFence;
 use crate::dns_transport::TokioDnsTransport;
-use crate::etcd::{EtcdClientConfig, GenerationGate};
+use crate::etcd::EtcdClientConfig;
 use crate::explicit_dns::{Clock, DnsTransport, ExplicitResolver, ResolveError, SystemClock};
 
 /// Upper bound on any single probe stage timeout (the HTTP attempt deadline and
@@ -143,7 +144,7 @@ impl ClusterConnector {
     /// # Errors
     ///
     /// Returns [`ClusterConnectError::Fenced`] when either is stale.
-    pub(crate) fn fence(&self, source_gate: &GenerationGate) -> Result<(), ClusterConnectError> {
+    pub(crate) fn fence(&self, source_gate: &dyn IoFence) -> Result<(), ClusterConnectError> {
         if self.owner.is_current() && source_gate.is_live() {
             Ok(())
         } else {
@@ -168,7 +169,7 @@ impl ClusterConnector {
         &self,
         host: &str,
         port: u16,
-        source_gate: &GenerationGate,
+        source_gate: &dyn IoFence,
     ) -> Result<TcpStream, ClusterConnectError> {
         self.fence(source_gate)?; // pre-DNS
         let candidates = self.resolve(host, port, source_gate).await?;
@@ -184,7 +185,7 @@ impl ClusterConnector {
         &self,
         host: &str,
         port: u16,
-        source_gate: &GenerationGate,
+        source_gate: &dyn IoFence,
     ) -> Result<Vec<SocketAddr>, ClusterConnectError> {
         if let Some(ip) = parse_ip_literal(host) {
             return Ok(vec![SocketAddr::new(ip, port)]);
@@ -218,7 +219,7 @@ impl ClusterConnector {
     async fn connect(
         &self,
         candidates: &[SocketAddr],
-        source_gate: &GenerationGate,
+        source_gate: &dyn IoFence,
     ) -> Result<TcpStream, ClusterConnectError> {
         let mut last_error: Option<std::io::Error> = None;
         for addr in candidates {
