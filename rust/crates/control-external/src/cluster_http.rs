@@ -37,6 +37,7 @@
 //! is TERMINAL and wins over any coincident I/O error, so a retired owner or a
 //! superseded routing source is never reported as a retryable transport failure.
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,16 +54,54 @@ use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use crate::IoFence;
 use crate::cluster_connect::{
     ClusterConnectError, ClusterConnector, MAX_PROBE_TIMEOUT, parse_ip_literal,
 };
 use crate::etcd::{EtcdClientConfig, EtcdConfigError, GenerationGate};
 use crate::explicit_dns::ResolveError;
-use crate::http::MAX_HTTP_RESPONSE_BYTES;
+use crate::http::{MAX_HTTP_RESPONSE_BYTES, MAX_HTTP_URL_BYTES};
 use crate::transport::MaybeTlsStream;
 
 /// The origin-form request target for a backend status probe.
 const STATUS_PATH: &str = "/status";
+/// A bounded origin-form HTTP path and optional query, with no host or scheme.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpTarget(Cow<'static, str>);
+
+impl HttpTarget {
+    /// Validates an ASCII, origin-form request target under the shared URL bound.
+    /// Query values must already be URL-encoded; fragments are never sent.
+    ///
+    /// # Errors
+    /// Returns [`ClusterHttpError::Request`] for an invalid or oversized target.
+    pub fn new(target: impl Into<String>) -> Result<Self, ClusterHttpError> {
+        let target = target.into();
+        if !target.starts_with('/')
+            || target.starts_with("//")
+            || target.len() > MAX_HTTP_URL_BYTES
+            || target.contains('#')
+            || target.bytes().any(|byte| byte <= b' ' || byte >= 0x7f)
+            || target.parse::<http::uri::PathAndQuery>().is_err()
+        {
+            return Err(ClusterHttpError::Request);
+        }
+        Ok(Self(Cow::Owned(target)))
+    }
+
+    /// The unchanged health-probe target.
+    #[must_use]
+    pub const fn status() -> Self {
+        Self(Cow::Borrowed(STATUS_PATH))
+    }
+
+    /// The validated origin-form bytes.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The fixed production response-body cap for a status probe: 64 KiB, well under
 /// the shared 16 MiB [`MAX_HTTP_RESPONSE_BYTES`] ceiling. The ceiling is only the
 /// unbreakable maximum; this is the value production actually enforces.
@@ -256,6 +295,23 @@ impl ClusterHttpClient {
         })
     }
 
+    /// Builds the plain HTTP/system-resolver transport used by Prometheus reads.
+    /// No cluster, TLS material, or synthetic etcd configuration is created.
+    ///
+    /// # Errors
+    /// Returns a policy error for an invalid deadline or response bound.
+    pub fn system_http(
+        owner: OwnerToken,
+        policy: HttpProbePolicy,
+    ) -> Result<Self, ClusterHttpConfigError> {
+        policy.validate()?;
+        Ok(Self {
+            connector: ClusterConnector::system_default(owner),
+            tls: None,
+            policy,
+        })
+    }
+
     /// Performs ONE `GET /status` attempt against `host:port`, bounded by a
     /// single absolute deadline of `policy.attempt_timeout` covering the whole
     /// exchange. Returns the raw response body on an exact HTTP 200; the body is
@@ -280,9 +336,25 @@ impl ClusterHttpClient {
         port: u16,
         source_gate: &GenerationGate,
     ) -> Result<Bytes, ClusterHttpError> {
+        self.get_target_once(host, port, &HttpTarget::status(), source_gate)
+            .await
+    }
+
+    /// Performs one bounded GET with the cluster's existing DNS/TLS policy.
+    /// The composed fence is checked around every stage and response frame.
+    ///
+    /// # Errors
+    /// Returns the same terminal/retryable classes as [`Self::get_once`].
+    pub async fn get_target_once(
+        &self,
+        host: &str,
+        port: u16,
+        target: &HttpTarget,
+        source_gate: &dyn IoFence,
+    ) -> Result<Bytes, ClusterHttpError> {
         match tokio::time::timeout(
             self.policy.attempt_timeout,
-            self.attempt(host, port, source_gate),
+            self.attempt(host, port, target, source_gate),
         )
         .await
         {
@@ -301,17 +373,18 @@ impl ClusterHttpClient {
         &self,
         host: &str,
         port: u16,
-        source_gate: &GenerationGate,
+        target: &HttpTarget,
+        source_gate: &dyn IoFence,
     ) -> Result<Bytes, ClusterHttpError> {
         // The connector fences pre-DNS, post-DNS, and around every candidate dial.
         let stream = self.connector.connect_once(host, port, source_gate).await?;
         let stream = self.maybe_tls(host, stream, source_gate).await?;
-        self.exchange(host, port, stream, source_gate).await
+        self.exchange(host, port, stream, target, source_gate).await
     }
 
     /// Returns `Ok` only while the process owner AND the source generation are
     /// both current. A stale check is a terminal [`ClusterHttpError::Fenced`].
-    fn fence(&self, source_gate: &GenerationGate) -> Result<(), ClusterHttpError> {
+    fn fence(&self, source_gate: &dyn IoFence) -> Result<(), ClusterHttpError> {
         self.connector
             .fence(source_gate)
             .map_err(ClusterHttpError::from)
@@ -324,7 +397,7 @@ impl ClusterHttpClient {
         &self,
         host: &str,
         stream: TcpStream,
-        source_gate: &GenerationGate,
+        source_gate: &dyn IoFence,
     ) -> Result<MaybeTlsStream, ClusterHttpError> {
         match &self.tls {
             Some(config) => {
@@ -350,7 +423,8 @@ impl ClusterHttpClient {
         host: &str,
         port: u16,
         stream: MaybeTlsStream,
-        source_gate: &GenerationGate,
+        target: &HttpTarget,
+        source_gate: &dyn IoFence,
     ) -> Result<Bytes, ClusterHttpError> {
         self.fence(source_gate)?; // pre-request-write
         let io = TokioIo::new(stream);
@@ -366,10 +440,13 @@ impl ClusterHttpClient {
         let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
+        let _driver_guard = DriverGuard(driver.abort_handle());
         let outcome = self
-            .send_and_read(&mut sender, host, port, source_gate)
+            .send_and_read(&mut sender, host, port, target, source_gate)
             .await;
         driver.abort();
+        let _ = driver.await;
+        self.fence(source_gate)?;
         outcome
     }
 
@@ -379,9 +456,10 @@ impl ClusterHttpClient {
         sender: &mut hyper::client::conn::http1::SendRequest<Empty<Bytes>>,
         host: &str,
         port: u16,
-        source_gate: &GenerationGate,
+        target: &HttpTarget,
+        source_gate: &dyn IoFence,
     ) -> Result<Bytes, ClusterHttpError> {
-        let request = build_request(host, port)?;
+        let request = build_request(host, port, target)?;
         let Ok(response) = sender.send_request(request).await else {
             // A fence wins over the coincident request-write I/O error.
             self.fence(source_gate)?;
@@ -409,7 +487,7 @@ impl ClusterHttpClient {
     async fn collect_body(
         &self,
         mut body: Incoming,
-        source_gate: &GenerationGate,
+        source_gate: &dyn IoFence,
     ) -> Result<Bytes, ClusterHttpError> {
         let mut collected: Vec<u8> = Vec::new();
         loop {
@@ -436,12 +514,23 @@ impl ClusterHttpClient {
     }
 }
 
-/// Builds the origin-form `GET /status HTTP/1.1` request with an explicit
-/// `Host:` (logical host, IPv6 bracketed) and `Connection: close`.
-fn build_request(host: &str, port: u16) -> Result<Request<Empty<Bytes>>, ClusterHttpError> {
+// Cancellation of the request future must not detach the connection driver.
+struct DriverGuard(tokio::task::AbortHandle);
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Builds an origin-form GET with the logical `Host` and `Connection: close`.
+fn build_request(
+    host: &str,
+    port: u16,
+    target: &HttpTarget,
+) -> Result<Request<Empty<Bytes>>, ClusterHttpError> {
     Request::builder()
         .method(Method::GET)
-        .uri(STATUS_PATH)
+        .uri(target.as_str())
         .header(HOST, host_header(host, port))
         .header(CONNECTION, "close")
         .body(Empty::<Bytes>::new())
@@ -481,6 +570,7 @@ fn content_length(headers: &http::HeaderMap) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    mod metrics;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};

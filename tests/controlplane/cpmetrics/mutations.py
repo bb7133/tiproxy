@@ -18,13 +18,14 @@ def main():
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
         environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
-        command = ["cargo", "test", "--locked", "--offline", "--manifest-path", str(root / "rust/Cargo.toml"), "-p", "control-topology", "--lib", "metrics::"]
+        # Select the data core, excluding module::tests::metrics runtime tests.
+        command = ["cargo", "test", "--locked", "--offline", "--manifest-path", str(root / "rust/Cargo.toml"), "-p", "control-topology", "--lib", "metrics::tests::"]
         def run(arguments):
             return subprocess.run(command + arguments, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
         def baseline():
             result = run(["--", "--nocapture"])
-            if result.returncode:
-                raise RuntimeError("isolated baseline/restoration failed:\n" + result.stdout)
+            if result.returncode or "CP-METRICS actual-Go observations passed: 152" not in result.stdout:
+                raise RuntimeError("isolated baseline/restoration failed or missing Go evidence:\n" + result.stdout)
         baseline()
         base = root / "rust/crates/control-topology/src"
         originals = {name: (base / name).read_text() for name in ["metrics.rs", "metrics/rules.rs", "metrics/history.rs", "metrics/decode.rs"]}

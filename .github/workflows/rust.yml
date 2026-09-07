@@ -105,6 +105,43 @@ jobs:
       - name: Reject a stale lockfile
         run: cargo check --locked --workspace --manifest-path rust/Cargo.toml
 
+  applied-metrics:
+    name: Applied metrics material and transport evidence
+    runs-on: ubuntu-24.04
+    # Keep the existing CP-ROUTE/CP-METRICS gates intact and give the new
+    # isolated real-etcd mutation build its own bounded execution budget.
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            bin/control-codegen
+            bin/control-codegen-rust
+            rust/target
+          key: rust-metric-applied-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Run applied metrics live and compiling mutation evidence
+        run: make controlplane-cpmetrics-applied-evidence
+
   supply-chain:
     name: Audit dependencies and policy
     runs-on: ubuntu-24.04

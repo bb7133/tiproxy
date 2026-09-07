@@ -45,6 +45,7 @@ mod health_feed;
 mod health_loop;
 mod health_overlay;
 mod merge;
+mod metric_source;
 pub mod metrics;
 mod model;
 mod module;
@@ -56,11 +57,14 @@ mod static_source;
 
 pub use backend_health::{BackendHealth, ClusterHealthNetwork};
 pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
-pub use discovery_publish::{DiscoveryError, DiscoveryHandle, EpochResult};
+pub use discovery_publish::{DiscoveryCapture, DiscoveryError, DiscoveryHandle, EpochResult};
 pub use health_config::HealthConfigError;
 pub use health_overlay::{HealthOverlayHandle, HealthSnapshot};
 pub use merge::{
     ClusterTopologyFetch, MergedBackend, MergedTopology, TopologyUnavailable, merge_tidb_topology,
+};
+pub use metric_source::{
+    MetricCapture, MetricConfigError, MetricReadError, MetricRuntimePolicy, MetricSourceHandle,
 };
 pub use model::{BackendInfo, PrometheusInfo, TopologySnapshot, parse_tidb_topology};
 pub use module::{

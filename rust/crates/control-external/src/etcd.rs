@@ -595,6 +595,7 @@ impl EtcdConnector {
             owner: self.owner.clone(),
             client,
             gate: None,
+            additional_fence: None,
         })
     }
 }
@@ -652,6 +653,7 @@ pub struct EtcdConnection {
     owner: OwnerToken,
     client: Client,
     gate: Option<GenerationGate>,
+    additional_fence: Option<Arc<dyn crate::IoFence>>,
 }
 
 impl EtcdConnection {
@@ -693,7 +695,12 @@ impl EtcdConnection {
     /// revoked generation is not mistaken for a plain timeout.
     #[must_use]
     pub fn is_current(&self) -> bool {
-        self.owner.is_current() && self.gate.as_ref().is_none_or(GenerationGate::is_live)
+        self.owner.is_current()
+            && self.gate.as_ref().is_none_or(GenerationGate::is_live)
+            && self
+                .additional_fence
+                .as_ref()
+                .is_none_or(|fence| fence.is_live())
     }
 
     /// Clones this connection, sharing the same long-lived channel (so DNS
@@ -705,6 +712,7 @@ impl EtcdConnection {
             owner: self.owner.clone(),
             client: self.client.clone(),
             gate: self.gate.clone(),
+            additional_fence: self.additional_fence.clone(),
         }
     }
 
@@ -717,6 +725,27 @@ impl EtcdConnection {
             owner: self.owner.clone(),
             client: self.client.clone(),
             gate: Some(gate),
+            additional_fence: self.additional_fence.clone(),
+        }
+    }
+
+    /// Forks the same channel under an additional retained capability. Existing
+    /// process, generation and prior extra fences are preserved conjunctively;
+    /// each `execute` checks all of them before and after its operation.
+    #[must_use]
+    pub fn fork_with_fence(&self, fence: Arc<dyn crate::IoFence>) -> Self {
+        let additional_fence = match &self.additional_fence {
+            Some(previous) => Arc::new(crate::io_fence::OwnedCombinedFence(
+                Arc::clone(previous),
+                fence,
+            )) as Arc<dyn crate::IoFence>,
+            None => fence,
+        };
+        Self {
+            owner: self.owner.clone(),
+            client: self.client.clone(),
+            gate: self.gate.clone(),
+            additional_fence: Some(additional_fence),
         }
     }
 }
@@ -810,6 +839,48 @@ mod tests {
         EtcdClientConfig, EtcdConfigError, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion,
         GenerationGate,
     };
+
+    #[tokio::test]
+    async fn metric_etcd_forks_preserve_all_additional_fences()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = OwnershipRegistry::new();
+        let owner = registry.claim(OwnerScope::Process, "metric-fork-fences")?;
+        let connection = super::EtcdConnector::new(
+            owner.token(),
+            EtcdClientConfig::new(["127.0.0.1:1".to_owned()], None)?,
+        )
+        .connect()
+        .await?;
+        for revoke in 0..3 {
+            let gates = [
+                GenerationGate::new(),
+                GenerationGate::new(),
+                GenerationGate::new(),
+            ];
+            let mut fork = connection
+                .fork_with_fence(std::sync::Arc::new(gates[0].clone()))
+                .fork_with_gate(gates[1].clone())
+                .fork_with_fence(std::sync::Arc::new(gates[2].clone()))
+                .fork();
+            assert!(fork.is_current());
+            gates[revoke].revoke();
+            assert!(!fork.is_current(), "METRIC_ETCD_FORK_CONJUNCTION");
+            assert!(
+                connection.is_current(),
+                "original connection kept independently live"
+            );
+            let mut invoked = false;
+            let result = fork
+                .execute(|_| {
+                    invoked = true;
+                    Box::pin(async { Ok(()) })
+                })
+                .await;
+            assert!(matches!(result, Err(super::EtcdOperationError::StaleOwner)));
+            assert!(!invoked, "METRIC_ETCD_FORK_ZERO_IO");
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_new_generation_gate_is_live_and_revoke_propagates_to_clones() {

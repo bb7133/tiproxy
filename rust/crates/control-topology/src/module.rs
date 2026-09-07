@@ -74,6 +74,7 @@ use crate::health_loop::{
     HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
 };
 use crate::health_overlay::{HealthOverlayHandle, HealthOverlayPublisher};
+use crate::metric_source::{MetricConfigError, MetricPublication, MetricSourceHandle};
 use crate::registrar::RegistrarError;
 use crate::resolver::AdvertiseEndpointResolver;
 use crate::routing_snapshot::{RoutingSnapshotHandle, RoutingSnapshotPublisher};
@@ -206,6 +207,8 @@ pub enum RejectionClass {
     /// plane is mutated and before the discovery epoch is reserved, so a health
     /// build failure never burns an epoch and retains all planes' last-good.
     HealthClientBuildFailed,
+    /// Metric transports could not be prepared; no live state was mutated.
+    MetricClientBuildFailed,
 }
 
 /// Observable registration status.
@@ -251,6 +254,8 @@ pub struct TopologyModule {
     /// publisher into the health task, feeder into the [`ModuleRuntime`] guard) at
     /// startup. `None` only after that move.
     health: Option<HealthParts>,
+    /// Unique applied metrics publisher; inactive until explicit startup opt-in.
+    metrics: MetricPublication,
     /// The applied backend-source mode (CP-ROUTE 220-3 B2): Static IFF the
     /// applied registration plan has no cluster. Its epoch gate is revoked
     /// before a new plan/commit is published and a fresh epoch published after.
@@ -338,6 +343,7 @@ pub struct TopologyModuleHandle {
     discovery: DiscoveryHandle,
     routing: RoutingSnapshotHandle,
     health: HealthOverlayHandle,
+    metrics: MetricSourceHandle,
     source: Arc<dyn ConfigNamespaceSource>,
     mode: watch::Receiver<Arc<ModeEpoch>>,
     statics: Arc<StaticRegistry>,
@@ -346,6 +352,13 @@ pub struct TopologyModuleHandle {
 }
 
 impl TopologyModuleHandle {
+    /// The staged applied metrics source; empty until explicitly enabled and a
+    /// matching dynamic discovery/R generation exists. No collector is started.
+    #[must_use]
+    pub fn metric_source(&self) -> MetricSourceHandle {
+        self.metrics.clone()
+    }
+
     /// Resolves once the module has applied its initial configuration
     /// generation: the registration children are spawned and the initial
     /// discovery set is published.
@@ -476,6 +489,17 @@ impl TopologyModule {
         )
     }
 
+    /// Enables the staged metrics material/feed using the constructor's pinned
+    /// health/metrics timing. No collector, owner listener or election is started.
+    /// Production composition remains a later control-plane cutover step.
+    ///
+    /// # Errors
+    /// Returns an error for invalid metrics cadence or request timing.
+    pub fn with_metrics(mut self) -> Result<Self, MetricConfigError> {
+        self.metrics.enable()?;
+        Ok(self)
+    }
+
     /// Test-only constructor that injects a deterministic child runner, used to
     /// exercise unexpected-child-exit and wedged-shutdown handling without a
     /// live backend. Discovery uses a plaintext connector so the registration
@@ -578,6 +602,7 @@ impl TopologyModule {
         #[cfg(test)]
         let mode_hook = mode.publish_hook();
         let statics = Arc::new(StaticRegistry::default());
+        let (metrics, metric_source) = MetricPublication::new(Arc::clone(&source), health);
         Ok((
             Self {
                 source: Arc::clone(&source),
@@ -598,6 +623,7 @@ impl TopologyModule {
                     publisher,
                 }),
                 mode,
+                metrics,
                 statics: Arc::clone(&statics),
                 #[cfg(test)]
                 refresh_override: None,
@@ -610,6 +636,7 @@ impl TopologyModule {
                 discovery: discovery_handle,
                 routing: routing_handle,
                 health: health_overlay,
+                metrics: metric_source,
                 source,
                 mode: mode_reader,
                 statics,
@@ -653,6 +680,7 @@ impl TopologyModule {
         let mut runtime = ModuleRuntime {
             routing: Arc::clone(&self.routing),
             discovery: &self.discovery,
+            metrics: &self.metrics,
             feeder,
             health: None,
             refresh: None,
@@ -740,6 +768,7 @@ impl TopologyModule {
                         break Err(module_error("routing_observer_closed"));
                     }
                     reconcile_health_feed(&runtime.feeder, active_health.as_ref(), &routing_reader);
+                    self.reconcile_metrics();
                 }
                 exited = children.tasks.join_next(), if !children.tasks.is_empty() => {
                     // A child completed while we were not tearing it down: an
@@ -940,6 +969,16 @@ impl TopologyModule {
             }
         };
 
+        // Metrics shares the validated candidate bytes and must also be built
+        // before any discovery epoch is reserved or live authority is revoked.
+        let prepared_metrics = if discovery_unchanged {
+            None
+        } else {
+            self.metrics
+                .prepare(owner, &clusters)
+                .map_err(|_| RejectionClass::MetricClientBuildFailed)?
+        };
+
         // Prepare-then-commit: build the new discovery generation's connections
         // (lazy, no network) BEFORE mutating any live state, so a connect failure
         // leaves both the registration children and the last-good discovery set
@@ -989,6 +1028,12 @@ impl TopologyModule {
         } else {
             BackendSourceMode::Dynamic
         };
+        // Metrics retirement precedes the first registration cleanup await even
+        // when dynamic mode, R and H are still unchanged. Preserve the existing
+        // health feed's later withdrawal contract below.
+        if prepared.is_some() {
+            self.metrics.withdraw_material();
+        }
         let mode_changes = self.mode.applied() != Some(next_mode);
         if mode_changes {
             self.mode.revoke();
@@ -1023,7 +1068,8 @@ impl TopologyModule {
         // withdrawn until the refresh loop publishes the new source Arc.
         if let Some(prepared) = prepared {
             health.feeder.withdraw();
-            self.discovery.commit(prepared);
+            let discovery = self.discovery.commit(prepared);
+            self.metrics.install(prepared_metrics, discovery);
             *health.active = candidate_health;
             reconcile_health_feed(health.feeder, health.active.as_ref(), health.routing);
         }
@@ -1035,7 +1081,14 @@ impl TopologyModule {
             statics.apply_mode(Some(next_mode));
             self.mode.publish(next_mode);
         }
+        self.reconcile_metrics();
         Ok(())
+    }
+
+    fn reconcile_metrics(&self) {
+        let mode = self.mode.subscribe().borrow().clone();
+        self.metrics
+            .reconcile(self.routing.handle().current(), mode);
     }
 
     /// Builds the fallible health-probe transport for every cluster from the
@@ -1270,6 +1323,7 @@ async fn supervise_child(handle: Option<&mut JoinHandle<()>>) {
 struct ModuleRuntime<'module> {
     routing: Arc<RoutingSnapshotPublisher>,
     discovery: &'module DiscoveryPublisher,
+    metrics: &'module MetricPublication,
     feeder: HealthGenerationFeeder,
     health: Option<JoinHandle<()>>,
     refresh: Option<JoinHandle<()>>,
@@ -1282,6 +1336,7 @@ impl ModuleRuntime<'_> {
         self.mode.revoke();
         self.routing.revoke_and_clear();
         self.discovery.revoke();
+        self.metrics.close();
         self.feeder.close();
         self.statics.revoke_all();
     }
@@ -1319,6 +1374,7 @@ impl Drop for ModuleRuntime<'_> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod metrics;
     use super::{
         ChildRunner, HealthFactory, ModePublisher, ModuleRuntime, ROUTING_REFRESH_INTERVAL,
         RefreshFactory, RegistrarError, RejectionClass, StaticProducers, StaticRegistry,
@@ -3352,9 +3408,14 @@ ns-servers = ["dns-a:53"]
         // does on teardown. A bare feeder (its feed dropped) is fine here: this
         // unit exercises only the routing-first fence ordering, not the feed.
         let mode = ModePublisher::new();
+        let store =
+            ConfigNamespaceStore::from_toml(&config_zero(), None, &std::env::current_dir()?)?;
+        let (metrics, _) =
+            crate::metric_source::MetricPublication::new(Arc::new(store), enabled_health());
         let mut owner = ModuleRuntime {
             routing: Arc::clone(&routing),
             discovery: &publisher,
+            metrics: &metrics,
             feeder: HealthGenerationFeeder::new().0,
             health: None,
             refresh: None,
@@ -4140,25 +4201,31 @@ ns-servers = ["dns-a:53"]
         routing: &RoutingSnapshotHandle,
         source: &Arc<RoutingSnapshot>,
     ) -> Result<(), TestError> {
-        for _ in 0..2000 {
-            if let Some(health) = overlay.current_for(source) {
-                if !overlay.still_current_for(&health, source, routing) {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                for backend in &source.backends.backends {
-                    let verdict = health.get(&backend.backend_id);
-                    if !verdict.healthy || verdict.server_version.is_some() {
-                        return Err("a disabled runtime must publish an all-healthy, \
-                                    version-None overlay for the exact source"
-                            .into());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut changes = overlay.clone();
+            loop {
+                if let Some(health) = overlay.current_for(source)
+                    && overlay.still_current_for(&health, source, routing)
+                {
+                    for backend in &source.backends.backends {
+                        let verdict = health.get(&backend.backend_id);
+                        if !verdict.healthy || verdict.server_version.is_some() {
+                            return Err("a disabled runtime must publish an all-healthy, \
+                                        version-None overlay for the exact source"
+                                .into());
+                        }
                     }
+                    return Ok(());
                 }
-                return Ok(());
+                // The cloned receiver retains unseen publication edges, including
+                // an update between the candidate check and this await.
+                changes.changed().await?;
             }
-            tokio::task::yield_now().await;
-        }
-        Err("the disabled runtime never published an overlay for the exact source".into())
+        })
+        .await
+        .map_err(|_| -> TestError {
+            "the disabled runtime never published an overlay for the exact source".into()
+        })?
     }
 
     /// Option D's module-level disabled guarantee, on the REAL run/health loop

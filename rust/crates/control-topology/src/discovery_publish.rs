@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use control_external::{
-    EtcdClientConfig, EtcdConnectError, EtcdConnection, EtcdConnector, GenerationGate,
+    EtcdClientConfig, EtcdConnectError, EtcdConnection, EtcdConnector, GenerationGate, IoFence,
 };
 use control_plane::OwnerToken;
 use tokio::sync::watch;
@@ -113,6 +113,7 @@ impl ClusterTopologyFetch for ConnectionTopologyFetch {
 /// One published discovery generation: its epoch, its revocable gate, and the
 /// long-lived per-cluster connections. Private — never leaked from the handle.
 struct DiscoverySet {
+    owner: OwnerToken,
     client_epoch: u64,
     gate: GenerationGate,
     clusters: Vec<(Arc<str>, EtcdConnection)>,
@@ -121,8 +122,9 @@ struct DiscoverySet {
 impl DiscoverySet {
     /// Whether this set is still the admissible current generation.
     fn is_admissible(&self, published: Option<&Arc<DiscoverySet>>) -> bool {
-        self.gate.is_live()
-            && published.is_some_and(|current| current.client_epoch == self.client_epoch)
+        self.owner.is_current()
+            && self.gate.is_live()
+            && published.is_some_and(|current| std::ptr::eq(current.as_ref(), self))
     }
 }
 
@@ -136,13 +138,28 @@ pub struct DiscoveryHandle {
 }
 
 impl DiscoveryHandle {
+    /// Retains the exact published discovery set for subsequent bounded reads.
+    /// A numeric epoch is only diagnostic; this capability keeps its actual set,
+    /// original owner, revocable gate, and originating publisher observation.
+    ///
+    /// # Errors
+    /// Returns [`DiscoveryError::Revoked`] when no live set can be captured.
+    pub fn capture(&self) -> Result<DiscoveryCapture, DiscoveryError> {
+        let set = self.admit()?;
+        self.still_current(&set)?;
+        Ok(DiscoveryCapture {
+            handle: self.clone(),
+            set,
+        })
+    }
+
     /// Captures the currently published set, failing closed when none is live.
     fn admit(&self) -> Result<Arc<DiscoverySet>, DiscoveryError> {
         let set = self
             .published
             .borrow()
             .as_ref()
-            .filter(|set| set.gate.is_live())
+            .filter(|set| set.gate.is_live() && set.owner.is_current())
             .map(Arc::clone);
         set.ok_or(DiscoveryError::Revoked)
     }
@@ -187,7 +204,7 @@ impl DiscoveryHandle {
         self.published
             .borrow()
             .as_ref()
-            .filter(|set| set.gate.is_live())
+            .filter(|set| set.gate.is_live() && set.owner.is_current())
             .map(|set| set.client_epoch)
     }
 
@@ -262,6 +279,103 @@ impl DiscoveryHandle {
     }
 }
 
+/// A retained capability for exactly one actual discovery publication.
+/// Cloning it never re-qualifies a retired set or captures a newer epoch.
+#[derive(Clone)]
+pub struct DiscoveryCapture {
+    handle: DiscoveryHandle,
+    set: Arc<DiscoverySet>,
+}
+
+impl IoFence for DiscoveryCapture {
+    fn is_live(&self) -> bool {
+        self.still_current()
+    }
+}
+
+impl DiscoveryCapture {
+    /// Whether this original owner and set are still the live publication.
+    #[must_use]
+    pub fn still_current(&self) -> bool {
+        self.handle.still_current(&self.set).is_ok()
+    }
+
+    /// The captured epoch, for diagnostics and private producer reconciliation.
+    #[must_use]
+    pub fn client_epoch(&self) -> u64 {
+        self.set.client_epoch
+    }
+
+    /// The names in this captured set. Callers recheck authority before effects.
+    pub fn cluster_names(&self) -> impl Iterator<Item = &str> {
+        self.set.clusters.iter().map(|(name, _)| name.as_ref())
+    }
+
+    /// Reads one captured cluster's full topology, independently of health H.
+    ///
+    /// # Errors
+    /// Returns stale/unknown-cluster or the bounded topology failure.
+    pub async fn poll_cluster_topology(
+        &self,
+        cluster: &str,
+    ) -> Result<MergedTopology, DiscoveryError> {
+        self.poll_cluster_topology_fenced(cluster, Arc::new(self.clone()))
+            .await
+    }
+
+    pub(crate) async fn poll_cluster_topology_fenced(
+        &self,
+        cluster: &str,
+        fence: Arc<dyn IoFence>,
+    ) -> Result<MergedTopology, DiscoveryError> {
+        self.handle.still_current(&self.set)?;
+        let (name, connection) = self.handle.locate(&self.set, cluster)?;
+        let result = merge_tidb_topology(
+            vec![ConnectionTopologyFetch {
+                cluster_name: name,
+                connection: connection
+                    .fork_with_gate(self.set.gate.clone())
+                    .fork_with_fence(fence),
+            }],
+            PER_CLUSTER_BUDGET,
+        )
+        .await;
+        self.handle.still_current(&self.set)?;
+        result.map_err(DiscoveryError::TopologyUnavailable)
+    }
+
+    /// Reads the current Prometheus record through this exact retained set.
+    ///
+    /// # Errors
+    /// Returns stale/unknown-cluster, current absence, or a bounded read failure.
+    pub async fn poll_prometheus(&self, cluster: &str) -> Result<PrometheusInfo, DiscoveryError> {
+        self.poll_prometheus_fenced(cluster, Arc::new(self.clone()))
+            .await
+    }
+
+    pub(crate) async fn poll_prometheus_fenced(
+        &self,
+        cluster: &str,
+        fence: Arc<dyn IoFence>,
+    ) -> Result<PrometheusInfo, DiscoveryError> {
+        self.handle.still_current(&self.set)?;
+        let (name, connection) = self.handle.locate(&self.set, cluster)?;
+        let mut connection = connection
+            .fork_with_gate(self.set.gate.clone())
+            .fork_with_fence(fence);
+        let result = poll_prometheus(&mut connection).await;
+        self.handle.still_current(&self.set)?;
+        match result {
+            Ok(Some(info)) => Ok(info),
+            Ok(None) => Err(DiscoveryError::NoPrometheus {
+                cluster: name,
+                client_epoch: self.set.client_epoch,
+            }),
+            Err(_) => Err(DiscoveryError::PrometheusUnavailable),
+        }
+    }
+}
+
 /// The material fingerprint of one discovery generation: the name-sorted cluster
 /// set with its exact etcd client material. Discovery rotates only when this
 /// changes.
@@ -293,6 +407,7 @@ pub(crate) fn default_discovery_connector() -> DiscoveryConnector {
 /// is infallible — a caller can mutate registration first, knowing the discovery
 /// commit that follows cannot fail and split the two planes.
 pub(crate) struct PreparedDiscovery {
+    owner: OwnerToken,
     client_epoch: u64,
     material: Material,
     connections: Vec<(Arc<str>, EtcdConnection)>,
@@ -407,6 +522,7 @@ impl DiscoveryPublisher {
             reserved
         };
         Ok(PreparedDiscovery {
+            owner: owner.clone(),
             client_epoch,
             material,
             connections,
@@ -417,7 +533,7 @@ impl DiscoveryPublisher {
     /// immutable set under the epoch already reserved by [`Self::prepare`]. This
     /// is infallible, so committing after a registration switch can never fail and
     /// leave the two planes split.
-    pub(crate) fn commit(&self, prepared: PreparedDiscovery) {
+    pub(crate) fn commit(&self, prepared: PreparedDiscovery) -> DiscoveryCapture {
         let mut state = self.lock();
         if let Some(previous) = &state.current_gate {
             previous.revoke();
@@ -425,11 +541,19 @@ impl DiscoveryPublisher {
         let gate = GenerationGate::new();
         state.current_gate = Some(gate.clone());
         state.current_material = Some(prepared.material);
-        self.published.send_replace(Some(Arc::new(DiscoverySet {
+        let set = Arc::new(DiscoverySet {
+            owner: prepared.owner,
             client_epoch: prepared.client_epoch,
             gate,
             clusters: prepared.connections,
-        })));
+        });
+        self.published.send_replace(Some(Arc::clone(&set)));
+        DiscoveryCapture {
+            handle: DiscoveryHandle {
+                published: self.published.subscribe(),
+            },
+            set,
+        }
     }
 
     /// Retires the publication: revokes the current gate first, then withdraws
@@ -442,6 +566,12 @@ impl DiscoveryPublisher {
         }
         state.current_material = None;
         self.published.send_replace(None);
+    }
+}
+
+impl Drop for DiscoveryPublisher {
+    fn drop(&mut self) {
+        self.revoke();
     }
 }
 
@@ -524,6 +654,56 @@ mod tests {
         assert_eq!(second.client_epoch, 1, "the epoch increments monotonically");
         // Each generation connected once per cluster.
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn metric_discovery_capture_original_owner_and_drop() {
+        for lose_owner in [false, true] {
+            let (_registry, lease) = owner();
+            let connector = counting_connector(&Arc::new(AtomicUsize::new(0)));
+            let (publisher, handle) = DiscoveryPublisher::new();
+            let capture = publisher.commit(prepare(&publisher, &connector, &lease, "a").await);
+            assert!(capture.still_current());
+            assert_eq!(capture.cluster_names().collect::<Vec<_>>(), vec!["a"]);
+            if lose_owner {
+                drop(lease);
+                assert!(
+                    capture.set.gate.is_live(),
+                    "original owner is the isolated fence"
+                );
+            } else {
+                drop(publisher);
+            }
+            assert!(!capture.still_current(), "METRIC_DISCOVERY_OWNER_OR_DROP");
+            assert!(handle.capture().is_err());
+            assert_eq!(
+                capture.poll_prometheus("missing").await.err(),
+                Some(DiscoveryError::Stale)
+            );
+            assert_eq!(
+                capture.poll_cluster_topology("missing").await.err(),
+                Some(DiscoveryError::Stale)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metric_discovery_diagnostic_epoch_is_not_set_identity() {
+        let (_registry, lease) = owner();
+        let connector = counting_connector(&Arc::new(AtomicUsize::new(0)));
+        let (first, _) = DiscoveryPublisher::new();
+        let (second, _) = DiscoveryPublisher::new();
+        let a = first.commit(prepare(&first, &connector, &lease, "a").await);
+        let b = second.commit(prepare(&second, &connector, &lease, "a").await);
+        assert_eq!(a.client_epoch(), b.client_epoch());
+        assert!(a.still_current() && b.still_current());
+        assert!(
+            !a.set.is_admissible(b.handle.published.borrow().as_ref()),
+            "METRIC_DISCOVERY_ACTUAL_SET_IDENTITY"
+        );
+        let successor = first.commit(prepare(&first, &connector, &lease, "a").await);
+        assert!(!a.still_current(), "METRIC_DISCOVERY_SAME_CONTENT_ROTATION");
+        assert!(successor.still_current() && b.still_current());
     }
 
     #[tokio::test]
