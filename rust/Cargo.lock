@@ -351,6 +351,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "mysql-wire",
  "prost",
  "rcgen",
  "reqwest",
