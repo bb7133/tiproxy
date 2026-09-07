@@ -91,7 +91,11 @@ Duplicates, foreign handles, closed sessions and superseded attempts have no
 counter effects. Closed sessions are removed instead of growing tombstone sets.
 
 Supported selection is connection balance with prefer-idle/random, group
-matching and one-attempt opaque-ID exclusions. Go's clamped connection factor,
+matching, label/status eligibility, per-group fail-list protection, and opaque-ID
+exclusions. `Router::selector` owns a connection retry cycle: only NoBackend
+clears prior attempts and tries once more; port conflicts preserve exclusions.
+Every finish takes the exact reservation; dropping the selector closes its
+session and releases pending/active accounting. Go's clamped connection factor,
 raw-count migration advice, candidate set and clock-ticket weights are retained.
 Production tickets use Unix microseconds with the original modulo rules; a
 private seam exists solely for deterministic evidence. Rust uses stable opaque-ID
@@ -107,12 +111,12 @@ before production composition in 220-3.
 
 The new API is **not wired to dataplane or tiproxy-rs**; the evidence gate rejects
 those manifest dependencies. Resource (including the global default), location,
-business-label isolation, fail lists, nonempty proxy-zone metadata and static-only
+nonempty proxy-zone metadata and static-only
 fallback return typed Unsupported before reservation. Global config acceptance
 is unchanged. Static backends must later obtain authoritative health; namespace
 addresses are not converted into healthy observations. Zone metadata must later
 come from the Go-equivalent health observation, not be recomputed from current C.
-Retry/exclusion orchestration, resource factors, redirects and production cutover
+Resource factors, timed failover/redirects and production cutover
 remain later work. This head does not close #220 or #147.
 
 Evidence layers:
@@ -128,6 +132,22 @@ Evidence layers:
   ticket periods, covering random 11:10 weights, prefer-idle eligibility, custom
   thresholds/rates, zero counts and 16-bit clamp ties. No alternative Go score
   or choice implementation serves as the oracle.
+- `composition/eligibility.json`: 21 updates through the real Go ConfigManager,
+  FactorBasedBalance and Group.Route versus production Rust eligibility, plus
+  13 address-to-PodName edge cases. Covers label renaming/disabling, omitted and
+  empty TOML label tables, same-address/different-cluster IDs, unhealthy and
+  label-ineligible members outside the all-failed denominator, independent
+  groups, exact pod/address matching and explicit exclusions. Go TOML updates
+  merge labels; they cannot change a populated map back to nil. Direct synthetic
+  FactorLabel.SetConfig transitions that bypass ConfigManager are not the
+  accepted configuration-update contract represented by this fixture.
+- `composition/retry.json`: eight events through the real Go BackendSelector,
+  Group.Route and port conflict detector versus Rust Selector with real
+  ConfigNamespaceStore/TopologyModule/health publication. Covers disappearance,
+  reappearance, exhausted and empty cycles, conflict and recovery. Successful
+  observations abort their exact attempt before the next event; separate Rust
+  regressions cover retransmission, late and foreign settlement, current policy
+  on unchanged R/H, and close after commit.
 - Real ConfigNamespaceStore / TopologyModule / health publisher with a local
   minimal etcd Range service: watch-delivery and Range-response barriers pin
   pending, rejected and committed states; actual mutex barriers cover C, R and
@@ -138,14 +158,18 @@ Evidence layers:
 - The evidence gate invokes `python3 tests/controlplane/cproute/mutations.py`,
   which copies the Rust workspace to
   an isolated directory and changes production authority/ledger/selector code.
-  Eight regressions must compile and complete with failed runtime tests: skipping
+  Sixteen regressions must compile and complete with failed runtime tests: skipping
   C/H checks, resetting accounting on refresh, settling the latest owner,
   duplicate settlement, retaining closed authority, silent resource fallback,
-  and namespace-content identity. Compilation errors or process crashes do not
+  namespace-content identity, label/status bypass, incorrect pod matching, both
+  fail-list safeguard branches, retry exclusions in its denominator, port-error
+  cycle reset, and cross-session selector settlement. Fresh Go composition/retry
+  outputs are asserted inside the Rust runtime tests for each mutation.
+  Compilation errors or process crashes do not
   count as a kill. Baseline and restored sources must pass.
 
 `make controlplane-cproute-evidence` requires every layer above, including all
-eight selector mutations, both locally and in the hosted Rust workflow.
+sixteen selector mutations, both locally and in the hosted Rust workflow.
 Also run `make lint`, `make rust-lint`, `make rust-test`, `make rust-build`, and Go
 router/bridge/factor package tests. The mutation runner uses a separate target
 directory and never changes repository source.

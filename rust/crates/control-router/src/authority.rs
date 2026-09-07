@@ -38,10 +38,6 @@ pub enum Unsupported {
     LocationPolicy,
     /// Zone-derived assignment metadata needs the later health composition.
     ZoneMetadata,
-    /// Business label isolation requires the later factor head.
-    LabelIsolation,
-    /// Failed-backend group policy requires the later composition head.
-    FailedBackends,
     /// Static fallback needs its own authoritative health source.
     StaticFallback,
 }
@@ -236,12 +232,6 @@ fn supported(config: &ConfigNamespaceSnapshot, policy: &RoutingConfig) -> Result
         .any(|(key, value)| key.as_ref() == "zone" && !value.is_empty())
     {
         return Err(RouteError::Unsupported(Unsupported::ZoneMetadata));
-    }
-    if !policy.label_name.is_empty() {
-        return Err(RouteError::Unsupported(Unsupported::LabelIsolation));
-    }
-    if !policy.failed_backends.is_empty() {
-        return Err(RouteError::Unsupported(Unsupported::FailedBackends));
     }
     if config
         .topology()
