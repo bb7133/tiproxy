@@ -20,8 +20,9 @@
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     ConnectionEventKind, ConnectionIdentity, ErrorCode, ErrorSource, HandshakeMetadata,
-    RouteAssignment,
+    RouteAssignment as WireRouteAssignment,
 };
+use control_routing::{RouteAssignment, RouteCode, RouteErrorSource, RouteResult};
 use dataplane::observability::{MetricsRecorder, Observation};
 use dataplane::route::{
     AcquireError, BackendDialer, CenteredJitter, DialSchedule, RouteChannel, RouteChannelError,
@@ -58,8 +59,8 @@ fn handshake() -> HandshakeMetadata {
     }
 }
 
-fn assignment(id: &str, backend: &str, address: &str) -> RouteAssignment {
-    RouteAssignment {
+fn assignment(id: &str, backend: &str, address: &str) -> WireRouteAssignment {
+    WireRouteAssignment {
         connection_id: CONN_ID,
         assignment_id: id.to_owned(),
         backend_id: backend.to_owned(),
@@ -69,6 +70,21 @@ fn assignment(id: &str, backend: &str, address: &str) -> RouteAssignment {
         healthy: true,
         local: true,
         code: ErrorCode::Ok.into(),
+        detail: String::new(),
+    }
+}
+
+fn domain_assignment(id: &str, backend: &str, address: &str) -> RouteAssignment {
+    RouteAssignment {
+        connection_id: CONN_ID,
+        assignment_id: id.to_owned(),
+        backend_id: backend.to_owned(),
+        backend_address: address.to_owned(),
+        cluster_name: String::new(),
+        keyspace: String::new(),
+        healthy: true,
+        local: true,
+        code: RouteCode::Ok,
         detail: String::new(),
     }
 }
@@ -153,6 +169,53 @@ async fn control_channel_round_trip_produces_exact_bodies() {
     assert_eq!(result.code(), ErrorCode::Ok);
 }
 
+/// The legacy bridge is the only place route-domain values become wire
+/// messages (or vice versa), including terminal codes and failure attribution.
+#[tokio::test]
+async fn control_channel_converts_only_at_the_wire_edge() {
+    let (sent_tx, mut sent) = mpsc::unbounded_channel();
+    let mut router = AssignmentRouter::new();
+    let assignments = router.register(CONN_ID);
+    let mut channel = ControlRouteChannel::new(
+        RecordingSink { sent: sent_tx },
+        assignments,
+        identity(),
+        handshake(),
+        String::new(),
+    );
+
+    let mut rejected = assignment("", "", "");
+    rejected.code = ErrorCode::Internal.into();
+    rejected.detail = "router failed".to_owned();
+    assert!(router.dispatch(rejected));
+    let rejected = channel
+        .next_assignment()
+        .await
+        .unwrap_or_else(|error| unreachable!("assignment: {error:?}"));
+    assert_eq!(rejected.code, RouteCode::Internal);
+    assert_eq!(rejected.detail, "router failed");
+
+    channel
+        .report_result(RouteResult {
+            connection_id: CONN_ID,
+            assignment_id: "as-failed".to_owned(),
+            connected: false,
+            error_source: RouteErrorSource::BackendNetwork,
+            code: RouteCode::BackendDialFailed,
+            detail: String::new(),
+        })
+        .await
+        .unwrap_or_else(|error| unreachable!("result: {error:?}"));
+    let Some(Body::RouteResult(result)) = sent.recv().await else {
+        unreachable!("domain result must become one wire result")
+    };
+    assert_eq!(result.connection_id, CONN_ID);
+    assert_eq!(result.assignment_id, "as-failed");
+    assert!(!result.connected);
+    assert_eq!(result.error_source(), ErrorSource::BackendNetwork);
+    assert_eq!(result.code(), ErrorCode::BackendDialFailed);
+}
+
 /// Dispatch-table semantics: unknown connection ids are refused (close
 /// accounting covers them), unregistering closes the session channel
 /// into `ControlLost`, and a foreign-id assignment that somehow reaches
@@ -196,7 +259,7 @@ trait SwapId {
     fn connection_id_swapped(self, id: u64) -> Self;
 }
 
-impl SwapId for RouteAssignment {
+impl SwapId for WireRouteAssignment {
     fn connection_id_swapped(mut self, id: u64) -> Self {
         self.connection_id = id;
         self
@@ -252,10 +315,7 @@ impl RouteChannel for OneAssignment {
     async fn next_assignment(&mut self) -> Result<RouteAssignment, RouteChannelError> {
         self.0.take().ok_or(RouteChannelError::ControlLost)
     }
-    async fn report_result(
-        &mut self,
-        _result: control_proto::v1::RouteResult,
-    ) -> Result<(), RouteChannelError> {
+    async fn report_result(&mut self, _result: RouteResult) -> Result<(), RouteChannelError> {
         Ok(())
     }
 }
@@ -281,7 +341,7 @@ async fn tcp_dialer_connects_and_stays_cluster_unaware() {
     // the scope before dialing (proven behaviorally below).
     let scoped = RouteAssignment {
         cluster_name: "serverless-1".to_owned(),
-        ..assignment("as-1", "tidb-a", address.as_str())
+        ..domain_assignment("as-1", "tidb-a", address.as_str())
     };
     let mut engine = RouteEngine::new(
         OneAssignment(Some(scoped)),
@@ -315,7 +375,7 @@ async fn cluster_tcp_dialer_is_cluster_aware_and_observable() {
     };
     let scoped = RouteAssignment {
         cluster_name: "default".to_owned(),
-        ..assignment("as-cluster", "tidb-cluster", address.as_str())
+        ..domain_assignment("as-cluster", "tidb-cluster", address.as_str())
     };
     let mut engine = RouteEngine::new(
         OneAssignment(Some(scoped)),

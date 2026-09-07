@@ -393,6 +393,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "control-routing"
+version = "0.1.0"
+
+[[package]]
 name = "control-topology"
 version = "0.1.0"
 dependencies = [
@@ -485,6 +489,7 @@ name = "dataplane"
 version = "0.1.0"
 dependencies = [
  "control-proto",
+ "control-routing",
  "getrandom 0.2.17",
  "mysql-wire",
  "prost",

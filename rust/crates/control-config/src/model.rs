@@ -169,6 +169,105 @@ pub struct TopologyRuntimeIdentity {
     pub start_timestamp: i64,
 }
 
+/// Backend-group selection rule consumed by CP-ROUTE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingRule {
+    /// Every backend belongs to one namespace-wide group.
+    MatchAll,
+    /// Match a backend group's CIDR labels against the client address.
+    ClientCidr,
+    /// Match a backend group's CIDR labels against the proxy address.
+    ProxyCidr,
+    /// Match a cluster-scoped backend group against the accepting listener port.
+    ListenerPort,
+}
+
+/// Ordered balance-factor family consumed by CP-ROUTE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingBalancePolicy {
+    /// Prefer health/resource signals before locality and connection count.
+    Resource,
+    /// Prefer locality before health/resource signals and connection count.
+    Location,
+    /// Route only by status and connection count.
+    Connection,
+}
+
+/// Candidate choice policy within the lowest-score backend set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingSelectionPolicy {
+    /// Prefer an idle backend, otherwise choose within the lowest-score set.
+    PreferIdle,
+    /// Choose randomly within the lowest-score set.
+    Random,
+}
+
+/// One factor's hot-reloadable migration rate.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RoutingFactorConfig {
+    /// Maximum migrations per second; zero selects the factor's Go default.
+    pub migrations_per_second: f64,
+}
+
+/// Connection-count factor policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RoutingConnectionFactorConfig {
+    /// Maximum migrations per second; zero selects the Go default.
+    pub migrations_per_second: f64,
+    /// Ratio above which connection-count imbalance is actionable; zero selects
+    /// the Go default.
+    pub count_ratio_threshold: f64,
+}
+
+/// Immutable, normalized process routing policy projected from one exact
+/// [`EffectiveConfig`] generation.
+///
+/// This is configuration only: topology, backend health, resource metrics, and
+/// connection accounting remain separately generation-fenced CP-ROUTE inputs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutingConfig {
+    /// Optional backend label used as the strict business-isolation factor.
+    pub label_name: Arc<str>,
+    /// How backends are partitioned into routeable groups.
+    pub routing_rule: RoutingRule,
+    /// Ordered balance-factor family.
+    pub balance_policy: RoutingBalancePolicy,
+    /// Candidate choice policy within the lowest-score set.
+    pub selection_policy: RoutingSelectionPolicy,
+    /// Backend status factor policy.
+    pub status: RoutingFactorConfig,
+    /// Backend health factor policy.
+    pub health: RoutingFactorConfig,
+    /// Backend memory factor policy.
+    pub memory: RoutingFactorConfig,
+    /// Backend CPU factor policy.
+    pub cpu: RoutingFactorConfig,
+    /// Proxy/backend locality factor policy.
+    pub location: RoutingFactorConfig,
+    /// Backend connection-count factor policy.
+    pub connection: RoutingConnectionFactorConfig,
+    /// Stable, sorted proxy labels used by the locality factor.
+    pub proxy_labels: Arc<[(Arc<str>, Arc<str>)]>,
+    /// Trimmed, de-duplicated failed backend pod names or addresses, preserving
+    /// the configured first-occurrence order.
+    pub failed_backends: Arc<[Arc<str>]>,
+    /// Grace period before sessions left on a failed backend are force-closed.
+    pub failover_timeout_seconds: u64,
+}
+
+/// CP-ROUTE's immutable projection of one namespace generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutingNamespace {
+    /// Namespace name.
+    pub name: Arc<str>,
+    /// Canonical frontend users (the current legacy shape has one).
+    pub users: Arc<[Arc<str>]>,
+    /// Static fallback backend endpoints, preserving configured order.
+    pub backend_instances: Arc<[Arc<str>]>,
+    /// Namespace-specific backend client TLS material and policy.
+    pub backend_tls: ClientTlsConfig,
+}
+
 /// SQL serving configuration owned by CP-CFG. Protocol-only handshake facts
 /// (advertised capability and server version) deliberately remain outside
 /// this type while the legacy control bridge still owns them.
@@ -379,6 +478,7 @@ impl EffectiveConfig {
         // Validate them before publishing a Rust-owned generation so the
         // process-local source can never get ahead of the serving projection.
         let _ = self.serving()?;
+        let _ = self.routing()?;
         Ok(self)
     }
 
@@ -528,6 +628,85 @@ impl EffectiveConfig {
             frontend_tls: serving_tls(&self.security.server_tls),
             backend_tls: serving_tls(&self.security.sql_tls),
             traffic_replay_enabled: self.enable_traffic_replay,
+        })
+    }
+
+    /// Returns the complete normalized CP-ROUTE policy projection.
+    ///
+    /// The returned value contains no live authority. A routing consumer must
+    /// retain and revalidate the exact
+    /// [`ConfigNamespaceSnapshot`](crate::ConfigNamespaceSnapshot) from which
+    /// this configuration was read before committing any reservation or
+    /// accounting side effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable field/class error if a raw, unvalidated value cannot be
+    /// represented by the routing contract. Normal config-store snapshots have
+    /// already passed this projection during candidate validation.
+    pub fn routing(&self) -> Result<RoutingConfig, ConfigError> {
+        let routing_rule = match self.balance.routing_rule.as_str() {
+            "" => RoutingRule::MatchAll,
+            "client_cidr" => RoutingRule::ClientCidr,
+            "proxy_cidr" => RoutingRule::ProxyCidr,
+            "port" => RoutingRule::ListenerPort,
+            _ => return invalid("balance.routing-rule", "unsupported"),
+        };
+        let balance_policy = match self.balance.policy.as_str() {
+            "resource" => RoutingBalancePolicy::Resource,
+            "location" => RoutingBalancePolicy::Location,
+            "connection" => RoutingBalancePolicy::Connection,
+            _ => return invalid("balance.policy", "unsupported"),
+        };
+        let selection_policy = match self.balance.routing_policy.as_str() {
+            "prefer-idle" => RoutingSelectionPolicy::PreferIdle,
+            "random" => RoutingSelectionPolicy::Random,
+            _ => return invalid("balance.routing-policy", "unsupported"),
+        };
+        let failover_timeout_seconds =
+            u64::try_from(self.proxy.online.failover_timeout).map_err(|_| {
+                ConfigError::InvalidField {
+                    field: "proxy.failover-timeout",
+                    class: "out_of_range",
+                }
+            })?;
+        let factor = |value: &FactorConfig| RoutingFactorConfig {
+            migrations_per_second: value.migrations_per_second,
+        };
+        Ok(RoutingConfig {
+            label_name: Arc::from(self.balance.label_name.as_str()),
+            routing_rule,
+            balance_policy,
+            selection_policy,
+            status: factor(&self.balance.status),
+            health: factor(&self.balance.health),
+            memory: factor(&self.balance.memory),
+            cpu: factor(&self.balance.cpu),
+            location: factor(&self.balance.location),
+            connection: RoutingConnectionFactorConfig {
+                migrations_per_second: self.balance.conn_count.factor.migrations_per_second,
+                count_ratio_threshold: self.balance.conn_count.count_ratio_threshold,
+            },
+            proxy_labels: Arc::from(
+                self.labels
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            Arc::<str>::from(name.as_str()),
+                            Arc::<str>::from(value.as_str()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            failed_backends: Arc::from(
+                self.proxy
+                    .online
+                    .fail_backend_list
+                    .iter()
+                    .map(|backend| Arc::<str>::from(backend.as_str()))
+                    .collect::<Vec<_>>(),
+            ),
+            failover_timeout_seconds,
         })
     }
 
@@ -856,6 +1035,24 @@ impl NamespaceConfig {
         ServingNamespace {
             name: Arc::from(self.namespace.as_str()),
             users,
+        }
+    }
+
+    /// Returns the CP-ROUTE-owned binding projection for this namespace.
+    #[must_use]
+    pub fn routing(&self) -> RoutingNamespace {
+        let serving = self.serving();
+        RoutingNamespace {
+            name: serving.name,
+            users: serving.users,
+            backend_instances: Arc::from(
+                self.backend
+                    .instances
+                    .iter()
+                    .map(|address| Arc::<str>::from(address.as_str()))
+                    .collect::<Vec<_>>(),
+            ),
+            backend_tls: client_tls(&self.backend.security),
         }
     }
 

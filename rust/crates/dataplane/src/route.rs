@@ -76,7 +76,7 @@
 
 use std::time::Duration;
 
-use control_proto::v1::{ErrorCode, ErrorSource, RouteAssignment, RouteResult};
+use control_routing::{RouteAssignment, RouteCode, RouteErrorSource, RouteResult};
 use tokio::time::{Instant, sleep, timeout_at};
 
 /// How one dial attempt failed. Payload-free by construction.
@@ -93,9 +93,9 @@ pub enum DialFailure {
 }
 
 impl DialFailure {
-    const fn error_source(self) -> ErrorSource {
+    const fn error_source(self) -> RouteErrorSource {
         match self {
-            Self::Connect | Self::Timeout | Self::Handshake => ErrorSource::BackendNetwork,
+            Self::Connect | Self::Timeout | Self::Handshake => RouteErrorSource::BackendNetwork,
         }
     }
 }
@@ -125,7 +125,7 @@ pub enum AcquireError {
     /// `NO_BACKEND` (internal routing failure).
     Routing {
         /// The adapter's error code.
-        code: ErrorCode,
+        code: RouteCode,
         /// Bounded adapter-provided detail.
         detail: String,
     },
@@ -153,7 +153,8 @@ pub enum AcquireError {
 }
 
 /// The engine's view of the control-plane route conversation. The
-/// transport (control-proto client) implements this; tests fake it.
+/// transport (currently the legacy bridge client) implements this; tests fake
+/// it.
 pub trait RouteChannel: Send {
     /// Sends the initial `RouteRequest` for this connection. Called
     /// exactly once per acquisition sequence.
@@ -493,13 +494,13 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
                 }
             };
             self.stats.assignments = self.stats.assignments.saturating_add(1);
-            match assignment.code() {
+            match assignment.code {
                 // Only an explicit OK is a backend-carrying assignment.
                 // UNSPECIFIED (the proto default) is a protocol-level
                 // terminal, not a success — the Go adapter always sets
                 // OK on real assignments.
-                ErrorCode::Ok => {}
-                ErrorCode::NoBackend => {
+                RouteCode::Ok => {}
+                RouteCode::NoBackend => {
                     return Err(AcquireError::NoBackend {
                         detail: assignment.detail,
                     });
@@ -617,16 +618,16 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
                 connection_id: self.connection_id,
                 assignment_id: assignment.assignment_id.clone(),
                 connected: true,
-                error_source: ErrorSource::Unspecified.into(),
-                code: ErrorCode::Ok.into(),
+                error_source: RouteErrorSource::Unspecified,
+                code: RouteCode::Ok,
                 detail: String::new(),
             },
             Err(failure) => RouteResult {
                 connection_id: self.connection_id,
                 assignment_id: assignment.assignment_id.clone(),
                 connected: false,
-                error_source: failure.error_source().into(),
-                code: ErrorCode::BackendDialFailed.into(),
+                error_source: failure.error_source(),
+                code: RouteCode::BackendDialFailed,
                 detail: String::new(),
             },
         };

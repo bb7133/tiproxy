@@ -23,7 +23,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use control_proto::v1::{ErrorCode, ErrorSource, RouteAssignment, RouteResult};
+use control_routing::{RouteAssignment, RouteCode, RouteErrorSource, RouteResult};
 use dataplane::route::{
     AcquireError, BackendDialer, CenteredJitter, DialFailure, DialSchedule, JitterSource,
     RouteChannel, RouteChannelError, RouteEngine, SplitMixJitter,
@@ -42,15 +42,15 @@ fn assignment(id: &str, backend: &str, address: &str) -> RouteAssignment {
         keyspace: "ks".to_owned(),
         healthy: true,
         local: true,
-        code: ErrorCode::Ok.into(),
+        code: RouteCode::Ok,
         detail: String::new(),
     }
 }
 
-fn terminal(code: ErrorCode, detail: &str) -> RouteAssignment {
+fn terminal(code: RouteCode, detail: &str) -> RouteAssignment {
     RouteAssignment {
         connection_id: CONN_ID,
-        code: code.into(),
+        code,
         detail: detail.to_owned(),
         ..assignment("", "", "")
     }
@@ -194,8 +194,8 @@ async fn second_backend_connects_after_first_fails() {
     let failed = results_for(&engine_channel.results, "a-1");
     assert_eq!(failed.len(), 1, "A retired exactly once");
     assert!(!failed[0].connected);
-    assert_eq!(failed[0].error_source(), ErrorSource::BackendNetwork);
-    assert_eq!(failed[0].code(), ErrorCode::BackendDialFailed);
+    assert_eq!(failed[0].error_source, RouteErrorSource::BackendNetwork);
+    assert_eq!(failed[0].code, RouteCode::BackendDialFailed);
     let connected = results_for(&engine_channel.results, "a-2");
     assert_eq!(connected.len(), 1, "B retired exactly once");
     assert!(connected[0].connected);
@@ -214,7 +214,7 @@ async fn all_backends_down_reaches_no_backend() {
         .push_back(assignment("a-2", "tidb-b", "10.0.0.2:4000"));
     adapter
         .assignments
-        .push_back(terminal(ErrorCode::NoBackend, "no backend available"));
+        .push_back(terminal(RouteCode::NoBackend, "no backend available"));
     let dialer = FakeDialer::new(&[
         ("10.0.0.1:4000", Outcome::Refuse),
         ("10.0.0.2:4000", Outcome::Refuse),
@@ -361,7 +361,7 @@ async fn terminal_routing_error_is_surfaced() {
     let mut adapter = FakeAdapter::default();
     adapter
         .assignments
-        .push_back(terminal(ErrorCode::Internal, "router broke"));
+        .push_back(terminal(RouteCode::Internal, "router broke"));
     let dialer = FakeDialer::new(&[]);
     let mut engine = engine(adapter, dialer, schedule());
     let Err(error) = engine.acquire(Vec::new()).await else {
@@ -370,7 +370,7 @@ async fn terminal_routing_error_is_surfaced() {
     assert_eq!(
         error,
         AcquireError::Routing {
-            code: ErrorCode::Internal,
+            code: RouteCode::Internal,
             detail: "router broke".to_owned()
         }
     );
@@ -799,7 +799,7 @@ async fn unspecified_and_malformed_assignments_are_terminal() {
     let mut adapter = FakeAdapter::default();
     adapter
         .assignments
-        .push_back(terminal(ErrorCode::Unspecified, "default fields"));
+        .push_back(terminal(RouteCode::Unspecified, "default fields"));
     let dialer = FakeDialer::new(&[]);
     let mut unspecified_engine = engine(adapter, dialer, schedule());
     let Err(error) = unspecified_engine.acquire(Vec::new()).await else {
@@ -808,7 +808,7 @@ async fn unspecified_and_malformed_assignments_are_terminal() {
     assert_eq!(
         error,
         AcquireError::Routing {
-            code: ErrorCode::Unspecified,
+            code: RouteCode::Unspecified,
             detail: "default fields".to_owned()
         }
     );

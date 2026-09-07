@@ -36,9 +36,11 @@ use std::collections::HashMap;
 
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
-    ConnectionEvent, ConnectionEventKind, ConnectionIdentity, ErrorSource, HandshakeMetadata,
-    RouteAssignment, RouteRequest, RouteResult,
+    ConnectionEvent, ConnectionEventKind, ConnectionIdentity, ErrorCode, ErrorSource,
+    HandshakeMetadata, RouteAssignment as WireRouteAssignment, RouteRequest,
+    RouteResult as WireRouteResult,
 };
+use control_routing::{RouteAssignment, RouteCode, RouteErrorSource, RouteResult};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -68,7 +70,7 @@ const ASSIGNMENT_CHANNEL_CAPACITY: usize = 2;
 /// `connection_id`. Owned by one task — no lock anywhere.
 #[derive(Default)]
 pub struct AssignmentRouter {
-    sessions: HashMap<u64, mpsc::Sender<RouteAssignment>>,
+    sessions: HashMap<u64, mpsc::Sender<WireRouteAssignment>>,
 }
 
 impl AssignmentRouter {
@@ -83,7 +85,7 @@ impl AssignmentRouter {
     /// Registers a session and returns the receiving half for its
     /// [`ControlRouteChannel`]. A previous registration for the same id
     /// is replaced (its receiver then observes `ControlLost`).
-    pub fn register(&mut self, connection_id: u64) -> mpsc::Receiver<RouteAssignment> {
+    pub fn register(&mut self, connection_id: u64) -> mpsc::Receiver<WireRouteAssignment> {
         let (tx, rx) = mpsc::channel(ASSIGNMENT_CHANNEL_CAPACITY);
         self.sessions.insert(connection_id, tx);
         rx
@@ -99,7 +101,7 @@ impl AssignmentRouter {
     /// owns the connection id (stale or raced close) — the caller
     /// should let close/reconcile accounting cover it rather than
     /// treating it as an error.
-    pub fn dispatch(&mut self, assignment: RouteAssignment) -> bool {
+    pub fn dispatch(&mut self, assignment: WireRouteAssignment) -> bool {
         let connection_id = assignment.connection_id;
         let Some(tx) = self.sessions.get(&connection_id) else {
             return false;
@@ -129,7 +131,7 @@ impl AssignmentRouter {
 /// Per-session [`RouteChannel`] over the real control envelopes.
 pub struct ControlRouteChannel<S> {
     sink: S,
-    assignments: mpsc::Receiver<RouteAssignment>,
+    assignments: mpsc::Receiver<WireRouteAssignment>,
     identity: ConnectionIdentity,
     handshake: HandshakeMetadata,
     namespace_hint: String,
@@ -142,7 +144,7 @@ impl<S: EnvelopeSink> ControlRouteChannel<S> {
     /// handshake event (`PROTOCOL_VIOLATION`).
     pub const fn new(
         sink: S,
-        assignments: mpsc::Receiver<RouteAssignment>,
+        assignments: mpsc::Receiver<WireRouteAssignment>,
         identity: ConnectionIdentity,
         handshake: HandshakeMetadata,
         namespace_hint: String,
@@ -178,7 +180,7 @@ impl<S: EnvelopeSink> RouteChannel for ControlRouteChannel<S> {
                 // a mismatch is a routing bug upstream; skip rather
                 // than act on another session's backend.
                 Some(assignment) if assignment.connection_id == self.identity.connection_id => {
-                    return Ok(assignment);
+                    return Ok(route_assignment_from_wire(assignment));
                 }
                 Some(_) => {}
                 None => return Err(RouteChannelError::ControlLost),
@@ -187,7 +189,104 @@ impl<S: EnvelopeSink> RouteChannel for ControlRouteChannel<S> {
     }
 
     async fn report_result(&mut self, result: RouteResult) -> Result<(), RouteChannelError> {
-        self.sink.send_control(Body::RouteResult(result)).await
+        self.sink
+            .send_control(Body::RouteResult(route_result_to_wire(result)))
+            .await
+    }
+}
+
+fn route_code_from_wire(code: ErrorCode) -> RouteCode {
+    match code {
+        ErrorCode::Unspecified => RouteCode::Unspecified,
+        ErrorCode::Ok => RouteCode::Ok,
+        ErrorCode::UnsupportedVersion => RouteCode::UnsupportedVersion,
+        ErrorCode::MissingCapability => RouteCode::MissingCapability,
+        ErrorCode::FrameTooLarge => RouteCode::FrameTooLarge,
+        ErrorCode::MalformedFrame => RouteCode::MalformedFrame,
+        ErrorCode::ProtocolViolation => RouteCode::ProtocolViolation,
+        ErrorCode::StaleEpoch => RouteCode::StaleEpoch,
+        ErrorCode::StaleGeneration => RouteCode::StaleGeneration,
+        ErrorCode::DuplicateRequest => RouteCode::DuplicateRequest,
+        ErrorCode::QueueFull => RouteCode::QueueFull,
+        ErrorCode::ControlUnavailable => RouteCode::ControlUnavailable,
+        ErrorCode::GraceExpired => RouteCode::GraceExpired,
+        ErrorCode::InvalidSnapshot => RouteCode::InvalidSnapshot,
+        ErrorCode::UnsupportedConfiguration => RouteCode::UnsupportedConfiguration,
+        ErrorCode::NoBackend => RouteCode::NoBackend,
+        ErrorCode::BackendDialFailed => RouteCode::BackendDialFailed,
+        ErrorCode::HandshakeRejected => RouteCode::HandshakeRejected,
+        ErrorCode::RedirectUnsafe => RouteCode::RedirectUnsafe,
+        ErrorCode::RedirectFailed => RouteCode::RedirectFailed,
+        ErrorCode::DrainInProgress => RouteCode::DrainInProgress,
+        ErrorCode::ReconciliationRequired => RouteCode::ReconciliationRequired,
+        ErrorCode::Internal => RouteCode::Internal,
+    }
+}
+
+fn route_code_to_wire(code: RouteCode) -> ErrorCode {
+    match code {
+        RouteCode::Unspecified => ErrorCode::Unspecified,
+        RouteCode::Ok => ErrorCode::Ok,
+        RouteCode::UnsupportedVersion => ErrorCode::UnsupportedVersion,
+        RouteCode::MissingCapability => ErrorCode::MissingCapability,
+        RouteCode::FrameTooLarge => ErrorCode::FrameTooLarge,
+        RouteCode::MalformedFrame => ErrorCode::MalformedFrame,
+        RouteCode::ProtocolViolation => ErrorCode::ProtocolViolation,
+        RouteCode::StaleEpoch => ErrorCode::StaleEpoch,
+        RouteCode::StaleGeneration => ErrorCode::StaleGeneration,
+        RouteCode::DuplicateRequest => ErrorCode::DuplicateRequest,
+        RouteCode::QueueFull => ErrorCode::QueueFull,
+        RouteCode::ControlUnavailable => ErrorCode::ControlUnavailable,
+        RouteCode::GraceExpired => ErrorCode::GraceExpired,
+        RouteCode::InvalidSnapshot => ErrorCode::InvalidSnapshot,
+        RouteCode::UnsupportedConfiguration => ErrorCode::UnsupportedConfiguration,
+        RouteCode::NoBackend => ErrorCode::NoBackend,
+        RouteCode::BackendDialFailed => ErrorCode::BackendDialFailed,
+        RouteCode::HandshakeRejected => ErrorCode::HandshakeRejected,
+        RouteCode::RedirectUnsafe => ErrorCode::RedirectUnsafe,
+        RouteCode::RedirectFailed => ErrorCode::RedirectFailed,
+        RouteCode::DrainInProgress => ErrorCode::DrainInProgress,
+        RouteCode::ReconciliationRequired => ErrorCode::ReconciliationRequired,
+        RouteCode::Internal => ErrorCode::Internal,
+    }
+}
+
+fn error_source_to_wire(source: RouteErrorSource) -> ErrorSource {
+    match source {
+        RouteErrorSource::Unspecified => ErrorSource::Unspecified,
+        RouteErrorSource::ClientNetwork => ErrorSource::ClientNetwork,
+        RouteErrorSource::BackendNetwork => ErrorSource::BackendNetwork,
+        RouteErrorSource::BackendSql => ErrorSource::BackendSql,
+        RouteErrorSource::Proxy => ErrorSource::Proxy,
+        RouteErrorSource::Control => ErrorSource::Control,
+        RouteErrorSource::Shutdown => ErrorSource::Shutdown,
+    }
+}
+
+pub(crate) fn route_assignment_from_wire(assignment: WireRouteAssignment) -> RouteAssignment {
+    let code = route_code_from_wire(assignment.code());
+    RouteAssignment {
+        connection_id: assignment.connection_id,
+        assignment_id: assignment.assignment_id,
+        backend_id: assignment.backend_id,
+        backend_address: assignment.backend_address,
+        cluster_name: assignment.cluster_name,
+        keyspace: assignment.keyspace,
+        healthy: assignment.healthy,
+        local: assignment.local,
+        code,
+        detail: assignment.detail,
+    }
+}
+
+pub(crate) fn route_result_to_wire(result: RouteResult) -> WireRouteResult {
+    WireRouteResult {
+        connection_id: result.connection_id,
+        assignment_id: result.assignment_id,
+        connected: result.connected,
+        error_source: error_source_to_wire(result.error_source).into(),
+        code: route_code_to_wire(result.code).into(),
+        detail: result.detail,
     }
 }
 
