@@ -21,7 +21,7 @@
 
 #![forbid(unsafe_code)]
 
-pub mod cluster_connect;
+mod cluster_connect;
 pub mod cluster_http;
 pub mod dns;
 mod dns_transport;
@@ -47,9 +47,6 @@ pub mod diagnostics {
     include!("generated/diagnosticspb.rs");
 }
 
-pub use cluster_connect::{
-    ClusterConnectError, ClusterConnector, MAX_CANDIDATES, MAX_PROBE_TIMEOUT,
-};
 pub use cluster_http::{
     ClusterHttpClient, ClusterHttpConfigError, ClusterHttpError, HEALTH_BODY_CAP, HttpProbePolicy,
 };

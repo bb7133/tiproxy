@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Owner-fenced, bounded raw TCP connector for one backend cluster (CP-TOPO
-//! #215-1).
+//! #215-1). Crate-private: it is never exposed outside `control-external`.
 //!
 //! [`ClusterConnector`] is the cluster-scoped DNS + TCP layer shared by every
 //! per-backend probe: the HTTP `/status` probe
@@ -26,13 +26,17 @@
 //! seam of Go `observer.DefaultHealthCheck`.
 //!
 //! One [`ClusterConnector::connect_once`] is a single fenced DNS resolve plus an
-//! in-order dial of the bounded candidate set. It carries NO deadline of its own:
-//! the caller bounds it (the HTTP probe under its one absolute attempt deadline,
-//! the SQL probe under Go's per-stage `DialTimeout`). Every awaited stage is
-//! fenced against the process [`OwnerToken`] AND the caller's source
-//! [`GenerationGate`] before and after it runs; a fence failure is TERMINAL and
-//! wins over any coincident DNS or I/O error, so a retired owner or a superseded
-//! routing source is never reported as a retryable transport failure.
+//! in-order dial of the bounded candidate set. It carries NO deadline of its own,
+//! which is exactly why it is crate-private: each public probe constructs its
+//! own connector with ITS stage budget as the resolver budget and bounds every
+//! `connect_once` under that same budget (the HTTP probe under its one absolute
+//! attempt deadline, the SQL probe under Go's per-stage `DialTimeout`), so no
+//! caller outside this crate can ever await it unbounded or pair it with a
+//! mismatched resolver budget. Every awaited stage is fenced against the process
+//! [`OwnerToken`] AND the caller's source [`GenerationGate`] before and after it
+//! runs; a fence failure is TERMINAL and wins over any coincident DNS or I/O
+//! error, so a retired owner or a superseded routing source is never reported as
+//! a retryable transport failure.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -48,19 +52,17 @@ use crate::explicit_dns::{Clock, DnsTransport, ExplicitResolver, ResolveError, S
 
 /// Upper bound on any single probe stage timeout (the HTTP attempt deadline and
 /// the SQL dial/read budget share it): five minutes.
-pub const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum resolved candidate addresses dialed within one connect, a bounded,
 /// order-preserving, de-duplicated subset (mirrors the etcd transport's bounded
 /// multi-address fallback).
-pub const MAX_CANDIDATES: usize = 8;
+pub(crate) const MAX_CANDIDATES: usize = 8;
 
-/// A stable single-connect failure class.
-///
-/// [`Self::is_retryable`] partitions the classes: a terminal class stops the
-/// policy layer's retry immediately, while a retryable class is a transient
-/// condition the policy layer may retry.
+/// A stable single-connect failure class. Each public probe maps it class for
+/// class into its own error, whose `is_retryable` partitions terminal from
+/// transient.
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum ClusterConnectError {
+pub(crate) enum ClusterConnectError {
     /// The process owner or the caller's source generation went stale
     /// mid-connect. Terminal, and it wins over any coincident DNS or I/O error.
     #[error("cluster connect fenced by a stale owner or source generation")]
@@ -78,15 +80,6 @@ pub enum ClusterConnectError {
     Transport,
 }
 
-impl ClusterConnectError {
-    /// Whether the policy layer may retry this failure: only a non-stale DNS
-    /// failure or a non-refused dial error.
-    #[must_use]
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Dns | Self::Transport)
-    }
-}
-
 /// An owner-fenced raw TCP connector for one backend cluster's DNS material.
 ///
 /// It privately holds the cluster's explicit-nameserver resolver (absent when no
@@ -95,7 +88,7 @@ impl ClusterConnectError {
 /// layered on top (the HTTP probe), not of the cluster dial. It is reusable
 /// across connects within one cluster-material/epoch.
 #[derive(Clone)]
-pub struct ClusterConnector {
+pub(crate) struct ClusterConnector {
     owner: OwnerToken,
     resolver: Option<Arc<ExplicitResolver>>,
 }
@@ -113,7 +106,7 @@ impl ClusterConnector {
     ///
     /// Returns the [`ResolveError`] of an unbuildable explicit-nameserver
     /// resolver (an invalid budget, too many or non-normalized `ns_servers`).
-    pub fn from_cluster_material(
+    pub(crate) fn from_cluster_material(
         config: &EtcdClientConfig,
         owner: OwnerToken,
         resolve_budget: Duration,
@@ -140,7 +133,7 @@ impl ClusterConnector {
     /// # Errors
     ///
     /// Returns [`ClusterConnectError::Fenced`] when either is stale.
-    pub fn fence(&self, source_gate: &GenerationGate) -> Result<(), ClusterConnectError> {
+    pub(crate) fn fence(&self, source_gate: &GenerationGate) -> Result<(), ClusterConnectError> {
         if self.owner.is_current() && source_gate.is_live() {
             Ok(())
         } else {
@@ -161,7 +154,7 @@ impl ClusterConnector {
     /// Returns [`ClusterConnectError::Fenced`] when the owner or `source_gate` is
     /// stale at any fence (terminal, wins over DNS and I/O), else the DNS or
     /// classified dial failure.
-    pub async fn connect_once(
+    pub(crate) async fn connect_once(
         &self,
         host: &str,
         port: u16,
@@ -364,14 +357,6 @@ mod tests {
         assert_eq!(capped[MAX_CANDIDATES - 1], sock([10, 0, 1, 7], 4000));
     }
 
-    #[test]
-    fn is_retryable_partitions_the_connect_classes() {
-        assert!(ClusterConnectError::Dns.is_retryable());
-        assert!(ClusterConnectError::Transport.is_retryable());
-        assert!(!ClusterConnectError::ConnectionRefused.is_retryable());
-        assert!(!ClusterConnectError::Fenced.is_retryable());
-    }
-
     // --- literal IP: no wire query ---------------------------------------
 
     #[tokio::test]
@@ -460,10 +445,6 @@ mod tests {
             unreachable!("a closed port cannot be dialed")
         };
         assert_eq!(error, ClusterConnectError::ConnectionRefused);
-        assert!(
-            !error.is_retryable(),
-            "refused is terminal: no retry, no backoff"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -484,7 +465,6 @@ mod tests {
         .await
         .unwrap_or_else(|_| unreachable!("test deadline"));
         assert_eq!(result.err(), Some(ClusterConnectError::Dns));
-        assert!(ClusterConnectError::Dns.is_retryable());
     }
 
     // --- generation revoke races: the fence wins over DNS and I/O ----------

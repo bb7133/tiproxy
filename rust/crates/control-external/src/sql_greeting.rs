@@ -47,15 +47,22 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
-use crate::cluster_connect::{ClusterConnectError, ClusterConnector, MAX_PROBE_TIMEOUT};
-use crate::etcd::GenerationGate;
+use control_plane::OwnerToken;
 
-/// A build-time rejection of the SQL-greeting probe policy.
-#[derive(Debug, Error, PartialEq, Eq)]
+use crate::cluster_connect::{ClusterConnectError, ClusterConnector, MAX_PROBE_TIMEOUT};
+use crate::etcd::{EtcdClientConfig, GenerationGate};
+use crate::explicit_dns::ResolveError;
+
+/// A build-time rejection of the SQL-greeting probe policy or material.
+#[derive(Debug, Error)]
 pub enum SqlGreetingConfigError {
-    /// The dial timeout is zero or over the five-minute probe bound.
+    /// The dial timeout is zero or over the five-minute probe bound. Checked
+    /// before any resolver is built.
     #[error("invalid SQL greeting dial timeout {0:?}")]
     InvalidDialTimeout(Duration),
+    /// The cluster's explicit-nameserver resolver could not be built.
+    #[error("SQL greeting probe explicit nameserver resolver could not be built")]
+    Resolver(#[source] ResolveError),
 }
 
 /// A stable single-attempt SQL-greeting failure class.
@@ -128,20 +135,33 @@ pub struct SqlGreetingProbe {
 }
 
 impl SqlGreetingProbe {
-    /// Builds the probe over the cluster's raw connector with Go's `DialTimeout`,
-    /// which bounds the dial stage and, separately and afresh, the read stage.
+    /// Builds the probe from one cluster's etcd client material, the process
+    /// owner token, and Go's `DialTimeout`, which bounds the dial stage and,
+    /// separately and afresh, the read stage.
+    ///
+    /// The cluster's raw connector is built HERE, with this same `dial_timeout`
+    /// as its explicit-nameserver resolution budget, so Go's "DNS + connect share
+    /// one whole `DialTimeout`" holds by construction: no caller can pair the
+    /// probe with a connector whose resolver budget is shorter than the dial
+    /// budget. The status-port TLS material is deliberately not consulted.
     ///
     /// # Errors
     ///
     /// Returns [`SqlGreetingConfigError::InvalidDialTimeout`] when
-    /// `dial_timeout` is zero or above the five-minute probe bound.
-    pub fn new(
-        connector: ClusterConnector,
+    /// `dial_timeout` is zero or above the five-minute probe bound (checked
+    /// before any resolver is built), or
+    /// [`SqlGreetingConfigError::Resolver`] when the cluster's explicit
+    /// nameservers cannot form a resolver.
+    pub fn from_cluster_material(
+        config: &EtcdClientConfig,
+        owner: OwnerToken,
         dial_timeout: Duration,
     ) -> Result<Self, SqlGreetingConfigError> {
         if dial_timeout.is_zero() || dial_timeout > MAX_PROBE_TIMEOUT {
             return Err(SqlGreetingConfigError::InvalidDialTimeout(dial_timeout));
         }
+        let connector = ClusterConnector::from_cluster_material(config, owner, dial_timeout)
+            .map_err(SqlGreetingConfigError::Resolver)?;
         Ok(Self {
             connector,
             dial_timeout,
@@ -232,7 +252,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{SqlGreetingConfigError, SqlGreetingError, SqlGreetingProbe};
-    use crate::cluster_connect::{ClusterConnectError, ClusterConnector, MAX_PROBE_TIMEOUT};
+    use crate::cluster_connect::{ClusterConnectError, MAX_PROBE_TIMEOUT};
     use crate::etcd::GenerationGate;
     use crate::probe_test_support::{
         ns_config, owner_lease, plaintext_config, spawn_dns_with_delay,
@@ -335,21 +355,17 @@ mod tests {
         addr
     }
 
-    fn probe(connector: ClusterConnector) -> SqlGreetingProbe {
-        SqlGreetingProbe::new(connector, DIAL_TIMEOUT)
+    /// A probe over a plaintext, system-resolver cluster at `DIAL_TIMEOUT`.
+    fn plaintext_probe(owner: control_plane::OwnerToken) -> SqlGreetingProbe {
+        SqlGreetingProbe::from_cluster_material(&plaintext_config(), owner, DIAL_TIMEOUT)
             .unwrap_or_else(|error| unreachable!("probe: {error}"))
-    }
-
-    fn plaintext_connector(owner: control_plane::OwnerToken) -> ClusterConnector {
-        ClusterConnector::from_cluster_material(&plaintext_config(), owner, DIAL_TIMEOUT)
-            .unwrap_or_else(|error| unreachable!("connector: {error}"))
     }
 
     /// One literal-IP attempt against a scripted greeter, with its wall time.
     async fn check_literal(greeting: Greeting) -> (Result<(), SqlGreetingError>, Duration) {
         let (_registry, lease) = owner_lease();
         let addr = spawn_greeter(greeting).await;
-        let probe = probe(plaintext_connector(lease.token()));
+        let probe = plaintext_probe(lease.token());
         let gate = GenerationGate::new();
         let started = Instant::now();
         let result = tokio::time::timeout(
@@ -363,20 +379,54 @@ mod tests {
 
     // --- policy and classification ----------------------------------------
 
+    // --- construction: the ONLY public entry, bounded by construction --------
+
     #[test]
-    fn new_rejects_a_zero_or_overbound_dial_timeout() {
+    fn construction_rejects_a_zero_or_overbound_dial_timeout_before_any_resolver() {
         let (_registry, lease) = owner_lease();
-        let connector = plaintext_connector(lease.token());
-        assert_eq!(
-            SqlGreetingProbe::new(connector.clone(), Duration::ZERO).err(),
-            Some(SqlGreetingConfigError::InvalidDialTimeout(Duration::ZERO))
-        );
+        // An explicit-NS config whose resolver WOULD build: the timeout check
+        // must reject first, so the resolver is never constructed.
+        let config = ns_config(1, None);
+        assert!(matches!(
+            SqlGreetingProbe::from_cluster_material(&config, lease.token(), Duration::ZERO),
+            Err(SqlGreetingConfigError::InvalidDialTimeout(timeout)) if timeout.is_zero()
+        ));
         let over = MAX_PROBE_TIMEOUT + Duration::from_secs(1);
-        assert_eq!(
-            SqlGreetingProbe::new(connector.clone(), over).err(),
-            Some(SqlGreetingConfigError::InvalidDialTimeout(over))
+        assert!(matches!(
+            SqlGreetingProbe::from_cluster_material(&config, lease.token(), over),
+            Err(SqlGreetingConfigError::InvalidDialTimeout(timeout)) if timeout == over
+        ));
+        assert!(
+            SqlGreetingProbe::from_cluster_material(&config, lease.token(), MAX_PROBE_TIMEOUT)
+                .is_ok(),
+            "the bound itself is accepted"
         );
-        assert!(SqlGreetingProbe::new(connector, MAX_PROBE_TIMEOUT).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_resolver_budget_is_the_dial_timeout_by_construction() {
+        // The nameserver answers only after 0.8 x DialTimeout. A connector built
+        // with ANY shorter resolver budget would fail DNS; because the public
+        // constructor uses the dial timeout itself as the budget, it succeeds.
+        let (_registry, lease) = owner_lease();
+        let addr = spawn_greeter(Greeting::V10).await;
+        let dns_port =
+            spawn_dns_with_delay(vec![Ipv4Addr::LOCALHOST], vec![], DIAL_TIMEOUT.mul_f32(0.8))
+                .await;
+        let probe = SqlGreetingProbe::from_cluster_material(
+            &ns_config(dns_port, None),
+            lease.token(),
+            DIAL_TIMEOUT,
+        )
+        .unwrap_or_else(|error| unreachable!("probe: {error}"));
+        let gate = GenerationGate::new();
+        let result = tokio::time::timeout(
+            TEST_DEADLINE,
+            probe.check_once("tidb.internal", addr.port(), &gate),
+        )
+        .await
+        .unwrap_or_else(|_| unreachable!("test deadline"));
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
@@ -453,7 +503,7 @@ mod tests {
             .unwrap_or_else(|error| unreachable!("addr: {error}"))
             .port();
         drop(listener);
-        let probe = probe(plaintext_connector(lease.token()));
+        let probe = plaintext_probe(lease.token());
         let gate = GenerationGate::new();
         let started = Instant::now();
         let result = probe.check_once("127.0.0.1", port, &gate).await;
@@ -504,13 +554,12 @@ mod tests {
         let stage = DIAL_TIMEOUT.mul_f32(0.6);
         let addr = spawn_greeter(Greeting::DelayedV10(stage)).await;
         let dns_port = spawn_dns_with_delay(vec![Ipv4Addr::LOCALHOST], vec![], stage).await;
-        let connector = ClusterConnector::from_cluster_material(
+        let probe = SqlGreetingProbe::from_cluster_material(
             &ns_config(dns_port, None),
             lease.token(),
             DIAL_TIMEOUT,
         )
-        .unwrap_or_else(|error| unreachable!("connector: {error}"));
-        let probe = probe(connector);
+        .unwrap_or_else(|error| unreachable!("probe: {error}"));
         let gate = GenerationGate::new();
         let started = Instant::now();
         let result = tokio::time::timeout(
@@ -541,7 +590,7 @@ mod tests {
         let (_registry, lease) = owner_lease();
         let release = Arc::new(Notify::new());
         let addr = spawn_greeter(Greeting::ByteAfterRelease(Arc::clone(&release))).await;
-        let probe = probe(plaintext_connector(lease.token()));
+        let probe = plaintext_probe(lease.token());
         let gate = Arc::new(GenerationGate::new());
         let revoker = Arc::clone(&gate);
         tokio::spawn(async move {
@@ -569,7 +618,7 @@ mod tests {
     async fn a_revoked_owner_is_fenced_before_any_dial() {
         let (_registry, lease) = owner_lease();
         let addr = spawn_greeter(Greeting::V10).await;
-        let probe = probe(plaintext_connector(lease.token()));
+        let probe = plaintext_probe(lease.token());
         drop(lease);
         let gate = GenerationGate::new();
         let result = probe.check_once("127.0.0.1", addr.port(), &gate).await;

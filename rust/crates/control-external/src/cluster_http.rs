@@ -16,9 +16,10 @@
 //!
 //! [`ClusterHttpClient`] owns the TLS/HTTP exchange for one backend cluster's
 //! per-backend `/status` health read (CP-TOPO #213-1) over the cluster's shared
-//! owner-fenced raw connector ([`ClusterConnector`], CP-TOPO #215-1: the
-//! explicit-nameserver resolver — or the system resolver when no `ns_servers` are
-//! configured — plus the bounded candidate dial). It applies the cluster's
+//! crate-private owner-fenced raw connector (`ClusterConnector`, CP-TOPO #215-1:
+//! the explicit-nameserver resolver — or the system resolver when no `ns_servers`
+//! are configured — plus the bounded candidate dial, built here with this
+//! probe's attempt timeout as the resolver budget). It applies the cluster's
 //! advanced TLS material
 //! ([`EtcdTlsConfig::client_config`](crate::etcd::EtcdTlsConfig)) on top, so a
 //! probe honors the exact DNS and TLS policy the cluster's etcd transport already
