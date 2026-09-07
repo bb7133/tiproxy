@@ -14,6 +14,8 @@ single-process Rust migration.
   and the Rust process-local control runtime.
 - `cp003/`: production Go versus Rust etcd lease/election parity, including
   transient outage, lease loss, compacted watch, and subprocess-death faults.
+- `cproute/`: production Go versus Rust normalized routing policy and
+  namespace-binding projection, before routing ownership moves.
 
 Run the gates:
 
@@ -22,6 +24,7 @@ make controlplane-contracts
 make controlplane-differential-self-test
 make controlplane-cp001-evidence
 make controlplane-cp003-evidence
+make controlplane-cproute-evidence
 go test ./tests/controlplane/...
 ```
 

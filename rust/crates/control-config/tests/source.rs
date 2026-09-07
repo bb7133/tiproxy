@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex};
 use control_config::{
     CandidateValidator, ConfigError, ConfigModule, ConfigModuleOptions, ConfigNamespaceSource,
     ConfigNamespaceStore, EffectiveConfig, NamespaceConfig, PersistentConfigSnapshot,
-    PreparedArtifact, SourceRevision, StoreError, decode_persistent_entries,
+    PreparedArtifact, RoutingBalancePolicy, RoutingRule, RoutingSelectionPolicy, SourceRevision,
+    StoreError, decode_persistent_entries,
 };
 use control_etcd::ElectionConfig;
 use control_external::EtcdClientConfig;
@@ -100,6 +101,177 @@ impl CandidateValidator for RecordingValidator {
 
 fn current_dir() -> &'static Path {
     Path::new("/var/lib/tiproxy-test")
+}
+
+fn assert_same_float(actual: f64, expected: f64) {
+    assert_eq!(actual.to_bits(), expected.to_bits());
+}
+
+#[test]
+fn routing_projection_has_go_compatible_defaults() {
+    let store = ConfigNamespaceStore::from_toml(&[], None, current_dir())
+        .unwrap_or_else(|error| unreachable!("default config: {error}"));
+    let snapshot = store.current();
+    let routing = snapshot
+        .effective()
+        .routing()
+        .unwrap_or_else(|error| unreachable!("routing projection: {error}"));
+
+    assert_eq!(routing.routing_rule, RoutingRule::MatchAll);
+    assert_eq!(routing.balance_policy, RoutingBalancePolicy::Resource);
+    assert_eq!(routing.selection_policy, RoutingSelectionPolicy::PreferIdle);
+    assert!(routing.label_name.is_empty());
+    assert!(routing.proxy_labels.is_empty());
+    assert!(routing.failed_backends.is_empty());
+    assert_eq!(routing.failover_timeout_seconds, 60);
+    for rate in [
+        routing.status.migrations_per_second,
+        routing.health.migrations_per_second,
+        routing.memory.migrations_per_second,
+        routing.cpu.migrations_per_second,
+        routing.location.migrations_per_second,
+        routing.connection.migrations_per_second,
+    ] {
+        assert_same_float(rate, 0.0);
+    }
+    assert_same_float(routing.connection.count_ratio_threshold, 0.0);
+}
+
+#[test]
+fn routing_projection_preserves_normalized_policy_and_namespace_binding() {
+    let store = ConfigNamespaceStore::from_toml(
+        br#"
+[proxy]
+fail-backend-list = [" tidb-1:4000 ", "tidb-2", "tidb-1:4000"]
+failover-timeout = 17
+
+[balance]
+label-name = "tenant"
+routing-rule = "port"
+policy = "location"
+routing-policy = "random"
+
+[balance.status]
+migrations-per-second = 1.5
+[balance.health]
+migrations-per-second = 2.5
+[balance.memory]
+migrations-per-second = 3.5
+[balance.cpu]
+migrations-per-second = 4.5
+[balance.location]
+migrations-per-second = 5.5
+[balance.conn-count]
+migrations-per-second = 6.5
+count-ratio-threshold = 1.25
+
+[labels]
+zone = "z1"
+region = "r1"
+"#,
+        None,
+        current_dir(),
+    )
+    .unwrap_or_else(|error| unreachable!("custom config: {error}"));
+    let routing = store
+        .current()
+        .effective()
+        .routing()
+        .unwrap_or_else(|error| unreachable!("routing projection: {error}"));
+
+    assert_eq!(routing.routing_rule, RoutingRule::ListenerPort);
+    assert_eq!(routing.balance_policy, RoutingBalancePolicy::Location);
+    assert_eq!(routing.selection_policy, RoutingSelectionPolicy::Random);
+    assert_eq!(routing.label_name.as_ref(), "tenant");
+    assert_eq!(
+        routing
+            .proxy_labels
+            .iter()
+            .map(|(name, value)| (name.as_ref(), value.as_ref()))
+            .collect::<Vec<_>>(),
+        vec![("region", "r1"), ("zone", "z1")]
+    );
+    assert_eq!(
+        routing
+            .failed_backends
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>(),
+        vec!["tidb-1:4000", "tidb-2"]
+    );
+    assert_eq!(routing.failover_timeout_seconds, 17);
+    assert_same_float(routing.status.migrations_per_second, 1.5);
+    assert_same_float(routing.health.migrations_per_second, 2.5);
+    assert_same_float(routing.memory.migrations_per_second, 3.5);
+    assert_same_float(routing.cpu.migrations_per_second, 4.5);
+    assert_same_float(routing.location.migrations_per_second, 5.5);
+    assert_same_float(routing.connection.migrations_per_second, 6.5);
+    assert_same_float(routing.connection.count_ratio_threshold, 1.25);
+
+    let namespace: NamespaceConfig = serde_json::from_str(
+        r#"{
+            "namespace":"sales",
+            "frontend":{"user":"alice"},
+            "backend":{"instances":["10.0.0.1:4000","10.0.0.2:4000"]}
+        }"#,
+    )
+    .unwrap_or_else(|error| unreachable!("namespace: {error}"));
+    let binding = namespace.routing();
+    assert_eq!(binding.name.as_ref(), "sales");
+    assert_eq!(
+        binding
+            .users
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>(),
+        vec!["alice"]
+    );
+    assert_eq!(
+        binding
+            .backend_instances
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>(),
+        vec!["10.0.0.1:4000", "10.0.0.2:4000"]
+    );
+    assert!(binding.backend_tls.ca_path.is_none());
+}
+
+#[test]
+fn invalid_or_overflowed_routing_inputs_retain_the_exact_last_good_generation() {
+    let store = ConfigNamespaceStore::from_toml(&[], None, current_dir())
+        .unwrap_or_else(|error| unreachable!("default config: {error}"));
+    let last_good = store.current();
+    let invalid = [
+        "[balance.health]\nmigrations-per-second = -1\n",
+        "[balance.conn-count]\ncount-ratio-threshold = 1\n",
+        "[proxy]\nfailover-timeout = -1\n",
+        "[proxy]\nfailover-timeout = 9223372036854775808\n",
+    ];
+
+    for (index, candidate) in invalid.into_iter().enumerate() {
+        let revision = u64::try_from(index + 2)
+            .unwrap_or_else(|_| unreachable!("small test revision fits u64"));
+        assert!(
+            store
+                .apply_toml(candidate.as_bytes(), None, revision, current_dir())
+                .is_err(),
+            "candidate {index} must fail closed"
+        );
+        let retained = store.current();
+        assert!(Arc::ptr_eq(&retained, &last_good));
+        assert_eq!(retained.generation(), 1);
+        assert_eq!(
+            retained
+                .effective()
+                .routing()
+                .unwrap_or_else(|error| unreachable!("last-good projection: {error}")),
+            last_good
+                .effective()
+                .routing()
+                .unwrap_or_else(|error| unreachable!("last-good projection: {error}"))
+        );
+    }
 }
 
 #[test]

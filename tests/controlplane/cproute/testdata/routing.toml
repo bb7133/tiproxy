@@ -1,0 +1,27 @@
+[proxy]
+fail-backend-list = [" tidb-1:4000 ", "tidb-2", "tidb-1:4000"]
+failover-timeout = 17
+
+[balance]
+label-name = "tenant"
+routing-rule = "port"
+policy = "location"
+routing-policy = "random"
+
+[balance.status]
+migrations-per-second = 1.5
+[balance.health]
+migrations-per-second = 2.5
+[balance.memory]
+migrations-per-second = 3.5
+[balance.cpu]
+migrations-per-second = 4.5
+[balance.location]
+migrations-per-second = 5.5
+[balance.conn-count]
+migrations-per-second = 6.5
+count-ratio-threshold = 1.25
+
+[labels]
+zone = "z1"
+region = "r1"

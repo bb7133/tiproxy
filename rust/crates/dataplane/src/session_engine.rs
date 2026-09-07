@@ -79,9 +79,9 @@ use control_proto::snapshot::ValidatedSnapshot;
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
     ConnectionIdentity, ControlEnvelope, ErrorCode, ErrorSource as WireErrorSource,
-    HandshakeMetadata, HandshakeResponseEvent, Priority, ProxyProtocolMode, RouteAssignment,
-    RouteRequest, RouteResult,
+    HandshakeMetadata, HandshakeResponseEvent, Priority, ProxyProtocolMode, RouteRequest,
 };
+use control_routing::{RouteAssignment, RouteResult};
 use mysql_wire::{
     Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams, StatusFlags,
     encode_error_packet, encode_handshake_response, encode_initial_handshake, encode_ssl_request,
@@ -140,7 +140,9 @@ use crate::observability::{
 use crate::route::{
     AcquireError, CenteredJitter, DialSchedule, RouteChannel, RouteChannelError, RouteEngine,
 };
-use crate::route_control::{ClusterTcpDialer, TrafficTotals};
+use crate::route_control::{
+    ClusterTcpDialer, TrafficTotals, route_assignment_from_wire, route_result_to_wire,
+};
 use crate::server::{AcceptedConnection, ConnectionFuture, SessionSeat};
 use crate::session::{
     EffectHandler, SessionControl, SessionEnd, SessionEventSource, SessionLoop, SessionLoopConfig,
@@ -521,7 +523,7 @@ impl RouteChannel for BindingRouteChannel {
                 return Err(RouteChannelError::ControlLost);
             };
             if let Some(Body::RouteAssignment(assignment)) = envelope.body {
-                return Ok(assignment);
+                return Ok(route_assignment_from_wire(assignment));
             }
             // A correlated non-assignment here is a dispatcher routing
             // bug; skip defensively rather than act on it.
@@ -529,7 +531,7 @@ impl RouteChannel for BindingRouteChannel {
     }
 
     async fn report_result(&mut self, result: RouteResult) -> Result<(), RouteChannelError> {
-        self.send_durable(Body::RouteResult(result))
+        self.send_durable(Body::RouteResult(route_result_to_wire(result)))
             .await
             .map(|_| ())
     }

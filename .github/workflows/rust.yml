@@ -87,6 +87,8 @@ jobs:
         run: make controlplane-cp003-evidence
       - name: Run CP-CFG/NS differential and real-etcd evidence
         run: make controlplane-cp004-evidence
+      - name: Run CP-ROUTE config and namespace projection evidence
+        run: make controlplane-cproute-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests

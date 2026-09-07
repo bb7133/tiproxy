@@ -12,6 +12,7 @@ default = []
 
 [dependencies]
 control-proto.workspace = true
+control-routing.workspace = true
 mysql-wire.workspace = true
 proxy-io.workspace = true
 session-core.workspace = true
