@@ -2086,7 +2086,7 @@ mod routing_generation_semantics {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::service::TowerToHyperService;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{Notify, watch};
+    use tokio::sync::{Notify, oneshot, watch};
     use tonic::codegen::{BoxFuture, Context, Poll, Service, http};
     use tonic::server::{Grpc, NamedService, UnaryService};
     use tonic_prost::ProstCodec;
@@ -2527,6 +2527,100 @@ ns-servers = [{ns_servers}]
         }
     }
 
+    /// Cancels and joins the wall-clock watchdog thread on EVERY exit — the
+    /// success path, the deadline `panic!`, or a `body` unwind — so a failing test
+    /// never leaves a thread still counting toward 120s. Dropping the cancel sender
+    /// disconnects the thread's `recv_timeout`, which it treats as a cancel and
+    /// returns at once, so the `join` is immediate.
+    struct WatchdogGuard {
+        cancel: Option<std::sync::mpsc::Sender<()>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            drop(self.cancel.take());
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Runs `body` under a REAL wall-clock deadlock watchdog, immune to the test's
+    /// paused virtual clock.
+    ///
+    /// A `tokio::time::timeout` cannot be used here: it runs on the paused clock,
+    /// so the instant `body` parks on real loopback I/O the runtime auto-advances
+    /// virtual time to the deadline and the "120s" timeout trips at once — a false
+    /// deadlock (see the discriminator below). Instead a std thread counts REAL
+    /// time via `recv_timeout`; only a genuine wall-clock hang fires the oneshot.
+    /// The `select!` resolves to an outcome first; the guard then cancels + joins
+    /// the thread on every path before we act on that outcome.
+    async fn with_real_wall_clock_watchdog<F>(body: F)
+    where
+        F: Future<Output = ()>,
+    {
+        enum Outcome {
+            Body,
+            Deadline,
+        }
+        let (deadline_tx, deadline_rx) = oneshot::channel::<()>();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            match cancel_rx.recv_timeout(Duration::from_secs(120)) {
+                // A real wall-clock hang: fire the deadline.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = deadline_tx.send(());
+                }
+                // Cancelled (sender dropped/disconnected) — return without firing.
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        });
+        let guard = WatchdogGuard {
+            cancel: Some(cancel_tx),
+            handle: Some(handle),
+        };
+        let outcome = tokio::select! {
+            () = body => Outcome::Body,
+            _ = deadline_rx => Outcome::Deadline,
+        };
+        // Cancel + join the watchdog thread BEFORE acting on the outcome, so the
+        // deadline `panic!` never skips the join. (A `body` unwind reaches the same
+        // cancel + join through `guard`'s `Drop`.)
+        drop(guard);
+        if matches!(outcome, Outcome::Deadline) {
+            unreachable!(
+                "real wall-clock watchdog: the composition test exceeded 120s of REAL time"
+            );
+        }
+    }
+
+    /// The determinism fix's own oracle: a `tokio::time::timeout` under a paused
+    /// clock FALSELY reports a deadlock, while [`with_real_wall_clock_watchdog`]
+    /// does not — even though the paused virtual clock keeps auto-advancing.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_timeout_falsely_trips_while_the_real_watchdog_does_not() {
+        // Old pattern: a virtual-clock `timeout` over a never-ready future
+        // auto-advances the paused clock to the deadline and trips immediately.
+        let tripped =
+            tokio::time::timeout(Duration::from_secs(120), std::future::pending::<()>()).await;
+        assert!(
+            tripped.is_err(),
+            "a paused-clock `timeout` falsely reports a deadlock on a pending future"
+        );
+        // New pattern: a body that only completes after a real std-thread schedule
+        // (a cross-thread oneshot handshake) is NOT tripped by the real wall-clock
+        // watchdog, though the paused virtual clock still auto-advances underneath.
+        with_real_wall_clock_watchdog(async {
+            let (tx, rx) = oneshot::channel::<()>();
+            std::thread::spawn(move || {
+                let _ = tx.send(());
+            });
+            let _ = rx.await;
+        })
+        .await;
+    }
+
     // ----- Row 1: same client_epoch, content change -> generation +1 --------
 
     #[tokio::test(start_paused = true)]
@@ -2580,12 +2674,7 @@ ns-servers = [{ns_servers}]
             comp.task.abort();
             drop(comp.runtime);
         };
-        if tokio::time::timeout(Duration::from_secs(120), body)
-            .await
-            .is_err()
-        {
-            unreachable!("row 1 completes within the deadlock watchdog");
-        }
+        with_real_wall_clock_watchdog(body).await;
     }
 
     // ----- Row 2: equal-content epoch rotation -> generation +1 -------------
@@ -2652,12 +2741,7 @@ ns-servers = [{ns_servers}]
             comp.task.abort();
             drop(comp.runtime);
         };
-        if tokio::time::timeout(Duration::from_secs(120), body)
-            .await
-            .is_err()
-        {
-            unreachable!("row 2 completes within the deadlock watchdog");
-        }
+        with_real_wall_clock_watchdog(body).await;
     }
 
     // ----- Row 3: old Arc fail-closed at BOTH the swap seam and teardown ----
@@ -2722,11 +2806,6 @@ ns-servers = [{ns_servers}]
                 .finish()
                 .unwrap_or_else(|error| unreachable!("finish: {error}"));
         };
-        if tokio::time::timeout(Duration::from_secs(120), body)
-            .await
-            .is_err()
-        {
-            unreachable!("row 3 completes within the deadlock watchdog");
-        }
+        with_real_wall_clock_watchdog(body).await;
     }
 }
