@@ -1,0 +1,21 @@
+# id	action	port (- empty)	cluster (- empty)	group
+initial-missing	get	4000	-	-
+ignore-empty	bind	-	alpha	one
+empty-missing	get	-	-	-
+first-owner	bind	4000	alpha	one
+same-owner-last-wins	bind	4000	alpha	two
+cross-cluster-conflict	bind	4000	beta	three
+original-owner-cannot-heal	bind	4000	alpha	four
+other-owner-cannot-heal	bind	4000	beta	five
+still-blocked	get	4000	-	-
+other-port-unaffected	bind	4001	beta	six
+raw-port-not-normalized	bind	04000	alpha	seven
+case-sensitive-owner	bind	4001	Beta	eight
+legacy-owner-first	bind	4002	-	nine
+legacy-owner-rebind	bind	4002	-	ten
+legacy-vs-named-conflict	bind	4002	alpha	eleven
+new-inventory	reset	4000	-	-
+rebuild-recovers	bind	4000	alpha	twelve
+rebuilt-unrelated-absent	get	4001	-	-
+reverse-order-first	bind	5000	beta	thirteen
+reverse-order-conflict	bind	5000	alpha	fourteen
