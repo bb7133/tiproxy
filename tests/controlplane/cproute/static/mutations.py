@@ -20,6 +20,14 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-static-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
+        # The isolated build shares a target directory across runs for dependency
+        # reuse. copytree preserves source mtimes, so a workspace crate could
+        # otherwise be judged "fresh" against a fingerprint left by a previous
+        # (mutated) build and its stale artifact reused. Touch every workspace
+        # source so the workspace crates are always rebuilt; registry
+        # dependencies stay cached.
+        for source in (root / "rust/crates").rglob("*.rs"):
+            os.utime(source, None)
         # Isolated build under the repository target directory so dependency
         # artifacts are reused (and cached by CI); mutated sources live only in
         # the temporary copy.
@@ -42,12 +50,18 @@ def main():
         base = root / "rust/crates/control-topology/src"
         originals = {name: (base / name).read_text() for name in ["module.rs", "static_source.rs", "backend_health.rs"]}
         cases = [
-            ("mode-from-pending-config-not-applied-plan", "module.rs", [
-                ("        statics.apply_mode(self.mode.applied());",
-                 "        statics.apply_mode(Some(if snapshot.topology().is_ok_and(|t| t.backend_clusters.is_empty()) { BackendSourceMode::Static } else { BackendSourceMode::Dynamic }));")]),
+            ("rejected-generation-publishes-pending-config-mode", "module.rs", [
+                ("        let outcome = self\n            .reconfigure(children, active_plan, snapshot, owner, health, statics)\n            .await;\n",
+                 "        let outcome = self\n            .reconfigure(children, active_plan, snapshot, owner, health, statics)\n            .await;\n        if outcome.is_err() {\n            let pending = if snapshot.topology().is_ok_and(|t| t.backend_clusters.is_empty()) { BackendSourceMode::Static } else { BackendSourceMode::Dynamic };\n            statics.apply_mode(Some(pending));\n            self.mode.publish(pending);\n        }\n")]),
             ("namespaces-reconciled-only-on-accepted-generations", "module.rs", [
-                ("        statics.reconcile(\n            snapshot,\n            owner,\n            &self.health_runtime,\n            &self.source,\n            self.mode.applied(),\n        );\n        let outcome = self\n            .reconfigure(children, active_plan, snapshot, owner, health)\n            .await;",
-                 "        let outcome = self\n            .reconfigure(children, active_plan, snapshot, owner, health)\n            .await;\n        if outcome.is_ok() {\n            statics.reconcile(snapshot, owner, &self.health_runtime, &self.source, self.mode.applied());\n        }")]),
+                ("        statics.reconcile(\n            snapshot,\n            owner,\n            &self.health_runtime,\n            &self.source,\n            self.mode.applied(),\n        );\n        let outcome = self\n            .reconfigure(children, active_plan, snapshot, owner, health, statics)\n            .await;",
+                 "        let outcome = self\n            .reconfigure(children, active_plan, snapshot, owner, health, statics)\n            .await;\n        if outcome.is_ok() {\n            statics.reconcile(snapshot, owner, &self.health_runtime, &self.source, self.mode.applied());\n        }")]),
+            ("mode-revoked-only-at-publish", "module.rs", [
+                ("        let mode_changes = self.mode.applied() != Some(next_mode);\n        if mode_changes {\n            self.mode.revoke();\n        }\n",
+                 "        let mode_changes = self.mode.applied() != Some(next_mode);\n")]),
+            ("static-parked-after-epoch-publish", "module.rs", [
+                ("            statics.apply_mode(Some(next_mode));\n            self.mode.publish(next_mode);",
+                 "            self.mode.publish(next_mode);\n            statics.apply_mode(Some(next_mode));")]),
             ("mode-identity-by-value-not-epoch", "static_source.rs", [
                 ("        if !Arc::ptr_eq(&snapshot.epoch, &current) || !snapshot.epoch.is_live() {",
                  "        if snapshot.epoch.mode != current.mode || !current.is_live() {")]),

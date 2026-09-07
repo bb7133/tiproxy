@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -22,13 +22,14 @@ use control_plane::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 
 use super::{BackendSourceHandle, BackendSourceMode, BackendSourceSnapshot, ModePublisher};
 use crate::discovery_publish::EpochResult;
 use crate::health_overlay::HealthOverlayPublisher;
 use crate::merge::MergedTopology;
-use crate::module::{TopologyClientFactory, TopologyClusterClient, TopologyModule};
+use crate::module::tests::kv_fixture::{FixtureFactory, spawn_fixture};
+use crate::module::{ChildRunner, TopologyClientFactory, TopologyClusterClient, TopologyModule};
 use crate::resolver::StaticAdvertiseResolver;
 use crate::routing_snapshot::RoutingSnapshotPublisher;
 use crate::static_source::{RegisteredProducer, StaticRegistry};
@@ -237,6 +238,37 @@ async fn spawn_module(
     store: ConfigNamespaceStore,
     health: HealthCheckConfig,
 ) -> TestResult<Module> {
+    let reject = Arc::new(AtomicBool::new(false));
+    let spawned_children = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&spawned_children);
+    let runner: ChildRunner = Arc::new(move |_owner, _connector, _info, _timeout, mut shutdown| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let _ = shutdown.changed().await;
+            Ok(())
+        })
+    });
+    spawn_module_with(
+        store,
+        health,
+        Box::new(Factory {
+            reject: Arc::clone(&reject),
+        }),
+        runner,
+        reject,
+        spawned_children,
+    )
+    .await
+}
+
+async fn spawn_module_with(
+    store: ConfigNamespaceStore,
+    health: HealthCheckConfig,
+    factory: Box<dyn TopologyClientFactory>,
+    runner: ChildRunner,
+    reject: Arc<AtomicBool>,
+    spawned_children: Arc<AtomicUsize>,
+) -> TestResult<Module> {
     let registry = Box::leak(Box::new(OwnershipRegistry::new()));
     let runtime = ControlRuntime::claim_process(
         registry,
@@ -251,15 +283,10 @@ async fn spawn_module(
         )?,
         Arc::new(NullSink),
     )?;
-    let reject = Arc::new(AtomicBool::new(false));
-    let spawned_children = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&spawned_children);
     let source: Arc<dyn ConfigNamespaceSource> = Arc::new(store);
     let (module, mut handle) = TopologyModule::new_with_child_runner_and_connector(
         source,
-        Box::new(Factory {
-            reject: Arc::clone(&reject),
-        }),
+        factory,
         Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
         TopologyRuntimeIdentity {
             version: Arc::from("v-test"),
@@ -268,13 +295,7 @@ async fn spawn_module(
             start_timestamp: 1_700_000_000,
         },
         health,
-        Arc::new(move |_owner, _connector, _info, _timeout, mut shutdown| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                let _ = shutdown.changed().await;
-                Ok(())
-            })
-        }),
+        runner,
         Arc::new(|owner, client| {
             Box::pin(async move { EtcdConnector::new(owner, client).connect().await })
         }),
@@ -545,6 +566,35 @@ async fn a_removed_namespace_fails_closed_at_the_source_and_recreation_is_new() 
     Ok(())
 }
 
+/// Installs the synchronous publish hook that records, at the very instant the
+/// Dynamic epoch is published, whether the bound static overlay is still
+/// authoritative (it must not be: the producer is parked before the publish).
+fn pin_dynamic_publish_boundary(
+    module: &Module,
+    handle: &BackendSourceHandle,
+) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+    let hook_fired = Arc::new(AtomicBool::new(false));
+    let static_live_at_publish = Arc::new(AtomicBool::new(false));
+    let (static_routing, static_health) = handle.static_side().clone();
+    let fired = Arc::clone(&hook_fired);
+    let live = Arc::clone(&static_live_at_publish);
+    *module
+        .handle
+        .mode_publish_hook()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move |epoch| {
+        if epoch.mode() == BackendSourceMode::Dynamic {
+            fired.store(true, Ordering::SeqCst);
+            if let Some(r) = static_routing.current()
+                && static_health.current_for(&r).is_some()
+            {
+                live.store(true, Ordering::SeqCst);
+            }
+        }
+    }));
+    (hook_fired, static_live_at_publish)
+}
+
 // ================================================================
 // S5: mode follows the APPLIED plan. Static→Dynamic parks the producer (no
 // probing, unroutable); a probe held across the switch cannot publish;
@@ -580,7 +630,13 @@ async fn mode_follows_the_applied_plan_and_parks_the_static_producer() -> TestRe
         gated.current().is_none(),
         "no H before the first round completes"
     );
+    // Let round 1 complete so the static side has a LIVE H, then hold round 2
+    // in flight across the mode switch.
+    gate.release(1);
+    let live_static = wait_snapshot(&gated, |_| true).await?;
+    gate.wait_accepted(2).await?;
 
+    let (hook_fired, static_live_at_publish) = pin_dynamic_publish_boundary(&module, &gated);
     apply(
         &observed,
         &one_cluster_config(),
@@ -588,6 +644,14 @@ async fn mode_follows_the_applied_plan_and_parks_the_static_producer() -> TestRe
         4,
     )?;
     wait_applied(&module, 4).await?;
+    assert!(
+        hook_fired.load(Ordering::SeqCst),
+        "the Dynamic publish was observed"
+    );
+    assert!(
+        !static_live_at_publish.load(Ordering::SeqCst),
+        "the parked static overlay was withdrawn BEFORE the Dynamic epoch was published"
+    );
     assert!(
         !handle.still_current(&before),
         "the Static epoch was revoked"
@@ -618,6 +682,14 @@ async fn mode_follows_the_applied_plan_and_parks_the_static_producer() -> TestRe
     let after = wait_snapshot(&gated, |_| true).await?;
     assert_eq!(after.mode(), BackendSourceMode::Static);
     assert!(gated.still_current(&after));
+    assert!(
+        !Arc::ptr_eq(after.health(), live_static.health()),
+        "re-activation publishes a FRESH H, never the pre-switch one"
+    );
+    assert!(
+        !gated.still_current(&live_static),
+        "the pre-switch static snapshot stays refused"
+    );
     assert!(
         !gated.still_current(&before),
         "the pre-switch snapshot stays refused"
@@ -964,6 +1036,146 @@ async fn shared_go_static_mode_observation() -> TestResult {
         assert_eq!(output, std::fs::read_to_string(expected)?);
     }
     std::fs::write(std::env::var("CPROUTE_STATIC_OUTPUT")?, output)?;
+    drop(module);
+    Ok(())
+}
+
+// ================================================================
+// S9 (real commit window): inside `reconfigure`'s Dynamic→Static window — the
+// run loop parked at `stop_children`, the only await after the outgoing epoch
+// is revoked and before the new plan/commit/epoch are published — a Dynamic
+// snapshot from REAL discovery is already refused and nothing is capturable.
+// A consumer that captured it BEFORE waiting on a lock, and re-validates after
+// the lock is granted, performs zero side effects.
+// ================================================================
+
+/// A Dynamic module over REAL discovery (one seeded backend) whose registration
+/// child parks its shutdown until `release` is notified, signalling `entered`
+/// first: the hook that holds `reconfigure` inside its Dynamic→Static window.
+async fn dynamic_module_with_parked_child()
+-> TestResult<(Module, ConfigNamespaceStore, Arc<Notify>, Arc<Notify>)> {
+    let seeded = vec![
+        (
+            b"/topology/tidb/10.0.0.9:4000/info".to_vec(),
+            br#"{"ip":"10.0.0.9","status_port":10080,"version":"v8"}"#.to_vec(),
+        ),
+        (b"/topology/tidb/10.0.0.9:4000/ttl".to_vec(), b"1".to_vec()),
+    ];
+    let addr = spawn_fixture(seeded)
+        .await
+        .ok_or("the fixture binds a loopback port")?;
+    // The registration child parks its shutdown until the row releases it.
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let spawned = Arc::new(AtomicUsize::new(0));
+    let runner: ChildRunner = {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        let spawned = Arc::clone(&spawned);
+        Arc::new(move |_owner, _connector, _info, _timeout, mut shutdown| {
+            spawned.fetch_add(1, Ordering::SeqCst);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Box::pin(async move {
+                let _ = shutdown.changed().await;
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        })
+    };
+    let store = store_with(
+        &one_cluster_config(),
+        vec![namespace("default", &["10.0.0.7:4000"])],
+    )?;
+    let observed = store.clone();
+    let module = spawn_module_with(
+        store,
+        health(false),
+        Box::new(FixtureFactory {
+            addr,
+            timeout_ms: Arc::new(AtomicU64::new(500)),
+        }),
+        runner,
+        Arc::new(AtomicBool::new(false)),
+        spawned,
+    )
+    .await?;
+    Ok((module, observed, entered, release))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dynamic_snapshot_is_refused_inside_the_commit_window_before_static_publishes()
+-> TestResult {
+    let (module, observed, entered, release) = dynamic_module_with_parked_child().await?;
+    let handle = wait_handle(&module, "default").await?;
+    let dynamic = wait_snapshot(&handle, |s| {
+        s.mode() == BackendSourceMode::Dynamic && s.routing().backends.backends.len() == 1
+    })
+    .await?;
+    assert_eq!(
+        dynamic.routing().backends.backends[0].backend_id.as_ref(),
+        "cluster-a/10.0.0.9:4000",
+        "a REAL discovered backend"
+    );
+
+    // The lock-holding consumer: captured `dynamic` BEFORE waiting on the lock
+    // the row holds across the whole window; after the lock is granted it
+    // re-validates and counts a side effect only if the capture still holds.
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let held = Arc::clone(&lock).lock_owned().await;
+    let side_effects = Arc::new(AtomicUsize::new(0));
+    let consumer = {
+        let handle = handle.clone();
+        let captured = dynamic.clone();
+        let lock = Arc::clone(&lock);
+        let side_effects = Arc::clone(&side_effects);
+        tokio::spawn(async move {
+            let _guard = lock.lock().await;
+            if handle.still_current(&captured) {
+                side_effects.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+
+    // Dynamic→Static: the run loop revokes the Dynamic epoch, then parks in
+    // stop_children on our child.
+    apply(
+        &observed,
+        &zero_cluster_config(),
+        vec![namespace("default", &["10.0.0.7:4000"])],
+        3,
+    )?;
+    tokio::time::timeout(Duration::from_secs(10), entered.notified()).await?;
+    assert!(
+        !handle.still_current(&dynamic),
+        "inside the window the outgoing Dynamic epoch is already revoked"
+    );
+    assert!(
+        handle.current().is_none(),
+        "inside the window no epoch is live: nothing can be captured"
+    );
+    assert!(
+        module.handle.status().borrow().applied_generation < 3,
+        "the static plan is not applied yet while the window is held"
+    );
+
+    // Grant the lock while the window is still held, then close the window.
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(10), consumer).await??;
+    assert_eq!(
+        side_effects.load(Ordering::SeqCst),
+        0,
+        "a consumer re-validating after the lock performs no side effect"
+    );
+    release.notify_one();
+    wait_applied(&module, 3).await?;
+    let stationary = wait_snapshot(&handle, |s| s.mode() == BackendSourceMode::Static).await?;
+    assert!(handle.still_current(&stationary));
+    assert!(
+        !handle.still_current(&dynamic),
+        "the Dynamic snapshot stays refused"
+    );
     drop(module);
     Ok(())
 }

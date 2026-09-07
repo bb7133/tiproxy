@@ -259,9 +259,18 @@ follow-up head.
   mode identity is the exact epoch (same R/H after Static→Dynamic→Static is
   refused; revoke-before-publish closes the window; an empty dynamic
   discovery is served empty, never as the static list).
-- `static/mutations.py`: nine compiling mutations a runtime test must kill —
+- Commit window (real `reconfigure`): with the run loop parked inside the
+  Dynamic→Static window (the registration child's shutdown is held), a Dynamic
+  snapshot from real discovery is already refused, nothing is capturable, and
+  a consumer that captured it before waiting on a lock performs zero side
+  effects after the lock is granted. Static producers are parked/activated
+  BEFORE the new epoch is published, so a parked static H is withdrawn the
+  instant Dynamic is visible and re-activation always yields a fresh H.
+- `static/mutations.py`: eleven compiling mutations a runtime test must kill —
   mode from the pending config instead of the applied plan; namespaces
-  reconciled only on accepted generations; mode identity by value; namespace
-  not checked at the source; inactive static keeps probing; empty dynamic
-  discovery falls back to static; producer reused across incarnations; static
-  health fabricated without a probe; static backend runs the status stage.
+  reconciled only on accepted generations; the outgoing mode epoch revoked
+  only at publish (not before the new plan/commit); static producers parked
+  after the epoch publish; mode identity by value; namespace not checked at
+  the source; inactive static keeps probing; empty dynamic discovery falls
+  back to static; producer reused across incarnations; static health
+  fabricated without a probe; static backend runs the status stage.

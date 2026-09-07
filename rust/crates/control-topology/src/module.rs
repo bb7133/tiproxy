@@ -341,6 +341,8 @@ pub struct TopologyModuleHandle {
     source: Arc<dyn ConfigNamespaceSource>,
     mode: watch::Receiver<Arc<ModeEpoch>>,
     statics: Arc<StaticRegistry>,
+    #[cfg(test)]
+    mode_hook: crate::static_source::PublishHook,
 }
 
 impl TopologyModuleHandle {
@@ -402,6 +404,13 @@ impl TopologyModuleHandle {
     #[must_use]
     pub fn health_overlay_handle(&self) -> HealthOverlayHandle {
         self.health.clone()
+    }
+
+    /// Test-only: the module's epoch publication hook slot (see
+    /// [`crate::static_source::PublishHook`]).
+    #[cfg(test)]
+    pub(crate) fn mode_publish_hook(&self) -> crate::static_source::PublishHook {
+        self.mode_hook.clone()
     }
 
     /// The live applied backend-source mode, or `None` before the first
@@ -566,6 +575,8 @@ impl TopologyModule {
         let (publisher, health_overlay) = HealthOverlayPublisher::new();
         let mode = ModePublisher::new();
         let mode_reader = mode.subscribe();
+        #[cfg(test)]
+        let mode_hook = mode.publish_hook();
         let statics = Arc::new(StaticRegistry::default());
         Ok((
             Self {
@@ -602,6 +613,8 @@ impl TopologyModule {
                 source,
                 mode: mode_reader,
                 statics,
+                #[cfg(test)]
+                mode_hook,
             },
         ))
     }
@@ -845,6 +858,7 @@ impl TopologyModule {
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
         health: &mut HealthReconcile<'_>,
+        statics: &mut StaticProducers,
     ) -> Result<(), RejectionClass> {
         let Ok(topology) = snapshot.topology() else {
             return Err(RejectionClass::TopologyProjection);
@@ -1013,8 +1027,12 @@ impl TopologyModule {
             *health.active = candidate_health;
             reconcile_health_feed(health.feeder, health.active.as_ref(), health.routing);
         }
-        // Mode transition, step 2 of 2: a fresh live epoch for the applied plan.
+        // Mode transition, step 2 of 2: park or activate the static producers
+        // FIRST (a parked feed is withdrawn synchronously, so no old static round
+        // or H is authoritative once the new epoch is visible; an activated
+        // producer is fed a fresh generation), THEN publish the fresh live epoch.
         if mode_changes {
+            statics.apply_mode(Some(next_mode));
             self.mode.publish(next_mode);
         }
         Ok(())
@@ -1075,10 +1093,8 @@ impl TopologyModule {
             self.mode.applied(),
         );
         let outcome = self
-            .reconfigure(children, active_plan, snapshot, owner, health)
+            .reconfigure(children, active_plan, snapshot, owner, health, statics)
             .await;
-        // Probe static sources only while the applied mode is Static.
-        statics.apply_mode(self.mode.applied());
         self.status.send_modify(|status| {
             status.observed_generation = generation;
             match outcome {
@@ -1302,7 +1318,7 @@ impl Drop for ModuleRuntime<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         ChildRunner, HealthFactory, ModePublisher, ModuleRuntime, ROUTING_REFRESH_INTERVAL,
         RefreshFactory, RegistrarError, RejectionClass, StaticProducers, StaticRegistry,
@@ -2530,7 +2546,7 @@ mod tests {
     /// row asserts a real discovery poll payload) and a GATED fixture that can park
     /// the first Range for a chosen prefix and count Range calls per prefix (the
     /// #212 mid-poll fence rows). Mirrors `tiproxy-rs`'s proven `KvFixture`.
-    mod kv_fixture {
+    pub(crate) mod kv_fixture {
         use std::convert::Infallible;
         use std::net::SocketAddr;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2759,7 +2775,7 @@ mod tests {
         }
 
         /// A plain (non-gated) fixture: returns the bound address.
-        pub(super) async fn spawn_fixture(seeded: Vec<(Vec<u8>, Vec<u8>)>) -> Option<SocketAddr> {
+        pub(crate) async fn spawn_fixture(seeded: Vec<(Vec<u8>, Vec<u8>)>) -> Option<SocketAddr> {
             bind_and_serve(KvFixture {
                 seeded: Arc::new(seeded),
                 observed: Arc::new(Mutex::new(Vec::new())),
@@ -2831,9 +2847,9 @@ mod tests {
         /// `addr` with a request timeout read from a shared atomic. Flipping the
         /// atomic across generations changes the cluster MATERIAL, forcing a
         /// discovery rotation.
-        pub(super) struct FixtureFactory {
-            pub(super) addr: SocketAddr,
-            pub(super) timeout_ms: Arc<AtomicU64>,
+        pub(crate) struct FixtureFactory {
+            pub(crate) addr: SocketAddr,
+            pub(crate) timeout_ms: Arc<AtomicU64>,
         }
 
         impl TopologyClientFactory for FixtureFactory {

@@ -98,7 +98,16 @@ impl ModeEpoch {
 /// yet), so every consumer fails closed until the first applied plan.
 pub(crate) struct ModePublisher {
     current: watch::Sender<Arc<ModeEpoch>>,
+    /// Test-only synchronous hook run right after a new epoch is published
+    /// (inside the publication step, before `publish` returns), so a row can
+    /// pin the publication boundary without relying on thread scheduling.
+    #[cfg(test)]
+    on_publish: PublishHook,
 }
+
+/// A shared, test-installed observer of epoch publications.
+#[cfg(test)]
+pub(crate) type PublishHook = Arc<Mutex<Option<Box<dyn Fn(&ModeEpoch) + Send + Sync>>>>;
 
 impl ModePublisher {
     pub(crate) fn new() -> Self {
@@ -110,7 +119,15 @@ impl ModePublisher {
                 gate,
             }))
             .0,
+            #[cfg(test)]
+            on_publish: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Test-only: the shared hook slot a row installs its observer into.
+    #[cfg(test)]
+    pub(crate) fn publish_hook(&self) -> PublishHook {
+        Arc::clone(&self.on_publish)
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<ModeEpoch>> {
@@ -132,10 +149,20 @@ impl ModePublisher {
     /// Publishes a fresh live epoch for `mode`: the last step of a transition.
     pub(crate) fn publish(&self, mode: BackendSourceMode) {
         self.current.borrow().gate.revoke();
-        self.current.send_replace(Arc::new(ModeEpoch {
+        let epoch = Arc::new(ModeEpoch {
             mode,
             gate: GenerationGate::new(),
-        }));
+        });
+        self.current.send_replace(Arc::clone(&epoch));
+        #[cfg(test)]
+        if let Some(hook) = self
+            .on_publish
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(&epoch);
+        }
     }
 }
 
@@ -516,6 +543,14 @@ impl BackendSourceHandle {
     #[must_use]
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Test-only: the bound static producer's routing/overlay handles, so a row
+    /// can assert the publication boundary (a parked static H is withdrawn
+    /// before the Dynamic epoch is visible).
+    #[cfg(test)]
+    pub(crate) const fn static_side(&self) -> &(RoutingSnapshotHandle, HealthOverlayHandle) {
+        &self.stationary
     }
 
     /// Whether the bound namespace incarnation is still the config source's
