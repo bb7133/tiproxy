@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Per-backend `/status` health decision (CP-TOPO #213-1, policy layer).
+//! Per-backend health decision (CP-TOPO #213-1 `/status` stage, #215-2 SQL
+//! greeting stage; policy layer).
 //!
-//! This is the pure policy layer above [`ClusterHttpClient`]: it owns the retry
-//! cadence, the typed JSON decode, and the exact-source authority fence, but no
-//! transport. It mirrors Go `observer.DefaultHealthCheck.checkStatusPort`
+//! This is the pure policy layer above [`ClusterHttpClient`] and
+//! [`SqlGreetingProbe`]: it owns the retry cadence, the typed JSON decode, and
+//! the exact-source authority fence, but no transport. The `/status` stage
+//! mirrors Go `observer.DefaultHealthCheck.checkStatusPort`
 //! (`pkg/balance/observer/health_check.go`):
 //!
 //! * a static backend (empty `ip`) is healthy this stage with no network I/O;
@@ -31,8 +33,19 @@
 //!   the health result, and a malformed body is terminal (the HTTP round already
 //!   succeeded, so it is not retried).
 //!
+//! The SQL greeting stage ([`ClusterHealthNetwork::probe_sql_port`]) mirrors Go
+//! `checkSqlPort`: the backend's SQL address (`addr`, `host:port`; empty is
+//! unhealthy) is dialed through the cluster's raw connector and its first packet
+//! judged by the minimal criterion, with the SAME retry cadence — `max_retries`
+//! retries after the initial attempt, `retry_interval` apart — retrying every
+//! [`SqlGreetingError::is_retryable`] class (an `ERR` greeting, a timeout, a
+//! transport or DNS failure) and stopping at a terminal one (refused, fenced,
+//! an empty packet). Both probes are built from ONE cluster's material at the
+//! same time, so the SQL stage never runs with different DNS material or a
+//! different dial budget than the status stage.
+//!
 //! The [`GenerationGate`] alone is not identity: at each attempt admission, after
-//! each backoff, and before accepting a healthy result, the probe re-validates
+//! each backoff, and before accepting a healthy result, each stage re-validates
 //! [`RoutingSnapshotHandle::still_current`] against the exact source `Arc`, so a
 //! superseded or sibling source is rejected and a fence failure is terminal.
 
@@ -42,6 +55,7 @@ use std::time::Duration;
 
 use control_external::{
     ClusterHttpClient, ClusterHttpConfigError, EtcdClientConfig, HttpProbePolicy,
+    SqlGreetingConfigError, SqlGreetingProbe,
 };
 use control_plane::OwnerToken;
 use serde::Deserialize;
@@ -160,6 +174,8 @@ fn decode_status_version(body: &[u8]) -> Option<String> {
 /// routing source.
 pub struct ClusterHealthNetwork {
     client: ClusterHttpClient,
+    /// The SQL-greeting probe over the same cluster material and dial budget.
+    sql: SqlGreetingProbe,
     /// The discovery client epoch this network's material was prepared under.
     client_epoch: u64,
     /// The backend cluster this network's DNS/TLS material belongs to.
@@ -177,27 +193,35 @@ pub struct ClusterHealthNetwork {
 /// `Clone`: one prepared network is bound exactly once.
 pub struct PreparedClusterHealthNetwork {
     client: ClusterHttpClient,
+    sql: SqlGreetingProbe,
     cluster_name: Arc<str>,
 }
 
 impl PreparedClusterHealthNetwork {
     /// Builds the fallible transport for one cluster from its etcd client
     /// material, the process owner token, and an already-validated probe policy,
-    /// without stamping any discovery epoch.
+    /// without stamping any discovery epoch: the `/status` client AND the
+    /// SQL-greeting probe, both from the same material, the latter with the
+    /// policy's attempt (dial) timeout as its `DialTimeout`.
     ///
     /// # Errors
     ///
     /// Returns the [`ClusterHttpConfigError`] from
     /// [`ClusterHttpClient::from_cluster_material`] (invalid policy, unbuildable
-    /// resolver, or a TLS cluster whose material fails closed at construction).
+    /// resolver, or a TLS cluster whose material fails closed at construction),
+    /// or the SQL probe's build failure mapped to the same classes.
     pub fn build(
         config: &EtcdClientConfig,
         owner: OwnerToken,
         policy: HttpProbePolicy,
         cluster_name: Arc<str>,
     ) -> Result<Self, ClusterHttpConfigError> {
+        let client = ClusterHttpClient::from_cluster_material(config, owner.clone(), policy)?;
+        let sql = SqlGreetingProbe::from_cluster_material(config, owner, policy.attempt_timeout)
+            .map_err(sql_build_error)?;
         Ok(Self {
-            client: ClusterHttpClient::from_cluster_material(config, owner, policy)?,
+            client,
+            sql,
             cluster_name,
         })
     }
@@ -210,6 +234,7 @@ impl PreparedClusterHealthNetwork {
     pub fn bind(self, client_epoch: u64) -> ClusterHealthNetwork {
         ClusterHealthNetwork {
             client: self.client,
+            sql: self.sql,
             client_epoch,
             cluster_name: self.cluster_name,
         }
@@ -341,6 +366,123 @@ impl ClusterHealthNetwork {
             }
         }
     }
+}
+
+impl ClusterHealthNetwork {
+    /// Probes one backend's SQL port and returns whether its SQL layer is live
+    /// (Go `checkSqlPort`): the exact-source authority and the network's stamped
+    /// `(client_epoch, cluster_name)` are verified FIRST, before any return; the
+    /// backend's `addr` is split as `host:port` (an empty or unparsable address is
+    /// unhealthy, mirroring Go's "backend address is empty"); then up to
+    /// `max_retries` retries (each `retry_interval` apart, `max_retries + 1`
+    /// attempts total) run [`SqlGreetingProbe::check_once`], retrying only a
+    /// retryable [`SqlGreetingError`](control_external::SqlGreetingError), with
+    /// `still_current` re-checked at each
+    /// attempt admission, after each failure, after each backoff, and before
+    /// accepting a live result.
+    ///
+    /// It yields no version: the SQL stage only confirms liveness. The combined
+    /// verdict (status stage, then SQL stage) is composed by the caller.
+    #[must_use]
+    pub async fn probe_sql_port(
+        &self,
+        handle: &RoutingSnapshotHandle,
+        source: &Arc<RoutingSnapshot>,
+        backend: &MergedBackend,
+        max_retries: u32,
+        retry_interval: Duration,
+    ) -> bool {
+        if !handle.still_current(source) {
+            return false;
+        }
+        if source.client_epoch != self.client_epoch
+            || backend.cluster_name.as_ref() != self.cluster_name.as_ref()
+        {
+            return false;
+        }
+        let Some((host, port)) = split_host_port(&backend.backend.addr) else {
+            return false;
+        };
+
+        let mut retries_remaining = max_retries;
+        loop {
+            if !handle.still_current(source) {
+                return false;
+            }
+            match self.sql.check_once(host, port, source.source_gate()).await {
+                // Never accept a live result from a superseded source.
+                Ok(()) => return handle.still_current(source),
+                Err(error) => {
+                    // Fence-first: a stale source is terminal and wins over the
+                    // failure class, so a retired source is never retried.
+                    if !handle.still_current(source) {
+                        return false;
+                    }
+                    if error.is_retryable() && retries_remaining > 0 {
+                        retries_remaining -= 1;
+                        tokio::time::sleep(retry_interval).await;
+                        if !handle.still_current(source) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// Maps the SQL probe's build failure onto the cluster health build error: the
+/// dial timeout is the same value the status policy already validated, and the
+/// resolver is built from the same material, so each class has an exact
+/// counterpart.
+fn sql_build_error(error: SqlGreetingConfigError) -> ClusterHttpConfigError {
+    match error {
+        SqlGreetingConfigError::InvalidDialTimeout(timeout) => {
+            ClusterHttpConfigError::InvalidAttemptTimeout(timeout)
+        }
+        SqlGreetingConfigError::Resolver(error) => ClusterHttpConfigError::Resolver(error),
+    }
+}
+
+/// Splits a backend SQL address into `(host, port)`, Go-equivalent for every
+/// legitimate production address (a discovered backend advertises a canonical
+/// `host:port` with a numeric port). Go hands `BackendInfo.Addr` to
+/// `net.Dialer` verbatim, so the accept/reject line follows
+/// `net.SplitHostPort`: a bracketed host (`[::1]:4000`; Go equally accepts
+/// `[127.0.0.1]:4000`) must close its bracket immediately before the FINAL
+/// colon and contain no further bracket; an unbracketed host may contain no
+/// colon at all, so a bare IPv6 `::1:4000` is rejected ("too many colons"), as
+/// are a stray or unbalanced bracket and a missing port.
+///
+/// This is NOT a complete `net.Dial` address parser. Two inputs outside the
+/// topology input domain are deliberately rejected fail-closed where Go would
+/// proceed: an empty host (`:4000`, which Go dials as the local system) and a
+/// non-numeric service-name port (which Go resolves). Neither can name a real
+/// `TiDB` backend.
+fn split_host_port(addr: &str) -> Option<(&str, u16)> {
+    let colon = addr.rfind(':')?;
+    let host = if let Some(bracketed) = addr.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        let host = &bracketed[..end];
+        // `[` + host + `]` occupies `end + 2` bytes; the final colon must follow.
+        if end + 2 != colon || host.contains('[') || host.contains(']') {
+            return None;
+        }
+        host
+    } else {
+        let host = &addr[..colon];
+        if host.contains(':') || host.contains('[') || host.contains(']') {
+            return None;
+        }
+        host
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = addr[colon + 1..].parse::<u16>().ok()?;
+    Some((host, port))
 }
 
 #[cfg(test)]
@@ -976,5 +1118,338 @@ mod tests {
                 }
             });
         }
+    }
+
+    // ====================================================================
+    // SQL greeting stage (CP-TOPO #215-2): Go `checkSqlPort` policy.
+    // ====================================================================
+
+    use super::{ClusterHttpConfigError, split_host_port, sql_build_error};
+    use control_external::{SqlGreetingConfigError, explicit_dns::ResolveError};
+
+    /// The SQL rows' retry interval: the cadence is a parameter, and these rows
+    /// count attempts rather than time the backoff.
+    const SQL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+    /// What the loopback SQL port sends as its first packet.
+    #[derive(Clone, Copy)]
+    enum Greeting {
+        /// A `HandshakeV10`-shaped packet (`0x0a` first byte).
+        V10,
+        /// An `ERR` packet (`0xff` first byte).
+        Err,
+        /// Accept, then never write.
+        Hang,
+    }
+
+    /// Binds a loopback SQL port that counts accepts, signals the first, and
+    /// answers every connection per `greeting`.
+    async fn bind_greeter(greeting: Greeting) -> (u16, Arc<AtomicUsize>, Arc<tokio::sync::Notify>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("bind: {error}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"))
+            .port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let first_accept = Arc::new(tokio::sync::Notify::new());
+        let counter = Arc::clone(&accepted);
+        let first = Arc::clone(&first_accept);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first.notify_one();
+                }
+                tokio::spawn(async move {
+                    match greeting {
+                        Greeting::V10 => {
+                            let _ = stream.write_all(&[3, 0, 0, 0, 0x0a, b'8', 0]).await;
+                        }
+                        Greeting::Err => {
+                            let _ = stream.write_all(&[3, 0, 0, 0, 0xff, 0x14, 0x04]).await;
+                        }
+                        Greeting::Hang => std::future::pending::<()>().await,
+                    }
+                });
+            }
+        });
+        (port, accepted, first_accept)
+    }
+
+    /// A `CLUSTER` backend whose SQL address is `addr` (the status endpoint is a
+    /// fixed, never-dialed placeholder: the SQL stage must not touch it).
+    fn merged_backend_at(cluster: &str, addr: &str) -> MergedBackend {
+        let mut backend = merged_backend(cluster, "127.0.0.1", 10080);
+        backend.backend.addr = addr.to_owned();
+        backend
+    }
+
+    /// Runs the SQL stage for a `CLUSTER` backend at `addr` under `source`.
+    async fn probe_sql(
+        network: &ClusterHealthNetwork,
+        handle: &RoutingSnapshotHandle,
+        source: &Arc<RoutingSnapshot>,
+        addr: &str,
+    ) -> bool {
+        network
+            .probe_sql_port(
+                handle,
+                source,
+                &merged_backend_at(CLUSTER, addr),
+                MAX_RETRIES,
+                SQL_RETRY_INTERVAL,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_handshake_greeting_makes_the_sql_stage_live() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let (port, accepted, _first) = bind_greeter(Greeting::V10).await;
+        assert!(
+            probe_sql(&network, &handle, &source, &format!("127.0.0.1:{port}")).await,
+            "a V10 first byte is a live SQL layer"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "one attempt, no retry");
+    }
+
+    #[tokio::test]
+    async fn an_err_greeting_is_retried_across_the_budget_then_unhealthy() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let (port, accepted, _first) = bind_greeter(Greeting::Err).await;
+        assert!(
+            !probe_sql(&network, &handle, &source, &format!("127.0.0.1:{port}")).await,
+            "an ERR greeting on every attempt is unhealthy"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            usize::try_from(MAX_RETRIES).unwrap_or(usize::MAX) + 1,
+            "an ERR greeting is retryable (Go), so exactly 1 + 3 attempts run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_sql_port_is_terminal_without_backoff() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("bind: {error}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"))
+            .port();
+        drop(listener);
+        let started = Instant::now();
+        let live = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{port}")),
+                MAX_RETRIES,
+                RETRY_INTERVAL,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(!live, "a refused SQL dial is unhealthy");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "connection-refused is terminal, so no 1s backoff ran (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hung_sql_port_times_out_on_every_attempt_of_the_budget() {
+        let (_registry, lease) = owner_lease();
+        // A short dial budget so four timeouts stay fast.
+        let dial = Duration::from_millis(200);
+        let network = ClusterHealthNetwork::from_cluster_material(
+            &plaintext_config(),
+            lease.token(),
+            HttpProbePolicy {
+                attempt_timeout: dial,
+                max_response_bytes: 64 * 1024,
+            },
+            NETWORK_EPOCH,
+            Arc::from(CLUSTER),
+        )
+        .unwrap_or_else(|error| unreachable!("network: {error}"));
+        let (_publisher, handle, source) = published_source();
+        let (port, accepted, _first) = bind_greeter(Greeting::Hang).await;
+        let started = Instant::now();
+        assert!(
+            !probe_sql(&network, &handle, &source, &format!("127.0.0.1:{port}")).await,
+            "a hung SQL port is unhealthy"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            usize::try_from(MAX_RETRIES).unwrap_or(usize::MAX) + 1,
+            "a timeout is retryable, so the full budget is spent"
+        );
+        assert!(
+            started.elapsed() >= dial * (MAX_RETRIES + 1),
+            "each attempt spent its own fresh read budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_unparsable_sql_address_is_unhealthy_without_io() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        for addr in [
+            "",
+            "127.0.0.1",
+            "[::1]",
+            "::1:4000",
+            ":4000",
+            "127.0.0.1:",
+            "127.0.0.1:70000",
+        ] {
+            assert!(
+                !probe_sql(&network, &handle, &source, addr).await,
+                "{addr:?}: Go reports an empty/unusable backend address as unhealthy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_source_or_mismatched_network_aborts_the_sql_stage_before_any_dial() {
+        let (_registry, lease) = owner_lease();
+        let (publisher, handle, source) = published_source();
+        let (port, accepted, _first) = bind_greeter(Greeting::V10).await;
+        let addr = format!("127.0.0.1:{port}");
+        // A stale-epoch network and a sibling-cluster network are rejected
+        // before any I/O even under the live source.
+        assert!(
+            !probe_sql(
+                &network_stamped(&lease, NETWORK_EPOCH + 1, CLUSTER),
+                &handle,
+                &source,
+                &addr
+            )
+            .await,
+            "a stale-epoch network never dials"
+        );
+        assert!(
+            !probe_sql(
+                &network_stamped(&lease, NETWORK_EPOCH, "cluster-b"),
+                &handle,
+                &source,
+                &addr
+            )
+            .await,
+            "a sibling-cluster network never dials"
+        );
+        // Supersede the source: the matching network is now fenced before dialing.
+        publisher
+            .publish(EpochResult {
+                client_epoch: NETWORK_EPOCH + 1,
+                value: MergedTopology::default(),
+            })
+            .unwrap_or_else(|_| unreachable!("supersede publish"));
+        assert!(
+            !probe_sql(&network(&lease), &handle, &source, &addr).await,
+            "a superseded source is fenced before any dial"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "no attempt ever dialed");
+    }
+
+    #[tokio::test]
+    async fn a_source_superseded_after_the_first_sql_attempt_is_not_retried() {
+        let (_registry, lease) = owner_lease();
+        let network = Arc::new(network(&lease));
+        let (publisher, handle, source) = published_source();
+        let (port, accepted, first_accept) = bind_greeter(Greeting::Err).await;
+        let net = Arc::clone(&network);
+        let handle_task = handle.clone();
+        let source_task = Arc::clone(&source);
+        let task = tokio::spawn(async move {
+            net.probe_sql_port(
+                &handle_task,
+                &source_task,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{port}")),
+                MAX_RETRIES,
+                RETRY_INTERVAL,
+            )
+            .await
+        });
+        // After the first attempt has dialed (and will read ERR, a retryable
+        // class), supersede the source: the post-failure / post-backoff
+        // `still_current` re-checks abort with no further attempt.
+        first_accept.notified().await;
+        publisher
+            .publish(EpochResult {
+                client_epoch: NETWORK_EPOCH + 1,
+                value: MergedTopology::default(),
+            })
+            .unwrap_or_else(|_| unreachable!("supersede publish"));
+        let live = task
+            .await
+            .unwrap_or_else(|error| unreachable!("probe task: {error}"));
+        assert!(!live, "a source superseded mid-probe is never live");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "exactly one attempt; the retry was fenced off"
+        );
+    }
+
+    #[test]
+    fn sql_addresses_split_with_go_host_port_semantics() {
+        assert_eq!(split_host_port("10.0.0.1:4000"), Some(("10.0.0.1", 4000)));
+        assert_eq!(split_host_port("[::1]:4000"), Some(("::1", 4000)));
+        assert_eq!(
+            split_host_port("[127.0.0.1]:4000"),
+            Some(("127.0.0.1", 4000)),
+            "Go accepts a bracketed IPv4 literal"
+        );
+        assert_eq!(
+            split_host_port("tidb-0.tidb-peer:4000"),
+            Some(("tidb-0.tidb-peer", 4000))
+        );
+        for bad in [
+            "",
+            "host",
+            "host:",
+            ":4000", // empty host: fail-closed (Go would dial the local system)
+            "host:99999",
+            "host:x",
+            "host:mysql", // service-name port: fail-closed (Go would resolve it)
+            "[]:4000",
+            "::1:4000", // bare IPv6: Go "too many colons in address"
+            "::1]:4000",
+            "[::1:4000",
+            "[[::1]]:4000",
+            "[::1]x:4000",
+            "[::1]",
+            "[::1]:",
+        ] {
+            assert_eq!(split_host_port(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_sql_probe_build_failure_maps_class_for_class() {
+        let timeout = Duration::from_secs(0);
+        assert!(matches!(
+            sql_build_error(SqlGreetingConfigError::InvalidDialTimeout(timeout)),
+            ClusterHttpConfigError::InvalidAttemptTimeout(mapped) if mapped == timeout
+        ));
+        assert!(matches!(
+            sql_build_error(SqlGreetingConfigError::Resolver(
+                ResolveError::InvalidBudget
+            )),
+            ClusterHttpConfigError::Resolver(ResolveError::InvalidBudget)
+        ));
     }
 }
