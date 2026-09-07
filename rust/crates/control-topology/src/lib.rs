@@ -45,6 +45,7 @@ mod health_feed;
 mod health_loop;
 mod health_overlay;
 mod merge;
+pub mod metrics;
 mod model;
 mod module;
 mod register;

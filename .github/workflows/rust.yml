@@ -92,6 +92,8 @@ jobs:
         run: make controlplane-cp004-evidence
       - name: Run CP-ROUTE config and namespace projection evidence
         run: make controlplane-cproute-evidence
+      - name: Run CP-METRICS query and history evidence
+        run: make controlplane-cpmetrics-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests

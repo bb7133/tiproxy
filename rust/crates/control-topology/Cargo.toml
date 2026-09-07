@@ -16,7 +16,7 @@ control-external.workspace = true
 control-plane.workspace = true
 etcd-client.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 tokio.workspace = true
 
