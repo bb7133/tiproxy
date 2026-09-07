@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -46,6 +47,8 @@ use tonic_prost::ProstCodec;
 use crate::{Candidate, Reservation, RouteError, Router, Settlement, Unsupported};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+mod locality;
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
     result.unwrap_or_else(|error| unreachable!("fixture: {error:?}"))
@@ -189,11 +192,15 @@ impl KvFixture {
     }
 
     fn backends(&self, backends: &[(&str, &[(&str, &str)])]) {
+        self.backends_with_ip(backends, "127.0.0.1");
+    }
+
+    fn backends_with_ip(&self, backends: &[(&str, &[(&str, &str)])], ip: &str) {
         let mut records = Vec::new();
         for (addr, labels) in backends {
             let labels: BTreeMap<&str, &str> = labels.iter().copied().collect();
             let value = must(serde_json::to_vec(
-                &serde_json::json!({"ip":"127.0.0.1", "labels":labels}),
+                &serde_json::json!({"ip":ip, "labels":labels}),
             ));
             records.push(KeyValue {
                 key: format!("/topology/tidb/{addr}/info").into_bytes(),
@@ -294,12 +301,38 @@ impl Harness {
         policy: &str,
         backends: &[(&str, &[(&str, &str)])],
     ) -> TestResult<Self> {
+        Self::with_health(
+            rule,
+            policy,
+            backends,
+            HealthCheckConfig {
+                enabled: false,
+                interval_nanos: 50_000_000,
+                ..HealthCheckConfig::default()
+            },
+            "",
+        )
+        .await
+    }
+
+    async fn with_health(
+        rule: &str,
+        policy: &str,
+        backends: &[(&str, &[(&str, &str)])],
+        health: HealthCheckConfig,
+        proxy_zone: &str,
+    ) -> TestResult<Self> {
         let fixture = KvFixture::new().await?;
-        fixture.backends(backends);
-        let config = format!(
+        // Enabled rows use real SQL greeting probes. Empty IP selects the
+        // production skip-HTTP path; no health verdict is fabricated here.
+        fixture.backends_with_ip(backends, if health.enabled { "" } else { "127.0.0.1" });
+        let mut config = format!(
             "[proxy]\npd-addrs = \"\"\n[[proxy.backend-clusters]]\nname = \"default\"\npd-addrs = \"{}\"\n[balance]\npolicy = \"{policy}\"\nrouting-rule = \"{rule}\"\n",
             fixture.endpoint
         );
+        if !proxy_zone.is_empty() {
+            writeln!(config, "[labels]\nzone = \"{proxy_zone}\"")?;
+        }
         let store = ConfigNamespaceStore::from_toml(config.as_bytes(), None, Path::new("/tmp"))?;
         let current = store.current();
         store.apply(
@@ -346,11 +379,7 @@ impl Harness {
                 deploy_path: "/tmp".into(),
                 start_timestamp: 1,
             },
-            HealthCheckConfig {
-                enabled: false,
-                interval_nanos: 50_000_000,
-                ..HealthCheckConfig::default()
-            },
+            health,
         )?;
         let context = runtime.handle().module_context();
         let module = tokio::spawn(async move {
@@ -945,25 +974,20 @@ async fn routing_and_health_swaps_while_the_ledger_is_locked_reject_retained_can
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unsupported_factor_inputs_remain_valid_config_but_never_reserve() -> TestResult {
     let harness = Harness::new("", "connection").await?;
-    for (revision, patch, expected) in [
-        (3, "[labels]\nzone = \"az-a\"", Unsupported::ZoneMetadata),
-        (
-            6,
-            "[proxy]\nfail-backend-list = []\n[balance]\npolicy = \"location\"",
-            Unsupported::LocationPolicy,
-        ),
-    ] {
-        harness.patch(patch, revision);
-        assert!(
-            matches!(harness.router.capture(), Err(RouteError::Unsupported(actual)) if actual == expected)
-        );
-        assert!(
-            harness
-                .router
-                .accounting("default/127.0.0.1:4000")
-                .is_none()
-        );
-    }
+    harness.patch(
+        "[proxy]\nfail-backend-list = []\n[balance]\npolicy = \"location\"",
+        6,
+    );
+    assert!(matches!(
+        harness.router.capture(),
+        Err(RouteError::Unsupported(Unsupported::LocationPolicy))
+    ));
+    assert!(
+        harness
+            .router
+            .accounting("default/127.0.0.1:4000")
+            .is_none()
+    );
     Ok(())
 }
 

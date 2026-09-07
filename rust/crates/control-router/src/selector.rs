@@ -181,7 +181,8 @@ impl Router {
         .ok_or(RouteError::NoBackend)?;
         let backend = choices[index].0;
         let identity = Arc::clone(&backend.account);
-        let assignment = assignment(&backend.source);
+        let local = candidate.health.get(&backend.source.backend_id).local;
+        let assignment = assignment(&backend.source, local);
         self.sources.validate(candidate)?;
         state
             .ledger
@@ -433,9 +434,9 @@ fn choose(scores: &[u64], policy: &RoutingConfig, ticket: u128) -> Option<usize>
         .map(|index| choices[index])
 }
 
-fn assignment(source: &MergedBackend) -> RouteAssignment {
-    // Zone metadata is explicitly unsupported until it is carried by the
-    // authoritative health composition. Go treats an unset self zone as local.
+fn assignment(source: &MergedBackend, local: bool) -> RouteAssignment {
+    // Locality belongs to the same exact H that admitted this reservation.
+    // Current routing config can be newer than the config observed by that H.
     RouteAssignment {
         backend_id: source.backend_id.to_string(),
         backend_address: source.backend.addr.clone(),
@@ -451,7 +452,7 @@ fn assignment(source: &MergedBackend) -> RouteAssignment {
             source.backend.keyspace.clone()
         },
         healthy: true,
-        local: true,
+        local,
         code: RouteCode::Ok,
         ..RouteAssignment::default()
     }

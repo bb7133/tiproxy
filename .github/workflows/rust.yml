@@ -48,7 +48,7 @@ jobs:
   quality:
     name: Format, lint, and test
     runs-on: ubuntu-24.04
-    # The CP-ROUTE evidence step compiles and runs 28 isolated production
+    # The CP-ROUTE evidence step compiles and runs isolated production
     # mutations (group, selector, health-round locality) before the unit
     # tests; 20 minutes no longer fits on the hosted runner.
     timeout-minutes: 30

@@ -36,8 +36,6 @@ pub enum Unsupported {
     ResourcePolicy,
     /// Locality-first factors are not yet composed into this selector.
     LocationPolicy,
-    /// Zone-derived assignment metadata needs the later health composition.
-    ZoneMetadata,
     /// Static fallback needs its own authoritative health source.
     StaticFallback,
 }
@@ -225,13 +223,6 @@ fn supported(config: &ConfigNamespaceSnapshot, policy: &RoutingConfig) -> Result
         RoutingBalancePolicy::Location => {
             return Err(RouteError::Unsupported(Unsupported::LocationPolicy));
         }
-    }
-    if policy
-        .proxy_labels
-        .iter()
-        .any(|(key, value)| key.as_ref() == "zone" && !value.is_empty())
-    {
-        return Err(RouteError::Unsupported(Unsupported::ZoneMetadata));
     }
     if config
         .topology()

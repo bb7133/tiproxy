@@ -169,7 +169,7 @@ Evidence layers:
   count as a kill. Baseline and restored sources must pass.
 
 `make controlplane-cproute-evidence` requires every layer above, including all
-sixteen selector mutations, both locally and in the hosted Rust workflow.
+nineteen selector mutations, both locally and in the hosted Rust workflow.
 Also run `make lint`, `make rust-lint`, `make rust-test`, `make rust-build`, and Go
 router/bridge/factor package tests. The mutation runner uses a separate target
 directory and never changes repository source.
@@ -195,3 +195,23 @@ locality with the exact H; nothing recomputes it from the current config.
   zone, case-insensitive compare, unlabelled backend local under a set zone,
   zone read after the round, zone re-read at each probe construction (killed by
   the concurrency-1 held fan-out row L7). Each run asserts the fresh Go output.
+
+### Selector assignment locality
+
+`control-router` copies `Local` from the selected backend's exact captured H
+into the reservation, matching Go `RouterAdapter.sendAssignmentLocked` reading
+`backend.Local()`. The actual Go health rule is covered by the shared locality
+observation above. A proxy zone is now supported for connection policy; resource
+and location factors and static fallback remain separately unsupported.
+
+`control-router/src/tests/locality.rs` composes the real config source, topology
+module, health loop, and selector. Disabled health always assigns `Local=false`,
+including unset, matching, and mismatching proxy zones. Enabled rows use held
+real SQL greeting probes: new C plus still-current old H keeps the observed
+locality, later rounds change it without rotating R, an old H cannot reserve,
+and already reserved metadata and settlement remain bound to the original
+reservation. These rows do not insert a fabricated health map.
+
+Three additional compiling selector mutations must fail those runtime rows:
+constant true, constant false, and recomputing locality from current config.
+The existing current-H authority mutation remains mandatory.

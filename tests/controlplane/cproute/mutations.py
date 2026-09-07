@@ -72,6 +72,13 @@ def main():
                 ('Err(RouteError::NoBackend)', 'Err(RouteError::NoBackend | RouteError::PortConflict)')]),
             ("selector-settles-other-session", "retry.rs", [
                 ('if !reservation.belongs_to(&self.session)', 'if false')]),
+            ("assignment-locality-always-true", "selector.rs", [
+                ('let local = candidate.health.get(&backend.source.backend_id).local;', 'let local = true;')]),
+            ("assignment-locality-always-false", "selector.rs", [
+                ('let local = candidate.health.get(&backend.source.backend_id).local;', 'let local = false;')]),
+            ("assignment-locality-from-current-config", "selector.rs", [
+                ('let local = candidate.health.get(&backend.source.backend_id).local;',
+                 'let local = candidate.policy.proxy_labels.iter().find(|(name, _)| name.as_ref() == "zone").is_none_or(|(_, zone)| zone.is_empty() || backend.source.backend.labels.get("zone").is_some_and(|value| value == zone.as_ref()));')]),
         ]
         for name, filename, replacements in cases:
             changed = originals[filename]
