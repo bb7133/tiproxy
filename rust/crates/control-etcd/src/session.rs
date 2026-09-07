@@ -26,7 +26,7 @@ use etcd_client::{
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::ElectionConfig;
+use crate::{ElectionAuthority, ElectionConfig};
 
 const MAX_TXN_KEY_BYTES: usize = 2_048;
 const MAX_TXN_VALUE_BYTES: usize = 64 * 1_024;
@@ -108,13 +108,15 @@ pub struct ElectionSnapshot {
 }
 
 impl ElectionSnapshot {
-    /// Returns whether owner-only effects may be committed now.
+    /// Whether this historical projection describes confirmed leadership.
+    /// Asynchronous consumers must use an `ElectionWorkPermit` for publication.
     #[must_use]
     pub const fn may_commit_owner_work(&self) -> bool {
         matches!(self.state, ElectionState::Leader)
     }
 
-    /// Returns whether this member still retains last-known local ownership.
+    /// Whether this historical projection describes last-known ownership.
+    /// Retained results must use the live `ElectionAuthority` instead.
     #[must_use]
     pub const fn retains_local_ownership(&self) -> bool {
         matches!(self.state, ElectionState::Leader | ElectionState::Uncertain)
@@ -261,6 +263,7 @@ pub enum ElectionError {
 /// the exact lease, value, and creation revision before returning to `Leader`.
 pub struct ElectionSession {
     owner: OwnerToken,
+    authority: ElectionAuthority,
     connector: EtcdConnector,
     config: ElectionConfig,
     request_timeout: Duration,
@@ -351,8 +354,10 @@ impl ElectionSession {
             retirement_reason: None,
         };
         let (snapshot_tx, _) = watch::channel(snapshot);
+        let authority = ElectionAuthority::new(owner.clone());
         let mut session = Self {
             owner,
+            authority,
             connector,
             config,
             request_timeout: client_config.request_timeout(),
@@ -382,6 +387,14 @@ impl ElectionSession {
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<ElectionSnapshot> {
         self.snapshot_tx.subscribe()
+    }
+
+    /// Retains this session's live authority without copying its diagnostic state.
+    /// The returned handle cannot outlive retirement, shutdown or session drop
+    /// as usable authority, even when its consumer never polls the state watch.
+    #[must_use]
+    pub fn authority(&self) -> ElectionAuthority {
+        self.authority.clone()
     }
 
     /// Sends and receives one lease keepalive.
@@ -945,7 +958,7 @@ impl ElectionSession {
             && owner.create_revision() == leader_key.rev())
     }
 
-    /// Resigns, revokes the lease, and crosses the local retirement fence.
+    /// Crosses the local retirement fence, then resigns and revokes the lease.
     ///
     /// Local state always becomes `Stopped`, even if etcd is unavailable; a
     /// failed revoke is safe because all attached keys still expire by TTL.
@@ -954,8 +967,12 @@ impl ElectionSession {
     ///
     /// Returns the first typed dependency failure after stopping locally.
     pub async fn shutdown(mut self) -> Result<(), ElectionError> {
+        // Capture cleanup eligibility BEFORE invalidating local authority. The
+        // early fence must not suppress remote Resign/LeaseRevoke cleanup.
+        let clean_up = self.owner.is_current() && self.snapshot().retains_local_ownership();
+        self.authority.retire();
         let mut first_error = None;
-        if self.owner.is_current() && self.snapshot().retains_local_ownership() {
+        if clean_up {
             if let Some(leader_key) = self.leader_key.take() {
                 let options = ResignOptions::new().with_leader(leader_key);
                 if let Err(source) = self
@@ -1147,7 +1164,16 @@ impl ElectionSession {
     fn update_snapshot(&self, update: impl FnOnce(&mut ElectionSnapshot)) {
         let mut snapshot = self.snapshot_tx.borrow().clone();
         update(&mut snapshot);
+        self.authority.transition(snapshot.state);
         self.snapshot_tx.send_replace(snapshot);
+    }
+}
+
+impl Drop for ElectionSession {
+    fn drop(&mut self) {
+        // No I/O from Drop. This also fences an aborted/never-polled shutdown
+        // future, which owns the session until that future is dropped.
+        self.authority.retire();
     }
 }
 

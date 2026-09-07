@@ -73,6 +73,8 @@ async fn run_scenarios(
     let (mut session, initial, recovered) =
         Box::pin(transient_and_compaction(owner, client_config, connection)).await?;
 
+    let authority = session.authority();
+    let old_work = authority.capture_work().ok_or("predecessor work permit")?;
     let successor_config = election_config("member-B", "member-B", 2)?;
     let successor =
         ElectionSession::campaign(owner.clone(), client_config.clone(), successor_config);
@@ -100,7 +102,10 @@ async fn run_scenarios(
     require(
         retired == RecoveryOutcome::Retired(RetirementReason::LeaseNotFound)
             && session.snapshot().state == ElectionState::Retired
-            && !session.snapshot().retains_local_ownership(),
+            && !session.snapshot().retains_local_ownership()
+            && !authority.retains_local_ownership()
+            && !old_work.still_current()
+            && old_work.with_current(|| 1).is_none(),
         "revoked lease did not retire before successor ownership",
     )?;
     require(
@@ -113,6 +118,12 @@ async fn run_scenarios(
     )?;
 
     let successor = tokio::time::timeout(Duration::from_secs(8), &mut successor).await??;
+    require(
+        !authority.retains_local_ownership()
+            && !old_work.still_current()
+            && successor.authority().capture_work().is_some(),
+        "old authority revived after successor ownership",
+    )?;
     let successor_snapshot = Box::pin(validate_successor(
         successor,
         owner,
@@ -192,6 +203,8 @@ async fn transient_and_compaction(
         "transient outage did not record both failure and recovery retry checkpoints",
     )?;
 
+    let authority = session.authority();
+    let compact_work = authority.capture_work().ok_or("pre-compaction permit")?;
     post_control(&connection.control_url, "/bump-compact").await?;
     session.resume_watch().await?;
     let watch_outcome = tokio::time::timeout(Duration::from_secs(5), async {
@@ -208,6 +221,12 @@ async fn transient_and_compaction(
             && session.snapshot().compaction_recoveries == 1
             && session.snapshot().state == ElectionState::Leader,
         "compacted watch did not relist and resume without false retirement",
+    )?;
+    require(
+        authority.retains_local_ownership()
+            && compact_work.still_current()
+            && compact_work.with_current(|| 7) == Some(7),
+        "same-owner compaction invalidated confirmed authority",
     )?;
     Ok((session, initial, recovered))
 }

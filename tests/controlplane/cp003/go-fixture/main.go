@@ -44,8 +44,9 @@ type fixture struct {
 }
 
 type connectionInfo struct {
-	EtcdEndpoint string `json:"etcd_endpoint"`
-	ControlURL   string `json:"control_url"`
+	EtcdEndpoint  string `json:"etcd_endpoint"`
+	ProxyEndpoint string `json:"proxy_endpoint"`
+	ControlURL    string `json:"control_url"`
 }
 
 func main() {
@@ -81,6 +82,11 @@ func run(connectionPath, dataDir string) error {
 	mux.HandleFunc("/revoke", f.revokeHandler)
 	mux.HandleFunc("/bump-compact", f.bumpCompactHandler)
 	mux.HandleFunc("/status", f.statusHandler)
+	proxy, proxyEndpoint, err := startCleanupProxy(f.addr, mux)
+	if err != nil {
+		return fmt.Errorf("start cleanup RPC proxy: %w", err)
+	}
+	defer proxy.close()
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
 	go func() {
 		_ = server.Serve(listener)
@@ -88,8 +94,9 @@ func run(connectionPath, dataDir string) error {
 	defer server.Close()
 
 	info := connectionInfo{
-		EtcdEndpoint: f.addr,
-		ControlURL:   "http://" + listener.Addr().String(),
+		EtcdEndpoint:  f.addr,
+		ProxyEndpoint: proxyEndpoint,
+		ControlURL:    "http://" + listener.Addr().String(),
 	}
 	data, err := json.Marshal(info)
 	if err != nil {
