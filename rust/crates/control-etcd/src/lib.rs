@@ -23,9 +23,11 @@
 
 #![forbid(unsafe_code)]
 
+mod authority;
 mod config;
 mod session;
 
+pub use authority::{ElectionAuthority, ElectionWorkPermit};
 pub use config::{ElectionConfig, ElectionConfigError};
 pub use session::{
     ElectionError, ElectionSession, ElectionSnapshot, ElectionState, PersistentDeleteResult,
