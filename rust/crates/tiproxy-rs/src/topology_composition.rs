@@ -1990,7 +1990,9 @@ ns-servers = []
                 Box::new(ArtifactClusterFactory),
                 Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
                 identity(),
-            );
+                control_config::HealthCheckConfig::default(),
+            )
+            .unwrap_or_else(|error| unreachable!("pinned health config is valid: {error}"));
             let context = runtime.handle().module_context();
             runtime
                 .mark_ready()
@@ -2474,7 +2476,9 @@ ns-servers = [{ns_servers}]
             Box::new(ArtifactClusterFactory),
             Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
             identity(),
-        );
+            control_config::HealthCheckConfig::default(),
+        )
+        .unwrap_or_else(|error| unreachable!("pinned health config is valid: {error}"));
         let context = runtime.handle().module_context();
         runtime
             .mark_ready()
@@ -2512,8 +2516,8 @@ ns-servers = [{ns_servers}]
     /// has fully completed and published — the target must be visible then, and if
     /// it is not, that poll genuinely failed and the drain fails outright rather
     /// than looping. The successor poll entered at Range #2 is itself still in
-    /// flight when the drain exits; every row tears its composition down
-    /// immediately afterward, which cancels it.
+    /// flight when the drain exits; every paused-clock row tears its composition
+    /// down immediately afterward, which cancels it.
     async fn drain_until<F>(
         routing: &RoutingSnapshotHandle,
         fixture: &KvFixture,
@@ -2584,12 +2588,38 @@ ns-servers = [{ns_servers}]
     /// later one, so it gets real time for the same reason as [`drain_until`].
     async fn wait_first_real(routing: &RoutingSnapshotHandle) -> Arc<RoutingSnapshot> {
         tokio::time::resume();
-        let first = routing
-            .wait_first()
-            .await
-            .unwrap_or_else(|_| unreachable!("the refresh loop publishes a first snapshot"));
+        let first = first_snapshot(routing).await;
         tokio::time::pause();
         first
+    }
+
+    /// The refresh loop's first published snapshot. A real-clock row calls this
+    /// directly; a paused-clock row goes through [`wait_first_real`].
+    async fn first_snapshot(routing: &RoutingSnapshotHandle) -> Arc<RoutingSnapshot> {
+        routing
+            .wait_first()
+            .await
+            .unwrap_or_else(|_| unreachable!("the refresh loop publishes a first snapshot"))
+    }
+
+    /// [`drain_until`] for a row that runs on the REAL clock: the refresh ticker
+    /// fires on its own within one interval, so nothing is advanced, and the same
+    /// two-Range completion fence decides success or fails fast.
+    async fn drain_until_real<F>(
+        routing: &RoutingSnapshotHandle,
+        fixture: &KvFixture,
+        mut done: F,
+    ) -> Arc<RoutingSnapshot>
+    where
+        F: FnMut(&RoutingSnapshot) -> bool,
+    {
+        if let Some(snapshot) = routing.current()
+            && done(&snapshot)
+        {
+            return snapshot;
+        }
+        let before = fixture.tidb_range_count();
+        drain_in_real_time(routing, fixture, before, &mut done).await
     }
 
     /// Waits until the module's observable status reaches `applied` — an
@@ -2960,6 +2990,701 @@ ns-servers = [{ns_servers}]
             comp.runtime
                 .finish()
                 .unwrap_or_else(|error| unreachable!("finish: {error}"));
+        };
+        with_real_wall_clock_watchdog(body).await;
+    }
+
+    // ===================================================================
+    // CP-TOPO #213-3b: real-composition proof of the backend-health seam.
+    //
+    // These rows drive the REAL TopologyModule + REAL #213-2 health loop
+    // (composed by #213-3a) against a REAL loopback HTTP/1.1 `/status`
+    // server, observing verdicts ONLY through the public source-paired
+    // protocol `routing_handle().current()` -> `health_overlay_handle()
+    // .current_for(&R)` -> `still_current_for` -> `HealthSnapshot::get`.
+    //
+    // NOTE on the `/status` server transport: the frozen design names a
+    // "hyper HTTP/1.1" loopback server, but tiproxy-rs's `hyper` dev-dep
+    // enables only `["http2","server"]` (http2 is required by the etcd gRPC
+    // `KvFixture` above) — NOT `http1`. Adding the `http1` feature would edit
+    // `Cargo.toml`, a production/build surface this task forbids. So this is
+    // the behaviourally-equivalent raw-TCP HTTP/1.1 `/status` server the
+    // design itself points to as "the MODEL" (control-topology's cfg(test)
+    // `serve_counting` is likewise raw TCP, exercised against the SAME
+    // `get_once` probe). No production is touched and Cargo.lock is unchanged.
+    // ===================================================================
+
+    use control_topology::{HealthOverlayHandle, HealthSnapshot};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The merged backend id for `ADDR_A` under `CLUSTER_NAME` (`{cluster}/{addr}`).
+    const BACKEND_ID: &str = "cluster-a/10.0.0.1:4000";
+
+    // ----- The controllable loopback HTTP/1.1 `/status` server --------------
+
+    /// The scripted per-request behavior of the loopback `/status` server,
+    /// snapshotted synchronously at the START of each request.
+    #[derive(Clone)]
+    enum StatusBehavior {
+        /// Answer `200 OK` with a valid `{"version": ...}` body.
+        Ok200(String),
+        /// Answer `500` whose body is a VALID version JSON, so a mutant deleting
+        /// the production non-200 rejection would wrongly decode it as healthy.
+        Status500,
+        /// Never respond: hold the connection open so the probe's own attempt
+        /// deadline fires, across the whole retry budget.
+        Hang,
+    }
+
+    /// A loopback HTTP/1.1 `/status` server. It records BOTH every accepted
+    /// connection AND — separately — every request parsed as an exact `GET
+    /// /status` (incremented + signalled only after the method/path are
+    /// confirmed), so a structured wait can key on a real post-switch probe and a
+    /// disabled row can assert zero I/O.
+    #[derive(Clone)]
+    struct StatusServer {
+        behavior: Arc<Mutex<StatusBehavior>>,
+        accepted: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+        port: u16,
+    }
+
+    impl StatusServer {
+        /// Swaps the controllable behavior; snapshotted at the start of each later
+        /// request (never held across an await).
+        fn set(&self, behavior: StatusBehavior) {
+            *self.behavior.lock().unwrap_or_else(PoisonError::into_inner) = behavior;
+        }
+
+        /// The count of exact `GET /status` requests parsed so far.
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+
+        /// The count of accepted TCP connections so far.
+        fn accepted_count(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Binds a loopback `/status` server and serves each accepted connection.
+    async fn spawn_status_server(behavior: StatusBehavior) -> StatusServer {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("status bind: {error}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("status addr: {error}"))
+            .port();
+        let server = StatusServer {
+            behavior: Arc::new(Mutex::new(behavior)),
+            accepted: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(AtomicUsize::new(0)),
+            notify: Arc::new(Notify::new()),
+            port,
+        };
+        let serving = server.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                serving.accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(serve_status_connection(stream, serving.clone()));
+            }
+        });
+        server
+    }
+
+    /// Serves one `/status` connection: reads the request head, snapshots the
+    /// behavior synchronously, counts + signals ONLY an exact `GET /status`, then
+    /// answers per the snapshotted behavior (or hangs).
+    async fn serve_status_connection(mut stream: TcpStream, server: StatusServer) {
+        let Some(head) = read_request_head(&mut stream).await else {
+            return;
+        };
+        // Snapshot the controllable behavior at the START of the request; the lock
+        // is released before any await.
+        let behavior = server
+            .behavior
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        // An unknown method/path is a non-200 that does NOT count as a `/status`
+        // request.
+        if !is_get_status(&head) {
+            let _ = stream.write_all(HTTP_404).await;
+            let _ = stream.flush().await;
+            return;
+        }
+        // Exactly `GET /status`: count and signal AFTER confirming method + path.
+        server.requests.fetch_add(1, Ordering::SeqCst);
+        server.notify.notify_one();
+        match behavior {
+            StatusBehavior::Ok200(version) => {
+                let response = http_response(200, "OK", &format!(r#"{{"version":"{version}"}}"#));
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+            StatusBehavior::Status500 => {
+                // A 500 with a VALID version body: a mutant that drops the non-200
+                // rejection would decode this as healthy (making R1 phase-500 red).
+                let response = http_response(
+                    500,
+                    "Internal Server Error",
+                    r#"{"version":"v-should-not-matter"}"#,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+            StatusBehavior::Hang => {
+                // Never respond; hold the connection open so the probe's 2s attempt
+                // deadline fires (across the whole retry budget). Keep the stream
+                // alive by never dropping it.
+                let _keep = stream;
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// A `404` head that is never counted as a `/status` request.
+    const HTTP_404: &[u8] =
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// Builds an HTTP/1.1 response with `Connection: close` and a `Content-Length`.
+    fn http_response(code: u16, reason: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Reads a request head up to (and including) the terminating `\r\n\r\n`,
+    /// returning the raw head or `None` on EOF/error.
+    async fn read_request_head(stream: &mut TcpStream) -> Option<String> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            }
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if buffer.len() > 8192 {
+                break;
+            }
+        }
+        Some(String::from_utf8_lossy(&buffer).into_owned())
+    }
+
+    /// Whether the request head's start line is exactly `GET /status ...`.
+    fn is_get_status(head: &str) -> bool {
+        let Some(line) = head.lines().next() else {
+            return false;
+        };
+        let mut parts = line.split_whitespace();
+        parts.next() == Some("GET") && parts.next() == Some("/status")
+    }
+
+    // ----- The port-templated backend seed ----------------------------------
+
+    /// The `info` + live `ttl` pair for one backend at `addr` whose `/status`
+    /// probe target is the loopback server: `ip = 127.0.0.1`, `status_port =
+    /// port`. The info `version` is irrelevant — the probe reads the version from
+    /// the HTTP `/status` body, not this etcd record.
+    fn backend_kvs_at(addr: &str, port: u16) -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            kv(
+                &format!("/topology/tidb/{addr}/info"),
+                &format!(r#"{{"ip":"127.0.0.1","status_port":{port},"version":"v8"}}"#),
+            ),
+            kv(&format!("/topology/tidb/{addr}/ttl"), "173000000000"),
+        ]
+    }
+
+    /// The seeded key space for one backend at `addr` templating the loopback
+    /// `/status` port.
+    fn seed_at(addr: &str, port: u16) -> Vec<(Vec<u8>, Vec<u8>)> {
+        backend_kvs_at(addr, port)
+    }
+
+    /// Builds the real pipeline against `addr` with an explicit (checked) health
+    /// config, so a row can pass `enabled = false` through the SAME public
+    /// `TopologyModule::new`. Mirrors [`build_composition`], which pins the enabled
+    /// default.
+    async fn build_composition_with_health(
+        addr: SocketAddr,
+        ns_servers: &str,
+        health: control_config::HealthCheckConfig,
+    ) -> Composition {
+        let dir = material_dir();
+        let toml = topology_toml(&format!("127.0.0.1:{}", addr.port()), ns_servers);
+        let roots = open_tls_roots(std::slice::from_ref(&dir));
+        let store = ConfigNamespaceStore::from_toml_with_validator(
+            &toml,
+            None,
+            &dir,
+            Arc::new(TopologyCandidateValidator::new(Arc::new(roots))),
+        )
+        .unwrap_or_else(|error| unreachable!("pipeline validation: {error}"));
+
+        let registry = Box::leak(Box::new(OwnershipRegistry::new()));
+        let config = ControlConfig::new(
+            1,
+            Duration::from_secs(30),
+            0,
+            TlsPolicy::default(),
+            LogLevel::Info,
+            MetricsPolicy::default(),
+        )
+        .unwrap_or_else(|error| unreachable!("control config: {error}"));
+        let runtime = ControlRuntime::claim_process(
+            registry,
+            "cptopo-health-comp",
+            config,
+            Arc::new(NullSink),
+        )
+        .unwrap_or_else(|error| unreachable!("claim process: {error}"));
+
+        let source: Arc<dyn ConfigNamespaceSource> = Arc::new(store.clone());
+        let (module, mut handle) = TopologyModule::new(
+            source,
+            Box::new(ArtifactClusterFactory),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            health,
+        )
+        .unwrap_or_else(|error| unreachable!("checked health config is valid: {error}"));
+        let context = runtime.handle().module_context();
+        runtime
+            .mark_ready()
+            .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
+        let task = tokio::spawn(Box::new(module).run(context));
+        handle
+            .wait_ready()
+            .await
+            .unwrap_or_else(|error| unreachable!("module ready: {error}"));
+        let routing = handle.routing_handle();
+        Composition {
+            handle,
+            routing,
+            store,
+            dir,
+            task,
+            runtime,
+        }
+    }
+
+    // ----- The anti-false-pass structured health wait -----------------------
+    //
+    // Every health row runs on the REAL clock from its first poll to its teardown:
+    // plain `#[tokio::test]`, never `advance`/`pause`/`resume`. Both the routing
+    // poll and the `/status` probe are real loopback I/O with production budgets
+    // (the per-cluster refresh timeout, the probe's attempt timeout), and a paused
+    // clock auto-advances past those budgets whenever the runtime idles mid-I/O,
+    // leaving a reset stream behind that poisons the next poll on the shared
+    // connection. No fence can prove a routing poll quiescent from the outside
+    // (the public surface exposes no client-side round completion), so instead
+    // nothing is ever in flight under a frozen clock. The cost is the Go-default
+    // cadence on the wall clock: one health round per 3s, and the Hang phase spends
+    // its 4 x 2s attempt + 3 x 1s retry budget for real.
+
+    /// A structured wait for the health overlay to carry `expected_healthy` /
+    /// `expected_version` for `backend_id` under the EXACT routing source `r`,
+    /// deterministically, without `sleep`/`yield` and without a spin budget.
+    ///
+    /// Observation is structured on the server's exact `GET /status` events: the
+    /// handler's notify fires when the request is parsed — before the response and
+    /// the loop's publication — so the verdict is re-checked after each event and
+    /// the wait returns only when ALL hold: (1) the request count advanced past
+    /// `baseline + min_request_delta` (a real post-switch probe; `>= 4` for Hang
+    /// covers the full retry budget); (2) `current_for(&r)` is `Some(h)`; (3)
+    /// `still_current_for(&h, &r, routing)`; (4) `h` is not `prev_h` (a genuinely
+    /// NEW overlay, never a stale prior verdict); (5) the verdict matches. The
+    /// waiter is registered before each check, so an event landing between the
+    /// check and the await cannot be lost. A genuine hang is bounded only by the
+    /// real wall-clock watchdog.
+    #[allow(clippy::too_many_arguments)]
+    async fn wait_health(
+        overlay: &HealthOverlayHandle,
+        routing: &RoutingSnapshotHandle,
+        r: &Arc<RoutingSnapshot>,
+        backend_id: &str,
+        expected_healthy: bool,
+        expected_version: Option<&str>,
+        baseline: usize,
+        min_request_delta: usize,
+        server: &StatusServer,
+        prev_h: Option<&Arc<HealthSnapshot>>,
+    ) -> Arc<HealthSnapshot> {
+        loop {
+            let notified = server.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if server.request_count() >= baseline + min_request_delta
+                && let Some(h) = overlay.current_for(r)
+                && prev_h.is_none_or(|prev| !Arc::ptr_eq(&h, prev))
+                && overlay.still_current_for(&h, r, routing)
+            {
+                let verdict = h.get(backend_id);
+                if verdict.healthy == expected_healthy
+                    && verdict.server_version.as_deref() == expected_version
+                {
+                    break h;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// A structured wait for a DISABLED runtime's published overlay.
+    ///
+    /// A disabled runtime does no probe I/O, so there is no `/status` request
+    /// signal to key on; a new generation's zero-I/O round runs immediately, so this
+    /// bounded-yields the (change-future-less) public overlay handle until a live
+    /// all-healthy overlay is published for `r`. The cap is a pure deadlock guard.
+    async fn drain_disabled_health(
+        overlay: &HealthOverlayHandle,
+        routing: &RoutingSnapshotHandle,
+        r: &Arc<RoutingSnapshot>,
+    ) -> Arc<HealthSnapshot> {
+        for _ in 0..20_000 {
+            tokio::task::yield_now().await;
+            if let Some(h) = overlay.current_for(r)
+                && overlay.still_current_for(&h, r, routing)
+            {
+                return h;
+            }
+        }
+        unreachable!("the disabled health overlay was not published within the budget");
+    }
+
+    /// Asserts every backend of `r` reads healthy with no version through `h`.
+    fn assert_all_healthy(h: &Arc<HealthSnapshot>, r: &Arc<RoutingSnapshot>) {
+        for backend in &r.backends.backends {
+            let verdict = h.get(backend.backend_id.as_ref());
+            assert!(
+                verdict.healthy,
+                "a disabled runtime reads {} healthy",
+                backend.backend_id
+            );
+            assert!(
+                verdict.server_version.is_none(),
+                "a disabled runtime carries no version for {}",
+                backend.backend_id
+            );
+        }
+    }
+
+    // ----- Row R1: a backend flips healthy -> 500 -> Hang on one source ------
+
+    #[tokio::test]
+    async fn a_backend_health_flips_through_the_real_status_probe() {
+        let body = async {
+            let server =
+                spawn_status_server(StatusBehavior::Ok200("v-health-200".to_owned())).await;
+            let Some((_fixture, addr)) = spawn_fixture(seed_at(ADDR_A, server.port)).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let comp = build_composition(addr, "").await;
+            let overlay = comp.handle.health_overlay_handle();
+
+            // The epoch-0 routing source R, observed only through the public handle.
+            let r = first_snapshot(&comp.routing).await;
+            let r_epoch = r.client_epoch;
+            let r_gen = r.generation;
+
+            // Phase 200: a real `GET /status` -> 200 decodes a healthy version.
+            let h200 = wait_health(
+                &overlay,
+                &comp.routing,
+                &r,
+                BACKEND_ID,
+                true,
+                Some("v-health-200"),
+                0,
+                1,
+                &server,
+                None,
+            )
+            .await;
+            assert!(h200.get(BACKEND_ID).healthy, "the 200 verdict is healthy");
+            assert_eq!(
+                h200.get(BACKEND_ID).server_version.as_deref(),
+                Some("v-health-200"),
+                "the healthy version came from the HTTP /status body"
+            );
+            assert_unchanged_routing(&comp.routing, &r, r_epoch, r_gen);
+
+            // Phase 500: a valid-body 500 is a terminal non-200 -> unhealthy.
+            server.set(StatusBehavior::Status500);
+            let baseline_500 = server.request_count();
+            let h500 = wait_health(
+                &overlay,
+                &comp.routing,
+                &r,
+                BACKEND_ID,
+                false,
+                None,
+                baseline_500,
+                1,
+                &server,
+                Some(&h200),
+            )
+            .await;
+            assert!(
+                !h500.get(BACKEND_ID).healthy,
+                "the 500 verdict is unhealthy"
+            );
+            assert!(
+                !overlay.still_current_for(&h200, &r, &comp.routing),
+                "the healthy overlay is de-authorized once the unhealthy round publishes"
+            );
+            assert_unchanged_routing(&comp.routing, &r, r_epoch, r_gen);
+
+            // Phase Hang: a hung backend times out every attempt across the FULL
+            // retry budget (initial + 3 retries) -> unhealthy with no version.
+            server.set(StatusBehavior::Hang);
+            let baseline_hang = server.request_count();
+            let h_timeout = wait_health(
+                &overlay,
+                &comp.routing,
+                &r,
+                BACKEND_ID,
+                false,
+                None,
+                baseline_hang,
+                4,
+                &server,
+                Some(&h500),
+            )
+            .await;
+            assert!(
+                server.request_count() - baseline_hang >= 4,
+                "the hung phase exercised the full 4-attempt retry budget"
+            );
+            let verdict = h_timeout.get(BACKEND_ID);
+            assert!(!verdict.healthy, "the hung verdict is unhealthy");
+            assert!(
+                verdict.server_version.is_none(),
+                "a hung probe yields no version"
+            );
+            assert!(
+                !overlay.still_current_for(&h500, &r, &comp.routing),
+                "the 500 overlay is de-authorized once the timeout round publishes"
+            );
+            // Throughout R1 a health flip never rotated the routing source.
+            assert_unchanged_routing(&comp.routing, &r, r_epoch, r_gen);
+
+            comp.task.abort();
+            drop(comp.runtime);
+        };
+        with_real_wall_clock_watchdog(body).await;
+    }
+
+    /// Asserts the routing source is still the exact live `Arc` at its published
+    /// epoch and generation — a health flip must not rotate routing.
+    fn assert_unchanged_routing(
+        routing: &RoutingSnapshotHandle,
+        r: &Arc<RoutingSnapshot>,
+        epoch: u64,
+        generation: u64,
+    ) {
+        let live = routing
+            .current()
+            .unwrap_or_else(|| unreachable!("the routing source stays live across a health flip"));
+        assert!(
+            Arc::ptr_eq(&live, r),
+            "the routing source Arc is unchanged across the health flip"
+        );
+        assert_eq!(live.client_epoch, epoch, "the routing epoch is unchanged");
+        assert_eq!(
+            live.generation, generation,
+            "the routing generation is unchanged"
+        );
+    }
+
+    // ----- Row R2: an epoch rotation realigns health provenance -------------
+
+    #[tokio::test]
+    async fn an_epoch_rotation_realigns_health_provenance_and_fails_the_old_source_closed() {
+        let body = async {
+            let server = spawn_status_server(StatusBehavior::Ok200("v-rot".to_owned())).await;
+            let Some((fixture, addr)) = spawn_fixture(seed_at(ADDR_A, server.port)).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let comp = build_composition(addr, "").await;
+            let overlay = comp.handle.health_overlay_handle();
+
+            let r0 = first_snapshot(&comp.routing).await;
+            let e0 = r0.client_epoch;
+            let h0 = wait_health(
+                &overlay,
+                &comp.routing,
+                &r0,
+                BACKEND_ID,
+                true,
+                Some("v-rot"),
+                0,
+                1,
+                &server,
+                None,
+            )
+            .await;
+            assert!(h0.get(BACKEND_ID).healthy, "the E0 source is healthy");
+
+            // Rotate the exact cluster MATERIAL (add a literal nameserver), keeping
+            // the backend KV content identical; the PD/backend endpoints stay
+            // literal IPs so the fixture stays reachable — only the client epoch
+            // rotates.
+            let mut status = comp.handle.status();
+            comp.store
+                .apply_toml(
+                    &topology_toml(&format!("127.0.0.1:{}", addr.port()), "\"203.0.113.9:53\""),
+                    None,
+                    2,
+                    &comp.dir,
+                )
+                .unwrap_or_else(|error| unreachable!("apply revision 2: {error}"));
+            wait_applied(&mut status, 2).await;
+
+            // The material/feed fence de-authorizes H0 synchronously at apply, while
+            // the routing source R0 is still the live `current()` (routing has not
+            // rotated yet) — isolating the health-feed fence from routing rotation.
+            assert!(
+                overlay.current_for(&r0).is_none(),
+                "H0 fails closed at the material/feed fence, before routing rotates"
+            );
+            let live = comp
+                .routing
+                .current()
+                .unwrap_or_else(|| unreachable!("R0 stays live until the next refresh tick"));
+            assert!(
+                Arc::ptr_eq(&live, &r0),
+                "the routing source R0 is still current at the feed fence"
+            );
+
+            // Drain the new routing generation R1: E0 -> E1, a fresh Arc, identical
+            // backend content.
+            let r1 = drain_until_real(&comp.routing, &fixture, |s| s.client_epoch == e0 + 1).await;
+            assert_eq!(
+                r1.client_epoch,
+                e0 + 1,
+                "the discovery client epoch rotated"
+            );
+            assert!(!Arc::ptr_eq(&r0, &r1), "the rotation installs a new Arc");
+            assert_eq!(
+                r1.backends, r0.backends,
+                "the backend content is identical across the epoch rotation"
+            );
+
+            // H1 healthy under R1 IS the provenance proof: a network still stamped
+            // E0 would be epoch-fenced unhealthy under the E1 source.
+            let baseline = server.request_count();
+            let h1 = wait_health(
+                &overlay,
+                &comp.routing,
+                &r1,
+                BACKEND_ID,
+                true,
+                Some("v-rot"),
+                baseline,
+                1,
+                &server,
+                None,
+            )
+            .await;
+            assert!(
+                h1.get(BACKEND_ID).healthy,
+                "the E1 source is healthy through an E1-stamped network"
+            );
+            assert!(
+                overlay.current_for(&r0).is_none(),
+                "the old provenance stays fail-closed after the rotation"
+            );
+            assert!(
+                !overlay.still_current_for(&h0, &r0, &comp.routing),
+                "the old overlay is not current for the old source"
+            );
+
+            comp.task.abort();
+            drop(comp.runtime);
+        };
+        with_real_wall_clock_watchdog(body).await;
+    }
+
+    // ----- Row R3: a disabled composition does no health I/O ----------------
+
+    #[tokio::test]
+    async fn a_disabled_composition_does_no_health_io_and_reads_all_healthy() {
+        let body = async {
+            // Ok200 that must NEVER be hit: a disabled runtime opens no socket.
+            let server = spawn_status_server(StatusBehavior::Ok200("never".to_owned())).await;
+            let Some((fixture, addr)) = spawn_fixture(seed_at(ADDR_A, server.port)).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            // The SAME public constructor, with a checked disabled health config.
+            let health = control_config::HealthCheckConfig {
+                enabled: false,
+                ..control_config::HealthCheckConfig::default()
+            };
+            let comp = build_composition_with_health(addr, "", health).await;
+            let overlay = comp.handle.health_overlay_handle();
+
+            // Initial source: the disabled seam publishes an all-healthy, no-version
+            // overlay with zero probe I/O.
+            let r0 = first_snapshot(&comp.routing).await;
+            assert_eq!(r0.backends.backends.len(), 1, "one backend is discovered");
+            let h0 = drain_disabled_health(&overlay, &comp.routing, &r0).await;
+            assert_all_healthy(&h0, &r0);
+
+            // A real material rotation, then the rotated source is ALSO all-healthy.
+            let mut status = comp.handle.status();
+            comp.store
+                .apply_toml(
+                    &topology_toml(&format!("127.0.0.1:{}", addr.port()), "\"203.0.113.9:53\""),
+                    None,
+                    2,
+                    &comp.dir,
+                )
+                .unwrap_or_else(|error| unreachable!("apply revision 2: {error}"));
+            wait_applied(&mut status, 2).await;
+            let r1 = drain_until_real(&comp.routing, &fixture, |s| {
+                s.client_epoch == r0.client_epoch + 1
+            })
+            .await;
+            assert!(!Arc::ptr_eq(&r0, &r1), "the rotation installs a new Arc");
+            assert!(
+                !comp.routing.still_current(&r0),
+                "the old routing source is de-authorized across the rotation"
+            );
+            assert!(
+                overlay.current_for(&r0).is_none(),
+                "the old overlay is de-authorized across the rotation"
+            );
+            let h1 = drain_disabled_health(&overlay, &comp.routing, &r1).await;
+            assert_all_healthy(&h1, &r1);
+
+            // Zero `/status` I/O ever: a disabled runtime built no client, opened no
+            // socket, and sent no probe. (Together with 3a's unbuildable-material
+            // row this closes zero-construction; this row alone proves the real-seam
+            // disabled all-healthy + zero-I/O, not that no client was constructed.)
+            assert_eq!(
+                server.accepted_count(),
+                0,
+                "a disabled runtime accepts no /status connection"
+            );
+            assert_eq!(
+                server.request_count(),
+                0,
+                "a disabled runtime sends no /status request"
+            );
+
+            comp.task.abort();
+            drop(comp.runtime);
         };
         with_real_wall_clock_watchdog(body).await;
     }

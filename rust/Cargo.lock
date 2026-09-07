@@ -348,6 +348,8 @@ dependencies = [
  "h2",
  "hickory-proto",
  "http",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "prost",
  "rcgen",

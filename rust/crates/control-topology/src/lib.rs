@@ -34,8 +34,16 @@
 
 #![forbid(unsafe_code)]
 
+mod backend_health;
 mod discovery;
 mod discovery_publish;
+// CP-TOPO #213-2 health-round loop + generation-fenced overlay, composed into the
+// module lifecycle by CP-TOPO #213-3 (config → runtime, owner-fenced feed, and the
+// generation-fenced overlay surfaced through the module handle).
+mod health_config;
+mod health_feed;
+mod health_loop;
+mod health_overlay;
 mod merge;
 mod model;
 mod module;
@@ -44,8 +52,11 @@ mod registrar;
 mod resolver;
 mod routing_snapshot;
 
+pub use backend_health::{BackendHealth, ClusterHealthNetwork};
 pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
 pub use discovery_publish::{DiscoveryError, DiscoveryHandle, EpochResult};
+pub use health_config::HealthConfigError;
+pub use health_overlay::{HealthOverlayHandle, HealthSnapshot};
 pub use merge::{
     ClusterTopologyFetch, MergedBackend, MergedTopology, TopologyUnavailable, merge_tidb_topology,
 };

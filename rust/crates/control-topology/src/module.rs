@@ -46,23 +46,34 @@
 //! handle is left zero-I/O fail-closed. The immutable snapshot published to
 //! CP-ROUTE (stamped by client epoch) is a dependent follow-up (#214).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceSource, TopologyRuntimeIdentity};
-use control_external::{EtcdClientConfig, EtcdConnector};
+use control_config::{
+    ConfigNamespaceSnapshot, ConfigNamespaceSource, HealthCheckConfig, TopologyRuntimeIdentity,
+};
+use control_external::{ClusterHttpConfigError, EtcdClientConfig, EtcdConnector};
 use control_plane::{
-    ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture, OwnerToken,
+    ControlModule, LifecyclePhase, LifecycleSnapshot, ModuleContext, ModuleError, ModuleFuture,
+    OwnerToken,
 };
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
+use crate::backend_health::{ClusterHealthNetwork, PreparedClusterHealthNetwork};
 use crate::discovery_publish::{
     DiscoveryConnector, DiscoveryHandle, DiscoveryPublisher, default_discovery_connector,
 };
+use crate::health_config::{HealthConfigError, HealthRuntime};
+use crate::health_feed::{HealthGenerationFeed, HealthGenerationFeeder};
+use crate::health_loop::{
+    HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
+};
+use crate::health_overlay::{HealthOverlayHandle, HealthOverlayPublisher};
 use crate::registrar::RegistrarError;
 use crate::resolver::AdvertiseEndpointResolver;
 use crate::routing_snapshot::{RoutingSnapshotHandle, RoutingSnapshotPublisher};
@@ -114,6 +125,23 @@ fn default_child_runner() -> ChildRunner {
 #[cfg(test)]
 type RefreshFactory =
     Arc<dyn Fn(DiscoveryHandle, Arc<RoutingSnapshotPublisher>) -> JoinHandle<()> + Send + Sync>;
+
+/// Spawns the health-check child. Test-only: a test injects a child that returns
+/// or panics (to exercise supervision) or holds a `DropGuard` (to exercise
+/// teardown abort/join) instead of the real [`run_health_loop`]. It receives the
+/// uniquely-owned feed and publisher (so the real ones are consumed) plus the
+/// routing handle and owner.
+#[cfg(test)]
+type HealthFactory = Arc<
+    dyn Fn(
+            HealthGenerationFeed,
+            HealthOverlayPublisher,
+            RoutingSnapshotHandle,
+            OwnerToken,
+        ) -> JoinHandle<()>
+        + Send
+        + Sync,
+>;
 
 /// One backend cluster's connection material, produced by a
 /// [`TopologyClientFactory`].
@@ -169,6 +197,11 @@ pub enum RejectionClass {
     ClusterSetMismatch,
     /// The factory returned two clients for the same cluster name.
     DuplicateClusterName,
+    /// A cluster's health-probe network could not be built (bad TLS material,
+    /// unbuildable resolver, or invalid probe policy). Raised BEFORE any live
+    /// plane is mutated and before the discovery epoch is reserved, so a health
+    /// build failure never burns an epoch and retains all planes' last-good.
+    HealthClientBuildFailed,
 }
 
 /// Observable registration status.
@@ -203,8 +236,85 @@ pub struct TopologyModule {
     discovery_connector: DiscoveryConnector,
     discovery_reader: DiscoveryHandle,
     routing: Arc<RoutingSnapshotPublisher>,
+    /// The validated, restart-pinned health runtime, derived once at construction
+    /// from the constructor-supplied [`HealthCheckConfig`]. It is process input,
+    /// not configuration generation: it lives only here, has no setter and no
+    /// snapshot/update path, so "restart-pinned" is guaranteed by this ownership
+    /// seam rather than by any per-generation comparison.
+    health_runtime: HealthRuntime,
+    /// The health feed/overlay-publisher pair, created at construction so the
+    /// overlay handle can be surfaced immediately; moved into the run loop (feed +
+    /// publisher into the health task, feeder into the [`ModuleRuntime`] guard) at
+    /// startup. `None` only after that move.
+    health: Option<HealthParts>,
     #[cfg(test)]
     refresh_override: Option<RefreshFactory>,
+    #[cfg(test)]
+    health_override: Option<HealthFactory>,
+}
+
+/// The uniquely-owned health primitives handed to the run loop: the feed and the
+/// overlay publisher (into the health task) and the feeder (into the module
+/// runtime guard). All three are non-`Clone`, so they are taken exactly once.
+struct HealthParts {
+    feeder: HealthGenerationFeeder,
+    feed: HealthGenerationFeed,
+    publisher: HealthOverlayPublisher,
+}
+
+/// One generation's per-cluster health networks, built (fallibly) but not yet
+/// stamped with the reserved discovery epoch.
+type PreparedHealthNetworks = Vec<(Arc<str>, PreparedClusterHealthNetwork)>;
+
+/// The immutable health authority for one discovery generation.
+///
+/// It is the SOLE source of health material: the exact `client_epoch` reserved by
+/// [`crate::discovery_publish::PreparedDiscovery`] plus the per-cluster networks
+/// stamped for it (`None` when health is disabled). The module never re-reads a
+/// [`RegistrationPlan`] — which carries no epoch — to build health material, so a
+/// routing source can only ever be paired with networks prepared for its own
+/// exact discovery generation.
+struct AppliedHealthMaterial {
+    client_epoch: u64,
+    networks: Option<Arc<HashMap<Arc<str>, ClusterHealthNetwork>>>,
+}
+
+/// The run-loop-owned health state threaded into [`TopologyModule::reconfigure`]:
+/// the unique feeder (shared by `&`), the active health artifact (mutated on a
+/// rotation), and the routing observer used to re-pair the feed.
+struct HealthReconcile<'a> {
+    feeder: &'a HealthGenerationFeeder,
+    active: &'a mut Option<AppliedHealthMaterial>,
+    routing: &'a RoutingSnapshotHandle,
+}
+
+/// Re-pairs the health feed with the current routing generation.
+///
+/// The feed is set with a [`HealthGeneration`] IFF an artifact is active AND a
+/// routing source is published whose `client_epoch` is exactly the artifact's;
+/// otherwise the feed is withdrawn (fail-closed). This is the single reconcile
+/// used both after a discovery commit and on every routing-observer wake, so a
+/// lag or epoch mismatch is always a withdraw, never a reuse of wrong-epoch
+/// material. A disabled artifact still pairs (with `networks == None`) so the
+/// loop runs its all-healthy zero-I/O rounds for the exact source.
+fn reconcile_health_feed(
+    feeder: &HealthGenerationFeeder,
+    active_health: Option<&AppliedHealthMaterial>,
+    routing: &RoutingSnapshotHandle,
+) {
+    let Some(artifact) = active_health else {
+        feeder.withdraw();
+        return;
+    };
+    match routing.current() {
+        Some(source) if source.client_epoch == artifact.client_epoch => {
+            feeder.set(Arc::new(HealthGeneration {
+                source,
+                networks: artifact.networks.clone(),
+            }));
+        }
+        _ => feeder.withdraw(),
+    }
 }
 
 /// Registration-readiness handle returned alongside a [`TopologyModule`].
@@ -217,6 +327,7 @@ pub struct TopologyModuleHandle {
     status: watch::Receiver<TopologyStatus>,
     discovery: DiscoveryHandle,
     routing: RoutingSnapshotHandle,
+    health: HealthOverlayHandle,
 }
 
 impl TopologyModuleHandle {
@@ -266,6 +377,19 @@ impl TopologyModuleHandle {
     pub fn routing_handle(&self) -> RoutingSnapshotHandle {
         self.routing.clone()
     }
+
+    /// A cheap-to-clone reader of the generation-fenced backend-health overlay.
+    ///
+    /// A consumer reaches a verdict only through the source-paired protocol:
+    /// `R = routing_handle().current()` → `H = health_overlay_handle().current_for(&R)`
+    /// → `H.get(id)` → and, before any side effect, re-validate with
+    /// [`HealthOverlayHandle::still_current_for`]. A missing routing source,
+    /// overlay, or backend id reads as fail-closed unhealthy; there is no raw
+    /// health `current()` that bypasses the routing source.
+    #[must_use]
+    pub fn health_overlay_handle(&self) -> HealthOverlayHandle {
+        self.health.clone()
+    }
 }
 
 impl TopologyModule {
@@ -274,18 +398,34 @@ impl TopologyModule {
     /// `source`, `factory`, and `resolver` are all injected from the
     /// composition root: the factory reads TLS material and the resolver owns
     /// interface enumeration, keeping both out of this crate.
-    #[must_use]
+    ///
+    /// `health` is the restart-pinned [`HealthCheckConfig`], a process input owned
+    /// by the module — not a configuration generation. `TiProxy` exposes no
+    /// user-facing health-check config (Go builds it from
+    /// `NewDefaultHealthCheckConfig()`), so the composition root passes the
+    /// Go-compatible default and it is never read from a config snapshot. It is
+    /// validated once here, so an invalid pinned policy is a loud startup
+    /// rejection, and thereafter held immutably (no setter, no snapshot/update
+    /// path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HealthConfigError`] when the pinned health config is invalid
+    /// (a non-positive or out-of-range interval, retry interval, or dial timeout,
+    /// or a retry count above its bound) — in every mode, disabled included.
     pub fn new(
         source: Arc<dyn ConfigNamespaceSource>,
         factory: Box<dyn TopologyClientFactory>,
         resolver: Arc<dyn AdvertiseEndpointResolver>,
         identity: TopologyRuntimeIdentity,
-    ) -> (Self, TopologyModuleHandle) {
+        health: HealthCheckConfig,
+    ) -> Result<(Self, TopologyModuleHandle), HealthConfigError> {
         Self::build(
             source,
             factory,
             resolver,
             identity,
+            health,
             default_child_runner(),
             default_discovery_connector(),
         )
@@ -301,8 +441,9 @@ impl TopologyModule {
         factory: Box<dyn TopologyClientFactory>,
         resolver: Arc<dyn AdvertiseEndpointResolver>,
         identity: TopologyRuntimeIdentity,
+        health: HealthCheckConfig,
         child_runner: ChildRunner,
-    ) -> (Self, TopologyModuleHandle) {
+    ) -> Result<(Self, TopologyModuleHandle), HealthConfigError> {
         let connector: DiscoveryConnector = Arc::new(|owner, _client| {
             Box::pin(async move {
                 let config = EtcdClientConfig::new(vec!["127.0.0.1:1".to_owned()], None)
@@ -310,7 +451,15 @@ impl TopologyModule {
                 EtcdConnector::new(owner, config).connect().await
             })
         });
-        Self::build(source, factory, resolver, identity, child_runner, connector)
+        Self::build(
+            source,
+            factory,
+            resolver,
+            identity,
+            health,
+            child_runner,
+            connector,
+        )
     }
 
     /// Test-only constructor that injects both a deterministic child runner and
@@ -322,14 +471,16 @@ impl TopologyModule {
         factory: Box<dyn TopologyClientFactory>,
         resolver: Arc<dyn AdvertiseEndpointResolver>,
         identity: TopologyRuntimeIdentity,
+        health: HealthCheckConfig,
         child_runner: ChildRunner,
         discovery_connector: DiscoveryConnector,
-    ) -> (Self, TopologyModuleHandle) {
+    ) -> Result<(Self, TopologyModuleHandle), HealthConfigError> {
         Self::build(
             source,
             factory,
             resolver,
             identity,
+            health,
             child_runner,
             discovery_connector,
         )
@@ -350,20 +501,34 @@ impl TopologyModule {
         self.refresh_override = Some(factory);
     }
 
+    /// Installs a test-only health-child factory (used by `spawn_health`), letting
+    /// a supervision/teardown test inject a child that returns, panics, or holds a
+    /// [`tokio::sync::oneshot`]/`DropGuard` instead of the production health loop.
+    #[cfg(test)]
+    fn set_health_override(&mut self, factory: HealthFactory) {
+        self.health_override = Some(factory);
+    }
+
     fn build(
         source: Arc<dyn ConfigNamespaceSource>,
         factory: Box<dyn TopologyClientFactory>,
         resolver: Arc<dyn AdvertiseEndpointResolver>,
         identity: TopologyRuntimeIdentity,
+        health: HealthCheckConfig,
         child_runner: ChildRunner,
         discovery_connector: DiscoveryConnector,
-    ) -> (Self, TopologyModuleHandle) {
+    ) -> Result<(Self, TopologyModuleHandle), HealthConfigError> {
+        // Validate the restart-pinned health config FIRST, so an invalid policy
+        // fails construction before any channel or publisher is created.
+        let health_runtime = HealthRuntime::from_config(&health)?;
         let (ready_tx, ready_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(TopologyStatus::default());
         let (discovery, discovery_handle) = DiscoveryPublisher::new();
         let (routing_publisher, routing_handle) = RoutingSnapshotPublisher::new();
         let routing = Arc::new(routing_publisher);
-        (
+        let (feeder, feed) = HealthGenerationFeeder::new();
+        let (publisher, health_overlay) = HealthOverlayPublisher::new();
+        Ok((
             Self {
                 source,
                 factory,
@@ -376,51 +541,98 @@ impl TopologyModule {
                 discovery_connector,
                 discovery_reader: discovery_handle.clone(),
                 routing,
+                health_runtime,
+                health: Some(HealthParts {
+                    feeder,
+                    feed,
+                    publisher,
+                }),
                 #[cfg(test)]
                 refresh_override: None,
+                #[cfg(test)]
+                health_override: None,
             },
             TopologyModuleHandle {
                 ready: ready_rx,
                 status: status_rx,
                 discovery: discovery_handle,
                 routing: routing_handle,
+                health: health_overlay,
             },
-        )
+        ))
     }
 
-    async fn run_inner(self, context: ModuleContext) -> Result<(), ModuleError> {
+    #[allow(clippy::too_many_lines)]
+    async fn run_inner(mut self, context: ModuleContext) -> Result<(), ModuleError> {
         let owner = context.owner().clone();
         let mut lifecycle = context.lifecycle();
         let mut updates = self.source.subscribe();
         let mut children = Children::default();
         let mut active_plan: Option<RegistrationPlan> = None;
-        // Owns the routing-refresh child plus the routing + discovery withdrawal
-        // authority. Created before the first apply so an early rejection (or the
-        // task being dropped/aborted) still fences discovery and the not-yet-
-        // published routing source closed. The refresh child is attached only once
-        // an initial generation is installed. On Drop it fences both planes in the
-        // fixed order without an async join, as an unbypassable backstop.
-        let mut refresh = RefreshOwner {
+        // The uniquely-owned health primitives, taken once. Their absence would
+        // mean the module was already run; fail closed rather than proceed with no
+        // health plane.
+        let Some(HealthParts {
+            feeder,
+            feed,
+            publisher,
+        }) = self.health.take()
+        else {
+            return Err(module_error("health_parts_missing"));
+        };
+        // The active health artifact (epoch + per-cluster networks) and a routing
+        // reader used to re-pair the feed. A separate `routing_observer` drives the
+        // main select so its `&mut` cursor never collides with these reads.
+        let mut active_health: Option<AppliedHealthMaterial> = None;
+        let routing_reader = self.routing.handle();
+        let mut routing_observer = self.routing.handle();
+        // Owns the routing-refresh child, the health child, the unique feeder, and
+        // the routing + discovery withdrawal authority. Created before the first
+        // apply so an early rejection (or the task being dropped/aborted) still
+        // fences discovery, closes the feed, and leaves the not-yet-published
+        // routing source closed. The children are attached only once an initial
+        // generation is installed. On Drop it fences all three planes in the fixed
+        // order without an async join, as an unbypassable backstop.
+        let mut runtime = ModuleRuntime {
             routing: Arc::clone(&self.routing),
             discovery: &self.discovery,
-            handle: None,
+            feeder,
+            health: None,
+            refresh: None,
         };
 
         // Apply the current generation once (including generation 1), then wait
         // for changes; borrowing after `subscribe` avoids a dropped edge.
         let initial = updates.borrow_and_update().clone();
-        if !self
-            .apply_and_report(&mut children, &mut active_plan, &initial, &owner)
-            .await
         {
-            return Err(module_error("initial_generation_rejected"));
+            let mut health = HealthReconcile {
+                feeder: &runtime.feeder,
+                active: &mut active_health,
+                routing: &routing_reader,
+            };
+            if !self
+                .apply_and_report(
+                    &mut children,
+                    &mut active_plan,
+                    &initial,
+                    &owner,
+                    &mut health,
+                )
+                .await
+            {
+                return Err(module_error("initial_generation_rejected"));
+            }
         }
         let _ = self.ready.send_replace(true);
         // The initial discovery set is installed, so the refresh loop has a set to
-        // pull; attach it now. `ready` is already signalled and never waits on a
-        // pull, so PD being unreachable cannot stall readiness.
-        refresh.handle =
+        // pull; attach both children now. `ready` is already signalled and never
+        // waits on a pull, so PD being unreachable cannot stall readiness. The
+        // health loop starts parked (the feed is withdrawn until the refresh loop
+        // publishes a routing source of the committed epoch).
+        runtime.refresh =
             Some(self.spawn_refresh(self.discovery_reader.clone(), Arc::clone(&self.routing)));
+        runtime.health =
+            Some(self.spawn_health(feed, publisher, self.routing.handle(), owner.clone()));
 
         let outcome = loop {
             tokio::select! {
@@ -440,40 +652,70 @@ impl TopologyModule {
                     }
                     let snapshot = updates.borrow_and_update().clone();
                     // A rejected generation (unresolvable advertise, build
-                    // failure, or a factory result that does not match the
-                    // configured cluster set) retains the last-good
-                    // registration rather than tearing it down; the rejection
-                    // class is published on the status watch.
+                    // failure, a factory result that does not match the
+                    // configured cluster set, or a health-material build failure)
+                    // retains the last-good registration rather than tearing it
+                    // down; the rejection class is published on the status watch.
+                    let mut health = HealthReconcile {
+                        feeder: &runtime.feeder,
+                        active: &mut active_health,
+                        routing: &routing_reader,
+                    };
                     let _ = self
-                        .apply_and_report(&mut children, &mut active_plan, &snapshot, &owner)
+                        .apply_and_report(
+                            &mut children,
+                            &mut active_plan,
+                            &snapshot,
+                            &owner,
+                            &mut health,
+                        )
                         .await;
+                }
+                changed = routing_observer.changed() => {
+                    // A crate-private routing observer, used only to re-pair the
+                    // health feed with each new exact routing source Arc. A closed
+                    // observer must not leave the module ready and silent.
+                    if changed.is_err() {
+                        break Err(module_error("routing_observer_closed"));
+                    }
+                    reconcile_health_feed(&runtime.feeder, active_health.as_ref(), &routing_reader);
                 }
                 exited = children.tasks.join_next(), if !children.tasks.is_empty() => {
                     // A child completed while we were not tearing it down: an
                     // unexpected retirement, owner loss, or panic. Fail loud so
-                    // the runtime does not treat an unregistered proxy as healthy.
+                    // the runtime does not treat an unregistered proxy as healthy
+                    // — unless the lifecycle has already requested this teardown.
                     if exited.is_some() {
-                        break Err(module_error("registration_child_exited"));
+                        break child_exit_outcome(&lifecycle, "registration_child_exited");
                     }
                 }
-                () = supervise_refresh(refresh.handle.as_mut()) => {
+                () = supervise_child(runtime.refresh.as_mut()) => {
                     // The refresh child completed without a teardown request — an
                     // unexpected return, panic, or cancel. The await consumed the
                     // JoinHandle, so drop it and fail loud rather than leave the
                     // module ready with a permanently silent routing source.
-                    refresh.handle = None;
-                    break Err(module_error("routing_refresh_failed"));
+                    runtime.refresh = None;
+                    break child_exit_outcome(&lifecycle, "routing_refresh_failed");
+                }
+                () = supervise_child(runtime.health.as_mut()) => {
+                    // The health child completed without a teardown request. The
+                    // await consumed the JoinHandle, so drop it and fail loud
+                    // rather than leave the module ready with a silent, never-
+                    // updated health overlay.
+                    runtime.health = None;
+                    break child_exit_outcome(&lifecycle, "health_loop_failed");
                 }
             }
         };
 
         // Frozen teardown order: the routing publisher is made terminal FIRST (so
         // any already-pulled result can only republish as `Retired`), then
-        // discovery is revoked (fail-closing further pulls), then the refresh child
-        // is aborted and joined — all inside `retire()` — before the registration
-        // children are stopped, so the refresh child is gone before the child
-        // grace period.
-        refresh.retire().await;
+        // discovery is revoked (fail-closing further pulls), then the feed is
+        // closed (revoking any retained health overlay's feed gate) — all inside
+        // `retire()`, which then aborts BOTH children together and joins each —
+        // before the registration children are stopped, so both children are gone
+        // before the child grace period.
+        runtime.retire().await;
         stop_children(&mut children).await;
         outcome
     }
@@ -500,6 +742,34 @@ impl TopologyModule {
         ))
     }
 
+    /// Spawns the health-check child, consuming the uniquely-owned feed and
+    /// overlay publisher. Production runs [`run_health_loop`] with the pinned
+    /// policy, the shared concurrency cap, and the real per-generation probe; a
+    /// test may inject an alternative child to exercise supervision or teardown.
+    // `self` carries the test-only health override; production ignores it.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn spawn_health(
+        &self,
+        feed: HealthGenerationFeed,
+        publisher: HealthOverlayPublisher,
+        routing: RoutingSnapshotHandle,
+        owner: OwnerToken,
+    ) -> JoinHandle<()> {
+        #[cfg(test)]
+        if let Some(factory) = &self.health_override {
+            return factory(feed, publisher, routing, owner);
+        }
+        tokio::spawn(run_health_loop(
+            feed,
+            routing,
+            publisher,
+            self.health_runtime.policy(),
+            owner,
+            HEALTH_CONCURRENCY,
+            probe_backend_in_generation,
+        ))
+    }
+
     /// Reconciles the per-cluster registration children for one generation.
     ///
     /// Returns `Ok(())` when registration is in a good applied state (either
@@ -515,12 +785,17 @@ impl TopologyModule {
     /// validated against the configured cluster set, and everything is checked
     /// *before* the old children are stopped, so a rejected generation never
     /// tears down a working registration and no retired write races a new one.
+    // One cohesive validate → prepare → commit critical path whose ordering
+    // (health build before epoch reserve, withdraw before commit, no await in the
+    // rotation window) is load-bearing and must not be split across a seam.
+    #[allow(clippy::too_many_lines)]
     async fn reconfigure(
         &self,
         children: &mut Children,
         active_plan: &mut Option<RegistrationPlan>,
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
+        health: &mut HealthReconcile<'_>,
     ) -> Result<(), RejectionClass> {
         let Ok(topology) = snapshot.topology() else {
             return Err(RejectionClass::TopologyProjection);
@@ -588,6 +863,20 @@ impl TopologyModule {
             return Ok(());
         }
 
+        // Build every enabled cluster's health-probe transport (the only fallible
+        // health step: resolver, TLS, policy) from the SAME candidate material,
+        // BEFORE the discovery publisher reserves an epoch. A health build failure
+        // therefore rejects the whole generation without burning an epoch and
+        // retains every plane's last-good. A disabled runtime builds nothing.
+        let prepared_health = if discovery_unchanged {
+            None
+        } else {
+            match self.build_prepared_health(owner, &clusters) {
+                Ok(prepared) => prepared,
+                Err(_) => return Err(RejectionClass::HealthClientBuildFailed),
+            }
+        };
+
         // Prepare-then-commit: build the new discovery generation's connections
         // (lazy, no network) BEFORE mutating any live state, so a connect failure
         // leaves both the registration children and the last-good discovery set
@@ -603,6 +892,28 @@ impl TopologyModule {
                 Ok(prepared) => Some(prepared),
                 Err(_) => return Err(RejectionClass::ClientBuildFailed),
             }
+        };
+
+        // Capture the reserved epoch from the prepared discovery and infallibly
+        // stamp the prepared health networks onto it — BEFORE `prepared` is moved
+        // into `commit`, so the health artifact and the discovery generation share
+        // one exact epoch and the stamp never reaches into a committed publisher.
+        let candidate_health = match &prepared {
+            Some(prepared) => {
+                let client_epoch = prepared.client_epoch();
+                Some(AppliedHealthMaterial {
+                    client_epoch,
+                    networks: prepared_health.map(|networks| {
+                        Arc::new(
+                            networks
+                                .into_iter()
+                                .map(|(name, prepared)| (name, prepared.bind(client_epoch)))
+                                .collect(),
+                        )
+                    }),
+                })
+            }
+            None => None,
         };
 
         // Commit registration first (fence: retire the previous generation before
@@ -628,10 +939,50 @@ impl TopologyModule {
         // The discovery generation was fully prepared (connections built + epoch
         // reserved) before the registration switch above, so this commit is
         // infallible and the two planes can never split.
+        //
+        // Rotate the health plane in lockstep, with NO await between the withdraw
+        // and the reconcile: withdraw the feed FIRST (synchronously revoking the
+        // retained overlay's feed gate, so a consumer loses authority before this
+        // config call returns), then commit the new discovery epoch, then replace
+        // the active health artifact, then re-pair the feed against the current
+        // routing source — which is usually still the old epoch, so it stays
+        // withdrawn until the refresh loop publishes the new source Arc.
         if let Some(prepared) = prepared {
+            health.feeder.withdraw();
             self.discovery.commit(prepared);
+            *health.active = candidate_health;
+            reconcile_health_feed(health.feeder, health.active.as_ref(), health.routing);
         }
         Ok(())
+    }
+
+    /// Builds the fallible health-probe transport for every cluster from the
+    /// candidate discovery material, or `Ok(None)` when health is disabled (no
+    /// resolver, TLS, or socket is constructed).
+    ///
+    /// This runs BEFORE the discovery publisher reserves an epoch, so any failure
+    /// rejects the whole generation without burning an epoch. The networks are
+    /// left unstamped ([`PreparedClusterHealthNetwork`]); the reserved epoch is
+    /// bound infallibly afterward.
+    fn build_prepared_health(
+        &self,
+        owner: &OwnerToken,
+        clusters: &[TopologyClusterClient],
+    ) -> Result<Option<PreparedHealthNetworks>, ClusterHttpConfigError> {
+        let Some(probe_policy) = self.health_runtime.probe_policy() else {
+            return Ok(None);
+        };
+        let mut prepared = Vec::with_capacity(clusters.len());
+        for cluster in clusters {
+            let network = PreparedClusterHealthNetwork::build(
+                &cluster.client,
+                owner.clone(),
+                probe_policy,
+                Arc::clone(&cluster.cluster_name),
+            )?;
+            prepared.push((Arc::clone(&cluster.cluster_name), network));
+        }
+        Ok(Some(prepared))
     }
 
     /// Applies one generation and publishes the resulting observable status.
@@ -646,10 +997,11 @@ impl TopologyModule {
         active_plan: &mut Option<RegistrationPlan>,
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
+        health: &mut HealthReconcile<'_>,
     ) -> bool {
         let generation = snapshot.generation();
         let outcome = self
-            .reconfigure(children, active_plan, snapshot, owner)
+            .reconfigure(children, active_plan, snapshot, owner, health)
             .await;
         self.status.send_modify(|status| {
             status.observed_generation = generation;
@@ -740,6 +1092,25 @@ const fn retire_requested(phase: LifecyclePhase) -> bool {
     matches!(phase, LifecyclePhase::Stopping | LifecyclePhase::Stopped)
 }
 
+/// Classifies a child exit observed by a supervision arm. The lifecycle alone
+/// decides: a child ending after the runtime requested retirement (`Stopping`)
+/// or vanished (the channel closed, so no later phase can arrive) is the clean
+/// teardown path — the lifecycle arm and the child arm are ready together then,
+/// and `select!` may observe either first — while a child ending under a live
+/// lifecycle that still keeps children alive is fatal under its exact class. The
+/// owner is deliberately not consulted: an external owner loss with a live
+/// lifecycle must still fail loud.
+fn child_exit_outcome(
+    lifecycle: &watch::Receiver<LifecycleSnapshot>,
+    error_class: &'static str,
+) -> Result<(), ModuleError> {
+    if lifecycle.has_changed().is_err() || retire_requested(lifecycle.borrow().phase) {
+        Ok(())
+    } else {
+        Err(module_error(error_class))
+    }
+}
+
 const fn module_error(error_class: &'static str) -> ModuleError {
     ModuleError {
         module: MODULE_NAME,
@@ -780,7 +1151,7 @@ async fn run_refresh<Seam, Fut>(
 /// Awaits the refresh child's completion for the run loop's supervision arm.
 /// Resolves only when the child ends on its own (an unexpected return, panic, or
 /// cancel); when no child is attached it is pending forever so the arm is inert.
-async fn supervise_refresh(handle: Option<&mut JoinHandle<()>>) {
+async fn supervise_child(handle: Option<&mut JoinHandle<()>>) {
     match handle {
         Some(handle) => {
             let _ = handle.await;
@@ -789,42 +1160,62 @@ async fn supervise_refresh(handle: Option<&mut JoinHandle<()>>) {
     }
 }
 
-/// Owns the routing-refresh child and the withdrawal authority for both the
-/// routing publisher and the discovery publisher.
+/// Owns the routing-refresh child, the health child, the unique health feeder,
+/// and the withdrawal authority for both the routing and discovery publishers.
 ///
 /// Teardown fences in a fixed order that does NOT depend on local
 /// declaration/drop order: the routing publisher is made terminal first (via its
 /// own mutex + `Retired` state, so any already-pulled result can only republish as
 /// `Retired`), then discovery is revoked (fail-closing subsequent pull I/O), then
-/// the refresh child is aborted. [`retire`](Self::retire) additionally joins the
-/// child on the normal path; [`Drop`] performs the same fences without an async
-/// join, as an unbypassable backstop for an aborted module task. Both are
-/// idempotent.
-struct RefreshOwner<'module> {
+/// the feed is closed (synchronously revoking any retained health overlay's feed
+/// gate, so a health consumer loses authority at once). Only then are the two
+/// children aborted. [`retire`](Self::retire) aborts BOTH children before joining
+/// either — never letting one run while awaiting the other — and joins each on the
+/// normal path; [`Drop`] performs the same fences and aborts both without an async
+/// join, as an unbypassable backstop for an aborted module task. The physical
+/// overlay revoke/clear is the health task's own `HealthLoopGuard::Drop` once it is
+/// aborted. Both paths are idempotent.
+struct ModuleRuntime<'module> {
     routing: Arc<RoutingSnapshotPublisher>,
     discovery: &'module DiscoveryPublisher,
-    handle: Option<JoinHandle<()>>,
+    feeder: HealthGenerationFeeder,
+    health: Option<JoinHandle<()>>,
+    refresh: Option<JoinHandle<()>>,
 }
 
-impl RefreshOwner<'_> {
+impl ModuleRuntime<'_> {
     fn terminal_fence(&self) {
         self.routing.revoke_and_clear();
         self.discovery.revoke();
+        self.feeder.close();
     }
 
     async fn retire(mut self) {
         self.terminal_fence();
-        if let Some(handle) = self.handle.take() {
+        // Abort BOTH children first, then join each, so neither keeps running
+        // while the other is awaited.
+        if let Some(handle) = self.health.as_ref() {
             handle.abort();
+        }
+        if let Some(handle) = self.refresh.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.health.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.refresh.take() {
             let _ = handle.await;
         }
     }
 }
 
-impl Drop for RefreshOwner<'_> {
+impl Drop for ModuleRuntime<'_> {
     fn drop(&mut self) {
         self.terminal_fence();
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.health.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.refresh.take() {
             handle.abort();
         }
     }
@@ -833,8 +1224,9 @@ impl Drop for RefreshOwner<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildRunner, ROUTING_REFRESH_INTERVAL, RefreshFactory, RefreshOwner, RegistrarError,
-        RejectionClass, TopologyClusterClient, TopologyModule, TopologyStatus, run_refresh,
+        ChildRunner, HealthFactory, ModuleRuntime, ROUTING_REFRESH_INTERVAL, RefreshFactory,
+        RegistrarError, RejectionClass, TopologyClusterClient, TopologyModule, TopologyStatus,
+        run_refresh,
     };
     use std::future::pending;
     use std::path::PathBuf;
@@ -842,23 +1234,30 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceStore, TopologyRuntimeIdentity};
+    use control_config::{
+        ConfigNamespaceSnapshot, ConfigNamespaceStore, HealthCheckConfig, TopologyRuntimeIdentity,
+    };
     use control_external::{
         EtcdClientConfig, EtcdConnectError, EtcdConnector, EtcdTlsConfig, EtcdTlsPolicy,
     };
     use control_plane::{
-        ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
-        MetricsPolicy, ModuleError, OwnerLease, OwnerScope, OwnershipRegistry, RuntimeEvent,
-        ShutdownReason, TlsPolicy,
+        ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LifecycleSnapshot,
+        LogLevel, MetricsPolicy, ModuleError, OwnerLease, OwnerScope, OwnershipRegistry,
+        RuntimeEvent, ShutdownReason, TlsPolicy,
     };
     use tokio::sync::{Notify, watch};
 
-    use crate::TopologyClientFactory;
     use crate::discovery_publish::{
-        DiscoveryConnector, DiscoveryError, DiscoveryHandle, DiscoveryPublisher,
+        DiscoveryConnector, DiscoveryError, DiscoveryHandle, DiscoveryPublisher, EpochResult,
     };
+    use crate::health_feed::{HealthGenerationFeed, HealthGenerationFeeder};
+    use crate::merge::{MergedBackend, MergedTopology};
+    use crate::model::BackendInfo;
     use crate::resolver::StaticAdvertiseResolver;
-    use crate::routing_snapshot::RoutingSnapshotPublisher;
+    use crate::routing_snapshot::{
+        RoutingSnapshot, RoutingSnapshotHandle, RoutingSnapshotPublisher,
+    };
+    use crate::{HealthConfigError, HealthOverlayHandle, TopologyClientFactory};
 
     type TestError = Box<dyn std::error::Error>;
     type ModuleTask = tokio::task::JoinHandle<Result<(), ModuleError>>;
@@ -866,6 +1265,13 @@ mod tests {
     struct NullSink;
     impl EventSink for NullSink {
         fn record(&self, _event: &RuntimeEvent) {}
+    }
+
+    /// The health config every module test constructs with: the default
+    /// (enabled: 3s interval / 3 retries / 1s retry / 2s dial), so the enabled
+    /// health loop is the reachable production path exercised under test.
+    fn enabled_health() -> HealthCheckConfig {
+        HealthCheckConfig::default()
     }
 
     fn identity() -> TopologyRuntimeIdentity {
@@ -904,12 +1310,20 @@ mod tests {
     }
 
     fn client(timeout_ms: u64, ca: &[u8]) -> EtcdClientConfig {
+        // `skip_ca_verification` keeps the arbitrary CA bytes in the config (so a
+        // same-path byte rotation still changes the plan) while letting the
+        // enabled health probe build its TLS client from this material without
+        // parsing the (non-PEM) CA — the health build is exercised, not the CA
+        // trust chain, which `tls.rs` locks separately.
         let tls = EtcdTlsConfig::new(
             Some(ca.to_vec()),
             None,
             None,
             Some("cluster.local".to_owned()),
-            EtcdTlsPolicy::default(),
+            EtcdTlsPolicy {
+                skip_ca_verification: true,
+                ..EtcdTlsPolicy::default()
+            },
         )
         .unwrap_or_else(|_| unreachable!("non-empty CA is valid"));
         EtcdClientConfig::new(["127.0.0.1:1".to_owned()], Some(tls))
@@ -990,8 +1404,9 @@ mod tests {
             factory,
             Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
             identity(),
+            enabled_health(),
             runner,
-        );
+        )?;
         let context = runtime.handle().module_context();
         runtime.mark_ready()?;
         let task = tokio::spawn(Box::new(module).run(context));
@@ -1066,9 +1481,10 @@ mod tests {
             factory,
             Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
             identity(),
+            enabled_health(),
             runner,
             connector,
-        );
+        )?;
         let context = runtime.handle().module_context();
         runtime.mark_ready()?;
         let task = tokio::spawn(Box::new(module).run(context));
@@ -1603,6 +2019,113 @@ mod tests {
             "a dropped lifecycle channel retires the registration"
         );
         Ok(())
+    }
+
+    /// A health child that mirrors the real loop's clean exit: it returns once the
+    /// process owner retires. It re-polls by waking itself (not `yield_now`, which
+    /// defers behind the driver), so on a single-threaded runtime it is re-queued
+    /// AHEAD of a module task woken by the same `drop`.
+    fn owner_retire_exit_health() -> HealthFactory {
+        Arc::new(|_feed, _publisher, _routing, owner: super::OwnerToken| {
+            tokio::spawn(std::future::poll_fn(move |cx| {
+                if owner.is_current() {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            }))
+        })
+    }
+
+    /// Supporting stress for the classifier (the deterministic lock is the
+    /// table-driven row below): dropping the runtime retires the owner (so a
+    /// health child exits cleanly) and closes the lifecycle channel in ONE
+    /// synchronous step, so the module's lifecycle arm and its health-supervision
+    /// arm become ready together. On a single-threaded runtime the self-waking
+    /// child is re-queued ahead of the woken module task, so both are ready at
+    /// the module's next `select!` poll, whose arm order is random. Whichever arm
+    /// is observed, the exit is a clean teardown — never `health_loop_failed`.
+    /// With the health arm made unconditional again, this row observes red.
+    #[tokio::test]
+    async fn a_dropped_lifecycle_with_a_cleanly_exiting_health_child_is_a_clean_teardown()
+    -> Result<(), TestError> {
+        for round in 0..16 {
+            let runtime = runtime()?;
+            let (task, mut handle) =
+                spawn_module_with_health(owner_retire_exit_health(), &runtime)?;
+            wait_ready(&mut handle).await?;
+            drop(runtime);
+            let outcome = tokio::time::timeout(Duration::from_secs(10), task).await??;
+            assert_eq!(
+                outcome,
+                Ok(()),
+                "round {round}: a child exiting during a dropped-lifecycle teardown is clean"
+            );
+        }
+        Ok(())
+    }
+
+    /// The child-exit classifier keys on the lifecycle alone, table-driven over
+    /// every phase: while the channel is live, `Starting`/`Ready`/`Quiescing`/
+    /// `Draining`/`Failed` all keep children alive, so a child exit there is fatal
+    /// under its exact class; `Stopping`/`Stopped` (retirement requested) and a
+    /// closed channel (the runtime is gone) are the clean teardown path. Which
+    /// `select!` arm observed the exit never enters the decision, so this locks
+    /// the semantics deterministically; the E2E row above is supporting stress.
+    #[test]
+    fn a_child_exit_is_classified_by_the_lifecycle_not_by_the_select_arm() {
+        const CLASSES: [&str; 3] = [
+            "registration_child_exited",
+            "routing_refresh_failed",
+            "health_loop_failed",
+        ];
+        let snapshot = |phase| LifecycleSnapshot {
+            phase,
+            owner_id: Arc::from("owner"),
+            owner_generation: 1,
+            config_generation: 1,
+            shutdown_reason: None,
+        };
+        let fatal = [
+            LifecyclePhase::Starting,
+            LifecyclePhase::Ready,
+            LifecyclePhase::Quiescing,
+            LifecyclePhase::Draining,
+            LifecyclePhase::Failed,
+        ];
+        let clean = [LifecyclePhase::Stopping, LifecyclePhase::Stopped];
+        let (tx, rx) = watch::channel(snapshot(LifecyclePhase::Starting));
+        for phase in fatal {
+            tx.send_replace(snapshot(phase));
+            for class in CLASSES {
+                assert_eq!(
+                    super::child_exit_outcome(&rx, class),
+                    Err(super::module_error(class)),
+                    "{phase:?}: a child exit under a live lifecycle is fatal"
+                );
+            }
+        }
+        for phase in clean {
+            tx.send_replace(snapshot(phase));
+            for class in CLASSES {
+                assert_eq!(
+                    super::child_exit_outcome(&rx, class),
+                    Ok(()),
+                    "{phase:?}: a child exit once retirement is requested is clean"
+                );
+            }
+        }
+        // Closed with the last value unseen: still clean (closed decides first).
+        tx.send_replace(snapshot(LifecyclePhase::Ready));
+        drop(tx);
+        for class in CLASSES {
+            assert_eq!(
+                super::child_exit_outcome(&rx, class),
+                Ok(()),
+                "a child exit after the lifecycle channel closed is clean"
+            );
+        }
     }
 
     /// The connect-count discovery oracle: discovery connects exactly once per
@@ -2307,9 +2830,10 @@ mod tests {
             }),
             Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
             identity(),
+            enabled_health(),
             counting_runner(&counters),
             counting_real_connector(&connects),
-        );
+        )?;
         module.force_next_epoch(u64::MAX - 1);
         let context = runtime.handle().module_context();
         runtime.mark_ready()?;
@@ -2728,11 +3252,15 @@ ns-servers = ["dns-a:53"]
         tokio::time::timeout(Duration::from_secs(5), entered.notified()).await?;
 
         // Land the production terminal fence FIRST (routing made terminal, then
-        // discovery revoked), exactly as `RefreshOwner` does on teardown.
-        let owner = RefreshOwner {
+        // discovery revoked, then the feed closed), exactly as `ModuleRuntime`
+        // does on teardown. A bare feeder (its feed dropped) is fine here: this
+        // unit exercises only the routing-first fence ordering, not the feed.
+        let owner = ModuleRuntime {
             routing: Arc::clone(&routing),
             discovery: &publisher,
-            handle: None,
+            feeder: HealthGenerationFeeder::new().0,
+            health: None,
+            refresh: None,
         };
         owner.terminal_fence();
 
@@ -2769,9 +3297,10 @@ ns-servers = ["dns-a:53"]
             }),
             Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
             identity(),
+            enabled_health(),
             counting_runner(&counters),
             counting_connector(&connects),
-        );
+        )?;
         module.set_refresh_override(refresh);
         let context = runtime.handle().module_context();
         runtime.mark_ready()?;
@@ -3045,9 +3574,10 @@ ns-servers = ["dns-a:53"]
                 }),
                 Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
                 identity(),
+                enabled_health(),
                 counting_runner(&counters),
                 counting_real_connector(&connects),
-            );
+            )?;
             module.set_refresh_override(pending_refresh());
             let context = runtime.handle().module_context();
             runtime.mark_ready()?;
@@ -3141,9 +3671,10 @@ ns-servers = ["dns-a:53"]
                 }),
                 Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
                 identity(),
+                enabled_health(),
                 counting_runner(&counters),
                 counting_real_connector(&connects),
-            );
+            )?;
             module.set_refresh_override(pending_refresh());
             let context = runtime.handle().module_context();
             runtime.mark_ready()?;
@@ -3195,5 +3726,996 @@ ns-servers = ["dns-a:53"]
             Ok(inner) => inner,
             Err(_) => unreachable!("the Prometheus fence scenario completes within the deadline"),
         }
+    }
+
+    // ====================================================================
+    // CP-TOPO #213-3a: health composed into the module lifecycle.
+    // ====================================================================
+
+    /// A disabled restart-pinned health config (valid cadence, no probe): the
+    /// module runs its all-healthy zero-I/O rounds and NEVER constructs a network.
+    fn disabled_health() -> HealthCheckConfig {
+        HealthCheckConfig {
+            enabled: false,
+            ..HealthCheckConfig::default()
+        }
+    }
+
+    /// Cluster material whose real `ClusterHttpClient` build FAILS closed: a
+    /// non-`skip_ca_verification` TLS policy with non-PEM CA bytes, so
+    /// `client_config()` rejects it (`EmptyCaCertificate`). The injected discovery
+    /// connector ignores this material and still connects, so a health-build
+    /// failure is isolated from discovery. `timeout_ms` varies the material so a
+    /// later generation is a genuine rotation.
+    fn bad_client(timeout_ms: u64) -> EtcdClientConfig {
+        let tls = EtcdTlsConfig::new(
+            Some(b"not-a-real-pem".to_vec()),
+            None,
+            None,
+            Some("cluster.local".to_owned()),
+            EtcdTlsPolicy::default(),
+        )
+        .unwrap_or_else(|_| unreachable!("non-empty CA is a valid config"));
+        EtcdClientConfig::new(["127.0.0.1:1".to_owned()], Some(tls))
+            .unwrap_or_else(|_| unreachable!("static endpoint is valid"))
+            .with_timeouts(
+                Duration::from_millis(500),
+                Duration::from_millis(timeout_ms),
+                Duration::from_secs(1),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+            )
+            .unwrap_or_else(|_| unreachable!("timeouts are valid"))
+    }
+
+    type MakeClient = Arc<dyn Fn() -> EtcdClientConfig + Send + Sync>;
+
+    /// A factory whose per-cluster client is a swappable closure, so a test drives
+    /// an exact material sequence (good → bad → good) across generations. The
+    /// closure is read under a lock on every `build`.
+    struct DynFactory {
+        make: Arc<std::sync::Mutex<MakeClient>>,
+    }
+
+    impl DynFactory {
+        fn new(make: MakeClient) -> (Self, Arc<std::sync::Mutex<MakeClient>>) {
+            let shared = Arc::new(std::sync::Mutex::new(make));
+            (
+                Self {
+                    make: Arc::clone(&shared),
+                },
+                shared,
+            )
+        }
+    }
+
+    fn set_make(shared: &Arc<std::sync::Mutex<MakeClient>>, make: MakeClient) {
+        *shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = make;
+    }
+
+    impl TopologyClientFactory for DynFactory {
+        fn build(
+            &self,
+            snapshot: &ConfigNamespaceSnapshot,
+        ) -> Result<Vec<TopologyClusterClient>, String> {
+            let topology = snapshot
+                .topology()
+                .map_err(|_| "topology projection".to_owned())?;
+            let make = Arc::clone(
+                &self
+                    .make
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            Ok(topology
+                .backend_clusters
+                .iter()
+                .map(|c| cluster(Arc::clone(&c.name), make()))
+                .collect())
+        }
+    }
+
+    /// One merged backend under `cluster-a` with a distinguishable address, so two
+    /// same-epoch routing snapshots differ by content.
+    fn merged_backend(index: usize) -> MergedBackend {
+        MergedBackend {
+            backend_id: Arc::from(format!("cluster-a/10.0.0.{index}:4000").as_str()),
+            cluster_name: Arc::from("cluster-a"),
+            backend: BackendInfo {
+                addr: format!("10.0.0.{index}:4000"),
+                keyspace: String::new(),
+                ip: String::new(),
+                status_port: 0,
+                version: String::new(),
+                git_hash: String::new(),
+                deploy_path: String::new(),
+                start_timestamp: 0,
+                labels: std::collections::BTreeMap::new(),
+            },
+        }
+    }
+
+    fn epoch_result(client_epoch: u64, backends: usize) -> EpochResult<MergedTopology> {
+        EpochResult {
+            client_epoch,
+            value: MergedTopology {
+                backends: (0..backends).map(merged_backend).collect(),
+            },
+        }
+    }
+
+    /// A refresh child that publishes exactly the routing snapshots the test sends
+    /// it, so a test drives the routing generation deterministically (which epoch
+    /// is live, and when a same-epoch content refresh lands). Returns the factory
+    /// and the command sender.
+    fn commandable_refresh() -> (
+        RefreshFactory,
+        tokio::sync::mpsc::UnboundedSender<EpochResult<MergedTopology>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<EpochResult<MergedTopology>>();
+        let rx = Arc::new(std::sync::Mutex::new(Some(rx)));
+        let factory: RefreshFactory = Arc::new(move |_discovery, routing| {
+            let taken = rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            tokio::spawn(async move {
+                let Some(mut rx) = taken else {
+                    pending::<()>().await;
+                    return;
+                };
+                while let Some(result) = rx.recv().await {
+                    let _ = routing.publish(result);
+                }
+            })
+        });
+        (factory, tx)
+    }
+
+    /// A health child that captures a clone of the feed (so a test can observe the
+    /// module's feed pairing directly) and then parks. It does not publish an
+    /// overlay: the feed IS the reconcile output under test.
+    fn capture_feed_health(
+        slot: &Arc<std::sync::Mutex<Option<HealthGenerationFeed>>>,
+    ) -> HealthFactory {
+        let slot = Arc::clone(slot);
+        Arc::new(move |feed, _publisher, _routing, _owner| {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(feed.clone());
+            tokio::spawn(pending::<()>())
+        })
+    }
+
+    /// Resolves once the health child has stored the module's feed (spawned right
+    /// after the module signals ready). Bounded and deterministic.
+    async fn captured_feed(
+        slot: &Arc<std::sync::Mutex<Option<HealthGenerationFeed>>>,
+    ) -> Result<HealthGenerationFeed, TestError> {
+        for _ in 0..2000 {
+            if let Some(feed) = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Ok(feed);
+            }
+            tokio::task::yield_now().await;
+        }
+        Err("the health child never stored the feed".into())
+    }
+
+    /// Waits until the feed's current generation reflects the given source epoch
+    /// (`Some(epoch)`) or is withdrawn (`None`), awaiting the feed's own change
+    /// notifier — no sleep, no busy-poll.
+    async fn wait_feed_epoch(
+        feed: &HealthGenerationFeed,
+        want: Option<u64>,
+    ) -> Result<(), TestError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (generation, revision, _terminal) = feed.snapshot();
+            let have = generation.as_ref().map(|g| g.source.client_epoch);
+            if have == want {
+                return Ok(());
+            }
+            tokio::time::timeout(
+                deadline - tokio::time::Instant::now(),
+                feed.wait_change(revision),
+            )
+            .await?;
+        }
+    }
+
+    /// Waits until the feed is paired with a source of the given routing
+    /// generation, returning that source and the feed's networks `Arc`.
+    #[allow(clippy::type_complexity)]
+    async fn wait_feed_source_gen(
+        feed: &HealthGenerationFeed,
+        want_generation: u64,
+    ) -> Result<
+        (
+            Arc<RoutingSnapshot>,
+            Option<Arc<std::collections::HashMap<Arc<str>, super::ClusterHealthNetwork>>>,
+        ),
+        TestError,
+    > {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (generation, revision, _terminal) = feed.snapshot();
+            if let Some(g) = &generation
+                && g.source.generation == want_generation
+            {
+                return Ok((Arc::clone(&g.source), g.networks.clone()));
+            }
+            tokio::time::timeout(
+                deadline - tokio::time::Instant::now(),
+                feed.wait_change(revision),
+            )
+            .await?;
+        }
+    }
+
+    // ----- B3: a disabled runtime constructs no health client ---------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_runtime_accepts_unbuildable_material_across_generations()
+    -> Result<(), TestError> {
+        // A disabled module with clusters whose material would FAIL a real
+        // ClusterHttpClient build: both the initial AND a later material rotation
+        // must be ACCEPTED (no HealthClientBuildFailed), proving no health client
+        // is ever constructed.
+        let store =
+            ConfigNamespaceStore::from_toml(&config_single(100), None, &std::env::current_dir()?)?;
+        let (factory, make) = DynFactory::new(Arc::new(|| bad_client(500)));
+        let counters = Counters::default();
+        let runtime = runtime()?;
+        let (module, mut handle) = TopologyModule::new_with_child_runner(
+            Arc::new(store.clone()),
+            Box::new(factory),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            disabled_health(),
+            counting_runner(&counters),
+        )?;
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+
+        // The initial generation applied: a disabled runtime built no client from
+        // the un-buildable material.
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        assert_eq!(status.borrow_and_update().applied_generation, 1);
+
+        // A real subsequent material rotation (different un-buildable client) is
+        // ALSO accepted — still no client construction.
+        set_make(&make, Arc::new(|| bad_client(700)));
+        store.apply_toml(&config_single(200), None, 2, &std::env::current_dir()?)?;
+        let after = wait_observed(&mut status, 2).await?;
+        assert_eq!(
+            after.applied_generation, 2,
+            "a disabled runtime accepts a rotation of un-buildable material"
+        );
+        assert_eq!(
+            after.last_rejection, None,
+            "no HealthClientBuildFailed: no health client was ever constructed"
+        );
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// Waits until the published routing source carries the given client epoch,
+    /// returning that exact source `Arc`.
+    async fn wait_routing_epoch(
+        routing: &RoutingSnapshotHandle,
+        want: u64,
+    ) -> Result<Arc<RoutingSnapshot>, TestError> {
+        // Check, then wait on the crate-private publication watch: a version
+        // published between the check and the wait is still unseen, so `changed`
+        // returns at once and no edge is lost. A closed source fails closed.
+        let mut routing = routing.clone();
+        loop {
+            if let Some(source) = routing.current()
+                && source.client_epoch == want
+            {
+                return Ok(source);
+            }
+            routing
+                .changed()
+                .await
+                .map_err(|_| "the routing source closed before the wanted epoch")?;
+        }
+    }
+
+    /// Waits until the health overlay is published for the EXACT source and asserts
+    /// every backend reads healthy with no version — the disabled all-healthy
+    /// verdict — re-checked through the unbypassable `still_current_for`.
+    async fn wait_overlay_all_healthy(
+        overlay: &HealthOverlayHandle,
+        routing: &RoutingSnapshotHandle,
+        source: &Arc<RoutingSnapshot>,
+    ) -> Result<(), TestError> {
+        for _ in 0..2000 {
+            if let Some(health) = overlay.current_for(source) {
+                if !overlay.still_current_for(&health, source, routing) {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                for backend in &source.backends.backends {
+                    let verdict = health.get(&backend.backend_id);
+                    if !verdict.healthy || verdict.server_version.is_some() {
+                        return Err("a disabled runtime must publish an all-healthy, \
+                                    version-None overlay for the exact source"
+                            .into());
+                    }
+                }
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Err("the disabled runtime never published an overlay for the exact source".into())
+    }
+
+    /// Option D's module-level disabled guarantee, on the REAL run/health loop
+    /// (no injected health child): a disabled runtime not only builds no client —
+    /// its `run_inner` adapter pairs a `networks = None` generation to the EXACT
+    /// published routing source, and the loop publishes an all-healthy, version-None
+    /// overlay for it. This holds across a real material rotation, and the
+    /// superseded source is de-authorized. It kills the reconcile mutation that
+    /// pairs only when `networks.is_some()` (disabled → permanent withdraw, no
+    /// overlay), which the construction-only B3 row cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_runtime_publishes_an_all_healthy_overlay_across_a_rotation()
+    -> Result<(), TestError> {
+        let store =
+            ConfigNamespaceStore::from_toml(&config_single(100), None, &std::env::current_dir()?)?;
+        let (factory, make) = DynFactory::new(Arc::new(|| bad_client(500)));
+        let counters = Counters::default();
+        let runtime = runtime()?;
+        let (module, mut handle) = TopologyModule::new_with_child_runner(
+            Arc::new(store.clone()),
+            Box::new(factory),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            disabled_health(),
+            counting_runner(&counters),
+        )?;
+        // Drive routing deterministically; the REAL health loop runs (no override).
+        let mut module = module;
+        let (refresh, commands) = commandable_refresh();
+        module.set_refresh_override(refresh);
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        let _ = status.borrow_and_update();
+        let overlay = handle.health_overlay_handle();
+        let routing = handle.routing_handle();
+
+        // Publish a matching epoch-0 source: the adapter pairs a disabled
+        // (networks = None) generation and the loop publishes an all-healthy overlay.
+        commands.send(epoch_result(0, 1))?;
+        let source0 = wait_routing_epoch(&routing, 0).await?;
+        wait_overlay_all_healthy(&overlay, &routing, &source0).await?;
+
+        // A real material rotation → discovery epoch 1, still no client construction.
+        set_make(&make, Arc::new(|| bad_client(700)));
+        store.apply_toml(&config_single(200), None, 2, &std::env::current_dir()?)?;
+        let after = wait_observed(&mut status, 2).await?;
+        assert_eq!(
+            after.applied_generation, 2,
+            "a disabled runtime accepts a rotation of un-buildable material"
+        );
+        assert_eq!(
+            after.last_rejection, None,
+            "no HealthClientBuildFailed: no health client was ever constructed"
+        );
+
+        // The matching epoch-1 source re-pairs and stays all-healthy; the old source
+        // is de-authorized.
+        commands.send(epoch_result(1, 1))?;
+        let source1 = wait_routing_epoch(&routing, 1).await?;
+        assert!(
+            !Arc::ptr_eq(&source0, &source1),
+            "the rotation published a new exact source Arc"
+        );
+        wait_overlay_all_healthy(&overlay, &routing, &source1).await?;
+        assert!(
+            overlay.current_for(&source0).is_none(),
+            "the superseded epoch-0 source is fail-closed after the rotation"
+        );
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    // ----- B4: a health-build failure burns no epoch ------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_build_failure_retains_last_good_and_burns_no_epoch() -> Result<(), TestError>
+    {
+        // ENABLED. The initial generation builds a health client from buildable
+        // material; a later generation's material fails the health build while the
+        // injected plaintext connector would still connect. The rejection must
+        // reserve NO discovery epoch: `build_prepared_health` runs BEFORE
+        // `discovery.prepare`, so the rejected generation issues no connect, and a
+        // following valid generation reconnects exactly once (epoch prev+1).
+        let store =
+            ConfigNamespaceStore::from_toml(&config_single(100), None, &std::env::current_dir()?)?;
+        let (factory, make) = DynFactory::new(Arc::new(|| client(500, b"pem-a")));
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_with_connector(
+            store.clone(),
+            Box::new(factory),
+            counting_runner(&counters),
+            counting_connector(&connects),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        assert_eq!(status.borrow_and_update().applied_generation, 1);
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "the initial generation reserved one discovery epoch"
+        );
+
+        // Generation 2: material that fails the health build. Rejected as
+        // HealthClientBuildFailed, retaining the last-good registration — and
+        // crucially issuing NO discovery connect (no epoch reserved).
+        set_make(&make, Arc::new(|| bad_client(700)));
+        store.apply_toml(&config_single(200), None, 2, &std::env::current_dir()?)?;
+        let rejected = wait_observed(&mut status, 2).await?;
+        assert_eq!(
+            rejected.last_rejection,
+            Some(RejectionClass::HealthClientBuildFailed),
+            "the health-build failure is the rejection class"
+        );
+        assert_eq!(
+            rejected.applied_generation, 1,
+            "the last-good generation is retained"
+        );
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "a health-build rejection reserves no epoch: no new discovery connect"
+        );
+
+        // Generation 3: valid material again → reconnects exactly once. Had the
+        // rejected generation burned an epoch, this would be the SECOND extra
+        // connect; it is the first.
+        set_make(&make, Arc::new(|| client(900, b"pem-a")));
+        store.apply_toml(&config_single(300), None, 3, &std::env::current_dir()?)?;
+        let applied = wait_observed(&mut status, 3).await?;
+        assert_eq!(
+            applied.applied_generation, 3,
+            "the valid generation applies"
+        );
+        assert_eq!(applied.last_rejection, None);
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "the next valid generation reserved exactly one further epoch (prev+1)"
+        );
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// Builds an enabled module with BOTH a commandable refresh child and a
+    /// feed-capturing health child, so a test drives routing generations by hand
+    /// and reads the module's feed pairing. Returns the task, handle, the routing
+    /// command sender, and the feed slot.
+    #[allow(clippy::type_complexity)]
+    fn spawn_module_with_controlled_planes(
+        store: ConfigNamespaceStore,
+        runtime: &ControlRuntime,
+    ) -> Result<
+        (
+            ModuleTask,
+            super::TopologyModuleHandle,
+            tokio::sync::mpsc::UnboundedSender<EpochResult<MergedTopology>>,
+            Arc<std::sync::Mutex<Option<HealthGenerationFeed>>>,
+        ),
+        TestError,
+    > {
+        let (factory, _make) = DynFactory::new(Arc::new(|| client(500, b"pem-a")));
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let (module, handle) = TopologyModule::new_with_child_runner_and_connector(
+            Arc::new(store),
+            Box::new(factory),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            enabled_health(),
+            counting_runner(&counters),
+            counting_connector(&connects),
+        )?;
+        let mut module = module;
+        let (refresh, commands) = commandable_refresh();
+        let slot: Arc<std::sync::Mutex<Option<HealthGenerationFeed>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        module.set_refresh_override(refresh);
+        module.set_health_override(capture_feed_health(&slot));
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+        Ok((task, handle, commands, slot))
+    }
+
+    // ----- B5: an epoch mismatch / lag withdraws the feed -------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_epoch_lagged_routing_source_withdraws_the_feed() -> Result<(), TestError> {
+        let store =
+            ConfigNamespaceStore::from_toml(&config_single(100), None, &std::env::current_dir()?)?;
+        let (factory, make) = DynFactory::new(Arc::new(|| client(500, b"pem-a")));
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime()?;
+        let (module, mut handle) = TopologyModule::new_with_child_runner_and_connector(
+            Arc::new(store.clone()),
+            Box::new(factory),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            enabled_health(),
+            counting_runner(&counters),
+            counting_connector(&connects),
+        )?;
+        let mut module = module;
+        let (refresh, commands) = commandable_refresh();
+        let slot: Arc<std::sync::Mutex<Option<HealthGenerationFeed>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        module.set_refresh_override(refresh);
+        module.set_health_override(capture_feed_health(&slot));
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        let _ = status.borrow_and_update();
+        let feed = captured_feed(&slot).await?;
+
+        // The initial generation reserved epoch 0. Publish a matching epoch-0
+        // routing source → the observer pairs the feed to epoch 0.
+        commands.send(epoch_result(0, 1))?;
+        wait_feed_epoch(&feed, Some(0)).await?;
+
+        // Rotate the cluster material → discovery advances to epoch 1. Routing is
+        // still the epoch-0 source (lagging), so the exact-epoch reconcile
+        // WITHDRAWS the feed rather than pairing wrong-epoch material.
+        set_make(&make, Arc::new(|| client(700, b"pem-a")));
+        store.apply_toml(&config_single(200), None, 2, &std::env::current_dir()?)?;
+        wait_observed(&mut status, 2).await?;
+        let (paired, _revision, _terminal) = feed.snapshot();
+        assert!(
+            paired.is_none(),
+            "an epoch-lagged routing source is fail-closed: the feed is withdrawn, not mis-paired"
+        );
+
+        // Once routing publishes the epoch-1 source, the observer re-pairs the feed.
+        commands.send(epoch_result(1, 1))?;
+        wait_feed_epoch(&feed, Some(1)).await?;
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    // ----- B7: a same-epoch content refresh re-pairs and reuses the artifact -
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_same_epoch_content_refresh_repairs_with_the_reused_artifact() -> Result<(), TestError>
+    {
+        let store =
+            ConfigNamespaceStore::from_toml(&config_single(100), None, &std::env::current_dir()?)?;
+        let runtime = runtime()?;
+        let (task, mut handle, commands, slot) =
+            spawn_module_with_controlled_planes(store, &runtime)?;
+
+        wait_ready(&mut handle).await?;
+        let feed = captured_feed(&slot).await?;
+
+        // Publish the first epoch-0 routing source (generation 1): the feed pairs
+        // and carries the artifact's networks Arc.
+        commands.send(epoch_result(0, 1))?;
+        let (first_source, first_networks) = wait_feed_source_gen(&feed, 1).await?;
+        assert_eq!(first_source.client_epoch, 0);
+        let first_networks =
+            first_networks.unwrap_or_else(|| unreachable!("enabled health carries networks"));
+
+        // A same-epoch CONTENT refresh: a NEW Arc, SAME epoch 0, different backends
+        // (generation 2). The observer re-pairs the feed to the NEW source Arc and
+        // REUSES the same networks Arc (the artifact is not rebuilt).
+        commands.send(epoch_result(0, 2))?;
+        let (second_source, second_networks) = wait_feed_source_gen(&feed, 2).await?;
+        let second_networks =
+            second_networks.unwrap_or_else(|| unreachable!("enabled health carries networks"));
+
+        assert_eq!(
+            second_source.client_epoch, 0,
+            "the refresh is the same discovery epoch"
+        );
+        assert!(
+            !Arc::ptr_eq(&first_source, &second_source),
+            "the feed re-paired to the NEW routing source Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&first_networks, &second_networks),
+            "the SAME networks artifact Arc is reused across a same-epoch refresh"
+        );
+        // The feed's source is exactly the module's currently published routing Arc.
+        let current = handle
+            .routing_handle()
+            .current()
+            .unwrap_or_else(|| unreachable!("a routing source is published"));
+        assert!(
+            Arc::ptr_eq(&current, &second_source),
+            "the feed is paired to the exact live routing source"
+        );
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    // ----- B8: health config is pinned by construction ----------------------
+
+    #[test]
+    fn an_invalid_pinned_health_config_is_rejected_before_construction() -> Result<(), TestError> {
+        // An invalid pinned config fails `new` with the exact HealthConfigError and
+        // yields NO module/handle — the failure is caught before any live plane is
+        // created. Validation holds in every mode (an enabled AND a disabled base).
+        type HealthCase = (fn(&mut HealthCheckConfig), HealthConfigError);
+        let cases: [HealthCase; 4] = [
+            (|c| c.interval_nanos = 0, HealthConfigError::InvalidInterval),
+            (
+                |c| c.retry_interval_nanos = 0,
+                HealthConfigError::InvalidRetryInterval,
+            ),
+            (|c| c.max_retries = 101, HealthConfigError::TooManyRetries),
+            (
+                |c| c.dial_timeout_nanos = 0,
+                HealthConfigError::InvalidDialTimeout,
+            ),
+        ];
+        for (mutate, expected) in cases {
+            for base in [HealthCheckConfig::default(), disabled_health()] {
+                let mut config = base;
+                mutate(&mut config);
+                let store = ConfigNamespaceStore::from_toml(
+                    &config_single(100),
+                    None,
+                    &std::env::current_dir()?,
+                )?;
+                let (factory, _make) = DynFactory::new(Arc::new(|| client(500, b"pem-a")));
+                let outcome = TopologyModule::new(
+                    Arc::new(store),
+                    Box::new(factory),
+                    Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+                    identity(),
+                    config,
+                );
+                let Err(error) = outcome else {
+                    unreachable!("an invalid pinned health config must fail construction");
+                };
+                assert_eq!(
+                    error, expected,
+                    "enabled={}: the invalid field is rejected before construction",
+                    config.enabled
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // ----- B9: an unexpected health-child exit fails the module loud ---------
+
+    /// Builds a zero-cluster module with an injected health child and default
+    /// refresh, spawns it, and returns the module task and handle.
+    fn spawn_module_with_health(
+        health: HealthFactory,
+        runtime: &ControlRuntime,
+    ) -> Result<(ModuleTask, super::TopologyModuleHandle), TestError> {
+        let store =
+            ConfigNamespaceStore::from_toml(&config_zero(), None, &std::env::current_dir()?)?;
+        let connects = Arc::new(AtomicUsize::new(0));
+        let counters = Counters::default();
+        let (mut module, handle) = TopologyModule::new_with_child_runner_and_connector(
+            Arc::new(store),
+            Box::new(SwitchableFactory {
+                gen2: Arc::new(watch::channel(None).0),
+            }),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            enabled_health(),
+            counting_runner(&counters),
+            counting_connector(&connects),
+        )?;
+        module.set_health_override(health);
+        module.set_refresh_override(pending_refresh());
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+        Ok((task, handle))
+    }
+
+    async fn assert_health_supervision_fails_loud(panics: bool) -> Result<(), TestError> {
+        let runtime = runtime()?;
+        let factory: HealthFactory = Arc::new(move |_feed, _publisher, _routing, _owner| {
+            tokio::spawn(async move {
+                assert!(!panics, "injected health panic");
+                // Otherwise return immediately: an unexpected health exit.
+            })
+        });
+        let (task, mut handle) = spawn_module_with_health(factory, &runtime)?;
+        wait_ready(&mut handle).await?;
+
+        // The health child ended on its own; the supervision arm must fail the
+        // module loud rather than leave it ready with a silent health overlay.
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await??;
+        let Err(error) = result else {
+            unreachable!("an ended health child must fail the module")
+        };
+        assert_eq!(error.module, "control_topology");
+        assert_eq!(error.error_class, "health_loop_failed");
+
+        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        shutdown(&runtime)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_returning_health_child_fails_the_module_loud() -> Result<(), TestError> {
+        assert_health_supervision_fails_loud(false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_health_child_fails_the_module_loud() -> Result<(), TestError> {
+        assert_health_supervision_fails_loud(true).await
+    }
+
+    // ----- B11: teardown leaks neither child --------------------------------
+
+    /// A health child that holds a `DropGuard` and parks forever. The guard's
+    /// `Drop` bumps `drops` and fires `dropped`; the child fires `entered` once it
+    /// is genuinely running, so a test proves the guard is dropped exactly once and
+    /// only through `ModuleRuntime`'s abort/join (retire) and abort (Drop).
+    fn guarded_pending_health(
+        drops: &Arc<AtomicUsize>,
+        dropped: &Arc<Notify>,
+        entered: &Arc<Notify>,
+    ) -> HealthFactory {
+        struct DropGuard {
+            drops: Arc<AtomicUsize>,
+            dropped: Arc<Notify>,
+        }
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                self.dropped.notify_one();
+            }
+        }
+
+        let drops = Arc::clone(drops);
+        let dropped = Arc::clone(dropped);
+        let entered = Arc::clone(entered);
+        Arc::new(move |_feed, _publisher, _routing, _owner| {
+            let guard = DropGuard {
+                drops: Arc::clone(&drops),
+                dropped: Arc::clone(&dropped),
+            };
+            let entered = Arc::clone(&entered);
+            tokio::spawn(async move {
+                let _guard = guard;
+                entered.notify_one();
+                pending::<()>().await;
+            })
+        })
+    }
+
+    /// Builds a zero-cluster module wired with BOTH a guarded refresh child and a
+    /// guarded health child, spawns it, and returns the task and handle.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_module_with_both_children(
+        refresh: RefreshFactory,
+        health: HealthFactory,
+        runtime: &ControlRuntime,
+    ) -> Result<(ModuleTask, super::TopologyModuleHandle), TestError> {
+        let store =
+            ConfigNamespaceStore::from_toml(&config_zero(), None, &std::env::current_dir()?)?;
+        let connects = Arc::new(AtomicUsize::new(0));
+        let counters = Counters::default();
+        let (mut module, handle) = TopologyModule::new_with_child_runner_and_connector(
+            Arc::new(store),
+            Box::new(SwitchableFactory {
+                gen2: Arc::new(watch::channel(None).0),
+            }),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            enabled_health(),
+            counting_runner(&counters),
+            counting_connector(&connects),
+        )?;
+        module.set_refresh_override(refresh);
+        module.set_health_override(health);
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+        Ok((task, handle))
+    }
+
+    /// A health child whose cancellation `Drop` BLOCKS on a sync `mpsc::recv`
+    /// until released, so a test can hold it mid-Drop and prove `ModuleRuntime::retire`
+    /// is *awaiting* the health `handle.await` (the JOIN) — the module task cannot
+    /// finish while the health child is still dropping. Mirrors `join_barrier_refresh`.
+    fn join_barrier_health(
+        drops: &Arc<AtomicUsize>,
+        entered: &Arc<Notify>,
+        drop_entered: &Arc<Notify>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+    ) -> HealthFactory {
+        struct BlockingGuard {
+            drops: Arc<AtomicUsize>,
+            drop_entered: Arc<Notify>,
+            release: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        }
+        impl Drop for BlockingGuard {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                self.drop_entered.notify_one();
+                let rx = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(rx) = rx {
+                    let _ = rx.recv();
+                }
+            }
+        }
+
+        let drops = Arc::clone(drops);
+        let entered = Arc::clone(entered);
+        let drop_entered = Arc::clone(drop_entered);
+        let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        Arc::new(move |_feed, _publisher, _routing, _owner| {
+            let guard = BlockingGuard {
+                drops: Arc::clone(&drops),
+                drop_entered: Arc::clone(&drop_entered),
+                release: Arc::clone(&release),
+            };
+            let entered = Arc::clone(&entered);
+            tokio::spawn(async move {
+                let _guard = guard;
+                entered.notify_one();
+                pending::<()>().await;
+            })
+        })
+    }
+
+    /// A clean Stopping teardown must ABORT **and JOIN** the health child before
+    /// `retire` returns — it is the JOIN (not merely the abort) that is locked, so
+    /// this survives the `ModuleRuntime::drop` backstop. The health child's Drop
+    /// bumps `drops`, signals `drop_entered`, then BLOCKS; the zero-cluster config
+    /// makes `stop_children` never yield, so the module task can be unfinished at
+    /// the barrier ONLY if `retire` is parked on the health `handle.await`.
+    /// Mutation "retire drops the health abort+join" turns `!task.is_finished()` RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopping_teardown_aborts_and_joins_the_health_child() -> Result<(), TestError> {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let drop_entered = Arc::new(Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let runtime = runtime()?;
+        let (mut task, mut handle) = spawn_module_with_both_children(
+            pending_refresh(),
+            join_barrier_health(&drops, &entered, &drop_entered, release_rx),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified()).await?;
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the guard is held by the live health child"
+        );
+
+        // Stopping teardown: `retire` aborts the health child; its Drop starts,
+        // signals, then blocks. Wait for the Drop to be in flight.
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(5), drop_entered.notified()).await?;
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the health child's cancellation Drop ran exactly once"
+        );
+
+        // The discriminator: with the health child's Drop blocked and NEVER
+        // released here, the module task cannot finish IFF `retire` is awaiting the
+        // health `handle.await` (the join) — so a bounded join must TIME OUT. The
+        // abort-without-join mutation lets `retire` return and the module finishes,
+        // so the bounded join completes instead of timing out. `is_finished()` is
+        // NOT used here: it samples an instant before the mutant's post-`retire`
+        // teardown has finished and would spuriously read "pending".
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        assert!(
+            joined.is_err(),
+            "the module must not finish while the health child's Drop is blocked: \
+             retire must be joining it, not aborting-without-join"
+        );
+
+        // Release the blocked Drop; the join then completes and the module returns.
+        let _ = release_tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(10), task).await??;
+        assert!(
+            matches!(result, Ok(())),
+            "a clean Stopping teardown returns Ok"
+        );
+        runtime.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_aborted_module_drops_both_children_via_runtime_drop() -> Result<(), TestError> {
+        let refresh_drops = Arc::new(AtomicUsize::new(0));
+        let refresh_dropped = Arc::new(Notify::new());
+        let refresh_entered = Arc::new(Notify::new());
+        let health_drops = Arc::new(AtomicUsize::new(0));
+        let health_dropped = Arc::new(Notify::new());
+        let health_entered = Arc::new(Notify::new());
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_module_with_both_children(
+            guarded_pending_refresh(&refresh_drops, &refresh_dropped, &refresh_entered),
+            guarded_pending_health(&health_drops, &health_dropped, &health_entered),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        tokio::time::timeout(Duration::from_secs(5), refresh_entered.notified()).await?;
+        tokio::time::timeout(Duration::from_secs(5), health_entered.notified()).await?;
+
+        // Hard abort: the `run_inner` frame is dropped, so `ModuleRuntime::drop`
+        // must abort BOTH children (no async join on this path).
+        task.abort();
+        let joined = tokio::time::timeout(Duration::from_secs(5), task).await?;
+        let Err(join_error) = joined else {
+            unreachable!("an aborted module task must not complete normally");
+        };
+        assert!(
+            join_error.is_cancelled(),
+            "the aborted module task ended cancelled"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), refresh_dropped.notified()).await?;
+        tokio::time::timeout(Duration::from_secs(5), health_dropped.notified()).await?;
+        assert_eq!(
+            refresh_drops.load(Ordering::SeqCst),
+            1,
+            "ModuleRuntime::drop aborts the refresh child"
+        );
+        assert_eq!(
+            health_drops.load(Ordering::SeqCst),
+            1,
+            "ModuleRuntime::drop aborts the health child"
+        );
+        drop(runtime);
+        Ok(())
     }
 }
