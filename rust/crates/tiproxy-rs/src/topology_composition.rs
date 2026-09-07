@@ -2099,6 +2099,7 @@ mod routing_generation_semantics {
     const CLUSTER_NAME: &str = "cluster-a";
     const ADDR_A: &str = "10.0.0.1:4000";
     const ADDR_B: &str = "10.0.0.2:4000";
+    const ADDR_C: &str = "10.0.0.3:4000";
     /// The classic `TiDB` topology prefix a merged poll reads first.
     const TIDB_PREFIX: &[u8] = b"/topology/tidb/";
     /// Mirrors the private production `ROUTING_REFRESH_INTERVAL` (3s); advancing
@@ -2166,8 +2167,15 @@ mod routing_generation_semantics {
     #[derive(Clone)]
     struct KvFixture {
         seeded: Arc<Mutex<KvPairs>>,
+        /// Bumped, and `served` fired, the moment a `TiDB`-prefix Range handler is
+        /// ENTERED — i.e. before the response exists or the client can publish.
         tidb_ranges: Arc<AtomicUsize>,
         served: Arc<Notify>,
+        /// A test-controlled response gate: a `TiDB` Range handler parks on it after
+        /// entry until it is open. Open by default; the paused-vs-real discriminator
+        /// closes it to hold a poll in flight deterministically (no wall sleep, no
+        /// thread scheduling).
+        gate: Arc<watch::Sender<bool>>,
     }
 
     impl KvFixture {
@@ -2177,6 +2185,14 @@ mod routing_generation_semantics {
 
         fn tidb_range_count(&self) -> usize {
             self.tidb_ranges.load(Ordering::SeqCst)
+        }
+
+        fn close_gate(&self) {
+            self.gate.send_replace(false);
+        }
+
+        fn open_gate(&self) {
+            self.gate.send_replace(true);
         }
     }
 
@@ -2224,6 +2240,13 @@ mod routing_generation_semantics {
                 if message.key.as_slice() == TIDB_PREFIX {
                     fixture.tidb_ranges.fetch_add(1, Ordering::SeqCst);
                     fixture.served.notify_one();
+                    // Hold the response until the gate is open (open by default).
+                    let mut gate = fixture.gate.subscribe();
+                    while !*gate.borrow_and_update() {
+                        if gate.changed().await.is_err() {
+                            break;
+                        }
+                    }
                 }
                 let matches = range_scan(&snapshot, &message.key, &message.range_end);
                 let count = i64::try_from(matches.len()).unwrap_or(i64::MAX);
@@ -2301,6 +2324,7 @@ mod routing_generation_semantics {
             seeded: Arc::new(Mutex::new(seeded)),
             tidb_ranges: Arc::new(AtomicUsize::new(0)),
             served: Arc::new(Notify::new()),
+            gate: Arc::new(watch::channel(true).0),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.ok()?;
         let addr = listener.local_addr().ok()?;
@@ -2472,18 +2496,22 @@ ns-servers = [{ns_servers}]
         }
     }
 
-    /// A structured, paused-clock drain.
+    /// Drives the refresh loop to the next published routing generation satisfying
+    /// `done`, deterministically, without `sleep`/`yield` and without a spin budget.
     ///
-    /// It fires the refresh loop's next tick with a SINGLE `advance` (kicking the
-    /// loop off its parked timer without straddling a poll's internal per-cluster
-    /// budget), then waits — event-driven, on the fixture's real `served` Range
-    /// signal — re-checking the published routing snapshot until `done` holds.
-    /// Any further ticks needed come from the paused runtime's own idle
-    /// auto-advance, which fires one timer at a time so each poll's real I/O
-    /// completes before its budget; the drain never issues a second blanket
-    /// `advance` that could cancel an in-flight poll. The drain waits on both a
-    /// real Range being served AND the observed generation — never a sleep or a
-    /// yield count. The iteration cap is a pure deadlock guard.
+    /// The paused clock is used for exactly one thing: `advance` wakes the parked
+    /// refresh ticker so the next poll starts. The poll's real loopback I/O then runs
+    /// under REAL time (`resume`) for the rest of the drain — with the clock resumed
+    /// the runtime never auto-advances, so the production per-cluster timeout inside
+    /// `merge_tidb_topology` cannot beat the fixture's response (the race CI hit).
+    ///
+    /// Observation is structured on real Range events. The handler's `served` fires
+    /// at ENTRY, before the response or the client's publication, so the target may
+    /// not be visible after Range #1. `run_refresh` is serial: Range #2 can only begin
+    /// once poll #1 has fully completed and published, so the target must be visible
+    /// then — if it is not, that poll genuinely failed and the drain fails outright
+    /// rather than looping. Never pause while a poll is in flight (that would put its
+    /// inner timeout back on virtual time): the clock is paused again only on exit.
     async fn drain_until<F>(
         routing: &RoutingSnapshotHandle,
         fixture: &KvFixture,
@@ -2497,24 +2525,68 @@ ns-servers = [{ns_servers}]
         {
             return snapshot;
         }
-        // Kick the parked refresh loop into its next tick exactly once.
         let before = fixture.tidb_range_count();
         tokio::time::advance(REFRESH_INTERVAL).await;
-        for _ in 0..1024 {
-            // Wake on a real refresh poll's TiDB Range, then re-check the published
-            // generation. Subsequent ticks arrive via the runtime's idle
-            // auto-advance (one timer at a time), so no in-flight poll is cancelled.
-            fixture.served.notified().await;
-            // Structured: require BOTH a fresh real Range served this drain AND the
-            // handle observing the target generation.
-            if fixture.tidb_range_count() > before
-                && let Some(snapshot) = routing.current()
-                && done(&snapshot)
-            {
-                return snapshot;
-            }
+        tokio::time::resume();
+        let snapshot = drain_in_real_time(routing, fixture, before, &mut done).await;
+        tokio::time::pause();
+        snapshot
+    }
+
+    /// The real-time half of [`drain_until`]: Range #1 (this poll entered), then, if
+    /// the target is not yet visible, Range #2 (this poll has completed + published).
+    async fn drain_in_real_time<F>(
+        routing: &RoutingSnapshotHandle,
+        fixture: &KvFixture,
+        before: usize,
+        done: &mut F,
+    ) -> Arc<RoutingSnapshot>
+    where
+        F: FnMut(&RoutingSnapshot) -> bool,
+    {
+        wait_range_past(fixture, before).await;
+        if let Some(snapshot) = routing.current()
+            && done(&snapshot)
+        {
+            return snapshot;
         }
-        unreachable!("the routing generation did not reach the target within the refresh budget");
+        wait_range_past(fixture, before + 1).await;
+        if let Some(snapshot) = routing.current()
+            && done(&snapshot)
+        {
+            return snapshot;
+        }
+        unreachable!(
+            "the routing generation is not at the target after a COMPLETE refresh poll: \
+             that poll failed, so the target can never arrive"
+        );
+    }
+
+    /// Resolves once the fixture has served more than `count` `TiDB` Ranges. The
+    /// waiter is registered (`enable`d) BEFORE the counter is read, so a Range landing
+    /// between the read and the await cannot be lost.
+    async fn wait_range_past(fixture: &KvFixture, count: usize) {
+        loop {
+            let notified = fixture.served.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if fixture.tidb_range_count() > count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// The refresh loop's very FIRST poll runs the same real loopback I/O as every
+    /// later one, so it gets real time for the same reason as [`drain_until`].
+    async fn wait_first_real(routing: &RoutingSnapshotHandle) -> Arc<RoutingSnapshot> {
+        tokio::time::resume();
+        let first = routing
+            .wait_first()
+            .await
+            .unwrap_or_else(|_| unreachable!("the refresh loop publishes a first snapshot"));
+        tokio::time::pause();
+        first
     }
 
     /// Waits until the module's observable status reaches `applied` — an
@@ -2621,6 +2693,89 @@ ns-servers = [{ns_servers}]
         .await;
     }
 
+    /// The mechanism oracle for the determinism fix, deterministic on every
+    /// platform (no wall sleep, no thread scheduling). A `TiDB` Range handler parks
+    /// on a test-controlled gate after ENTRY (after it is counted and `served`
+    /// fires), holding a poll in flight with the response withheld.
+    ///
+    /// Real time first (the fix): with the clock resumed there is no auto-advance,
+    /// so opening the gate after entry lets that in-flight poll complete and
+    /// publish. Paused clock last (the bug): holding the gate closed leaves the
+    /// runtime nothing runnable, so it auto-advances straight to the production
+    /// per-cluster timeout inside the poll — Ranges are served, yet nothing is
+    /// published. The paused half runs last because a poll it times out leaves a
+    /// dangling handler on a reset h2 stream, which would poison a later poll on
+    /// the shared connection (observed: the next gated poll fails and only the one
+    /// after it publishes) — nothing after the paused half needs a poll to succeed.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_lets_the_inner_timeout_beat_a_served_range_but_real_time_does_not() {
+        let body = async {
+            let Some((fixture, addr)) = spawn_fixture(seed(&[(ADDR_A, "10.0.0.1")])).await else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let comp = build_composition(addr, "").await;
+            let s1 = wait_first_real(&comp.routing).await;
+            assert_eq!(s1.generation, 1, "the first snapshot is generation 1");
+
+            // REAL time (the fix). A content change makes the next successful poll
+            // publish generation 2. Gate the poll after entry, resume, then open the
+            // gate: the in-flight poll completes and publishes. Range #2 (serial
+            // refresh) proves that poll is done before we read.
+            fixture.swap(seed(&[(ADDR_A, "10.0.0.1"), (ADDR_B, "10.0.0.2")]));
+            fixture.close_gate();
+            let before = fixture.tidb_range_count();
+            tokio::time::advance(REFRESH_INTERVAL).await;
+            wait_range_past(&fixture, before).await;
+            tokio::time::resume();
+            fixture.open_gate();
+            wait_range_past(&fixture, before + 1).await;
+            let published = comp
+                .routing
+                .current()
+                .unwrap_or_else(|| unreachable!("a routing source is published"));
+            assert_eq!(
+                published.generation, 2,
+                "under real time the gate-released poll completes and publishes"
+            );
+            tokio::time::pause();
+
+            // PAUSED clock (the bug). Another content change would publish generation
+            // 3 on a successful poll. Hold the gate closed across the poll: it is
+            // entered (Range served), then the only pending work is timers, so the
+            // paused runtime auto-advances — the poll's inner timeout fires (the poll
+            // fails), the ticker fires, the next poll is entered, and NOTHING is
+            // published.
+            fixture.swap(seed(&[
+                (ADDR_A, "10.0.0.1"),
+                (ADDR_B, "10.0.0.2"),
+                (ADDR_C, "10.0.0.3"),
+            ]));
+            fixture.close_gate();
+            let before = fixture.tidb_range_count();
+            tokio::time::advance(REFRESH_INTERVAL).await;
+            wait_range_past(&fixture, before).await;
+            wait_range_past(&fixture, before + 1).await;
+            let stuck = comp
+                .routing
+                .current()
+                .unwrap_or_else(|| unreachable!("a routing source is published"));
+            assert_eq!(
+                stuck.generation, 2,
+                "Ranges were served, but the paused clock let the inner timeout beat the \
+                 response: nothing was published"
+            );
+            assert!(
+                fixture.tidb_range_count() >= before + 2,
+                "at least two Ranges were served while nothing published"
+            );
+            fixture.open_gate();
+
+            comp.task.abort();
+            drop(comp.runtime);
+        };
+        with_real_wall_clock_watchdog(body).await;
+    }
+
     // ----- Row 1: same client_epoch, content change -> generation +1 --------
 
     #[tokio::test(start_paused = true)]
@@ -2632,10 +2787,7 @@ ns-servers = [{ns_servers}]
             let comp = build_composition(addr, "").await;
 
             // The refresh loop's OWN first publication.
-            let s1 =
-                comp.routing.wait_first().await.unwrap_or_else(|_| {
-                    unreachable!("the refresh loop publishes a first snapshot")
-                });
+            let s1 = wait_first_real(&comp.routing).await;
             assert_eq!(s1.generation, 1, "the first snapshot is generation 1");
             assert_eq!(
                 addrs(&s1),
@@ -2687,10 +2839,7 @@ ns-servers = [{ns_servers}]
             };
             let comp = build_composition(addr, "").await;
 
-            let s1 =
-                comp.routing.wait_first().await.unwrap_or_else(|_| {
-                    unreachable!("the refresh loop publishes a first snapshot")
-                });
+            let s1 = wait_first_real(&comp.routing).await;
             assert_eq!(addrs(&s1), vec![ADDR_A.to_owned()]);
             let e0 = s1.client_epoch;
             let g1 = s1.generation;
@@ -2754,10 +2903,7 @@ ns-servers = [{ns_servers}]
             };
             let comp = build_composition(addr, "").await;
 
-            let s1 =
-                comp.routing.wait_first().await.unwrap_or_else(|_| {
-                    unreachable!("the refresh loop publishes a first snapshot")
-                });
+            let s1 = wait_first_real(&comp.routing).await;
 
             // (a) A replacement (content change) supersedes s1 at the swap seam: the
             // old Arc must be reported not-current via the SAME public handle.
