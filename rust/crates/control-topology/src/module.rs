@@ -57,17 +57,26 @@ use control_plane::{
     ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture, OwnerToken,
 };
 use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::MissedTickBehavior;
 
 use crate::discovery_publish::{
     DiscoveryConnector, DiscoveryHandle, DiscoveryPublisher, default_discovery_connector,
 };
 use crate::registrar::RegistrarError;
 use crate::resolver::AdvertiseEndpointResolver;
+use crate::routing_snapshot::{RoutingSnapshotHandle, RoutingSnapshotPublisher};
 
 /// Grace period for a retired generation's children to deregister before they
 /// are aborted, so a wedged child can never block a reconfigure or shutdown.
 const CHILD_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// Cadence of the routing-topology refresh loop, mirroring Go
+/// `healthCheckInterval` (`lib/config/health.go`): the interval at which the
+/// merged topology is re-pulled from discovery and republished for CP-ROUTE. This
+/// is the topology content-refresh cadence, distinct from the lease-TTL refresh
+/// in `register` and from the (future) wire-push cadence to the dataplane.
+const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 use crate::register::TopologyInfo;
 
@@ -98,6 +107,13 @@ fn default_child_runner() -> ChildRunner {
         ))
     })
 }
+
+/// Spawns the routing-topology refresh child. Test-only: a test injects a child
+/// that returns or panics (to exercise the run loop's supervision) instead of the
+/// real periodic [`run_refresh`] loop.
+#[cfg(test)]
+type RefreshFactory =
+    Arc<dyn Fn(DiscoveryHandle, Arc<RoutingSnapshotPublisher>) -> JoinHandle<()> + Send + Sync>;
 
 /// One backend cluster's connection material, produced by a
 /// [`TopologyClientFactory`].
@@ -185,6 +201,10 @@ pub struct TopologyModule {
     child_runner: ChildRunner,
     discovery: DiscoveryPublisher,
     discovery_connector: DiscoveryConnector,
+    discovery_reader: DiscoveryHandle,
+    routing: Arc<RoutingSnapshotPublisher>,
+    #[cfg(test)]
+    refresh_override: Option<RefreshFactory>,
 }
 
 /// Registration-readiness handle returned alongside a [`TopologyModule`].
@@ -196,6 +216,7 @@ pub struct TopologyModuleHandle {
     ready: watch::Receiver<bool>,
     status: watch::Receiver<TopologyStatus>,
     discovery: DiscoveryHandle,
+    routing: RoutingSnapshotHandle,
 }
 
 impl TopologyModuleHandle {
@@ -235,6 +256,15 @@ impl TopologyModuleHandle {
     #[must_use]
     pub fn discovery_handle(&self) -> DiscoveryHandle {
         self.discovery.clone()
+    }
+
+    /// A cheap-to-clone reader of the published, generation-stamped routing
+    /// topology snapshot. It is fail-closed until the refresh loop publishes a
+    /// first snapshot and after the module retires; a consumer must treat `None`
+    /// (and a stale [`RoutingSnapshotHandle::still_current`]) as not-routable.
+    #[must_use]
+    pub fn routing_handle(&self) -> RoutingSnapshotHandle {
+        self.routing.clone()
     }
 }
 
@@ -312,6 +342,14 @@ impl TopologyModule {
         self.discovery.set_next_epoch(next_epoch);
     }
 
+    /// Installs a test-only refresh-child factory (used by `spawn_refresh`),
+    /// letting a supervision/teardown test inject a child that returns, panics, or
+    /// runs a barrier-controlled [`run_refresh`] instead of the production loop.
+    #[cfg(test)]
+    fn set_refresh_override(&mut self, factory: RefreshFactory) {
+        self.refresh_override = Some(factory);
+    }
+
     fn build(
         source: Arc<dyn ConfigNamespaceSource>,
         factory: Box<dyn TopologyClientFactory>,
@@ -323,6 +361,8 @@ impl TopologyModule {
         let (ready_tx, ready_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(TopologyStatus::default());
         let (discovery, discovery_handle) = DiscoveryPublisher::new();
+        let (routing_publisher, routing_handle) = RoutingSnapshotPublisher::new();
+        let routing = Arc::new(routing_publisher);
         (
             Self {
                 source,
@@ -334,11 +374,16 @@ impl TopologyModule {
                 child_runner,
                 discovery,
                 discovery_connector,
+                discovery_reader: discovery_handle.clone(),
+                routing,
+                #[cfg(test)]
+                refresh_override: None,
             },
             TopologyModuleHandle {
                 ready: ready_rx,
                 status: status_rx,
                 discovery: discovery_handle,
+                routing: routing_handle,
             },
         )
     }
@@ -349,10 +394,17 @@ impl TopologyModule {
         let mut updates = self.source.subscribe();
         let mut children = Children::default();
         let mut active_plan: Option<RegistrationPlan> = None;
-        // RAII: on any exit — a clean retire, an error return, or the task being
-        // dropped/aborted — revoke the current discovery gate and withdraw the
-        // published set, so the handle is left zero-I/O fail-closed.
-        let _discovery_revoke = DiscoveryRevoke(&self.discovery);
+        // Owns the routing-refresh child plus the routing + discovery withdrawal
+        // authority. Created before the first apply so an early rejection (or the
+        // task being dropped/aborted) still fences discovery and the not-yet-
+        // published routing source closed. The refresh child is attached only once
+        // an initial generation is installed. On Drop it fences both planes in the
+        // fixed order without an async join, as an unbypassable backstop.
+        let mut refresh = RefreshOwner {
+            routing: Arc::clone(&self.routing),
+            discovery: &self.discovery,
+            handle: None,
+        };
 
         // Apply the current generation once (including generation 1), then wait
         // for changes; borrowing after `subscribe` avoids a dropped edge.
@@ -364,8 +416,13 @@ impl TopologyModule {
             return Err(module_error("initial_generation_rejected"));
         }
         let _ = self.ready.send_replace(true);
+        // The initial discovery set is installed, so the refresh loop has a set to
+        // pull; attach it now. `ready` is already signalled and never waits on a
+        // pull, so PD being unreachable cannot stall readiness.
+        refresh.handle =
+            Some(self.spawn_refresh(self.discovery_reader.clone(), Arc::clone(&self.routing)));
 
-        loop {
+        let outcome = loop {
             tokio::select! {
                 changed = lifecycle.changed() => {
                     // Retire the registration only once the runtime reaches
@@ -374,14 +431,12 @@ impl TopologyModule {
                     // Quiescing/Draining keep the registration and lease refresh
                     // alive so this instance stays discoverable during drain.
                     if changed.is_err() || retire_requested(lifecycle.borrow().phase) {
-                        stop_children(&mut children).await;
-                        return Ok(());
+                        break Ok(());
                     }
                 }
                 changed = updates.changed() => {
                     if changed.is_err() {
-                        stop_children(&mut children).await;
-                        return Err(module_error("config_source_stopped"));
+                        break Err(module_error("config_source_stopped"));
                     }
                     let snapshot = updates.borrow_and_update().clone();
                     // A rejected generation (unresolvable advertise, build
@@ -398,12 +453,51 @@ impl TopologyModule {
                     // unexpected retirement, owner loss, or panic. Fail loud so
                     // the runtime does not treat an unregistered proxy as healthy.
                     if exited.is_some() {
-                        stop_children(&mut children).await;
-                        return Err(module_error("registration_child_exited"));
+                        break Err(module_error("registration_child_exited"));
                     }
                 }
+                () = supervise_refresh(refresh.handle.as_mut()) => {
+                    // The refresh child completed without a teardown request — an
+                    // unexpected return, panic, or cancel. The await consumed the
+                    // JoinHandle, so drop it and fail loud rather than leave the
+                    // module ready with a permanently silent routing source.
+                    refresh.handle = None;
+                    break Err(module_error("routing_refresh_failed"));
+                }
             }
+        };
+
+        // Frozen teardown order: the routing publisher is made terminal FIRST (so
+        // any already-pulled result can only republish as `Retired`), then
+        // discovery is revoked (fail-closing further pulls), then the refresh child
+        // is aborted and joined — all inside `retire()` — before the registration
+        // children are stopped, so the refresh child is gone before the child
+        // grace period.
+        refresh.retire().await;
+        stop_children(&mut children).await;
+        outcome
+    }
+
+    /// Spawns the routing-refresh child. Production runs the periodic
+    /// [`run_refresh`] loop with a no-op post-poll seam; a test may inject an
+    /// alternative child (e.g. one that returns or panics) to exercise supervision.
+    // `self` carries the test-only refresh override; production ignores it.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn spawn_refresh(
+        &self,
+        handle: DiscoveryHandle,
+        routing: Arc<RoutingSnapshotPublisher>,
+    ) -> JoinHandle<()> {
+        #[cfg(test)]
+        if let Some(factory) = &self.refresh_override {
+            return factory(handle, routing);
         }
+        tokio::spawn(run_refresh(
+            handle,
+            routing,
+            ROUTING_REFRESH_INTERVAL,
+            || async {},
+        ))
     }
 
     /// Reconciles the per-cluster registration children for one generation.
@@ -653,22 +747,94 @@ const fn module_error(error_class: &'static str) -> ModuleError {
     }
 }
 
-/// Revokes the discovery publication when the module's run loop exits by any
-/// path — a clean retire, an error return, or the task being dropped/aborted —
-/// so the handle is always left zero-I/O fail-closed.
-struct DiscoveryRevoke<'module>(&'module DiscoveryPublisher);
+/// The routing-topology refresh loop: on each tick it pulls the merged topology
+/// from discovery and republishes it, retaining the last-good snapshot on any pull
+/// failure (transport error, or the epoch/gate fence returning `Stale`/`Revoked`).
+///
+/// The first tick fires immediately; subsequent ticks keep a fixed start-to-start
+/// cadence and *skip* (never burst) if a pull runs longer than the interval, so a
+/// slow PD can never make the loop catch up in a burst. Polls and publishes are
+/// sequential, so at most one pull is ever in flight. `after_poll` is an injected
+/// seam — empty in production — that a test uses to interpose between a successful
+/// pull and its publish, to exercise teardown ordering.
+async fn run_refresh<Seam, Fut>(
+    handle: DiscoveryHandle,
+    routing: Arc<RoutingSnapshotPublisher>,
+    interval: Duration,
+    mut after_poll: Seam,
+) where
+    Seam: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if let Ok(result) = handle.poll_merged_topology().await {
+            after_poll().await;
+            let _ = routing.publish(result);
+        }
+    }
+}
 
-impl Drop for DiscoveryRevoke<'_> {
+/// Awaits the refresh child's completion for the run loop's supervision arm.
+/// Resolves only when the child ends on its own (an unexpected return, panic, or
+/// cancel); when no child is attached it is pending forever so the arm is inert.
+async fn supervise_refresh(handle: Option<&mut JoinHandle<()>>) {
+    match handle {
+        Some(handle) => {
+            let _ = handle.await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Owns the routing-refresh child and the withdrawal authority for both the
+/// routing publisher and the discovery publisher.
+///
+/// Teardown fences in a fixed order that does NOT depend on local
+/// declaration/drop order: the routing publisher is made terminal first (via its
+/// own mutex + `Retired` state, so any already-pulled result can only republish as
+/// `Retired`), then discovery is revoked (fail-closing subsequent pull I/O), then
+/// the refresh child is aborted. [`retire`](Self::retire) additionally joins the
+/// child on the normal path; [`Drop`] performs the same fences without an async
+/// join, as an unbypassable backstop for an aborted module task. Both are
+/// idempotent.
+struct RefreshOwner<'module> {
+    routing: Arc<RoutingSnapshotPublisher>,
+    discovery: &'module DiscoveryPublisher,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RefreshOwner<'_> {
+    fn terminal_fence(&self) {
+        self.routing.revoke_and_clear();
+        self.discovery.revoke();
+    }
+
+    async fn retire(mut self) {
+        self.terminal_fence();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for RefreshOwner<'_> {
     fn drop(&mut self) {
-        self.0.revoke();
+        self.terminal_fence();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildRunner, RegistrarError, RejectionClass, TopologyClusterClient, TopologyModule,
-        TopologyStatus,
+        ChildRunner, ROUTING_REFRESH_INTERVAL, RefreshFactory, RefreshOwner, RegistrarError,
+        RejectionClass, TopologyClusterClient, TopologyModule, TopologyStatus, run_refresh,
     };
     use std::future::pending;
     use std::path::PathBuf;
@@ -682,13 +848,17 @@ mod tests {
     };
     use control_plane::{
         ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
-        MetricsPolicy, ModuleError, OwnershipRegistry, RuntimeEvent, ShutdownReason, TlsPolicy,
+        MetricsPolicy, ModuleError, OwnerLease, OwnerScope, OwnershipRegistry, RuntimeEvent,
+        ShutdownReason, TlsPolicy,
     };
-    use tokio::sync::watch;
+    use tokio::sync::{Notify, watch};
 
     use crate::TopologyClientFactory;
-    use crate::discovery_publish::{DiscoveryConnector, DiscoveryError};
+    use crate::discovery_publish::{
+        DiscoveryConnector, DiscoveryError, DiscoveryHandle, DiscoveryPublisher,
+    };
     use crate::resolver::StaticAdvertiseResolver;
+    use crate::routing_snapshot::RoutingSnapshotPublisher;
 
     type TestError = Box<dyn std::error::Error>;
     type ModuleTask = tokio::task::JoinHandle<Result<(), ModuleError>>;
@@ -1753,14 +1923,15 @@ mod tests {
     /// A minimal in-process etcd v3 `KV.Range` fixture (hand-rolled tonic over
     /// plain hyper h2, real prefix-range filtering) serving the `TiDB` topology
     /// prefixes, plus a factory that points one cluster at it with a
-    /// timeout-driven material knob. Used only by the epoch-overflow module test,
-    /// which must assert a real discovery poll payload (a `127.0.0.1:1` connection
-    /// returns nothing). Mirrors `tests/discovery_fence.rs`.
-    mod overflow_fixture {
+    /// timeout-driven material knob. Two modes: a plain fixture (the epoch-overflow
+    /// row asserts a real discovery poll payload) and a GATED fixture that can park
+    /// the first Range for a chosen prefix and count Range calls per prefix (the
+    /// #212 mid-poll fence rows). Mirrors `tiproxy-rs`'s proven `KvFixture`.
+    mod kv_fixture {
         use std::convert::Infallible;
         use std::net::SocketAddr;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex, PoisonError};
         use std::time::Duration;
 
         use control_config::ConfigNamespaceSnapshot;
@@ -1769,6 +1940,7 @@ mod tests {
         use hyper_util::rt::{TokioExecutor, TokioIo};
         use hyper_util::service::TowerToHyperService;
         use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::Notify;
         use tonic::codegen::{BoxFuture, Context, Poll, Service, http};
         use tonic::server::{Grpc, NamedService, UnaryService};
         use tonic_prost::ProstCodec;
@@ -1826,9 +1998,24 @@ mod tests {
             count: i64,
         }
 
+        /// Parks the FIRST Range whose key equals `prefix`, signals the test, and
+        /// waits for release. When `error_after_release` is set it then answers a
+        /// gRPC error (so, absent the per-connection gate fence, the caller's retry
+        /// issues another Range — the Prometheus fence must suppress it).
+        #[derive(Clone)]
+        struct StallControl {
+            prefix: Vec<u8>,
+            arrived: Arc<Notify>,
+            release: Arc<Notify>,
+            stalled: Arc<AtomicBool>,
+            error_after_release: bool,
+        }
+
         #[derive(Clone)]
         struct KvFixture {
             seeded: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
+            observed: Arc<Mutex<Vec<Vec<u8>>>>,
+            stall: Option<StallControl>,
         }
 
         /// Real etcd `Range` semantics: an empty `range_end` is an exact get,
@@ -1865,6 +2052,23 @@ mod tests {
                 let fixture = self.fixture.clone();
                 Box::pin(async move {
                     let message = request.into_inner();
+                    fixture
+                        .observed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(message.key.clone());
+
+                    if let Some(stall) = &fixture.stall
+                        && message.key == stall.prefix
+                        && !stall.stalled.swap(true, Ordering::SeqCst)
+                    {
+                        stall.arrived.notify_one();
+                        stall.release.notified().await;
+                        if stall.error_after_release {
+                            return Err(tonic::Status::internal("injected fence error"));
+                        }
+                    }
+
                     let matches = range_scan(&fixture.seeded, &message.key, &message.range_end);
                     let count = i64::try_from(matches.len()).unwrap_or(i64::MAX);
                     let kvs = matches
@@ -1934,13 +2138,10 @@ mod tests {
             response
         }
 
-        /// Binds a loopback listener and serves the KV adapter over each accepted
+        /// Binds a loopback listener and serves `fixture` over each accepted
         /// plaintext connection. The accept loop is detached; the test bounds its
         /// lifetime. Returns the bound address.
-        pub(super) async fn spawn_fixture(seeded: Vec<(Vec<u8>, Vec<u8>)>) -> Option<SocketAddr> {
-            let fixture = KvFixture {
-                seeded: Arc::new(seeded),
-            };
+        async fn bind_and_serve(fixture: KvFixture) -> Option<SocketAddr> {
             let listener = TcpListener::bind("127.0.0.1:0").await.ok()?;
             let addr = listener.local_addr().ok()?;
             tokio::spawn(async move {
@@ -1952,6 +2153,67 @@ mod tests {
                 }
             });
             Some(addr)
+        }
+
+        /// A plain (non-gated) fixture: returns the bound address.
+        pub(super) async fn spawn_fixture(seeded: Vec<(Vec<u8>, Vec<u8>)>) -> Option<SocketAddr> {
+            bind_and_serve(KvFixture {
+                seeded: Arc::new(seeded),
+                observed: Arc::new(Mutex::new(Vec::new())),
+                stall: None,
+            })
+            .await
+        }
+
+        /// A gated fixture: it parks the first Range for `stall_prefix` and counts
+        /// Range calls per prefix. Returns the bound address plus the coordination
+        /// handles.
+        pub(super) async fn spawn_gated_fixture(
+            seeded: Vec<(Vec<u8>, Vec<u8>)>,
+            stall_prefix: &[u8],
+            error_after_release: bool,
+        ) -> Option<Gated> {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let arrived = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let fixture = KvFixture {
+                seeded: Arc::new(seeded),
+                observed: Arc::clone(&observed),
+                stall: Some(StallControl {
+                    prefix: stall_prefix.to_vec(),
+                    arrived: Arc::clone(&arrived),
+                    release: Arc::clone(&release),
+                    stalled: Arc::new(AtomicBool::new(false)),
+                    error_after_release,
+                }),
+            };
+            let addr = bind_and_serve(fixture).await?;
+            Some(Gated {
+                addr,
+                observed,
+                arrived,
+                release,
+            })
+        }
+
+        /// The handles for a running gated fixture.
+        pub(super) struct Gated {
+            pub(super) addr: SocketAddr,
+            observed: Arc<Mutex<Vec<Vec<u8>>>>,
+            pub(super) arrived: Arc<Notify>,
+            pub(super) release: Arc<Notify>,
+        }
+
+        impl Gated {
+            /// How many Range requests were observed for exactly `prefix`.
+            pub(super) fn range_count(&self, prefix: &[u8]) -> usize {
+                self.observed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .filter(|key| key.as_slice() == prefix)
+                    .count()
+            }
         }
 
         async fn serve_connection(stream: TcpStream, fixture: KvFixture) {
@@ -2013,7 +2275,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn an_epoch_overflow_on_a_material_rotation_retains_the_live_generation()
     -> Result<(), TestError> {
-        use overflow_fixture::{FixtureFactory, spawn_fixture};
+        use kv_fixture::{FixtureFactory, spawn_fixture};
 
         // One live TiDB backend under the classic prefix; the keyspace prefix has
         // nothing.
@@ -2205,5 +2467,733 @@ ns-servers = ["dns-a:53"]
         );
         assert_eq!(info.registration_addr(), "10.0.0.7:10000");
         Ok(())
+    }
+
+    // ===================================================================
+    // 214-2 — routing-topology refresh loop matrix
+    // ===================================================================
+    //
+    // These drive `run_refresh` and the module's refresh supervision/teardown
+    // directly. The discovery side is a committed ZERO-cluster generation, whose
+    // `poll_merged_topology` returns `Ok(empty)` synchronously (no socket I/O), so
+    // the paused-clock rows are deterministic; the mid-poll-rotation Stale path
+    // itself is covered by the fixture-backed `tests/discovery_fence.rs`.
+
+    /// A committed zero-cluster discovery generation at epoch 0. Its
+    /// `poll_merged_topology` returns `Ok(EpochResult{ 0, empty })` with no I/O.
+    /// The publisher is returned so a test can `revoke()` it (turning later polls
+    /// into `Err(Revoked)`); the registry/lease keep the owner current.
+    async fn empty_discovery() -> (
+        DiscoveryPublisher,
+        DiscoveryHandle,
+        OwnershipRegistry,
+        OwnerLease,
+    ) {
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "refresh-matrix")
+            .unwrap_or_else(|error| unreachable!("claim: {error}"));
+        let (publisher, handle) = DiscoveryPublisher::new();
+        let unused = Arc::new(AtomicUsize::new(0));
+        let connector = counting_connector(&unused);
+        let prepared = publisher
+            .prepare(&connector, &lease.token(), Vec::new())
+            .await
+            .unwrap_or_else(|_| unreachable!("empty material prepares without connecting"));
+        publisher.commit(prepared);
+        (publisher, handle, registry, lease)
+    }
+
+    /// Yields enough times for a spawned, purely-synchronous refresh child to drain
+    /// its runnable work (poll + publish) after a clock advance, so a following
+    /// assertion observes a settled state. Bounded and deterministic: each tick's
+    /// work never awaits real I/O, and the test task staying runnable here prevents
+    /// the paused clock from auto-advancing further ticks.
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A refresh child that never polls and never completes, so the module's
+    /// refresh loop cannot touch a shared fixture. Used to isolate the discovery
+    /// poll under test from any background refresh poll.
+    fn pending_refresh() -> RefreshFactory {
+        Arc::new(|_discovery, _routing| tokio::spawn(pending::<()>()))
+    }
+
+    /// A refresh child that holds a `DropGuard` and parks forever without polling.
+    /// The guard's `Drop` bumps `drops` and fires `dropped`, and the child fires
+    /// `entered` once it is genuinely running (so the guard is held by the LIVE
+    /// future), letting a test prove the guard is dropped exactly once — and only —
+    /// through `RefreshOwner`'s abort/join (retire) and abort (Drop) backstops.
+    fn guarded_pending_refresh(
+        drops: &Arc<AtomicUsize>,
+        dropped: &Arc<Notify>,
+        entered: &Arc<Notify>,
+    ) -> RefreshFactory {
+        struct DropGuard {
+            drops: Arc<AtomicUsize>,
+            dropped: Arc<Notify>,
+        }
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                self.dropped.notify_one();
+            }
+        }
+
+        let drops = Arc::clone(drops);
+        let dropped = Arc::clone(dropped);
+        let entered = Arc::clone(entered);
+        Arc::new(move |_discovery, _routing| {
+            let guard = DropGuard {
+                drops: Arc::clone(&drops),
+                dropped: Arc::clone(&dropped),
+            };
+            let entered = Arc::clone(&entered);
+            tokio::spawn(async move {
+                let _guard = guard;
+                entered.notify_one();
+                pending::<()>().await;
+            })
+        })
+    }
+
+    /// A refresh child whose cancellation `Drop` BLOCKS on a sync `mpsc::recv`
+    /// until the test releases it, so the test can hold the child mid-Drop and
+    /// prove `RefreshOwner::retire` is *awaiting* `handle.await` (the JOIN) — the
+    /// module task cannot finish while the child is still dropping. The guard bumps
+    /// `drops` and signals `drop_entered` BEFORE it blocks; releasing (or dropping
+    /// the sender on a panic) unblocks the `recv`, so a failing run never hangs.
+    fn join_barrier_refresh(
+        drops: &Arc<AtomicUsize>,
+        entered: &Arc<Notify>,
+        drop_entered: &Arc<Notify>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+    ) -> RefreshFactory {
+        struct BlockingGuard {
+            drops: Arc<AtomicUsize>,
+            drop_entered: Arc<Notify>,
+            release: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        }
+        impl Drop for BlockingGuard {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                self.drop_entered.notify_one();
+                let rx = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(rx) = rx {
+                    // Sync blocking wait: returns on the test's `send`, or `Err` when
+                    // the sender is dropped (panic path), so it can never hang.
+                    let _ = rx.recv();
+                }
+            }
+        }
+
+        let drops = Arc::clone(drops);
+        let entered = Arc::clone(entered);
+        let drop_entered = Arc::clone(drop_entered);
+        let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        Arc::new(move |_discovery, _routing| {
+            let guard = BlockingGuard {
+                drops: Arc::clone(&drops),
+                drop_entered: Arc::clone(&drop_entered),
+                release: Arc::clone(&release),
+            };
+            let entered = Arc::clone(&entered);
+            tokio::spawn(async move {
+                let _guard = guard;
+                entered.notify_one();
+                pending::<()>().await;
+            })
+        })
+    }
+
+    // ----- Row 1: the first refresh publishes immediately at t=0 -----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_publishes_a_first_snapshot_immediately() -> Result<(), TestError> {
+        let (_publisher, discovery, _registry, _lease) = empty_discovery().await;
+        let (routing_publisher, routing_handle) = RoutingSnapshotPublisher::new();
+        let routing = Arc::new(routing_publisher);
+        let child = tokio::spawn(run_refresh(
+            discovery,
+            Arc::clone(&routing),
+            ROUTING_REFRESH_INTERVAL,
+            || async {},
+        ));
+
+        // The first tick fires immediately — no time advance is needed for a
+        // routable snapshot to appear.
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), routing_handle.wait_first())
+            .await?
+            .unwrap_or_else(|_| unreachable!("a first routing snapshot is published at t=0"));
+        assert_eq!(snapshot.generation, 1, "the first snapshot is generation 1");
+        assert_eq!(snapshot.client_epoch, 0, "it carries the discovery epoch");
+        assert!(
+            snapshot.backends.backends.is_empty(),
+            "the zero-cluster topology is empty"
+        );
+
+        child.abort();
+        Ok(())
+    }
+
+    // ----- Row 2: Skip cadence, no burst catch-up --------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_skips_missed_ticks_and_does_not_burst() -> Result<(), TestError> {
+        let (_publisher, discovery, _registry, _lease) = empty_discovery().await;
+        let (routing_publisher, _routing_handle) = RoutingSnapshotPublisher::new();
+        let routing = Arc::new(routing_publisher);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let after_poll = {
+            let polls = Arc::clone(&polls);
+            move || {
+                let polls = Arc::clone(&polls);
+                async move {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+        let child = tokio::spawn(run_refresh(
+            discovery,
+            Arc::clone(&routing),
+            ROUTING_REFRESH_INTERVAL,
+            after_poll,
+        ));
+
+        // t=0: the immediate first tick polls once.
+        settle().await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the immediate tick polls once"
+        );
+
+        // Jump the clock across FIVE intervals at once while nothing was pending.
+        // With `Skip`, the loop fires exactly ONE catch-up tick and then resumes on
+        // the schedule; with `Burst` it would fire all five to catch up.
+        tokio::time::advance(ROUTING_REFRESH_INTERVAL * 5).await;
+        settle().await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            2,
+            "Skip fires exactly one catch-up tick, not a five-tick burst"
+        );
+
+        child.abort();
+        Ok(())
+    }
+
+    // ----- Row 3a: teardown makes routing terminal FIRST → Retired ---------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_teardown_before_an_in_flight_publish_refuses_it_as_retired() -> Result<(), TestError>
+    {
+        let (publisher, discovery, _registry, _lease) = empty_discovery().await;
+        let (routing_publisher, routing_handle) = RoutingSnapshotPublisher::new();
+        let routing = Arc::new(routing_publisher);
+
+        // The seam parks the loop AFTER a successful poll but BEFORE its publish,
+        // so a teardown can land while an `Ok` result is in flight.
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let after_poll = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let first = Arc::new(AtomicBool::new(true));
+            move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let first = Arc::clone(&first);
+                async move {
+                    if first.swap(false, Ordering::SeqCst) {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                }
+            }
+        };
+        let child = tokio::spawn(run_refresh(
+            discovery,
+            Arc::clone(&routing),
+            ROUTING_REFRESH_INTERVAL,
+            after_poll,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), entered.notified()).await?;
+
+        // Land the production terminal fence FIRST (routing made terminal, then
+        // discovery revoked), exactly as `RefreshOwner` does on teardown.
+        let owner = RefreshOwner {
+            routing: Arc::clone(&routing),
+            discovery: &publisher,
+            handle: None,
+        };
+        owner.terminal_fence();
+
+        // Release the in-flight publish: because routing is already terminal, it is
+        // refused as `Retired` and cannot resurrect a snapshot.
+        release.notify_one();
+        settle().await;
+        assert!(
+            routing_handle.current().is_none(),
+            "a publish that lands after the routing-first fence is refused, not resurrected"
+        );
+
+        drop(owner);
+        child.abort();
+        Ok(())
+    }
+
+    // ----- Row 3b: module teardown aborts + joins / drops the refresh child --
+
+    /// Builds a zero-cluster module wired with `refresh_override`, spawns it, and
+    /// returns the module task and handle.
+    fn spawn_module_with_refresh(
+        refresh: RefreshFactory,
+        runtime: &ControlRuntime,
+    ) -> Result<(ModuleTask, super::TopologyModuleHandle), TestError> {
+        let store =
+            ConfigNamespaceStore::from_toml(&config_zero(), None, &std::env::current_dir()?)?;
+        let connects = Arc::new(AtomicUsize::new(0));
+        let counters = Counters::default();
+        let (mut module, handle) = TopologyModule::new_with_child_runner_and_connector(
+            Arc::new(store),
+            Box::new(SwitchableFactory {
+                gen2: Arc::new(watch::channel(None).0),
+            }),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            counting_runner(&counters),
+            counting_connector(&connects),
+        );
+        module.set_refresh_override(refresh);
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+        Ok((task, handle))
+    }
+
+    /// A clean Stopping teardown must ABORT **and JOIN** the refresh child before
+    /// `retire` returns — it is the JOIN, not merely the abort, that is locked here.
+    ///
+    /// The injected child's cancellation `Drop` bumps `drops`, signals
+    /// `drop_entered`, then BLOCKS on a sync `mpsc::recv` (holding one of the two
+    /// workers). While the child is thus mid-Drop, the module task can only be
+    /// unfinished if `retire` is parked on `handle.await` (the join): the config
+    /// has zero registration children, so `stop_children` never yields, meaning a
+    /// join-less `retire` (abort kept, `handle.await` deleted) runs straight from
+    /// the Stopping wake to `Ok` in a single poll — finishing the module task
+    /// BEFORE the child's Drop is even scheduled. So `!task.is_finished()` at the
+    /// `drop_entered` barrier holds ONLY when the join is present. Mutations
+    /// "retire keeps abort but deletes the await join" and "retire fully detaches"
+    /// each turn the `!task.is_finished()` assertion RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopping_teardown_aborts_and_joins_the_refresh_child() -> Result<(), TestError> {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let drop_entered = Arc::new(Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_module_with_refresh(
+            join_barrier_refresh(&drops, &entered, &drop_entered, release_rx),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+
+        // Ensure the child future is genuinely entered, holding its guard.
+        tokio::time::timeout(Duration::from_secs(5), entered.notified()).await?;
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the guard is held by the live refresh child"
+        );
+
+        // Stopping teardown: `retire` aborts the child; its Drop starts, signals,
+        // then blocks. Wait for the Drop to be in flight.
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(5), drop_entered.notified()).await?;
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the child's cancellation Drop ran exactly once"
+        );
+
+        // The discriminator: the module task must STILL be pending, which can only
+        // be true if `retire` is awaiting `handle.await` (the join) on the child
+        // that is currently blocked mid-Drop.
+        assert!(
+            !task.is_finished(),
+            "the module task must still be pending: retire is joining the mid-Drop child"
+        );
+
+        // Release the blocked Drop; the join then completes and the module returns.
+        let _ = release_tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(10), task).await??;
+        assert!(
+            matches!(result, Ok(())),
+            "a clean Stopping teardown returns Ok"
+        );
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// A hard abort of the module task must STILL fence the refresh child: dropping
+    /// the `run_inner` frame drops `RefreshOwner`, whose `Drop` aborts the child.
+    /// The `dropped` `Notify` is a synchronisation point, and the timeout is a wide
+    /// deadlock watchdog, not a semantic threshold: without the `Drop` abort the
+    /// guard is NEVER dropped (the child leaks), so the wait always times out; with
+    /// it, it fires promptly. Mutation "Drop detaches without abort" turns this row
+    /// RED via the watchdog.
+    #[tokio::test]
+    async fn an_aborted_module_drops_the_refresh_child_via_refresh_owner_drop()
+    -> Result<(), TestError> {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(Notify::new());
+        let entered = Arc::new(Notify::new());
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_module_with_refresh(
+            guarded_pending_refresh(&drops, &dropped, &entered),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified()).await?;
+
+        // Hard abort: the `run_inner` frame is dropped, so `RefreshOwner::drop`
+        // must abort the child (no async join available on this path). The parent
+        // JoinHandle must resolve to a cancelled `JoinError`, never a normal Ok.
+        task.abort();
+        let joined = tokio::time::timeout(Duration::from_secs(5), task).await?;
+        let Err(join_error) = joined else {
+            unreachable!("an aborted module task must not complete normally");
+        };
+        assert!(
+            join_error.is_cancelled(),
+            "the aborted module task ended cancelled"
+        );
+
+        // The guard must be dropped exactly once by the child's cancellation.
+        if tokio::time::timeout(Duration::from_secs(5), dropped.notified())
+            .await
+            .is_err()
+        {
+            unreachable!("RefreshOwner::drop must abort the child so its guard is dropped");
+        }
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the aborted child's guard is dropped exactly once"
+        );
+        drop(runtime);
+        Ok(())
+    }
+
+    // ----- Row 4: refresh supervision fails loud ---------------------------
+
+    async fn assert_refresh_supervision_fails_loud(panics: bool) -> Result<(), TestError> {
+        let runtime = runtime()?;
+        let factory: RefreshFactory = Arc::new(move |_discovery, _routing| {
+            tokio::spawn(async move {
+                assert!(!panics, "injected refresh panic");
+                // Otherwise return immediately: an unexpected refresh exit.
+            })
+        });
+        let (task, mut handle) = spawn_module_with_refresh(factory, &runtime)?;
+        wait_ready(&mut handle).await?;
+
+        // The refresh child ended on its own; the supervision arm must fail the
+        // module loud rather than leave it ready with a silent routing source.
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await??;
+        let Err(error) = result else {
+            unreachable!("an ended refresh child must fail the module")
+        };
+        assert_eq!(error.module, "control_topology");
+        assert_eq!(error.error_class, "routing_refresh_failed");
+
+        runtime.begin_shutdown(ShutdownReason::Requested)?;
+        shutdown(&runtime)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_returning_refresh_child_fails_the_module_loud() -> Result<(), TestError> {
+        assert_refresh_supervision_fails_loud(false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_refresh_child_fails_the_module_loud() -> Result<(), TestError> {
+        assert_refresh_supervision_fails_loud(true).await
+    }
+
+    // ----- Row 5 (+6 routing side): a pull error retains the last good ------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_error_never_clears_or_advances_the_routing_snapshot() -> Result<(), TestError> {
+        // Start with NO committed discovery set: the first poll errors.
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "refresh-retain")
+            .unwrap_or_else(|error| unreachable!("claim: {error}"));
+        let (publisher, discovery) = DiscoveryPublisher::new();
+        let (routing_publisher, routing_handle) = RoutingSnapshotPublisher::new();
+        let routing = Arc::new(routing_publisher);
+        let child = tokio::spawn(run_refresh(
+            discovery,
+            Arc::clone(&routing),
+            ROUTING_REFRESH_INTERVAL,
+            || async {},
+        ));
+
+        // The immediate first poll errors (no live set): routing stays fail-closed.
+        settle().await;
+        assert!(
+            routing_handle.current().is_none(),
+            "an initial pull error leaves the routing source None"
+        );
+
+        // Commit a live set; the next tick publishes generation 1.
+        let unused = Arc::new(AtomicUsize::new(0));
+        let connector = counting_connector(&unused);
+        let prepared = publisher
+            .prepare(&connector, &lease.token(), Vec::new())
+            .await
+            .unwrap_or_else(|_| unreachable!("empty material prepares"));
+        publisher.commit(prepared);
+        tokio::time::advance(ROUTING_REFRESH_INTERVAL).await;
+        settle().await;
+        let good = routing_handle
+            .current()
+            .unwrap_or_else(|| unreachable!("a successful pull publishes generation 1"));
+        assert_eq!(good.generation, 1);
+
+        // Revoke discovery so the next pull errors (the Stale/Revoked class the
+        // refresh loop must treat as retain-last-good): the routing snapshot must
+        // keep the SAME Arc and generation, never clear or advance.
+        publisher.revoke();
+        tokio::time::advance(ROUTING_REFRESH_INTERVAL).await;
+        settle().await;
+        let after = routing_handle
+            .current()
+            .unwrap_or_else(|| unreachable!("the last-good snapshot is retained"));
+        assert!(
+            Arc::ptr_eq(&good, &after),
+            "a post-success pull error retains the exact last-good snapshot"
+        );
+        assert_eq!(
+            after.generation, 1,
+            "a pull error never advances the generation"
+        );
+
+        child.abort();
+        Ok(())
+    }
+
+    // ===================================================================
+    // #212 mid-poll fence rows (moved from tests/discovery_fence.rs and
+    // isolated from the background refresh so there is no wall-clock race).
+    // ===================================================================
+    //
+    // Each drives a REAL module whose discovery connection points at a gated
+    // KV.Range fixture, but with a `pending_refresh` override so the module's own
+    // refresh loop never polls the fixture. The test's explicit poll is therefore
+    // the ONLY caller that can consume the armed stall — with NO dependency on the
+    // 3s refresh cadence.
+
+    const CLUSTER_NAME: &str = "cluster-a";
+    const TIDB_PREFIX: &[u8] = b"/topology/tidb/";
+    const KEYSPACE_PREFIX: &[u8] = b"/keyspaces/tidb/";
+    const PROM_PREFIX: &[u8] = b"/topology/prometheus";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn a_tidb_poll_revoked_mid_read_aborts_before_the_second_prefix_and_is_stale()
+    -> Result<(), TestError> {
+        use kv_fixture::{FixtureFactory, spawn_gated_fixture};
+
+        let body = async {
+            // One live TiDB backend under the classic prefix; the keyspace prefix
+            // has nothing. The poll reads the classic prefix first (where we stall).
+            let seeded = vec![
+                (
+                    b"/topology/tidb/10.0.0.9:4000/info".to_vec(),
+                    br#"{"ip":"10.0.0.9","status_port":10080,"version":"v8"}"#.to_vec(),
+                ),
+                (b"/topology/tidb/10.0.0.9:4000/ttl".to_vec(), b"1".to_vec()),
+            ];
+            let Some(fixture) = spawn_gated_fixture(seeded, TIDB_PREFIX, false).await else {
+                unreachable!("the fixture binds a loopback port");
+            };
+            let timeout_ms = Arc::new(AtomicU64::new(500));
+            let store = ConfigNamespaceStore::from_toml(
+                &config_single(100),
+                None,
+                &std::env::current_dir()?,
+            )?;
+            let counters = Counters::default();
+            let connects = Arc::new(AtomicUsize::new(0));
+            let runtime = runtime()?;
+            let (mut module, mut handle) = TopologyModule::new_with_child_runner_and_connector(
+                Arc::new(store.clone()),
+                Box::new(FixtureFactory {
+                    addr: fixture.addr,
+                    timeout_ms: Arc::clone(&timeout_ms),
+                }),
+                Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+                identity(),
+                counting_runner(&counters),
+                counting_real_connector(&connects),
+            );
+            module.set_refresh_override(pending_refresh());
+            let context = runtime.handle().module_context();
+            runtime.mark_ready()?;
+            let task = tokio::spawn(Box::new(module).run(context));
+            wait_ready(&mut handle).await?;
+            let mut status = handle.status();
+            let _ = status.borrow_and_update();
+
+            // Park a merged poll inside its first (classic) TiDB Range.
+            let discovery = handle.discovery_handle();
+            let poll = tokio::spawn(async move { discovery.poll_merged_topology().await });
+            fixture.arrived.notified().await;
+            assert_eq!(
+                fixture.range_count(TIDB_PREFIX),
+                1,
+                "the poll issued exactly the first (classic) TiDB Range"
+            );
+            assert_eq!(
+                fixture.range_count(KEYSPACE_PREFIX),
+                0,
+                "the second prefix has not been read yet"
+            );
+
+            // Rotate the material mid-poll (a different client timeout), revoking
+            // the parked epoch's gate, then release the stall.
+            timeout_ms.store(700, Ordering::SeqCst);
+            store.apply_toml(&config_single(200), None, 2, &std::env::current_dir()?)?;
+            wait_observed(&mut status, 2).await?;
+            fixture.release.notify_one();
+
+            let joined = tokio::time::timeout(Duration::from_secs(5), poll).await?;
+            let result = joined.unwrap_or_else(|error| unreachable!("poll task: {error}"));
+
+            // Fence 1 (per-connection gate): the revoked gate aborted the poll at
+            // its next `execute`, so the SECOND prefix Range was never issued.
+            assert_eq!(
+                fixture.range_count(KEYSPACE_PREFIX),
+                0,
+                "the revoked gate aborted the poll before the second prefix Range"
+            );
+            // Fence 2 (handle still_current): a rotation mid-poll surfaces as Stale.
+            assert_eq!(
+                result.err(),
+                Some(DiscoveryError::Stale),
+                "a poll whose epoch rotated mid-read returns Stale"
+            );
+
+            request_stop(&runtime)?;
+            tokio::time::timeout(Duration::from_secs(10), task).await???;
+            runtime.finish()?;
+            Ok::<(), TestError>(())
+        };
+        match tokio::time::timeout(Duration::from_secs(10), body).await {
+            Ok(inner) => inner,
+            Err(_) => unreachable!("the TiDB fence scenario completes within the deadline"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn a_prometheus_poll_revoked_mid_read_sends_no_retry_and_is_stale()
+    -> Result<(), TestError> {
+        use kv_fixture::{FixtureFactory, spawn_gated_fixture};
+
+        let body = async {
+            // A valid Prometheus record so a NON-fenced retry would succeed; the
+            // fence must stop the poll before any retry. `error_after_release`
+            // fails the parked first attempt, so absent the gate fence the retry
+            // policy would issue a SECOND Prometheus Range.
+            let seeded = vec![(
+                b"/topology/prometheus/x".to_vec(),
+                br#"{"ip":"1.2.3.4","port":9090}"#.to_vec(),
+            )];
+            let Some(fixture) = spawn_gated_fixture(seeded, PROM_PREFIX, true).await else {
+                unreachable!("the fixture binds a loopback port");
+            };
+            let timeout_ms = Arc::new(AtomicU64::new(500));
+            let store = ConfigNamespaceStore::from_toml(
+                &config_single(100),
+                None,
+                &std::env::current_dir()?,
+            )?;
+            let counters = Counters::default();
+            let connects = Arc::new(AtomicUsize::new(0));
+            let runtime = runtime()?;
+            let (mut module, mut handle) = TopologyModule::new_with_child_runner_and_connector(
+                Arc::new(store.clone()),
+                Box::new(FixtureFactory {
+                    addr: fixture.addr,
+                    timeout_ms: Arc::clone(&timeout_ms),
+                }),
+                Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+                identity(),
+                counting_runner(&counters),
+                counting_real_connector(&connects),
+            );
+            module.set_refresh_override(pending_refresh());
+            let context = runtime.handle().module_context();
+            runtime.mark_ready()?;
+            let task = tokio::spawn(Box::new(module).run(context));
+            wait_ready(&mut handle).await?;
+            let mut status = handle.status();
+            let _ = status.borrow_and_update();
+
+            // Park a Prometheus poll inside its first Range attempt.
+            let discovery = handle.discovery_handle();
+            let poll = tokio::spawn(async move { discovery.poll_prometheus(CLUSTER_NAME).await });
+            fixture.arrived.notified().await;
+            assert_eq!(
+                fixture.range_count(PROM_PREFIX),
+                1,
+                "the poll issued exactly the first Prometheus Range"
+            );
+
+            // Rotate the material mid-poll, revoking the parked epoch's gate, then
+            // release the stall (which then fails the first attempt).
+            timeout_ms.store(700, Ordering::SeqCst);
+            store.apply_toml(&config_single(200), None, 2, &std::env::current_dir()?)?;
+            wait_observed(&mut status, 2).await?;
+            fixture.release.notify_one();
+
+            let joined = tokio::time::timeout(Duration::from_secs(5), poll).await?;
+            let result = joined.unwrap_or_else(|error| unreachable!("poll task: {error}"));
+
+            // Fence 1 (per-connection gate): the revoked gate aborts the retry loop
+            // at the next attempt's `execute`, so NO second Prometheus Range is sent.
+            assert_eq!(
+                fixture.range_count(PROM_PREFIX),
+                1,
+                "the revoked gate suppressed the Prometheus retry Range"
+            );
+            // Fence 2 (handle still_current): the rotated epoch surfaces as Stale.
+            assert_eq!(
+                result.err(),
+                Some(DiscoveryError::Stale),
+                "a Prometheus poll whose epoch rotated mid-read returns Stale"
+            );
+
+            request_stop(&runtime)?;
+            tokio::time::timeout(Duration::from_secs(10), task).await???;
+            runtime.finish()?;
+            Ok::<(), TestError>(())
+        };
+        match tokio::time::timeout(Duration::from_secs(10), body).await {
+            Ok(inner) => inner,
+            Err(_) => unreachable!("the Prometheus fence scenario completes within the deadline"),
+        }
     }
 }
