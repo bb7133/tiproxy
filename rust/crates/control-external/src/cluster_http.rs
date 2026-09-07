@@ -14,11 +14,13 @@
 
 //! Owner-fenced, single-attempt HTTP `/status` probe for a backend cluster.
 //!
-//! [`ClusterHttpClient`] owns all TCP/TLS/DNS/HTTP transport for one backend
-//! cluster's per-backend `/status` health read (CP-TOPO #213-1). It reuses the
-//! cluster's owner-fenced explicit-nameserver [`ExplicitResolver`] (or the system
-//! resolver when no `ns_servers` are configured) and the cluster's advanced TLS
-//! material ([`EtcdTlsConfig::client_config`](crate::etcd::EtcdTlsConfig)), so a
+//! [`ClusterHttpClient`] owns the TLS/HTTP exchange for one backend cluster's
+//! per-backend `/status` health read (CP-TOPO #213-1) over the cluster's shared
+//! owner-fenced raw connector ([`ClusterConnector`], CP-TOPO #215-1: the
+//! explicit-nameserver resolver — or the system resolver when no `ns_servers` are
+//! configured — plus the bounded candidate dial). It applies the cluster's
+//! advanced TLS material
+//! ([`EtcdTlsConfig::client_config`](crate::etcd::EtcdTlsConfig)) on top, so a
 //! probe honors the exact DNS and TLS policy the cluster's etcd transport already
 //! uses.
 //!
@@ -34,7 +36,7 @@
 //! is TERMINAL and wins over any coincident I/O error, so a retired owner or a
 //! superseded routing source is never reported as a retryable transport failure.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,18 +52,14 @@ use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::dns_transport::TokioDnsTransport;
+use crate::cluster_connect::{
+    ClusterConnectError, ClusterConnector, MAX_PROBE_TIMEOUT, parse_ip_literal,
+};
 use crate::etcd::{EtcdClientConfig, EtcdConfigError, GenerationGate};
-use crate::explicit_dns::{Clock, DnsTransport, ExplicitResolver, ResolveError, SystemClock};
+use crate::explicit_dns::ResolveError;
 use crate::http::MAX_HTTP_RESPONSE_BYTES;
 use crate::transport::MaybeTlsStream;
 
-/// Upper bound on one probe's absolute attempt deadline.
-const MAX_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
-/// Maximum resolved candidate addresses dialed within one attempt budget, a
-/// bounded, order-preserving, de-duplicated subset (mirrors the etcd transport's
-/// bounded multi-address fallback).
-const MAX_CANDIDATES: usize = 8;
 /// The origin-form request target for a backend status probe.
 const STATUS_PATH: &str = "/status";
 /// The fixed production response-body cap for a status probe: 64 KiB, well under
@@ -106,7 +104,7 @@ impl HttpProbePolicy {
     /// Validates the policy: a non-zero attempt timeout no larger than five
     /// minutes and a non-zero body cap.
     fn validate(&self) -> Result<(), ClusterHttpConfigError> {
-        if self.attempt_timeout.is_zero() || self.attempt_timeout > MAX_ATTEMPT_TIMEOUT {
+        if self.attempt_timeout.is_zero() || self.attempt_timeout > MAX_PROBE_TIMEOUT {
             return Err(ClusterHttpConfigError::InvalidAttemptTimeout(
                 self.attempt_timeout,
             ));
@@ -183,6 +181,17 @@ pub enum ClusterHttpError {
     Timeout,
 }
 
+impl From<ClusterConnectError> for ClusterHttpError {
+    fn from(error: ClusterConnectError) -> Self {
+        match error {
+            ClusterConnectError::Fenced => Self::Fenced,
+            ClusterConnectError::Dns => Self::Dns,
+            ClusterConnectError::ConnectionRefused => Self::ConnectionRefused,
+            ClusterConnectError::Transport => Self::Transport,
+        }
+    }
+}
+
 impl ClusterHttpError {
     /// Whether the policy layer may retry this failure. Only transient transport
     /// conditions (non-stale DNS failures, other transport/read errors, and
@@ -196,15 +205,14 @@ impl ClusterHttpError {
 /// An owner-fenced, single-attempt HTTP `/status` probe client for one backend
 /// cluster's material and generation.
 ///
-/// It privately holds the cluster's explicit-nameserver resolver (absent when no
-/// `ns_servers` are configured, falling back to the system resolver), the
-/// cluster's TLS client configuration (absent for a plaintext cluster), the
-/// process owner token, and the probe policy. It is reusable across probes within
-/// one cluster-material/epoch.
+/// It privately holds the cluster's owner-fenced raw connector (the
+/// explicit-nameserver resolver, absent when no `ns_servers` are configured, and
+/// the bounded candidate dial), the cluster's TLS client configuration (absent
+/// for a plaintext cluster), and the probe policy. It is reusable across probes
+/// within one cluster-material/epoch.
 #[derive(Clone)]
 pub struct ClusterHttpClient {
-    owner: OwnerToken,
-    resolver: Option<Arc<ExplicitResolver>>,
+    connector: ClusterConnector,
     tls: Option<Arc<ClientConfig>>,
     policy: HttpProbePolicy,
 }
@@ -233,28 +241,15 @@ impl ClusterHttpClient {
         policy: HttpProbePolicy,
     ) -> Result<Self, ClusterHttpConfigError> {
         policy.validate()?;
-        let resolver = if config.ns_servers().is_empty() {
-            None
-        } else {
-            let transport: Arc<dyn DnsTransport> = Arc::new(TokioDnsTransport);
-            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-            let resolver = ExplicitResolver::new(
-                owner.clone(),
-                config.ns_servers(),
-                transport,
-                clock,
-                policy.attempt_timeout,
-            )
-            .map_err(ClusterHttpConfigError::Resolver)?;
-            Some(Arc::new(resolver))
-        };
+        let connector =
+            ClusterConnector::from_cluster_material(config, owner, policy.attempt_timeout)
+                .map_err(ClusterHttpConfigError::Resolver)?;
         let tls = match config.tls() {
             Some(tls) => Some(tls.client_config().map_err(ClusterHttpConfigError::Tls)?),
             None => None,
         };
         Ok(Self {
-            owner,
-            resolver,
+            connector,
             tls,
             policy,
         })
@@ -307,10 +302,8 @@ impl ClusterHttpClient {
         port: u16,
         source_gate: &GenerationGate,
     ) -> Result<Bytes, ClusterHttpError> {
-        self.fence(source_gate)?; // pre-DNS
-        let candidates = self.resolve(host, port, source_gate).await?;
-        self.fence(source_gate)?; // post-DNS
-        let stream = self.connect(&candidates, source_gate).await?;
+        // The connector fences pre-DNS, post-DNS, and around every candidate dial.
+        let stream = self.connector.connect_once(host, port, source_gate).await?;
         let stream = self.maybe_tls(host, stream, source_gate).await?;
         self.exchange(host, port, stream, source_gate).await
     }
@@ -318,68 +311,9 @@ impl ClusterHttpClient {
     /// Returns `Ok` only while the process owner AND the source generation are
     /// both current. A stale check is a terminal [`ClusterHttpError::Fenced`].
     fn fence(&self, source_gate: &GenerationGate) -> Result<(), ClusterHttpError> {
-        if self.owner.is_current() && source_gate.is_live() {
-            Ok(())
-        } else {
-            Err(ClusterHttpError::Fenced)
-        }
-    }
-
-    /// Resolves `host` to a bounded, ordered, de-duplicated candidate set. A
-    /// literal IP is a single candidate with no wire query; a hostname resolves
-    /// through the cluster resolver (never a second system lookup per candidate)
-    /// or the system resolver when no `ns_servers` are configured.
-    async fn resolve(
-        &self,
-        host: &str,
-        port: u16,
-        source_gate: &GenerationGate,
-    ) -> Result<Vec<SocketAddr>, ClusterHttpError> {
-        if let Some(ip) = parse_ip_literal(host) {
-            return Ok(vec![SocketAddr::new(ip, port)]);
-        }
-        let resolved: Vec<SocketAddr> = if let Some(resolver) = &self.resolver {
-            let outcome = resolver.resolve(host).await;
-            // Fence after the resolve await, before classifying: a stale owner or
-            // source gate is terminal and wins over any DNS error.
-            self.fence(source_gate)?;
-            outcome
-                .map_err(|_| ClusterHttpError::Dns)?
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, port))
-                .collect()
-        } else {
-            let authority = format!("{host}:{port}");
-            let outcome = tokio::net::lookup_host(authority).await;
-            self.fence(source_gate)?;
-            outcome.map_err(|_| ClusterHttpError::Dns)?.collect()
-        };
-        let candidates = collect_candidates(resolved.into_iter());
-        if candidates.is_empty() {
-            return Err(ClusterHttpError::Dns);
-        }
-        Ok(candidates)
-    }
-
-    /// Dials the candidate set in order under the shared deadline, falling back
-    /// candidate by candidate; only the LAST dial error (after exhaustion)
-    /// classifies the result. Each candidate's await is fenced before and after.
-    async fn connect(
-        &self,
-        candidates: &[SocketAddr],
-        source_gate: &GenerationGate,
-    ) -> Result<TcpStream, ClusterHttpError> {
-        let mut last_error: Option<std::io::Error> = None;
-        for addr in candidates {
-            self.fence(source_gate)?; // pre-connect
-            let result = TcpStream::connect(*addr).await;
-            self.fence(source_gate)?; // post-connect: a fence wins over the I/O result
-            match result {
-                Ok(stream) => return Ok(stream),
-                Err(error) => last_error = Some(error),
-            }
-        }
-        Err(classify_dial_error(last_error.as_ref()))
+        self.connector
+            .fence(source_gate)
+            .map_err(ClusterHttpError::from)
     }
 
     /// Wraps the TCP stream in TLS when the cluster has TLS material (fenced
@@ -501,17 +435,6 @@ impl ClusterHttpClient {
     }
 }
 
-/// Classifies the final exhausted-candidates dial error: a refused connection is
-/// terminal, any other transport error is retryable.
-fn classify_dial_error(error: Option<&std::io::Error>) -> ClusterHttpError {
-    match error {
-        Some(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-            ClusterHttpError::ConnectionRefused
-        }
-        _ => ClusterHttpError::Transport,
-    }
-}
-
 /// Builds the origin-form `GET /status HTTP/1.1` request with an explicit
 /// `Host:` (logical host, IPv6 bracketed) and `Connection: close`.
 fn build_request(host: &str, port: u16) -> Result<Request<Empty<Bytes>>, ClusterHttpError> {
@@ -555,31 +478,6 @@ fn content_length(headers: &http::HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// Parses a bare or bracketed IP-literal host.
-fn parse_ip_literal(host: &str) -> Option<IpAddr> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Some(ip);
-    }
-    host.strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .and_then(|inner| inner.parse::<IpAddr>().ok())
-}
-
-/// Collects resolved addresses into a bounded, order-preserving, de-duplicated
-/// candidate set capped at [`MAX_CANDIDATES`].
-fn collect_candidates(resolved: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
-    let mut addrs: Vec<SocketAddr> = Vec::new();
-    for addr in resolved {
-        if addrs.len() >= MAX_CANDIDATES {
-            break;
-        }
-        if !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
-    }
-    addrs
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -587,7 +485,7 @@ mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
-    use control_plane::{OwnerLease, OwnerScope, OwnershipRegistry};
+    use control_plane::OwnerLease;
     use rustls::ServerConfig;
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -604,6 +502,7 @@ mod tests {
         EtcdClientConfig, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion, GenerationGate,
     };
     use crate::http::MAX_HTTP_RESPONSE_BYTES;
+    use crate::probe_test_support::{ns_config, owner_lease, plaintext_config, spawn_dns};
 
     /// A whole-test wall-clock bound so a stalled socket trips well inside CI's
     /// patience. The probe's own attempt deadline is shorter still.
@@ -611,24 +510,11 @@ mod tests {
 
     // --- ownership -------------------------------------------------------
 
-    fn owner_lease() -> (OwnershipRegistry, OwnerLease) {
-        let registry = OwnershipRegistry::new();
-        let lease = registry
-            .claim(OwnerScope::Process, "cluster-http-test")
-            .unwrap_or_else(|error| unreachable!("claim: {error}"));
-        (registry, lease)
-    }
-
     fn policy(attempt_timeout: Duration, max_response_bytes: usize) -> HttpProbePolicy {
         HttpProbePolicy {
             attempt_timeout,
             max_response_bytes,
         }
-    }
-
-    fn plaintext_config() -> EtcdClientConfig {
-        EtcdClientConfig::new(["127.0.0.1:2379".to_owned()], None)
-            .unwrap_or_else(|error| unreachable!("config: {error}"))
     }
 
     // --- a boxable loopback stream --------------------------------------
@@ -914,71 +800,6 @@ mod tests {
 
     /// Spawns a loopback UDP nameserver answering `A` with `a`, `AAAA` with
     /// `aaaa` (each empty family is authoritative NODATA), returning its port.
-    async fn spawn_dns(a: Vec<Ipv4Addr>, aaaa: Vec<Ipv6Addr>) -> u16 {
-        use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-        use hickory_proto::rr::rdata::{A, AAAA};
-        use hickory_proto::rr::{RData, Record, RecordType};
-
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap_or_else(|error| unreachable!("bind dns: {error}"));
-        let port = socket
-            .local_addr()
-            .unwrap_or_else(|error| unreachable!("dns addr: {error}"))
-            .port();
-        tokio::spawn(async move {
-            let mut buffer = vec![0u8; 2048];
-            loop {
-                let Ok((len, src)) = socket.recv_from(&mut buffer).await else {
-                    return;
-                };
-                let Ok(message) = Message::from_vec(&buffer[..len]) else {
-                    continue;
-                };
-                let Some(query) = message.queries.first() else {
-                    continue;
-                };
-                let qname = query.name().clone();
-                let qtype = query.query_type();
-                let mut response = Message::new(message.id, MessageType::Response, OpCode::Query);
-                response.metadata.authoritative = true;
-                response.metadata.response_code = ResponseCode::NoError;
-                response.add_query(Query::query(qname.clone(), qtype));
-                if qtype == RecordType::A {
-                    for ip in &a {
-                        let octets = ip.octets();
-                        response.add_answer(Record::from_rdata(
-                            qname.clone(),
-                            30,
-                            RData::A(A::new(octets[0], octets[1], octets[2], octets[3])),
-                        ));
-                    }
-                } else if qtype == RecordType::AAAA {
-                    for ip in &aaaa {
-                        response.add_answer(Record::from_rdata(
-                            qname.clone(),
-                            30,
-                            RData::AAAA(AAAA(*ip)),
-                        ));
-                    }
-                }
-                let Ok(bytes) = response.to_vec() else {
-                    continue;
-                };
-                let _ = socket.send_to(&bytes, src).await;
-            }
-        });
-        port
-    }
-
-    fn ns_config(dns_port: u16, tls: Option<EtcdTlsConfig>) -> EtcdClientConfig {
-        let ns: Arc<[Arc<str>]> =
-            Arc::from([Arc::<str>::from(format!("127.0.0.1:{dns_port}").as_str())]);
-        EtcdClientConfig::new(["127.0.0.1:2379".to_owned()], tls)
-            .and_then(|config| config.with_ns_servers(ns))
-            .unwrap_or_else(|error| unreachable!("config: {error}"))
-    }
-
     // ====================================================================
     // Policy validation and error classification.
     // ====================================================================

@@ -21,13 +21,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cluster_connect;
 pub mod cluster_http;
 pub mod dns;
 mod dns_transport;
 pub mod etcd;
 pub mod explicit_dns;
 pub mod http;
+#[cfg(test)]
+mod probe_test_support;
 pub mod retry;
+pub mod sql_greeting;
 mod tls;
 mod transport;
 
@@ -43,6 +47,9 @@ pub mod diagnostics {
     include!("generated/diagnosticspb.rs");
 }
 
+pub use cluster_connect::{
+    ClusterConnectError, ClusterConnector, MAX_CANDIDATES, MAX_PROBE_TIMEOUT,
+};
 pub use cluster_http::{
     ClusterHttpClient, ClusterHttpConfigError, ClusterHttpError, HEALTH_BODY_CAP, HttpProbePolicy,
 };
@@ -54,6 +61,7 @@ pub use etcd::{
 };
 pub use http::{BoundedHttpClient, HttpClientConfig, HttpConfigError, HttpError, HttpTlsConfig};
 pub use retry::{RetryDecision, RetryError, RetryPolicy, RetryPolicyError, retry_bounded};
+pub use sql_greeting::{SqlGreetingConfigError, SqlGreetingError, SqlGreetingProbe};
 
 /// The sole direct `kvproto` service binding needed by the current Go server.
 pub const DIRECT_KVPROTO_BINDINGS: &[&str] = &["diagnosticspb.Diagnostics"];
