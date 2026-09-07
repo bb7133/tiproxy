@@ -2516,8 +2516,8 @@ ns-servers = [{ns_servers}]
     /// has fully completed and published — the target must be visible then, and if
     /// it is not, that poll genuinely failed and the drain fails outright rather
     /// than looping. The successor poll entered at Range #2 is itself still in
-    /// flight when the drain exits; every row tears its composition down
-    /// immediately afterward, which cancels it.
+    /// flight when the drain exits; every paused-clock row tears its composition
+    /// down immediately afterward, which cancels it.
     async fn drain_until<F>(
         routing: &RoutingSnapshotHandle,
         fixture: &KvFixture,
@@ -2588,12 +2588,38 @@ ns-servers = [{ns_servers}]
     /// later one, so it gets real time for the same reason as [`drain_until`].
     async fn wait_first_real(routing: &RoutingSnapshotHandle) -> Arc<RoutingSnapshot> {
         tokio::time::resume();
-        let first = routing
-            .wait_first()
-            .await
-            .unwrap_or_else(|_| unreachable!("the refresh loop publishes a first snapshot"));
+        let first = first_snapshot(routing).await;
         tokio::time::pause();
         first
+    }
+
+    /// The refresh loop's first published snapshot. A real-clock row calls this
+    /// directly; a paused-clock row goes through [`wait_first_real`].
+    async fn first_snapshot(routing: &RoutingSnapshotHandle) -> Arc<RoutingSnapshot> {
+        routing
+            .wait_first()
+            .await
+            .unwrap_or_else(|_| unreachable!("the refresh loop publishes a first snapshot"))
+    }
+
+    /// [`drain_until`] for a row that runs on the REAL clock: the refresh ticker
+    /// fires on its own within one interval, so nothing is advanced, and the same
+    /// two-Range completion fence decides success or fails fast.
+    async fn drain_until_real<F>(
+        routing: &RoutingSnapshotHandle,
+        fixture: &KvFixture,
+        mut done: F,
+    ) -> Arc<RoutingSnapshot>
+    where
+        F: FnMut(&RoutingSnapshot) -> bool,
+    {
+        if let Some(snapshot) = routing.current()
+            && done(&snapshot)
+        {
+            return snapshot;
+        }
+        let before = fixture.tidb_range_count();
+        drain_in_real_time(routing, fixture, before, &mut done).await
     }
 
     /// Waits until the module's observable status reaches `applied` — an
@@ -2991,9 +3017,6 @@ ns-servers = [{ns_servers}]
     use control_topology::{HealthOverlayHandle, HealthSnapshot};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// The default health round cadence (`HealthCheckConfig::default().interval`),
-    /// which the paused-clock structured wait advances by to fire the next round.
-    const HEALTH_INTERVAL: Duration = Duration::from_secs(3);
     /// The merged backend id for `ADDR_A` under `CLUSTER_NAME` (`{cluster}/{addr}`).
     const BACKEND_ID: &str = "cluster-a/10.0.0.1:4000";
 
@@ -3256,20 +3279,22 @@ ns-servers = [{ns_servers}]
     }
 
     // ----- The anti-false-pass structured health wait -----------------------
+    //
+    // Every health row runs on the REAL clock from its first poll to its teardown:
+    // plain `#[tokio::test]`, never `advance`/`pause`/`resume`. Both the routing
+    // poll and the `/status` probe are real loopback I/O with production budgets
+    // (the per-cluster refresh timeout, the probe's attempt timeout), and a paused
+    // clock auto-advances past those budgets whenever the runtime idles mid-I/O,
+    // leaving a reset stream behind that poisons the next poll on the shared
+    // connection. No fence can prove a routing poll quiescent from the outside
+    // (the public surface exposes no client-side round completion), so instead
+    // nothing is ever in flight under a frozen clock. The cost is the Go-default
+    // cadence on the wall clock: one health round per 3s, and the Hang phase spends
+    // its 4 x 2s attempt + 3 x 1s retry budget for real.
 
     /// A structured wait for the health overlay to carry `expected_healthy` /
     /// `expected_version` for `backend_id` under the EXACT routing source `r`,
     /// deterministically, without `sleep`/`yield` and without a spin budget.
-    ///
-    /// The paused clock is used for exactly one thing: `advance(health_interval)`
-    /// wakes the parked health loop into its next round. When a real `/status`
-    /// RESPONSE must arrive (`real_time`: the 200 / 500 phases), the clock is then
-    /// `resume`d for the rest of the wait — with the clock resumed the runtime never
-    /// auto-advances, so the production probe's attempt timeout cannot beat the
-    /// loopback response (the same race the routing drain had) — and paused again
-    /// on exit. When the attempt timeout firing IS the expected event (not
-    /// `real_time`: the Hang phase), the wait stays on the paused clock, whose
-    /// auto-advance drives the initial attempt and each retry deterministically.
     ///
     /// Observation is structured on the server's exact `GET /status` events: the
     /// handler's notify fires when the request is parsed — before the response and
@@ -3294,14 +3319,8 @@ ns-servers = [{ns_servers}]
         min_request_delta: usize,
         server: &StatusServer,
         prev_h: Option<&Arc<HealthSnapshot>>,
-        real_time: bool,
-        health_interval: Duration,
     ) -> Arc<HealthSnapshot> {
-        tokio::time::advance(health_interval).await;
-        if real_time {
-            tokio::time::resume();
-        }
-        let h = loop {
+        loop {
             let notified = server.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -3318,40 +3337,25 @@ ns-servers = [{ns_servers}]
                 }
             }
             notified.await;
-        };
-        if real_time {
-            tokio::time::pause();
         }
-        h
     }
 
     /// A structured wait for a DISABLED runtime's published overlay.
     ///
     /// A disabled runtime does no probe I/O, so there is no `/status` request
-    /// signal to key on; this advances one further cadence and then bounded-yields
-    /// the (change-future-less) public overlay handle until a live all-healthy
-    /// overlay is published for `r`. The cap is a pure deadlock guard.
-    ///
-    /// The cadence advance also fires the routing refresh ticker (the two intervals
-    /// coincide), starting a real loopback poll. That poll runs under REAL time
-    /// (`resume` across the wait, `pause` on exit) for the same reason as
-    /// [`drain_until`]: a paused clock would let the runtime auto-advance past the
-    /// production per-cluster timeout while the poll's I/O is in flight and leave a
-    /// failed, half-finished refresh round behind for the next drain.
+    /// signal to key on; a new generation's zero-I/O round runs immediately, so this
+    /// bounded-yields the (change-future-less) public overlay handle until a live
+    /// all-healthy overlay is published for `r`. The cap is a pure deadlock guard.
     async fn drain_disabled_health(
         overlay: &HealthOverlayHandle,
         routing: &RoutingSnapshotHandle,
         r: &Arc<RoutingSnapshot>,
-        health_interval: Duration,
     ) -> Arc<HealthSnapshot> {
-        tokio::time::advance(health_interval).await;
-        tokio::time::resume();
         for _ in 0..20_000 {
             tokio::task::yield_now().await;
             if let Some(h) = overlay.current_for(r)
                 && overlay.still_current_for(&h, r, routing)
             {
-                tokio::time::pause();
                 return h;
             }
         }
@@ -3377,7 +3381,7 @@ ns-servers = [{ns_servers}]
 
     // ----- Row R1: a backend flips healthy -> 500 -> Hang on one source ------
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_backend_health_flips_through_the_real_status_probe() {
         let body = async {
             let server =
@@ -3389,10 +3393,7 @@ ns-servers = [{ns_servers}]
             let overlay = comp.handle.health_overlay_handle();
 
             // The epoch-0 routing source R, observed only through the public handle.
-            let r =
-                comp.routing.wait_first().await.unwrap_or_else(|_| {
-                    unreachable!("the refresh loop publishes a first snapshot")
-                });
+            let r = first_snapshot(&comp.routing).await;
             let r_epoch = r.client_epoch;
             let r_gen = r.generation;
 
@@ -3408,8 +3409,6 @@ ns-servers = [{ns_servers}]
                 1,
                 &server,
                 None,
-                true,
-                HEALTH_INTERVAL,
             )
             .await;
             assert!(h200.get(BACKEND_ID).healthy, "the 200 verdict is healthy");
@@ -3434,8 +3433,6 @@ ns-servers = [{ns_servers}]
                 1,
                 &server,
                 Some(&h200),
-                true,
-                HEALTH_INTERVAL,
             )
             .await;
             assert!(
@@ -3463,8 +3460,6 @@ ns-servers = [{ns_servers}]
                 4,
                 &server,
                 Some(&h500),
-                false,
-                HEALTH_INTERVAL,
             )
             .await;
             assert!(
@@ -3514,7 +3509,7 @@ ns-servers = [{ns_servers}]
 
     // ----- Row R2: an epoch rotation realigns health provenance -------------
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn an_epoch_rotation_realigns_health_provenance_and_fails_the_old_source_closed() {
         let body = async {
             let server = spawn_status_server(StatusBehavior::Ok200("v-rot".to_owned())).await;
@@ -3524,10 +3519,7 @@ ns-servers = [{ns_servers}]
             let comp = build_composition(addr, "").await;
             let overlay = comp.handle.health_overlay_handle();
 
-            let r0 =
-                comp.routing.wait_first().await.unwrap_or_else(|_| {
-                    unreachable!("the refresh loop publishes a first snapshot")
-                });
+            let r0 = first_snapshot(&comp.routing).await;
             let e0 = r0.client_epoch;
             let h0 = wait_health(
                 &overlay,
@@ -3540,8 +3532,6 @@ ns-servers = [{ns_servers}]
                 1,
                 &server,
                 None,
-                true,
-                HEALTH_INTERVAL,
             )
             .await;
             assert!(h0.get(BACKEND_ID).healthy, "the E0 source is healthy");
@@ -3551,12 +3541,6 @@ ns-servers = [{ns_servers}]
             // literal IPs so the fixture stays reachable — only the client epoch
             // rotates.
             let mut status = comp.handle.status();
-            // The rotation runs under REAL time: `reconfigure` awaits inside the module
-            // (child stop/spawn, lazy connects) can leave the runtime idle, and an idle
-            // PAUSED clock would auto-advance the routing ticker, firing a post-commit
-            // poll whose budget then trips — a reset stream that poisons the new epoch's
-            // connection for the drain that follows.
-            tokio::time::resume();
             comp.store
                 .apply_toml(
                     &topology_toml(&format!("127.0.0.1:{}", addr.port()), "\"203.0.113.9:53\""),
@@ -3566,7 +3550,6 @@ ns-servers = [{ns_servers}]
                 )
                 .unwrap_or_else(|error| unreachable!("apply revision 2: {error}"));
             wait_applied(&mut status, 2).await;
-            tokio::time::pause();
 
             // The material/feed fence de-authorizes H0 synchronously at apply, while
             // the routing source R0 is still the live `current()` (routing has not
@@ -3586,7 +3569,7 @@ ns-servers = [{ns_servers}]
 
             // Drain the new routing generation R1: E0 -> E1, a fresh Arc, identical
             // backend content.
-            let r1 = drain_until(&comp.routing, &fixture, |s| s.client_epoch == e0 + 1).await;
+            let r1 = drain_until_real(&comp.routing, &fixture, |s| s.client_epoch == e0 + 1).await;
             assert_eq!(
                 r1.client_epoch,
                 e0 + 1,
@@ -3612,8 +3595,6 @@ ns-servers = [{ns_servers}]
                 1,
                 &server,
                 None,
-                true,
-                HEALTH_INTERVAL,
             )
             .await;
             assert!(
@@ -3637,7 +3618,7 @@ ns-servers = [{ns_servers}]
 
     // ----- Row R3: a disabled composition does no health I/O ----------------
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_disabled_composition_does_no_health_io_and_reads_all_healthy() {
         let body = async {
             // Ok200 that must NEVER be hit: a disabled runtime opens no socket.
@@ -3655,22 +3636,13 @@ ns-servers = [{ns_servers}]
 
             // Initial source: the disabled seam publishes an all-healthy, no-version
             // overlay with zero probe I/O.
-            let r0 =
-                comp.routing.wait_first().await.unwrap_or_else(|_| {
-                    unreachable!("the refresh loop publishes a first snapshot")
-                });
+            let r0 = first_snapshot(&comp.routing).await;
             assert_eq!(r0.backends.backends.len(), 1, "one backend is discovered");
-            let h0 = drain_disabled_health(&overlay, &comp.routing, &r0, HEALTH_INTERVAL).await;
+            let h0 = drain_disabled_health(&overlay, &comp.routing, &r0).await;
             assert_all_healthy(&h0, &r0);
 
             // A real material rotation, then the rotated source is ALSO all-healthy.
             let mut status = comp.handle.status();
-            // The rotation runs under REAL time: `reconfigure` awaits inside the module
-            // (child stop/spawn, lazy connects) can leave the runtime idle, and an idle
-            // PAUSED clock would auto-advance the routing ticker, firing a post-commit
-            // poll whose budget then trips — a reset stream that poisons the new epoch's
-            // connection for the drain that follows.
-            tokio::time::resume();
             comp.store
                 .apply_toml(
                     &topology_toml(&format!("127.0.0.1:{}", addr.port()), "\"203.0.113.9:53\""),
@@ -3680,8 +3652,7 @@ ns-servers = [{ns_servers}]
                 )
                 .unwrap_or_else(|error| unreachable!("apply revision 2: {error}"));
             wait_applied(&mut status, 2).await;
-            tokio::time::pause();
-            let r1 = drain_until(&comp.routing, &fixture, |s| {
+            let r1 = drain_until_real(&comp.routing, &fixture, |s| {
                 s.client_epoch == r0.client_epoch + 1
             })
             .await;
@@ -3694,7 +3665,7 @@ ns-servers = [{ns_servers}]
                 overlay.current_for(&r0).is_none(),
                 "the old overlay is de-authorized across the rotation"
             );
-            let h1 = drain_disabled_health(&overlay, &comp.routing, &r1, HEALTH_INTERVAL).await;
+            let h1 = drain_disabled_health(&overlay, &comp.routing, &r1).await;
             assert_all_healthy(&h1, &r1);
 
             // Zero `/status` I/O ever: a disabled runtime built no client, opened no
