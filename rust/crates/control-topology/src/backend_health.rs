@@ -44,6 +44,13 @@
 //! same time, so the SQL stage never runs with different DNS material or a
 //! different dial budget than the status stage.
 //!
+//! [`ClusterHealthNetwork::probe_backend`] composes the two stages exactly as Go
+//! `DefaultHealthCheck.Check` does (#215-3): the status stage first, returning
+//! its verdict unchanged when unhealthy; then the SQL stage, which a static
+//! backend (empty `ip`, no status port) still runs against its `addr`. An SQL
+//! failure is unhealthy but RETAINS the `server_version` the status stage
+//! already read, as Go's `BackendHealth.ServerVersion` survives `checkSqlPort`.
+//!
 //! The [`GenerationGate`] alone is not identity: at each attempt admission, after
 //! each backoff, and before accepting a healthy result, each stage re-validates
 //! [`RoutingSnapshotHandle::still_current`] against the exact source `Arc`, so a
@@ -269,7 +276,45 @@ impl ClusterHealthNetwork {
         )
     }
 
-    /// Probes one backend's `/status` port and returns its health verdict.
+    /// Probes one backend and returns its combined health verdict, mirroring Go
+    /// `DefaultHealthCheck.Check`: the `/status` stage
+    /// ([`Self::probe_status_port`]) first — an unhealthy status verdict is
+    /// returned as is and the SQL port is never dialed — then the SQL greeting
+    /// stage ([`Self::probe_sql_port`]) against the backend's `addr`, which a
+    /// static backend (empty `ip`) still runs. An SQL failure is unhealthy but
+    /// retains the status stage's `server_version`, as Go retains
+    /// `ServerVersion` across `checkSqlPort`.
+    ///
+    /// Each stage re-validates the exact source authority itself; the fences
+    /// and retry budgets are those of the two stages, threaded through unchanged.
+    pub async fn probe_backend(
+        &self,
+        handle: &RoutingSnapshotHandle,
+        source: &Arc<RoutingSnapshot>,
+        backend: &MergedBackend,
+        max_retries: u32,
+        retry_interval: Duration,
+    ) -> BackendHealth {
+        let status = self
+            .probe_status_port(handle, source, backend, max_retries, retry_interval)
+            .await;
+        if !status.healthy {
+            return status;
+        }
+        if self
+            .probe_sql_port(handle, source, backend, max_retries, retry_interval)
+            .await
+        {
+            status
+        } else {
+            BackendHealth {
+                healthy: false,
+                server_version: status.server_version,
+            }
+        }
+    }
+
+    /// Probes one backend's `/status` port and returns that stage's verdict.
     ///
     /// The exact `Arc<RoutingSnapshot>` source authority is verified FIRST — before
     /// any return, including a static backend or an out-of-range port — via
@@ -291,7 +336,7 @@ impl ClusterHealthNetwork {
     /// [`HealthPolicy`](crate::health_loop) (Go defaults: 3 retries, 1s apart);
     /// the retry classification, the JSON decode, and the exact-source fence are
     /// unchanged by the parameterization.
-    pub async fn probe_backend(
+    async fn probe_status_port(
         &self,
         handle: &RoutingSnapshotHandle,
         source: &Arc<RoutingSnapshot>,
@@ -313,7 +358,8 @@ impl ClusterHealthNetwork {
             return BackendHealth::unhealthy();
         }
         let ip = backend.backend.ip.as_str();
-        // A static backend has no status port; it is healthy this stage.
+        // A static backend has no status port; it is healthy THIS stage (the SQL
+        // stage still dials its `addr`).
         if ip.is_empty() {
             return BackendHealth {
                 healthy: true,
@@ -633,7 +679,9 @@ mod tests {
         out
     }
 
-    /// Probes a `CLUSTER` backend at `ip:status_port` under the given source.
+    /// Probes a `CLUSTER` backend at `ip:status_port` under the given source; the
+    /// backend's SQL `addr` is `ip:status_port` too, so a row expecting a
+    /// status-stage failure never reaches the SQL stage.
     async fn probe(
         network: &ClusterHealthNetwork,
         handle: &RoutingSnapshotHandle,
@@ -656,19 +704,64 @@ mod tests {
     // Static backend and port guard (test 9).
     // ====================================================================
 
+    /// Probes a `CLUSTER` backend at `ip:status_port` whose SQL `addr` is
+    /// `sql_addr` (a loopback greeter), so the combined verdict runs both stages.
+    async fn probe_with_sql(
+        network: &ClusterHealthNetwork,
+        handle: &RoutingSnapshotHandle,
+        source: &Arc<RoutingSnapshot>,
+        ip: &str,
+        status_port: u64,
+        sql_addr: &str,
+    ) -> BackendHealth {
+        let mut backend = merged_backend(CLUSTER, ip, status_port);
+        backend.backend.addr = sql_addr.to_owned();
+        network
+            .probe_backend(handle, source, &backend, MAX_RETRIES, RETRY_INTERVAL)
+            .await
+    }
+
     #[tokio::test]
-    async fn a_static_backend_is_healthy_without_io() {
+    async fn a_static_backend_skips_the_status_stage_but_dials_its_sql_address() {
         let (_registry, lease) = owner_lease();
         let network = network(&lease);
         let (_publisher, handle, source) = published_source();
-        let health = probe(&network, &handle, &source, "", 0).await;
+        let (sql_port, accepted, _first) = bind_greeter(Greeting::V10).await;
+        let health = probe_with_sql(
+            &network,
+            &handle,
+            &source,
+            "",
+            0,
+            &format!("127.0.0.1:{sql_port}"),
+        )
+        .await;
         assert_eq!(
             health,
             BackendHealth {
                 healthy: true,
                 server_version: None
             },
-            "a static backend (empty ip) is healthy with no network I/O"
+            "a static backend (empty ip) skips the status stage (no version) and is \
+             healthy through its SQL greeting"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the SQL stage dialed the static backend's addr exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_static_backend_with_an_empty_address_is_unhealthy_without_io() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let health = probe_with_sql(&network, &handle, &source, "", 0, "").await;
+        assert_eq!(
+            health,
+            BackendHealth::unhealthy(),
+            "Go: \"backend address is empty\" fails the SQL stage"
         );
     }
 
@@ -697,13 +790,27 @@ mod tests {
             br#"{"connections":5,"version":"v8.1.0","git_hash":"abc"}"#.to_vec(),
         ))
         .await;
-        let health = probe(&network, &handle, &source, "127.0.0.1", u64::from(port)).await;
+        let (sql_port, sql_accepted, _first) = bind_greeter(Greeting::V10).await;
+        let health = probe_with_sql(
+            &network,
+            &handle,
+            &source,
+            "127.0.0.1",
+            u64::from(port),
+            &format!("127.0.0.1:{sql_port}"),
+        )
+        .await;
         assert_eq!(
             health,
             BackendHealth {
                 healthy: true,
                 server_version: Some("v8.1.0".to_owned())
             }
+        );
+        assert_eq!(
+            sql_accepted.load(Ordering::SeqCst),
+            1,
+            "the SQL stage ran once after the status stage passed"
         );
     }
 
@@ -815,7 +922,16 @@ mod tests {
             body: br#"{"version":"v9"}"#.to_vec(),
         })
         .await;
-        let health = probe(&network, &handle, &source, "127.0.0.1", u64::from(port)).await;
+        let (sql_port, _sql_accepted, _first) = bind_greeter(Greeting::V10).await;
+        let health = probe_with_sql(
+            &network,
+            &handle,
+            &source,
+            "127.0.0.1",
+            u64::from(port),
+            &format!("127.0.0.1:{sql_port}"),
+        )
+        .await;
         assert_eq!(
             health,
             BackendHealth {
@@ -1451,5 +1567,105 @@ mod tests {
             )),
             ClusterHttpConfigError::Resolver(ResolveError::InvalidBudget)
         ));
+    }
+
+    // ====================================================================
+    // Combined verdict (CP-TOPO #215-3): Go `Check` = status stage, then SQL.
+    // ====================================================================
+
+    #[tokio::test]
+    async fn a_200_status_with_an_err_greeting_is_unhealthy_but_keeps_the_version() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let (port, status_accepted) =
+            bind_counting_server(Behavior::Ok200(br#"{"version":"v8.1.0"}"#.to_vec())).await;
+        let (sql_port, sql_accepted, _first) = bind_greeter(Greeting::Err).await;
+        let mut backend = merged_backend(CLUSTER, "127.0.0.1", u64::from(port));
+        backend.backend.addr = format!("127.0.0.1:{sql_port}");
+        let health = network
+            .probe_backend(&handle, &source, &backend, MAX_RETRIES, SQL_RETRY_INTERVAL)
+            .await;
+        assert_eq!(
+            health,
+            BackendHealth {
+                healthy: false,
+                server_version: Some("v8.1.0".to_owned())
+            },
+            "an ERR greeting fails the backend but the status stage's version is retained (Go)"
+        );
+        assert_eq!(
+            status_accepted.load(Ordering::SeqCst),
+            1,
+            "one status round"
+        );
+        assert_eq!(
+            sql_accepted.load(Ordering::SeqCst),
+            usize::try_from(MAX_RETRIES).unwrap_or(usize::MAX) + 1,
+            "the SQL stage spent its own 1 + 3 attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_status_stage_never_dials_the_sql_port() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let (port, _status_accepted) = bind_counting_server(Behavior::Status(503)).await;
+        let (sql_port, sql_accepted, _first) = bind_greeter(Greeting::V10).await;
+        let health = probe_with_sql(
+            &network,
+            &handle,
+            &source,
+            "127.0.0.1",
+            u64::from(port),
+            &format!("127.0.0.1:{sql_port}"),
+        )
+        .await;
+        assert_eq!(health, BackendHealth::unhealthy());
+        assert_eq!(
+            sql_accepted.load(Ordering::SeqCst),
+            0,
+            "Go returns after an unhealthy status stage: the SQL port is never dialed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_200_status_with_a_refused_sql_port_is_unhealthy_without_backoff() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let (port, _status_accepted) =
+            bind_counting_server(Behavior::Ok200(br#"{"version":"v8.1.0"}"#.to_vec())).await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("bind: {error}"));
+        let sql_port = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("addr: {error}"))
+            .port();
+        drop(listener);
+        let started = Instant::now();
+        let health = probe_with_sql(
+            &network,
+            &handle,
+            &source,
+            "127.0.0.1",
+            u64::from(port),
+            &format!("127.0.0.1:{sql_port}"),
+        )
+        .await;
+        assert_eq!(
+            health,
+            BackendHealth {
+                healthy: false,
+                server_version: Some("v8.1.0".to_owned())
+            },
+            "a refused SQL port fails the backend, version retained"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "refused is terminal in the SQL stage too: no 1s backoff"
+        );
     }
 }
