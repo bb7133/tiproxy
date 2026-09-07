@@ -3257,20 +3257,31 @@ ns-servers = [{ns_servers}]
 
     // ----- The anti-false-pass structured health wait -----------------------
 
-    /// A structured, paused-clock wait for a FRESH post-switch health verdict.
+    /// A structured wait for the health overlay to carry `expected_healthy` /
+    /// `expected_version` for `backend_id` under the EXACT routing source `r`,
+    /// deterministically, without `sleep`/`yield` and without a spin budget.
     ///
-    /// It advances the paused clock by `health_interval` to drive the next round's
-    /// cadence, then — event-driven on the loopback server's real `/status`
-    /// request signal, mirroring [`drain_until`] — succeeds ONLY when ALL hold:
-    /// (1) the server's exact `/status` `request_count` has advanced to at least
-    /// `baseline + min_request_delta` (a real post-switch probe — and, for the
-    /// Hang phase, the FULL `>= 4` retry budget — happened); (2) `current_for(&r)`
-    /// is `Some(h)`; (3) `still_current_for(&h, &r, routing)`; (4) `prev_h` is
-    /// `None` OR `!Arc::ptr_eq(&h, prev_h)` (a genuinely NEW overlay, never the
-    /// stale prior verdict); (5) `h.get(backend_id)` matches
-    /// `(expected_healthy, expected_version)`. Otherwise it keeps driving. The
-    /// iteration cap is a pure deadlock guard (the outer 120s watchdog is the real
-    /// bound). No sleep; the only yield is this bounded structured wait.
+    /// The paused clock is used for exactly one thing: `advance(health_interval)`
+    /// wakes the parked health loop into its next round. When a real `/status`
+    /// RESPONSE must arrive (`real_time`: the 200 / 500 phases), the clock is then
+    /// `resume`d for the rest of the wait — with the clock resumed the runtime never
+    /// auto-advances, so the production probe's attempt timeout cannot beat the
+    /// loopback response (the same race the routing drain had) — and paused again
+    /// on exit. When the attempt timeout firing IS the expected event (not
+    /// `real_time`: the Hang phase), the wait stays on the paused clock, whose
+    /// auto-advance drives the initial attempt and each retry deterministically.
+    ///
+    /// Observation is structured on the server's exact `GET /status` events: the
+    /// handler's notify fires when the request is parsed — before the response and
+    /// the loop's publication — so the verdict is re-checked after each event and
+    /// the wait returns only when ALL hold: (1) the request count advanced past
+    /// `baseline + min_request_delta` (a real post-switch probe; `>= 4` for Hang
+    /// covers the full retry budget); (2) `current_for(&r)` is `Some(h)`; (3)
+    /// `still_current_for(&h, &r, routing)`; (4) `h` is not `prev_h` (a genuinely
+    /// NEW overlay, never a stale prior verdict); (5) the verdict matches. The
+    /// waiter is registered before each check, so an event landing between the
+    /// check and the await cannot be lost. A genuine hang is bounded only by the
+    /// real wall-clock watchdog.
     #[allow(clippy::too_many_arguments)]
     async fn wait_health(
         overlay: &HealthOverlayHandle,
@@ -3283,14 +3294,17 @@ ns-servers = [{ns_servers}]
         min_request_delta: usize,
         server: &StatusServer,
         prev_h: Option<&Arc<HealthSnapshot>>,
+        real_time: bool,
         health_interval: Duration,
     ) -> Arc<HealthSnapshot> {
-        // Kick the parked health loop into its next cadence exactly once;
-        // subsequent rounds arrive via the paused runtime's idle auto-advance.
         tokio::time::advance(health_interval).await;
-        for _ in 0..20_000 {
-            // Wake on a real, exact `GET /status` request parsed by the server.
-            server.notify.notified().await;
+        if real_time {
+            tokio::time::resume();
+        }
+        let h = loop {
+            let notified = server.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if server.request_count() >= baseline + min_request_delta
                 && let Some(h) = overlay.current_for(r)
                 && prev_h.is_none_or(|prev| !Arc::ptr_eq(&h, prev))
@@ -3300,11 +3314,15 @@ ns-servers = [{ns_servers}]
                 if verdict.healthy == expected_healthy
                     && verdict.server_version.as_deref() == expected_version
                 {
-                    return h;
+                    break h;
                 }
             }
+            notified.await;
+        };
+        if real_time {
+            tokio::time::pause();
         }
-        unreachable!("the health overlay did not reach the target verdict within the budget");
+        h
     }
 
     /// A structured wait for a DISABLED runtime's published overlay.
@@ -3313,6 +3331,13 @@ ns-servers = [{ns_servers}]
     /// signal to key on; this advances one further cadence and then bounded-yields
     /// the (change-future-less) public overlay handle until a live all-healthy
     /// overlay is published for `r`. The cap is a pure deadlock guard.
+    ///
+    /// The cadence advance also fires the routing refresh ticker (the two intervals
+    /// coincide), starting a real loopback poll. That poll runs under REAL time
+    /// (`resume` across the wait, `pause` on exit) for the same reason as
+    /// [`drain_until`]: a paused clock would let the runtime auto-advance past the
+    /// production per-cluster timeout while the poll's I/O is in flight and leave a
+    /// failed, half-finished refresh round behind for the next drain.
     async fn drain_disabled_health(
         overlay: &HealthOverlayHandle,
         routing: &RoutingSnapshotHandle,
@@ -3320,11 +3345,13 @@ ns-servers = [{ns_servers}]
         health_interval: Duration,
     ) -> Arc<HealthSnapshot> {
         tokio::time::advance(health_interval).await;
+        tokio::time::resume();
         for _ in 0..20_000 {
             tokio::task::yield_now().await;
             if let Some(h) = overlay.current_for(r)
                 && overlay.still_current_for(&h, r, routing)
             {
+                tokio::time::pause();
                 return h;
             }
         }
@@ -3381,6 +3408,7 @@ ns-servers = [{ns_servers}]
                 1,
                 &server,
                 None,
+                true,
                 HEALTH_INTERVAL,
             )
             .await;
@@ -3406,6 +3434,7 @@ ns-servers = [{ns_servers}]
                 1,
                 &server,
                 Some(&h200),
+                true,
                 HEALTH_INTERVAL,
             )
             .await;
@@ -3434,6 +3463,7 @@ ns-servers = [{ns_servers}]
                 4,
                 &server,
                 Some(&h500),
+                false,
                 HEALTH_INTERVAL,
             )
             .await;
@@ -3457,12 +3487,7 @@ ns-servers = [{ns_servers}]
             comp.task.abort();
             drop(comp.runtime);
         };
-        if tokio::time::timeout(Duration::from_secs(120), body)
-            .await
-            .is_err()
-        {
-            unreachable!("row R1 completes within the deadlock watchdog");
-        }
+        with_real_wall_clock_watchdog(body).await;
     }
 
     /// Asserts the routing source is still the exact live `Arc` at its published
@@ -3515,6 +3540,7 @@ ns-servers = [{ns_servers}]
                 1,
                 &server,
                 None,
+                true,
                 HEALTH_INTERVAL,
             )
             .await;
@@ -3525,6 +3551,12 @@ ns-servers = [{ns_servers}]
             // literal IPs so the fixture stays reachable — only the client epoch
             // rotates.
             let mut status = comp.handle.status();
+            // The rotation runs under REAL time: `reconfigure` awaits inside the module
+            // (child stop/spawn, lazy connects) can leave the runtime idle, and an idle
+            // PAUSED clock would auto-advance the routing ticker, firing a post-commit
+            // poll whose budget then trips — a reset stream that poisons the new epoch's
+            // connection for the drain that follows.
+            tokio::time::resume();
             comp.store
                 .apply_toml(
                     &topology_toml(&format!("127.0.0.1:{}", addr.port()), "\"203.0.113.9:53\""),
@@ -3534,6 +3566,7 @@ ns-servers = [{ns_servers}]
                 )
                 .unwrap_or_else(|error| unreachable!("apply revision 2: {error}"));
             wait_applied(&mut status, 2).await;
+            tokio::time::pause();
 
             // The material/feed fence de-authorizes H0 synchronously at apply, while
             // the routing source R0 is still the live `current()` (routing has not
@@ -3579,6 +3612,7 @@ ns-servers = [{ns_servers}]
                 1,
                 &server,
                 None,
+                true,
                 HEALTH_INTERVAL,
             )
             .await;
@@ -3598,12 +3632,7 @@ ns-servers = [{ns_servers}]
             comp.task.abort();
             drop(comp.runtime);
         };
-        if tokio::time::timeout(Duration::from_secs(120), body)
-            .await
-            .is_err()
-        {
-            unreachable!("row R2 completes within the deadlock watchdog");
-        }
+        with_real_wall_clock_watchdog(body).await;
     }
 
     // ----- Row R3: a disabled composition does no health I/O ----------------
@@ -3636,6 +3665,12 @@ ns-servers = [{ns_servers}]
 
             // A real material rotation, then the rotated source is ALSO all-healthy.
             let mut status = comp.handle.status();
+            // The rotation runs under REAL time: `reconfigure` awaits inside the module
+            // (child stop/spawn, lazy connects) can leave the runtime idle, and an idle
+            // PAUSED clock would auto-advance the routing ticker, firing a post-commit
+            // poll whose budget then trips — a reset stream that poisons the new epoch's
+            // connection for the drain that follows.
+            tokio::time::resume();
             comp.store
                 .apply_toml(
                     &topology_toml(&format!("127.0.0.1:{}", addr.port()), "\"203.0.113.9:53\""),
@@ -3645,6 +3680,7 @@ ns-servers = [{ns_servers}]
                 )
                 .unwrap_or_else(|error| unreachable!("apply revision 2: {error}"));
             wait_applied(&mut status, 2).await;
+            tokio::time::pause();
             let r1 = drain_until(&comp.routing, &fixture, |s| {
                 s.client_epoch == r0.client_epoch + 1
             })
@@ -3679,11 +3715,6 @@ ns-servers = [{ns_servers}]
             comp.task.abort();
             drop(comp.runtime);
         };
-        if tokio::time::timeout(Duration::from_secs(120), body)
-            .await
-            .is_err()
-        {
-            unreachable!("row R3 completes within the deadlock watchdog");
-        }
+        with_real_wall_clock_watchdog(body).await;
     }
 }
