@@ -446,19 +446,42 @@ fn sql_build_error(error: SqlGreetingConfigError) -> ClusterHttpConfigError {
     }
 }
 
-/// Splits a backend SQL address into `(host, port)`: `host:port`, or
-/// `[v6]:port` with the brackets stripped. An empty host, a missing or
-/// unparsable port, or an empty address yields `None`.
+/// Splits a backend SQL address into `(host, port)`, Go-equivalent for every
+/// legitimate production address (a discovered backend advertises a canonical
+/// `host:port` with a numeric port). Go hands `BackendInfo.Addr` to
+/// `net.Dialer` verbatim, so the accept/reject line follows
+/// `net.SplitHostPort`: a bracketed host (`[::1]:4000`; Go equally accepts
+/// `[127.0.0.1]:4000`) must close its bracket immediately before the FINAL
+/// colon and contain no further bracket; an unbracketed host may contain no
+/// colon at all, so a bare IPv6 `::1:4000` is rejected ("too many colons"), as
+/// are a stray or unbalanced bracket and a missing port.
+///
+/// This is NOT a complete `net.Dial` address parser. Two inputs outside the
+/// topology input domain are deliberately rejected fail-closed where Go would
+/// proceed: an empty host (`:4000`, which Go dials as the local system) and a
+/// non-numeric service-name port (which Go resolves). Neither can name a real
+/// `TiDB` backend.
 fn split_host_port(addr: &str) -> Option<(&str, u16)> {
-    let (host, port) = addr.rsplit_once(':')?;
-    let port = port.parse::<u16>().ok()?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(host);
+    let colon = addr.rfind(':')?;
+    let host = if let Some(bracketed) = addr.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        let host = &bracketed[..end];
+        // `[` + host + `]` occupies `end + 2` bytes; the final colon must follow.
+        if end + 2 != colon || host.contains('[') || host.contains(']') {
+            return None;
+        }
+        host
+    } else {
+        let host = &addr[..colon];
+        if host.contains(':') || host.contains('[') || host.contains(']') {
+            return None;
+        }
+        host
+    };
     if host.is_empty() {
         return None;
     }
+    let port = addr[colon + 1..].parse::<u16>().ok()?;
     Some((host, port))
 }
 
@@ -1287,6 +1310,7 @@ mod tests {
             "",
             "127.0.0.1",
             "[::1]",
+            "::1:4000",
             ":4000",
             "127.0.0.1:",
             "127.0.0.1:70000",
@@ -1381,10 +1405,14 @@ mod tests {
     }
 
     #[test]
-    fn sql_addresses_split_into_host_and_port() {
+    fn sql_addresses_split_with_go_host_port_semantics() {
         assert_eq!(split_host_port("10.0.0.1:4000"), Some(("10.0.0.1", 4000)));
         assert_eq!(split_host_port("[::1]:4000"), Some(("::1", 4000)));
-        assert_eq!(split_host_port("::1:4000"), Some(("::1", 4000)));
+        assert_eq!(
+            split_host_port("[127.0.0.1]:4000"),
+            Some(("127.0.0.1", 4000)),
+            "Go accepts a bracketed IPv4 literal"
+        );
         assert_eq!(
             split_host_port("tidb-0.tidb-peer:4000"),
             Some(("tidb-0.tidb-peer", 4000))
@@ -1393,10 +1421,18 @@ mod tests {
             "",
             "host",
             "host:",
-            ":4000",
+            ":4000", // empty host: fail-closed (Go would dial the local system)
             "host:99999",
             "host:x",
+            "host:mysql", // service-name port: fail-closed (Go would resolve it)
             "[]:4000",
+            "::1:4000", // bare IPv6: Go "too many colons in address"
+            "::1]:4000",
+            "[::1:4000",
+            "[[::1]]:4000",
+            "[::1]x:4000",
+            "[::1]",
+            "[::1]:",
         ] {
             assert_eq!(split_host_port(bad), None, "{bad:?}");
         }
