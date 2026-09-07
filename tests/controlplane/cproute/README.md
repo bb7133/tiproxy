@@ -59,12 +59,83 @@ compile/run successfully and disagree with the real Go observations; compiler
 errors and crashes fail the gate. The unmodified copy and restored copy must
 both agree. No repository source is mutated by the gate.
 
-These primitives own no backend selection or reservation. Stateful group
-retention/refresh, exact config/routing/health source capture, assignment
-accounting, factor policy, and production cutover remain later #220/#147 work.
-The existing production route/bridge ownership is unchanged; `control-routing`
-continues to have no dependencies and the lockfile is unchanged.
+These primitives own no backend selection or reservation. The next section
+covers their stateful composition. `control-routing` remains dependency-free;
+production route/bridge ownership is unchanged.
 
 The earlier config observer's `allowed_common_names` sorting/trimming is the
 already accepted CP-CFG normalization shared by both observers; it is not a
 claim that the production Go config layer performs that normalization itself.
+
+
+## Staged selector and accounting (head 220-2)
+
+`control-router` owns one namespace router incarnation. It captures independent
+current config C, routing source R, and the exact live health overlay H for R.
+It revalidates the private source-bundle identity, exact C and H/R gates after
+acquiring the ledger mutex and immediately before reserve. Retained snapshots
+never grant authority. Pending/rejected topology configuration can use old valid
+R/H with current C; material commit revokes H synchronously until new R/H arrives.
+
+Namespace identities are private store-minted `Arc` handles, carried unchanged
+across global policy and material updates. Namespace replacement, removal and
+identical re-creation mint different identities even if no consumer observed
+the intermediate snapshot. They do not enter checksums, content equality,
+public routing projections, or existing byte-exact observations.
+
+Accounting owners survive source/epoch replacement, unhealthy observations and
+removal while reservations or live connections remain. Each session and attempt
+has an opaque router-bound identity and a checked never-reused sequence. A
+terminal settles the captured accounting owner without consulting current C/R/H.
+Duplicates, foreign handles, closed sessions and superseded attempts have no
+counter effects. Closed sessions are removed instead of growing tombstone sets.
+
+Supported selection is connection balance with prefer-idle/random, group
+matching and one-attempt opaque-ID exclusions. Go's clamped connection factor,
+raw-count migration advice, candidate set and clock-ticket weights are retained.
+Production tickets use Unix microseconds with the original modulo rules; a
+private seam exists solely for deterministic evidence. Exact tie order is not
+promised across languages; tests compare eligible sets and weights.
+
+The new API is **not wired to dataplane or tiproxy-rs**; the evidence gate rejects
+those manifest dependencies. Resource (including the global default), location,
+business-label isolation, fail lists, nonempty proxy-zone metadata and static-only
+fallback return typed Unsupported before reservation. Global config acceptance
+is unchanged. Static backends must later obtain authoritative health; namespace
+addresses are not converted into healthy observations. Zone metadata must later
+come from the Go-equivalent health observation, not be recomputed from current C.
+Retry/exclusion orchestration, resource factors, redirects and production cutover
+remain later work. This head does not close #220 or #147.
+
+Evidence layers:
+
+- `ledger/events.tsv`: 17 event rows run through the real Go RouterAdapter and
+  ScoreBasedRouter, compared with Rust's production ledger. Includes pending
+  retransmission, failure plus retry, duplicate/late results, new sessions and
+  both pending/active close. Go bridge IDs cannot be reopened after close; rows
+  mint new connections and late results retain their old assignment IDs.
+- `choice/weights.tsv`: actual Go FactorBasedBalance and FactorConnCount versus
+  the Rust selector's private choice function. A Go overlay changes only its
+  two clock reads in a temporary source copy. Fourteen rows enumerate complete
+  ticket periods, covering random 11:10 weights, prefer-idle eligibility, custom
+  thresholds/rates, zero counts and 16-bit clamp ties. No alternative Go score
+  or choice implementation serves as the oracle.
+- Real ConfigNamespaceStore / TopologyModule / health publisher with a local
+  minimal etcd Range service: watch-delivery and Range-response barriers pin
+  pending, rejected and committed states; actual mutex barriers cover C, R and
+  H replacement while reserve waits. Tests cover namespace ABA, lifecycle,
+  CIDR rejection/refresh, retained owners, prune/reappearance, port conflicts,
+  opaque exclusions and close/success races. Health is produced by the real
+  module's explicitly disabled-probe policy, never fabricated from a namespace.
+- `python3 tests/controlplane/cproute/mutations.py` copies the Rust workspace to
+  an isolated directory and changes production authority/ledger/selector code.
+  Eight regressions must compile and complete with failed runtime tests: skipping
+  C/H checks, resetting accounting on refresh, settling the latest owner,
+  duplicate settlement, retaining closed authority, silent resource fallback,
+  and namespace-content identity. Compilation errors or process crashes do not
+  count as a kill. Baseline and restored sources must pass.
+
+Run the main evidence gate and the mutation runner above, plus `make lint`,
+`make rust-lint`, `make rust-test`, `make rust-build`, and Go router/bridge/factor
+package tests. The mutation runner uses a separate target directory and never
+changes repository source.

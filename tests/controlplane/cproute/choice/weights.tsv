@@ -1,0 +1,15 @@
+# row	policy	sorted-raw-scores	ratio	migrations-per-second	ticket-period
+random-one	random	0	1.2	0	11
+random-three	random	0,10,100	1.2	0	31
+random-four	random	5,6,7,8	1.2	0	41
+random-clamp-ties	random	65535,65536,99999	1.2	0	31
+prefer-unique	prefer-idle	10,20,100	1.2	0	1
+prefer-near	prefer-idle	10,11,13	1.2	0	3
+prefer-mixed	prefer-idle	10,11,20	1.2	0	2
+prefer-default-ratio	prefer-idle	10,11,20	0	0	2
+prefer-custom-ratio	prefer-idle	10,20,30	2	0	2
+prefer-tiny-rate	prefer-idle	10,20,100	1.2	0.0001	3
+prefer-positive-rate	prefer-idle	10,20,100	1.2	0.00011	1
+prefer-clamp-ties	prefer-idle	65535,65536,99999	1.2	0	3
+prefer-clamp-edge	prefer-idle	65534,65535,99999	1.2	0	2
+prefer-zero	prefer-idle	0,1,2	1.2	0	2

@@ -1,0 +1,18 @@
+# row	operation
+reserve	reserve
+repeat-reserve	repeat
+commit	commit
+repeat-commit	commit
+failed-after-commit	fail
+close-active	close
+repeat-close	close
+success-after-close	commit
+new-session	reserve
+old-session-success	old_commit
+failed-attempt-retries	fail_retry
+failed-old-attempt	old_fail
+commit-retry	commit
+close-retry	close
+reserve-before-close	reserve
+close-pending	close
+success-after-pending-close	commit

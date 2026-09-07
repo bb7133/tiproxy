@@ -999,3 +999,80 @@ fn proxy_max_connections(snapshot: &control_config::ConfigNamespaceSnapshot) -> 
         .as_u64()
         .unwrap_or_else(|| unreachable!("max-connections is an unsigned integer"))
 }
+
+#[test]
+fn namespace_incarnation_tracks_continuity_without_changing_content_identity()
+-> Result<(), StoreError> {
+    let store = ConfigNamespaceStore::new(
+        EffectiveConfig::default(),
+        vec![NamespaceConfig {
+            namespace: "default".into(),
+            ..NamespaceConfig::default()
+        }],
+        SourceRevision::default(),
+        Path::new("/tmp"),
+    )?;
+    let first = store.current();
+    store.apply_toml(
+        b"[balance]\nrouting-policy = \"random\"",
+        None,
+        1,
+        Path::new("/tmp"),
+    )?;
+    let policy = store.current();
+    assert!(first.same_namespace_incarnation(&policy, "default"));
+    let refreshed = store.refresh_external_material()?;
+    assert!(policy.same_namespace_incarnation(&refreshed, "default"));
+    assert_eq!(policy.namespace_checksum(), refreshed.namespace_checksum());
+    assert!(
+        store
+            .apply(
+                (**refreshed.effective()).clone(),
+                refreshed.namespaces().to_vec(),
+                SourceRevision::default(),
+                Path::new("/tmp")
+            )?
+            .is_none()
+    );
+    let mut replaced = first.namespaces().to_vec();
+    replaced[0].frontend.user = "replacement".into();
+    store.apply(
+        (**refreshed.effective()).clone(),
+        replaced,
+        SourceRevision::default(),
+        Path::new("/tmp"),
+    )?;
+    let changed = store.current();
+    assert!(!first.same_namespace_incarnation(&changed, "default"));
+    store.apply(
+        (**refreshed.effective()).clone(),
+        first.namespaces().to_vec(),
+        SourceRevision::default(),
+        Path::new("/tmp"),
+    )?;
+    let restored = store.current();
+    assert!(!first.same_namespace_incarnation(&restored, "default"));
+    assert!(!changed.same_namespace_incarnation(&restored, "default"));
+    store.apply(
+        (**refreshed.effective()).clone(),
+        Vec::new(),
+        SourceRevision::default(),
+        Path::new("/tmp"),
+    )?;
+    store.apply(
+        (**refreshed.effective()).clone(),
+        first.namespaces().to_vec(),
+        SourceRevision::default(),
+        Path::new("/tmp"),
+    )?;
+    assert!(!restored.same_namespace_incarnation(&store.current(), "default"));
+    let foreign = ConfigNamespaceStore::new(
+        (**first.effective()).clone(),
+        first.namespaces().to_vec(),
+        first.source_revision(),
+        Path::new("/tmp"),
+    )?;
+    assert_eq!(first, foreign.current());
+    assert!(!first.same_namespace_incarnation(&foreign.current(), "default"));
+    Ok(())
+}

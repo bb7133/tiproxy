@@ -147,6 +147,21 @@ impl GroupMatcher {
         })
     }
 
+    /// Refreshes an existing group's raw CIDR union.
+    ///
+    /// Go replaces raw values first, then parses them. On an invalid update it
+    /// retains the previous parsed networks while exposing the new raw values.
+    /// This differs from constructing a new invalid group, which is rejected.
+    ///
+    /// # Errors
+    /// Returns [`InvalidCidr`] while preserving the prior matching networks.
+    pub fn refresh_values(&mut self, values: Vec<String>) -> Result<(), InvalidCidr> {
+        self.values = values;
+        let parsed = Self::new(self.rule, self.values.clone())?;
+        self.networks = parsed.networks;
+        Ok(())
+    }
+
     /// Original, unnormalized group values.
     #[must_use]
     pub fn values(&self) -> &[String] {
