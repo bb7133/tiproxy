@@ -187,7 +187,11 @@ fn decode_status_version(body: &[u8]) -> Option<String> {
 /// stale-epoch or sibling-cluster network's DNS/TLS material against a live
 /// routing source.
 pub struct ClusterHealthNetwork {
-    client: ClusterHttpClient,
+    /// The owner-fenced `/status` client, or `None` for the empty-cluster
+    /// default network of STATIC backends (which carry no `ip`, so the status
+    /// stage is skipped exactly as in Go; a non-static backend can never
+    /// resolve to this network, and would read unhealthy if it did).
+    client: Option<ClusterHttpClient>,
     /// The SQL-greeting probe over the same cluster material and dial budget.
     sql: SqlGreetingProbe,
     /// The discovery client epoch this network's material was prepared under.
@@ -206,7 +210,7 @@ pub struct ClusterHealthNetwork {
 /// epoch is then bound infallibly with [`Self::bind`]. It is deliberately not
 /// `Clone`: one prepared network is bound exactly once.
 pub struct PreparedClusterHealthNetwork {
-    client: ClusterHttpClient,
+    client: Option<ClusterHttpClient>,
     sql: SqlGreetingProbe,
     cluster_name: Arc<str>,
 }
@@ -234,9 +238,30 @@ impl PreparedClusterHealthNetwork {
         let sql = SqlGreetingProbe::from_cluster_material(config, owner, policy.attempt_timeout)
             .map_err(sql_build_error)?;
         Ok(Self {
-            client,
+            client: Some(client),
             sql,
             cluster_name,
+        })
+    }
+
+    /// Builds Go's empty-cluster default network (CP-ROUTE 220-3 B2): the SQL
+    /// greeting probe over the system resolver and plain TCP, no cluster or
+    /// namespace TLS, under the empty cluster name that static backends carry.
+    /// It has no `/status` client because a static backend has no `ip`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL probe's build failure (an invalid attempt timeout).
+    pub fn system_default(
+        owner: OwnerToken,
+        policy: HttpProbePolicy,
+    ) -> Result<Self, ClusterHttpConfigError> {
+        let sql = SqlGreetingProbe::system_default(owner, policy.attempt_timeout)
+            .map_err(sql_build_error)?;
+        Ok(Self {
+            client: None,
+            sql,
+            cluster_name: Arc::from(""),
         })
     }
 
@@ -386,7 +411,10 @@ impl ClusterHealthNetwork {
             if !handle.still_current(source) {
                 return BackendHealth::unhealthy();
             }
-            match self.client.get_once(ip, port, source.source_gate()).await {
+            let Some(client) = self.client.as_ref() else {
+                return BackendHealth::unhealthy();
+            };
+            match client.get_once(ip, port, source.source_gate()).await {
                 Ok(body) => {
                     // The HTTP round succeeded; a decode failure is terminal.
                     let Some(version) = decode_status_version(body.as_ref()) else {

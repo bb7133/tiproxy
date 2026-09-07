@@ -215,3 +215,62 @@ reservation. These rows do not insert a fabricated health map.
 Three additional compiling selector mutations must fail those runtime rows:
 constant true, constant false, and recomputing locality from current config.
 The existing current-H authority mutation remains mandatory.
+
+## Namespace static backend source (head 220-3 B2)
+
+Go's `FallbackFetcher` serves a namespace from its static instance list IFF the
+APPLIED backend cluster map is empty (`backendcluster.Manager.HasBackendClusters`);
+the same observer probes those addresses through the empty-cluster default
+network (system resolver, plain TCP, SQL greeting only — no `/status` stage
+because a static backend has no IP, and no namespace TLS), and a replaced
+namespace is a new observer. In Rust the mode is the topology module's applied
+`RegistrationPlan` — never the pending config nor an empty/failed discovery —
+published as a `ModeEpoch` whose gate is revoked BEFORE a new plan, discovery
+commit or epoch is published. One `StaticBackendProducer` per namespace
+incarnation composes the existing routing publisher (raw-address ids, empty
+cluster name, diagnostic epoch 0), health feed/overlay and health loop; it is
+parked (no probing, unroutable) in Dynamic mode, runs a fresh round on
+re-activation, and is revoked synchronously on replacement/removal/teardown.
+Consumers hold an opaque `BackendSourceHandle` and capture a
+`BackendSourceSnapshot` (handle identity, exact mode epoch, R, H) that is
+re-checked — together with the namespace incarnation at the config source —
+at every side-effect boundary; `current()` ends with that same check. Router
+consumption of the handle (lifting `Unsupported::StaticFallback`) is the
+follow-up head.
+
+- `static/modes.json`: six cluster-configuration steps through the real Go
+  `Manager.syncClusters`/`HasBackendClusters` + `FallbackFetcher` +
+  `StaticFetcher` over embedded etcd (`pkg/manager/backendcluster/
+  cproute_static_evidence_test.go`) versus the real `TopologyModule` applied
+  plan and static producer (`static_source::tests::shared_go_static_mode_observation`),
+  compared byte-for-byte. Static identity = raw address (duplicates collapse,
+  whitespace variants are distinct, IPv6 literal and host names verbatim). One
+  step is an ACCEPTED DIVERGENCE recorded with both observations: Go commits
+  per cluster (old `a` removed even though new `b` fails → empty map → static),
+  Rust rejects the whole generation and retains `a` (dynamic).
+- Module rows (real `TopologyModule` + real loopback SQL greeters): static list
+  served with real greeting verdicts, failure and recovery; disabled health =
+  all-healthy/Local=false with zero I/O; the same address in two namespaces is
+  the same id in two isolated sources, held per producer; a namespace removed
+  in C fails closed at the source before the run loop reconciles and an
+  identical re-creation is a new producer; Static→Dynamic parks the producer
+  (a held probe cannot publish), Dynamic→Static runs a fresh round; a rejected
+  cluster generation keeps the last-good mode but still reconciles namespaces;
+  mode identity is the exact epoch (same R/H after Static→Dynamic→Static is
+  refused; revoke-before-publish closes the window; an empty dynamic
+  discovery is served empty, never as the static list).
+- Commit window (real `reconfigure`): with the run loop parked inside the
+  Dynamic→Static window (the registration child's shutdown is held), a Dynamic
+  snapshot from real discovery is already refused, nothing is capturable, and
+  a consumer that captured it before waiting on a lock performs zero side
+  effects after the lock is granted. Static producers are parked/activated
+  BEFORE the new epoch is published, so a parked static H is withdrawn the
+  instant Dynamic is visible and re-activation always yields a fresh H.
+- `static/mutations.py`: eleven compiling mutations a runtime test must kill —
+  mode from the pending config instead of the applied plan; namespaces
+  reconciled only on accepted generations; the outgoing mode epoch revoked
+  only at publish (not before the new plan/commit); static producers parked
+  after the epoch publish; mode identity by value; namespace not checked at
+  the source; inactive static keeps probing; empty dynamic discovery falls
+  back to static; producer reused across incarnations; static health
+  fabricated without a probe; static backend runs the status stage.

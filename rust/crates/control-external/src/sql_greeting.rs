@@ -168,6 +168,27 @@ impl SqlGreetingProbe {
         })
     }
 
+    /// Builds the probe over Go's empty-cluster default dialer (system resolver,
+    /// plain TCP, no cluster or namespace TLS): the network a STATIC backend
+    /// (no `ClusterName`) is greeted through, owner-fenced like the cluster form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlGreetingConfigError::InvalidDialTimeout`] for a zero or
+    /// over-long dial timeout.
+    pub fn system_default(
+        owner: OwnerToken,
+        dial_timeout: Duration,
+    ) -> Result<Self, SqlGreetingConfigError> {
+        if dial_timeout.is_zero() || dial_timeout > MAX_PROBE_TIMEOUT {
+            return Err(SqlGreetingConfigError::InvalidDialTimeout(dial_timeout));
+        }
+        Ok(Self {
+            connector: ClusterConnector::system_default(owner),
+            dial_timeout,
+        })
+    }
+
     /// Performs ONE greeting attempt against `host:port`: a fenced resolve-and-
     /// dial under one full `dial_timeout`, then the first-packet judgement under
     /// a FRESH full `dial_timeout`. The connection is dropped (closed) on every

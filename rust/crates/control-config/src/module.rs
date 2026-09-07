@@ -633,10 +633,14 @@ async fn poll_campaign(
 async fn join_reader(
     reader: &mut Option<JoinHandle<Result<(), &'static str>>>,
 ) -> Option<Result<Result<(), &'static str>, tokio::task::JoinError>> {
-    match reader {
-        Some(reader) => Some(reader.await),
+    let result = match reader {
+        Some(reader) => reader.await,
         None => pending().await,
-    }
+    };
+    // A cancelled pending join must leave the reader owned by the module, but
+    // finish must not poll a handle whose output was already consumed here.
+    *reader = None;
+    Some(result)
 }
 
 #[derive(Clone, Debug)]
@@ -980,3 +984,7 @@ const fn module_error(error_class: &'static str) -> ModuleError {
         error_class,
     }
 }
+
+#[cfg(test)]
+#[path = "module_tests.rs"]
+mod tests;

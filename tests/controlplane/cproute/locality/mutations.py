@@ -20,6 +20,14 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-locality-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
+        # The isolated build shares a target directory across runs for dependency
+        # reuse. copytree preserves source mtimes, so a workspace crate could
+        # otherwise be judged "fresh" against a fingerprint left by a previous
+        # (mutated) build and its stale artifact reused. Touch every workspace
+        # source so the workspace crates are always rebuilt; registry
+        # dependencies stay cached.
+        for source in (root / "rust/crates").rglob("*.rs"):
+            os.utime(source, None)
         # Keep the isolated build under the repository target directory so the
         # dependency artifacts are reused across runs (and by the CI cache); the
         # mutated sources themselves live only in the temporary copy.

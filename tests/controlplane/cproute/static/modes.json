@@ -1,0 +1,19 @@
+{
+  "instances": [
+    "10.0.0.9:4000",
+    "10.0.0.9:4000",
+    " 10.0.0.9:4000",
+    "10.0.0.9:4000 ",
+    "[::1]:4000",
+    "host.example:4000"
+  ],
+  "steps": [
+    {"name": "no-clusters", "clusters": []},
+    {"name": "cluster-a-applied", "clusters": ["a"]},
+    {"name": "update-a-fails-keeps-old", "clusters": ["a2"], "fail": true},
+    {"name": "replace-a-with-failing-b", "clusters": ["b"], "fail": true,
+     "divergence": "go=static (per-cluster commit: a removed, b failed, map empty) rust=dynamic (whole generation rejected, a retained)"},
+    {"name": "back-to-a", "clusters": ["a"]},
+    {"name": "remove-all", "clusters": []}
+  ]
+}
