@@ -46,6 +46,7 @@ pub use dns::{DnsError, DnsResolver, MAX_RESOLVED_ADDRESSES};
 pub use etcd::{
     EtcdClientConfig, EtcdConfigError, EtcdConnectError, EtcdConnectSource, EtcdConnection,
     EtcdConnector, EtcdOperationError, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion,
+    GenerationGate,
 };
 pub use http::{BoundedHttpClient, HttpClientConfig, HttpConfigError, HttpError, HttpTlsConfig};
 pub use retry::{RetryDecision, RetryError, RetryPolicy, RetryPolicyError, retry_bounded};

@@ -397,10 +397,15 @@ dependencies = [
  "control-external",
  "control-plane",
  "etcd-client",
+ "hyper",
+ "hyper-util",
+ "prost",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

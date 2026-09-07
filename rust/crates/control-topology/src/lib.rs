@@ -35,14 +35,20 @@
 #![forbid(unsafe_code)]
 
 mod discovery;
+mod discovery_publish;
+mod merge;
 mod model;
 mod module;
 mod register;
 mod registrar;
 mod resolver;
 
-pub use discovery::poll_tidb_topology;
-pub use model::{BackendInfo, TopologySnapshot, parse_tidb_topology};
+pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
+pub use discovery_publish::{DiscoveryError, DiscoveryHandle, EpochResult};
+pub use merge::{
+    ClusterTopologyFetch, MergedBackend, MergedTopology, TopologyUnavailable, merge_tidb_topology,
+};
+pub use model::{BackendInfo, PrometheusInfo, TopologySnapshot, parse_tidb_topology};
 pub use module::{
     RejectionClass, TopologyClientFactory, TopologyClusterClient, TopologyModule,
     TopologyModuleHandle, TopologyStatus,

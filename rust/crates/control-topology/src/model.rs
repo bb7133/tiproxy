@@ -189,6 +189,108 @@ impl<'de> Deserialize<'de> for LabelMap {
     }
 }
 
+/// One discovered Prometheus endpoint, projected from the `/topology/prometheus`
+/// record. Mirrors Go `infosync.PrometheusInfo`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrometheusInfo {
+    /// The Prometheus advertised IP.
+    pub ip: String,
+    /// The Prometheus binary path (carried like Go even though the reader builds
+    /// the address only from `ip`/`port`).
+    pub binary_path: String,
+    /// The Prometheus port. `i64` mirrors Go's `int` on the amd64/arm64 targets
+    /// so record acceptance is identical (no clamp).
+    pub port: i64,
+}
+
+/// Typed projection of a `/topology/prometheus` record, matching Go's
+/// `json.Unmarshal` into `PrometheusInfo` exactly.
+///
+/// A hand-written [`Deserialize`] reproduces Go `encoding/json` object semantics
+/// (case-insensitive field names, last-wins duplicates, `null`/missing → zero,
+/// unknown members ignored, a wrong-typed known field fails the whole record).
+/// Unlike a plain `deserialize_map`, a **top-level JSON `null`** deserializes to
+/// the zero struct (Go `json.Unmarshal("null", &s)` leaves the zero value with no
+/// error), while any non-null, non-object top-level (number, string, array, bool)
+/// is rejected.
+#[derive(Default)]
+struct RawPrometheusInfo {
+    ip: String,
+    binary_path: String,
+    port: i64,
+}
+
+impl<'de> Deserialize<'de> for RawPrometheusInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawPrometheusInfoVisitor;
+
+        impl<'de> Visitor<'de> for RawPrometheusInfoVisitor {
+            type Value = RawPrometheusInfo;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a prometheus info object or null")
+            }
+
+            /// A top-level JSON `null` yields the zero struct, as Go's
+            /// `json.Unmarshal` does; it is not a rejection.
+            fn visit_unit<E>(self) -> Result<RawPrometheusInfo, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RawPrometheusInfo::default())
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<RawPrometheusInfo, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut info = RawPrometheusInfo::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key.eq_ignore_ascii_case("ip") {
+                        if let Some(value) = map.next_value::<Option<String>>()? {
+                            info.ip = value;
+                        }
+                    } else if key.eq_ignore_ascii_case("binary_path") {
+                        if let Some(value) = map.next_value::<Option<String>>()? {
+                            info.binary_path = value;
+                        }
+                    } else if key.eq_ignore_ascii_case("port") {
+                        if let Some(value) = map.next_value::<Option<i64>>()? {
+                            info.port = value;
+                        }
+                    } else {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(info)
+            }
+        }
+
+        // `deserialize_any` lets a JSON object reach `visit_map` and a JSON
+        // `null` reach `visit_unit`, while any other top-level type has no
+        // matching visitor method and is rejected — exactly Go's behaviour.
+        deserializer.deserialize_any(RawPrometheusInfoVisitor)
+    }
+}
+
+impl PrometheusInfo {
+    /// Parses one `/topology/prometheus` record, mirroring Go's
+    /// `json.Unmarshal(value, &PrometheusInfo)`: a JSON object or a top-level
+    /// `null` yields a value (`null` → zero), while a non-null non-object top
+    /// level or a wrong-typed known field rejects the record (`None`).
+    pub(crate) fn from_json(raw: &[u8]) -> Option<Self> {
+        let parsed: RawPrometheusInfo = serde_json::from_slice(raw).ok()?;
+        Some(Self {
+            ip: parsed.ip,
+            binary_path: parsed.binary_path,
+            port: parsed.port,
+        })
+    }
+}
+
 impl BackendInfo {
     /// Parses one `info` record. Returns `None` when the record is not valid
     /// JSON or has a wrong-typed field, matching Go's concrete `json.Unmarshal`
@@ -284,7 +386,7 @@ pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendInfo, parse_tidb_topology};
+    use super::{BackendInfo, PrometheusInfo, parse_tidb_topology};
 
     fn kv(key: &str, value: &str) -> (Vec<u8>, Vec<u8>) {
         (key.as_bytes().to_vec(), value.as_bytes().to_vec())
@@ -468,5 +570,74 @@ mod tests {
         let info = BackendInfo::from_info_json("a:1", "", br#"{"labels":{"a":null}}"#)
             .unwrap_or_else(|| unreachable!("null label value is accepted as empty"));
         assert_eq!(info.labels.get("a").map(String::as_str), Some(""));
+    }
+
+    // ----- Prometheus record (Go infosync.PrometheusInfo json parity) --------
+
+    #[test]
+    fn prometheus_object_parses_all_fields() {
+        let info =
+            PrometheusInfo::from_json(br#"{"ip":"10.0.0.5","binary_path":"/prom","port":9090}"#)
+                .unwrap_or_else(|| unreachable!("a valid prometheus object parses"));
+        assert_eq!(info.ip, "10.0.0.5");
+        assert_eq!(info.binary_path, "/prom");
+        assert_eq!(info.port, 9090);
+    }
+
+    #[test]
+    fn prometheus_top_level_null_is_the_zero_struct_like_go() {
+        // Go json.Unmarshal("null", &PrometheusInfo) leaves the zero value and
+        // does NOT error; a top-level null must not be rejected.
+        let info = PrometheusInfo::from_json(b"null")
+            .unwrap_or_else(|| unreachable!("top-level null yields the zero struct"));
+        assert_eq!(info, PrometheusInfo::default());
+    }
+
+    #[test]
+    fn prometheus_non_object_non_null_top_level_is_rejected() {
+        // A number/string/array/bool top level is a type mismatch for a struct
+        // unmarshal, so the record is rejected.
+        assert!(PrometheusInfo::from_json(b"7").is_none());
+        assert!(PrometheusInfo::from_json(br#""x""#).is_none());
+        assert!(PrometheusInfo::from_json(b"[1,2]").is_none());
+        assert!(PrometheusInfo::from_json(b"true").is_none());
+        assert!(PrometheusInfo::from_json(b"{not json").is_none());
+    }
+
+    #[test]
+    fn prometheus_null_and_missing_fields_default() {
+        let info = PrometheusInfo::from_json(br#"{"ip":null}"#)
+            .unwrap_or_else(|| unreachable!("null fields default like Go"));
+        assert_eq!(info.ip, "");
+        assert_eq!(info.binary_path, "");
+        assert_eq!(info.port, 0);
+    }
+
+    #[test]
+    fn prometheus_wrong_type_field_rejects_whole_record() {
+        assert!(PrometheusInfo::from_json(br#"{"port":"nope"}"#).is_none());
+        assert!(PrometheusInfo::from_json(br#"{"ip":5}"#).is_none());
+    }
+
+    #[test]
+    fn prometheus_unknown_fields_are_ignored() {
+        let info = PrometheusInfo::from_json(br#"{"ip":"1.2.3.4","future":123}"#)
+            .unwrap_or_else(|| unreachable!("unknown fields ignored like Go"));
+        assert_eq!(info.ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn prometheus_fields_match_case_insensitively_like_go() {
+        let info = PrometheusInfo::from_json(br#"{"IP":"1.2.3.4","Port":9090}"#)
+            .unwrap_or_else(|| unreachable!("case-insensitive fields parse"));
+        assert_eq!(info.ip, "1.2.3.4");
+        assert_eq!(info.port, 9090);
+    }
+
+    #[test]
+    fn prometheus_duplicate_keys_take_the_last_value_like_go() {
+        let info = PrometheusInfo::from_json(br#"{"port":1,"port":2}"#)
+            .unwrap_or_else(|| unreachable!("duplicate keys parse"));
+        assert_eq!(info.port, 2);
     }
 }

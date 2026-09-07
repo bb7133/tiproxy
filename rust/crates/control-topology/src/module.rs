@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `control_topology` self-registration module.
+//! The `control_topology` self-registration and discovery-publication module.
 //!
 //! [`TopologyModule`] is a [`control_plane::ControlModule`] that runs
-//! self-registration. It subscribes to the injected
-//! [`control_config::ConfigNamespaceStore`], and for every configuration
-//! generation it fans one [`crate::registrar::run`] loop out per backend
-//! cluster (Go keeps one `InfoSyncer` per cluster), each publishing the same
-//! [`TopologyInfo`] under its own per-instance lease.
+//! self-registration and publishes topology discovery. It subscribes to the
+//! injected [`control_config::ConfigNamespaceStore`], and for every configuration
+//! generation it fans one [`crate::registrar::run`] loop out per backend cluster
+//! (Go keeps one `InfoSyncer` per cluster), each publishing the same
+//! [`TopologyInfo`] under its own per-instance lease, and — when the cluster
+//! material changes — publishes a new discovery generation for the
+//! [`crate::DiscoveryHandle`] to pull.
 //!
-//! This module fans out self-registration only: the binary mounts it in its
-//! [`control_plane::ControlModuleSet`], but topology discovery is not yet driven
-//! (see the scope note below), so becoming ready means the initial registration
-//! plan's children are installed, not that discovery is published or routing is
-//! ready.
+//! Becoming ready means both the initial registration children are installed and
+//! the initial discovery set is published; it does not imply PD is reachable or
+//! that any topology has yet been fetched.
 //!
 //! # Generation fence
 //!
@@ -35,12 +35,16 @@
 //! **joins** every old child before starting the new ones. A late write from a
 //! retired generation can therefore never overwrite a newer snapshot.
 //!
-//! # Scope
+//! # Discovery publication
 //!
-//! This slice fans out self-registration only. The discovery poll
-//! ([`crate::poll_tidb_topology`]) is not yet driven here because its snapshot
-//! has no in-process consumer until routing lands; wiring a per-cluster poll
-//! loop is a dependent follow-up.
+//! Discovery rotates on its own "client epoch", which bumps only when the cluster
+//! *material* (endpoints / TLS / `ns_servers`) changes — an advertise-only or
+//! log-level reconfigure reuses the same long-lived channels and does not flap
+//! discovery. Each generation is prepared (all cluster connections built) before
+//! anything is committed, so a connect failure retains the last-good registration
+//! and discovery; and on any run-loop exit the publication is RAII-revoked, so the
+//! handle is left zero-I/O fail-closed. The immutable snapshot published to
+//! CP-ROUTE (stamped by client epoch) is a dependent follow-up (#214).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -55,6 +59,9 @@ use control_plane::{
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use crate::discovery_publish::{
+    DiscoveryConnector, DiscoveryHandle, DiscoveryPublisher, default_discovery_connector,
+};
 use crate::registrar::RegistrarError;
 use crate::resolver::AdvertiseEndpointResolver;
 
@@ -167,7 +174,7 @@ pub struct TopologyStatus {
     pub last_rejection: Option<RejectionClass>,
 }
 
-/// The self-registration control-plane module.
+/// The self-registration and discovery-publication control-plane module.
 pub struct TopologyModule {
     source: Arc<dyn ConfigNamespaceSource>,
     factory: Box<dyn TopologyClientFactory>,
@@ -176,26 +183,30 @@ pub struct TopologyModule {
     ready: watch::Sender<bool>,
     status: watch::Sender<TopologyStatus>,
     child_runner: ChildRunner,
+    discovery: DiscoveryPublisher,
+    discovery_connector: DiscoveryConnector,
 }
 
 /// Registration-readiness handle returned alongside a [`TopologyModule`].
 ///
 /// The composition root waits on [`TopologyModuleHandle::wait_ready`] before
-/// starting modules that depend on registration having begun. This signals only
-/// that the initial generation's registration children are spawned; it does not
-/// assert a published topology-discovery snapshot, which a later slice owns.
+/// starting modules that depend on registration and discovery having begun, then
+/// pulls discovery through [`TopologyModuleHandle::discovery_handle`].
 pub struct TopologyModuleHandle {
     ready: watch::Receiver<bool>,
     status: watch::Receiver<TopologyStatus>,
+    discovery: DiscoveryHandle,
 }
 
 impl TopologyModuleHandle {
     /// Resolves once the module has applied its initial configuration
-    /// generation and spawned the registration children.
+    /// generation: the registration children are spawned and the initial
+    /// discovery set is published.
     ///
-    /// This is a local determinism guarantee that registration has begun: it
-    /// does not require PD to be reachable (registration keeps retrying
-    /// underneath) and does not imply a topology snapshot has been published.
+    /// This is a local determinism guarantee that registration and discovery
+    /// publication have begun: it does not require PD to be reachable
+    /// (registration keeps retrying underneath) and does not imply any topology
+    /// has yet been fetched through the discovery handle.
     ///
     /// # Errors
     ///
@@ -217,6 +228,14 @@ impl TopologyModuleHandle {
     pub fn status(&self) -> watch::Receiver<TopologyStatus> {
         self.status.clone()
     }
+
+    /// A pull-on-demand discovery handle for the published topology. It is
+    /// generation-fenced: a pull under a retired client epoch fails closed rather
+    /// than returning stale data. Cheap to clone.
+    #[must_use]
+    pub fn discovery_handle(&self) -> DiscoveryHandle {
+        self.discovery.clone()
+    }
 }
 
 impl TopologyModule {
@@ -232,12 +251,20 @@ impl TopologyModule {
         resolver: Arc<dyn AdvertiseEndpointResolver>,
         identity: TopologyRuntimeIdentity,
     ) -> (Self, TopologyModuleHandle) {
-        Self::build(source, factory, resolver, identity, default_child_runner())
+        Self::build(
+            source,
+            factory,
+            resolver,
+            identity,
+            default_child_runner(),
+            default_discovery_connector(),
+        )
     }
 
     /// Test-only constructor that injects a deterministic child runner, used to
     /// exercise unexpected-child-exit and wedged-shutdown handling without a
-    /// live backend. Not compiled into the production crate.
+    /// live backend. Discovery uses a plaintext connector so the registration
+    /// tests need not stand up real TLS material. Not compiled into production.
     #[cfg(test)]
     fn new_with_child_runner(
         source: Arc<dyn ConfigNamespaceSource>,
@@ -246,7 +273,43 @@ impl TopologyModule {
         identity: TopologyRuntimeIdentity,
         child_runner: ChildRunner,
     ) -> (Self, TopologyModuleHandle) {
-        Self::build(source, factory, resolver, identity, child_runner)
+        let connector: DiscoveryConnector = Arc::new(|owner, _client| {
+            Box::pin(async move {
+                let config = EtcdClientConfig::new(vec!["127.0.0.1:1".to_owned()], None)
+                    .unwrap_or_else(|_| unreachable!("a plaintext endpoint is valid"));
+                EtcdConnector::new(owner, config).connect().await
+            })
+        });
+        Self::build(source, factory, resolver, identity, child_runner, connector)
+    }
+
+    /// Test-only constructor that injects both a deterministic child runner and
+    /// a discovery connector, so a test can count and gate the per-cluster
+    /// discovery connections a generation builds. Not compiled into production.
+    #[cfg(test)]
+    fn new_with_child_runner_and_connector(
+        source: Arc<dyn ConfigNamespaceSource>,
+        factory: Box<dyn TopologyClientFactory>,
+        resolver: Arc<dyn AdvertiseEndpointResolver>,
+        identity: TopologyRuntimeIdentity,
+        child_runner: ChildRunner,
+        discovery_connector: DiscoveryConnector,
+    ) -> (Self, TopologyModuleHandle) {
+        Self::build(
+            source,
+            factory,
+            resolver,
+            identity,
+            child_runner,
+            discovery_connector,
+        )
+    }
+
+    /// Drives the discovery publisher's epoch counter to a chosen value before
+    /// the module runs, so a test can exercise the checked-epoch overflow path.
+    #[cfg(test)]
+    fn force_next_epoch(&self, next_epoch: u64) {
+        self.discovery.set_next_epoch(next_epoch);
     }
 
     fn build(
@@ -255,9 +318,11 @@ impl TopologyModule {
         resolver: Arc<dyn AdvertiseEndpointResolver>,
         identity: TopologyRuntimeIdentity,
         child_runner: ChildRunner,
+        discovery_connector: DiscoveryConnector,
     ) -> (Self, TopologyModuleHandle) {
         let (ready_tx, ready_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(TopologyStatus::default());
+        let (discovery, discovery_handle) = DiscoveryPublisher::new();
         (
             Self {
                 source,
@@ -267,10 +332,13 @@ impl TopologyModule {
                 ready: ready_tx,
                 status: status_tx,
                 child_runner,
+                discovery,
+                discovery_connector,
             },
             TopologyModuleHandle {
                 ready: ready_rx,
                 status: status_rx,
+                discovery: discovery_handle,
             },
         )
     }
@@ -281,6 +349,10 @@ impl TopologyModule {
         let mut updates = self.source.subscribe();
         let mut children = Children::default();
         let mut active_plan: Option<RegistrationPlan> = None;
+        // RAII: on any exit — a clean retire, an error return, or the task being
+        // dropped/aborted — revoke the current discovery gate and withdraw the
+        // published set, so the handle is left zero-I/O fail-closed.
+        let _discovery_revoke = DiscoveryRevoke(&self.discovery);
 
         // Apply the current generation once (including generation 1), then wait
         // for changes; borrowing after `subscribe` avoids a dropped edge.
@@ -397,6 +469,14 @@ impl TopologyModule {
             return Err(RejectionClass::ClusterSetMismatch);
         }
 
+        // The discovery generation ("client epoch") rotates only on a change to
+        // the cluster *material* — the name-sorted (name, client) set — so an
+        // advertise-only or log-level reconfigure reuses the same long-lived
+        // channels and does not flap discovery, even though it may re-register.
+        let material: Vec<(Arc<str>, EtcdClientConfig)> = clusters
+            .iter()
+            .map(|cluster| (Arc::clone(&cluster.cluster_name), cluster.client.clone()))
+            .collect();
         let plan = RegistrationPlan {
             info: info.clone(),
             clusters: clusters
@@ -407,27 +487,56 @@ impl TopologyModule {
                 })
                 .collect(),
         };
-        if active_plan.as_ref() == Some(&plan) {
-            // Nothing that affects registration changed; keep the children.
+        let registration_unchanged = active_plan.as_ref() == Some(&plan);
+        let discovery_unchanged = self.discovery.material_unchanged(&material);
+        if registration_unchanged && discovery_unchanged {
+            // Nothing that affects registration or discovery changed.
             return Ok(());
         }
 
-        // Fence: retire the previous generation before the new one publishes.
-        stop_children(children).await;
-        for cluster in clusters {
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let receive_timeout = cluster.client.request_timeout();
-            let connector = EtcdConnector::new(owner.clone(), cluster.client);
-            children.shutdowns.push(shutdown_tx);
-            children.tasks.spawn((self.child_runner)(
-                owner.clone(),
-                connector,
-                info.clone(),
-                receive_timeout,
-                shutdown_rx,
-            ));
+        // Prepare-then-commit: build the new discovery generation's connections
+        // (lazy, no network) BEFORE mutating any live state, so a connect failure
+        // leaves both the registration children and the last-good discovery set
+        // untouched.
+        let prepared = if discovery_unchanged {
+            None
+        } else {
+            match self
+                .discovery
+                .prepare(&self.discovery_connector, owner, material)
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(_) => return Err(RejectionClass::ClientBuildFailed),
+            }
+        };
+
+        // Commit registration first (fence: retire the previous generation before
+        // the new one publishes), then commit discovery (revoke the old gate,
+        // publish the new epoch).
+        if !registration_unchanged {
+            stop_children(children).await;
+            for cluster in clusters {
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let receive_timeout = cluster.client.request_timeout();
+                let connector = EtcdConnector::new(owner.clone(), cluster.client);
+                children.shutdowns.push(shutdown_tx);
+                children.tasks.spawn((self.child_runner)(
+                    owner.clone(),
+                    connector,
+                    info.clone(),
+                    receive_timeout,
+                    shutdown_rx,
+                ));
+            }
+            *active_plan = Some(plan);
         }
-        *active_plan = Some(plan);
+        // The discovery generation was fully prepared (connections built + epoch
+        // reserved) before the registration switch above, so this commit is
+        // infallible and the two planes can never split.
+        if let Some(prepared) = prepared {
+            self.discovery.commit(prepared);
+        }
         Ok(())
     }
 
@@ -544,6 +653,17 @@ const fn module_error(error_class: &'static str) -> ModuleError {
     }
 }
 
+/// Revokes the discovery publication when the module's run loop exits by any
+/// path — a clean retire, an error return, or the task being dropped/aborted —
+/// so the handle is always left zero-I/O fail-closed.
+struct DiscoveryRevoke<'module>(&'module DiscoveryPublisher);
+
+impl Drop for DiscoveryRevoke<'_> {
+    fn drop(&mut self) {
+        self.0.revoke();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -553,11 +673,13 @@ mod tests {
     use std::future::pending;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceStore, TopologyRuntimeIdentity};
-    use control_external::{EtcdClientConfig, EtcdTlsConfig, EtcdTlsPolicy};
+    use control_external::{
+        EtcdClientConfig, EtcdConnectError, EtcdConnector, EtcdTlsConfig, EtcdTlsPolicy,
+    };
     use control_plane::{
         ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
         MetricsPolicy, ModuleError, OwnershipRegistry, RuntimeEvent, ShutdownReason, TlsPolicy,
@@ -565,6 +687,7 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::TopologyClientFactory;
+    use crate::discovery_publish::{DiscoveryConnector, DiscoveryError};
     use crate::resolver::StaticAdvertiseResolver;
 
     type TestError = Box<dyn std::error::Error>;
@@ -589,6 +712,23 @@ mod tests {
     fn config(max_connections: u64) -> Vec<u8> {
         format!(
             "\n[proxy]\naddr = \"0.0.0.0:6000\"\nmax-connections = {max_connections}\n\n[api]\naddr = \"0.0.0.0:10080\"\n\n[[proxy.backend-clusters]]\nname = \"cluster-a\"\npd-addrs = \"pd-a:2379\"\nns-servers = [\"dns-a:53\"]\n\n[[proxy.backend-clusters]]\nname = \"cluster-b\"\npd-addrs = \"pd-b:2379\"\nns-servers = [\"dns-b:53\"]\n"
+        )
+        .into_bytes()
+    }
+
+    /// A config with ZERO backend clusters: no `[[proxy.backend-clusters]]` and an
+    /// explicitly empty top-level `pd-addrs` (which otherwise defaults to a single
+    /// cluster), so the normalized topology has an empty cluster set.
+    fn config_zero() -> Vec<u8> {
+        b"\n[proxy]\naddr = \"0.0.0.0:6000\"\npd-addrs = \"\"\n\n[api]\naddr = \"0.0.0.0:10080\"\n"
+            .to_vec()
+    }
+
+    /// A single-backend-cluster config; `max_connections` is hot-reloadable, so a
+    /// new generation can be published without touching a reload-locked field.
+    fn config_single(max_connections: u64) -> Vec<u8> {
+        format!(
+            "\n[proxy]\naddr = \"0.0.0.0:6000\"\nmax-connections = {max_connections}\n\n[api]\naddr = \"0.0.0.0:10080\"\n\n[[proxy.backend-clusters]]\nname = \"cluster-a\"\npd-addrs = \"pd-a:2379\"\nns-servers = []\n"
         )
         .into_bytes()
     }
@@ -681,6 +821,83 @@ mod tests {
             Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
             identity(),
             runner,
+        );
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+        Ok((task, handle))
+    }
+
+    /// A discovery connector that counts how many per-cluster connections it
+    /// builds, returning a real plaintext (lazy, no-network) `EtcdConnection`.
+    /// This lets a test prove that discovery reconnects exactly once per cluster
+    /// on a material rotation and never on an unrelated or rejected generation,
+    /// and that a poll forks the epoch's connection rather than reconnecting.
+    fn counting_connector(count: &Arc<AtomicUsize>) -> DiscoveryConnector {
+        let count = Arc::clone(count);
+        Arc::new(move |owner, _client| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let config = EtcdClientConfig::new(vec!["127.0.0.1:1".to_owned()], None)
+                    .unwrap_or_else(|_| unreachable!("a plaintext endpoint is valid"));
+                EtcdConnector::new(owner, config).connect().await
+            })
+        })
+    }
+
+    /// A discovery connector that counts attempts and connects (real
+    /// `EtcdConnector::connect`) to the endpoints of the *supplied* client — so a
+    /// test whose factory points the cluster at a live fixture gets a working
+    /// discovery connection, and its poll can assert a real payload.
+    fn counting_real_connector(count: &Arc<AtomicUsize>) -> DiscoveryConnector {
+        let count = Arc::clone(count);
+        Arc::new(move |owner, client| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { EtcdConnector::new(owner, client).connect().await })
+        })
+    }
+
+    /// A discovery connector that connects (real plaintext) while `fail` is unset
+    /// and returns a retired-owner connect failure once it is set, counting every
+    /// attempt. This exercises prepare-then-commit: a later material rotation whose
+    /// connect fails must retain both the registration children and the last-good
+    /// discovery set.
+    fn gated_fail_connector(
+        count: &Arc<AtomicUsize>,
+        fail: &Arc<AtomicBool>,
+    ) -> DiscoveryConnector {
+        let count = Arc::clone(count);
+        let fail = Arc::clone(fail);
+        Arc::new(move |owner, _client| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let fail = fail.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    return Err(EtcdConnectError::StaleOwner);
+                }
+                let config = EtcdClientConfig::new(vec!["127.0.0.1:1".to_owned()], None)
+                    .unwrap_or_else(|_| unreachable!("a plaintext endpoint is valid"));
+                EtcdConnector::new(owner, config).connect().await
+            })
+        })
+    }
+
+    /// Mirrors [`spawn`] but injects a supplied discovery connector so a test can
+    /// count and gate the per-cluster discovery connections.
+    fn spawn_with_connector(
+        store: ConfigNamespaceStore,
+        factory: Box<dyn TopologyClientFactory>,
+        runner: ChildRunner,
+        connector: DiscoveryConnector,
+        runtime: &ControlRuntime,
+    ) -> Result<(ModuleTask, super::TopologyModuleHandle), TestError> {
+        let (module, handle) = TopologyModule::new_with_child_runner_and_connector(
+            Arc::new(store),
+            factory,
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            runner,
+            connector,
         );
         let context = runtime.handle().module_context();
         runtime.mark_ready()?;
@@ -1215,6 +1432,719 @@ mod tests {
             2,
             "a dropped lifecycle channel retires the registration"
         );
+        Ok(())
+    }
+
+    /// The connect-count discovery oracle: discovery connects exactly once per
+    /// cluster at ready, a poll forks that epoch's connection (never
+    /// reconnecting), an unrelated (advertise-only) generation does not flap
+    /// discovery, and only a material change (a different etcd client timeout)
+    /// rotates it — reconnecting both clusters. This kills a per-poll rebuild and
+    /// a config-number-driven flap. Making `reconfigure` rebuild discovery on
+    /// every generation (ignoring `material_unchanged`) turns the unrelated-
+    /// generation assertion RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_reconnects_only_on_a_material_change_never_per_poll_or_unrelated()
+    -> Result<(), TestError> {
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let (gen2_tx, _gen2_rx) = watch::channel(None);
+        let gen2_tx = Arc::new(gen2_tx);
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_with_connector(
+            store.clone(),
+            Box::new(SwitchableFactory {
+                gen2: Arc::clone(&gen2_tx),
+            }),
+            counting_runner(&counters),
+            counting_connector(&connects),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        let _ = status.borrow_and_update();
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "each of the two clusters connected exactly once at ready"
+        );
+
+        // A poll forks the epoch's connections for one pull; it must NOT
+        // reconnect. The pull itself may fail (the plaintext endpoint has no
+        // server) — the oracle is the connector count, not the pull result. The
+        // await is bounded because it touches a real socket.
+        let discovery = handle.discovery_handle();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), discovery.poll_merged_topology()).await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), discovery.poll_merged_topology()).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "a poll forks the epoch's connection; it does not reconnect"
+        );
+
+        // An unrelated (advertise-only) generation: same clients + a hot-reloaded
+        // max-connections. Neither registration nor discovery changes, so no
+        // reconnect and no rotation.
+        gen2_tx.send_replace(Some(Gen2::Same));
+        store.apply_toml(&config(200), None, 2, &std::env::current_dir()?)?;
+        wait_observed(&mut status, 2).await?;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "an unrelated generation does not flap discovery"
+        );
+
+        // A material change (a different etcd client timeout) rotates discovery:
+        // both clusters reconnect, so the count reaches four.
+        gen2_tx.send_replace(Some(Gen2::TransportChange));
+        store.apply_toml(&config(300), None, 3, &std::env::current_dir()?)?;
+        wait_observed(&mut status, 3).await?;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            4,
+            "a material change reconnects both clusters (the epoch rotated)"
+        );
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// The RAII-revoke shutdown oracle: when the module's run loop exits, the
+    /// discovery publication is withdrawn, so the handle fails closed
+    /// (`Revoked`) with no I/O — for both the merged-topology and Prometheus
+    /// polls. Removing the `DiscoveryRevoke` RAII guard leaves the last set
+    /// published after exit and turns these assertions RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_raii_revokes_the_discovery_and_fails_closed() -> Result<(), TestError> {
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_with_connector(
+            store,
+            Box::new(SwitchableFactory {
+                gen2: Arc::new(watch::channel(None).0),
+            }),
+            counting_runner(&counters),
+            counting_connector(&connects),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        // Capture the handle while the publication is live, then drive the module
+        // to exit and join it so the RAII revoke has run.
+        let discovery = handle.discovery_handle();
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+
+        assert_eq!(
+            discovery.poll_merged_topology().await.err(),
+            Some(DiscoveryError::Revoked),
+            "the publication is withdrawn on exit; the merged poll fails closed"
+        );
+        assert_eq!(
+            discovery.poll_prometheus("cluster-a").await.err(),
+            Some(DiscoveryError::Revoked),
+            "the Prometheus poll also fails closed after revoke"
+        );
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "a fail-closed handle attempts no further connections"
+        );
+        Ok(())
+    }
+
+    /// The rejection-retains oracle: a rejected generation (a cluster-set
+    /// mismatch) neither reconnects nor rotates discovery — the last-good epoch's
+    /// connections are retained untouched. This kills "a rejection clears or
+    /// rotates the discovery set".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_generation_retains_the_last_good_discovery() -> Result<(), TestError> {
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let (gen2_tx, _gen2_rx) = watch::channel(None);
+        let gen2_tx = Arc::new(gen2_tx);
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_with_connector(
+            store.clone(),
+            Box::new(SwitchableFactory {
+                gen2: Arc::clone(&gen2_tx),
+            }),
+            counting_runner(&counters),
+            counting_connector(&connects),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        let _ = status.borrow_and_update();
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+
+        // A rejected generation: the factory drops a cluster (a set mismatch).
+        gen2_tx.send_replace(Some(Gen2::Missing));
+        store.apply_toml(&config(200), None, 2, &std::env::current_dir()?)?;
+        let after = wait_observed(&mut status, 2).await?;
+        assert_eq!(
+            after.last_rejection,
+            Some(RejectionClass::ClusterSetMismatch),
+            "the generation is rejected as a cluster-set mismatch"
+        );
+        assert_eq!(
+            after.applied_generation, 1,
+            "the last-good applied generation is retained"
+        );
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "a rejected generation neither reconnects nor rotates discovery"
+        );
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// Prepare-then-commit atomicity (blocker 4): when a later material rotation's
+    /// discovery `prepare` fails at connect, BOTH planes are retained — the
+    /// registration children are not torn down (no extra stops), the status shows
+    /// a `ClientBuildFailed` rejection with the last-good `applied_generation`, and
+    /// the last-good discovery set is still the published, admissible generation
+    /// (a poll fails on I/O against the dead endpoint, i.e. `TopologyUnavailable`,
+    /// never `Revoked` or `Stale`). Moving the discovery `commit`/`prepare` ahead
+    /// of the registration switch, or tearing children down before the connect
+    /// succeeds, breaks this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_material_rotation_retains_both_registration_and_discovery()
+    -> Result<(), TestError> {
+        let store = ConfigNamespaceStore::from_toml(&config(100), None, &std::env::current_dir()?)?;
+        let (gen2_tx, _gen2_rx) = watch::channel(None);
+        let gen2_tx = Arc::new(gen2_tx);
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_with_connector(
+            store.clone(),
+            Box::new(SwitchableFactory {
+                gen2: Arc::clone(&gen2_tx),
+            }),
+            counting_runner(&counters),
+            gated_fail_connector(&connects, &fail),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        let mut status = handle.status();
+        let _ = status.borrow_and_update();
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "both clusters connected once on the initial generation"
+        );
+        assert_eq!(counters.spawns(), 2);
+        assert_eq!(counters.stops(), 0);
+
+        // Arm the connector to fail, then apply a material rotation. The discovery
+        // prepare connects the first cluster, fails, and returns before any live
+        // state is mutated.
+        fail.store(true, Ordering::SeqCst);
+        gen2_tx.send_replace(Some(Gen2::TransportChange));
+        store.apply_toml(&config(200), None, 2, &std::env::current_dir()?)?;
+        let after = wait_observed(&mut status, 2).await?;
+        assert_eq!(
+            after.last_rejection,
+            Some(RejectionClass::ClientBuildFailed),
+            "a connect failure on the rotation is a ClientBuildFailed rejection"
+        );
+        assert_eq!(
+            after.applied_generation, 1,
+            "the last-good applied generation is retained"
+        );
+        // Registration retained: no child was stopped (the failing prepare returns
+        // before the registration switch).
+        assert_eq!(
+            counters.stops(),
+            0,
+            "a failing rotation does not tear down the registration children"
+        );
+        assert_eq!(counters.spawns(), 2, "no new registration child is spawned");
+
+        // Discovery retained: the last-good epoch-0 set is still the published,
+        // admissible generation, so a poll gets past admit + the final fence and
+        // fails only on the dead endpoint's I/O — never Revoked or Stale.
+        let discovery = handle.discovery_handle();
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(5), discovery.poll_merged_topology()).await
+        else {
+            unreachable!("the poll resolves within the deadline");
+        };
+        assert!(
+            matches!(result, Err(DiscoveryError::TopologyUnavailable(_))),
+            "the retained set is admitted and current; only its I/O fails: {result:?}"
+        );
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// A zero-cluster initial generation still publishes a discovery set: after
+    /// ready, a merged poll returns `Ok` with an empty topology at epoch 0 and the
+    /// connector was never called (nothing to connect). This proves the initial
+    /// generation publishes `Some(empty)` — not `None` — before ready.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_cluster_initial_generation_publishes_an_empty_topology_at_epoch_zero()
+    -> Result<(), TestError> {
+        let store =
+            ConfigNamespaceStore::from_toml(&config_zero(), None, &std::env::current_dir()?)?;
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime()?;
+        let (task, mut handle) = spawn_with_connector(
+            store,
+            Box::new(SwitchableFactory {
+                gen2: Arc::new(watch::channel(None).0),
+            }),
+            counting_runner(&counters),
+            counting_connector(&connects),
+            &runtime,
+        )?;
+        wait_ready(&mut handle).await?;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            0,
+            "a zero-cluster generation connects nothing"
+        );
+        assert_eq!(counters.spawns(), 0, "no registration child is spawned");
+
+        let discovery = handle.discovery_handle();
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(5), discovery.poll_merged_topology()).await
+        else {
+            unreachable!("the empty poll resolves within the deadline");
+        };
+        let merged = result.unwrap_or_else(|error| {
+            unreachable!("an empty topology is a successful poll, not an error: {error:?}")
+        });
+        assert_eq!(
+            merged.client_epoch, 0,
+            "the initial (empty) generation publishes epoch 0"
+        );
+        assert!(
+            merged.value.backends.is_empty(),
+            "a zero-cluster generation yields no backends"
+        );
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
+        Ok(())
+    }
+
+    /// A minimal in-process etcd v3 `KV.Range` fixture (hand-rolled tonic over
+    /// plain hyper h2, real prefix-range filtering) serving the `TiDB` topology
+    /// prefixes, plus a factory that points one cluster at it with a
+    /// timeout-driven material knob. Used only by the epoch-overflow module test,
+    /// which must assert a real discovery poll payload (a `127.0.0.1:1` connection
+    /// returns nothing). Mirrors `tests/discovery_fence.rs`.
+    mod overflow_fixture {
+        use std::convert::Infallible;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        use control_config::ConfigNamespaceSnapshot;
+        use control_external::EtcdClientConfig;
+        use hyper::body::Incoming;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::service::TowerToHyperService;
+        use tokio::net::{TcpListener, TcpStream};
+        use tonic::codegen::{BoxFuture, Context, Poll, Service, http};
+        use tonic::server::{Grpc, NamedService, UnaryService};
+        use tonic_prost::ProstCodec;
+
+        use crate::{TopologyClientFactory, TopologyClusterClient};
+
+        const RANGE_PATH: &str = "/etcdserverpb.KV/Range";
+        const KV_SERVICE_NAME: &str = "etcdserverpb.KV";
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct RangeRequest {
+            #[prost(bytes = "vec", tag = "1")]
+            key: Vec<u8>,
+            #[prost(bytes = "vec", tag = "2")]
+            range_end: Vec<u8>,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct ResponseHeader {
+            #[prost(uint64, tag = "1")]
+            cluster_id: u64,
+            #[prost(uint64, tag = "2")]
+            member_id: u64,
+            #[prost(int64, tag = "3")]
+            revision: i64,
+            #[prost(uint64, tag = "4")]
+            raft_term: u64,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct KeyValue {
+            #[prost(bytes = "vec", tag = "1")]
+            key: Vec<u8>,
+            #[prost(int64, tag = "2")]
+            create_revision: i64,
+            #[prost(int64, tag = "3")]
+            mod_revision: i64,
+            #[prost(int64, tag = "4")]
+            version: i64,
+            #[prost(bytes = "vec", tag = "5")]
+            value: Vec<u8>,
+            #[prost(int64, tag = "6")]
+            lease: i64,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct RangeResponse {
+            #[prost(message, optional, tag = "1")]
+            header: Option<ResponseHeader>,
+            #[prost(message, repeated, tag = "2")]
+            kvs: Vec<KeyValue>,
+            #[prost(bool, tag = "3")]
+            more: bool,
+            #[prost(int64, tag = "4")]
+            count: i64,
+        }
+
+        #[derive(Clone)]
+        struct KvFixture {
+            seeded: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
+        }
+
+        /// Real etcd `Range` semantics: an empty `range_end` is an exact get,
+        /// otherwise a half-open range `key <= k < range_end`, ascending by key.
+        fn range_scan(
+            seeded: &[(Vec<u8>, Vec<u8>)],
+            key: &[u8],
+            range_end: &[u8],
+        ) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut hits: Vec<(Vec<u8>, Vec<u8>)> = seeded
+                .iter()
+                .filter(|(k, _)| {
+                    if range_end.is_empty() {
+                        k.as_slice() == key
+                    } else {
+                        k.as_slice() >= key && k.as_slice() < range_end
+                    }
+                })
+                .cloned()
+                .collect();
+            hits.sort_by(|(a, _), (b, _)| a.cmp(b));
+            hits
+        }
+
+        struct RangeHandler {
+            fixture: KvFixture,
+        }
+
+        impl UnaryService<RangeRequest> for RangeHandler {
+            type Response = RangeResponse;
+            type Future = BoxFuture<tonic::Response<RangeResponse>, tonic::Status>;
+
+            fn call(&mut self, request: tonic::Request<RangeRequest>) -> Self::Future {
+                let fixture = self.fixture.clone();
+                Box::pin(async move {
+                    let message = request.into_inner();
+                    let matches = range_scan(&fixture.seeded, &message.key, &message.range_end);
+                    let count = i64::try_from(matches.len()).unwrap_or(i64::MAX);
+                    let kvs = matches
+                        .into_iter()
+                        .map(|(key, value)| KeyValue {
+                            key,
+                            value,
+                            ..KeyValue::default()
+                        })
+                        .collect();
+                    let header = ResponseHeader {
+                        cluster_id: 7,
+                        member_id: 11,
+                        revision: 42,
+                        raft_term: 3,
+                    };
+                    Ok(tonic::Response::new(RangeResponse {
+                        header: Some(header),
+                        kvs,
+                        more: false,
+                        count,
+                    }))
+                })
+            }
+        }
+
+        impl Service<http::Request<Incoming>> for KvFixture {
+            type Response = http::Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = BoxFuture<Self::Response, Infallible>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, request: http::Request<Incoming>) -> Self::Future {
+                let fixture = self.clone();
+                Box::pin(async move {
+                    let response = if request.uri().path() == RANGE_PATH {
+                        let mut grpc =
+                            Grpc::new(ProstCodec::<RangeResponse, RangeRequest>::default());
+                        grpc.unary(RangeHandler { fixture }, request).await
+                    } else {
+                        // The registrar's lease Grant/Put land here and retry harmlessly.
+                        unimplemented_reply()
+                    };
+                    Ok(response)
+                })
+            }
+        }
+
+        impl NamedService for KvFixture {
+            const NAME: &'static str = KV_SERVICE_NAME;
+        }
+
+        fn unimplemented_reply() -> http::Response<tonic::body::Body> {
+            let mut response = http::Response::new(tonic::body::Body::default());
+            let headers = response.headers_mut();
+            headers.insert(
+                tonic::Status::GRPC_STATUS,
+                http::HeaderValue::from_static("12"),
+            );
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                tonic::metadata::GRPC_CONTENT_TYPE,
+            );
+            response
+        }
+
+        /// Binds a loopback listener and serves the KV adapter over each accepted
+        /// plaintext connection. The accept loop is detached; the test bounds its
+        /// lifetime. Returns the bound address.
+        pub(super) async fn spawn_fixture(seeded: Vec<(Vec<u8>, Vec<u8>)>) -> Option<SocketAddr> {
+            let fixture = KvFixture {
+                seeded: Arc::new(seeded),
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.ok()?;
+            let addr = listener.local_addr().ok()?;
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _peer)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(serve_connection(stream, fixture.clone()));
+                }
+            });
+            Some(addr)
+        }
+
+        async fn serve_connection(stream: TcpStream, fixture: KvFixture) {
+            let service = TowerToHyperService::new(fixture);
+            let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+            let _ = builder
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        }
+
+        /// Builds one plaintext cluster client per configured cluster, pointed at
+        /// `addr` with a request timeout read from a shared atomic. Flipping the
+        /// atomic across generations changes the cluster MATERIAL, forcing a
+        /// discovery rotation.
+        pub(super) struct FixtureFactory {
+            pub(super) addr: SocketAddr,
+            pub(super) timeout_ms: Arc<AtomicU64>,
+        }
+
+        impl TopologyClientFactory for FixtureFactory {
+            fn build(
+                &self,
+                snapshot: &ConfigNamespaceSnapshot,
+            ) -> Result<Vec<TopologyClusterClient>, String> {
+                let topology = snapshot
+                    .topology()
+                    .map_err(|_| "topology projection".to_owned())?;
+                let timeout = Duration::from_millis(self.timeout_ms.load(Ordering::SeqCst));
+                let mut clusters = Vec::with_capacity(topology.backend_clusters.len());
+                for cluster in topology.backend_clusters.iter() {
+                    let client = EtcdClientConfig::new(vec![self.addr.to_string()], None)
+                        .and_then(|config| {
+                            config.with_timeouts(
+                                Duration::from_secs(1),
+                                timeout,
+                                Duration::from_secs(1),
+                                Duration::from_millis(500),
+                                Duration::from_secs(1),
+                            )
+                        })
+                        .map_err(|_| "client build".to_owned())?;
+                    clusters.push(TopologyClusterClient {
+                        cluster_name: Arc::clone(&cluster.name),
+                        client,
+                    });
+                }
+                Ok(clusters)
+            }
+        }
+    }
+
+    /// Blocker-1 atomicity: when the checked epoch counter overflows on a material
+    /// rotation, the module rejects the generation BEFORE any registration
+    /// teardown, retaining BOTH the old registration children AND the old, still
+    /// usable discovery generation — proven by the old handle's REAL poll payload,
+    /// not just its epoch. Tearing children down on the overflow path (a bad impl)
+    /// turns the `stops == 0` assertion RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)]
+    async fn an_epoch_overflow_on_a_material_rotation_retains_the_live_generation()
+    -> Result<(), TestError> {
+        use overflow_fixture::{FixtureFactory, spawn_fixture};
+
+        // One live TiDB backend under the classic prefix; the keyspace prefix has
+        // nothing.
+        let seeded = vec![
+            (
+                b"/topology/tidb/10.0.0.9:4000/info".to_vec(),
+                br#"{"ip":"10.0.0.9","status_port":10080,"version":"v8"}"#.to_vec(),
+            ),
+            (b"/topology/tidb/10.0.0.9:4000/ttl".to_vec(), b"1".to_vec()),
+        ];
+        let Some(addr) = spawn_fixture(seeded).await else {
+            unreachable!("the fixture binds a loopback port");
+        };
+
+        let timeout_ms = Arc::new(AtomicU64::new(500));
+        let store =
+            ConfigNamespaceStore::from_toml(&config_single(100), None, &std::env::current_dir()?)?;
+        let counters = Counters::default();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime()?;
+
+        // Build the module manually so the epoch counter can be driven to its
+        // overflow boundary BEFORE the run loop applies the initial generation.
+        let (module, mut handle) = TopologyModule::new_with_child_runner_and_connector(
+            Arc::new(store.clone()),
+            Box::new(FixtureFactory {
+                addr,
+                timeout_ms: Arc::clone(&timeout_ms),
+            }),
+            Arc::new(StaticAdvertiseResolver::new("10.0.0.1")),
+            identity(),
+            counting_runner(&counters),
+            counting_real_connector(&connects),
+        );
+        module.force_next_epoch(u64::MAX - 1);
+        let context = runtime.handle().module_context();
+        runtime.mark_ready()?;
+        let task = tokio::spawn(Box::new(module).run(context));
+
+        let discovery = handle.discovery_handle();
+        let body = async {
+            wait_ready(&mut handle).await?;
+            let mut status = handle.status();
+            let _ = status.borrow_and_update();
+
+            // The initial generation reserved epoch MAX-1 (next -> MAX).
+            assert_eq!(
+                connects.load(Ordering::SeqCst),
+                1,
+                "one cluster connected once on the initial generation"
+            );
+            assert_eq!(counters.spawns(), 1, "one registration child was spawned");
+            let before =
+                tokio::time::timeout(Duration::from_secs(5), discovery.poll_merged_topology())
+                    .await?
+                    .unwrap_or_else(|error| unreachable!("the initial poll succeeds: {error:?}"));
+            assert_eq!(
+                before.client_epoch,
+                u64::MAX - 1,
+                "the initial generation published epoch MAX-1"
+            );
+            assert_eq!(
+                before.value.backends.len(),
+                1,
+                "the seeded backend is discovered"
+            );
+            assert_eq!(before.value.backends[0].backend.addr, "10.0.0.9:4000");
+            assert_eq!(before.value.backends[0].cluster_name.as_ref(), "cluster-a");
+
+            // A material rotation (a different client timeout). Its discovery
+            // prepare reserves MAX, then `checked_add(1)` overflows, so reconfigure
+            // rejects the generation BEFORE stopping any child.
+            timeout_ms.store(700, Ordering::SeqCst);
+            store.apply_toml(&config_single(200), None, 2, &std::env::current_dir()?)?;
+            let after = wait_observed(&mut status, 2).await?;
+
+            assert_eq!(
+                counters.stops(),
+                0,
+                "the overflow generation did not tear down the registration children"
+            );
+            assert_eq!(
+                counters.spawns(),
+                1,
+                "no new registration child was spawned"
+            );
+            assert_eq!(
+                after.applied_generation, 1,
+                "the last-good applied generation is retained"
+            );
+            assert_eq!(
+                after.last_rejection,
+                Some(RejectionClass::ClientBuildFailed),
+                "the overflow surfaces as a ClientBuildFailed rejection"
+            );
+            // `prepare` connects BEFORE it reserves the epoch, so the overflow
+            // generation built one throwaway connection (count 1 -> 2) — but it was
+            // never committed: no NEW discovery set was published.
+            assert_eq!(
+                connects.load(Ordering::SeqCst),
+                2,
+                "the overflow generation's throwaway prepare connected once, then rejected"
+            );
+            assert_eq!(
+                discovery.current_epoch(),
+                Some(u64::MAX - 1),
+                "the live discovery epoch is retained across the overflow"
+            );
+
+            // The decisive check: the OLD material is still usable — a real poll
+            // still returns the same seeded backend at the same epoch.
+            let retained =
+                tokio::time::timeout(Duration::from_secs(5), discovery.poll_merged_topology())
+                    .await?
+                    .unwrap_or_else(|error| unreachable!("the retained poll succeeds: {error:?}"));
+            assert_eq!(
+                retained.client_epoch,
+                u64::MAX - 1,
+                "the retained poll still reports the last-good epoch"
+            );
+            assert_eq!(
+                retained.value, before.value,
+                "the retained poll returns the same payload"
+            );
+            Ok::<(), TestError>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), body).await??;
+
+        request_stop(&runtime)?;
+        tokio::time::timeout(Duration::from_secs(10), task).await???;
+        runtime.finish()?;
         Ok(())
     }
 
