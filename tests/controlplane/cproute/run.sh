@@ -21,16 +21,16 @@ trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
 cd "$repo_root"
 
-if rg -n 'control_proto|control-proto' \
+if grep -R -n -E 'control_proto|control-proto' \
     rust/crates/control-routing rust/crates/dataplane/src/route.rs; then
     echo "CP-ROUTE domain leaks the legacy protocol dependency" >&2
     exit 1
 fi
 while IFS= read -r file; do
-    if rg -q 'control_proto' "$file"; then
+    if grep -q 'control_proto' "$file"; then
         printf '%s\n' "$file"
     fi
-done < <(rg -l 'Route(Assignment|Request|Result)' rust/crates/dataplane/src) \
+done < <(grep -R -l -E 'Route(Assignment|Request|Result)' rust/crates/dataplane/src) \
     | LC_ALL=C sort >"$tmp_dir/proto-wire-files.txt"
 cmp tests/controlplane/cproute/proto-wire-files.txt "$tmp_dir/proto-wire-files.txt"
 
