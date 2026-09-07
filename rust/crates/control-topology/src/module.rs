@@ -57,7 +57,8 @@ use control_config::{
 };
 use control_external::{ClusterHttpConfigError, EtcdClientConfig, EtcdConnector};
 use control_plane::{
-    ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture, OwnerToken,
+    ControlModule, LifecyclePhase, LifecycleSnapshot, ModuleContext, ModuleError, ModuleFuture,
+    OwnerToken,
 };
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -682,9 +683,10 @@ impl TopologyModule {
                 exited = children.tasks.join_next(), if !children.tasks.is_empty() => {
                     // A child completed while we were not tearing it down: an
                     // unexpected retirement, owner loss, or panic. Fail loud so
-                    // the runtime does not treat an unregistered proxy as healthy.
+                    // the runtime does not treat an unregistered proxy as healthy
+                    // — unless the lifecycle has already requested this teardown.
                     if exited.is_some() {
-                        break Err(module_error("registration_child_exited"));
+                        break child_exit_outcome(&lifecycle, "registration_child_exited");
                     }
                 }
                 () = supervise_child(runtime.refresh.as_mut()) => {
@@ -693,7 +695,7 @@ impl TopologyModule {
                     // JoinHandle, so drop it and fail loud rather than leave the
                     // module ready with a permanently silent routing source.
                     runtime.refresh = None;
-                    break Err(module_error("routing_refresh_failed"));
+                    break child_exit_outcome(&lifecycle, "routing_refresh_failed");
                 }
                 () = supervise_child(runtime.health.as_mut()) => {
                     // The health child completed without a teardown request. The
@@ -701,7 +703,7 @@ impl TopologyModule {
                     // rather than leave the module ready with a silent, never-
                     // updated health overlay.
                     runtime.health = None;
-                    break Err(module_error("health_loop_failed"));
+                    break child_exit_outcome(&lifecycle, "health_loop_failed");
                 }
             }
         };
@@ -1090,6 +1092,25 @@ const fn retire_requested(phase: LifecyclePhase) -> bool {
     matches!(phase, LifecyclePhase::Stopping | LifecyclePhase::Stopped)
 }
 
+/// Classifies a child exit observed by a supervision arm. The lifecycle alone
+/// decides: a child ending after the runtime requested retirement (`Stopping`)
+/// or vanished (the channel closed, so no later phase can arrive) is the clean
+/// teardown path — the lifecycle arm and the child arm are ready together then,
+/// and `select!` may observe either first — while a child ending under a live
+/// lifecycle that still keeps children alive is fatal under its exact class. The
+/// owner is deliberately not consulted: an external owner loss with a live
+/// lifecycle must still fail loud.
+fn child_exit_outcome(
+    lifecycle: &watch::Receiver<LifecycleSnapshot>,
+    error_class: &'static str,
+) -> Result<(), ModuleError> {
+    if lifecycle.has_changed().is_err() || retire_requested(lifecycle.borrow().phase) {
+        Ok(())
+    } else {
+        Err(module_error(error_class))
+    }
+}
+
 const fn module_error(error_class: &'static str) -> ModuleError {
     ModuleError {
         module: MODULE_NAME,
@@ -1220,9 +1241,9 @@ mod tests {
         EtcdClientConfig, EtcdConnectError, EtcdConnector, EtcdTlsConfig, EtcdTlsPolicy,
     };
     use control_plane::{
-        ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LogLevel,
-        MetricsPolicy, ModuleError, OwnerLease, OwnerScope, OwnershipRegistry, RuntimeEvent,
-        ShutdownReason, TlsPolicy,
+        ControlConfig, ControlModule, ControlRuntime, EventSink, LifecyclePhase, LifecycleSnapshot,
+        LogLevel, MetricsPolicy, ModuleError, OwnerLease, OwnerScope, OwnershipRegistry,
+        RuntimeEvent, ShutdownReason, TlsPolicy,
     };
     use tokio::sync::{Notify, watch};
 
@@ -1998,6 +2019,113 @@ mod tests {
             "a dropped lifecycle channel retires the registration"
         );
         Ok(())
+    }
+
+    /// A health child that mirrors the real loop's clean exit: it returns once the
+    /// process owner retires. It re-polls by waking itself (not `yield_now`, which
+    /// defers behind the driver), so on a single-threaded runtime it is re-queued
+    /// AHEAD of a module task woken by the same `drop`.
+    fn owner_retire_exit_health() -> HealthFactory {
+        Arc::new(|_feed, _publisher, _routing, owner: super::OwnerToken| {
+            tokio::spawn(std::future::poll_fn(move |cx| {
+                if owner.is_current() {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            }))
+        })
+    }
+
+    /// Supporting stress for the classifier (the deterministic lock is the
+    /// table-driven row below): dropping the runtime retires the owner (so a
+    /// health child exits cleanly) and closes the lifecycle channel in ONE
+    /// synchronous step, so the module's lifecycle arm and its health-supervision
+    /// arm become ready together. On a single-threaded runtime the self-waking
+    /// child is re-queued ahead of the woken module task, so both are ready at
+    /// the module's next `select!` poll, whose arm order is random. Whichever arm
+    /// is observed, the exit is a clean teardown — never `health_loop_failed`.
+    /// With the health arm made unconditional again, this row observes red.
+    #[tokio::test]
+    async fn a_dropped_lifecycle_with_a_cleanly_exiting_health_child_is_a_clean_teardown()
+    -> Result<(), TestError> {
+        for round in 0..16 {
+            let runtime = runtime()?;
+            let (task, mut handle) =
+                spawn_module_with_health(owner_retire_exit_health(), &runtime)?;
+            wait_ready(&mut handle).await?;
+            drop(runtime);
+            let outcome = tokio::time::timeout(Duration::from_secs(10), task).await??;
+            assert_eq!(
+                outcome,
+                Ok(()),
+                "round {round}: a child exiting during a dropped-lifecycle teardown is clean"
+            );
+        }
+        Ok(())
+    }
+
+    /// The child-exit classifier keys on the lifecycle alone, table-driven over
+    /// every phase: while the channel is live, `Starting`/`Ready`/`Quiescing`/
+    /// `Draining`/`Failed` all keep children alive, so a child exit there is fatal
+    /// under its exact class; `Stopping`/`Stopped` (retirement requested) and a
+    /// closed channel (the runtime is gone) are the clean teardown path. Which
+    /// `select!` arm observed the exit never enters the decision, so this locks
+    /// the semantics deterministically; the E2E row above is supporting stress.
+    #[test]
+    fn a_child_exit_is_classified_by_the_lifecycle_not_by_the_select_arm() {
+        const CLASSES: [&str; 3] = [
+            "registration_child_exited",
+            "routing_refresh_failed",
+            "health_loop_failed",
+        ];
+        let snapshot = |phase| LifecycleSnapshot {
+            phase,
+            owner_id: Arc::from("owner"),
+            owner_generation: 1,
+            config_generation: 1,
+            shutdown_reason: None,
+        };
+        let fatal = [
+            LifecyclePhase::Starting,
+            LifecyclePhase::Ready,
+            LifecyclePhase::Quiescing,
+            LifecyclePhase::Draining,
+            LifecyclePhase::Failed,
+        ];
+        let clean = [LifecyclePhase::Stopping, LifecyclePhase::Stopped];
+        let (tx, rx) = watch::channel(snapshot(LifecyclePhase::Starting));
+        for phase in fatal {
+            tx.send_replace(snapshot(phase));
+            for class in CLASSES {
+                assert_eq!(
+                    super::child_exit_outcome(&rx, class),
+                    Err(super::module_error(class)),
+                    "{phase:?}: a child exit under a live lifecycle is fatal"
+                );
+            }
+        }
+        for phase in clean {
+            tx.send_replace(snapshot(phase));
+            for class in CLASSES {
+                assert_eq!(
+                    super::child_exit_outcome(&rx, class),
+                    Ok(()),
+                    "{phase:?}: a child exit once retirement is requested is clean"
+                );
+            }
+        }
+        // Closed with the last value unseen: still clean (closed decides first).
+        tx.send_replace(snapshot(LifecyclePhase::Ready));
+        drop(tx);
+        for class in CLASSES {
+            assert_eq!(
+                super::child_exit_outcome(&rx, class),
+                Ok(()),
+                "a child exit after the lifecycle channel closed is clean"
+            );
+        }
     }
 
     /// The connect-count discovery oracle: discovery connects exactly once per
@@ -3888,15 +4016,21 @@ ns-servers = ["dns-a:53"]
         routing: &RoutingSnapshotHandle,
         want: u64,
     ) -> Result<Arc<RoutingSnapshot>, TestError> {
-        for _ in 0..2000 {
+        // Check, then wait on the crate-private publication watch: a version
+        // published between the check and the wait is still unseen, so `changed`
+        // returns at once and no edge is lost. A closed source fails closed.
+        let mut routing = routing.clone();
+        loop {
             if let Some(source) = routing.current()
                 && source.client_epoch == want
             {
                 return Ok(source);
             }
-            tokio::task::yield_now().await;
+            routing
+                .changed()
+                .await
+                .map_err(|_| "the routing source closed before the wanted epoch")?;
         }
-        Err("routing never published the wanted epoch".into())
     }
 
     /// Waits until the health overlay is published for the EXACT source and asserts
