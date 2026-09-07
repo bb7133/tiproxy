@@ -3017,8 +3017,84 @@ ns-servers = [{ns_servers}]
     use control_topology::{HealthOverlayHandle, HealthSnapshot};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// The merged backend id for `ADDR_A` under `CLUSTER_NAME` (`{cluster}/{addr}`).
-    const BACKEND_ID: &str = "cluster-a/10.0.0.1:4000";
+    /// The merged backend id (`{cluster}/{addr}`) of the one backend the health
+    /// rows seed, whose SQL `addr` is the loopback greeter at `sql_port`.
+    fn backend_id(sql_port: u16) -> String {
+        format!("{CLUSTER_NAME}/127.0.0.1:{sql_port}")
+    }
+
+    /// The seeded backend's SQL address: the loopback greeter.
+    fn sql_addr(greeter: &SqlGreeter) -> String {
+        format!("127.0.0.1:{}", greeter.port)
+    }
+
+    // ----- The controllable loopback `MySQL` greeting server ----------------
+
+    /// What the loopback SQL port sends as its first packet, snapshotted at
+    /// accept time.
+    #[derive(Clone, Copy)]
+    enum Greeting {
+        /// A `HandshakeV10`-shaped packet (`0x0a` first byte): a live SQL layer.
+        V10,
+        /// An `ERR` packet (`0xff` first byte): the SQL layer refuses sessions.
+        Err,
+    }
+
+    /// A loopback SQL greeter: counts accepted connections and answers each with
+    /// the CURRENT scripted greeting, so a row can flip the SQL verdict while the
+    /// `/status` port stays healthy.
+    #[derive(Clone)]
+    struct SqlGreeter {
+        greeting: Arc<Mutex<Greeting>>,
+        accepted: Arc<AtomicUsize>,
+        port: u16,
+    }
+
+    impl SqlGreeter {
+        fn set(&self, greeting: Greeting) {
+            *self.greeting.lock().unwrap_or_else(PoisonError::into_inner) = greeting;
+        }
+
+        fn accepted_count(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn spawn_sql_greeter(greeting: Greeting) -> SqlGreeter {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|error| unreachable!("bind greeter: {error}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("greeter addr: {error}"))
+            .port();
+        let greeter = SqlGreeter {
+            greeting: Arc::new(Mutex::new(greeting)),
+            accepted: Arc::new(AtomicUsize::new(0)),
+            port,
+        };
+        let serving = greeter.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                serving.accepted.fetch_add(1, Ordering::SeqCst);
+                let greeting = *serving
+                    .greeting
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                tokio::spawn(async move {
+                    let packet: &[u8] = match greeting {
+                        Greeting::V10 => &[3, 0, 0, 0, 0x0a, b'8', 0],
+                        Greeting::Err => &[3, 0, 0, 0, 0xff, 0x14, 0x04],
+                    };
+                    let _ = stream.write_all(packet).await;
+                });
+            }
+        });
+        greeter
+    }
 
     // ----- The controllable loopback HTTP/1.1 `/status` server --------------
 
@@ -3386,7 +3462,11 @@ ns-servers = [{ns_servers}]
         let body = async {
             let server =
                 spawn_status_server(StatusBehavior::Ok200("v-health-200".to_owned())).await;
-            let Some((_fixture, addr)) = spawn_fixture(seed_at(ADDR_A, server.port)).await else {
+            let greeter = spawn_sql_greeter(Greeting::V10).await;
+            let backend_id = backend_id(greeter.port);
+            let Some((_fixture, addr)) =
+                spawn_fixture(seed_at(&sql_addr(&greeter), server.port)).await
+            else {
                 unreachable!("the fixture binds an ephemeral loopback port");
             };
             let comp = build_composition(addr, "").await;
@@ -3402,7 +3482,7 @@ ns-servers = [{ns_servers}]
                 &overlay,
                 &comp.routing,
                 &r,
-                BACKEND_ID,
+                backend_id.as_str(),
                 true,
                 Some("v-health-200"),
                 0,
@@ -3411,9 +3491,12 @@ ns-servers = [{ns_servers}]
                 None,
             )
             .await;
-            assert!(h200.get(BACKEND_ID).healthy, "the 200 verdict is healthy");
+            assert!(
+                h200.get(backend_id.as_str()).healthy,
+                "the 200 verdict is healthy"
+            );
             assert_eq!(
-                h200.get(BACKEND_ID).server_version.as_deref(),
+                h200.get(backend_id.as_str()).server_version.as_deref(),
                 Some("v-health-200"),
                 "the healthy version came from the HTTP /status body"
             );
@@ -3426,7 +3509,7 @@ ns-servers = [{ns_servers}]
                 &overlay,
                 &comp.routing,
                 &r,
-                BACKEND_ID,
+                backend_id.as_str(),
                 false,
                 None,
                 baseline_500,
@@ -3436,7 +3519,7 @@ ns-servers = [{ns_servers}]
             )
             .await;
             assert!(
-                !h500.get(BACKEND_ID).healthy,
+                !h500.get(backend_id.as_str()).healthy,
                 "the 500 verdict is unhealthy"
             );
             assert!(
@@ -3453,7 +3536,7 @@ ns-servers = [{ns_servers}]
                 &overlay,
                 &comp.routing,
                 &r,
-                BACKEND_ID,
+                backend_id.as_str(),
                 false,
                 None,
                 baseline_hang,
@@ -3466,7 +3549,7 @@ ns-servers = [{ns_servers}]
                 server.request_count() - baseline_hang >= 4,
                 "the hung phase exercised the full 4-attempt retry budget"
             );
-            let verdict = h_timeout.get(BACKEND_ID);
+            let verdict = h_timeout.get(backend_id.as_str());
             assert!(!verdict.healthy, "the hung verdict is unhealthy");
             assert!(
                 verdict.server_version.is_none(),
@@ -3513,7 +3596,11 @@ ns-servers = [{ns_servers}]
     async fn an_epoch_rotation_realigns_health_provenance_and_fails_the_old_source_closed() {
         let body = async {
             let server = spawn_status_server(StatusBehavior::Ok200("v-rot".to_owned())).await;
-            let Some((fixture, addr)) = spawn_fixture(seed_at(ADDR_A, server.port)).await else {
+            let greeter = spawn_sql_greeter(Greeting::V10).await;
+            let backend_id = backend_id(greeter.port);
+            let Some((fixture, addr)) =
+                spawn_fixture(seed_at(&sql_addr(&greeter), server.port)).await
+            else {
                 unreachable!("the fixture binds an ephemeral loopback port");
             };
             let comp = build_composition(addr, "").await;
@@ -3525,7 +3612,7 @@ ns-servers = [{ns_servers}]
                 &overlay,
                 &comp.routing,
                 &r0,
-                BACKEND_ID,
+                backend_id.as_str(),
                 true,
                 Some("v-rot"),
                 0,
@@ -3534,7 +3621,10 @@ ns-servers = [{ns_servers}]
                 None,
             )
             .await;
-            assert!(h0.get(BACKEND_ID).healthy, "the E0 source is healthy");
+            assert!(
+                h0.get(backend_id.as_str()).healthy,
+                "the E0 source is healthy"
+            );
 
             // Rotate the exact cluster MATERIAL (add a literal nameserver), keeping
             // the backend KV content identical; the PD/backend endpoints stay
@@ -3588,7 +3678,7 @@ ns-servers = [{ns_servers}]
                 &overlay,
                 &comp.routing,
                 &r1,
-                BACKEND_ID,
+                backend_id.as_str(),
                 true,
                 Some("v-rot"),
                 baseline,
@@ -3598,7 +3688,7 @@ ns-servers = [{ns_servers}]
             )
             .await;
             assert!(
-                h1.get(BACKEND_ID).healthy,
+                h1.get(backend_id.as_str()).healthy,
                 "the E1 source is healthy through an E1-stamped network"
             );
             assert!(
@@ -3623,7 +3713,10 @@ ns-servers = [{ns_servers}]
         let body = async {
             // Ok200 that must NEVER be hit: a disabled runtime opens no socket.
             let server = spawn_status_server(StatusBehavior::Ok200("never".to_owned())).await;
-            let Some((fixture, addr)) = spawn_fixture(seed_at(ADDR_A, server.port)).await else {
+            let greeter = spawn_sql_greeter(Greeting::V10).await;
+            let Some((fixture, addr)) =
+                spawn_fixture(seed_at(&sql_addr(&greeter), server.port)).await
+            else {
                 unreachable!("the fixture binds an ephemeral loopback port");
             };
             // The SAME public constructor, with a checked disabled health config.
@@ -3681,6 +3774,111 @@ ns-servers = [{ns_servers}]
                 server.request_count(),
                 0,
                 "a disabled runtime sends no /status request"
+            );
+            assert_eq!(
+                greeter.accepted_count(),
+                0,
+                "a disabled runtime dials no SQL port either"
+            );
+
+            comp.task.abort();
+            drop(comp.runtime);
+        };
+        with_real_wall_clock_watchdog(body).await;
+    }
+
+    // ----- Row R4: the SQL greeting flips under a steady 200 status ---------
+
+    /// The combined verdict on the REAL pipeline (CP-TOPO #215-3): with the
+    /// `/status` port answering 200 throughout, the SQL greeting alone flips the
+    /// backend V10 -> ERR -> V10. The ERR round is unhealthy yet RETAINS the
+    /// status version (Go keeps `ServerVersion` across `checkSqlPort`), spends the
+    /// SQL retry budget, and the next V10 round recovers.
+    #[tokio::test]
+    async fn a_backend_health_flips_through_the_real_sql_greeting() {
+        let body = async {
+            let server = spawn_status_server(StatusBehavior::Ok200("v-sql".to_owned())).await;
+            let greeter = spawn_sql_greeter(Greeting::V10).await;
+            let backend_id = backend_id(greeter.port);
+            let Some((_fixture, addr)) =
+                spawn_fixture(seed_at(&sql_addr(&greeter), server.port)).await
+            else {
+                unreachable!("the fixture binds an ephemeral loopback port");
+            };
+            let comp = build_composition(addr, "").await;
+            let overlay = comp.handle.health_overlay_handle();
+            let r = first_snapshot(&comp.routing).await;
+
+            // Phase V10: 200 + a live greeting -> healthy with the status version.
+            let h_live = wait_health(
+                &overlay,
+                &comp.routing,
+                &r,
+                backend_id.as_str(),
+                true,
+                Some("v-sql"),
+                0,
+                1,
+                &server,
+                None,
+            )
+            .await;
+            assert!(h_live.get(backend_id.as_str()).healthy);
+            assert!(
+                greeter.accepted_count() >= 1,
+                "the SQL stage dialed the greeter after the status stage passed"
+            );
+
+            // Phase ERR: the status port still answers 200, but the SQL layer
+            // refuses -> unhealthy, version retained, SQL retry budget spent.
+            greeter.set(Greeting::Err);
+            let sql_baseline = greeter.accepted_count();
+            let status_baseline = server.request_count();
+            let h_err = wait_health(
+                &overlay,
+                &comp.routing,
+                &r,
+                backend_id.as_str(),
+                false,
+                Some("v-sql"),
+                status_baseline,
+                1,
+                &server,
+                Some(&h_live),
+            )
+            .await;
+            let verdict = h_err.get(backend_id.as_str());
+            assert!(!verdict.healthy, "an ERR greeting fails the backend");
+            assert_eq!(
+                verdict.server_version.as_deref(),
+                Some("v-sql"),
+                "the status stage's version is retained across the SQL failure (Go)"
+            );
+            assert!(
+                greeter.accepted_count() - sql_baseline >= 4,
+                "the ERR greeting was retried across the full 1 + 3 budget"
+            );
+
+            // Phase V10 again: the SQL layer recovers -> healthy with the version.
+            greeter.set(Greeting::V10);
+            let status_baseline = server.request_count();
+            let h_back = wait_health(
+                &overlay,
+                &comp.routing,
+                &r,
+                backend_id.as_str(),
+                true,
+                Some("v-sql"),
+                status_baseline,
+                1,
+                &server,
+                Some(&h_err),
+            )
+            .await;
+            assert!(h_back.get(backend_id.as_str()).healthy, "recovered");
+            assert!(
+                !overlay.still_current_for(&h_err, &r, &comp.routing),
+                "the ERR overlay is de-authorized once the recovered round publishes"
             );
 
             comp.task.abort();
