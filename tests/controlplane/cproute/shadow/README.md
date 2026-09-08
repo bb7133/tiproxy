@@ -106,3 +106,30 @@ Native factor construction has not installed that binding in production yet.
 No production clock callsite is changed. The next implementation adds the actual
 native factor read tape, bounded storage and independent Rust comparison under
 [frozen v1.1](read-contract.md); full 2B acceptance remains pending.
+
+## Native time prerequisites (2B-1b)
+
+`make controlplane-cproute-time-evidence` verifies the bounded Go time projection
+and the shared pure Rust `control-routing::go_time` arithmetic. The gate uses
+fresh actual Go Add/Sub/Equal/raw-identity outputs (12 clock rows and 5 sample
+rows), separate startup zone-limit processes at512/513 bytes, complete observation
+Go race tests, Rust domain tests and24 compiling mutations. It preserves the
+existing26 foundation,31 recorder and24 v1 mutations and the fixed60s windows.
+
+TimeProjection is not yet installed in native factor construction. Its fixed
+128-pointer Location registry is bounded to2KiB of entries per owner on64-bit
+Go (at most256KiB across128 owners); no entries are evicted or reused. Origin
+construction receives two already captured startup values and validates their
+raw monotonic suffix difference against Sub; only Go1.25.12 is supported.
+Per-evaluation projection does not format time, reread a clock or use unsafe or
+reflection; test-only Sizeof checks the fixed dictionary layout. Rust separately
+tests raw-monotonic reconstruction at int64 equality/overflow and Add stripping.
+Synthetic extreme monotonic operands in these Rust tests are not presented as
+Go-created runtime values; the Go oracle uses only public time operations.
+
+This prerequisite still uses v2 lifecycle-only transport, with all factor,
+selection and scheduler coverage false. The origin's version/baseline metadata
+and time values are not yet in a v3 codec. Production factor time callsites and
+existing Rust resource-factor arithmetic remain unchanged. Actual native capture,
+arenas/publication, codec, retained factor histories and independent comparison
+remain required before claiming2B-1 complete.

@@ -298,3 +298,36 @@ rejects zero at schema decoding. Missing/empty results use explicit result kinds
 an absent publication is represented by the corresponding structural variant,
 not a fabricated zero publication ID. The compiling fault that replaces immediate
 Go owner invalidation with zero identity and continued publication must fail.
+
+## Time representation clarification (9789981d, c2679eb6, 2caac6b6)
+
+Every v3 time value has an explicit arithmetic domain. Go time.Time carries
+internal year-1 wall seconds, nanoseconds, owner-local Location pointer-identity
+token, monotonic presence and relative nanoseconds. Raw cache equality includes
+the Location token, even for different pointers with the same name/offset.
+Prometheus model.Time retains signed millisecond ticks; subtraction and subsequent
+multiplication by1ms both wrap. They must not use Go time.Time saturating Sub.
+
+A process/nonce startup origin carries `origin_baseline_present`, its raw Go
+monotonic baseline and the Go toolchain version. Only the audited Go1.25.12
+representation is accepted. Before formatting either of two startup-captured
+values, bound its zone name to512 bytes. Strictly parse the monotonic suffix and
+verify that the exact raw difference equals the second value's Sub(origin).
+Reject unknown formatting, overflow, toolchains or self-check mismatch for the
+whole observation process. The extra clock sample is startup-only.
+
+Retain128 distinct Location pointers per owner in a fixed array (2KiB of entries
+on64-bit Go,256KiB across128 owners); never evict/reuse identities. Boundary128
+is allowed;129 invalidates observation without changing Go routing. Projecting
+a monotonic time against a wall-only origin, or a saturated Sub(origin), also
+invalidates observation. The v3 consumer rejects a needed but absent baseline,
+raw-ext reconstruction overflow, zero Location token or invalid packed-wall data.
+
+Rust GoTime Add reproduces wall normalization, packed-wall range stripping,
+Go's signed-second overflow clamps and monotonic-overflow stripping. Domain
+mutations independently change sample wrapping to saturation and Go saturation
+to wrapping. Other mutations normalize Location names, bypass startup validation,
+format/resample on the hot path, retain monotonic data after overflow, or accept
+an unrepresentable baseline reconstruction. Health all-empty/zero-time expiry,
+N<=1/Empty early exits and three Since callsite read order remain native-capture
+acceptance obligations; these pure prerequisites do not qualify those paths.

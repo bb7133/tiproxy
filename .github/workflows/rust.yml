@@ -400,6 +400,8 @@ jobs:
         run: make controlplane-cproute-recorder-evidence
       - name: Verify mixed capture leases and actual metrics read provenance
         run: make controlplane-cproute-read-foundation-evidence
+      - name: Verify exact Go clocks and independent time arithmetic
+        run: make controlplane-cproute-time-evidence
 
   supply-chain:
     name: Audit dependencies and policy
