@@ -10,6 +10,7 @@ python3 tests/controlplane/cproute/shadow/isolation.py "$root"
 cargo test --locked --manifest-path rust/Cargo.toml -p control-router shadow::
 cargo test --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow
 cargo test --locked --manifest-path rust/Cargo.toml -p tiproxy-rs routing_observer
+cargo test --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow --example live_socket_check
 cargo build --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow --examples
 CP_ROUTE_LIVE_FRAMES="$task_tmp/actual.frames" go test -race ./pkg/balance/router -run '^TestObservationActualLifecycle$' -count=1 -v
 rust/target/debug/examples/live_check "$task_tmp/actual.frames"

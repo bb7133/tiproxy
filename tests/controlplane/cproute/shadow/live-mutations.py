@@ -56,7 +56,10 @@ CASES = [
  rust('missing-account-witness-accepted','batch_witness_is_output_and_failure_keeps_previous_compared_sequence','LIVE_WITNESS',[edit(DOMAIN,'required != observed','(!observed.is_empty() && required != observed)')]),
  rust('reconnect-changes-redirect-accounting','reconnect_marker_never_changes_redirect_accounting_or_v1_pending_set','LIVE_RECONNECT_NOT_REDIRECT',[edit(LEDGER,'s.reconnect = Some(operation);','self.change(&[(account, [0, 0, 1, 1])], None, None)?;\n s.redirect = Some((operation,account,account));')]),
  rust('unpaired-selection-only-marked-closed','unpaired_selection_cannot_refund_and_invalid_owner_never_recovers','LIVE_SELECTION_DISCARD',[edit(LEDGER,' || s.reservation.is_some()','', '    pub(super) fn selection_done(', '    // Administrative Go reconnection')]),
+ rust('foreign-progress-qualifies-known-owner','omitted_group_history_replayed_nonce_and_batch_overflow_invalidate','LIVE_PROGRESS_IDENTITY',[edit(DOMAIN,'owner.epoch != epoch','false','    pub fn progress(', '    /// Read an explicit diagnostic snapshot')]),
  rust('live-batch-limit-expanded','omitted_group_history_replayed_nonce_and_batch_overflow_invalidate','LIVE_BATCH_BOUND',[edit(DOMAIN,'batch.events.len() > MAX_EVENTS','batch.events.len() > MAX_EVENTS+1')]),
+ ('producer-cause-discarded','rust','legacy-router-shadow','consumer::tests::consumer_invalid_summary_and_bad_frames_never_advance_progress','LIVE_PRODUCER_REASON',[edit('rust/crates/legacy-router-shadow/src/consumer.rs','.insert(epoch, (reason, last_admitted));','.get(&epoch); let _ = (reason,last_admitted);')]),
+ ('owner-total-added-without-replacement','rust','legacy-router-shadow','consumer::tests::incremental_report_preserves_other_owners_and_replaces_one_contribution','LIVE_INCREMENTAL_TOTALS',[edit('rust/crates/legacy-router-shadow/src/consumer.rs','report.score - previous.0 + totals.0','report.score + totals.0')]),
  ('v2-unknown-envelope-fields-ignored','rust','legacy-router-shadow','live_tests::live_go_golden_and_strict_schema','LIVE_STRICT_SCHEMA',[edit(WIRE,', deny_unknown_fields','', '#[serde(tag = "kind"', 'enum WireFrame')]),
 ]
 

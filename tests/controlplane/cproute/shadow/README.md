@@ -46,6 +46,9 @@ storage; both queued and writer-owned batches hold their credit. Hard limits are
 4096records,64MiB and a1MiB frame body. The128owner registry retains tombstones.
 Overflow emits an out-of-band invalid summary even when the queue is full;
 last_admitted never advances Rust's compared sequence. Invalid state is sticky.
+Rust diagnostics retain the original producer cause and
+last admitted sequence separately from comparison progress; per-frame totals
+refresh only the changed owner, with full refresh on interval loss or shutdown.
 
 Actual administrative same-backend reconnects use a separate marker with no
 incoming/outgoing redirect accounting. They can reorder physical arrival within
@@ -57,14 +60,18 @@ the same account. The v1 ordinary redirect semantics and wire bytes remain intac
   strict framing, API/dependency isolation and24 compiling mutations.
 - `make controlplane-cproute-recorder-evidence`: actual factory/router capture,
   independent v2 comparison, real UDS faults, lifecycle rollback/join, bounded
-  recorder faults and28 additional compiling mutations. A separate30-minute CI
+  recorder faults and31 additional compiling mutations. A separate30-minute CI
   job runs it, retaining all existing control-plane jobs.
 
 The positive recorder workload is fixed:60seconds, two owners, two groups per
 owner, eight clients,200accepted lifecycle operations/second, plus concurrent
 backend publication. Disabled and enabled workloads use identical work. The gate
 requires12000operations, continuous comparison, zero invalid/mismatch/loss and
-settled independent totals. It reports queue/bytes and cycle/group-lock latency
+settled independent totals. Before PASS, the test consumer must independently
+compare through each complete owner epoch's final admitted sequence, including
+metadata after the final business operation. Those boundaries travel only over
+test-control stdin, never as inputs to the mirror or as reverse UDS traffic.
+It reports queue/bytes and cycle/group-lock latency
 percentiles. A separate helper microtiming uses actual wrapper state but repeated
 diagnostic input; that component measurement never counts as lifecycle evidence.
 

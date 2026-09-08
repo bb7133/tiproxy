@@ -92,6 +92,15 @@ func (o *Owner) Epoch() Epoch {
 	return o.epoch
 }
 
+// AdmittedSequence reads producer metadata only. It does not imply delivery or
+// successful Rust comparison; consumers must independently reach this boundary.
+func (o *Owner) AdmittedSequence() uint64 {
+	if o == nil {
+		return 0
+	}
+	return o.admitted.Load()
+}
+
 // NextIdentity allocates diagnostic group/account/session/operation identities.
 // Exhaustion invalidates this owner; a wrapped value is never reused.
 func (o *Owner) NextIdentity() uint64 {

@@ -48,6 +48,10 @@ pub struct Report {
     pub transport_errors: u64,
     /// Last status and successfully compared sequence, bounded to 128 owners.
     pub owners: BTreeMap<Epoch, Progress>,
+    /// Original producer cause and last admitted sequence, never comparison proof.
+    pub producer_invalid: BTreeMap<Epoch, (live::InvalidCause, u64)>,
+    // Per-owner contributions avoid rescanning every account on every frame.
+    totals_by_owner: BTreeMap<Epoch, (u64, u64)>,
 }
 /// Read-only diagnostic handle. The consumer never calls a production object.
 #[derive(Clone)]
@@ -136,7 +140,7 @@ async fn run(path: &Path, mut shutdown: watch::Receiver<bool>, diagnostics: &Dia
                 }
             }
             state.transport_lost();
-            publish(&state, &epochs, diagnostics);
+            publish(&state, &epochs, diagnostics, None);
             if *shutdown.borrow() {
                 break;
             }
@@ -162,7 +166,7 @@ async fn run(path: &Path, mut shutdown: watch::Receiver<bool>, diagnostics: &Dia
         tokio::select! {_=shutdown.changed()=>break,()=tokio::time::sleep(Duration::from_millis(500))=>{}}
     }
     state.transport_lost();
-    publish(&state, &epochs, diagnostics);
+    publish(&state, &epochs, diagnostics, None);
 }
 
 async fn connect(path: &Path) -> Result<UnixStream, &'static str> {
@@ -199,11 +203,12 @@ async fn consume(
     let mut last_report = Instant::now();
     loop {
         let frame = read_frame(stream).await?;
-        match live::decode(&frame).map_err(|_| "schema")? {
+        let changed = match live::decode(&frame).map_err(|_| "schema")? {
             Frame::Coverage { process, nonce } => {
                 if identity.replace((process, nonce)).is_some() {
                     return Err("duplicate_coverage");
                 }
+                None
             }
             Frame::Batch(batch) => {
                 if identity != Some((batch.epoch.process, batch.epoch.nonce)) {
@@ -215,25 +220,7 @@ async fn consume(
                 epochs.insert(batch.epoch, Instant::now());
                 let progress = state.observe(&batch);
                 let operations = if progress.status == Status::Comparing {
-                    batch
-                        .events
-                        .iter()
-                        .filter(|event| {
-                            matches!(
-                                event,
-                                control_router::shadow::live::LiveEvent::Lifecycle {
-                                    event: Event::Reserve { .. }
-                                        | Event::Created { .. }
-                                        | Event::Redirect { .. }
-                                        | Event::Redirected { .. }
-                                        | Event::Closing { .. }
-                                        | Event::Closed(_)
-                                        | Event::Rehydrate { .. },
-                                    ..
-                                }
-                            )
-                        })
-                        .count()
+                    business_operations(&batch.events)
                 } else {
                     0
                 };
@@ -244,8 +231,13 @@ async fn consume(
                 report.batches += 1;
                 report.operations += u64::try_from(operations).map_err(|_| "operation_count")?;
                 report.events += u64::try_from(batch.events.len()).map_err(|_| "event_count")?;
+                Some(batch.epoch)
             }
-            Frame::Invalid { epoch, .. } => {
+            Frame::Invalid {
+                epoch,
+                reason,
+                last_admitted,
+            } => {
                 if identity != Some((epoch.process, epoch.nonce)) {
                     return Err("identity");
                 }
@@ -254,17 +246,31 @@ async fn consume(
                 }
                 epochs.insert(epoch, Instant::now());
                 state.invalidate(epoch, InvalidReason::Transport);
+                diagnostics
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .producer_invalid
+                    .insert(epoch, (reason, last_admitted));
+                Some(epoch)
             }
-        }
+        };
+        let mut expired = false;
         let now = Instant::now();
         for (epoch, last) in epochs.iter() {
             if now.duration_since(*last) > STALE_DEADLINE
                 && state.progress(*epoch).status == Status::Comparing
             {
                 state.invalidate(*epoch, InvalidReason::Stale);
+                expired = true;
             }
         }
-        publish(state, epochs, diagnostics);
+        publish(
+            state,
+            epochs,
+            diagnostics,
+            if expired { None } else { changed },
+        );
         if last_report.elapsed() >= Duration::from_secs(10) {
             let report = diagnostics.snapshot();
             let invalid = report
@@ -282,14 +288,41 @@ async fn consume(
         }
     }
 }
-fn publish(state: &LiveState, epochs: &BTreeMap<Epoch, Instant>, diagnostics: &Diagnostics) {
+fn business_operations(events: &[control_router::shadow::live::LiveEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                control_router::shadow::live::LiveEvent::Lifecycle {
+                    event: Event::Reserve { .. }
+                        | Event::Created { .. }
+                        | Event::Redirect { .. }
+                        | Event::Redirected { .. }
+                        | Event::Closing { .. }
+                        | Event::Closed(_)
+                        | Event::Rehydrate { .. },
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+fn publish(
+    state: &LiveState,
+    epochs: &BTreeMap<Epoch, Instant>,
+    diagnostics: &Diagnostics,
+    only: Option<Epoch>,
+) {
     let mut report = diagnostics
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    report.score = 0;
-    report.physical = 0;
-    for epoch in epochs.keys() {
+    for epoch in epochs
+        .keys()
+        .filter(|epoch| only.is_none_or(|key| key == **epoch))
+    {
         let progress = state.progress(*epoch);
         if matches!(progress.status, Status::Invalid(_))
             && report
@@ -298,15 +331,22 @@ fn publish(state: &LiveState, epochs: &BTreeMap<Epoch, Instant>, diagnostics: &D
                 .is_none_or(|old| !matches!(old.status, Status::Invalid(_)))
         {
             eprintln!(
-                "routing_shadow lifecycle_only=true owner={} process={} compared={} invalid={:?}",
-                epoch.owner, epoch.process, progress.compared_sequence, progress.status
+                "routing_shadow lifecycle_only=true owner={} process={} compared={} invalid={:?} producer={:?}",
+                epoch.owner,
+                epoch.process,
+                progress.compared_sequence,
+                progress.status,
+                report.producer_invalid.get(epoch)
             );
         }
         report.owners.insert(*epoch, progress);
-        if let Some((score, physical)) = state.totals(*epoch) {
-            report.score += score;
-            report.physical += physical;
-        }
+        let totals = state.totals(*epoch).unwrap_or_default();
+        let previous = report
+            .totals_by_owner
+            .insert(*epoch, totals)
+            .unwrap_or_default();
+        report.score = report.score - previous.0 + totals.0;
+        report.physical = report.physical - previous.1 + totals.1;
     }
 }
 

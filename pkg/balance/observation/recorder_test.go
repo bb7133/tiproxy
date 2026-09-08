@@ -56,6 +56,9 @@ func TestRecorderBatchSequenceAcrossConcurrentGroups(t *testing.T) {
 		delivery.Release()
 	}
 	require.Equal(t, map[uint64]uint64{1: 1025, 2: 1025}, sequences)
+	for _, owner := range owners {
+		require.Equal(t, sequences[owner.Epoch().Owner], owner.AdmittedSequence(), "RECORDER_ADMITTED_BOUNDARY")
+	}
 	require.Empty(t, r.InvalidOwners(), "RECORDER_CONCURRENT_CAPTURE")
 	records, bytes := r.Retained()
 	require.Zero(t, records)

@@ -309,6 +309,13 @@ fn omitted_group_history_replayed_nonce_and_batch_overflow_invalidate() {
     let mut wrong = batch(4, vec![life(Event::Watermark)], Witness::default());
     wrong.epoch.nonce = 44;
     assert_eq!(
+        state.progress(wrong.epoch).status,
+        Status::Invalid(InvalidReason::Identity),
+        "LIVE_PROGRESS_IDENTITY"
+    );
+    assert_eq!(state.progress(wrong.epoch).compared_sequence, 3);
+    assert_eq!(state.progress(epoch(1)).status, Status::Comparing);
+    assert_eq!(
         state.observe(&wrong).status,
         Status::Invalid(InvalidReason::Identity)
     );

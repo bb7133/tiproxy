@@ -58,9 +58,10 @@ production control-protocol message, Rust routing authority or second service.
   retain it; do not close production objects or report a clean retirement. The
   replacement namespace independently starts a fresh owner. After Invalid,
   retain only known ledger/queued tail/Invalid summaries, without new witness
-  copying or a final-settlement claim. Late Retire/End also cannot clear Invalid. Normal Router.Close
-  may record Retire; End additionally requires a fully settled retained tail.
-  Any later actual operation after End invalidates that interval.
+  copying or a final-settlement claim. In slice2A, Router.Close immediately
+  records Invalid(Shutdown), without Retire or End; this slice makes no CleanEnded
+  claim. The v1 foundation retains Retire/End for complete owned corpus traces,
+  and neither can clear an already Invalid interval.
 
 ## Actual capture and witnesses
 
@@ -78,7 +79,7 @@ read an alternative clock or write connScore/connList/phase/forceClosing.
 | redirectConn | Accepted or refused issuance, actual operation number/from/to; score movement on acceptance. Capture force-close and cross-keyspace refusal without introducing observer effects. |
 | onRedirectFinished / OnConnClosed | Actual terminal identity, duplicate/closed no-op, physical arrival/movement and exact close/result ordering. |
 | CloseTimedOutFailoverConnections | Actual ForceClose acceptance/refusal; closing marker without prematurely settling score or physical ownership. |
-| Namespace removal / Router.Close | Explicit disappearance invalidation versus Retire; retained tail and truthful End. |
+| Namespace removal / Router.Close | OwnerDisappeared or Shutdown invalidation with retained diagnostic tail; slice2A emits neither Retire nor End. |
 
 Witnesses are outputs, never Rust inputs. For every changed account capture Go's
 actual ConnScore, connList.Len and physical head/tail IDs; capture the affected
@@ -116,8 +117,10 @@ section has no I/O, callback, producer read, queue wait or admission retry.
 This explicitly amends the parent v1.2 phrase that producer contention itself
 invalidates an epoch: ordinary same-owner group concurrency is serialized;
 failed nonblocking queue/budget admission still invalidates.
-Inside that leaf lock: reserve bounded aggregate record/byte budget, assign the
-next sequence and attempt nonblocking buffered-channel admission. Advance the
+Inside that leaf lock, one credit simultaneously reserves a record and its
+fixed BatchCharge in bytes. Credit capacity is the smaller of the record limit
+and floor(byte limit / BatchCharge). Then assign the next sequence and attempt
+nonblocking buffered-channel admission. Advance the
 stored sequence only for the admitted batch. No fetch_add sequence followed by
 an independently ordered enqueue; no waiting for queue space, I/O or retry loop.
 Capacity/oversize/sequence exhaustion invalidate the owner
@@ -129,7 +132,9 @@ socket dequeue from contending with a hot path. The aggregate channel is bounded
 at4096 records and64MiB charged retained bytes, with frame body <=1MiB. Count
 queued and drain-owned pending data until released; no unbounded batch or
 unaccounted writer backlog. Initially witnesses are fixed-size; compute a safe
-encoded upper bound before admission and verify actual encoded size off locks.
+encoded upper bound before admission; off locks, the encoder separately checks
+actual encoded length including the prefix <= BatchCharge. Records and bytes are
+separate configured limits enforced together by that single credit.
 Retained owner/account/session registries have explicit caps and tombstones.
 
 An out-of-band atomic invalidation slot per bounded owner lets the drain publish
@@ -194,13 +199,18 @@ closes listener/writer and joins both tasks, without manufacturing CleanEnded.
    watermark stall, shutdown and startup rollback. Go control routing/accounting
    continue and no observer task/FD remains after join.
 4. Recorder tests prove Invalid-before-copy, atomic batch sequence/admission,
-   independent count and byte budgets at equality/+1, no lock/I/O callback from
+   both configured count/byte limits at equality/+1 using their shared minimum
+   credit capacity, no lock/I/O callback from
    drain, no growing invalid tombstones or writer backlog. Compile each injected
    fault first, require its named assertion, and restore the baseline.
 5. Positive concurrent capture: two owners, two groups per owner, eight clients,
    200 accepted lifecycle operations/second total for60 seconds, plus concurrent
    backend publication. Require nonzero coverage of all exercised operations,
-   zero gap/loss/Invalid/mismatch and exact drained totals. Capacity/slow-reader
+   zero gap/loss/Invalid/mismatch and exact drained totals. The test consumer must
+   also independently compare through each full owner epoch's final admitted
+   sequence, including the final metadata tail; those boundaries travel only over
+   test-control stdin and never become mirror inputs or reverse UDS traffic.
+   Capacity/slow-reader
    negative runs separately prove bounded invalidation and unaffected routing.
    This is a recorder integration gate, not the later real-TiDB load acceptance.
 6. Record enabled/disabled retained bytes, queue high-water, capture latency and

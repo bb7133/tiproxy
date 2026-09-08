@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Test harness for the exact consumer task used inside tiproxy-rs.
-use control_router::shadow::Status;
+use control_router::shadow::{Epoch, Status};
 use legacy_router_shadow::consumer::Task;
 use std::{io, path::PathBuf, time::Duration};
 #[tokio::main]
@@ -14,7 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // test process's stdin. Nothing travels back through the observation UDS.
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
-    let expected: u64 = line.trim().parse()?;
+    let target = parse_target(&line)?;
+    let expected = target.operations;
     let result = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let report = diagnostics.snapshot();
@@ -25,7 +26,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return Err("invalid owner");
             }
-            if report.operations >= expected && report.score == 0 && report.physical == 0 {
+            let compared_tail = target.boundaries.iter().all(|(epoch, sequence)| {
+                report.owners.get(epoch).is_some_and(|p| {
+                    p.status == Status::Comparing && p.compared_sequence >= *sequence
+                })
+            });
+            if compared_tail
+                && report.operations >= expected
+                && report.score == 0
+                && report.physical == 0
+            {
                 return Ok(report);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -43,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("unexpected live report: {report:?}").into());
     }
     println!(
-        "lifecycle_only=true owners={} operations={} batches={} events={} score={} physical={} invalid=0 mismatch=0 connections={} transport_errors={}",
+        "lifecycle_only=true owners={} operations={} batches={} events={} score={} physical={} invalid=0 mismatch=0 connections={} transport_errors={} compared_tail=true",
         report.owners.len(),
         report.operations,
         report.batches,
@@ -54,4 +64,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.transport_errors
     );
     Ok(())
+}
+
+struct Target {
+    operations: u64,
+    boundaries: Vec<(Epoch, u64)>,
+}
+fn parse_target(line: &str) -> Result<Target, Box<dyn std::error::Error>> {
+    let mut fields = line.split_whitespace();
+    let operations = fields.next().ok_or("operations required")?.parse()?;
+    let mut boundaries = Vec::new();
+    for field in fields {
+        let numbers = field
+            .split(':')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let [process, owner, nonce, sequence] = numbers.as_slice() else {
+            return Err("complete epoch and sequence required".into());
+        };
+        let epoch = Epoch {
+            process: *process,
+            owner: *owner,
+            nonce: *nonce,
+        };
+        if [*process, *owner, *nonce, *sequence].contains(&0)
+            || boundaries.iter().any(|(known, _)| *known == epoch)
+        {
+            return Err("nonzero distinct owner boundaries required".into());
+        }
+        boundaries.push((epoch, *sequence));
+    }
+    if boundaries.len() != 2 {
+        return Err("two owner boundaries required".into());
+    }
+    Ok(Target {
+        operations,
+        boundaries,
+    })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn target_requires_complete_distinct_owner_boundaries() {
+        for invalid in [
+            "10",
+            "10 41:1:43:9",
+            "10 41:1:43:9 41:1:43:9",
+            "10 41:1:43:0 41:2:43:9",
+        ] {
+            assert!(parse_target(invalid).is_err());
+        }
+        let target = parse_target("10 41:1:43:9 41:2:43:12")
+            .unwrap_or_else(|error| unreachable!("target: {error}"));
+        assert_eq!(target.operations, 10);
+        assert_eq!(target.boundaries[1].1, 12);
+    }
 }

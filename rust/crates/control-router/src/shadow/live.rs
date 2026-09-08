@@ -165,7 +165,19 @@ impl LiveState {
     /// Last qualified comparison sequence. Invalid summaries never advance it.
     #[must_use]
     pub fn progress(&self, epoch: Epoch) -> Progress {
-        self.core.progress(epoch, None)
+        let mut progress = self.core.progress(epoch, None);
+        if self
+            .core
+            .owners
+            .get(&(epoch.process, epoch.owner))
+            .is_some_and(|owner| owner.epoch != epoch)
+        {
+            // Diagnostic queries cannot qualify another nonce's interval.
+            // Retain the compared boundary without mutating the real owner.
+            progress.status = Status::Invalid(InvalidReason::Identity);
+            progress.transition = None;
+        }
+        progress
     }
 
     /// Read an explicit diagnostic snapshot, outside capture or comparison loops.

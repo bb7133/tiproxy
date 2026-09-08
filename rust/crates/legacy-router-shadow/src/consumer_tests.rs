@@ -164,6 +164,15 @@ async fn consumer_invalid_summary_and_bad_frames_never_advance_progress()
     for (name, bytes, transport) in [
         ("last_admitted", framed(invalid), false),
         (
+            "unpaired_discard",
+            framed(
+                String::from_utf8_lossy(invalid)
+                    .replace("capacity", "unpaired_discard")
+                    .as_bytes(),
+            ),
+            false,
+        ),
+        (
             "gap",
             framed(
                 raw.replace("\"sequence\":\"1\"", "\"sequence\":\"3\"")
@@ -211,6 +220,18 @@ async fn consumer_invalid_summary_and_bad_frames_never_advance_progress()
         })
         .await?;
         let report = d.snapshot();
+        if name == "last_admitted" || name == "unpaired_discard" {
+            let expected = if name == "unpaired_discard" {
+                live::InvalidCause::UnpairedDiscard
+            } else {
+                live::InvalidCause::Capacity
+            };
+            assert_eq!(
+                report.producer_invalid.get(&epoch),
+                Some(&(expected, u64::MAX)),
+                "LIVE_PRODUCER_REASON"
+            );
+        }
         assert_eq!(
             report.owners[&epoch].compared_sequence, 1,
             "LIVE_SOCKET_PROGRESS: {name}"
@@ -225,4 +246,117 @@ async fn consumer_invalid_summary_and_bad_frames_never_advance_progress()
         assert!(d.snapshot().stopped, "LIVE_SOCKET_JOIN: {name}");
     }
     Ok(())
+}
+
+#[test]
+fn incremental_report_preserves_other_owners_and_replaces_one_contribution() {
+    use control_router::shadow::live::{AccountWitness, Batch, LiveEvent, Witness};
+    let mut state = LiveState::new(Limits::default());
+    let mut epochs = BTreeMap::new();
+    let diagnostics = Diagnostics(Arc::new(Mutex::new(Report::default())));
+    for owner in 1..=2 {
+        let epoch = Epoch {
+            process: 41,
+            owner,
+            nonce: 43,
+        };
+        epochs.insert(epoch, Instant::now());
+        reserve_for_report(&mut state, epoch);
+        publish(&state, &epochs, &diagnostics, Some(epoch));
+    }
+    assert_eq!(diagnostics.snapshot().score, 2, "LIVE_INCREMENTAL_TOTALS");
+    let epoch = Epoch {
+        process: 41,
+        owner: 1,
+        nonce: 43,
+    };
+    assert_eq!(
+        state
+            .observe(&Batch {
+                epoch,
+                sequence: 6,
+                events: vec![LiveEvent::Lifecycle {
+                    event: Event::Created {
+                        session: 3,
+                        operation: 1,
+                        success: false
+                    },
+                    source: 0,
+                    target: 0
+                }],
+                witness: Witness {
+                    accounts: vec![AccountWitness {
+                        id: 2,
+                        score: 0,
+                        physical: 0,
+                        head: 0,
+                        tail: 0
+                    }],
+                    session: 3,
+                    ..Witness::default()
+                }
+            })
+            .status,
+        Status::Comparing
+    );
+    publish(&state, &epochs, &diagnostics, Some(epoch));
+    assert_eq!(diagnostics.snapshot().score, 1, "LIVE_INCREMENTAL_TOTALS");
+    publish(&state, &epochs, &diagnostics, None);
+    assert_eq!(diagnostics.snapshot().score, 1, "LIVE_INCREMENTAL_TOTALS");
+}
+
+fn reserve_for_report(state: &mut LiveState, epoch: Epoch) {
+    use control_router::shadow::live::{AccountWitness, Batch, LiveEvent, Witness};
+    let life = |event| LiveEvent::Lifecycle {
+        event,
+        source: 0,
+        target: 0,
+    };
+    let account = |score| AccountWitness {
+        id: 2,
+        score,
+        physical: 0,
+        head: 0,
+        tail: 0,
+    };
+    for (sequence, events, witness) in [
+        (1, vec![life(Event::Begin)], Witness::default()),
+        (2, vec![LiveEvent::GroupCreated(1)], Witness::default()),
+        (
+            3,
+            vec![life(Event::Account { id: 2, group: 1 })],
+            Witness {
+                accounts: vec![account(0)],
+                ..Witness::default()
+            },
+        ),
+        (
+            4,
+            vec![
+                life(Event::Open(3)),
+                life(Event::Reserve {
+                    session: 3,
+                    operation: 1,
+                    account: 2,
+                }),
+            ],
+            Witness {
+                accounts: vec![account(1)],
+                session: 3,
+                ..Witness::default()
+            },
+        ),
+    ] {
+        assert_eq!(
+            state
+                .observe(&Batch {
+                    epoch,
+                    sequence,
+                    events,
+                    witness
+                })
+                .status,
+            Status::Comparing
+        );
+    }
 }

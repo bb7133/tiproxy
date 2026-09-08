@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -239,7 +240,7 @@ func runObservationLoad(t *testing.T, binary string, enabled bool) {
 		require.Empty(t, recorder.InvalidOwners(), "positive gate cannot discard any owner")
 		require.LessOrEqual(t, highRecords, int64(observation.MaxRecords))
 		require.LessOrEqual(t, highBytes, int64(observation.MaxQueuedBytes))
-		_, err := fmt.Fprintln(input, operations.Load())
+		_, err := fmt.Fprint(input, observationFence(operations.Load(), routers[0].observation, routers[1].observation))
 		require.NoError(t, err)
 		require.NoError(t, input.Close())
 		err = command.Wait()
@@ -264,8 +265,10 @@ func TestObservationSocketSettlementReport(t *testing.T) {
 	service, err := shadowwire.Start(context.Background(), path, zap.NewNop())
 	require.NoError(t, err)
 	defer service.Close()
+	var owners []*observation.Owner
 	for range 2 {
 		r := observedRouter(t, service.Recorder())
+		owners = append(owners, r.observation)
 		conn, b := observedConn(t, r, false)
 		g := b.group
 		var target *backendWrapper
@@ -285,7 +288,7 @@ func TestObservationSocketSettlementReport(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, binary, path)
-	command.Stdin = bytes.NewBufferString("10\n")
+	command.Stdin = bytes.NewBufferString(observationFence(10, owners...))
 	output, err := command.CombinedOutput()
 	t.Log(string(output))
 	require.NoError(t, err)
@@ -338,4 +341,15 @@ func TestObservationCaptureLatency(t *testing.T) {
 		require.NoError(t, source.group.OnConnClosed(source.ID(), conn))
 		t.Logf("capture_component_only enabled=%t samples=%d helper(%s) group_lock_hold(%s)", enabled, len(elapsed), percentiles(elapsed), percentiles(holds))
 	}
+}
+
+// This test-control input is separate from the one-way observation socket.
+// Reaching business totals alone does not prove the final metadata tail was read.
+func observationFence(operations uint64, owners ...*observation.Owner) string {
+	fields := []string{fmt.Sprint(operations)}
+	for _, owner := range owners {
+		epoch := owner.Epoch()
+		fields = append(fields, fmt.Sprintf("%d:%d:%d:%d", epoch.Process, epoch.Owner, epoch.Nonce, owner.AdmittedSequence()))
+	}
+	return strings.Join(fields, " ") + "\n"
 }
