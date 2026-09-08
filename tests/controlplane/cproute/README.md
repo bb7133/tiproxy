@@ -317,3 +317,12 @@ window row specifically. The full entry contains 46 mutations (6 group,
 automatic query lifetimes, static-empty qualification and missing-metric source
 windows. See [resource/README.md](resource/README.md). The original entrypoint
 and its 46 mutations remain unchanged; production composition remains gated.
+
+
+### Isolated migration ledger and bounded admission
+
+`make controlplane-cproute-migration-evidence` adds the shared actual-Go
+migration lifecycle and exact-token ledger, final admission lock and compiling
+mutations. See [migration/README.md](migration/README.md). This first #222 slice
+uses a fresh simulation router and private local queue. Timed factor-driven
+rebalance, observation-only shadow and production effects remain later slices.

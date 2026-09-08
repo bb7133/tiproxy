@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use control_config::{ConfigNamespaceSource, RoutingConfig, RoutingRule, RoutingSelectionPolicy};
 use control_plane::ModuleContext;
@@ -25,7 +25,9 @@ use control_routing::{RouteAssignment, RouteCode};
 use control_topology::{HealthSnapshot, MergedBackend, RoutingSnapshot, TopologyModuleHandle};
 
 use crate::authority::{Candidate, RouteError, Sources};
-use crate::ledger::{AccountIdentity, Accounting, Ledger, Reservation, Session, Settlement};
+use crate::ledger::{
+    AccountIdentity, Accounting, Ledger, Redirect, Reservation, Session, Settlement,
+};
 use crate::policy::{RoutingIdentity, label_matches};
 
 struct Backend {
@@ -59,6 +61,9 @@ type MetricUseBarrier = (
     std::sync::mpsc::Receiver<()>,
 );
 
+#[cfg(test)]
+type RedirectOfferBarrier = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
 /// One namespace router incarnation, with a single lock for selection/accounting.
 ///
 /// This staged API is intentionally not wired to the production dataplane.
@@ -75,6 +80,8 @@ pub struct Router {
     next_lock: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     next_metric_use: Mutex<Option<MetricUseBarrier>>,
+    #[cfg(test)]
+    next_redirect_offer: Mutex<Option<RedirectOfferBarrier>>,
 }
 
 impl Router {
@@ -100,6 +107,8 @@ impl Router {
             next_lock: Mutex::new(None),
             #[cfg(test)]
             next_metric_use: Mutex::new(None),
+            #[cfg(test)]
+            next_redirect_offer: Mutex::new(None),
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
                 factors: BTreeMap::new(),
@@ -160,6 +169,19 @@ impl Router {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(signal);
         attempted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_redirect_offer_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (signal, offered) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        *self
+            .next_redirect_offer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((signal, wait));
+        (offered, release)
     }
 
     #[cfg(test)]
@@ -392,6 +414,84 @@ impl Router {
             .ok_or(RouteError::StaleCandidate)?
     }
 
+    pub(crate) fn prepare_redirect(
+        &self,
+        session: &Session,
+        candidate: &Candidate,
+        target_id: &str,
+    ) -> Result<crate::PreparedRedirect, RouteError> {
+        let mut state = self.lock();
+        self.sources.validate(candidate)?;
+        state.refresh(candidate)?;
+        let source = Arc::clone(state.ledger.active_owner(session)?);
+        let target = state.redirect_target(&source, candidate, target_id)?;
+        self.sources.validate(candidate)?;
+        Ok(crate::PreparedRedirect {
+            session: session.clone(),
+            candidate: candidate.clone(),
+            source,
+            target: Arc::clone(&target.account),
+            target_id: Arc::clone(&target.source.backend_id),
+        })
+    }
+
+    pub(crate) fn offer_redirect(
+        &self,
+        prepared: &crate::PreparedRedirect,
+        sender: &std::sync::mpsc::SyncSender<Redirect>,
+        now: Instant,
+    ) -> Result<bool, RouteError> {
+        let mut state = self.lock();
+        self.sources.validate(&prepared.candidate)?;
+        if !Arc::ptr_eq(
+            state.ledger.active_owner(&prepared.session)?,
+            &prepared.source,
+        ) {
+            return Err(RouteError::StaleCandidate);
+        }
+        state.refresh(&prepared.candidate)?;
+        let target =
+            state.redirect_target(&prepared.source, &prepared.candidate, &prepared.target_id)?;
+        if !Arc::ptr_eq(&target.account, &prepared.target) {
+            return Err(RouteError::StaleCandidate);
+        }
+        let assignment = assignment(
+            &target.source,
+            prepared.candidate.health.get(&prepared.target_id).local,
+        );
+        let redirect =
+            state
+                .ledger
+                .prepare_redirect(&prepared.session, &prepared.target, assignment, now)?;
+        self.sources.validate(&prepared.candidate)?;
+        // No callback, blocking send or fallible state transition after this
+        // offer. An immediate terminal has to acquire this same router lock.
+        let accepted = sender.try_send(redirect.clone()).is_ok();
+        #[cfg(test)]
+        if let Some((signal, wait)) = self
+            .next_redirect_offer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = signal.send(());
+            // The test bounds its waits and owns release. Do not let elapsed
+            // time open this barrier; dropping release also unblocks cleanup.
+            let _ = wait.recv();
+        }
+        state.ledger.admit_redirect(redirect, accepted, now);
+        Ok(accepted)
+    }
+
+    pub(crate) fn finish_redirect(
+        &self,
+        redirect: &Redirect,
+        success: bool,
+        now: Instant,
+    ) -> Settlement {
+        self.lock().ledger.finish_redirect(redirect, success, now)
+    }
+
     /// Settles an exact pending attempt, even after its C/R/H inputs retire.
     /// Duplicate, foreign and late results have no effect.
     pub fn finish(&self, reservation: &Reservation, connected: bool) -> Settlement {
@@ -488,6 +588,35 @@ fn group_values(backend: &MergedBackend, rule: MatchType) -> Vec<String> {
 }
 
 impl State {
+    fn redirect_target(
+        &self,
+        source: &Arc<AccountIdentity>,
+        candidate: &Candidate,
+        target_id: &str,
+    ) -> Result<&Backend, RouteError> {
+        let physical = self
+            .backends
+            .values()
+            .find(|backend| Arc::ptr_eq(&backend.account, source))
+            .ok_or(RouteError::StaleCandidate)?;
+        let group = physical.group.ok_or(RouteError::NoBackend)?;
+        let target = self
+            .routeable(group, &candidate.policy, &[])
+            .into_iter()
+            .find(|(backend, _)| backend.source.backend_id.as_ref() == target_id)
+            .map(|(backend, _)| backend)
+            .ok_or(RouteError::NoBackend)?;
+        if Arc::ptr_eq(&target.account, source) {
+            return Err(RouteError::SameBackend);
+        }
+        if assignment(&physical.source, false).keyspace
+            != assignment(&target.source, false).keyspace
+        {
+            return Err(RouteError::CrossKeyspace);
+        }
+        Ok(target)
+    }
+
     fn factor_group(
         &self,
         candidate: &Candidate,

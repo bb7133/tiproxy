@@ -140,6 +140,34 @@ func TestCPRouteResourceObservation(t *testing.T) {
 	group.SetConfig(cfg)
 	require.Equal(t, 12, reader.adds)
 	route("recreated", nil)
+	// Strictly discriminate a bypassed Resource path: actual extra physical
+	// connections make Connection prefer A while health still makes Resource B.
+	cfg.Balance.Policy = config.BalancePolicyConnection
+	group.SetConfig(cfg)
+	var extra []*mockRedirectableConn
+	for i := range 4 {
+		conn := newMockRedirectableConn(t, uint64(100+i))
+		_, ok := group.RehydrateConn("127.0.0.1:4001", conn)
+		require.True(t, ok)
+		extra = append(extra, conn)
+	}
+	for _, step := range []struct{ name, policy, wanted string }{
+		{"connection_strict", config.BalancePolicyConnection, "127.0.0.1:4000"},
+		{"resource_strict", config.BalancePolicyResource, "127.0.0.1:4001"},
+	} {
+		cfg.Balance.Policy = step.policy
+		group.SetConfig(cfg)
+		backend, err := group.Route(nil)
+		require.NoError(t, err)
+		require.Equal(t, step.wanted, backend.ID(), step.name)
+		backend.(*backendWrapper).connScore--
+		outcomes[step.name] = backend.ID()
+	}
+	for _, conn := range extra {
+		require.NoError(t, group.OnConnClosed("127.0.0.1:4001", conn))
+	}
+	require.Equal(t, 10, group.backends["127.0.0.1:4001"].ConnCount())
+	require.Equal(t, 12, group.backends["127.0.0.1:4001"].ConnScore())
 	data, err := json.Marshal(outcomes)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(output, data, 0o600))

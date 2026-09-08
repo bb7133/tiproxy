@@ -50,6 +50,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 mod factors_live;
 mod locality;
+mod migration;
 mod registration;
 mod resource;
 mod sources;

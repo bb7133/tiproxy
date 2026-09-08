@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use control_routing::RouteAssignment;
 
@@ -26,12 +27,19 @@ pub struct Accounting {
     reserved: u64,
     /// Established connections still owned by this backend.
     active: u64,
+    incoming: u64,
+    outgoing: u64,
 }
 
 impl Accounting {
     #[cfg(test)]
     pub(crate) const fn for_factor_test(active: u64, reserved: u64) -> Self {
-        Self { reserved, active }
+        Self {
+            reserved,
+            active,
+            incoming: 0,
+            outgoing: 0,
+        }
     }
 
     /// Pending backend handshakes charged to this owner.
@@ -46,12 +54,28 @@ impl Accounting {
         self.active
     }
 
-    /// The connection score includes both pending and established connections.
+    /// Accepted redirects targeting this owner, before physical completion.
+    #[must_use]
+    pub const fn incoming(self) -> u64 {
+        self.incoming
+    }
+
+    /// Physical connections whose accepted redirect targets another owner.
+    #[must_use]
+    pub const fn outgoing(self) -> u64 {
+        self.outgoing
+    }
+
+    /// Go transfers score on admission, but physical ownership only on success.
     #[must_use]
     pub const fn connection_score(self) -> u64 {
-        // Reserve checks the total before mutation. Commit only transfers one
-        // unit between these fields; every other transition decreases it.
-        self.reserved + self.active
+        self.active - self.outgoing + self.reserved + self.incoming
+    }
+
+    fn capacity_used(self) -> u64 {
+        // Outgoing connections may fail and return their score. They must not
+        // release capacity that would make that infallible rollback overflow.
+        self.active + self.reserved + self.incoming
     }
 }
 
@@ -95,6 +119,40 @@ impl Reservation {
     }
 }
 
+/// Exact authority for one accepted migration in an isolated simulation.
+/// This is deliberately distinct from an initial handshake reservation.
+#[derive(Clone, Debug)]
+pub struct Redirect {
+    session: Session,
+    sequence: u64,
+    pub(crate) source: Arc<AccountIdentity>,
+    pub(crate) target: Arc<AccountIdentity>,
+    from: RouteAssignment,
+    to: RouteAssignment,
+    issued_at: Instant,
+}
+
+impl Redirect {
+    /// Captured physical assignment before this operation.
+    #[must_use]
+    pub const fn from(&self) -> &RouteAssignment {
+        &self.from
+    }
+    /// Captured destination; neither a new lookup nor settlement authority.
+    #[must_use]
+    pub const fn to(&self) -> &RouteAssignment {
+        &self.to
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Active {
+    account: Arc<AccountIdentity>,
+    assignment: RouteAssignment,
+    redirect: Option<Redirect>,
+    failed_at: Option<Instant>,
+}
+
 /// Whether a terminal event changed this ledger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Settlement {
@@ -112,13 +170,18 @@ pub(crate) enum LedgerError {
     ForeignAccount,
     Exhausted,
     Capacity,
+    NotActive,
+    RedirectPending,
+    CoolingDown,
+    SameAccount,
+    CrossKeyspace,
 }
 
 #[derive(Clone, Debug)]
 enum Stage {
     Idle,
     Pending(Reservation),
-    Active(Reservation),
+    Active(Box<Active>),
 }
 
 #[derive(Debug)]
@@ -132,6 +195,7 @@ pub(crate) struct Ledger {
     next_session: u64,
     next_reservation: u64,
     next_account: u64,
+    next_redirect: u64,
     max_sessions: usize,
     sessions: BTreeMap<u64, Stage>,
     accounts: BTreeMap<u64, Account>,
@@ -144,6 +208,7 @@ impl Ledger {
             next_session: 1,
             next_reservation: 1,
             next_account: 1,
+            next_redirect: 1,
             max_sessions,
             sessions: BTreeMap::new(),
             accounts: BTreeMap::new(),
@@ -233,7 +298,7 @@ impl Ledger {
         let account = self.account(identity).ok_or(LedgerError::ForeignAccount)?;
         account
             .counts
-            .connection_score()
+            .capacity_used()
             .checked_add(1)
             .ok_or(LedgerError::Exhausted)?;
         let next = self
@@ -277,12 +342,169 @@ impl Ledger {
         account.counts.reserved -= 1;
         let stage = if connected {
             account.counts.active += 1;
-            Stage::Active(reservation.clone())
+            Stage::Active(Box::new(Active {
+                account: Arc::clone(&reservation.account),
+                assignment: reservation.assignment.clone(),
+                redirect: None,
+                failed_at: None,
+            }))
         } else {
             Stage::Idle
         };
         self.sessions.insert(reservation.session.sequence, stage);
         Settlement::Applied
+    }
+
+    pub(crate) fn active_owner(
+        &self,
+        session: &Session,
+    ) -> Result<&Arc<AccountIdentity>, LedgerError> {
+        match self.stage(session)? {
+            Stage::Active(active) => Ok(&active.account),
+            _ => Err(LedgerError::NotActive),
+        }
+    }
+
+    /// Read-only preparation. The enclosing lock must remain held until the
+    /// bounded offer and accept/reject finish; no callback may reenter it.
+    pub(crate) fn prepare_redirect(
+        &self,
+        session: &Session,
+        target: &Arc<AccountIdentity>,
+        mut assignment: RouteAssignment,
+        now: Instant,
+    ) -> Result<Redirect, LedgerError> {
+        let Stage::Active(active) = self.stage(session)? else {
+            return Err(LedgerError::NotActive);
+        };
+        if active.redirect.is_some() {
+            return Err(LedgerError::RedirectPending);
+        }
+        if active
+            .failed_at
+            .is_some_and(|failed| now.saturating_duration_since(failed) < Duration::from_secs(3))
+        {
+            return Err(LedgerError::CoolingDown);
+        }
+        if Arc::ptr_eq(&active.account, target) {
+            return Err(LedgerError::SameAccount);
+        }
+        if active.assignment.keyspace != assignment.keyspace {
+            return Err(LedgerError::CrossKeyspace);
+        }
+        let source = self
+            .account(&active.account)
+            .ok_or(LedgerError::ForeignAccount)?;
+        let target_account = self.account(target).ok_or(LedgerError::ForeignAccount)?;
+        source
+            .counts
+            .outgoing
+            .checked_add(1)
+            .filter(|out| *out <= source.counts.active)
+            .ok_or(LedgerError::Exhausted)?;
+        target_account
+            .counts
+            .capacity_used()
+            .checked_add(1)
+            .ok_or(LedgerError::Exhausted)?;
+        self.next_redirect
+            .checked_add(1)
+            .ok_or(LedgerError::Exhausted)?;
+        assignment.connection_id = session.sequence;
+        assignment.assignment_id = self.next_redirect.to_string();
+        Ok(Redirect {
+            session: session.clone(),
+            sequence: self.next_redirect,
+            source: Arc::clone(&active.account),
+            target: Arc::clone(target),
+            from: active.assignment.clone(),
+            to: assignment,
+            issued_at: now,
+        })
+    }
+
+    pub(crate) fn admit_redirect(&mut self, redirect: Redirect, admitted: bool, now: Instant) {
+        // Only called immediately after prepare_redirect under the same lock.
+        if admitted {
+            self.next_redirect += 1;
+            self.accounts
+                .get_mut(&redirect.source.sequence)
+                .unwrap_or_else(|| unreachable!("prepared source"))
+                .counts
+                .outgoing += 1;
+            self.accounts
+                .get_mut(&redirect.target.sequence)
+                .unwrap_or_else(|| unreachable!("prepared target"))
+                .counts
+                .incoming += 1;
+        }
+        let Some(Stage::Active(active)) = self.sessions.get_mut(&redirect.session.sequence) else {
+            unreachable!("prepared active session")
+        };
+        if admitted {
+            active.redirect = Some(redirect);
+        } else {
+            active.failed_at = Some(now);
+        }
+    }
+
+    pub(crate) fn finish_redirect(
+        &mut self,
+        redirect: &Redirect,
+        success: bool,
+        _now: Instant,
+    ) -> Settlement {
+        let Ok(Stage::Active(active)) = self.stage(&redirect.session) else {
+            return Settlement::Ignored;
+        };
+        let Some(pending) = &active.redirect else {
+            return Settlement::Ignored;
+        };
+        if pending.sequence != redirect.sequence
+            || !Arc::ptr_eq(&pending.source, &redirect.source)
+            || !Arc::ptr_eq(&pending.target, &redirect.target)
+        {
+            return Settlement::Ignored;
+        }
+        self.release_redirect(redirect);
+        if success {
+            self.accounts
+                .get_mut(&redirect.source.sequence)
+                .unwrap_or_else(|| unreachable!("retained source"))
+                .counts
+                .active -= 1;
+            self.accounts
+                .get_mut(&redirect.target.sequence)
+                .unwrap_or_else(|| unreachable!("retained target"))
+                .counts
+                .active += 1;
+        }
+        let Some(Stage::Active(active)) = self.sessions.get_mut(&redirect.session.sequence) else {
+            unreachable!("matching active session")
+        };
+        active.redirect = None;
+        if success {
+            active.account = Arc::clone(&redirect.target);
+            active.assignment = redirect.to.clone();
+            active.failed_at = None;
+        } else {
+            // Go's cooldown starts at issuance, not when the failure arrives.
+            active.failed_at = Some(redirect.issued_at);
+        }
+        Settlement::Applied
+    }
+
+    fn release_redirect(&mut self, redirect: &Redirect) {
+        self.accounts
+            .get_mut(&redirect.source.sequence)
+            .unwrap_or_else(|| unreachable!("retained source"))
+            .counts
+            .outgoing -= 1;
+        self.accounts
+            .get_mut(&redirect.target.sequence)
+            .unwrap_or_else(|| unreachable!("retained target"))
+            .counts
+            .incoming -= 1;
     }
 
     pub(crate) fn close(&mut self, session: &Session) -> Settlement {
@@ -299,8 +521,11 @@ impl Ledger {
                     account.counts.reserved -= 1;
                 }
             }
-            Stage::Active(reservation) => {
-                if let Some(account) = self.accounts.get_mut(&reservation.account.sequence) {
+            Stage::Active(active) => {
+                if let Some(redirect) = active.redirect {
+                    self.release_redirect(&redirect);
+                }
+                if let Some(account) = self.accounts.get_mut(&active.account.sequence) {
                     account.counts.active -= 1;
                 }
             }
@@ -338,7 +563,8 @@ mod tests {
             ledger.counts(&account),
             Some(Accounting {
                 reserved: 1,
-                active: 0
+                active: 0,
+                ..Accounting::default()
             })
         );
         assert_eq!(ledger.finish(&first, true), Settlement::Applied);
@@ -347,7 +573,8 @@ mod tests {
             ledger.counts(&account),
             Some(Accounting {
                 reserved: 0,
-                active: 1
+                active: 1,
+                ..Accounting::default()
             })
         );
         assert_eq!(ledger.close(&session), Settlement::Applied);
@@ -376,7 +603,8 @@ mod tests {
             ledger.counts(&new),
             Some(Accounting {
                 reserved: 1,
-                active: 0
+                active: 0,
+                ..Accounting::default()
             })
         );
         assert_eq!(ledger.finish(&second, true), Settlement::Applied);
@@ -402,7 +630,8 @@ mod tests {
             ledger.counts(&new),
             Some(Accounting {
                 reserved: 1,
-                active: 0
+                active: 0,
+                ..Accounting::default()
             })
         );
         assert_eq!(ledger.finish(&next, true), Settlement::Applied);
@@ -426,7 +655,8 @@ mod tests {
             right.counts(&account_right),
             Some(Accounting {
                 reserved: 1,
-                active: 0
+                active: 0,
+                ..Accounting::default()
             })
         );
     }
@@ -472,7 +702,8 @@ mod tests {
             ledger.counts(&account),
             Some(Accounting {
                 active: 0,
-                reserved: 1
+                reserved: 1,
+                ..Accounting::default()
             })
         );
         ledger.finish(&b, true);
@@ -558,3 +789,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "ledger_redirect_tests.rs"]
+mod redirect_tests;

@@ -65,6 +65,16 @@ pub enum RouteError {
     Capacity,
     /// A never-reused identity or connection counter cannot advance.
     Exhausted,
+    /// Redirects require an established physical session.
+    NotActive,
+    /// This session already has one accepted redirect awaiting a result.
+    RedirectPending,
+    /// A failed or rejected redirect is inside Go's three-second cooldown.
+    CoolingDown,
+    /// Redirect source and target are the same retained owner.
+    SameBackend,
+    /// Migration may never cross keyspace scopes, including empty/nonempty.
+    CrossKeyspace,
 }
 
 impl From<LedgerError> for RouteError {
@@ -76,6 +86,11 @@ impl From<LedgerError> for RouteError {
             LedgerError::AlreadyActive => Self::AlreadyActive,
             LedgerError::Exhausted => Self::Exhausted,
             LedgerError::Capacity => Self::Capacity,
+            LedgerError::NotActive => Self::NotActive,
+            LedgerError::RedirectPending => Self::RedirectPending,
+            LedgerError::CoolingDown => Self::CoolingDown,
+            LedgerError::SameAccount => Self::SameBackend,
+            LedgerError::CrossKeyspace => Self::CrossKeyspace,
         }
     }
 }

@@ -60,7 +60,7 @@ def main():
                 ('self.accounts.get_mut(&reservation.account.sequence) else', 'self.accounts.last_entry().map(|entry| entry.into_mut()) else'),
                 ('if !Arc::ptr_eq(&account.identity, &reservation.account) {', 'if false {')]),
             ("duplicate-terminal-settles-active", "ledger.rs", [
-                ('let Ok(Stage::Pending(pending)) = self.stage(&reservation.session)', 'let Ok(Stage::Pending(pending) | Stage::Active(pending)) = self.stage(&reservation.session)')]),
+                ('let Ok(Stage::Pending(pending)) = self.stage(&reservation.session)', 'if matches!(self.stage(&reservation.session), Ok(Stage::Active(_))) { self.accounts.get_mut(&reservation.account.sequence).unwrap().counts.active += 1; return Settlement::Applied; } let Ok(Stage::Pending(pending)) = self.stage(&reservation.session)')]),
             ("closed-session-retains-pending-authority", "ledger.rs", [
                 ('self.sessions.remove(&session.sequence) else', 'self.sessions.get(&session.sequence).cloned() else')]),
             ("resource-silently-uses-connection", "authority.rs", [

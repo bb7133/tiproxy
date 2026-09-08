@@ -39,7 +39,7 @@ pub enum Factor {
     Cpu,
     /// Actual health snapshot locality.
     Location,
-    /// Active plus pending connections.
+    /// Physical plus initial pending and incoming minus outgoing redirects.
     Connection,
 }
 impl Factor {
