@@ -120,7 +120,14 @@ async fn worker_source_notifications_close_without_redirect_and_join() -> TestRe
         }
     })
     .await?;
+    // HeldSource deliberately separates current store state from notification.
+    // Publish the actual watch edge; an incidental initial backend wake is not
+    // evidence that the worker observed a configuration notification.
+    let updates = h.source.subscribe();
     policy(&h, 100.0, 0, &["a"], 3);
+    assert!(!updates.has_changed()?);
+    h.source.deliver();
+    assert!(updates.has_changed()?, "WORKER_CONFIG_DELIVERED");
     let close = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if sim.progress().values().any(|p| p.closes > 0) {
