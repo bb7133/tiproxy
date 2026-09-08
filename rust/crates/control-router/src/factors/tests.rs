@@ -111,28 +111,28 @@ fn compare_balance(report: &FactorReport, expected: &Value, context: &str) {
     if pair.is_null() {
         assert!(
             report.balance.is_none(),
-            "BALANCE_NONE {context}: {:?}",
+            "FACTOR_BALANCE_NONE {context}: {:?}",
             report.balance
         );
     } else {
         let actual = report
             .balance
             .as_ref()
-            .unwrap_or_else(|| unreachable!("BALANCE_MISSING {context}"));
+            .unwrap_or_else(|| unreachable!("FACTOR_BALANCE_MISSING {context}"));
         assert_eq!(
             actual.from.as_ref(),
             text(&pair["from"]),
-            "BALANCE_SOURCE {context}"
+            "FACTOR_BALANCE_SOURCE {context}"
         );
         assert_eq!(
             actual.to.as_ref(),
             text(&pair["to"]),
-            "BALANCE_TARGET {context}"
+            "FACTOR_BALANCE_TARGET {context}"
         );
         let rate: f64 = must(text(&pair["rate"]).parse());
         assert!(
             (actual.rate - rate).abs() <= rate.abs() * 1e-10 || actual.rate == rate,
-            "BALANCE_RATE {context}"
+            "FACTOR_BALANCE_RATE {context}"
         );
         let reason = match actual.reason {
             Factor::Label => "label",
@@ -143,7 +143,11 @@ fn compare_balance(report: &FactorReport, expected: &Value, context: &str) {
             Factor::Location => "location",
             Factor::Connection => "conn",
         };
-        assert_eq!(reason, text(&pair["reason"]), "BALANCE_REASON {context}");
+        assert_eq!(
+            reason,
+            text(&pair["reason"]),
+            "FACTOR_BALANCE_REASON {context}"
+        );
     }
 }
 
