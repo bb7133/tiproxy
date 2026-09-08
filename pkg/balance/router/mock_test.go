@@ -5,7 +5,6 @@ package router
 
 import (
 	"context"
-	"maps"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -191,8 +190,13 @@ func (mbo *mockBackendObserver) Refresh() {
 
 func (mbo *mockBackendObserver) notify(err error) {
 	mbo.healthLock.Lock()
+	// Hand out value snapshots: the router keeps reading the delivered health
+	// while the test keeps toggling the mock's own copy under healthLock.
 	healths := make(map[string]*observer.BackendHealth, len(mbo.healths))
-	maps.Copy(healths, mbo.healths)
+	for addr, health := range mbo.healths {
+		snapshot := *health
+		healths[addr] = &snapshot
+	}
 	mbo.healthLock.Unlock()
 	mbo.subscriberLock.Lock()
 	for _, subscriber := range mbo.subscribers {
