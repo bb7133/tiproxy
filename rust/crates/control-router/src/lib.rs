@@ -20,12 +20,14 @@ mod ledger;
 mod policy;
 mod retry;
 mod selector;
+mod simulation;
 
 pub use authority::{Candidate, RouteError, Unsupported};
 pub use factors::{BalanceAdvice, Factor, FactorAdvice, FactorReport, FactorScore};
-pub use ledger::{Accounting, Reservation, Session, Settlement};
+pub use ledger::{Accounting, Redirect, Reservation, Session, Settlement};
 pub use retry::Selector;
 pub use selector::Router;
+pub use simulation::{MigrationSimulation, PreparedRedirect};
 
 #[cfg(test)]
 mod tests;
