@@ -23,6 +23,9 @@ mod scheduler;
 mod selector;
 mod simulation;
 
+/// Observation-only routing ledger; never a production command authority.
+pub mod shadow;
+
 pub use authority::{Candidate, RouteError, Unsupported};
 pub use factors::{BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore};
 pub use ledger::{Accounting, ForceClose, Redirect, Reservation, Session, Settlement};
