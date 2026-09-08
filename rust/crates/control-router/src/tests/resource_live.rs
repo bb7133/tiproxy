@@ -456,3 +456,128 @@ async fn observe_composed() -> TestResult {
     tokio::time::timeout(Duration::from_secs(5), &mut live.running.module).await??;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires owned CP003_CONNECTION_FILE; mandatory balance evidence"]
+async fn balance_real_metrics_and_missing_window() -> TestResult {
+    let live = start_with_health(true, 3_600_000_000_000, "[labels]\nzone=\"z0\"").await?;
+    let sim = Arc::new(
+        crate::MigrationSimulation::new(
+            Arc::new(live.store.clone()),
+            &live.topology,
+            &live.running.runtime.handle().module_context(),
+            "default",
+            100,
+            1,
+            Some(live.overlay.clone()),
+        )
+        .map_err(|e| format!("balance simulation: {e:?}"))?,
+    );
+    let c = candidate(sim.router(), "BALANCE_LOAD", |c| {
+        c.health.get(&live.ids[0]).healthy && c.health.get(&live.ids[1]).healthy
+    })
+    .await?;
+    let mut sessions = Vec::new();
+    for index in 0..2 {
+        for _ in 0..10 {
+            let (s, r) = reserve(sim.router(), &c, &[&live.ids[1 - index]], "BALANCE_LOAD")?;
+            assert_eq!(sim.router().finish(&r, true), Settlement::Applied);
+            sessions.push(s);
+        }
+    }
+    patch(&live, "resource")?;
+    let resource = candidate(sim.router(), "BALANCE_RESOURCE", has_cpu).await?;
+    let plan = must(sim.prepare_balance(&resource, ClientInfo::default(), ""))
+        .ok_or("BALANCE_REAL_PAIR")?;
+    assert_eq!(
+        plan.pair().from.as_ref(),
+        live.ids[0],
+        "BALANCE_REAL_METRICS_SOURCE"
+    );
+    assert_eq!(
+        plan.pair().to.as_ref(),
+        live.ids[1],
+        "BALANCE_REAL_METRICS_TARGET"
+    );
+    assert_eq!(plan.redirects().len(), 10);
+    assert_eq!(
+        sim.router()
+            .accounting(&live.ids[0])
+            .map(crate::Accounting::outgoing),
+        Some(0)
+    );
+    assert!(must(sim.offer(&plan.redirects()[0])));
+    let accepted = sim.take_redirect().ok_or("BALANCE_REAL_ACCEPT")?;
+    assert_eq!(sim.finish(&accepted, false), Settlement::Applied);
+
+    // Retire the REAL producer after its nonempty queries were read and
+    // before the final metric fence. Current C/R/H survives this input loss.
+    let (read, release) = sim.router().observe_next_metric_use_for_test();
+    let worker = Arc::clone(&sim);
+    let captured = resource.clone();
+    let planning =
+        std::thread::spawn(move || worker.prepare_balance(&captured, ClientInfo::default(), ""));
+    assert_eq!(
+        read.recv_timeout(Duration::from_secs(5))?,
+        6,
+        "BALANCE_REAL_READ"
+    );
+    live.running.collector.abort();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metric(&resource).is_some_and(MetricSnapshot::still_current) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    release.send(())?;
+    let fallback = must(planning.join())
+        .map_err(|e| format!("BALANCE_RETIRED: {e:?}"))?
+        .ok_or("BALANCE_EMPTY_PAIR")?;
+    assert_eq!(
+        fallback.pair().from.as_ref(),
+        live.ids[1],
+        "BALANCE_EMPTY_SOURCE"
+    );
+    assert_eq!(
+        fallback.pair().reason,
+        crate::Factor::Location,
+        "BALANCE_EMPTY_LOCALITY"
+    );
+    // C/R/H revocation remains authoritative even when metric input is empty.
+    patch(&live, "connection")?;
+    assert!(matches!(
+        sim.prepare_balance(&resource, ClientInfo::default(), ""),
+        Err(RouteError::StaleCandidate)
+    ));
+    assert!(matches!(
+        sim.offer(&fallback.redirects()[0]),
+        Err(RouteError::StaleCandidate)
+    ));
+    for s in sessions {
+        sim.router().close(&s);
+    }
+    stop_balance_live(live).await?;
+    println!("CP-ROUTE-BALANCE real producer preparation and fences passed");
+    Ok(())
+}
+
+async fn stop_balance_live(mut live: Live) -> TestResult {
+    live.running
+        .runtime
+        .begin_shutdown(ShutdownReason::Requested)?;
+    live.running
+        .runtime
+        .advance_shutdown(LifecyclePhase::Draining)?;
+    live.running
+        .runtime
+        .advance_shutdown(LifecyclePhase::Stopping)?;
+    let _ = (&mut live.running.collector).await;
+    tokio::time::timeout(Duration::from_secs(5), &mut live.running.module).await??;
+    live.etcd
+        .delete(
+            "/topology/",
+            Some(etcd_client::DeleteOptions::new().with_prefix()),
+        )
+        .await?;
+    Ok(())
+}

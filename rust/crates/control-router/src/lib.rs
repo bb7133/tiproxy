@@ -23,11 +23,11 @@ mod selector;
 mod simulation;
 
 pub use authority::{Candidate, RouteError, Unsupported};
-pub use factors::{BalanceAdvice, Factor, FactorAdvice, FactorReport, FactorScore};
+pub use factors::{BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore};
 pub use ledger::{Accounting, Redirect, Reservation, Session, Settlement};
 pub use retry::Selector;
 pub use selector::Router;
-pub use simulation::{MigrationSimulation, PreparedRedirect};
+pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};
 
 #[cfg(test)]
 mod tests;

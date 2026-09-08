@@ -30,6 +30,8 @@ use crate::ledger::{
 };
 use crate::policy::{RoutingIdentity, label_matches};
 
+mod balance;
+
 struct Backend {
     source: MergedBackend,
     routing_identity: RoutingIdentity,

@@ -33,6 +33,21 @@ pub struct Accounting {
 
 impl Accounting {
     #[cfg(test)]
+    pub(crate) const fn for_balance_test(
+        active: u64,
+        reserved: u64,
+        incoming: u64,
+        outgoing: u64,
+    ) -> Self {
+        Self {
+            reserved,
+            active,
+            incoming,
+            outgoing,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) const fn for_factor_test(active: u64, reserved: u64) -> Self {
         Self {
             reserved,
@@ -188,6 +203,8 @@ enum Stage {
 struct Account {
     identity: Arc<AccountIdentity>,
     counts: Accounting,
+    // Only actual connection/redirect success appends to this physical list.
+    physical: Vec<u64>,
 }
 
 pub(crate) struct Ledger {
@@ -246,6 +263,7 @@ impl Ledger {
             Account {
                 identity: Arc::clone(&identity),
                 counts: Accounting::default(),
+                physical: Vec::new(),
             },
         );
         Ok(identity)
@@ -342,6 +360,7 @@ impl Ledger {
         account.counts.reserved -= 1;
         let stage = if connected {
             account.counts.active += 1;
+            account.physical.push(reservation.session.sequence);
             Stage::Active(Box::new(Active {
                 account: Arc::clone(&reservation.account),
                 assignment: reservation.assignment.clone(),
@@ -353,6 +372,19 @@ impl Ledger {
         };
         self.sessions.insert(reservation.session.sequence, stage);
         Settlement::Applied
+    }
+
+    /// Physical arrival order, including pending redirects until they succeed.
+    /// A session ID is an identity, never a sorting key for migrated arrivals.
+    pub(crate) fn physical_sessions(&self, owner: &Arc<AccountIdentity>) -> Vec<Session> {
+        self.account(owner)
+            .into_iter()
+            .flat_map(|account| &account.physical)
+            .map(|&sequence| Session {
+                ledger: Arc::clone(&self.identity),
+                sequence,
+            })
+            .collect()
     }
 
     pub(crate) fn active_owner(
@@ -468,16 +500,20 @@ impl Ledger {
         }
         self.release_redirect(redirect);
         if success {
-            self.accounts
+            let source = self
+                .accounts
                 .get_mut(&redirect.source.sequence)
-                .unwrap_or_else(|| unreachable!("retained source"))
-                .counts
-                .active -= 1;
-            self.accounts
+                .unwrap_or_else(|| unreachable!("retained source"));
+            source.counts.active -= 1;
+            source
+                .physical
+                .retain(|id| *id != redirect.session.sequence);
+            let target = self
+                .accounts
                 .get_mut(&redirect.target.sequence)
-                .unwrap_or_else(|| unreachable!("retained target"))
-                .counts
-                .active += 1;
+                .unwrap_or_else(|| unreachable!("retained target"));
+            target.counts.active += 1;
+            target.physical.push(redirect.session.sequence);
         }
         let Some(Stage::Active(active)) = self.sessions.get_mut(&redirect.session.sequence) else {
             unreachable!("matching active session")
@@ -527,6 +563,7 @@ impl Ledger {
                 }
                 if let Some(account) = self.accounts.get_mut(&active.account.sequence) {
                     account.counts.active -= 1;
+                    account.physical.retain(|id| *id != session.sequence);
                 }
             }
         }
@@ -793,3 +830,7 @@ mod tests {
 #[cfg(test)]
 #[path = "ledger_redirect_tests.rs"]
 mod redirect_tests;
+
+#[cfg(test)]
+#[path = "ledger_arrival_tests.rs"]
+mod arrival_tests;
