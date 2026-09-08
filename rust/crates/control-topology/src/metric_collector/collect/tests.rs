@@ -219,3 +219,37 @@ async fn collector_batch_waits_for_canceled_child_destructor()
     assert!(matches!(outcome, Err(RoundError::Stale)));
     Ok(())
 }
+
+#[test]
+fn factor_lineage_tracks_selected_history_not_round_or_unused_owners() {
+    use crate::metric_collector::MetricCacheLineage;
+    use crate::metrics::Source;
+    let mut state = State::default();
+    state.reader.complete_prom(BTreeMap::new());
+    let first = state.result();
+    let lineage = MetricCacheLineage(Arc::clone(&first.lineage));
+    let replacement = State::default();
+    assert!(
+        !lineage.same_history(&MetricCacheLineage(Arc::clone(&replacement.lineage))),
+        "FACTOR_LINEAGE_OPAQUE_IDENTITY"
+    );
+    let second = state.result();
+    first.gate.revoke();
+    assert!(
+        lineage.same_history(&MetricCacheLineage(Arc::clone(&second.lineage))),
+        "FACTOR_ROUND_NOT_LINEAGE"
+    );
+    state.reset_backend();
+    assert_eq!(state.reader.source(), Source::Prometheus);
+    assert!(
+        lineage.same_history(&MetricCacheLineage(Arc::clone(&state.lineage))),
+        "FACTOR_PROM_UNUSED_OWNER_CONTINUITY"
+    );
+    state.reader.complete_backend(BTreeMap::new(), true);
+    let backend = MetricCacheLineage(Arc::clone(&state.lineage));
+    state.reset_backend();
+    assert!(
+        !backend.same_history(&MetricCacheLineage(Arc::clone(&state.lineage))),
+        "FACTOR_BACKEND_OWNER_COLD_START"
+    );
+}

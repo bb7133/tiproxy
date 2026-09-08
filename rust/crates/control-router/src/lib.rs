@@ -15,12 +15,14 @@
 //! Stateful, process-local routing and exact reservation accounting.
 
 mod authority;
+mod factors;
 mod ledger;
 mod policy;
 mod retry;
 mod selector;
 
 pub use authority::{Candidate, RouteError, Unsupported};
+pub use factors::{BalanceAdvice, Factor, FactorAdvice, FactorReport, FactorScore};
 pub use ledger::{Accounting, Reservation, Session, Settlement};
 pub use retry::Selector;
 pub use selector::Router;

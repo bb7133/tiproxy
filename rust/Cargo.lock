@@ -401,6 +401,7 @@ dependencies = [
  "control-plane",
  "control-routing",
  "control-topology",
+ "etcd-client",
  "futures-util",
  "prost",
  "serde_json",

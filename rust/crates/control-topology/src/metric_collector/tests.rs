@@ -117,6 +117,7 @@ pub(super) fn result() -> ClusterResult {
     let mut reader = ReaderState::default();
     reader.complete_backend(BTreeMap::new(), true);
     ClusterResult {
+        lineage: Arc::new(()),
         gate: GenerationGate::new(),
         reader,
         backend_proofs: Vec::new(),

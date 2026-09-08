@@ -163,3 +163,38 @@ Go peer's control API only drives test inputs and calls the existing election,
 owner enumeration, backend history producer and owner HTTP consumer. Histories
 cross real TCP in both directions. Logs report payload-free invariant names;
 connection descriptions and ports remain in owned temporary directories.
+
+### Staged factors and ledger consumer
+
+`make controlplane-cpmetrics-factor-evidence` generates 95 multi-step observations
+from the actual Go factor methods, then drives the Rust factor state with the same
+queries, samples, clocks and counts. The Go overlay changes only clock reads;
+score composition, `CanBeRouted`, `BalanceCount` and both selection methods run
+unchanged. The comparison includes each score segment, advice and 63-ticket
+selection distributions. The separate runtime row owns real etcd, SQL greetings,
+backend/status HTTP, Prometheus HTTP, `TopologyModule`, `MetricCollector` and the
+router's reservation ledger. The entrypoint also compiles isolated mutations and
+requires their named observations to fail before restoring and rerunning baseline.
+
+The public `Router::factor_report` is a diagnostic consumer and cannot reserve or
+migrate a connection. Resource/Location capture/reserve remain typed Unsupported
+until the subsequent selector-composition slice. Static-source empty metric
+qualification and the final policy-subscription lifecycle belong to that slice;
+production composition remains disabled until CP integration.
+
+Each collector cluster issues an opaque cache lineage for its selected history.
+Ordinary same-source rounds retain it despite replacement of the snapshot's round
+gate. Capture/material/R replacement, backend owner/peer/zone cold starts and
+selected-source switches replace it. Unused backend ownership changes preserve
+Prometheus lineage. The router stores caches under stable ledger account identity,
+retains sample times, and clears resource state for a replaced lineage; an ID or
+newer UpdateTime cannot authorize reuse. A snapshot's final current-authority
+closure still guards evaluation and cache commit.
+
+Cold starts across authority/source changes are an explicit difference from Go's
+long-lived factor objects. With healthy I/O, Prometheus range data restores the
+cache at the first new completed round; backend CPU needs a valid pair at least
+one second apart. Empty/missing samples and unavailable I/O retain their specified
+Go defaults, so no recovery bound is claimed during failed acquisition. Within a
+lineage, global query expiry, per-sample cache expiry, missing defaults and pending
+connection extrapolation follow the actual Go observations exactly.

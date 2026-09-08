@@ -528,6 +528,19 @@ async fn mixed_owners() -> Result<(), TestError> {
     )
     .await
     .map_err(|e| format!("replaced round: {e:?}"))?;
+    assert!(
+        !snapshot
+            .cache_lineage("collector-fixture")
+            .ok_or("old peer lineage")?
+            .same_history(
+                &overlay
+                    .current_for(&capture)
+                    .ok_or("new peer result")?
+                    .cache_lineage("collector-fixture")
+                    .ok_or("new peer lineage")?
+            ),
+        "FACTOR_REAL_PEER_REPLACEMENT_LINEAGE"
+    );
     assert_eq!(
         state.history.entries()["memory"][&west.address.to_string()]
             .step1

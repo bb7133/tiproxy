@@ -47,6 +47,7 @@ impl From<MetricError> for RoundError {
 }
 
 struct State {
+    lineage: Arc<()>,
     reader: ReaderState,
     history: History,
     export: Arc<[u8]>,
@@ -58,6 +59,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            lineage: Arc::new(()),
             reader: ReaderState::default(),
             history: History::default(),
             export: Arc::from([]),
@@ -70,6 +72,9 @@ impl Default for State {
 }
 impl State {
     fn reset_backend(&mut self) {
+        if self.reader.source() == crate::metrics::Source::Backend {
+            self.lineage = Arc::new(());
+        }
         self.reader.reset_backend();
         self.history = History::default();
         self.export = Arc::from([]);
@@ -77,6 +82,7 @@ impl State {
     }
     fn result(&self) -> ClusterResult {
         ClusterResult {
+            lineage: Arc::clone(&self.lineage),
             gate: GenerationGate::new(),
             reader: self.reader.clone(),
             backend_proofs: self.proofs.clone(),
@@ -140,6 +146,9 @@ async fn round(
         Ok(results) => {
             if !capture.still_current() {
                 return Err(RoundError::Stale);
+            }
+            if state.reader.source() != crate::metrics::Source::Prometheus {
+                state.lineage = Arc::new(());
             }
             state.reader.complete_prom(results);
             if !shared.publish(capture, cluster, state.result(), None) {
@@ -418,7 +427,13 @@ async fn backend_round(
     if let Some(local) = &state.owner {
         proofs.push(owner::Proof::Local(Arc::clone(local)));
     }
+    let lineage = if reader.source() == state.reader.source() {
+        Arc::clone(&state.lineage)
+    } else {
+        Arc::new(())
+    };
     let result = ClusterResult {
+        lineage: Arc::clone(&lineage),
         gate: GenerationGate::new(),
         reader: reader.clone(),
         backend_proofs: proofs.clone(),
@@ -428,6 +443,7 @@ async fn backend_round(
     if !shared.publish(capture, cluster, result, fence.work.as_ref()) {
         return Err(RoundError::Stale);
     }
+    state.lineage = lineage;
     state.history = history;
     state.reader = reader;
     state.export = export;

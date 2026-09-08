@@ -29,6 +29,11 @@ pub struct Accounting {
 }
 
 impl Accounting {
+    #[cfg(test)]
+    pub(crate) const fn for_factor_test(active: u64, reserved: u64) -> Self {
+        Self { reserved, active }
+    }
+
     /// Pending backend handshakes charged to this owner.
     #[must_use]
     pub const fn reserved(self) -> u64 {

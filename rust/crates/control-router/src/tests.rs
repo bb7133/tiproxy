@@ -48,6 +48,7 @@ use crate::{Candidate, Reservation, RouteError, Router, Settlement, Unsupported}
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+mod factors_live;
 mod locality;
 mod registration;
 mod sources;
