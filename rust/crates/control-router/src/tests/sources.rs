@@ -483,3 +483,91 @@ async fn static_namespace_aba_while_ledger_locked_refuses_work_and_preserves_oth
     replacement.close(&new_session);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composed_static_empty_uses_actual_namespace_mode_and_ledger() -> TestResult {
+    let mut greeter = Greeter::new().await?;
+    let mut harness = static_harness(
+        HealthCheckConfig {
+            enabled: true,
+            interval_nanos: 50_000_000,
+            ..HealthCheckConfig::default()
+        },
+        vec![namespace("default", &[&greeter.address])],
+    )
+    .await?;
+    harness.patch("[balance]\npolicy=\"resource\"", 5);
+    harness.router = Arc::new(must(Router::new_with_factors(
+        Arc::new(harness.source.clone()),
+        &harness.topology,
+        &harness.runtime.handle().module_context(),
+        "default",
+        100,
+        None,
+    )));
+    greeter
+        .probe()
+        .await?
+        .send(true)
+        .map_err(|_| "probe lost")?;
+    let first = verdict(&harness.router, &greeter.address, true).await?;
+    let _held = greeter.probe().await?;
+    assert!(
+        matches!(first.metrics, crate::authority::MetricInputs::StaticEmpty),
+        "COMPOSE_STATIC_ACTUAL_EMPTY_SOURCE"
+    );
+    let (session, pending) = harness.reserve(&first);
+    assert_eq!(pending.assignment().backend_address, greeter.address);
+    assert!(pending.assignment().local, "COMPOSE_STATIC_H_LOCAL");
+    assert_eq!(pending.assignment().cluster_name, "");
+    let duplicate = must(
+        harness
+            .router
+            .reserve(&session, &first, ClientInfo::default(), "", &[]),
+    );
+    assert_eq!(duplicate.assignment(), pending.assignment());
+    assert_eq!(
+        harness
+            .router
+            .accounting(&greeter.address)
+            .map(crate::Accounting::reserved),
+        Some(1),
+        "COMPOSE_STATIC_PENDING_ONCE"
+    );
+    harness.patch("[balance]\npolicy=\"location\"", 6);
+    let current = must(harness.router.capture());
+    assert!(matches!(
+        current.metrics,
+        crate::authority::MetricInputs::StaticEmpty
+    ));
+    let (other, _) = harness.reserve(&current);
+    assert!(
+        matches!(
+            harness
+                .router
+                .reserve(&session, &first, ClientInfo::default(), "", &[]),
+            Err(RouteError::StaleCandidate)
+        ),
+        "COMPOSE_STATIC_FINAL_C"
+    );
+    assert_eq!(
+        harness.router.finish(&pending, true),
+        Settlement::Applied,
+        "COMPOSE_STATIC_SETTLES_OLD_OWNER"
+    );
+    publish_namespaces(&harness, Vec::new(), 7)?;
+    publish_namespaces(&harness, vec![namespace("default", &[&greeter.address])], 8)?;
+    assert!(
+        harness.router.capture().is_err(),
+        "COMPOSE_STATIC_NAMESPACE_ABA"
+    );
+    assert!(
+        harness
+            .router
+            .reserve(&other, &current, ClientInfo::default(), "", &[])
+            .is_err()
+    );
+    assert_eq!(harness.router.close(&session), Settlement::Applied);
+    assert_eq!(harness.router.close(&other), Settlement::Applied);
+    Ok(())
+}

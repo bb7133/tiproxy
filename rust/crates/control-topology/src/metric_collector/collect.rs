@@ -47,6 +47,7 @@ impl From<MetricError> for RoundError {
 }
 
 struct State {
+    queries: Option<super::QueryLifetime>,
     lineage: Arc<()>,
     reader: ReaderState,
     history: History,
@@ -59,6 +60,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            queries: None,
             lineage: Arc::new(()),
             reader: ReaderState::default(),
             history: History::default(),
@@ -71,6 +73,19 @@ impl Default for State {
     }
 }
 impl State {
+    fn set_queries(&mut self, next: Option<super::QueryLifetime>) {
+        if matches!((&self.queries, &next), (Some(old), Some(next)) if !old.incarnation.same_as(&next.incarnation))
+        {
+            // Query removal/recreation discards both Prometheus and backend
+            // history, but does not restart the actual election owner.
+            self.lineage = Arc::new(());
+            self.reader = ReaderState::default();
+            self.history = History::default();
+            self.export = Arc::from([]);
+            self.proofs.clear();
+        }
+        self.queries = next;
+    }
     fn reset_backend(&mut self) {
         if self.reader.source() == crate::metrics::Source::Backend {
             self.lineage = Arc::new(());
@@ -82,6 +97,7 @@ impl State {
     }
     fn result(&self) -> ClusterResult {
         ClusterResult {
+            queries: self.queries.clone(),
             lineage: Arc::clone(&self.lineage),
             gate: GenerationGate::new(),
             reader: self.reader.clone(),
@@ -123,7 +139,8 @@ pub(super) async fn run_cluster(
         if owner.is_finished() {
             break;
         }
-        let rules = shared.queries();
+        state.set_queries(shared.query_lifetime());
+        let rules = shared.queries(state.queries.as_ref());
         // Stop revokes the scope directly; finish this bounded round so every
         // spawned backend is joined before the owner worker is shut down.
         let round = round(&shared, &capture, &cluster, &rules, &mut owner, &mut state).await;
@@ -433,6 +450,7 @@ async fn backend_round(
         Arc::new(())
     };
     let result = ClusterResult {
+        queries: state.queries.clone(),
         lineage: Arc::clone(&lineage),
         gate: GenerationGate::new(),
         reader: reader.clone(),

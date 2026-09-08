@@ -64,6 +64,12 @@ impl Drop for Http {
 }
 impl Http {
     async fn new(body: Arc<dyn Fn(&str) -> String + Send + Sync>) -> TestResult<Self> {
+        Self::gated(body, watch::channel(true).1).await
+    }
+    async fn gated(
+        body: Arc<dyn Fn(&str) -> String + Send + Sync>,
+        release: watch::Receiver<bool>,
+    ) -> TestResult<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let task = tokio::spawn(async move {
@@ -73,6 +79,7 @@ impl Http {
                     accepted = listener.accept() => {
                         let Ok((mut socket, _)) = accepted else { break; };
                         let body = Arc::clone(&body);
+                        let mut release = release.clone();
                         workers.spawn(async move {
                             let mut head = Vec::new();
                             while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
@@ -80,6 +87,7 @@ impl Http {
                                 if socket.read_exact(&mut byte).await.is_err() { return; }
                                 head.push(byte[0]);
                             }
+                            if release.wait_for(|released| *released).await.is_err() { return; }
                             let body = body(&String::from_utf8_lossy(&head));
                             let wire = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             let _ = socket.write_all(wire.as_bytes()).await;
@@ -198,153 +206,26 @@ async fn factor_real_producer_cache_and_authority() -> TestResult {
 
 #[allow(clippy::too_many_lines)]
 async fn observe() -> TestResult {
-    let endpoints: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(std::env::var("CP003_CONNECTION_FILE")?)?)?;
-    let endpoint = endpoints["etcd_endpoint"].as_str().ok_or("etcd endpoint")?;
-    let mut etcd = etcd_client::Client::connect([endpoint], None).await?;
-    let backend = Http::new(Arc::new(backend_body)).await?;
-    let greeting_a = Greeting::new().await?;
-    let greeting_b = Greeting::new().await?;
-    let addresses = [
-        greeting_a.address.to_string(),
-        greeting_b.address.to_string(),
-    ];
-    let ids = addresses
-        .each_ref()
-        .map(|address| format!("default/{address}"));
-    for (index, address) in addresses.iter().enumerate() {
-        etcd.put(
-            format!("/topology/tidb/{address}/info"),
-            format!(
-                r#"{{"ip":"127.0.0.1","status_port":{},"labels":{{"zone":"z{}"}}}}"#,
-                backend.address.port(),
-                index
-            ),
-            None,
-        )
-        .await?;
-        etcd.put(format!("/topology/tidb/{address}/ttl"), "1", None)
-            .await?;
-    }
-    // Use distinct operator labels while both real backend requests reach one
-    // owned server. Instance labels are status endpoints, never routing IDs.
-    let status_a = backend.address.to_string();
-    // Distinct status IPs require a second real listener for unambiguous lookup.
-    let backend_b = Http::new(Arc::new(backend_body)).await?;
-    etcd.put(
-        format!("/topology/tidb/{}/info", addresses[1]),
-        format!(
-            r#"{{"ip":"127.0.0.1","status_port":{}}}"#,
-            backend_b.address.port()
-        ),
-        None,
-    )
-    .await?;
-    let status_b = backend_b.address.to_string();
-    let mode = Arc::new(AtomicU64::new(0));
-    let prom_mode = Arc::clone(&mode);
-    let prom = Http::new(Arc::new(move |request| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |time| time.as_secs());
-        let cpu = request.contains("irate");
-        let matrix = request.contains("query_range");
-        let failure = request.contains("failed_cmds") || request.contains("backoff_seconds");
-        let values = if cpu { ["0.2", "0.8"] } else if matrix { ["0.2", "0.2"] }
-            else if failure { ["5", "0"] } else { ["10", "10"] };
-        let mut series = Vec::new();
-        for (index, instance) in [&status_a, &status_b].iter().enumerate() {
-            if cpu && index == 0 && prom_mode.load(Ordering::SeqCst) == 1 {
-                continue;
-            }
-            let sample_time = if cpu && index == 0 && prom_mode.load(Ordering::SeqCst) == 2 { now - 121 } else { now };
-            series.push(if matrix {
-                serde_json::json!({"metric":{"instance":instance},"values":[[sample_time,values[index]]]})
-            } else {
-                serde_json::json!({"metric":{"instance":instance},"value":[sample_time,values[index]]})
-            });
-        }
-        serde_json::json!({"status":"success","data":{"resultType":if matrix { "matrix" } else { "vector" },"result":series}})
-            .to_string()
-    }))
-    .await?;
-    let prom_key = "/topology/prometheus/factor-evidence";
-    let prom_info = format!(r#"{{"ip":"127.0.0.1","port":{}}}"#, prom.address.port());
-    etcd.put(prom_key, prom_info.clone(), None).await?;
-    let store = ConfigNamespaceStore::from_toml(
-        format!("[proxy]\npd-addrs=\"\"\n[[proxy.backend-clusters]]\nname=\"default\"\npd-addrs=\"{endpoint}\"\n[balance]\npolicy=\"connection\"").as_bytes(),
-        None,
-        Path::new("/tmp"),
-    )?;
-    let initial = store.current();
-    store.apply(
-        (**initial.effective()).clone(),
-        vec![NamespaceConfig {
-            namespace: "default".into(),
-            ..NamespaceConfig::default()
-        }],
-        SourceRevision {
-            file_revision: 2,
-            etcd_revision: 0,
-        },
-        Path::new("/tmp"),
-    )?;
-    let registry = OwnershipRegistry::new();
-    let runtime = ControlRuntime::claim_process(
-        &registry,
-        "factor-live",
-        ControlConfig::new(
-            1,
-            Duration::from_secs(30),
-            0,
-            TlsPolicy::default(),
-            LogLevel::Info,
-            MetricsPolicy::default(),
-        )?,
-        Arc::new(NullSink),
-    )?;
-    runtime.mark_ready()?;
-    let timeout = Arc::new(AtomicU64::new(500));
-    let (module, mut topology) = TopologyModule::new(
-        Arc::new(store.clone()),
-        Box::new(MaterialFactory {
-            endpoint: endpoint.into(),
-            timeout: Arc::clone(&timeout),
-        }),
-        Arc::new(StaticAdvertiseResolver::new("127.0.0.1")),
-        TopologyRuntimeIdentity {
-            version: "test".into(),
-            git_hash: "test".into(),
-            deploy_path: "/tmp".into(),
-            start_timestamp: 1,
-        },
-        HealthCheckConfig {
-            enabled: true,
-            interval_nanos: 50_000_000,
-            metrics_interval_nanos: 200_000_000,
-            ..HealthCheckConfig::default()
-        },
-    )?;
-    let module = module.with_metrics()?;
-    let context = runtime.handle().module_context();
-    let module = tokio::spawn(async move {
-        let _ = Box::new(module).run(context).await;
-    });
-    tokio::time::timeout(Duration::from_secs(5), topology.wait_ready()).await??;
-    let feed = topology.metric_source();
-    let (collector, overlay) = MetricCollector::bind(feed.clone(), "127.0.0.1:0".parse()?).await?;
-    for query in control_topology::metrics::query_catalog() {
-        overlay.add_query(query.id);
-    }
-    let context = runtime.handle().module_context();
-    let collector = tokio::spawn(async move {
-        let _ = Box::new(collector).run(context).await;
-    });
-    let mut running = Running {
-        runtime,
-        module,
-        collector,
-    };
+    let Live {
+        mut etcd,
+        backend,
+        backend_b,
+        addresses,
+        ids,
+        mode,
+        prom_key,
+        prom_info,
+        store,
+        timeout,
+        topology,
+        feed,
+        overlay,
+        mut running,
+        endpoint,
+        _greetings,
+        _prom,
+        prom_release: _,
+    } = start(false).await?;
     let router = must(Router::new(
         Arc::new(store.clone()),
         &topology,
@@ -637,3 +518,208 @@ async fn observe() -> TestResult {
     .await?;
     Ok(())
 }
+
+struct Live {
+    etcd: etcd_client::Client,
+    backend: Http,
+    backend_b: Http,
+    _greetings: [Greeting; 2],
+    _prom: Http,
+    addresses: [String; 2],
+    ids: [String; 2],
+    mode: Arc<AtomicU64>,
+    prom_key: &'static str,
+    prom_info: String,
+    prom_release: watch::Sender<bool>,
+    store: ConfigNamespaceStore,
+    timeout: Arc<AtomicU64>,
+    topology: TopologyModuleHandle,
+    feed: MetricSourceHandle,
+    overlay: MetricOverlayHandle,
+    running: Running,
+    endpoint: String,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn start(routing: bool) -> TestResult<Live> {
+    let endpoints: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(std::env::var("CP003_CONNECTION_FILE")?)?)?;
+    let endpoint = endpoints["etcd_endpoint"]
+        .as_str()
+        .ok_or("etcd endpoint")?
+        .to_owned();
+    let mut etcd = etcd_client::Client::connect([endpoint.clone()], None).await?;
+    let backend = Http::new(Arc::new(backend_body)).await?;
+    let greeting_a = Greeting::new().await?;
+    let greeting_b = Greeting::new().await?;
+    let addresses = [
+        greeting_a.address.to_string(),
+        greeting_b.address.to_string(),
+    ];
+    let ids = addresses
+        .each_ref()
+        .map(|address| format!("default/{address}"));
+    for (index, address) in addresses.iter().enumerate() {
+        etcd.put(
+            format!("/topology/tidb/{address}/info"),
+            format!(
+                r#"{{"ip":"127.0.0.1","status_port":{},"labels":{{"zone":"z{}"}}}}"#,
+                backend.address.port(),
+                index
+            ),
+            None,
+        )
+        .await?;
+        etcd.put(format!("/topology/tidb/{address}/ttl"), "1", None)
+            .await?;
+    }
+    // Use distinct operator labels while both real backend requests reach one
+    // owned server. Instance labels are status endpoints, never routing IDs.
+    let status_a = backend.address.to_string();
+    // Distinct status IPs require a second real listener for unambiguous lookup.
+    let backend_b = Http::new(Arc::new(backend_body)).await?;
+    etcd.put(
+        format!("/topology/tidb/{}/info", addresses[1]),
+        format!(
+            r#"{{"ip":"127.0.0.1","status_port":{}}}"#,
+            backend_b.address.port()
+        ),
+        None,
+    )
+    .await?;
+    let status_b = backend_b.address.to_string();
+    let mode = Arc::new(AtomicU64::new(0));
+    let prom_mode = Arc::clone(&mode);
+    let prom_release = watch::channel(true).0;
+    let prom = Http::gated(Arc::new(move |request| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.as_secs());
+        let cpu = request.contains("irate");
+        let matrix = request.contains("query_range");
+        let failure = request.contains("failed_cmds") || request.contains("backoff_seconds");
+        let values = if cpu { ["0.2", "0.8"] } else if matrix { ["0.2", "0.2"] }
+            else if failure { ["5", "0"] } else { ["10", "10"] };
+        let mut series = Vec::new();
+        for (index, instance) in [&status_a, &status_b].iter().enumerate() {
+            if cpu && index == 0 && prom_mode.load(Ordering::SeqCst) == 1 {
+                continue;
+            }
+            let sample_time = if cpu && index == 0 && prom_mode.load(Ordering::SeqCst) == 2 { now - 121 } else { now };
+            series.push(if matrix {
+                serde_json::json!({"metric":{"instance":instance},"values":[[sample_time,values[index]]]})
+            } else {
+                serde_json::json!({"metric":{"instance":instance},"value":[sample_time,values[index]]})
+            });
+        }
+        serde_json::json!({"status":"success","data":{"resultType":if matrix { "matrix" } else { "vector" },"result":series}})
+            .to_string()
+    }), prom_release.subscribe())
+    .await?;
+    let prom_key = "/topology/prometheus/factor-evidence";
+    let prom_info = format!(r#"{{"ip":"127.0.0.1","port":{}}}"#, prom.address.port());
+    etcd.put(prom_key, prom_info.clone(), None).await?;
+    let store = ConfigNamespaceStore::from_toml(
+        format!("[proxy]\npd-addrs=\"\"\n[[proxy.backend-clusters]]\nname=\"default\"\npd-addrs=\"{endpoint}\"\n[balance]\npolicy=\"connection\"").as_bytes(),
+        None,
+        Path::new("/tmp"),
+    )?;
+    let initial = store.current();
+    store.apply(
+        (**initial.effective()).clone(),
+        vec![NamespaceConfig {
+            namespace: "default".into(),
+            ..NamespaceConfig::default()
+        }],
+        SourceRevision {
+            file_revision: 2,
+            etcd_revision: 0,
+        },
+        Path::new("/tmp"),
+    )?;
+    let registry = OwnershipRegistry::new();
+    let runtime = ControlRuntime::claim_process(
+        &registry,
+        "factor-live",
+        ControlConfig::new(
+            1,
+            Duration::from_secs(30),
+            0,
+            TlsPolicy::default(),
+            LogLevel::Info,
+            MetricsPolicy::default(),
+        )?,
+        Arc::new(NullSink),
+    )?;
+    runtime.mark_ready()?;
+    let timeout = Arc::new(AtomicU64::new(500));
+    let (module, mut topology) = TopologyModule::new(
+        Arc::new(store.clone()),
+        Box::new(MaterialFactory {
+            endpoint: endpoint.clone(),
+            timeout: Arc::clone(&timeout),
+        }),
+        Arc::new(StaticAdvertiseResolver::new("127.0.0.1")),
+        TopologyRuntimeIdentity {
+            version: "test".into(),
+            git_hash: "test".into(),
+            deploy_path: "/tmp".into(),
+            start_timestamp: 1,
+        },
+        HealthCheckConfig {
+            enabled: true,
+            interval_nanos: 50_000_000,
+            metrics_interval_nanos: 200_000_000,
+            ..HealthCheckConfig::default()
+        },
+    )?;
+    let module = module.with_metrics()?;
+    let context = runtime.handle().module_context();
+    let module = tokio::spawn(async move {
+        let _ = Box::new(module).run(context).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), topology.wait_ready()).await??;
+    let feed = topology.metric_source();
+    let (collector, overlay) = if routing {
+        MetricCollector::bind_for_routing(feed.clone(), "127.0.0.1:0".parse()?).await?
+    } else {
+        let bound = MetricCollector::bind(feed.clone(), "127.0.0.1:0".parse()?).await?;
+        for query in control_topology::metrics::query_catalog() {
+            bound.1.add_query(query.id);
+        }
+        bound
+    };
+    let context = runtime.handle().module_context();
+    let collector = tokio::spawn(async move {
+        let _ = Box::new(collector).run(context).await;
+    });
+    let running = Running {
+        runtime,
+        module,
+        collector,
+    };
+    Ok(Live {
+        etcd,
+        backend,
+        backend_b,
+        addresses,
+        ids,
+        mode,
+        prom_key,
+        prom_info,
+        prom_release,
+        store,
+        timeout,
+        topology,
+        feed,
+        overlay,
+        running,
+        endpoint,
+        _greetings: [greeting_a, greeting_b],
+        _prom: prom,
+    })
+}
+
+#[cfg(test)]
+#[path = "resource_live.rs"]
+mod resource_live;

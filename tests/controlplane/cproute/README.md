@@ -310,3 +310,10 @@ use raw C emptiness to block the still-applied Dynamic source; bind every
 namespace to the default source. The first two must fail the real lease-revoke
 window row specifically. The full entry contains 46 mutations (6 group,
 23 selector/source, 6 locality, 11 static-producer).
+
+### Opt-in Resource/Location reservations
+
+`make controlplane-cproute-resource-evidence` adds actual factor reservations,
+automatic query lifetimes, static-empty qualification and missing-metric source
+windows. See [resource/README.md](resource/README.md). The original entrypoint
+and its 46 mutations remain unchanged; production composition remains gated.

@@ -253,3 +253,142 @@ fn factor_lineage_tracks_selected_history_not_round_or_unused_owners() {
         "FACTOR_BACKEND_OWNER_COLD_START"
     );
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn routing_queries_retire_rounds_and_purge_both_histories()
+-> Result<(), super::super::tests::TestError> {
+    use control_config::ConfigNamespaceSource;
+    let fixture = super::super::tests::Fixture::new("127.0.0.1:1").await?;
+    let (collector, overlay) = super::super::MetricCollector::bind_for_routing(
+        fixture.handle.clone(),
+        "127.0.0.1:0".parse()?,
+    )
+    .await?;
+    collector.shared.serving.activate(fixture.lease.token());
+    let capture = fixture.capture()?;
+    collector.shared.lock().capture = Some(capture.clone());
+    let mut state = State::default();
+    state.set_queries(collector.shared.query_lifetime());
+    assert_eq!(
+        collector.shared.queries(state.queries.as_ref()).len(),
+        6,
+        "COMPOSE_AUTOMATIC_SIX_QUERIES"
+    );
+    let result = decode_prometheus(br#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"instance":"x:10080"},"value":[100,"0.2"]}]}}"#, "collector-fixture", 100)?;
+    state
+        .reader
+        .complete_prom(BTreeMap::from([(QueryId::Cpu, result)]));
+    let backend = decode_backend(b"process_cpu_seconds_total 100\ntidb_server_maxprocs 1\nprocess_resident_memory_bytes 20\ntidb_server_memory_quota_bytes 100\n")?;
+    state.history.observe(
+        &[QueryId::Memory],
+        &crate::metrics::address_label("x:10080"),
+        &backend,
+        100_000,
+    )?;
+    assert!(
+        state
+            .history
+            .missing(&[QueryId::Memory], &["x:10080".into()])
+            .is_empty(),
+        "seeded backend history"
+    );
+    state.export = Arc::from(b"old history".as_slice());
+    assert!(
+        collector
+            .shared
+            .publish(&capture, "collector-fixture", state.result(), None)
+    );
+    let before = overlay.current_for(&capture).ok_or("snapshot")?;
+    let lineage = Arc::clone(&state.lineage);
+    fixture.config.apply_toml(
+        b"[balance]\npolicy=\"location\"",
+        None,
+        2,
+        std::path::Path::new("/tmp"),
+    )?;
+    state.set_queries(collector.shared.query_lifetime());
+    assert!(Arc::ptr_eq(&lineage, &state.lineage));
+    assert!(before.still_current(), "COMPOSE_LOCATION_KEEPS_QUERIES");
+    fixture.config.apply_toml(
+        b"[balance]\npolicy=\"connection\"",
+        None,
+        3,
+        std::path::Path::new("/tmp"),
+    )?;
+    assert!(
+        collector
+            .shared
+            .queries(collector.shared.query_lifetime().as_ref())
+            .is_empty(),
+        "COMPOSE_CONNECTION_UNSUBSCRIBES"
+    );
+    assert!(!before.still_current(), "COMPOSE_POLICY_RETIRES_SNAPSHOT");
+    assert_eq!(
+        before.with_current(|| 7),
+        None,
+        "COMPOSE_POLICY_FINAL_INPUT_FENCE"
+    );
+    assert!(
+        !collector
+            .shared
+            .publish(&capture, "collector-fixture", state.result(), None),
+        "COMPOSE_POLICY_STALE_ROUND_REJECTED"
+    );
+    fixture.config.apply_toml(
+        b"[balance]\npolicy=\"resource\"",
+        None,
+        4,
+        std::path::Path::new("/tmp"),
+    )?;
+    assert!(!before.still_current(), "COMPOSE_QUERY_ABA_STAYS_RETIRED");
+    state.set_queries(collector.shared.query_lifetime());
+    assert!(
+        !Arc::ptr_eq(&lineage, &state.lineage),
+        "COMPOSE_QUERY_NEW_LINEAGE"
+    );
+    assert!(
+        state.reader.get(QueryId::Cpu).is_none(),
+        "COMPOSE_PROM_HISTORY_PURGED"
+    );
+    assert!(
+        state
+            .history
+            .missing(&[QueryId::Memory], &["x:10080".into()])
+            .len()
+            == 1,
+        "COMPOSE_BACKEND_HISTORY_PURGED"
+    );
+    assert!(state.export.is_empty(), "COMPOSE_OWNER_EXPORT_PURGED");
+    assert_eq!(collector.shared.queries(state.queries.as_ref()).len(), 6);
+    assert!(
+        overlay
+            .routing_current_for(
+                capture.routing(),
+                &fixture.config.current().resource_incarnation()
+            )
+            .is_none()
+    );
+    assert!(
+        collector
+            .shared
+            .publish(&capture, "collector-fixture", state.result(), None)
+    );
+    assert!(
+        overlay
+            .routing_current_for(
+                capture.routing(),
+                &fixture.config.current().resource_incarnation()
+            )
+            .is_some()
+    );
+    let foreign =
+        control_config::ConfigNamespaceStore::from_toml(b"", None, std::path::Path::new("/tmp"))?;
+    assert!(
+        overlay
+            .routing_current_for(capture.routing(), &foreign.current().resource_incarnation())
+            .is_none(),
+        "COMPOSE_OVERLAY_FOREIGN_POLICY"
+    );
+    Ok(())
+}

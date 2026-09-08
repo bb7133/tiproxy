@@ -1076,3 +1076,53 @@ fn namespace_incarnation_tracks_continuity_without_changing_content_identity()
     assert!(!first.same_namespace_incarnation(&foreign.current(), "default"));
     Ok(())
 }
+
+#[test]
+fn resource_incarnation_records_coalesced_policy_lifetimes() {
+    fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        result.unwrap_or_else(|error| unreachable!("config fixture: {error:?}"))
+    }
+    let root = Path::new("/tmp");
+    let store = must(ConfigNamespaceStore::from_toml(
+        b"[balance]\npolicy=\"resource\"",
+        None,
+        root,
+    ));
+    let mut watch = store.subscribe();
+    let original = store.current().resource_incarnation();
+    assert!(original.enabled());
+    must(store.apply_toml(b"[balance]\npolicy=\"location\"", None, 2, root));
+    assert!(
+        original.same_as(&store.current().resource_incarnation()),
+        "COMPOSE_RESOURCE_LOCATION_CONTINUITY"
+    );
+    must(store.apply_toml(b"[log]\nlevel=\"debug\"", None, 3, root));
+    assert!(
+        original.same_as(&store.current().resource_incarnation()),
+        "COMPOSE_UNRELATED_CONFIG_CONTINUITY"
+    );
+    assert!(
+        store
+            .apply_toml(b"[balance]\npolicy=\"invalid\"", None, 4, root)
+            .is_err()
+    );
+    assert!(
+        original.same_as(&store.current().resource_incarnation()),
+        "COMPOSE_REJECTED_CONFIG_CONTINUITY"
+    );
+    must(store.apply_toml(b"[balance]\npolicy=\"connection\"", None, 5, root));
+    assert!(!store.current().resource_incarnation().enabled());
+    must(store.apply_toml(b"[balance]\npolicy=\"resource\"", None, 6, root));
+    let last = watch.borrow_and_update().resource_incarnation();
+    assert!(last.enabled());
+    assert!(!original.same_as(&last), "COMPOSE_COALESCED_CONNECTION_ABA");
+    let foreign = must(ConfigNamespaceStore::from_toml(
+        b"[balance]\npolicy=\"resource\"",
+        None,
+        root,
+    ));
+    assert!(
+        !last.same_as(&foreign.current().resource_incarnation()),
+        "COMPOSE_FOREIGN_POLICY_IDENTITY"
+    );
+}

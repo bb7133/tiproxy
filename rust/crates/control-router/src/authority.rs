@@ -80,6 +80,20 @@ impl From<LedgerError> for RouteError {
     }
 }
 
+pub(crate) enum MetricInputs {
+    // This variant is minted only from the actual Static backend snapshot.
+    StaticEmpty,
+    Dynamic(Option<Arc<control_topology::MetricSnapshot>>),
+}
+impl Clone for MetricInputs {
+    fn clone(&self) -> Self {
+        match self {
+            Self::StaticEmpty => Self::StaticEmpty,
+            Self::Dynamic(snapshot) => Self::Dynamic(snapshot.clone()),
+        }
+    }
+}
+
 /// An opaque candidate, valid only when rechecked by its producing router.
 ///
 /// Retaining this value never retains routing authority. Config, routing and
@@ -93,6 +107,7 @@ pub struct Candidate {
     pub(crate) routing: Arc<RoutingSnapshot>,
     pub(crate) health: Arc<HealthSnapshot>,
     pub(crate) policy: RoutingConfig,
+    pub(crate) metrics: MetricInputs,
 }
 
 pub(crate) struct Sources {
@@ -170,6 +185,28 @@ impl Sources {
         self.capture_inputs(false)
     }
 
+    pub(crate) fn capture_composed(
+        &self,
+        overlay: Option<&control_topology::MetricOverlayHandle>,
+    ) -> Result<Candidate, RouteError> {
+        let mut candidate = self.capture_inputs(true)?;
+        candidate.metrics =
+            if candidate.backend.mode() == control_topology::BackendSourceMode::Static {
+                MetricInputs::StaticEmpty
+            } else {
+                MetricInputs::Dynamic(overlay.and_then(|overlay| {
+                    overlay
+                        .routing_current_for(
+                            &candidate.routing,
+                            &candidate.config.resource_incarnation(),
+                        )
+                        .map(Arc::new)
+                }))
+            };
+        self.validate(&candidate)?;
+        Ok(candidate)
+    }
+
     pub(crate) fn capture_factors(&self) -> Result<Candidate, RouteError> {
         self.capture_inputs(true)
     }
@@ -194,6 +231,7 @@ impl Sources {
             health: Arc::clone(backend.health()),
             backend,
             policy,
+            metrics: MetricInputs::Dynamic(None),
         };
         self.validate(&candidate)?;
         Ok(candidate)

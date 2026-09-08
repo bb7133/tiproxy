@@ -123,6 +123,7 @@ impl Response {
         };
         let result = result.filter(|result| {
             result.gate.is_live()
+                && result.queries_current()
                 && result
                     .owner
                     .as_ref()
@@ -153,11 +154,9 @@ impl Response {
                     .with_current(|| {
                         let proofs: Vec<_> = self.proofs.iter().collect();
                         owner::with_retained(&proofs, || {
-                            if self
-                                .result
-                                .as_ref()
-                                .is_none_or(|result| result.gate.is_live())
-                            {
+                            if self.result.as_ref().is_none_or(|result| {
+                                result.gate.is_live() && result.queries_current()
+                            }) {
                                 Some(write())
                             } else {
                                 None
@@ -302,3 +301,51 @@ pub(super) fn encode_query(value: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    #[tokio::test]
+    async fn routing_query_retirement_fences_owner_response_capture_and_write()
+    -> Result<(), super::super::tests::TestError> {
+        let fixture = super::super::tests::Fixture::new("127.0.0.1:1").await?;
+        let (collector, _) = super::super::MetricCollector::bind_for_routing(
+            fixture.handle.clone(),
+            "127.0.0.1:0".parse()?,
+        )
+        .await?;
+        collector.shared.serving.activate(fixture.lease.token());
+        let capture = fixture.capture()?;
+        collector.shared.lock().capture = Some(capture.clone());
+        let mut result = super::super::tests::result();
+        result.queries = collector.shared.query_lifetime();
+        assert!(
+            collector
+                .shared
+                .publish(&capture, "collector-fixture", result, None)
+        );
+        let retained =
+            Response::capture(&collector.shared, "collector-fixture").ok_or("response")?;
+        assert_eq!(retained.bytes.as_ref(), b"{}");
+        assert_eq!(retained.with_current(|| 1), Some(1));
+        fixture.config.apply_toml(
+            b"[balance]\npolicy=\"connection\"",
+            None,
+            2,
+            std::path::Path::new("/tmp"),
+        )?;
+        assert!(
+            Response::capture(&collector.shared, "collector-fixture")
+                .ok_or("empty response")?
+                .bytes
+                .is_empty(),
+            "COMPOSE_OWNER_CAPTURE_QUERY_FENCE"
+        );
+        assert_eq!(
+            retained.with_current(|| 1),
+            None,
+            "COMPOSE_OWNER_WRITE_QUERY_FENCE"
+        );
+        Ok(())
+    }
+}
