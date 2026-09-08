@@ -191,10 +191,19 @@ async fn migration_simulations_never_share_ownership_and_close_wins_terminal_rac
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn migration_immediate_terminal_waits_for_accepted_ledger_commit() -> TestResult {
-    let h = Harness::with_backends(
+    // This test owns the offer/commit interleaving. Periodic health replacement
+    // must not revoke its prepared candidate during an OS thread handoff;
+    // source replacement is exercised separately by the final-lock test.
+    let h = Harness::with_health(
         "",
         "connection",
         &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
     )
     .await?;
     let sim = Arc::new(simulation(&h, 1));
@@ -205,7 +214,9 @@ async fn migration_immediate_terminal_waits_for_accepted_ledger_commit() -> Test
         let (offered, release) = sim.router().hold_next_redirect_offer_for_test();
         let issuer = Arc::clone(&sim);
         let offer = std::thread::spawn(move || issuer.offer(&p));
-        offered.recv_timeout(Duration::from_secs(3))?;
+        offered
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|err| format!("MIGRATION_OFFER_BARRIER: {err}"))?;
         let op = sim
             .take_redirect()
             .unwrap_or_else(|| unreachable!("offered token"));
@@ -215,7 +226,9 @@ async fn migration_immediate_terminal_waits_for_accepted_ledger_commit() -> Test
         let terminal = std::thread::spawn(move || {
             let _ = done.send(consumer.finish(&op, success));
         });
-        attempted.recv_timeout(Duration::from_secs(3))?;
+        attempted
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|err| format!("MIGRATION_TERMINAL_LOCK_ATTEMPT: {err}"))?;
         let early = result.recv_timeout(Duration::from_millis(100));
         release.send(())?;
         assert!(must(must(offer.join())));
@@ -226,7 +239,9 @@ async fn migration_immediate_terminal_waits_for_accepted_ledger_commit() -> Test
             "MIGRATION_TERMINAL_BEFORE_COMMIT"
         );
         assert_eq!(
-            result.recv_timeout(Duration::from_secs(3))?,
+            result
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|err| format!("MIGRATION_TERMINAL_SETTLEMENT: {err}"))?,
             Settlement::Applied
         );
         assert_eq!(

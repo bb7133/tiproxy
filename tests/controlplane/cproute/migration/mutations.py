@@ -66,6 +66,8 @@ def main():
             tested = run([])
             if tested.returncode != 101 or f"{expected} ... FAILED" not in tested.stdout:
                 raise RuntimeError(f"mutation missed required test: {name}\n{tested.stdout}")
+            if name == "offer-releases-lock-before-commit" and "MIGRATION_TERMINAL_BEFORE_COMMIT" not in tested.stdout:
+                raise RuntimeError(f"mutation missed commit-order assertion: {name}\n{tested.stdout}")
             path.write_text(original)
             print(f"CP-ROUTE migration mutation killed: {name}", flush=True)
         baseline()

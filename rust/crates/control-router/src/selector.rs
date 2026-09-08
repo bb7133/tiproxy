@@ -475,7 +475,9 @@ impl Router {
             .take()
         {
             let _ = signal.send(());
-            let _ = wait.recv_timeout(std::time::Duration::from_secs(5));
+            // The test bounds its waits and owns release. Do not let elapsed
+            // time open this barrier; dropping release also unblocks cleanup.
+            let _ = wait.recv();
         }
         state.ledger.admit_redirect(redirect, accepted, now);
         Ok(accepted)
