@@ -50,6 +50,7 @@ fn shared_go_composition_observation() {
         let mut state = State {
             ledger: Ledger::new(100),
             factors: BTreeMap::new(),
+            schedules: BTreeMap::new(),
             backends: BTreeMap::new(),
             groups: BTreeMap::new(),
             ports: PortRoutes::default(),
@@ -81,6 +82,7 @@ fn shared_go_composition_observation() {
                     account: must(state.ledger.add_account()),
                     healthy: backend["healthy"].as_bool().unwrap_or(false),
                     group: Some(number(&backend["group"])),
+                    failover_since: None,
                 },
             );
         }

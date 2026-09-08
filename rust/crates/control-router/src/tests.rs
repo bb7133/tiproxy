@@ -54,6 +54,7 @@ mod migration;
 mod registration;
 mod resource;
 mod sources;
+mod worker;
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
     result.unwrap_or_else(|error| unreachable!("fixture: {error:?}"))

@@ -539,6 +539,21 @@ impl BackendSourceHandle {
         })
     }
 
+    /// Waits for a mode, routing or health publication. This wake-up grants no
+    /// authority: callers must capture `current()` and revalidate before effects.
+    /// All sides are observed so a parked source cannot hide a mode transition.
+    /// # Errors
+    /// Returns `RoutingSourceClosed` when any bound publisher closes.
+    pub async fn changed(&mut self) -> Result<(), crate::RoutingSourceClosed> {
+        tokio::select! {
+            result = self.mode.changed() => result.map_err(|_| crate::RoutingSourceClosed),
+            result = self.dynamic.0.changed() => result,
+            result = self.stationary.0.changed() => result,
+            result = self.dynamic.1.changed() => result.map_err(|_| crate::RoutingSourceClosed),
+            result = self.stationary.1.changed() => result.map_err(|_| crate::RoutingSourceClosed),
+        }
+    }
+
     /// The namespace this handle is bound to.
     #[must_use]
     pub fn namespace(&self) -> &str {

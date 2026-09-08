@@ -13,9 +13,10 @@
 // limitations under the License.
 
 //! Effectless migration harness. Its queue carries local tokens only, never
-//! production session commands. The scheduler and real effect sink are later slices.
+//! production session commands. Its owned worker has no production effect sink.
 
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use control_config::ConfigNamespaceSource;
@@ -67,8 +68,10 @@ impl PreparedBalance {
 /// observational shadow: that later API must advance only from observed events.
 pub struct MigrationSimulation {
     router: Router,
-    sender: mpsc::SyncSender<Redirect>,
-    receiver: Mutex<mpsc::Receiver<Redirect>>,
+    pub(crate) sender: crate::scheduler::CommandQueue,
+    running: AtomicBool,
+    #[cfg(test)]
+    initialized: AtomicBool,
 }
 
 impl MigrationSimulation {
@@ -85,7 +88,6 @@ impl MigrationSimulation {
         queue_capacity: usize,
         metrics: Option<MetricOverlayHandle>,
     ) -> Result<Self, RouteError> {
-        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         Ok(Self {
             router: Router::new_with_factors(
                 source,
@@ -95,8 +97,10 @@ impl MigrationSimulation {
                 max_sessions,
                 metrics,
             )?,
-            sender,
-            receiver: Mutex::new(receiver),
+            sender: crate::scheduler::CommandQueue::new(queue_capacity),
+            running: AtomicBool::new(false),
+            #[cfg(test)]
+            initialized: AtomicBool::new(false),
         })
     }
 
@@ -153,12 +157,22 @@ impl MigrationSimulation {
 
     /// Removes one local simulated admission, without performing any I/O.
     #[must_use]
-    pub fn take_redirect(&self) -> Option<Redirect> {
-        self.receiver
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .try_recv()
-            .ok()
+    #[cfg(test)]
+    pub(crate) fn take_redirect(&self) -> Option<Redirect> {
+        self.sender.take_redirect()
+    }
+
+    /// Removes the oldest local command. Unlike `take_redirect`, this can drain
+    /// a close command; `take_redirect` preserves a close at the queue head.
+    #[must_use]
+    pub fn take_command(&self) -> Option<crate::MigrationCommand> {
+        self.sender.take()
+    }
+
+    /// Observes physical closure after an admitted close, even after revocation
+    /// or a pending redirect result. Duplicate/foreign tokens are ignored.
+    pub fn observe_close(&self, close: &crate::ForceClose) -> Settlement {
+        self.router.observe_close(close)
     }
 
     /// Supplies a simulated terminal. Revoked sources do not revoke the exact
@@ -171,3 +185,6 @@ impl MigrationSimulation {
         self.router.finish_redirect(redirect, success, now)
     }
 }
+
+#[path = "simulation_worker.rs"]
+mod worker;
