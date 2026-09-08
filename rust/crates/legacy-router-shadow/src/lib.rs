@@ -18,6 +18,10 @@
 //! The bounded inbox is a consumer-side primitive, not the Go hot-path recorder.
 //! Lifecycle comparison alone never qualifies a complete routing shadow interval.
 
+/// Optional same-process local-socket consumer with explicit cancellation/join.
+pub mod consumer;
+/// Strict v2 actual-capture codec, independent of the immutable v1 corpus.
+pub mod live;
 mod wire;
 use control_router::shadow::Observation;
 use std::collections::VecDeque;
@@ -144,3 +148,6 @@ impl Inbox {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod live_tests;

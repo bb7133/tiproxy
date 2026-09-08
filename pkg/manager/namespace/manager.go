@@ -16,6 +16,7 @@ import (
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/balance/factor"
 	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
@@ -39,6 +40,7 @@ type NamespaceManager interface {
 }
 
 type namespaceManager struct {
+	observation *observation.Recorder
 	sync.RWMutex
 	nsm            map[string]*Namespace
 	tpFetcher      observer.TopologyFetcher
@@ -51,7 +53,13 @@ type namespaceManager struct {
 }
 
 func NewNamespaceManager() *namespaceManager {
-	return &namespaceManager{}
+	return NewNamespaceManagerWithObservation(nil)
+}
+
+// NewNamespaceManagerWithObservation fixes the factory before Init; observation
+// cannot be attached to an existing namespace or initialized router.
+func NewNamespaceManagerWithObservation(recorder *observation.Recorder) *namespaceManager {
+	return &namespaceManager{observation: recorder}
 }
 
 func (mgr *namespaceManager) buildNamespace(cfg *config.Namespace) (*Namespace, error) {
@@ -63,7 +71,11 @@ func (mgr *namespaceManager) buildNamespace(cfg *config.Namespace) (*Namespace, 
 	fetcher := observer.NewFallbackFetcher(mgr.tpFetcher, dynamicFetcher, staticFetcher)
 
 	// init Router
-	rt := router.NewScoreBasedRouter(logger.Named("router"))
+	var owner *observation.Owner
+	if mgr.observation != nil {
+		owner = mgr.observation.NewOwner()
+	}
+	rt := router.NewScoreBasedRouterWithObservation(logger.Named("router"), owner)
 	hc := observer.NewDefaultHealthCheckWithNetwork(mgr.backendNetwork, healthCheckCfg, logger.Named("hc"))
 	bo := observer.NewDefaultBackendObserver(logger.Named("observer"), healthCheckCfg, fetcher, hc, mgr.cfgMgr)
 	bo.Start(context.Background())
@@ -75,15 +87,25 @@ func (mgr *namespaceManager) buildNamespace(cfg *config.Namespace) (*Namespace, 
 	rt.Init(context.Background(), bo, bpCreator, mgr.cfgMgr, mgr.cfgMgr.WatchConfig())
 
 	return &Namespace{
-		name:   cfg.Namespace,
-		user:   cfg.Frontend.User,
-		bo:     bo,
-		router: rt,
+		observation: owner,
+		name:        cfg.Namespace,
+		user:        cfg.Frontend.User,
+		bo:          bo,
+		router:      rt,
 	}, nil
 }
 
 func (mgr *namespaceManager) CommitNamespaces(nss []*config.Namespace, nssDelete []bool) error {
 	nsm := make(map[string]*Namespace)
+	var built []*Namespace
+	committed := false
+	defer func() {
+		for _, ns := range built {
+			if !committed || nsm[ns.Name()] != ns {
+				ns.observation.Invalidate(observation.OwnerDisappeared)
+			}
+		}
+	}()
 	mgr.RLock()
 	maps.Copy(nsm, mgr.nsm)
 	mgr.RUnlock()
@@ -98,11 +120,18 @@ func (mgr *namespaceManager) CommitNamespaces(nss []*config.Namespace, nssDelete
 		if err != nil {
 			return fmt.Errorf("%w: create namespace error, namespace: %s", err, nsc.Namespace)
 		}
+		built = append(built, ns)
 		nsm[ns.Name()] = ns
 	}
 
 	mgr.Lock()
+	for name, old := range mgr.nsm {
+		if nsm[name] != old {
+			old.observation.Invalidate(observation.OwnerDisappeared)
+		}
+	}
 	mgr.nsm = nsm
+	committed = true
 	mgr.Unlock()
 	return nil
 }

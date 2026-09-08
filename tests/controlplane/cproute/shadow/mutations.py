@@ -74,15 +74,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='cproute-shadow-') as temporary:
         directory = Path(temporary) / 'repo'
         shutil.copytree(ROOT, directory, ignore=shutil.ignore_patterns('.git', 'target', 'bin', 'artifacts', '__pycache__'))
-        target = directory / 'rust/target'
-        seed = ROOT / 'rust/target'
-        # The caller finishes its baseline first. This target is exclusive to
-        # this sequential runner and is always removed by TemporaryDirectory.
-        if seed.exists():
-            if sys.platform == 'darwin':
-                subprocess.run(['cp', '-cR', str(seed), str(target)], check=True)
-            else:
-                shutil.copytree(seed, target, ignore=shutil.ignore_patterns('incremental'))
+        # One caller-owned Cargo cache, reused sequentially; mutations still
+        # touch only this isolated source copy. No duplicate multi-GB cache.
+        target = ROOT / 'rust/target'
         env = dict(os.environ, CARGO_TARGET_DIR=str(target))
         files = {path: (directory / path).read_text() for _, _, _, _, edits in CASES for path, *_ in edits}
         baseline(directory, env)

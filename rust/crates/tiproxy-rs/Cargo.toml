@@ -19,6 +19,7 @@ control-plane.workspace = true
 control-proto.workspace = true
 control-topology.workspace = true
 dataplane.workspace = true
+legacy-router-shadow.workspace = true
 if-addrs.workspace = true
 libc.workspace = true
 rustix.workspace = true

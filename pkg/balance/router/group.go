@@ -14,6 +14,7 @@ import (
 	glist "github.com/bahlo/generic-list-go"
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
 	"github.com/pingcap/tiproxy/pkg/manager/backendcluster"
@@ -69,15 +70,27 @@ type Group struct {
 	// group.
 	crossKeyspaceSkipCount uint64
 	lastCrossKeyspaceWarn  time.Time
+	observation            *observation.Owner
+	observationID          uint64
 }
 
 func NewGroup(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger) (*Group, error) {
+	return newGroupObserved(values, bpCreator, matchType, lg, nil)
+}
+
+func newGroupObserved(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner) (*Group, error) {
+	var observationID uint64
+	if owner.Enabled() {
+		observationID = owner.NextIdentity()
+		owner.Emit(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.GroupCreated, Group: observationID}}})
+	}
 	if len(values) > 0 {
 		lg = lg.With(zap.Strings("values", values))
 	}
 	lg.Info("new group created")
 
 	group := &Group{
+		observation: owner, observationID: observationID,
 		matchType:       matchType,
 		lg:              lg,
 		values:          values,
@@ -87,6 +100,9 @@ func NewGroup(values []string, bpCreator func(lg *zap.Logger) policy.BalancePoli
 	}
 	err := group.parseValues()
 	if err != nil {
+		if owner.Enabled() {
+			owner.Emit(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.GroupRemoved, Group: observationID}}})
+		}
 		err = errors.Wrapf(err, "failed to parse values")
 	}
 	return group, err
@@ -186,6 +202,7 @@ func (g *Group) AddBackend(backendID string, backend *backendWrapper) {
 	defer g.Unlock()
 	g.backends[backendID] = backend
 	backend.group = g
+	g.observeAccount(backend)
 }
 
 // removeBackendIfIdle removes the backend from the group only if it has no connections and no
@@ -197,6 +214,14 @@ func (g *Group) removeBackendIfIdle(backendID string, backend *backendWrapper) (
 		return false, false
 	}
 	delete(g.backends, backendID)
+	if g.observation.Enabled() {
+		batch := observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.RemoveAccount, Account: backend.observationID}}}
+		if len(g.backends) == 0 {
+			batch.Events[1] = observation.Event{Kind: observation.GroupRemoved, Group: g.observationID}
+			batch.EventCount++
+		}
+		g.capture(batch, nil, observation.ConnectionState{}, backend)
+	}
 	return true, len(g.backends) == 0
 }
 
@@ -307,10 +332,15 @@ func (g *Group) UpdateFailover(now time.Time) {
 }
 
 func (g *Group) Route(excluded []BackendInst) (policy.BackendCtx, error) {
+	return g.routeObserved(excluded, nil)
+}
+
+func (g *Group) routeObserved(excluded []BackendInst, selection *selectionObservation) (policy.BackendCtx, error) {
 	g.Lock()
 	defer g.Unlock()
 
 	if len(g.backends) == 0 {
+		g.observeNoRoute(selection)
 		return nil, ErrNoBackend
 	}
 	backends := make([]policy.BackendCtx, 0, len(g.backends))
@@ -334,10 +364,12 @@ func (g *Group) Route(excluded []BackendInst) (policy.BackendCtx, error) {
 
 	idlestBackend := g.policy.BackendToRoute(backends)
 	if idlestBackend == nil || reflect.ValueOf(idlestBackend).IsNil() {
+		g.observeNoRoute(selection)
 		return nil, ErrNoBackend
 	}
 	backend := idlestBackend.(*backendWrapper)
 	backend.connScore++
+	g.observeReserved(selection, backend)
 	return backend, nil
 }
 
@@ -432,6 +464,10 @@ func (g *Group) Balance(ctx context.Context) {
 }
 
 func (g *Group) onCreateConn(backendInst BackendInst, conn RedirectableConn, succeed bool) {
+	g.onCreateConnObserved(backendInst, conn, succeed, nil)
+}
+
+func (g *Group) onCreateConnObserved(backendInst BackendInst, conn RedirectableConn, succeed bool, selection *selectionObservation) {
 	g.Lock()
 	defer g.Unlock()
 	backend := g.ensureBackend(backendInst.ID())
@@ -443,11 +479,15 @@ func (g *Group) onCreateConn(backendInst BackendInst, conn RedirectableConn, suc
 			phase:            phaseNotRedirected,
 			forceClosing:     false,
 		}
+		if selection != nil {
+			connWrapper.observationID = selection.session
+		}
 		g.addConn(backend, connWrapper)
 		conn.SetEventReceiver(g)
 	} else {
 		backend.connScore--
 	}
+	g.observeCreated(selection, backend, conn, succeed)
 }
 
 // RehydrateConn implements the group half of AssignmentRehydrator: the
@@ -472,8 +512,14 @@ func (g *Group) RehydrateConn(backendID string, conn RedirectableConn) (BackendI
 		phase:            phaseNotRedirected,
 		forceClosing:     false,
 	}
+	if g.observation.Enabled() {
+		connWrapper.observationID = g.observation.NextIdentity()
+	}
 	g.addConn(backend, connWrapper)
 	conn.SetEventReceiver(g)
+	if g.observation.Enabled() {
+		g.capture(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.Rehydrate, Session: connWrapper.observationID, Account: backend.observationID}}}, connWrapper, observation.ConnectionState{}, backend)
+	}
 	return backend, true
 }
 
@@ -500,9 +546,20 @@ func (g *Group) CloseTimedOutFailoverConnections(now time.Time) {
 				zap.Duration("failover_timeout", g.failoverTimeout),
 				zap.Duration("failover_elapsed", now.Sub(since)),
 			}
-			if conn.ForceClose() {
+			before := g.beforeObservation(conn)
+			accepted := conn.ForceClose()
+			if accepted {
 				conn.forceClosing = true
 				g.lg.Info("force close connection on failover backend", fields...)
+			}
+			if g.observation.Enabled() {
+				kind := observation.Rejected
+				op := g.observation.NextIdentity()
+				if accepted {
+					kind = observation.Closing
+					conn.observationClose = op
+				}
+				g.capture(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: kind, Session: conn.observationID, Operation: op}}}, conn, before, conn.physicalOwner, conn.scoreOwner)
 			}
 		}
 	}
@@ -548,10 +605,16 @@ func (g *Group) RedirectConnections() error {
 			// This is only for test, so we allow it to reconnect to the same backend.
 			connWrapper := ce.Value
 			if connWrapper.phase != phaseRedirectNotify {
+				before := g.beforeObservation(connWrapper)
 				connWrapper.phase = phaseRedirectNotify
 				connWrapper.redirectReason = "test"
-				if connWrapper.Redirect(backend) {
+				accepted := connWrapper.Redirect(backend)
+				if accepted {
 					metrics.PendingMigrateGuage.WithLabelValues(backend.addr, backend.addr, connWrapper.redirectReason).Inc()
+				}
+				if g.observation.Enabled() {
+					connWrapper.observationRedirect = g.observation.NextIdentity()
+					g.capture(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.Reconnect, Session: connWrapper.observationID, Operation: connWrapper.observationRedirect, Account: backend.observationID, Success: accepted}}}, connWrapper, before, backend)
 				}
 			}
 		}
@@ -582,6 +645,7 @@ func (g *Group) ensureBackend(backendID string) *backendWrapper {
 		Healthy:            false,
 	})
 	g.backends[backendID] = backend
+	g.observeAccount(backend)
 	return backend
 }
 
@@ -603,8 +667,10 @@ func (g *Group) onRedirectFinished(from, to string, conn RedirectableConn, succe
 	fromBackend := g.ensureBackend(from)
 	toBackend := g.ensureBackend(to)
 	connWrapper := getConnWrapper(conn).Value
+	before := g.beforeObservation(connWrapper)
 	// The connection may be closed when this function is waiting for the lock.
 	if connWrapper.phase == phaseClosed {
+		g.observeRedirected(connWrapper, before, fromBackend, toBackend, succeed)
 		return
 	}
 
@@ -617,6 +683,7 @@ func (g *Group) onRedirectFinished(from, to string, conn RedirectableConn, succe
 		connWrapper.transferScore(fromBackend)
 		connWrapper.phase = phaseRedirectFail
 	}
+	g.observeRedirected(connWrapper, before, fromBackend, toBackend, succeed)
 }
 
 // OnConnClosed implements ConnEventReceiver.OnConnClosed interface.
@@ -625,6 +692,8 @@ func (g *Group) OnConnClosed(backendID string, conn RedirectableConn) error {
 	defer g.Unlock()
 	connWrapper := getConnWrapper(conn)
 	cw := connWrapper.Value
+	before := g.beforeObservation(cw)
+	physical, score := cw.physicalOwner, cw.scoreOwner
 	// If the physical owner mismatches the score owner, it means the redirect result has not been processed yet.
 	if cw.physicalOwner != cw.scoreOwner && cw.physicalOwner != nil && cw.scoreOwner != nil {
 		addMigrateMetrics(cw.physicalOwner.addr, cw.scoreOwner.addr, cw.redirectReason, false, cw.lastRedirect)
@@ -635,11 +704,15 @@ func (g *Group) OnConnClosed(backendID string, conn RedirectableConn) error {
 	// by its physicalOwner. onRedirectFinished won't touch the list once the phase is phaseClosed.
 	g.removeConn(connWrapper)
 	cw.phase = phaseClosed
+	if g.observation.Enabled() {
+		g.capture(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.Closed, Session: cw.observationID}}}, cw, before, physical, score)
+	}
 	return nil
 }
 
 func (g *Group) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toBackend *backendWrapper,
 	reason string, logFields []zap.Field, curTime time.Time) bool {
+	before := g.beforeObservation(conn)
 	// Cross-keyspace guard (DPL-07 #41): a dynamic change may never
 	// migrate an existing session to another keyspace. This is the
 	// FINAL issuance boundary - Go's BackendConnManager and the Rust
@@ -662,6 +735,7 @@ func (g *Group) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toB
 		g.logCrossKeyspaceSkip(fromBackend, toBackend, fromKeyspace, toKeyspace, reason, curTime)
 		conn.phase = phaseRedirectFail
 		conn.lastRedirect = curTime
+		g.observeRedirect(conn, before, fromBackend, toBackend, false)
 		return false
 	}
 	// Skip the connection if it's closing.
@@ -687,6 +761,7 @@ func (g *Group) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toB
 		g.lg.Debug("skip redirecting because it's closing", fields...)
 	}
 	conn.lastRedirect = curTime
+	g.observeRedirect(conn, before, fromBackend, toBackend, succeed)
 	return succeed
 }
 

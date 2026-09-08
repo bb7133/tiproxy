@@ -15,6 +15,8 @@
 //! Bounded observation-only routing state. This module has no production handles.
 
 mod ledger;
+/// Actual-capture batches and independent output-witness comparison.
+pub mod live;
 
 use std::collections::BTreeMap;
 
@@ -62,6 +64,8 @@ pub enum InvalidReason {
     Transport,
     /// No recent observation watermark is available.
     Stale,
+    /// Go output differs from the independently applied lifecycle transition.
+    Witness,
 }
 
 /// Qualification state of one owner interval.

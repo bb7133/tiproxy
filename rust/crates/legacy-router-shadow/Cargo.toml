@@ -14,6 +14,8 @@ default = []
 control-router.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true

@@ -44,10 +44,11 @@ type Config struct {
 // control channel. Every field is restart-required; dynamic SQL policy is
 // delivered through StateSnapshot instead.
 type RustDataplane struct {
-	Enabled         bool     `yaml:"enabled,omitempty" toml:"enabled,omitempty" json:"enabled,omitempty" reloadable:"false"`
-	ControlSocket   string   `yaml:"control-socket,omitempty" toml:"control-socket,omitempty" json:"control-socket,omitempty" reloadable:"false"`
-	AllowedUID      int64    `yaml:"allowed-uid,omitempty" toml:"allowed-uid,omitempty" json:"allowed-uid,omitempty" reloadable:"false"`
-	TLSAllowedRoots []string `yaml:"tls-allowed-roots,omitempty" toml:"tls-allowed-roots,omitempty" json:"tls-allowed-roots,omitempty" reloadable:"false"`
+	RoutingShadowSocket string   `yaml:"routing-shadow-socket,omitempty" toml:"routing-shadow-socket,omitempty" json:"routing-shadow-socket,omitempty" reloadable:"false"`
+	Enabled             bool     `yaml:"enabled,omitempty" toml:"enabled,omitempty" json:"enabled,omitempty" reloadable:"false"`
+	ControlSocket       string   `yaml:"control-socket,omitempty" toml:"control-socket,omitempty" json:"control-socket,omitempty" reloadable:"false"`
+	AllowedUID          int64    `yaml:"allowed-uid,omitempty" toml:"allowed-uid,omitempty" json:"allowed-uid,omitempty" reloadable:"false"`
+	TLSAllowedRoots     []string `yaml:"tls-allowed-roots,omitempty" toml:"tls-allowed-roots,omitempty" json:"tls-allowed-roots,omitempty" reloadable:"false"`
 }
 
 type KeepAlive struct {
@@ -250,6 +251,11 @@ func (cfg *Config) Check() error {
 	}
 	if cfg.RustDataplane.ControlSocket != "" && !filepath.IsAbs(cfg.RustDataplane.ControlSocket) {
 		return errors.Wrapf(ErrInvalidConfigValue, "rust-dataplane.control-socket must be absolute")
+	}
+	if path := cfg.RustDataplane.RoutingShadowSocket; path != "" {
+		if !cfg.RustDataplane.Enabled || !filepath.IsAbs(path) || path == cfg.RustDataplane.ControlSocket {
+			return errors.Wrapf(ErrInvalidConfigValue, "rust-dataplane.routing-shadow-socket requires the Rust dataplane and a distinct absolute path")
+		}
 	}
 	if cfg.RustDataplane.Enabled && cfg.EnableTrafficReplay {
 		return errors.Wrapf(ErrInvalidConfigValue,

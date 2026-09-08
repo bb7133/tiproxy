@@ -26,6 +26,10 @@
       "reason": "Configuration validation runs before admission and has no MySQL packet representation."
     },
     {
+      "parity_id": "CFG-003",
+      "reason": "The optional restart-pinned observer socket and joined task ownership require real configuration and process lifecycle; validated by the control-config/tiproxy-rs tests and controlplane-cproute-recorder-evidence, outside a MySQL byte trace."
+    },
+    {
       "parity_id": "CMP-001",
       "reason": "The v1 oracle stores uncompressed MySQL frames; zlib negotiation and framing use Go golden vectors and compressed session tests."
     },
@@ -108,6 +112,10 @@
     {
       "parity_id": "MIG-008",
       "reason": "Keyspace-stable redirect refusal lives at the Go router issuance boundary before any Rust packet stream."
+    },
+    {
+      "parity_id": "MIG-009",
+      "reason": "Actual Go lifecycle witnesses, bounded loss and independent Rust comparison require router owners and a live UDS consumer; controlplane-cproute-recorder-evidence supplies these checks, which an immutable MySQL byte stream cannot represent."
     },
     {
       "parity_id": "MTR-001",

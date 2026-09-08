@@ -201,6 +201,8 @@ pub struct LedgerView {
 
 #[derive(Clone, Debug, Default)]
 struct Session {
+    bound: bool,
+    reconnect: Option<u64>,
     closed: bool,
     active: Option<u64>,
     reservation: Option<(u64, u64)>,
@@ -337,7 +339,7 @@ impl Mirror {
         };
         if let Some((id, session)) = append {
             let account = self.account(id)?;
-            if account.physical_order.contains(&session) {
+            if account.physical_order.contains(&session) && remove != Some((id, session)) {
                 return Err(InvalidReason::Lifecycle);
             }
             if account.physical_order.len() >= self.limits.sessions {
@@ -405,6 +407,7 @@ impl Mirror {
         )?;
         state.reservation = None;
         if success {
+            state.bound = true;
             state.active = Some(account);
         }
         self.sessions.insert(session, state);
@@ -422,6 +425,7 @@ impl Mirror {
         let source = state.active.ok_or(InvalidReason::Lifecycle)?;
         if state.closed
             || state.redirect.is_some()
+            || state.reconnect.is_some()
             || state.closing.is_some()
             || operation == 0
             || operation <= state.redirect_watermark
@@ -443,6 +447,25 @@ impl Mirror {
         Ok(Transition::Applied)
     }
 
+    fn reconnected(
+        &mut self,
+        session: u64,
+        operation: u64,
+        success: bool,
+    ) -> Result<Transition, InvalidReason> {
+        let mut state = self.session(session)?;
+        if state.reconnect != Some(operation) {
+            return Ok(Transition::Ignored);
+        }
+        let account = state.active.ok_or(InvalidReason::Lifecycle)?;
+        if success {
+            self.change(&[], Some((account, session)), Some((account, session)))?;
+        }
+        state.reconnect = None;
+        self.sessions.insert(session, state);
+        Ok(Transition::Applied)
+    }
+
     fn redirected(
         &mut self,
         session: u64,
@@ -450,6 +473,9 @@ impl Mirror {
         success: bool,
     ) -> Result<Transition, InvalidReason> {
         let mut state = self.session(session)?;
+        if state.reconnect.is_some() {
+            return self.reconnected(session, operation, success);
+        }
         let Some((pending, source, target)) = state.redirect else {
             return Ok(Transition::Ignored);
         };
@@ -503,6 +529,7 @@ impl Mirror {
         } else if let Some(account) = state.active {
             self.change(&[(account, [-1, 0, 0, 0])], Some((account, session)), None)?;
         }
+        state.reconnect = None;
         state.closed = true;
         state.active = None;
         state.reservation = None;
@@ -525,11 +552,110 @@ impl Mirror {
         self.sessions.insert(
             session,
             Session {
+                bound: true,
                 active: Some(account),
                 ..Session::default()
             },
         );
         Ok(Transition::Applied)
+    }
+
+    pub(super) fn totals(&self) -> (u64, u64) {
+        self.accounts.values().fold((0, 0), |(score, physical), a| {
+            (score + a.counts.score(), physical + a.counts.active())
+        })
+    }
+
+    pub(super) fn connection(&self, id: u64) -> super::live::ConnectionState {
+        let Some(s) = self.sessions.get(&id).filter(|s| s.bound) else {
+            return super::live::ConnectionState::default();
+        };
+        super::live::ConnectionState {
+            present: true,
+            physical: s.active.unwrap_or(0),
+            score_owner: s
+                .redirect
+                .map_or(s.active.unwrap_or(0), |(_, _, target)| target),
+            redirect_pending: s.redirect.is_some() || s.reconnect.is_some(),
+            closing: s.closing.is_some(),
+            closed: s.closed,
+        }
+    }
+
+    pub(super) fn compact_account(&self, id: u64) -> Option<super::live::AccountWitness> {
+        self.accounts.get(&id).and_then(|a| {
+            Some(super::live::AccountWitness {
+                id,
+                score: i64::try_from(a.counts.score()).ok()?,
+                physical: a.counts.active,
+                head: a.physical_order.first().copied().unwrap_or(0),
+                tail: a.physical_order.last().copied().unwrap_or(0),
+            })
+        })
+    }
+
+    pub(super) fn predecessor(&self, id: u64) -> u64 {
+        self.sessions
+            .get(&id)
+            .and_then(|s| s.active)
+            .and_then(|a| self.accounts.get(&a))
+            .and_then(|a| {
+                a.physical_order
+                    .iter()
+                    .position(|s| *s == id)
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| a.physical_order.get(i))
+            })
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn pending_account(&self, id: u64) -> Option<u64> {
+        self.sessions
+            .get(&id)
+            .and_then(|s| s.reservation.map(|(_, a)| a))
+    }
+
+    pub(super) fn group_empty(&self, group: u64) -> bool {
+        self.accounts
+            .values()
+            .all(|a| a.group != group || a.removed)
+    }
+
+    pub(super) fn selection_done(&mut self, id: u64) -> Result<(), InvalidReason> {
+        let mut s = self.session(id)?;
+        if s.bound || s.closed || s.reservation.is_some() || s.active.is_some() {
+            return Err(InvalidReason::Lifecycle);
+        }
+        s.closed = true;
+        self.sessions.insert(id, s);
+        Ok(())
+    }
+
+    // Administrative Go reconnection marks pending before checking the callback
+    // result. This live-only transition preserves that behavior, including a
+    // refused callback and an already-closing physical session. It changes no
+    // score owner, and does not relax the v1 ordinary Redirect contract.
+    pub(super) fn reconnect(
+        &mut self,
+        id: u64,
+        operation: u64,
+        account: u64,
+    ) -> Result<(), InvalidReason> {
+        let mut s = self.session(id)?;
+        if s.closed
+            || s.active != Some(account)
+            || s.redirect.is_some()
+            || s.reconnect.is_some()
+            || operation == 0
+            || operation <= s.redirect_watermark
+        {
+            return Err(InvalidReason::Lifecycle);
+        }
+        s.reconnect = Some(operation);
+        s.redirect_watermark = operation;
+        self.sessions.insert(id, s);
+        Ok(())
     }
 
     pub(super) fn apply(&mut self, event: &Event) -> Result<Transition, InvalidReason> {

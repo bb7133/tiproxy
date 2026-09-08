@@ -368,6 +368,9 @@ func (adapter *RouterAdapter) handleRouteRequest(
 	if state.namespace == "" {
 		state.namespace = bounded(request.GetNamespaceHint())
 	}
+	if state.selector != nil {
+		state.selector.CloseObservation()
+	}
 	selector := state.router.GetBackendSelector(projectClientInfo(state.identity))
 	state.selector = &selector
 	return adapter.nextAssignmentLocked(ctx, sender, requestID, state, request.GetExcludedBackendIds())
@@ -1198,6 +1201,9 @@ func (adapter *RouterAdapter) closeStateLocked(state *connectionState, source ba
 	if state.assignment != nil && !state.assignment.finished && state.selector != nil {
 		state.assignment.finished = true
 		state.selector.Finish(state.conn, false)
+	}
+	if state.selector != nil {
+		state.selector.CloseObservation()
 	}
 	adapter.abandonBackendLocked(state)
 	if !state.handshakeDone {

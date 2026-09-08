@@ -81,6 +81,7 @@ const MAX_DRAIN_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
 struct Options {
     config_file: PathBuf,
     control_socket: PathBuf,
+    routing_shadow_socket: Option<PathBuf>,
     control_uid: u32,
     tls_roots: Vec<PathBuf>,
     drain_grace: Option<Duration>,
@@ -213,6 +214,7 @@ struct RunningProcess<R, E, S, H> {
     metrics_exporter: E,
     metering_sampler: S,
     health_task: Option<H>,
+    routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
 /// Owns every resource acquired after the first control module is spawned, so a
@@ -236,6 +238,7 @@ struct StartupGuard<R, E, S, H> {
     metrics_exporter: Option<E>,
     metering_sampler: Option<S>,
     health_task: Option<H>,
+    routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
 impl<R, E, S, H> StartupGuard<R, E, S, H>
@@ -256,6 +259,7 @@ where
             metrics_exporter: None,
             metering_sampler: None,
             health_task: None,
+            routing_shadow: None,
         }
     }
 
@@ -297,6 +301,9 @@ where
         // latest-first. A resource absent at the failure point (its `Option` is
         // `None`) is simply skipped.
         let mut steps: Vec<(&'static str, startup::TeardownFuture)> = Vec::new();
+        if let Some(observer) = self.routing_shadow.take() {
+            steps.push(("routing_shadow", startup::Teardown::teardown(observer)));
+        }
         if let Some(runtime) = self.runtime.take() {
             steps.push(("legacy_runtime", runtime.teardown()));
         }
@@ -338,6 +345,7 @@ where
             metrics_exporter,
             metering_sampler,
             health_task,
+            routing_shadow,
         } = self;
         let runtime = runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set"));
         let metrics_exporter = metrics_exporter
@@ -351,6 +359,7 @@ where
             metrics_exporter,
             metering_sampler,
             health_task,
+            routing_shadow,
         }
     }
 }
@@ -372,6 +381,18 @@ async fn run(options: Options) -> Result<(), String> {
         .unwrap_or(u64::MAX);
     let process_id = format!("tiproxy-rs-{}", std::process::id());
     let config_owner = load_config_owner(&options, &process_id)?;
+    let routing_shadow_socket = options.routing_shadow_socket.clone().or_else(|| {
+        config_owner
+            .handle
+            .source()
+            .current()
+            .effective()
+            .routing_shadow_socket()
+            .map(Path::to_path_buf)
+    });
+    if routing_shadow_socket.as_ref() == Some(&options.control_socket) {
+        return Err("routing shadow socket must differ from control socket".to_owned());
+    }
     let initial_config = control_config(
         config_owner.handle.source().current().as_ref(),
         options.health_port,
@@ -462,6 +483,7 @@ async fn run(options: Options) -> Result<(), String> {
     // until its TTL); a successful startup ends with `guard.commit`.
     let mut guard = StartupGuard::arm(Arc::clone(&in_process), modules);
     // STARTUP-GUARD:ARMED
+    guard.routing_shadow = routing_shadow_socket.map(legacy_router_shadow::consumer::Task::spawn);
     if let Err(error) = guard.spawn_module(config_owner.module) {
         return Err(guard
             .rollback(format!("start config owner module: {error}"))
@@ -601,6 +623,7 @@ async fn run(options: Options) -> Result<(), String> {
                 shutdown: _,
             },
         health_task,
+        routing_shadow,
     } = guard.commit();
 
     // Supervise control and metering together. Either task disappearing must
@@ -717,6 +740,9 @@ async fn run(options: Options) -> Result<(), String> {
             (control, sampler, serving_result, Err(failure))
         }
     };
+    if let Some(observer) = routing_shadow {
+        observer.shutdown().await;
+    }
     let module_executor_result = join_modules(&mut modules).await;
     if let Some(task) = health_task {
         task.abort();
@@ -989,6 +1015,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         .unwrap_or_default();
     let mut drain_grace = None;
     let mut health_port: u16 = 0;
+    let mut routing_shadow_socket = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--version" | "-V" => return Ok(Command::Version),
@@ -1005,6 +1032,12 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                 socket =
                     Some(PathBuf::from(arguments.next().ok_or_else(|| {
                         "--control-socket requires a path".to_owned()
+                    })?));
+            }
+            "--routing-shadow-socket" => {
+                routing_shadow_socket =
+                    Some(PathBuf::from(arguments.next().ok_or_else(|| {
+                        "--routing-shadow-socket requires a path".to_owned()
                     })?));
             }
             "--control-uid" => {
@@ -1050,6 +1083,12 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     if !control_socket.is_absolute() {
         return Err("control socket path must be absolute".to_owned());
     }
+    if routing_shadow_socket
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute() || *path == control_socket)
+    {
+        return Err("routing shadow socket must be distinct and absolute".to_owned());
+    }
     if tls_roots.iter().any(|root| !root.is_absolute()) {
         return Err("TLS allowlist roots must be absolute".to_owned());
     }
@@ -1057,6 +1096,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         config_file: config_file
             .ok_or_else(|| format!("--config or {CONFIG_FILE_ENV} is required"))?,
         control_socket,
+        routing_shadow_socket,
         control_uid: uid
             .ok_or_else(|| format!("--control-uid or {CONTROL_UID_ENV} is required"))?,
         tls_roots,
@@ -1071,9 +1111,17 @@ fn parse_uid(value: &str) -> Result<u32, String> {
         .map_err(|_| format!("control uid must be a uint32, got {value:?}"))
 }
 
+impl startup::Teardown for legacy_router_shadow::consumer::Task {
+    fn teardown(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            self.shutdown().await;
+        })
+    }
+}
+
 fn usage() -> &'static str {
     "Usage: tiproxy-rs --config <path> --control-socket <absolute-path> --control-uid <uid> \
-     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>]\n\
+     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--routing-shadow-socket <absolute-path>]\n\
      Environment: TIPROXY_CONFIG, TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 
@@ -1205,6 +1253,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_observer_is_joined_on_startup_rollback_without_sql_supervision() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        let modules = modules_with_stoppable(&in_process, &log);
+        let mut guard = StartupGuard::<FakeResource, FakeResource, FakeResource, FakeResource>::arm(
+            Arc::clone(&in_process),
+            modules,
+        );
+        let observer = legacy_router_shadow::consumer::Task::spawn(PathBuf::from(
+            "/tmp/absent-routing-shadow.sock",
+        ));
+        let diagnostics = observer.diagnostics();
+        guard.routing_shadow = Some(observer);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            guard.rollback("injected later startup failure".to_owned()),
+        )
+        .await
+        .unwrap_or_else(|error| unreachable!("join observer: {error}"));
+        assert_eq!(error, "injected later startup failure");
+        assert!(
+            diagnostics.snapshot().stopped,
+            "startup rollback must cancel and join observer"
+        );
+    }
+
+    #[test]
+    fn routing_observer_cli_is_explicit_and_distinct() {
+        let base = [
+            "--config",
+            "/tmp/tiproxy.toml",
+            "--control-socket",
+            "/tmp/control.sock",
+            "--control-uid",
+            "0",
+        ];
+        let Command::Run(options) = parse_options(base.map(str::to_owned))
+            .unwrap_or_else(|error| unreachable!("options: {error}"))
+        else {
+            unreachable!("run")
+        };
+        assert!(options.routing_shadow_socket.is_none());
+        for path in ["relative.sock", "/tmp/control.sock"] {
+            assert!(
+                parse_options(
+                    base.into_iter()
+                        .chain(["--routing-shadow-socket", path])
+                        .map(str::to_owned)
+                )
+                .is_err()
+            );
+        }
+        let Command::Run(options) = parse_options(
+            base.into_iter()
+                .chain(["--routing-shadow-socket", "/tmp/observer.sock"])
+                .map(str::to_owned),
+        )
+        .unwrap_or_else(|error| unreachable!("observer options: {error}")) else {
+            unreachable!("run")
+        };
+        assert_eq!(
+            options.routing_shadow_socket,
+            Some(PathBuf::from("/tmp/observer.sock"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cp_cfg_ready_failure_joins_the_module_then_finishes_the_owner() {
         let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
         let in_process = armed_owner();
@@ -1307,6 +1422,12 @@ mod tests {
         guard.set_metering_sampler(fake("metering_sampler", &log));
         guard.set_health_task(fake("health_task", &log));
 
+        let observer = legacy_router_shadow::consumer::Task::spawn(PathBuf::from(
+            "/tmp/absent-routing-shadow.sock",
+        ));
+        let diagnostics = observer.diagnostics();
+        guard.routing_shadow = Some(observer);
+
         // Commit hands every resource out (and disarms cleanly — no drop bomb).
         let RunningProcess {
             modules: _modules,
@@ -1314,9 +1435,18 @@ mod tests {
             metrics_exporter,
             metering_sampler,
             health_task,
+            routing_shadow,
         } = guard.commit();
         // Tearing the transferred handles down proves they were moved out of the
         // guard rather than dropped by commit.
+        routing_shadow
+            .unwrap_or_else(|| unreachable!("observer transferred"))
+            .shutdown()
+            .await;
+        assert!(
+            diagnostics.snapshot().stopped,
+            "normal commit transfers the owned observer for joined shutdown"
+        );
         runtime.teardown().await;
         metrics_exporter.teardown().await;
         metering_sampler.teardown().await;
@@ -1504,6 +1634,7 @@ mod tests {
         assert_eq!(
             options,
             Options {
+                routing_shadow_socket: None,
                 config_file: PathBuf::from("/etc/tiproxy/tiproxy.toml"),
                 control_socket: PathBuf::from("/tmp/control.sock"),
                 control_uid: 42,
@@ -1560,6 +1691,7 @@ mod tests {
     #[test]
     fn operational_cli_projects_into_rust_control_domain() {
         let options = Options {
+            routing_shadow_socket: None,
             config_file: PathBuf::from("/etc/tiproxy/tiproxy.toml"),
             control_socket: PathBuf::from("/tmp/control.sock"),
             control_uid: 42,

@@ -316,6 +316,7 @@ func (mgr *BackendConnManager) getBackendIO(ctx context.Context, cctx ConnContex
 		}
 	}
 	selector := r.GetBackendSelector(ci)
+	defer selector.CloseObservation()
 	startTime := time.Now()
 	var addr string
 	var backend router.BackendInst

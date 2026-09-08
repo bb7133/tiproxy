@@ -1126,3 +1126,51 @@ fn resource_incarnation_records_coalesced_policy_lifetimes() {
         "COMPOSE_FOREIGN_POLICY_IDENTITY"
     );
 }
+
+#[test]
+fn routing_observer_socket_is_disabled_by_default_validated_and_restart_pinned() {
+    let load = |text: &[u8]| ConfigNamespaceStore::from_toml(text, None, current_dir());
+    let disabled = load(&[]).unwrap_or_else(|error| unreachable!("default: {error}"));
+    assert!(
+        disabled
+            .current()
+            .effective()
+            .routing_shadow_socket()
+            .is_none()
+    );
+    let input = br#"enable-traffic-replay=false
+[rust-dataplane]
+enabled=true
+control-socket="/tmp/control.sock"
+routing-shadow-socket="/tmp/observer.sock"
+"#;
+    let enabled = load(input).unwrap_or_else(|error| unreachable!("observer: {error}"));
+    assert_eq!(
+        enabled.current().effective().routing_shadow_socket(),
+        Some(Path::new("/tmp/observer.sock"))
+    );
+    assert!(matches!(
+        enabled.apply_toml(
+            &String::from_utf8_lossy(input)
+                .replace("observer.sock", "next.sock")
+                .into_bytes(),
+            None,
+            2,
+            current_dir()
+        ),
+        Err(StoreError::Config(ConfigError::RestartRequired {
+            field: "rust-dataplane"
+        }))
+    ));
+    assert_eq!(disabled.current().generation(), 1);
+    for invalid in [
+        "[rust-dataplane]\nrouting-shadow-socket='/tmp/observer.sock'",
+        "[rust-dataplane]\nenabled=true\nrouting-shadow-socket='relative.sock'",
+        "[rust-dataplane]\nenabled=true\ncontrol-socket='/tmp/control.sock'\nrouting-shadow-socket='/tmp/control.sock'",
+    ] {
+        assert!(
+            load(format!("enable-traffic-replay=false\n{invalid}").as_bytes()).is_err(),
+            "routing observer validation: {invalid}"
+        );
+    }
+}
