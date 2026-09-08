@@ -21,6 +21,8 @@ Absent, foreign, unmatched, or retired metrics mean empty inputs with no cache
 lineage. They never independently reject a reserve. This follows the existing
 Go missing-query behavior, including its distinction between an entirely empty
 CPU query and a nonempty query missing an individual backend.
+Query merge errors likewise discard the metric inputs and lineage and use the
+same Go empty-input path.
 
 Selection, factor-cache commit, and pending accounting use the existing single
 ledger mutex. A current metric snapshot fences the synchronous evaluation and

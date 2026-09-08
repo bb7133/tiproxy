@@ -37,7 +37,26 @@ async fn composed(policy: &str) -> TestResult<Harness> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn composed_missing_metrics_never_block_reservation_or_retry() -> TestResult {
     for policy in ["resource", "location", "connection"] {
-        let h = composed(policy).await?;
+        // Seed through Connection so this setup is independent of the factor
+        // retry filter under test. Four active sessions make A strictly better
+        // than B even under Go's prefer-idle tolerance, regardless of ticket.
+        let h = composed("connection").await?;
+        let initial = h.ready().await;
+        let a = "default/127.0.0.1:4000";
+        let b = "default/127.0.0.1:4001";
+        let mut load = Vec::new();
+        for _ in 0..4 {
+            let session = must(h.router.open());
+            let pending =
+                must(
+                    h.router
+                        .reserve(&session, &initial, ClientInfo::default(), "", &[a]),
+                );
+            assert_eq!(pending.assignment().backend_id, b);
+            assert_eq!(h.router.finish(&pending, true), Settlement::Applied);
+            load.push(session);
+        }
+        h.patch(&format!("[balance]\npolicy=\"{policy}\""), 3);
         let candidate = h.ready().await;
         assert!(matches!(
             candidate.metrics,
@@ -45,6 +64,11 @@ async fn composed_missing_metrics_never_block_reservation_or_retry() -> TestResu
         ));
         let mut selector = must(h.router.selector());
         let first = must(selector.next(ClientInfo::default(), ""));
+        assert_eq!(
+            first.assignment().backend_id,
+            a,
+            "COMPOSE_STRICT_PREFERENCE"
+        );
         assert_eq!(
             h.router
                 .accounting(&first.assignment().backend_id)
@@ -66,6 +90,9 @@ async fn composed_missing_metrics_never_block_reservation_or_retry() -> TestResu
         );
         assert_eq!(h.router.finish(&second, true), Settlement::Applied);
         drop(selector);
+        for session in load {
+            assert_eq!(h.router.close(&session), Settlement::Applied);
+        }
         assert_eq!(
             h.router
                 .accounting(&second.assignment().backend_id)
