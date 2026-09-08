@@ -79,6 +79,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/session-core/` - Protocol-independent session lifecycle and migration state.
 - `rust/crates/control-router/` - Staged namespace-scoped routing selection, exact config/topology/health capture, and reservation accounting. Production dataplane/binary wiring remains prohibited until full routing parity is complete.
 - `rust/crates/control-routing/` - Protocol-independent route values and pure group matching/port-conflict primitives; it owns no reservation or production selector yet and carries no wire payloads.
+- `rust/crates/legacy-router-shadow/` - Temporary read-only routing observation codec and bounded consumer inbox at the Go/Rust migration boundary. Domain mirror state stays in `control-router::shadow`; no production effects or socket activation in the initial slice.
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
 - `rust/crates/control-topology/src/metric_collector/` - Opt-in in-process metrics rounds, scoped owner tasks, qualified overlay and bounded real owner HTTP service; production composition remains off until the control-plane integration slice.
 - `rust/crates/control-topology/src/metrics/` - Bounded query/history data core for staged backend resource metrics; runtime source/election authority is supplied separately by the collector.
