@@ -51,6 +51,8 @@ type cleanupProxy struct {
 	release   chan struct{}
 	entered   bool
 	completed map[string]int
+	started   map[string]int
+	forwarded map[string]int
 }
 
 func startCleanupProxy(endpoint string, mux *http.ServeMux) (*cleanupProxy, string, error) {
@@ -63,7 +65,7 @@ func startCleanupProxy(endpoint string, mux *http.ServeMux) (*cleanupProxy, stri
 		_ = upstream.Close()
 		return nil, "", err
 	}
-	p := &cleanupProxy{upstream: upstream, completed: make(map[string]int)}
+	p := &cleanupProxy{upstream: upstream, completed: make(map[string]int), started: make(map[string]int), forwarded: make(map[string]int)}
 	p.server = grpc.NewServer(grpc.WaitForHandlers(true), grpc.ForceServerCodec(rawFrameCodec{}), grpc.UnknownServiceHandler(p.forward))
 	mux.HandleFunc("/hold-cleanup", p.hold)
 	mux.HandleFunc("/release-cleanup", p.releaseGate)
@@ -85,6 +87,7 @@ func (p *cleanupProxy) forward(_ any, stream grpc.ServerStream) (result error) {
 	}
 	name := method[strings.LastIndex(method, "/")+1:]
 	p.mu.Lock()
+	p.started[name]++
 	var release <-chan struct{}
 	if p.method == name && p.release != nil {
 		p.entered = true
@@ -122,6 +125,9 @@ func (p *cleanupProxy) forward(_ any, stream grpc.ServerStream) (result error) {
 				}
 				return
 			}
+			p.mu.Lock()
+			p.forwarded[name]++
+			p.mu.Unlock()
 			if err := upstream.SendMsg(&frame); err != nil {
 				cancel()
 				return
@@ -185,5 +191,5 @@ func (p *cleanupProxy) releaseGate(writer http.ResponseWriter, request *http.Req
 func (p *cleanupProxy) state(writer http.ResponseWriter, _ *http.Request) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_ = json.NewEncoder(writer).Encode(map[string]any{"entered": p.entered, "completed": p.completed})
+	_ = json.NewEncoder(writer).Encode(map[string]any{"entered": p.entered, "completed": p.completed, "started": p.started, "forwarded": p.forwarded})
 }

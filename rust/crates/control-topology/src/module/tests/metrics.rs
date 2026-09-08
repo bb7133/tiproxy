@@ -16,6 +16,7 @@ use super::*;
 use crate::{BackendSourceMode, MetricCapture, MetricReadError, MetricSourceHandle};
 use control_external::HttpTarget;
 
+mod collector;
 mod live;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

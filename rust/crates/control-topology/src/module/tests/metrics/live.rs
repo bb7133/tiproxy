@@ -92,7 +92,7 @@ impl HeldHttp {
     }
 }
 
-fn live_client(endpoint: String, request_ms: u64) -> EtcdClientConfig {
+pub(super) fn live_client(endpoint: String, request_ms: u64) -> EtcdClientConfig {
     EtcdClientConfig::new([endpoint], None)
         .and_then(|config| {
             config.with_timeouts(

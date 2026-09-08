@@ -10,6 +10,7 @@ on:
       - "buf.gen.yaml"
       - "go.mod"
       - "pkg/controlbridge/**"
+      - "pkg/balance/metricsreader/**"
       - "proto/**"
       - "rust-toolchain.toml"
       - "rust/**"
@@ -26,6 +27,7 @@ on:
       - "buf.gen.yaml"
       - "go.mod"
       - "pkg/controlbridge/**"
+      - "pkg/balance/metricsreader/**"
       - "proto/**"
       - "rust-toolchain.toml"
       - "rust/**"
@@ -48,10 +50,10 @@ jobs:
   quality:
     name: Format, lint, and test
     runs-on: ubuntu-24.04
-    # The CP-ROUTE evidence step compiles and runs isolated production
-    # mutations before the unit tests. The 42-mutation run took 28 minutes
-    # on the hosted runner; leave room for the router source authority rows.
-    timeout-minutes: 40
+    # The complete existing mutation matrix already took nearly 38 minutes.
+    # Its topology-dependent builds now include the collector; leave headroom
+    # for those builds while keeping every older gate and the separate C job.
+    timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -141,6 +143,43 @@ jobs:
           key: rust-metric-applied-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
       - name: Run applied metrics live and compiling mutation evidence
         run: make controlplane-cpmetrics-applied-evidence
+
+  collector-metrics:
+    name: Metrics collector and mixed owner evidence
+    runs-on: ubuntu-24.04
+    # Run the complete collector evidence independently of the older quality job.
+    # Each compiling mutant gets owned real etcd and an actual Go reader peer.
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            bin/control-codegen
+            bin/control-codegen-rust
+            rust/target
+          key: rust-metric-collector-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Run collector live and compiling mutation evidence
+        run: make controlplane-cpmetrics-collector-evidence
 
   supply-chain:
     name: Audit dependencies and policy

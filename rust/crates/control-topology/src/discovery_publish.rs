@@ -63,6 +63,9 @@ pub struct EpochResult<T> {
 /// Why a discovery pull did not return a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiscoveryError {
+    /// A bounded metrics owner enumeration failed.
+    MetricOwnersUnavailable,
+
     /// No discovery set is published, or the captured set's gate was already
     /// revoked at admission: the handle is fail-closed (no I/O attempted).
     Revoked,
@@ -309,6 +312,55 @@ impl DiscoveryCapture {
     /// The names in this captured set. Callers recheck authority before effects.
     pub fn cluster_names(&self) -> impl Iterator<Item = &str> {
         self.set.clusters.iter().map(|(name, _)| name.as_ref())
+    }
+
+    pub(crate) async fn poll_metric_owners_fenced(
+        &self,
+        cluster: &str,
+        prefix: &str,
+        fence: Arc<dyn IoFence>,
+    ) -> Result<Vec<crate::metric_owner::OwnerRecord>, DiscoveryError> {
+        self.handle.still_current(&self.set)?;
+        let (_, connection) = self.handle.locate(&self.set, cluster)?;
+        let discovery_gate = self.set.gate.clone();
+        let mut connection = connection
+            .fork_with_gate(discovery_gate)
+            .fork_with_fence(Arc::clone(&fence));
+        if prefix.len() > 2048 {
+            return Err(DiscoveryError::MetricOwnersUnavailable);
+        }
+        let prefix = prefix.as_bytes().to_vec();
+        let options = etcd_client::GetOptions::new()
+            .with_prefix()
+            .with_limit(10_001);
+        let result = connection
+            .execute(move |client| Box::pin(client.get(prefix, Some(options))))
+            .await;
+        self.handle.still_current(&self.set)?;
+        if !fence.is_live() {
+            return Err(DiscoveryError::Stale);
+        }
+        let response = result.map_err(|_| DiscoveryError::MetricOwnersUnavailable)?;
+        if response.more() || response.kvs().len() > 10_000 {
+            return Err(DiscoveryError::MetricOwnersUnavailable);
+        }
+        let mut total = 0usize;
+        let mut records = Vec::with_capacity(response.kvs().len());
+        for kv in response.kvs() {
+            total = total
+                .saturating_add(kv.key().len())
+                .saturating_add(kv.value().len());
+            if kv.key().len() > 2048 || kv.value().len() > 256 || total > 16 * 1024 * 1024 {
+                return Err(DiscoveryError::MetricOwnersUnavailable);
+            }
+            records.push(crate::metric_owner::OwnerRecord {
+                key: kv.key().to_vec(),
+                value: kv.value().to_vec(),
+                lease: kv.lease(),
+                created: kv.create_revision(),
+            });
+        }
+        Ok(records)
     }
 
     /// Reads one captured cluster's full topology, independently of health H.

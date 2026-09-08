@@ -12,6 +12,7 @@ default = []
 
 [dependencies]
 control-config.workspace = true
+control-etcd.workspace = true
 control-external.workspace = true
 control-plane.workspace = true
 etcd-client.workspace = true
@@ -21,9 +22,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-# Required applied-metrics evidence uses the actual election permit and the
-# embedded-etcd fixture's bounded HTTP fault controls.
-control-etcd.workspace = true
+# Applied-metrics evidence uses the embedded-etcd fixture HTTP fault controls.
 reqwest.workspace = true
 # The `poll_prometheus` live-range integration test drives the real
 # `EtcdConnection` against an in-process etcd v3 KV fixture hand-rolled from a
