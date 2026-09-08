@@ -540,8 +540,16 @@ struct Live {
     endpoint: String,
 }
 
-#[allow(clippy::too_many_lines)]
 async fn start(routing: bool) -> TestResult<Live> {
+    start_with_health(routing, 50_000_000, "").await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn start_with_health(
+    routing: bool,
+    health_interval_nanos: i64,
+    initial_labels: &str,
+) -> TestResult<Live> {
     let endpoints: serde_json::Value =
         serde_json::from_slice(&std::fs::read(std::env::var("CP003_CONNECTION_FILE")?)?)?;
     let endpoint = endpoints["etcd_endpoint"]
@@ -620,7 +628,7 @@ async fn start(routing: bool) -> TestResult<Live> {
     let prom_info = format!(r#"{{"ip":"127.0.0.1","port":{}}}"#, prom.address.port());
     etcd.put(prom_key, prom_info.clone(), None).await?;
     let store = ConfigNamespaceStore::from_toml(
-        format!("[proxy]\npd-addrs=\"\"\n[[proxy.backend-clusters]]\nname=\"default\"\npd-addrs=\"{endpoint}\"\n[balance]\npolicy=\"connection\"").as_bytes(),
+        format!("[proxy]\npd-addrs=\"\"\n[[proxy.backend-clusters]]\nname=\"default\"\npd-addrs=\"{endpoint}\"\n[balance]\npolicy=\"connection\"\n{initial_labels}").as_bytes(),
         None,
         Path::new("/tmp"),
     )?;
@@ -668,7 +676,7 @@ async fn start(routing: bool) -> TestResult<Live> {
         },
         HealthCheckConfig {
             enabled: true,
-            interval_nanos: 50_000_000,
+            interval_nanos: health_interval_nanos,
             metrics_interval_nanos: 200_000_000,
             ..HealthCheckConfig::default()
         },

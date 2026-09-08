@@ -17,15 +17,36 @@
 use super::*;
 use crate::authority::MetricInputs;
 
-fn pick(router: &Router, candidate: &Candidate) -> String {
-    let session = must(router.open());
-    let result =
-        must(router.reserve_with_ticket(&session, candidate, ClientInfo::default(), "", &[], 1));
+fn reserve(
+    router: &Router,
+    candidate: &Candidate,
+    excluded: &[&str],
+    stage: &str,
+) -> TestResult<(crate::Session, Reservation)> {
+    let session = router
+        .open()
+        .map_err(|err| format!("COMPOSE_{stage}_OPEN: {err:?}"))?;
+    let reservation = router
+        .reserve(&session, candidate, ClientInfo::default(), "", excluded)
+        .map_err(|err| format!("COMPOSE_{stage}_RESERVE: {err:?}"))?;
+    Ok((session, reservation))
+}
+fn pick(router: &Router, candidate: &Candidate, stage: &str) -> TestResult<String> {
+    let session = router
+        .open()
+        .map_err(|err| format!("COMPOSE_{stage}_OPEN: {err:?}"))?;
+    let result = router
+        .reserve_with_ticket(&session, candidate, ClientInfo::default(), "", &[], 1)
+        .map_err(|err| format!("COMPOSE_{stage}_RESERVE: {err:?}"))?;
     let id = result.assignment().backend_id.clone();
     assert_eq!(router.close(&session), Settlement::Applied);
-    id
+    Ok(id)
 }
-async fn candidate(router: &Router, wanted: impl Fn(&Candidate) -> bool) -> TestResult<Candidate> {
+async fn candidate(
+    router: &Router,
+    stage: &str,
+    wanted: impl Fn(&Candidate) -> bool,
+) -> TestResult<Candidate> {
     Ok(tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             if let Ok(candidate) = router.capture()
@@ -36,7 +57,8 @@ async fn candidate(router: &Router, wanted: impl Fn(&Candidate) -> bool) -> Test
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
-    .await?)
+    .await
+    .map_err(|err| format!("COMPOSE_{stage}_CANDIDATE_TIMEOUT: {err}"))?)
 }
 fn metric(candidate: &Candidate) -> Option<&MetricSnapshot> {
     match &candidate.metrics {
@@ -81,7 +103,10 @@ async fn composed_real_policy_queries_reservations_and_missing_windows() -> Test
 
 #[allow(clippy::too_many_lines)]
 async fn observe_composed() -> TestResult {
-    let mut live = start(true).await?;
+    // This row changes config, routing and metric authority explicitly. Keep
+    // each real health round stable while its captured candidates are reserved;
+    // the initial zone still comes through the real greeting/status health path.
+    let mut live = start_with_health(true, 3_600_000_000_000, "[labels]\nzone=\"z0\"").await?;
     let router = Arc::new(must(Router::new_with_factors(
         Arc::new(live.store.clone()),
         &live.topology,
@@ -91,20 +116,14 @@ async fn observe_composed() -> TestResult {
         Some(live.overlay.clone()),
     )));
     let mut sessions = Vec::new();
-    let ready = candidate(&router, |c| {
+    let ready = candidate(&router, "INITIAL", |c| {
         c.health.get(&live.ids[0]).healthy && c.health.get(&live.ids[1]).healthy
     })
     .await?;
     for index in 0..2 {
         for count in 0..12 {
-            let session = must(router.open());
-            let reservation = must(router.reserve(
-                &session,
-                &ready,
-                ClientInfo::default(),
-                "",
-                &[&live.ids[1 - index]],
-            ));
+            let (session, reservation) =
+                reserve(&router, &ready, &[&live.ids[1 - index]], "INITIAL_LOAD")?;
             if count < 10 {
                 assert_eq!(router.finish(&reservation, true), Settlement::Applied);
             }
@@ -115,15 +134,13 @@ async fn observe_composed() -> TestResult {
     // ephemeral port order or ticket. Resource must still prefer healthy B.
     let mut strict_load = Vec::new();
     for _ in 0..4 {
-        let session = must(router.open());
-        let pending =
-            must(router.reserve(&session, &ready, ClientInfo::default(), "", &[&live.ids[0]]));
+        let (session, pending) = reserve(&router, &ready, &[&live.ids[0]], "STRICT_LOAD")?;
         assert_eq!(pending.assignment().backend_id, live.ids[1]);
         assert_eq!(router.finish(&pending, true), Settlement::Applied);
         strict_load.push(session);
     }
     assert_eq!(
-        pick(&router, &ready),
+        pick(&router, &ready, "CONNECTION_STRICT")?,
         go_choice(&live, "connection_strict")?,
         "COMPOSE_CONNECTION_STRICT_LOAD"
     );
@@ -133,19 +150,22 @@ async fn observe_composed() -> TestResult {
         3,
         Path::new("/tmp"),
     )?;
-    let first = candidate(&router, |c| {
+    let first = candidate(&router, "RESOURCE", |c| {
         has_cpu(c) && c.health.get(&live.ids[0]).local && !c.health.get(&live.ids[1]).local
     })
     .await?;
     assert_eq!(
-        pick(&router, &first),
+        pick(&router, &first, "RESOURCE_STRICT")?,
         go_choice(&live, "resource_strict")?,
         "COMPOSE_REAL_RESOURCE_PREFERS_HEALTH"
     );
     for session in strict_load {
         assert_eq!(router.close(&session), Settlement::Applied);
     }
-    assert_eq!(pick(&router, &first), go_choice(&live, "resource")?);
+    assert_eq!(
+        pick(&router, &first, "RESOURCE")?,
+        go_choice(&live, "resource")?
+    );
     assert_eq!(
         router
             .accounting(&live.ids[0])
@@ -171,9 +191,9 @@ async fn observe_composed() -> TestResult {
         100,
         Some(live.overlay.clone()),
     ));
-    let labeled = candidate(&label_router, has_cpu).await?;
+    let labeled = candidate(&label_router, "LABEL", has_cpu).await?;
     assert_eq!(
-        pick(&label_router, &labeled),
+        pick(&label_router, &labeled, "LABEL")?,
         go_choice(&live, "label")?,
         "COMPOSE_REAL_LABEL_ISOLATION"
     );
@@ -205,9 +225,9 @@ async fn observe_composed() -> TestResult {
     );
     live.mode.store(0, Ordering::SeqCst);
     patch(&live, "location")?;
-    let located = candidate(&router, has_cpu).await?;
+    let located = candidate(&router, "LOCATION", has_cpu).await?;
     assert_eq!(
-        pick(&router, &located),
+        pick(&router, &located, "LOCATION")?,
         go_choice(&live, "location")?,
         "COMPOSE_REAL_LOCATION_PREFERS_LOCAL"
     );
@@ -221,15 +241,21 @@ async fn observe_composed() -> TestResult {
         "COMPOSE_REAL_LOCATION_RETAINS_HISTORY"
     );
     patch(&live, "resource")?;
-    let before = candidate(&router, has_cpu).await?;
-    assert_eq!(pick(&router, &before), live.ids[1]);
-    let mut foreign = Harness::with_backends(
+    let before = candidate(&router, "BEFORE_ABA", has_cpu).await?;
+    assert_eq!(pick(&router, &before, "BEFORE_ABA")?, live.ids[1]);
+    let mut foreign = Harness::with_health(
         "",
         "connection",
         &[
             (live.addresses[0].as_str(), &[]),
             (live.addresses[1].as_str(), &[]),
         ],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
     )
     .await?;
     {
@@ -255,7 +281,7 @@ async fn observe_composed() -> TestResult {
         100,
         Some(live.overlay.clone()),
     )));
-    let initial_foreign = candidate(&foreign.router, |c| {
+    let initial_foreign = candidate(&foreign.router, "FOREIGN_INITIAL", |c| {
         c.routing.backends.backends.len() == 2
             && c.routing
                 .backends
@@ -268,31 +294,29 @@ async fn observe_composed() -> TestResult {
     // ephemeral SQL ports. Foreign health-risk data would instead prefer B.
     let mut foreign_load = Vec::new();
     for _ in 0..4 {
-        let session = must(foreign.router.open());
-        let pending = must(foreign.router.reserve(
-            &session,
+        let (session, pending) = reserve(
+            &foreign.router,
             &initial_foreign,
-            ClientInfo::default(),
-            "",
             &[&live.ids[0]],
-        ));
+            "FOREIGN_LOAD",
+        )?;
         assert_eq!(pending.assignment().backend_id, live.ids[1]);
         assert_eq!(foreign.router.finish(&pending, true), Settlement::Applied);
         foreign_load.push(session);
     }
     foreign.patch("[balance]\npolicy=\"resource\"", 3);
-    let mut other = candidate(&foreign.router, |_| true).await?;
+    let mut other = candidate(&foreign.router, "FOREIGN_POLICY", |_| true).await?;
     assert!(
         matches!(other.metrics, MetricInputs::Dynamic(None)),
         "COMPOSE_FOREIGN_OVERLAY_UNAVAILABLE"
     );
-    let donor = candidate(&router, has_cpu).await?;
+    let donor = candidate(&router, "DONOR", has_cpu).await?;
     assert!(!Arc::ptr_eq(&other.routing, &donor.routing));
     // Only input data is substituted; candidate C/R/H and ledger stay genuine.
     other.metrics = donor.metrics.clone();
     assert!(metric(&other).is_some_and(MetricSnapshot::still_current));
     assert_eq!(
-        pick(&foreign.router, &other),
+        pick(&foreign.router, &other, "FOREIGN")?,
         live.ids[0],
         "COMPOSE_FOREIGN_CURRENT_R_DATA_IGNORED"
     );
@@ -325,9 +349,9 @@ async fn observe_composed() -> TestResult {
         20,
         "COMPOSE_REAL_QUERY_ABA_COLD_CPU"
     );
-    let retained = candidate(&router, has_cpu).await?;
+    let retained = candidate(&router, "RECREATED", has_cpu).await?;
     assert_eq!(
-        pick(&router, &retained),
+        pick(&router, &retained, "RECREATED")?,
         go_choice(&live, "recreated")?,
         "COMPOSE_REAL_RECREATED_FACTORS"
     );
@@ -343,30 +367,26 @@ async fn observe_composed() -> TestResult {
             None,
         )
         .await?;
-    let changed = candidate(&router, |c| !Arc::ptr_eq(&c.routing, &retained.routing)).await?;
+    let changed = candidate(&router, "ROUTING_CHANGED", |c| {
+        !Arc::ptr_eq(&c.routing, &retained.routing)
+    })
+    .await?;
     assert!(!has_cpu(&changed), "COMPOSE_REAL_R_WINDOW_HAS_NO_INPUTS");
     for _ in 0..3 {
         assert_eq!(
-            pick(&router, &changed),
+            pick(&router, &changed, "MISSING")?,
             go_choice(&live, "missing")?,
             "COMPOSE_REAL_R_WINDOW_RESERVES"
         );
     }
     live.prom_release.send_replace(true);
-    let resumed = candidate(&router, has_cpu).await?;
+    let resumed = candidate(&router, "RESUMED", has_cpu).await?;
     assert_eq!(
-        pick(&router, &resumed),
+        pick(&router, &resumed, "RESTORED")?,
         go_choice(&live, "restored")?,
         "COMPOSE_REAL_R_WINDOW_RECOVERS"
     );
-    let retry_session = must(router.open());
-    let retry = must(router.reserve(
-        &retry_session,
-        &resumed,
-        ClientInfo::default(),
-        "",
-        &[&live.ids[1]],
-    ));
+    let (retry_session, retry) = reserve(&router, &resumed, &[&live.ids[1]], "RETRY")?;
     assert_eq!(
         retry.assignment().backend_id,
         go_choice(&live, "retry")?,
@@ -399,21 +419,25 @@ async fn observe_composed() -> TestResult {
     })
     .await?;
     release.send(())?;
-    let guarded = must(blocked.join().map_err(|_| "metric reserve thread")?);
+    let guarded = blocked
+        .join()
+        .map_err(|_| "COMPOSE_FINAL_FENCE_THREAD")?
+        .map_err(|err| format!("COMPOSE_FINAL_FENCE_RESERVE: {err:?}"))?;
     assert_eq!(
         guarded.assignment().backend_id,
         live.ids[0],
         "COMPOSE_FINAL_INPUT_FENCE_RESERVES_EMPTY"
     );
     assert_eq!(
-        pick(&router, &resumed),
+        pick(&router, &resumed, "STALE_INPUT")?,
         live.ids[0],
         "COMPOSE_REAL_STALE_INPUT_RESERVES"
     );
     patch(&live, "connection")?;
-    let independent = candidate(&router, |_| true).await?;
+    let independent = candidate(&router, "CONNECTION", |_| true).await?;
     assert!(
-        live.ids.contains(&pick(&router, &independent)),
+        live.ids
+            .contains(&pick(&router, &independent, "CONNECTION")?),
         "COMPOSE_REAL_CONNECTION_INDEPENDENT"
     );
     for session in &sessions {
