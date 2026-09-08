@@ -150,7 +150,6 @@ fn compare_balance(report: &FactorReport, expected: &Value, context: &str) {
 #[allow(clippy::float_cmp)] // Also compare the actual Go infinity result.
 fn compare(report: &FactorReport, step: &Value, context: &str) {
     let expected = &step["expected"];
-    compare_balance(report, expected, context);
     assert_eq!(
         report.rows.len(),
         array(&expected["scores"]).len(),
@@ -226,6 +225,9 @@ fn compare(report: &FactorReport, step: &Value, context: &str) {
             );
         }
     }
+    // Preserve the original factor mutation's first-divergence labels before
+    // comparing the derived migration pair.
+    compare_balance(report, expected, context);
 }
 
 #[test]
