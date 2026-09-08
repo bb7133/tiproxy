@@ -30,10 +30,10 @@ def rust(name, test, marker, edits):
     return name, 'rust', 'control-router', 'shadow::live::tests::'+test, marker, edits
 
 CASES = [
- go('record-limit-plus-one','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_LIMIT_PLUS_ONE',[edit(REC,'min(limits.Records, int(limits.Bytes/BatchCharge))','min(limits.Records+1, int(limits.Bytes/BatchCharge))')]),
- go('byte-limit-plus-one','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_LIMIT_PLUS_ONE',[edit(REC,'min(limits.Records, int(limits.Bytes/BatchCharge))','min(limits.Records, int(limits.Bytes/BatchCharge)+1)')]),
- go('equality-refused','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_LIMIT_EQUALITY',[edit(REC,'min(limits.Records, int(limits.Bytes/BatchCharge))','min(limits.Records-1, int(limits.Bytes/BatchCharge))')]),
- go('writer-charge-released-on-pop','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_WRITER_CHARGE',[edit(REC,'case record := <-r.queue:', 'case record := <-r.queue:\n r.release()', 'func (r *Recorder) Next(', 'func (r *Recorder) Retained(')]),
+ go('record-limit-plus-one','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_LIMIT_PLUS_ONE',[edit(REC,'r.records >= int64(r.limits.Records)','r.records > int64(r.limits.Records)')]),
+ go('byte-limit-plus-one','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_LIMIT_PLUS_ONE',[edit(REC,'charge > r.limits.Bytes-r.bytes','charge > r.limits.Bytes-r.bytes+BatchCharge')]),
+ go('equality-refused','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_LIMIT_EQUALITY',[edit(REC,'r.records >= int64(r.limits.Records)','r.records >= int64(r.limits.Records)-1')]),
+ go('writer-charge-released-on-pop','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_WRITER_CHARGE',[edit(REC,'case record := <-r.queue:', 'case record := <-r.queue:\n r.release(BatchCharge)', 'func (r *Recorder) Next(', 'func (r *Recorder) Retained(')]),
  go('batch-sequence-increments-once','TestRecorderBatchSequenceAcrossConcurrentGroups','RECORDER_ATOMIC_SEQUENCE',[edit(REC,'o.sequence += uint64(batch.EventCount)','o.sequence++')]),
  go('contention-drops-capture','TestRecorderLeafSerializationWaitsForPeerProducer','RECORDER_LEAF_SERIALIZATION',[edit(REC,'o.mu.Lock()','if !o.mu.TryLock() { o.Invalidate(Capacity); return false }','func (o *Owner) Emit(', 'func (o *Owner) Invalidate(')]),
  go('full-queue-invalid-notice-lost','TestRecorderBudgetsIncludeWriterOwnedRecord','RECORDER_FULL_QUEUE_INVALID_NOTICE',[edit(REC,'select {\n\tcase o.recorder.changed <- struct{}{}:\n\tdefault:\n\t}', '_ = o.recorder')]),
@@ -72,7 +72,8 @@ def must_pass(args,cwd,env):
         raise RuntimeError('baseline/compile failure is not a mutation kill\n'+result.stdout)
     return result
 
-def main():
+def main(baseline_go=None):
+    baseline_go = baseline_go or ['go','test','./pkg/balance/observation','./pkg/balance/router','-run','TestRecorder|TestObservation','-count=1']
     originals={path:(ROOT/path).read_bytes() for *_,edits in CASES for path,*_ in edits}
     with tempfile.TemporaryDirectory(prefix='cproute-live-') as temporary:
         directory=Path(temporary)/'repo'
@@ -81,7 +82,7 @@ def main():
         for key in ['CP_ROUTE_LIVE_SOCKET_CHECK','CP_ROUTE_LIVE_FRAMES']:
             env.pop(key,None)
         cargo=['cargo','test','--locked','--offline','--manifest-path','rust/Cargo.toml']
-        must_pass(['go','test','./pkg/balance/observation','./pkg/balance/router','-run','TestRecorder|TestObservation','-count=1'],directory,env)
+        must_pass(baseline_go,directory,env)
         must_pass(cargo+['-p','control-router','shadow::live::'],directory,env)
         must_pass(cargo+['-p','legacy-router-shadow'],directory,env)
         must_pass(['cargo','build','--locked','--offline','--manifest-path','rust/Cargo.toml','-p','legacy-router-shadow','--example','live_check'],directory,env)
@@ -112,7 +113,7 @@ def main():
             finally:
                 for path,source in originals.items():
                     (directory/path).write_bytes(source)
-        must_pass(['go','test','./pkg/balance/observation','./pkg/balance/router','-run','TestRecorder|TestObservation','-count=1'],directory,env)
+        must_pass(baseline_go,directory,env)
         must_pass(cargo+['-p','control-router','shadow::live::'],directory,env)
         must_pass(cargo+['-p','legacy-router-shadow'],directory,env)
     if any((ROOT/path).read_bytes()!=source for path,source in originals.items()):

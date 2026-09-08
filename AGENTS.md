@@ -46,7 +46,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `lib/util/` - Utilities, including error wrapping, logging helpers, retrial process, certification, etc.
 - `pkg/balance/factor/` - Factor-based load-balance policy. The load balancer calculates backend scores based on these factors.
 - `pkg/balance/metricsreader/` - Collects backend metrics so that factors can calculate scores based on metrics.
-- `pkg/balance/observation/` - Fixed-size read-only routing lifecycle values and bounded journal admission; owns no production router, policy, connection or transport.
+- `pkg/balance/observation/` - Read-only routing lifecycle values, mixed record/byte capture leases and bounded journal admission; owns no production router, policy, connection or transport.
 - `pkg/balance/observer/` - Queries backend list and checks backend health, then notifies the router.
 - `pkg/balance/policy/` - The `BalancePolicy` interface and implementations such as `SimpleBalancePolicy`.
 - `pkg/balance/router/` - Load-balance and routing service. Rebalances and routes connections based on a `BalancePolicy`.

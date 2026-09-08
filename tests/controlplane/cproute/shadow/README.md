@@ -86,3 +86,23 @@ with controlled backend callbacks. They do not qualify real SQL workload latency
 factor/candidate comparison, weighted-ticket selection or scheduler advice.
 Slice2B adds those observation inputs and independent comparisons; slice3 must
 freeze and run real SQL/etcd/health/collector acceptance before issue223 activation.
+
+## Actual read prerequisites (2B-1a)
+
+`make controlplane-cproute-read-foundation-evidence` verifies mixed v2 batch and
+1MiB capture reservations under the shared 4096-record/64MiB budget, plus actual
+Prom/Backend query publication provenance and single-load source selection.
+It runs complete touched Go package race tests and 26 compiling semantic faults.
+The older recorder job retains all 31 faults and both fixed 60-second workloads;
+the v1 job retains its 24 faults.
+
+This preparation change keeps wire v2 and `lifecycle_only=true`, with factors,
+selection and scheduler all false. `LeaseEvaluation` only reserves accounting
+space; it has no arena, frame, publication operation or comparison credit yet.
+The constructor-only prerequisite `BindObservationOwner` binds bounded Go
+loss-notification metadata. Query/source exhaustion immediately invalidates every
+bound owner before any getter/consumer runs; future reads cannot recover it.
+Native factor construction has not installed that binding in production yet.
+No production clock callsite is changed. The next implementation adds the actual
+native factor read tape, bounded storage and independent Rust comparison under
+[frozen v1.1](read-contract.md); full 2B acceptance remains pending.

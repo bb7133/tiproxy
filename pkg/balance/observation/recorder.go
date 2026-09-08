@@ -33,7 +33,9 @@ type Recorder struct {
 	limits   Limits
 	queue    chan Record
 	changed  chan struct{}
-	credits  chan struct{}
+	budgetMu sync.Mutex // leaf: never held while calling an owner or production code
+	records  int64
+	bytes    int64
 }
 
 // Owner serializes the sequence and queue admission of all groups in one owner.
@@ -57,7 +59,7 @@ func NewRecorder(limits Limits, process, nonce uint64) (*Recorder, error) {
 	capacity := min(limits.Records, int(limits.Bytes/BatchCharge))
 	return &Recorder{
 		process: process, nonce: nonce, limits: limits,
-		queue: make(chan Record, capacity), credits: make(chan struct{}, capacity), changed: make(chan struct{}, 1),
+		queue: make(chan Record, capacity), changed: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -140,15 +142,10 @@ func (o *Owner) Emit(batch Batch) bool {
 		return false
 	}
 	r := o.recorder
-	// Charge both queued and drain-owned records. Popping from the channel
-	// alone does not release budget or create an extra unaccounted writer slot.
-	// Fixed-size batches use one credit each. Its capacity is the minimum
-	// of the record limit and floor(byte limit / worst-case encoded charge).
-	// A channel token reserves both budgets together, without transient
-	// overcharging, CAS retry or taking a consumer/producer shared Mutex.
-	select {
-	case r.credits <- struct{}{}:
-	default:
+	// Reserve both limits once, before publishing. The short budget lock does
+	// not span production work, queue operations or encoding. A writer keeps
+	// the reservation after dequeue, just like an in-flight evaluation.
+	if !r.reserve(BatchCharge) {
 		o.Invalidate(Capacity)
 		return false
 	}
@@ -159,7 +156,7 @@ func (o *Owner) Emit(batch Batch) bool {
 		o.admitted.Store(o.sequence)
 		return true
 	default:
-		r.release()
+		r.release(BatchCharge)
 		o.Invalidate(Capacity)
 		return false
 	}
@@ -207,11 +204,25 @@ type Delivery struct {
 }
 
 func (d *Delivery) Release() {
-	d.once.Do(d.owner.release)
+	d.once.Do(func() { d.owner.release(BatchCharge) })
 }
 
-func (r *Recorder) release() {
-	<-r.credits
+func (r *Recorder) reserve(charge int64) bool {
+	r.budgetMu.Lock()
+	defer r.budgetMu.Unlock()
+	if charge <= 0 || r.records >= int64(r.limits.Records) || charge > r.limits.Bytes-r.bytes {
+		return false
+	}
+	r.records++
+	r.bytes += charge
+	return true
+}
+
+func (r *Recorder) release(charge int64) {
+	r.budgetMu.Lock()
+	r.records--
+	r.bytes -= charge
+	r.budgetMu.Unlock()
 }
 
 func (r *Recorder) Next(ctx context.Context) (*Delivery, error) {
@@ -224,8 +235,9 @@ func (r *Recorder) Next(ctx context.Context) (*Delivery, error) {
 }
 
 func (r *Recorder) Retained() (records, bytes int64) {
-	records = int64(len(r.credits))
-	return records, records * BatchCharge
+	r.budgetMu.Lock()
+	defer r.budgetMu.Unlock()
+	return r.records, r.bytes
 }
 
 // Close is called after stopping and joining the transport consumer. It fences
@@ -248,7 +260,7 @@ func (r *Recorder) Close() {
 	for {
 		select {
 		case <-r.queue:
-			r.release()
+			r.release(BatchCharge)
 		default:
 			return
 		}

@@ -5,10 +5,13 @@ package metricsreader
 
 import (
 	"context"
+	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/tiproxy/lib/config"
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/util/http"
 	"github.com/pingcap/tiproxy/pkg/util/waitgroup"
@@ -51,13 +54,16 @@ var _ MetricsReader = (*ClusterReader)(nil)
 
 // ClusterReader is the metrics reader owned by one backend cluster.
 type ClusterReader struct {
-	source        atomic.Int32
-	backendReader *BackendReader
-	promReader    *PromReader
-	wg            waitgroup.WaitGroup
-	cancel        context.CancelFunc
-	lg            *zap.Logger
-	cfg           *config.HealthCheck
+	source            atomic.Pointer[sourceSelection]
+	sourceMu          sync.Mutex // serializes only source writers, never spans metric reads
+	identity          uint64
+	observationOwners diagnosticOwners
+	backendReader     *BackendReader
+	promReader        *PromReader
+	wg                waitgroup.WaitGroup
+	cancel            context.CancelFunc
+	lg                *zap.Logger
+	cfg               *config.HealthCheck
 }
 
 func NewClusterReader(lg *zap.Logger, clusterName string, promFetcher PromInfoFetcher, backendFetcher TopologyFetcher, httpCli *http.Client,
@@ -65,6 +71,7 @@ func NewClusterReader(lg *zap.Logger, clusterName string, promFetcher PromInfoFe
 	promReader := NewPromReader(lg.Named("prom_reader"), promFetcher, cfg)
 	promReader.clusterName = clusterName
 	return &ClusterReader{
+		identity:      nextReaderIdentity(),
 		lg:            lg,
 		cfg:           cfg,
 		promReader:    promReader,
@@ -121,15 +128,27 @@ func (dmr *ClusterReader) readMetrics(ctx context.Context) {
 }
 
 func (dmr *ClusterReader) setSource(source int32, err error) {
+	dmr.sourceMu.Lock()
+	defer dmr.sourceMu.Unlock()
 	old := dmr.source.Load()
-	if old != source {
-		dmr.source.Store(source)
-		switch source {
-		case sourceProm:
-			dmr.lg.Info("read metrics from Prometheus")
-		case sourceBackend:
-			dmr.lg.Info("read Prometheus failed, turn to read backends", zap.Error(err))
+	if old != nil && old.kind == source {
+		return
+	}
+	generation := uint64(1)
+	if old != nil {
+		if old.generation == 0 || old.generation == math.MaxUint64 {
+			generation = 0 // sticky diagnostic exhaustion; routing still switches
+			dmr.observationOwners.invalidate(observation.SequenceExhausted)
+		} else {
+			generation = old.generation + 1
 		}
+	}
+	dmr.source.Store(&sourceSelection{kind: source, generation: generation})
+	switch source {
+	case sourceProm:
+		dmr.lg.Info("read metrics from Prometheus")
+	case sourceBackend:
+		dmr.lg.Info("read Prometheus failed, turn to read backends", zap.Error(err))
 	}
 }
 
@@ -145,14 +164,28 @@ func (dmr *ClusterReader) RemoveQueryExpr(key string) {
 
 // GetQueryResult returns an empty result if the key or the result is not found.
 func (dmr *ClusterReader) GetQueryResult(key string) QueryResult {
-	switch dmr.source.Load() {
-	case sourceProm:
-		return dmr.promReader.GetQueryResult(key)
-	case sourceBackend:
-		return dmr.backendReader.GetQueryResult(key)
-	default:
-		return QueryResult{}
+	selected := dmr.source.Load()
+	return dmr.queryResultFromSelection(key, selected)
+}
+
+// Selection remains immutable while the selected reader acquires its own lock.
+func (dmr *ClusterReader) queryResultFromSelection(key string, selected *sourceSelection) QueryResult {
+	var result QueryResult
+	if selected != nil {
+		switch selected.kind {
+		case sourceProm:
+			result = dmr.promReader.GetQueryResult(key)
+		case sourceBackend:
+			result = dmr.backendReader.GetQueryResult(key)
+		}
+		result.Provenance.Source = selected.kind
+		result.Provenance.SourceGeneration = selected.generation
 	}
+	if dmr.identity == 0 || selected != nil && selected.generation == 0 {
+		result.Provenance.Invalid = observation.SequenceExhausted
+	}
+	result.Provenance.Cluster = dmr.identity
+	return result
 }
 
 func (dmr *ClusterReader) GetBackendMetrics() []byte {

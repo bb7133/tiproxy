@@ -26,6 +26,7 @@ import (
 type PromReader struct {
 	sync.Mutex
 	queryExprs   map[string]QueryExpr
+	lineage      queryLineage
 	queryResults map[string]QueryResult
 	promFetcher  PromInfoFetcher
 	clusterName  string
@@ -39,6 +40,7 @@ func NewPromReader(lg *zap.Logger, promFetcher PromInfoFetcher, cfg *config.Heal
 		promFetcher:  promFetcher,
 		cfg:          cfg,
 		queryExprs:   make(map[string]QueryExpr),
+		lineage:      newQueryLineage(),
 		queryResults: make(map[string]QueryResult),
 	}
 }
@@ -56,6 +58,8 @@ func (pr *PromReader) ReadMetrics(ctx context.Context) error {
 	pr.Lock()
 	copyedMap := make(map[string]QueryExpr, len(pr.queryExprs))
 	maps.Copy(copyedMap, pr.queryExprs)
+	registrations := make(map[string]uint64, len(pr.lineage.registered))
+	maps.Copy(registrations, pr.lineage.registered)
 	pr.Unlock()
 	results := make(map[string]QueryResult, len(copyedMap))
 	now := time.Now()
@@ -70,6 +74,10 @@ func (pr *PromReader) ReadMetrics(ctx context.Context) error {
 		results[id] = qr
 	}
 	pr.Lock()
+	for key, result := range results {
+		result.Provenance = pr.lineage.publication(registrations[key])
+		results[key] = result
+	}
 	pr.queryResults = results
 	pr.Unlock()
 	return nil
@@ -136,19 +144,21 @@ func (pr *PromReader) AddQueryExpr(key string, queryExpr QueryExpr) {
 	pr.Lock()
 	defer pr.Unlock()
 	pr.queryExprs[key] = queryExpr
+	pr.lineage.add(key)
 }
 
 func (pr *PromReader) RemoveQueryExpr(key string) {
 	pr.Lock()
 	defer pr.Unlock()
 	delete(pr.queryExprs, key)
+	delete(pr.lineage.registered, key)
 }
 
 func (pr *PromReader) GetQueryResult(key string) QueryResult {
 	pr.Lock()
 	defer pr.Unlock()
 	// Return an empty QueryResult if it's not found.
-	return pr.queryResults[key]
+	return pr.lineage.read(key, pr.queryResults[key])
 }
 
 func (pr *PromReader) Close() {

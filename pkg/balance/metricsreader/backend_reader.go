@@ -66,6 +66,7 @@ type BackendReader struct {
 	sync.Mutex
 	// rule key: QueryRule
 	queryRules map[string]QueryRule
+	lineage    queryLineage
 	// rule key: QueryResult
 	queryResults map[string]QueryResult
 	// the owner generates the history from querying backends and other members query the history from the owner
@@ -97,6 +98,7 @@ func NewClusterBackendReader(lg *zap.Logger, clusterName string, cfgGetter confi
 	backendFetcher TopologyFetcher, cfg *config.HealthCheck) *BackendReader {
 	return &BackendReader{
 		queryRules:        make(map[string]QueryRule),
+		lineage:           newQueryLineage(),
 		queryResults:      make(map[string]QueryResult),
 		history:           make(map[string]map[string]backendHistory),
 		lg:                lg,
@@ -150,19 +152,21 @@ func (br *BackendReader) AddQueryRule(key string, rule QueryRule) {
 	br.Lock()
 	defer br.Unlock()
 	br.queryRules[key] = rule
+	br.lineage.add(key)
 }
 
 func (br *BackendReader) RemoveQueryRule(key string) {
 	br.Lock()
 	defer br.Unlock()
 	delete(br.queryRules, key)
+	delete(br.lineage.registered, key)
 }
 
 func (br *BackendReader) GetQueryResult(key string) QueryResult {
 	br.Lock()
 	defer br.Unlock()
 	// Return an empty QueryResult if it's not found.
-	return br.queryResults[key]
+	return br.lineage.read(key, br.queryResults[key])
 }
 
 func (br *BackendReader) ReadMetrics(ctx context.Context) error {
@@ -484,6 +488,7 @@ func (br *BackendReader) history2QueryResult() {
 		queryResults[ruleKey] = QueryResult{
 			Value:      value,
 			UpdateTime: now,
+			Provenance: br.lineage.publication(br.lineage.registered[ruleKey]),
 		}
 	}
 
