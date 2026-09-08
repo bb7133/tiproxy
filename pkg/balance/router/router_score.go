@@ -13,6 +13,7 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
 	"github.com/pingcap/tiproxy/pkg/util/waitgroup"
@@ -51,14 +52,22 @@ type ScoreBasedRouter struct {
 	serverVersion string
 	// The backend supports redirection only when they have signing certs.
 	supportRedirection bool
+	observation        *observation.Owner
 }
 
 // NewScoreBasedRouter creates a ScoreBasedRouter.
 func NewScoreBasedRouter(logger *zap.Logger) *ScoreBasedRouter {
+	return NewScoreBasedRouterWithObservation(logger, nil)
+}
+
+// NewScoreBasedRouterWithObservation installs the observer at construction,
+// before Init or any policy call. There is no live-router attachment setter.
+func NewScoreBasedRouterWithObservation(logger *zap.Logger, owner *observation.Owner) *ScoreBasedRouter {
 	return &ScoreBasedRouter{
-		logger:   logger,
-		backends: make(map[string]*backendWrapper),
-		groups:   make([]*Group, 0),
+		observation: owner,
+		logger:      logger,
+		backends:    make(map[string]*backendWrapper),
+		groups:      make([]*Group, 0),
 	}
 }
 
@@ -95,7 +104,12 @@ func (r *ScoreBasedRouter) Init(ctx context.Context, ob observer.BackendObserver
 // GetBackendSelector implements Router.GetBackendSelector interface.
 func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) BackendSelector {
 	var group *Group
+	var selection *selectionObservation
+	if router.observation.Enabled() {
+		selection = &selectionObservation{owner: router.observation, session: router.observation.NextIdentity()}
+	}
 	return BackendSelector{
+		closeObservation: func() { selection.finish() },
 		routeOnce: func(excluded []BackendInst) (backend BackendInst, err error) {
 			// Prevent the group from being removed after it's chosen. In that case,
 			// the connection will be on a orphan group.
@@ -111,28 +125,31 @@ func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) Backen
 				}
 			}()
 			if router.observeError != nil {
+				selection.noRoute(0)
 				err = router.observeError
 				return
 			}
 			// The group may change from round to round because the backends are updated.
 			group, err = router.routeToGroup(clientInfo)
 			if err != nil {
+				selection.noRoute(0)
 				return
 			}
 			if group == nil {
+				selection.noRoute(0)
 				err = ErrNoBackend
 				return
 			}
 			// The router may remove this group concurrently, make sure the group can be accessed after it's removed.
 			var backendCtx policy.BackendCtx
-			backendCtx, err = group.Route(excluded)
+			backendCtx, err = group.routeObserved(excluded, selection)
 			if err == nil && backendCtx != nil {
 				backend = backendCtx.(BackendInst)
 			}
 			return
 		},
 		onCreate: func(backend BackendInst, conn RedirectableConn, succeed bool) {
-			group.onCreateConn(backend, conn, succeed)
+			group.onCreateConnObserved(backend, conn, succeed, selection)
 		},
 	}
 }
@@ -363,7 +380,7 @@ func (router *ScoreBasedRouter) updateGroups() {
 		switch router.matchType {
 		case MatchAll:
 			if len(router.groups) == 0 {
-				group, _ = NewGroup(nil, router.bpCreator, router.matchType, router.logger)
+				group, _ = newGroupObserved(nil, router.bpCreator, router.matchType, router.logger, router.observation)
 				// A new group must observe the CURRENT config, exactly
 				// like the label/port branches below: without this a
 				// startup fail-backend-list (and failover-timeout) is
@@ -388,7 +405,7 @@ func (router *ScoreBasedRouter) updateGroups() {
 				}
 			}
 			if group == nil {
-				g, err := NewGroup(values, router.bpCreator, router.matchType, router.logger)
+				g, err := newGroupObserved(values, router.bpCreator, router.matchType, router.logger, router.observation)
 				if err == nil {
 					group = g
 					if router.cfgGetter != nil {
@@ -483,6 +500,9 @@ func (router *ScoreBasedRouter) ServerVersion() string {
 
 // Close implements Router.Close interface.
 func (router *ScoreBasedRouter) Close() {
+	// Closing the router does not prove that retained connections/selectors
+	// cannot still settle; preserve an invalid tail instead of fabricating End.
+	router.observation.Invalidate(observation.Shutdown)
 	if router.cancelFunc != nil {
 		router.cancelFunc()
 		router.cancelFunc = nil

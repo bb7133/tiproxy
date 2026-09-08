@@ -11,6 +11,7 @@ import (
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/pkg/controlbridge"
+	shadowbridge "github.com/pingcap/tiproxy/pkg/controlbridge/shadow"
 	"github.com/pingcap/tiproxy/pkg/manager/backendcluster"
 	"github.com/pingcap/tiproxy/pkg/manager/cert"
 	mgrcfg "github.com/pingcap/tiproxy/pkg/manager/config"
@@ -54,6 +55,7 @@ type Server struct {
 	// L7 proxy
 	proxy         *proxy.SQLServer
 	controlBridge *controlbridge.Bridge
+	routingShadow *shadowbridge.Service
 }
 
 func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error) {
@@ -117,6 +119,23 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 	// general cluster HTTP client
 	{
 		srv.httpCli = http.NewHTTPClient(srv.certManager.ClusterTLS)
+	}
+
+	// Observation starts before any namespace, policy or router Init. A failed
+	// diagnostic socket stays disabled and cannot prevent SQL/control startup.
+	if cfg.RustDataplane.RoutingShadowSocket != "" {
+		shadow, shadowErr := shadowbridge.Start(ctx, cfg.RustDataplane.RoutingShadowSocket, lg.Named("routing-shadow"))
+		if shadowErr != nil {
+			lg.Warn("routing lifecycle observation disabled", zap.Error(shadowErr))
+		} else {
+			srv.routingShadow = shadow
+			srv.namespaceManager = mgrns.NewNamespaceManagerWithObservation(shadow.Recorder())
+			defer func() {
+				if err != nil {
+					shadow.Close()
+				}
+			}()
+		}
 	}
 
 	// setup namespace manager
@@ -278,6 +297,9 @@ func (s *Server) Close() error {
 	}
 	if s.namespaceManager != nil {
 		errs = append(errs, s.namespaceManager.Close())
+	}
+	if s.routingShadow != nil {
+		s.routingShadow.Close()
 	}
 	if s.memManager != nil {
 		s.memManager.Close()

@@ -7,15 +7,17 @@
 package namespace
 
 import (
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 )
 
 type Namespace struct {
-	name   string
-	user   string
-	bo     observer.BackendObserver
-	router router.Router
+	observation *observation.Owner
+	name        string
+	user        string
+	bo          observer.BackendObserver
+	router      router.Router
 }
 
 func (n *Namespace) Name() string {

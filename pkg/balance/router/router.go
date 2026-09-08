@@ -117,7 +117,8 @@ type backendWrapper struct {
 	// connList only includes the connections that are currently on this backend.
 	connList *glist.List[*connWrapper]
 	// The group that this backend belongs to.
-	group *Group
+	group         *Group
+	observationID uint64 // diagnostic incarnation, protected by its group lock
 }
 
 func newBackendWrapper(id string, health observer.BackendHealth) *backendWrapper {
@@ -300,10 +301,13 @@ type connWrapper struct {
 	// The reason why the redirection happens.
 	redirectReason string
 	// Last redirect start time of this connection.
-	lastRedirect time.Time
-	createTime   time.Time
-	phase        connPhase
-	forceClosing bool
+	lastRedirect        time.Time
+	createTime          time.Time
+	phase               connPhase
+	forceClosing        bool
+	observationID       uint64
+	observationRedirect uint64
+	observationClose    uint64
 }
 
 func (c *connWrapper) transferScore(to *backendWrapper) {

@@ -14,10 +14,11 @@ type ClientInfo struct {
 }
 
 type BackendSelector struct {
-	excluded  []BackendInst
-	cur       BackendInst
-	routeOnce func(excluded []BackendInst) (BackendInst, error)
-	onCreate  func(backend BackendInst, conn RedirectableConn, succeed bool)
+	excluded         []BackendInst
+	cur              BackendInst
+	routeOnce        func(excluded []BackendInst) (BackendInst, error)
+	onCreate         func(backend BackendInst, conn RedirectableConn, succeed bool)
+	closeObservation func()
 }
 
 func (bs *BackendSelector) Next() (BackendInst, error) {
@@ -37,4 +38,12 @@ func (bs *BackendSelector) Next() (BackendInst, error) {
 
 func (bs *BackendSelector) Finish(conn RedirectableConn, succeed bool) {
 	bs.onCreate(bs.cur, conn, succeed)
+}
+
+// CloseObservation records the real end of selection without changing routing
+// or accounting. Finish remains the only creation-result/accounting callback.
+func (bs *BackendSelector) CloseObservation() {
+	if bs.closeObservation != nil {
+		bs.closeObservation()
+	}
 }

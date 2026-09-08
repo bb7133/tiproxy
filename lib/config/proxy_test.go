@@ -139,6 +139,22 @@ func TestRustDataplaneConfigGateAndClone(t *testing.T) {
 	require.ErrorContains(t, cfg.Check(), "allowed-uid")
 }
 
+func TestRoutingObservationConfigIsExplicitAndRestartPinned(t *testing.T) {
+	cfg := NewConfig()
+	require.Empty(t, cfg.RustDataplane.RoutingShadowSocket)
+	cfg.RustDataplane.RoutingShadowSocket = "/tmp/routing-shadow/observer.sock"
+	require.ErrorContains(t, cfg.Check(), "routing-shadow-socket")
+	cfg.RustDataplane.Enabled = true
+	cfg.EnableTrafficReplay = false
+	cfg.RustDataplane.ControlSocket = "/tmp/routing-shadow/control.sock"
+	require.NoError(t, cfg.Check())
+	require.Equal(t, cfg.RustDataplane.RoutingShadowSocket, cfg.Clone().RustDataplane.RoutingShadowSocket)
+	cfg.RustDataplane.RoutingShadowSocket = cfg.RustDataplane.ControlSocket
+	require.ErrorContains(t, cfg.Check(), "routing-shadow-socket")
+	cfg.RustDataplane.RoutingShadowSocket = "relative.sock"
+	require.ErrorContains(t, cfg.Check(), "routing-shadow-socket")
+}
+
 func TestProxyConfigCOS(t *testing.T) {
 	data := []byte(`
 [metering]

@@ -1154,8 +1154,10 @@ name = "legacy-router-shadow"
 version = "0.1.0"
 dependencies = [
  "control-router",
+ "rustix",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2117,6 +2119,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
+ "legacy-router-shadow",
  "libc",
  "prost",
  "rcgen",

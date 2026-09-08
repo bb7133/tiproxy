@@ -471,6 +471,16 @@ impl EffectiveConfig {
         {
             return invalid("rust-dataplane.control-socket", "relative_path");
         }
+        if !self.rust_dataplane.routing_shadow_socket.is_empty()
+            && (!self.rust_dataplane.enabled
+                || !Path::new(&self.rust_dataplane.routing_shadow_socket).is_absolute()
+                || self.rust_dataplane.routing_shadow_socket == self.rust_dataplane.control_socket)
+        {
+            return invalid(
+                "rust-dataplane.routing-shadow-socket",
+                "requires_rust_and_distinct_absolute_path",
+            );
+        }
         if self.rust_dataplane.enabled && self.enable_traffic_replay {
             return invalid("enable-traffic-replay", "conflicts_with_rust_dataplane");
         }
@@ -708,6 +718,13 @@ impl EffectiveConfig {
             ),
             failover_timeout_seconds,
         })
+    }
+
+    /// Returns the explicit, restart-pinned routing observation socket.
+    #[must_use]
+    pub fn routing_shadow_socket(&self) -> Option<&Path> {
+        (!self.rust_dataplane.routing_shadow_socket.is_empty())
+            .then(|| Path::new(&self.rust_dataplane.routing_shadow_socket))
     }
 
     /// Returns the process TLS allowlist configured for the Rust dataplane.
@@ -1011,6 +1028,11 @@ impl EffectiveConfig {
         }
 
         output.top_table("rust-dataplane");
+        output.string(
+            1,
+            "routing-shadow-socket",
+            &self.rust_dataplane.routing_shadow_socket,
+        );
         output.boolean(1, "enabled", self.rust_dataplane.enabled);
         output.string(1, "control-socket", &self.rust_dataplane.control_socket);
         output.signed(1, "allowed-uid", self.rust_dataplane.allowed_uid);
@@ -1897,6 +1919,7 @@ struct LocalFsMeteringConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct RustDataplaneConfig {
+    routing_shadow_socket: String,
     enabled: bool,
     control_socket: String,
     allowed_uid: i64,
@@ -1906,6 +1929,7 @@ struct RustDataplaneConfig {
 impl Default for RustDataplaneConfig {
     fn default() -> Self {
         Self {
+            routing_shadow_socket: String::new(),
             enabled: false,
             control_socket: String::new(),
             allowed_uid: -1,
