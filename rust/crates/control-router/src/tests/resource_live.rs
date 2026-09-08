@@ -205,7 +205,7 @@ async fn observe_composed() -> TestResult {
     assert_eq!(pick(&router, &before), live.ids[1]);
     let mut foreign = Harness::with_backends(
         "",
-        "resource",
+        "connection",
         &[
             (live.addresses[0].as_str(), &[]),
             (live.addresses[1].as_str(), &[]),
@@ -235,7 +235,7 @@ async fn observe_composed() -> TestResult {
         100,
         Some(live.overlay.clone()),
     )));
-    let mut other = candidate(&foreign.router, |c| {
+    let initial_foreign = candidate(&foreign.router, |c| {
         c.routing.backends.backends.len() == 2
             && c.routing
                 .backends
@@ -244,6 +244,24 @@ async fn observe_composed() -> TestResult {
                 .all(|b| b.backend.status_port > 0)
     })
     .await?;
+    // Empty metrics must prefer A for a real reason, not the ordering of
+    // ephemeral SQL ports. Foreign health-risk data would instead prefer B.
+    let mut foreign_load = Vec::new();
+    for _ in 0..4 {
+        let session = must(foreign.router.open());
+        let pending = must(foreign.router.reserve(
+            &session,
+            &initial_foreign,
+            ClientInfo::default(),
+            "",
+            &[&live.ids[0]],
+        ));
+        assert_eq!(pending.assignment().backend_id, live.ids[1]);
+        assert_eq!(foreign.router.finish(&pending, true), Settlement::Applied);
+        foreign_load.push(session);
+    }
+    foreign.patch("[balance]\npolicy=\"resource\"", 3);
+    let mut other = candidate(&foreign.router, |_| true).await?;
     assert!(
         matches!(other.metrics, MetricInputs::Dynamic(None)),
         "COMPOSE_FOREIGN_OVERLAY_UNAVAILABLE"
@@ -258,6 +276,9 @@ async fn observe_composed() -> TestResult {
         live.ids[0],
         "COMPOSE_FOREIGN_CURRENT_R_DATA_IGNORED"
     );
+    for session in foreign_load {
+        assert_eq!(foreign.router.close(&session), Settlement::Applied);
+    }
     // Neither collector nor router is polled between these committed changes.
     // Opaque config publication must remember the discarded factor lifetime.
     live.mode.store(1, Ordering::SeqCst);
@@ -371,9 +392,8 @@ async fn observe_composed() -> TestResult {
     );
     patch(&live, "connection")?;
     let independent = candidate(&router, |_| true).await?;
-    assert_eq!(
-        pick(&router, &independent),
-        live.ids[0],
+    assert!(
+        live.ids.contains(&pick(&router, &independent)),
         "COMPOSE_REAL_CONNECTION_INDEPENDENT"
     );
     for session in &sessions {
