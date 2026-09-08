@@ -256,3 +256,201 @@ async fn migration_immediate_terminal_waits_for_accepted_ledger_commit() -> Test
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn balance_plan_retains_unhealthy_physical_source_and_final_authority() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let sim = simulation(&h, 2);
+    let c = ready(&sim).await;
+    let mut sessions = Vec::new();
+    for _ in 0..4 {
+        sessions.push(active(&sim, &c));
+    }
+    let plan = must(sim.prepare_balance(&c, ClientInfo::default(), "")).ok_or("balance missing")?;
+    assert_eq!(plan.pair().from.as_ref(), A, "BALANCE_PHYSICAL_SOURCE");
+    assert_eq!(plan.pair().to.as_ref(), B, "BALANCE_TARGET");
+    assert_eq!(plan.redirects().len(), 4, "BALANCE_SOURCE_ORDER_COUNT");
+    assert!(must(sim.offer(&plan.redirects()[1])));
+    let op = sim.take_redirect().ok_or("redirect")?;
+    // Prepare is effectless and pending is still physically in its source.
+    let next = must(sim.prepare_balance(&c, ClientInfo::default(), "")).ok_or("next pair")?;
+    assert_eq!(next.redirects().len(), 4);
+    assert!(matches!(
+        sim.offer(&next.redirects()[1]),
+        Err(RouteError::RedirectPending)
+    ));
+    assert_eq!(sim.finish(&op, true), Settlement::Applied);
+    assert_eq!(counts(&sim, A), (3, 3, 0, 0));
+    assert_eq!(counts(&sim, B), (1, 1, 0, 0));
+
+    // Removing A from the real routing producer must preserve it as a source.
+    h.fixture.backends(&[("127.0.0.1:4001", &[])]);
+    let c2 = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok(next) = sim.router().capture()
+                && !Arc::ptr_eq(&c.routing, &next.routing)
+            {
+                break next;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(matches!(
+        sim.offer(&plan.redirects()[0]),
+        Err(RouteError::StaleCandidate)
+    ));
+    let removed =
+        must(sim.prepare_balance(&c2, ClientInfo::default(), "")).ok_or("removed source pair")?;
+    assert_eq!(removed.pair().from.as_ref(), A, "BALANCE_RETAIN_UNHEALTHY");
+    assert_eq!(
+        removed.pair().reason,
+        crate::Factor::Status,
+        "BALANCE_STATUS_FIRST"
+    );
+    assert_eq!(removed.redirects().len(), 3);
+    assert!(must(sim.offer(&removed.redirects()[0])));
+    let op = sim.take_redirect().ok_or("removed source offer")?;
+    assert_eq!(sim.finish(&op, true), Settlement::Applied);
+    for session in sessions {
+        sim.router().close(&session);
+    }
+    assert_eq!(counts(&sim, A), (0, 0, 0, 0));
+    assert_eq!(counts(&sim, B), (0, 0, 0, 0));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn balance_plan_fail_list_all_failed_guard_and_stale_config() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let sim = simulation(&h, 1);
+    let c = ready(&sim).await;
+    let sessions: Vec<_> = (0..4).map(|_| active(&sim, &c)).collect();
+    // Explicit draining takes priority over the connection imbalance.
+    h.patch("[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]", 3);
+    h.source.deliver();
+    h.applied().await;
+    let c2 = ready(&sim).await;
+    assert!(matches!(
+        sim.prepare_balance(&c, ClientInfo::default(), ""),
+        Err(RouteError::StaleCandidate)
+    ));
+    let plan = must(sim.prepare_balance(&c2, ClientInfo::default(), "")).ok_or("draining pair")?;
+    assert_eq!(
+        plan.pair().reason,
+        crate::Factor::Status,
+        "BALANCE_FAIL_LIST_STATUS"
+    );
+    h.patch(
+        "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\",\"127.0.0.1:4001\"]",
+        4,
+    );
+    h.source.deliver();
+    h.applied().await;
+    let c3 = ready(&sim).await;
+    let all =
+        must(sim.prepare_balance(&c3, ClientInfo::default(), "")).ok_or("all failed safeguard")?;
+    assert_eq!(
+        all.pair().reason,
+        crate::Factor::Connection,
+        "BALANCE_ALL_FAILED_GUARD"
+    );
+    assert!(matches!(
+        sim.offer(&plan.redirects()[0]),
+        Err(RouteError::StaleCandidate)
+    ));
+    for s in sessions {
+        sim.router().close(&s);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn balance_plan_cross_keyspace_refusal_retains_factor_history_only() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[
+            ("127.0.0.1:4000", &[("keyspace", "tenant")]),
+            ("127.0.0.1:4001", &[("keyspace", "other")]),
+        ],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let sim = simulation(&h, 1);
+    let c = ready(&sim).await;
+    let mut sessions: Vec<_> = (0..5).map(|_| active(&sim, &c)).collect();
+    h.patch("[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]", 3);
+    h.source.deliver();
+    h.applied().await;
+    let failed = ready(&sim).await;
+    let no_elapsed_time = Instant::now();
+    assert!(matches!(
+        sim.prepare_balance(&failed, ClientInfo::default(), ""),
+        Err(RouteError::CrossKeyspace)
+    ));
+    assert_eq!(counts(&sim, A), (5, 5, 0, 0), "BALANCE_REFUSED_NO_EFFECT");
+    assert!(sim.take_redirect().is_none());
+    for s in sessions.drain(1..) {
+        sim.router().close(&s);
+    }
+    h.fixture.backends(&[
+        ("127.0.0.1:4000", &[("keyspace", "tenant")]),
+        ("127.0.0.1:4001", &[("keyspace", "tenant")]),
+    ]);
+    let current = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok(c) = sim.router().capture()
+                && !Arc::ptr_eq(&c.routing, &failed.routing)
+            {
+                break c;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let plan = must(sim.prepare_balance(&current, ClientInfo::default(), ""))
+        .ok_or("same keyspace pair")?;
+    // The first score evaluation captured 5 physical connections / 5s.
+    // Losing that history at refusal would recompute the rate as 1 / 5s.
+    assert!(
+        (plan.pair().rate - 1.0).abs() < f64::EPSILON,
+        "BALANCE_REFUSED_STATUS_HISTORY"
+    );
+    assert_eq!(plan.pair().reason, crate::Factor::Status);
+    assert!(
+        must(sim.offer_at(&plan.redirects()[0], no_elapsed_time)),
+        "BALANCE_PAIR_REFUSAL_NO_COOLDOWN"
+    );
+    let op = sim.take_redirect().ok_or("admission")?;
+    sim.finish(&op, true);
+    sim.router().close(&sessions[0]);
+    Ok(())
+}

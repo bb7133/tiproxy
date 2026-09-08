@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use control_config::ConfigNamespaceSource;
 use control_plane::ModuleContext;
+use control_routing::group::ClientInfo;
 use control_topology::{MetricOverlayHandle, TopologyModuleHandle};
 
 use crate::ledger::AccountIdentity;
@@ -34,6 +35,28 @@ pub struct PreparedRedirect {
     pub(crate) source: Arc<AccountIdentity>,
     pub(crate) target: Arc<AccountIdentity>,
     pub(crate) target_id: Arc<str>,
+}
+
+/// A factor-selected pair and its source sessions in physical arrival order.
+/// Every entry must still pass the original final offer fence; preparing this
+/// plan changes no session counts and does not bypass pending/cooldown checks.
+pub struct PreparedBalance {
+    pub(crate) pair: crate::BalancePair,
+    pub(crate) redirects: Vec<PreparedRedirect>,
+}
+impl PreparedBalance {
+    /// Diagnostic pair chosen from all retained owners in the selected group.
+    #[must_use]
+    pub const fn pair(&self) -> &crate::BalancePair {
+        &self.pair
+    }
+
+    /// Source physical order, including pending redirects. The later scheduler
+    /// skips ineligible entries; incoming redirects are absent until success.
+    #[must_use]
+    pub fn redirects(&self) -> &[PreparedRedirect] {
+        &self.redirects
+    }
 }
 
 /// A fresh, isolated router with a bounded queue of simulated admissions.
@@ -94,6 +117,21 @@ impl MigrationSimulation {
         target_id: &str,
     ) -> Result<PreparedRedirect, RouteError> {
         self.router.prepare_redirect(session, candidate, target_id)
+    }
+
+    /// Selects the actual factor migration pair and captures physical source
+    /// order using this simulation's real C/R/H and optional producer metrics.
+    /// This is preparation only: no timer, quota or failover-close worker runs.
+    /// # Errors
+    /// Rejects stale sources, missing groups and cross-keyspace pairs.
+    pub fn prepare_balance(
+        &self,
+        candidate: &Candidate,
+        client: ClientInfo<'_>,
+        listener_port: &str,
+    ) -> Result<Option<PreparedBalance>, RouteError> {
+        self.router
+            .prepare_balance(candidate, client, listener_port)
     }
 
     /// Tries one synchronous bounded offer after final validation under the

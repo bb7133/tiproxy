@@ -1,0 +1,22 @@
+# name action session backend millis
+reset reset 0 a 0
+open1 open 1 a 0
+open2 open 2 a 0
+open3 open 3 a 0
+connect3 connect 3 a 0
+connect1 connect 1 a 0
+connect2 connect 2 b 0
+pending1 admit 1 b 0
+rejected3 reject 3 b 1
+success1 success 1 b 2
+pending2 admit 2 a 3
+failed2 failure 2 a 4
+pending3 admit 3 b 3001
+success3 success 3 b 3002
+pending1back admit 1 a 3003
+close1pending close 1 a 3004
+late1 late_success 1 a 3005
+pending2again admit 2 a 3006
+success2 success 2 a 3007
+close2 close 2 a 3008
+close3 close 3 b 3009

@@ -22,6 +22,7 @@ use control_topology::metrics::{QueryId, QueryResult};
 
 use crate::ledger::{AccountIdentity, Accounting};
 
+mod balance;
 mod resource;
 
 /// One Go factor, in score-composition order.
@@ -92,6 +93,20 @@ pub struct FactorScore {
     pub advice_to_best: Vec<FactorAdvice>,
 }
 
+/// Go's first actionable worst-to-best migration pair. Diagnostic values do
+/// not grant permission to issue a redirect.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BalancePair {
+    /// Physical source backend.
+    pub from: Arc<str>,
+    /// Lowest-scoring routeable backend.
+    pub to: Arc<str>,
+    /// Connections per second.
+    pub rate: f64,
+    /// First actionable factor in policy priority order.
+    pub reason: Factor,
+}
+
 /// Staged factor observations; these values cannot reserve a connection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FactorReport {
@@ -99,6 +114,8 @@ pub struct FactorReport {
     pub rows: Vec<FactorScore>,
     /// Eligible IDs in Go prefer-idle's ticket order (worst to best).
     pub preferred: Vec<Arc<str>>,
+    /// Migration pair over the supplied physical/score owners, independent of prefer-idle.
+    pub balance: Option<BalancePair>,
 }
 impl FactorReport {
     /// Applies Go's ticket weights. The result is data, without route authority.
@@ -339,7 +356,9 @@ impl State {
                     .collect();
             }
         }
+        let balance = balance::select(&sorted);
         FactorReport {
+            balance,
             rows: sorted.into_iter().map(|(_, row)| row).collect(),
             preferred,
         }

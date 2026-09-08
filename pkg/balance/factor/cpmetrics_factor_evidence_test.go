@@ -25,13 +25,15 @@ var cpFactorNow time.Time
 var cpFactorTicket int64
 
 type cpFactorBackend struct {
-	ID      string `json:"id"`
-	Cluster string `json:"cluster"`
-	Active  int    `json:"active"`
-	Pending int    `json:"pending"`
-	Healthy bool   `json:"healthy"`
-	Local   bool   `json:"local"`
-	Label   bool   `json:"label"`
+	ID       string `json:"id"`
+	Cluster  string `json:"cluster"`
+	Active   int    `json:"active"`
+	Pending  int    `json:"pending"`
+	Incoming int    `json:"incoming"`
+	Outgoing int    `json:"outgoing"`
+	Healthy  bool   `json:"healthy"`
+	Local    bool   `json:"local"`
+	Label    bool   `json:"label"`
 }
 type cpFactorSample struct {
 	Time  int64  `json:"time"`
@@ -58,10 +60,18 @@ type cpFactorScore struct {
 	Routeable bool             `json:"routeable"`
 	Advice    []cpFactorAdvice `json:"advice"`
 }
+type cpBalancePair struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Rate   string `json:"rate"`
+	Reason string `json:"reason"`
+}
+
 type cpFactorExpected struct {
-	Scores []cpFactorScore `json:"scores"`
-	Random map[string]int  `json:"random"`
-	Prefer map[string]int  `json:"prefer"`
+	Balance *cpBalancePair  `json:"balance"`
+	Scores  []cpFactorScore `json:"scores"`
+	Random  map[string]int  `json:"random"`
+	Prefer  map[string]int  `json:"prefer"`
 }
 type cpFactorStep struct {
 	Now      int64                    `json:"now"`
@@ -332,6 +342,9 @@ func TestCPMetricsFactorObservation(t *testing.T) {
 	}
 	require.Equal(t, "1", os.Getenv("CPMETRICS_FACTOR_CLOCK"))
 	cases := cpFactorCases()
+	if os.Getenv("CPROUTE_BALANCE_CASES") == "1" {
+		cases = append(cases, cpBalanceCases()...)
+	}
 	for ci := range cases {
 		reader := newMockMetricsReader()
 		fbb := NewFactorBasedBalance(zap.NewNop(), reader)
@@ -356,7 +369,7 @@ func TestCPMetricsFactorObservation(t *testing.T) {
 				if b.Label {
 					label = "yes"
 				}
-				backends = append(backends, &mockBackend{id: b.ID, addr: b.ID + ":4000", connCount: b.Active, connScore: b.Active + b.Pending, healthy: b.Healthy, local: b.Local,
+				backends = append(backends, &mockBackend{id: b.ID, addr: b.ID + ":4000", connCount: b.Active, connScore: b.Active + b.Pending + b.Incoming - b.Outgoing, healthy: b.Healthy, local: b.Local,
 					BackendInfo: observer.BackendInfo{IP: b.ID, StatusPort: 10080, ClusterName: b.Cluster, Labels: map[string]string{s.Label: label}}})
 			}
 			reader.qrs = make(map[string]metricsreader.QueryResult)
@@ -389,6 +402,10 @@ func TestCPMetricsFactorObservation(t *testing.T) {
 					qr.Value = vector
 				}
 				reader.qrs[key] = qr
+			}
+			from, to, rate, reason, _ := fbb.BackendsToBalance(backends)
+			if from != nil {
+				s.Expected.Balance = &cpBalancePair{from.ID(), to.ID(), strconv.FormatFloat(rate, 'g', 17, 64), reason}
 			}
 			scored := fbb.updateScore(backends)
 			for _, b := range scored {

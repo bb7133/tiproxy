@@ -254,7 +254,7 @@ jobs:
         run: make controlplane-cproute-resource-evidence
 
   migration-ledger:
-    name: Migration ledger and bounded admission
+    name: Migration ledger, factor pairs and physical order
     runs-on: ubuntu-24.04
     # Actual Go Group.Balance lifecycle, final admission lock and exact terminals.
     timeout-minutes: 30
@@ -288,6 +288,8 @@ jobs:
           key: rust-migration-ledger-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
       - name: Run shared migration lifecycle and compiling mutations
         run: make controlplane-cproute-migration-evidence
+      - name: Compare actual factor pairs and physical arrival order
+        run: make controlplane-cproute-balance-evidence
 
   supply-chain:
     name: Audit dependencies and policy

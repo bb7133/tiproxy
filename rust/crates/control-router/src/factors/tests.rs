@@ -105,6 +105,52 @@ fn policy(step: &Value) -> RoutingConfig {
     policy.connection.count_ratio_threshold = float(&step["ratio"]);
     policy
 }
+#[allow(clippy::float_cmp)] // Exact infinity as in the existing factor oracle.
+fn compare_balance(report: &FactorReport, expected: &Value, context: &str) {
+    let pair = &expected["balance"];
+    if pair.is_null() {
+        assert!(
+            report.balance.is_none(),
+            "FACTOR_BALANCE_NONE {context}: {:?}",
+            report.balance
+        );
+    } else {
+        let actual = report
+            .balance
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("FACTOR_BALANCE_MISSING {context}"));
+        assert_eq!(
+            actual.from.as_ref(),
+            text(&pair["from"]),
+            "FACTOR_BALANCE_SOURCE {context}"
+        );
+        assert_eq!(
+            actual.to.as_ref(),
+            text(&pair["to"]),
+            "FACTOR_BALANCE_TARGET {context}"
+        );
+        let rate: f64 = must(text(&pair["rate"]).parse());
+        assert!(
+            (actual.rate - rate).abs() <= rate.abs() * 1e-10 || actual.rate == rate,
+            "FACTOR_BALANCE_RATE {context}"
+        );
+        let reason = match actual.reason {
+            Factor::Label => "label",
+            Factor::Status => "status",
+            Factor::Health => "health",
+            Factor::Memory => "memory",
+            Factor::Cpu => "cpu",
+            Factor::Location => "location",
+            Factor::Connection => "conn",
+        };
+        assert_eq!(
+            reason,
+            text(&pair["reason"]),
+            "FACTOR_BALANCE_REASON {context}"
+        );
+    }
+}
+
 #[allow(clippy::float_cmp)] // Also compare the actual Go infinity result.
 fn compare(report: &FactorReport, step: &Value, context: &str) {
     let expected = &step["expected"];
@@ -183,6 +229,9 @@ fn compare(report: &FactorReport, step: &Value, context: &str) {
             );
         }
     }
+    // Preserve the original factor mutation's first-divergence labels before
+    // comparing the derived migration pair.
+    compare_balance(report, expected, context);
 }
 
 #[test]
@@ -191,8 +240,13 @@ fn shared_go_factor_observations() {
         return;
     };
     let cases: Value = must(serde_json::from_slice(&must(std::fs::read(path))));
+    let inventory = if std::env::var("CPROUTE_BALANCE_CASES").as_deref() == Ok("1") {
+        104
+    } else {
+        95
+    };
     assert!(
-        array(&cases).len() == 95,
+        array(&cases).len() == inventory,
         "mandatory Go factor scenario inventory"
     );
     let selected = std::env::var("CPMETRICS_FACTOR_CASE").ok();
@@ -221,9 +275,11 @@ fn shared_go_factor_observations() {
                         id,
                         owner: Arc::clone(owner),
                         cluster: text(&backend["cluster"]).into(),
-                        counts: Accounting::for_factor_test(
+                        counts: Accounting::for_balance_test(
                             natural(&backend["active"]),
                             natural(&backend["pending"]),
+                            backend["incoming"].as_u64().unwrap_or(0),
+                            backend["outgoing"].as_u64().unwrap_or(0),
                         ),
                         healthy: backend["healthy"] == true,
                         local: backend["local"] == true,
@@ -246,7 +302,7 @@ fn shared_go_factor_observations() {
     }
     assert_eq!(
         observed,
-        if selected.is_some() { 1 } else { 95 },
+        if selected.is_some() { 1 } else { inventory },
         "Go factor scenario selection"
     );
     println!("CP-METRIC-FACTORS actual Go observations passed: {observed}");
