@@ -1276,26 +1276,33 @@ func TestKeepAlive(t *testing.T) {
 		config.proxyConfig.bcConfig.HealthyKeepAlive.Idle = time.Minute
 		config.proxyConfig.bcConfig.UnhealthyKeepAlive.Idle = time.Second
 	})
+	// The signal loop updates keepalive under processLock. Read the test-only
+	// diagnostic with that same lock instead of racing the background writer.
+	keepAliveIdle := func() time.Duration {
+		ts.mp.processLock.Lock()
+		defer ts.mp.processLock.Unlock()
+		return (*ts.mp.backendIO.Load()).LastKeepAlive().Idle
+	}
 	runners := []runner{
 		{
 			client: ts.mc.authenticate,
 			proxy: func(clientIO, backendIO pnet.PacketIO) error {
 				require.NoError(t, ts.firstHandshake4Proxy(clientIO, backendIO))
-				require.Equal(t, time.Minute, (*ts.mp.backendIO.Load()).LastKeepAlive().Idle)
+				require.Equal(t, time.Minute, keepAliveIdle())
 				return nil
 			},
 			backend: ts.handshake4Backend,
 		},
 		{
 			proxy: func(clientIO, backendIO pnet.PacketIO) error {
-				require.Equal(t, time.Minute, (*ts.mp.backendIO.Load()).LastKeepAlive().Idle)
+				require.Equal(t, time.Minute, keepAliveIdle())
 				ts.mp.curBackend.(*router.StaticBackend).SetHealthy(false)
 				require.Eventually(t, func() bool {
-					return (*ts.mp.backendIO.Load()).LastKeepAlive().Idle == time.Second
+					return keepAliveIdle() == time.Second
 				}, 3*time.Second, 10*time.Millisecond)
 				ts.mp.curBackend.(*router.StaticBackend).SetHealthy(true)
 				require.Eventually(t, func() bool {
-					return (*ts.mp.backendIO.Load()).LastKeepAlive().Idle == time.Minute
+					return keepAliveIdle() == time.Minute
 				}, 3*time.Second, 10*time.Millisecond)
 				return nil
 			},
