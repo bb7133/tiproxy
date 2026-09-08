@@ -80,7 +80,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/proxy-io/` - Client/backend transport ownership, including future TLS, compression, and PROXY protocol support.
 - `rust/crates/session-core/` - Protocol-independent session lifecycle and migration state.
 - `rust/crates/control-router/` - Staged namespace-scoped routing selection, exact config/topology/health capture, and reservation accounting. Production dataplane/binary wiring remains prohibited until full routing parity is complete.
-- `rust/crates/control-routing/` - Protocol-independent route values and pure group matching/port-conflict primitives; it owns no reservation or production selector yet and carries no wire payloads.
+- `rust/crates/control-routing/` - Protocol-independent route values, pure group matching/port-conflict primitives, and Go-compatible time arithmetic; it owns no reservation or production selector yet and carries no wire payloads.
 - `rust/crates/legacy-router-shadow/` - Temporary read-only routing observation codecs and optional bounded UDS consumer inside the existing Rust process. Domain mirror state stays in `control-router::shadow`; it has no production routing authority.
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
 - `rust/crates/control-topology/src/metric_collector/` - Opt-in in-process metrics rounds, scoped owner tasks, qualified overlay and bounded real owner HTTP service; production composition remains off until the control-plane integration slice.
