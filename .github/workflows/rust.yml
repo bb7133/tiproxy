@@ -398,6 +398,8 @@ jobs:
           key: rust-routing-recorder-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
       - name: Compare actual capture, bounded loss and compiling mutations
         run: make controlplane-cproute-recorder-evidence
+      - name: Verify mixed capture leases and actual metrics read provenance
+        run: make controlplane-cproute-read-foundation-evidence
 
   supply-chain:
     name: Audit dependencies and policy

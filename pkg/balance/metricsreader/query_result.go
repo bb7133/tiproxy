@@ -56,6 +56,7 @@ type QueryRule struct {
 type QueryResult struct {
 	Value      model.Value
 	UpdateTime time.Time
+	Provenance QueryProvenance
 }
 
 func (qr QueryResult) Empty() bool {

@@ -74,7 +74,7 @@ func TestCPMetricsSourceObservation(t *testing.T) {
 	observations := make([]map[string]any, 0)
 	read := func(kind string, value *int, success bool) {
 		reader.readMetrics(context.Background())
-		source := map[int32]string{sourceNone: "none", sourceProm: "prometheus", sourceBackend: "backend"}[reader.source.Load()]
+		source := map[int32]string{sourceNone: "none", sourceProm: "prometheus", sourceBackend: "backend"}[reader.sourceKind()]
 		var result any
 		qr := reader.GetQueryResult("memory")
 		if !qr.Empty() {
