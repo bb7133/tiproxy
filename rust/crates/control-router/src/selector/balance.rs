@@ -27,7 +27,27 @@ impl Router {
         self.sources.validate(candidate)?;
         state.refresh(candidate)?;
         let group = state.factor_group(candidate, client, listener_port)?;
-        let now = now_nanos()?;
+        self.with_balance_group(
+            &mut state,
+            candidate,
+            group,
+            now_nanos()?,
+            |_, prepared, _| prepared,
+        )
+    }
+
+    pub(super) fn with_balance_group<T>(
+        &self,
+        state: &mut super::State,
+        candidate: &Candidate,
+        group: u64,
+        now: i64,
+        mut use_prepared: impl FnMut(
+            &mut super::State,
+            Result<Option<crate::PreparedBalance>, RouteError>,
+            Option<&crate::BalancePair>,
+        ) -> Result<T, RouteError>,
+    ) -> Result<T, RouteError> {
         let mut select = |metrics: Option<&control_topology::MetricSnapshot>,
                           queries: &crate::factors::Queries| {
             self.sources.validate(candidate)?;
@@ -59,6 +79,7 @@ impl Router {
             let report = factors
                 .core
                 .evaluate(&inputs, &candidate.policy, queries, now);
+            let diagnostic_pair = report.balance.clone();
             let prepared = (|| {
                 if let Some(pair) = report.balance {
                     let source = &state.backends[&pair.from];
@@ -84,7 +105,7 @@ impl Router {
             // Go updates factor history before Group refuses a cross-keyspace
             // pair. Refusal must not reset its first Status migration rate.
             state.factors.insert(group, factors);
-            prepared
+            use_prepared(state, prepared, diagnostic_pair.as_ref())
         };
         let metrics = match &candidate.metrics {
             crate::authority::MetricInputs::StaticEmpty => None,

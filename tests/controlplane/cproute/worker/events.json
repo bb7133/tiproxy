@@ -1,0 +1,647 @@
+[
+  {
+    "name": "rate-2.5",
+    "rate": 2.5,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 399999999
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 400000000
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "rate-49.999999",
+    "rate": 49.999999,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 19999999
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 20000000
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "rate-50",
+    "rate": 50,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 19999999
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 20000000
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "rate-50.00001",
+    "rate": 50.00001,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 19999995
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 19999996
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "rate-100",
+    "rate": 100,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 9999999
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 10000000
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "rate-100.00001",
+    "rate": 100.00001,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 9999998
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 9999999
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "rate-120",
+    "rate": 120,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 8333332
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 8333333
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "rate-200",
+    "rate": 200,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 4999999
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 5000000
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "rate-200.00001",
+    "rate": 200.00001,
+    "capacity": 12,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "repeat",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 4999998
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 4999999
+      },
+      {
+        "label": "later",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "queue-cooldown",
+    "rate": 120,
+    "capacity": 1,
+    "events": [
+      {
+        "label": "first",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "drain",
+        "op": "drain",
+        "at": 0
+      },
+      {
+        "label": "no-reissue",
+        "op": "tick",
+        "at": 1
+      },
+      {
+        "label": "failed",
+        "op": "failure",
+        "at": 0,
+        "id": 1
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 2999999999
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 3000000000
+      },
+      {
+        "label": "drain2",
+        "op": "drain",
+        "at": 3000000001
+      },
+      {
+        "label": "skip-failed-and-pending",
+        "op": "tick",
+        "at": 3000000002
+      }
+    ]
+  },
+  {
+    "name": "zero-capacity",
+    "rate": 120,
+    "capacity": 0,
+    "events": [
+      {
+        "label": "rejected",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "cooling",
+        "op": "tick",
+        "at": 2999999999
+      },
+      {
+        "label": "retry",
+        "op": "tick",
+        "at": 3000000000
+      }
+    ]
+  },
+  {
+    "name": "success-first",
+    "rate": 50,
+    "capacity": 12,
+    "timeout": 1,
+    "events": [
+      {
+        "label": "redirect",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "fresh-close",
+        "op": "tick",
+        "at": 999999999,
+        "close_at": 1000000000,
+        "enabled": false
+      },
+      {
+        "label": "drain",
+        "op": "drain",
+        "at": 1000000000
+      },
+      {
+        "label": "success",
+        "op": "success",
+        "at": 1000000001,
+        "id": 1
+      },
+      {
+        "label": "observed",
+        "op": "close",
+        "at": 1000000002,
+        "id": 1
+      },
+      {
+        "label": "duplicate-close",
+        "op": "close",
+        "at": 1000000003,
+        "id": 1
+      },
+      {
+        "label": "no-reissue",
+        "op": "tick",
+        "at": 4000000000
+      }
+    ]
+  },
+  {
+    "name": "close-first",
+    "rate": 50,
+    "capacity": 12,
+    "timeout": 1,
+    "events": [
+      {
+        "label": "redirect",
+        "op": "tick",
+        "at": 0
+      },
+      {
+        "label": "fresh-close",
+        "op": "tick",
+        "at": 999999999,
+        "close_at": 1000000000,
+        "enabled": false
+      },
+      {
+        "label": "drain",
+        "op": "drain",
+        "at": 1000000000
+      },
+      {
+        "label": "observed",
+        "op": "close",
+        "at": 1000000001,
+        "id": 1
+      },
+      {
+        "label": "late",
+        "op": "success",
+        "at": 1000000002,
+        "id": 1
+      },
+      {
+        "label": "duplicate-close",
+        "op": "close",
+        "at": 1000000003,
+        "id": 1
+      },
+      {
+        "label": "no-reissue",
+        "op": "tick",
+        "at": 4000000000
+      }
+    ]
+  },
+  {
+    "name": "close-rejection-retry",
+    "rate": 50,
+    "capacity": 1,
+    "timeout": 0,
+    "events": [
+      {
+        "label": "disabled",
+        "op": "tick",
+        "at": 0,
+        "enabled": false
+      },
+      {
+        "label": "full",
+        "op": "tick",
+        "at": 1,
+        "enabled": false
+      },
+      {
+        "label": "drain",
+        "op": "drain",
+        "at": 2
+      },
+      {
+        "label": "retry",
+        "op": "tick",
+        "at": 3,
+        "enabled": false
+      },
+      {
+        "label": "drain2",
+        "op": "drain",
+        "at": 4
+      },
+      {
+        "label": "observed",
+        "op": "close",
+        "at": 5,
+        "id": 1
+      },
+      {
+        "label": "retry2",
+        "op": "tick",
+        "at": 6,
+        "enabled": false
+      }
+    ]
+  },
+  {
+    "name": "failover-aba-all-failed",
+    "rate": 50,
+    "capacity": 12,
+    "timeout": 1,
+    "events": [
+      {
+        "label": "off",
+        "op": "config",
+        "at": 500000000,
+        "fail": []
+      },
+      {
+        "label": "on",
+        "op": "config",
+        "at": 800000000,
+        "fail": [
+          "a"
+        ]
+      },
+      {
+        "label": "not-original-deadline",
+        "op": "tick",
+        "at": 1000000000,
+        "enabled": false
+      },
+      {
+        "label": "all",
+        "op": "config",
+        "at": 1100000000,
+        "fail": [
+          "a",
+          "b"
+        ]
+      },
+      {
+        "label": "suppressed",
+        "op": "tick",
+        "at": 2000000000,
+        "enabled": false
+      },
+      {
+        "label": "restore",
+        "op": "config",
+        "at": 3000000000,
+        "fail": [
+          "a"
+        ]
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 3999999999,
+        "enabled": false
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 4000000000,
+        "enabled": false
+      }
+    ]
+  },
+  {
+    "name": "cross-tick",
+    "rate": 50,
+    "capacity": 12,
+    "cross": true,
+    "events": [
+      {
+        "label": "refused",
+        "op": "tick",
+        "at": 0,
+        "id": 1
+      },
+      {
+        "label": "repeated",
+        "op": "tick",
+        "at": 9999999999,
+        "id": 1
+      },
+      {
+        "label": "record-boundary",
+        "op": "tick",
+        "at": 10000000000,
+        "id": 1
+      }
+    ]
+  },
+  {
+    "name": "cross-backstop",
+    "rate": 50,
+    "capacity": 12,
+    "cross": true,
+    "events": [
+      {
+        "label": "refused",
+        "op": "backstop",
+        "at": 0,
+        "id": 1
+      },
+      {
+        "label": "repeated",
+        "op": "backstop",
+        "at": 9999999999,
+        "id": 1
+      },
+      {
+        "label": "record-boundary",
+        "op": "backstop",
+        "at": 10000000000,
+        "id": 1
+      }
+    ]
+  },
+  {
+    "name": "failover-retains-first-activation",
+    "rate": 50,
+    "capacity": 12,
+    "timeout": 1,
+    "events": [
+      {
+        "label": "repeat-config",
+        "op": "config",
+        "at": 400000000,
+        "fail": [
+          "a"
+        ]
+      },
+      {
+        "label": "before",
+        "op": "tick",
+        "at": 999999999,
+        "enabled": false
+      },
+      {
+        "label": "equal",
+        "op": "tick",
+        "at": 1000000000,
+        "enabled": false
+      }
+    ]
+  }
+]

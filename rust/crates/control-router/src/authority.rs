@@ -43,6 +43,8 @@ pub enum Unsupported {
 pub enum RouteError {
     /// The current accepted configuration cannot be projected.
     InvalidConfig,
+    /// A simulation already has an owned worker running.
+    WorkerRunning,
     /// The named namespace does not exist in the current source.
     NamespaceMissing,
     /// This namespace router has been replaced and cannot admit new work.
@@ -71,6 +73,8 @@ pub enum RouteError {
     RedirectPending,
     /// A failed or rejected redirect is inside Go's three-second cooldown.
     CoolingDown,
+    /// This session already has an admitted close awaiting observation.
+    ForceClosing,
     /// Redirect source and target are the same retained owner.
     SameBackend,
     /// Migration may never cross keyspace scopes, including empty/nonempty.
@@ -89,6 +93,7 @@ impl From<LedgerError> for RouteError {
             LedgerError::NotActive => Self::NotActive,
             LedgerError::RedirectPending => Self::RedirectPending,
             LedgerError::CoolingDown => Self::CoolingDown,
+            LedgerError::ForceClosing => Self::ForceClosing,
             LedgerError::SameAccount => Self::SameBackend,
             LedgerError::CrossKeyspace => Self::CrossKeyspace,
         }
@@ -160,6 +165,20 @@ impl Sources {
             namespace,
             namespace_origin: current,
         })
+    }
+
+    pub(crate) fn updates(
+        &self,
+    ) -> (
+        watch::Receiver<Arc<ConfigNamespaceSnapshot>>,
+        BackendSourceHandle,
+        watch::Receiver<LifecycleSnapshot>,
+    ) {
+        (
+            self.source.subscribe(),
+            self.backend.clone(),
+            self.lifecycle.clone(),
+        )
     }
 
     pub(crate) fn admit(&self) -> Result<Arc<ConfigNamespaceSnapshot>, RouteError> {

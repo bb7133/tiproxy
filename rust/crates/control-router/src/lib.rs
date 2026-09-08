@@ -19,15 +19,18 @@ mod factors;
 mod ledger;
 mod policy;
 mod retry;
+mod scheduler;
 mod selector;
 mod simulation;
 
 pub use authority::{Candidate, RouteError, Unsupported};
 pub use factors::{BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore};
-pub use ledger::{Accounting, Redirect, Reservation, Session, Settlement};
+pub use ledger::{Accounting, ForceClose, Redirect, Reservation, Session, Settlement};
 pub use retry::Selector;
 pub use selector::Router;
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};
 
 #[cfg(test)]
 mod tests;
+
+pub use scheduler::{KeyspaceRefusal, MigrationCommand, MigrationProgress};

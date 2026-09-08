@@ -581,3 +581,96 @@ async fn stop_balance_live(mut live: Live) -> TestResult {
         .await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires owned CP003_CONNECTION_FILE; mandatory worker evidence"]
+async fn worker_real_metrics_retirement_at_issuance() -> TestResult {
+    let live = start_with_health(true, 3_600_000_000_000, "[labels]\nzone=\"z0\"").await?;
+    let sim = Arc::new(must(crate::MigrationSimulation::new(
+        Arc::new(live.store.clone()),
+        &live.topology,
+        &live.running.runtime.handle().module_context(),
+        "default",
+        100,
+        1,
+        Some(live.overlay.clone()),
+    )));
+    let c = candidate(sim.router(), "WORKER_LOAD", |c| {
+        c.health.get(&live.ids[0]).healthy && c.health.get(&live.ids[1]).healthy
+    })
+    .await?;
+    for index in 0..2 {
+        for _ in 0..10 {
+            let (_, r) = reserve(sim.router(), &c, &[&live.ids[1 - index]], "WORKER_LOAD")?;
+            assert_eq!(sim.router().finish(&r, true), Settlement::Applied);
+        }
+    }
+    patch(&live, "resource")?;
+    let resource = candidate(sim.router(), "WORKER_RESOURCE", has_cpu).await?;
+    let (stop_tx, stop) = watch::channel(false);
+    let now = std::time::Instant::now();
+    let wall = crate::selector::now_nanos().map_err(|e| format!("clock {e:?}"))?;
+    must(sim.router().refresh_failover(&resource, now));
+    must(sim.round_at(&resource, true, &stop, now, now, wall));
+    let Some(crate::MigrationCommand::Redirect(first)) = sim.take_command() else {
+        return Err("WORKER_REAL_RESOURCE_ADMISSION".into());
+    };
+    assert_eq!(
+        first.from().backend_id,
+        live.ids[0],
+        "WORKER_REAL_RESOURCE_SOURCE"
+    );
+    assert_eq!(
+        first.to().backend_id,
+        live.ids[1],
+        "WORKER_REAL_RESOURCE_TARGET"
+    );
+    assert_eq!(sim.finish(&first, false), Settlement::Applied);
+    let (read, release) = sim.router().observe_next_metric_use_for_test();
+    let worker = Arc::clone(&sim);
+    let captured = resource.clone();
+    let later = now + Duration::from_secs(5);
+    let issuing = std::thread::spawn(move || {
+        worker.round_at(&captured, true, &stop, later, later, wall + 5_000_000_000)
+    });
+    assert_eq!(
+        read.recv_timeout(Duration::from_secs(5))?,
+        6,
+        "WORKER_REAL_NONEMPTY_READ"
+    );
+    live.running.collector.abort();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metric(&resource).is_some_and(MetricSnapshot::still_current) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    release.send(())?;
+    must(must(issuing.join()));
+    let Some(crate::MigrationCommand::Redirect(fallback)) = sim.take_command() else {
+        return Err("WORKER_REAL_FALLBACK_ADMISSION".into());
+    };
+    assert_eq!(
+        fallback.from().backend_id,
+        live.ids[1],
+        "WORKER_REAL_RETIRED_SOURCE"
+    );
+    assert_eq!(
+        fallback.to().backend_id,
+        live.ids[0],
+        "WORKER_REAL_RETIRED_TARGET"
+    );
+    patch(&live, "connection")?;
+    assert!(
+        matches!(
+            sim.round_at(&resource, true, &stop_tx.subscribe(), later, later, wall),
+            Err(RouteError::StaleCandidate)
+        ),
+        "WORKER_REAL_RETIRED_CONFIG"
+    );
+    assert!(sim.take_command().is_none());
+    assert_eq!(sim.finish(&fallback, true), Settlement::Applied);
+    stop_balance_live(live).await?;
+    println!("CP-ROUTE-WORKER real producer issuance and retirement passed");
+    Ok(())
+}

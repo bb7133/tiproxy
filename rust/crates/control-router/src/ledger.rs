@@ -160,12 +160,29 @@ impl Redirect {
     }
 }
 
+/// Exact authority for one admitted local force-close. It remains valid if
+/// an accepted redirect settles before the physical close is observed.
+#[derive(Clone, Debug)]
+pub struct ForceClose {
+    session: Session,
+    sequence: u64,
+    assignment: RouteAssignment,
+}
+impl ForceClose {
+    /// Assignment at close admission; diagnostic, not a settlement lookup.
+    #[must_use]
+    pub const fn assignment(&self) -> &RouteAssignment {
+        &self.assignment
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Active {
     account: Arc<AccountIdentity>,
     assignment: RouteAssignment,
     redirect: Option<Redirect>,
     failed_at: Option<Instant>,
+    closing: Option<ForceClose>,
 }
 
 /// Whether a terminal event changed this ledger.
@@ -188,6 +205,7 @@ pub(crate) enum LedgerError {
     NotActive,
     RedirectPending,
     CoolingDown,
+    ForceClosing,
     SameAccount,
     CrossKeyspace,
 }
@@ -213,6 +231,7 @@ pub(crate) struct Ledger {
     next_reservation: u64,
     next_account: u64,
     next_redirect: u64,
+    next_close: u64,
     max_sessions: usize,
     sessions: BTreeMap<u64, Stage>,
     accounts: BTreeMap<u64, Account>,
@@ -226,6 +245,7 @@ impl Ledger {
             next_reservation: 1,
             next_account: 1,
             next_redirect: 1,
+            next_close: 1,
             max_sessions,
             sessions: BTreeMap::new(),
             accounts: BTreeMap::new(),
@@ -365,6 +385,7 @@ impl Ledger {
                 account: Arc::clone(&reservation.account),
                 assignment: reservation.assignment.clone(),
                 redirect: None,
+                closing: None,
                 failed_at: None,
             }))
         } else {
@@ -409,6 +430,9 @@ impl Ledger {
         let Stage::Active(active) = self.stage(session)? else {
             return Err(LedgerError::NotActive);
         };
+        if active.closing.is_some() {
+            return Err(LedgerError::ForceClosing);
+        }
         if active.redirect.is_some() {
             return Err(LedgerError::RedirectPending);
         }
@@ -541,6 +565,86 @@ impl Ledger {
             .unwrap_or_else(|| unreachable!("retained target"))
             .counts
             .incoming -= 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_observation(&self, start: Instant) -> (Vec<u64>, Vec<u64>, Vec<i64>) {
+        let mut pending = Vec::new();
+        let mut closing = Vec::new();
+        let mut failed = Vec::new();
+        for id in 1..=6 {
+            let mut failure = -1;
+            if let Some(Stage::Active(active)) = self.sessions.get(&id) {
+                if active.redirect.is_some() {
+                    pending.push(id);
+                } else if let Some(at) = active.failed_at {
+                    failure =
+                        i64::try_from(at.duration_since(start).as_nanos()).unwrap_or(i64::MAX);
+                }
+                if active.closing.is_some() {
+                    closing.push(id);
+                }
+            }
+            failed.push(failure);
+        }
+        (pending, closing, failed)
+    }
+
+    pub(crate) fn reject_keyspace(
+        &mut self,
+        session: &Session,
+        now: Instant,
+    ) -> Result<(), LedgerError> {
+        let Stage::Active(active) = self.stage(session)? else {
+            return Err(LedgerError::NotActive);
+        };
+        if active.closing.is_some() {
+            return Err(LedgerError::ForceClosing);
+        }
+        if active.redirect.is_some() {
+            return Err(LedgerError::RedirectPending);
+        }
+        let Some(Stage::Active(active)) = self.sessions.get_mut(&session.sequence) else {
+            unreachable!("checked active");
+        };
+        active.failed_at = Some(now);
+        Ok(())
+    }
+    pub(crate) fn prepare_close(&self, session: &Session) -> Result<ForceClose, LedgerError> {
+        let Stage::Active(active) = self.stage(session)? else {
+            return Err(LedgerError::NotActive);
+        };
+        if active.closing.is_some() {
+            return Err(LedgerError::ForceClosing);
+        }
+        self.next_close
+            .checked_add(1)
+            .ok_or(LedgerError::Exhausted)?;
+        Ok(ForceClose {
+            session: session.clone(),
+            sequence: self.next_close,
+            assignment: active.assignment.clone(),
+        })
+    }
+    pub(crate) fn admit_close(&mut self, close: ForceClose) {
+        self.next_close += 1;
+        let Some(Stage::Active(active)) = self.sessions.get_mut(&close.session.sequence) else {
+            unreachable!("prepared active close");
+        };
+        active.closing = Some(close);
+    }
+    pub(crate) fn observe_close(&mut self, close: &ForceClose) -> Settlement {
+        let Ok(Stage::Active(active)) = self.stage(&close.session) else {
+            return Settlement::Ignored;
+        };
+        if active
+            .closing
+            .as_ref()
+            .is_none_or(|pending| pending.sequence != close.sequence)
+        {
+            return Settlement::Ignored;
+        }
+        self.close(&close.session)
     }
 
     pub(crate) fn close(&mut self, session: &Session) -> Settlement {

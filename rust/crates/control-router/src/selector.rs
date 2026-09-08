@@ -31,6 +31,7 @@ use crate::ledger::{
 use crate::policy::{RoutingIdentity, label_matches};
 
 mod balance;
+mod scheduler;
 
 struct Backend {
     source: MergedBackend,
@@ -38,6 +39,7 @@ struct Backend {
     account: Arc<AccountIdentity>,
     healthy: bool,
     group: Option<u64>,
+    failover_since: Option<Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -50,6 +52,7 @@ struct GroupFactors {
 struct State {
     ledger: Ledger,
     factors: BTreeMap<u64, GroupFactors>,
+    schedules: BTreeMap<u64, crate::scheduler::GroupSchedule>,
     backends: BTreeMap<Arc<str>, Backend>,
     groups: BTreeMap<u64, GroupMatcher>,
     ports: PortRoutes<u64>,
@@ -114,6 +117,7 @@ impl Router {
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
                 factors: BTreeMap::new(),
+                schedules: BTreeMap::new(),
                 backends: BTreeMap::new(),
                 groups: BTreeMap::new(),
                 ports: PortRoutes::default(),
@@ -440,34 +444,13 @@ impl Router {
     pub(crate) fn offer_redirect(
         &self,
         prepared: &crate::PreparedRedirect,
-        sender: &std::sync::mpsc::SyncSender<Redirect>,
+        sender: &crate::scheduler::CommandQueue,
         now: Instant,
     ) -> Result<bool, RouteError> {
         let mut state = self.lock();
-        self.sources.validate(&prepared.candidate)?;
-        if !Arc::ptr_eq(
-            state.ledger.active_owner(&prepared.session)?,
-            &prepared.source,
-        ) {
-            return Err(RouteError::StaleCandidate);
-        }
-        state.refresh(&prepared.candidate)?;
-        let target =
-            state.redirect_target(&prepared.source, &prepared.candidate, &prepared.target_id)?;
-        if !Arc::ptr_eq(&target.account, &prepared.target) {
-            return Err(RouteError::StaleCandidate);
-        }
-        let assignment = assignment(
-            &target.source,
-            prepared.candidate.health.get(&prepared.target_id).local,
-        );
-        let redirect =
-            state
-                .ledger
-                .prepare_redirect(&prepared.session, &prepared.target, assignment, now)?;
-        self.sources.validate(&prepared.candidate)?;
-        // No callback, blocking send or fallible state transition after this
-        // offer. An immediate terminal has to acquire this same router lock.
+        let Some(redirect) = self.prepare_offer_locked(&mut state, prepared, now)? else {
+            return Ok(false);
+        };
         let accepted = sender.try_send(redirect.clone()).is_ok();
         #[cfg(test)]
         if let Some((signal, wait)) = self
@@ -483,6 +466,85 @@ impl Router {
         }
         state.ledger.admit_redirect(redirect, accepted, now);
         Ok(accepted)
+    }
+
+    fn offer_redirect_locked(
+        &self,
+        state: &mut State,
+        prepared: &crate::PreparedRedirect,
+        sender: &crate::scheduler::CommandQueue,
+        now: Instant,
+    ) -> Result<bool, RouteError> {
+        let Some(redirect) = self.prepare_offer_locked(state, prepared, now)? else {
+            return Ok(false);
+        };
+        let accepted = sender.try_send(redirect.clone()).is_ok();
+        #[cfg(test)]
+        if let Some((signal, wait)) = self
+            .next_redirect_offer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = signal.send(());
+            // The test bounds its waits and owns release. Do not let elapsed
+            // time open this barrier; dropping release also unblocks cleanup.
+            let _ = wait.recv();
+        }
+        state.ledger.admit_redirect(redirect, accepted, now);
+        Ok(accepted)
+    }
+
+    fn prepare_offer_locked(
+        &self,
+        state: &mut State,
+        prepared: &crate::PreparedRedirect,
+        now: Instant,
+    ) -> Result<Option<Redirect>, RouteError> {
+        self.sources.validate(&prepared.candidate)?;
+        if !Arc::ptr_eq(
+            state.ledger.active_owner(&prepared.session)?,
+            &prepared.source,
+        ) {
+            return Err(RouteError::StaleCandidate);
+        }
+        state.refresh(&prepared.candidate)?;
+        let target =
+            match state.redirect_target(&prepared.source, &prepared.candidate, &prepared.target_id)
+            {
+                Ok(target) => target,
+                Err(RouteError::CrossKeyspace) => {
+                    self.sources.validate(&prepared.candidate)?;
+                    state.ledger.reject_keyspace(&prepared.session, now)?;
+                    state.record_keyspace_refusal(&prepared.source, &prepared.target_id, None, now);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        if !Arc::ptr_eq(&target.account, &prepared.target) {
+            return Err(RouteError::StaleCandidate);
+        }
+        let assignment = assignment(
+            &target.source,
+            prepared.candidate.health.get(&prepared.target_id).local,
+        );
+        let redirect = match state.ledger.prepare_redirect(
+            &prepared.session,
+            &prepared.target,
+            assignment,
+            now,
+        ) {
+            Ok(redirect) => redirect,
+            Err(crate::ledger::LedgerError::CrossKeyspace) => {
+                self.sources.validate(&prepared.candidate)?;
+                state.ledger.reject_keyspace(&prepared.session, now)?;
+                state.record_keyspace_refusal(&prepared.source, &prepared.target_id, None, now);
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.sources.validate(&prepared.candidate)?;
+        Ok(Some(redirect))
     }
 
     pub(crate) fn finish_redirect(
@@ -518,7 +580,7 @@ impl Router {
     }
 }
 
-fn now_nanos() -> Result<i64, RouteError> {
+pub(crate) fn now_nanos() -> Result<i64, RouteError> {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -795,6 +857,7 @@ impl State {
                         account,
                         healthy,
                         group: None,
+                        failover_since: None,
                     },
                 );
             }
@@ -810,6 +873,7 @@ impl State {
             .collect();
         self.groups.retain(|id, _| occupied.contains(id));
         self.factors.retain(|id, _| occupied.contains(id));
+        self.schedules.retain(|id, _| occupied.contains(id));
         let rule = match_type(candidate.policy.routing_rule);
         for backend in self
             .backends
