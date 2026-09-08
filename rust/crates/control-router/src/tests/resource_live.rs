@@ -111,6 +111,22 @@ async fn observe_composed() -> TestResult {
             sessions.push(session);
         }
     }
+    // Make the wrong Connection path strictly prefer A, independently of the
+    // ephemeral port order or ticket. Resource must still prefer healthy B.
+    let mut strict_load = Vec::new();
+    for _ in 0..4 {
+        let session = must(router.open());
+        let pending =
+            must(router.reserve(&session, &ready, ClientInfo::default(), "", &[&live.ids[0]]));
+        assert_eq!(pending.assignment().backend_id, live.ids[1]);
+        assert_eq!(router.finish(&pending, true), Settlement::Applied);
+        strict_load.push(session);
+    }
+    assert_eq!(
+        pick(&router, &ready),
+        go_choice(&live, "connection_strict")?,
+        "COMPOSE_CONNECTION_STRICT_LOAD"
+    );
     live.store.apply_toml(
         b"[labels]\nzone=\"z0\"\n[balance]\npolicy=\"resource\"",
         None,
@@ -123,9 +139,13 @@ async fn observe_composed() -> TestResult {
     .await?;
     assert_eq!(
         pick(&router, &first),
-        go_choice(&live, "resource")?,
+        go_choice(&live, "resource_strict")?,
         "COMPOSE_REAL_RESOURCE_PREFERS_HEALTH"
     );
+    for session in strict_load {
+        assert_eq!(router.close(&session), Settlement::Applied);
+    }
+    assert_eq!(pick(&router, &first), go_choice(&live, "resource")?);
     assert_eq!(
         router
             .accounting(&live.ids[0])
