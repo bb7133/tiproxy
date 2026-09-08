@@ -88,7 +88,7 @@ pub struct FactorScore {
     pub parts: Vec<(Factor, u64)>,
     /// The conjunction of the factors' `CanBeRouted` results.
     pub routeable: bool,
-    /// Advice to the first row, used by prefer-idle before routing is enabled.
+    /// Advice to the first row, used by prefer-idle selection.
     pub advice_to_best: Vec<FactorAdvice>,
 }
 
@@ -101,7 +101,7 @@ pub struct FactorReport {
     pub preferred: Vec<Arc<str>>,
 }
 impl FactorReport {
-    /// Applies Go's ticket weights to this diagnostic report only.
+    /// Applies Go's ticket weights. The result is data, without route authority.
     #[must_use]
     pub fn choice(&self, policy: RoutingSelectionPolicy, ticket: u128) -> Option<&str> {
         let choices: Vec<&str> = if policy == RoutingSelectionPolicy::Random {

@@ -202,14 +202,35 @@ pub struct ConfigNamespaceSnapshot {
     effective: Arc<EffectiveConfig>,
     namespaces: Arc<[NamespaceConfig]>,
     namespace_identities: BTreeMap<String, Arc<()>>,
+    resource_incarnation: ResourceIncarnation,
     prepared: PreparedArtifact,
+}
+
+/// Continuous lifetime of Resource/Location factors and their six queries.
+/// A cache key only; consumers must still validate their current C/R/H inputs.
+#[derive(Clone, Debug)]
+pub struct ResourceIncarnation {
+    identity: Arc<()>,
+    enabled: bool,
+}
+impl ResourceIncarnation {
+    /// Resource and Location share the same factor/query lifetime.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+    /// Object identity survives unrelated config and Resource/Location switches,
+    /// but never a Connection transition, even if watch delivery coalesces it.
+    #[must_use]
+    pub fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
 }
 
 impl PartialEq for ConfigNamespaceSnapshot {
     fn eq(&self, other: &Self) -> bool {
-        // The prepared artifact is intentionally excluded: it is an opaque,
-        // per-generation handle, not part of the config identity, and the
-        // no-op-suppression comparison must not depend on it.
+        // Prepared artifacts and runtime incarnation identities are opaque
+        // handles, not config values; no-op suppression must not depend on them.
         self.generation == other.generation
             && self.source_revision == other.source_revision
             && self.config_checksum == other.config_checksum
@@ -220,6 +241,12 @@ impl PartialEq for ConfigNamespaceSnapshot {
 }
 
 impl ConfigNamespaceSnapshot {
+    /// Resource-factor incarnation committed atomically with this config.
+    #[must_use]
+    pub fn resource_incarnation(&self) -> ResourceIncarnation {
+        self.resource_incarnation.clone()
+    }
+
     /// Returns the contiguous accepted generation.
     #[must_use]
     pub const fn generation(&self) -> u64 {
@@ -285,7 +312,10 @@ impl ConfigNamespaceSnapshot {
             .map(|identity| NamespaceIncarnation(Arc::clone(identity)))
     }
 
-    fn retain_namespace_identities(&mut self, previous: &Self) {
+    fn retain_identities(&mut self, previous: &Self) {
+        if self.resource_incarnation.enabled == previous.resource_incarnation.enabled {
+            self.resource_incarnation = previous.resource_incarnation.clone();
+        }
         for namespace in self.namespaces.iter() {
             if previous
                 .namespaces
@@ -635,7 +665,7 @@ impl ConfigNamespaceStore {
             state.current.source_revision,
             prepared,
         )?;
-        candidate.retain_namespace_identities(&state.current);
+        candidate.retain_identities(&state.current);
         let candidate = Arc::new(candidate);
         state.current = Arc::clone(&candidate);
         self.updates.send_replace(Arc::clone(&candidate));
@@ -1055,7 +1085,7 @@ fn publish_candidate(
     {
         return Ok(None);
     }
-    candidate.retain_namespace_identities(&state.current);
+    candidate.retain_identities(&state.current);
     let candidate = Arc::new(candidate);
     state.current = Arc::clone(&candidate);
     updates.send_replace(Arc::clone(&candidate));
@@ -1084,7 +1114,12 @@ fn build_snapshot(
             kind: "namespace_checksum",
             source,
         })?;
+    let resource_incarnation = ResourceIncarnation {
+        identity: Arc::new(()),
+        enabled: effective.routing()?.balance_policy != crate::RoutingBalancePolicy::Connection,
+    };
     Ok(ConfigNamespaceSnapshot {
+        resource_incarnation,
         generation,
         source_revision,
         config_checksum: crc32fast::hash(config_data.as_bytes()),

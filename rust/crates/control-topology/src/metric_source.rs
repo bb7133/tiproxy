@@ -368,6 +368,10 @@ pub struct MetricSourceHandle {
 }
 
 impl MetricSourceHandle {
+    pub(crate) fn resource_incarnation(&self) -> control_config::ResourceIncarnation {
+        self.source.current().resource_incarnation()
+    }
+
     /// Captures the exact current material/source/mode incarnation, if live.
     #[must_use]
     pub fn capture(&self) -> Option<MetricCapture> {

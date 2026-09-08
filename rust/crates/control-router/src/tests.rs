@@ -51,6 +51,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 mod factors_live;
 mod locality;
 mod registration;
+mod resource;
 mod sources;
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {

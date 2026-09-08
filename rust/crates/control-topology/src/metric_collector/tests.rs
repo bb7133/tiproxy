@@ -24,6 +24,7 @@ use control_plane::{OwnerLease, OwnerScope, OwnershipRegistry};
 
 pub(super) type TestError = Box<dyn std::error::Error>;
 pub(super) struct Fixture {
+    pub config: ConfigNamespaceStore,
     _registry: OwnershipRegistry,
     pub lease: OwnerLease,
     pub publication: MetricPublication,
@@ -89,6 +90,7 @@ impl Fixture {
             mode.subscribe().borrow().clone(),
         );
         Ok(Self {
+            config,
             _registry: registry,
             lease,
             publication,
@@ -117,6 +119,7 @@ pub(super) fn result() -> ClusterResult {
     let mut reader = ReaderState::default();
     reader.complete_backend(BTreeMap::new(), true);
     ClusterResult {
+        queries: None,
         lineage: Arc::new(()),
         gate: GenerationGate::new(),
         reader,

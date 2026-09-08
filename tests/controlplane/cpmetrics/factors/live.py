@@ -30,7 +30,7 @@ def compile_binary(environment):
     return binaries[0]
 
 
-def observe(binary, environment):
+def observe(binary, environment, selection="factor_real_"):
     with tempfile.TemporaryDirectory(prefix="cpmetric-factor-live-") as directory:
         temp = Path(directory)
         environment = dict(environment, CP003_CONNECTION_FILE=str(temp / "connection.json"))
@@ -41,7 +41,7 @@ def observe(binary, environment):
                     "-connection-file", environment["CP003_CONNECTION_FILE"], "-data-dir", str(temp / "etcd")],
                     env=environment, stdout=log, stderr=subprocess.STDOUT)
                 ready(temp / "connection.json", fixture)
-                result = subprocess.run([binary, "factor_real_", "--ignored", "--nocapture", "--test-threads=1"],
+                result = subprocess.run([binary, selection, "--ignored", "--nocapture", "--test-threads=1"],
                     env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
                 if result.returncode:
                     log.seek(0)

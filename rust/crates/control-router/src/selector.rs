@@ -38,6 +38,7 @@ struct Backend {
 
 #[derive(Clone, Default)]
 struct GroupFactors {
+    incarnation: Option<control_config::ResourceIncarnation>,
     core: crate::factors::State,
     lineages: BTreeMap<String, control_topology::MetricCacheLineage>,
 }
@@ -52,18 +53,28 @@ struct State {
     observed: Option<(Arc<RoutingSnapshot>, Arc<HealthSnapshot>)>,
 }
 
+#[cfg(test)]
+type MetricUseBarrier = (
+    std::sync::mpsc::Sender<usize>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 /// One namespace router incarnation, with a single lock for selection/accounting.
 ///
 /// This staged API is intentionally not wired to the production dataplane.
-/// Resource/locality factors and static health composition
-/// must be completed before that wiring. Unsupported policy is a typed error.
+/// `new` retains the staged Connection-only API; `new_with_factors` explicitly
+/// composes Resource/Location inputs with the same reservation ledger.
 /// Replacing/removing this router's namespace rejects new work; already minted
 /// reservations can still settle their original accounting owner.
 pub struct Router {
+    factors_enabled: bool,
+    metrics: Option<control_topology::MetricOverlayHandle>,
     sources: Sources,
     state: Mutex<State>,
     #[cfg(test)]
     next_lock: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    next_metric_use: Mutex<Option<MetricUseBarrier>>,
 }
 
 impl Router {
@@ -82,9 +93,13 @@ impl Router {
         max_sessions: usize,
     ) -> Result<Self, RouteError> {
         Ok(Self {
+            factors_enabled: false,
+            metrics: None,
             sources: Sources::new(source, topology, context, namespace)?,
             #[cfg(test)]
             next_lock: Mutex::new(None),
+            #[cfg(test)]
+            next_metric_use: Mutex::new(None),
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
                 factors: BTreeMap::new(),
@@ -95,6 +110,26 @@ impl Router {
                 observed: None,
             }),
         })
+    }
+
+    /// Explicitly enables Resource/Location selection using the existing
+    /// ledger. Dynamic metrics are optional inputs from a routing-bound
+    /// collector; static empty inputs come from the actual backend source.
+    /// This constructor does not enable the production dataplane composition.
+    /// # Errors
+    /// Returns the same namespace/backend registration errors as `new`.
+    pub fn new_with_factors(
+        source: Arc<dyn ConfigNamespaceSource>,
+        topology: &TopologyModuleHandle,
+        context: &ModuleContext,
+        namespace: &str,
+        max_sessions: usize,
+        metrics: Option<control_topology::MetricOverlayHandle>,
+    ) -> Result<Self, RouteError> {
+        let mut router = Self::new(source, topology, context, namespace, max_sessions)?;
+        router.factors_enabled = true;
+        router.metrics = metrics;
+        Ok(router)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -127,6 +162,22 @@ impl Router {
         attempted
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_next_metric_use_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (signal, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        *self
+            .next_metric_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((signal, wait));
+        (observed, release)
+    }
+
     /// Admits a new session under the current namespace incarnation.
     ///
     /// # Errors
@@ -147,7 +198,11 @@ impl Router {
     /// Returns a typed unsupported policy, absent source, lifecycle or namespace
     /// error. Every candidate is checked again after acquiring the reserve lock.
     pub fn capture(&self) -> Result<Candidate, RouteError> {
-        self.sources.capture()
+        if self.factors_enabled {
+            self.sources.capture_composed(self.metrics.as_ref())
+        } else {
+            self.sources.capture()
+        }
     }
 
     /// Selects and reserves using a previously captured candidate.
@@ -174,7 +229,7 @@ impl Router {
         self.reserve_with_ticket(session, candidate, client, listener_port, excluded, ticket)
     }
 
-    fn reserve_with_ticket(
+    pub(crate) fn reserve_with_ticket(
         &self,
         session: &Session,
         candidate: &Candidate,
@@ -189,20 +244,10 @@ impl Router {
             return Ok(pending);
         }
         state.refresh(candidate)?;
-        let group = if candidate.policy.routing_rule == RoutingRule::ListenerPort {
-            state
-                .ports
-                .group_for(listener_port)
-                .map_err(|_| RouteError::PortConflict)?
-                .copied()
-        } else {
-            state
-                .groups
-                .iter()
-                .find(|(_, matcher)| matcher.matches(client))
-                .map(|(id, _)| *id)
+        let group = state.factor_group(candidate, client, listener_port)?;
+        if self.factors_enabled && candidate.config.resource_incarnation().enabled() {
+            return self.reserve_factors(&mut state, session, candidate, group, excluded, ticket);
         }
-        .ok_or(RouteError::NoBackend)?;
         let mut choices = state.routeable(group, &candidate.policy, excluded);
         // Go leaves exact ordering of ties unspecified. This owner chooses a
         // stable opaque-ID order; the score clamp and ticket weights are exact.
@@ -224,9 +269,75 @@ impl Router {
             .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_factors(
+        &self,
+        state: &mut State,
+        session: &Session,
+        candidate: &Candidate,
+        group: u64,
+        excluded: &[&str],
+        ticket: u128,
+    ) -> Result<Reservation, RouteError> {
+        let metrics = match &candidate.metrics {
+            crate::authority::MetricInputs::StaticEmpty => None,
+            crate::authority::MetricInputs::Dynamic(snapshot) => snapshot.as_deref(),
+        };
+        let now = now_nanos()?;
+        let mut select = |metrics: Option<&control_topology::MetricSnapshot>,
+                          queries: &crate::factors::Queries| {
+            self.sources.validate(candidate)?;
+            let inputs = state.resource_inputs(group, candidate, excluded);
+            let mut factors = state.prepare_factors(
+                group,
+                metrics,
+                &inputs,
+                &candidate.config.resource_incarnation(),
+            );
+            let report = factors
+                .core
+                .evaluate(&inputs, &candidate.policy, queries, now);
+            let id = report
+                .choice(candidate.policy.selection_policy, ticket)
+                .ok_or(RouteError::NoBackend)?;
+            let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
+            let identity = Arc::clone(&backend.account);
+            let assignment = assignment(&backend.source, candidate.health.get(id).local);
+            // Metrics qualify input data only. C/R/H and the ledger authorize
+            // the effect, under this same lock and (when present) metric fence.
+            self.sources.validate(candidate)?;
+            let reserved = state.ledger.reserve(session, &identity, assignment)?;
+            state.factors.insert(group, factors);
+            Ok(reserved)
+        };
+        // Keep the test barrier after reading data and before its final fence.
+        #[allow(clippy::collapsible_if)]
+        if let Some(metrics) =
+            metrics.filter(|metrics| Arc::ptr_eq(&candidate.routing, metrics.source().routing()))
+            && let Ok(queries) = read_queries(metrics)
+        {
+            #[cfg(test)]
+            if let Some((signal, wait)) = self
+                .next_metric_use
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                let _ = signal.send(queries.len());
+                let _ = wait.recv();
+            }
+            if let Some(result) = metrics.with_current(|| select(Some(metrics), &queries)) {
+                return result;
+            }
+        }
+        // A material change or a delayed collector must never create an
+        // availability window. Discard stale values AND their cache lineage.
+        select(None, &crate::factors::Queries::new())
+    }
+
     /// Evaluates staged Resource/Location factors using this router's actual
     /// ledger counts and a producer-issued metric snapshot. Returns diagnostic
-    /// data only; capture/reserve still reject these policies until composition.
+    /// data only; this method never reserves connections.
     ///
     /// # Errors
     /// Rejects mismatched/stale C/R/H/metric authority, missing groups, and
@@ -265,7 +376,12 @@ impl Router {
                 state.refresh(&candidate)?;
                 let group = state.factor_group(&candidate, client, listener_port)?;
                 let inputs = state.factor_inputs(group, &candidate);
-                let mut factors = state.prepare_factors(group, metrics, &inputs);
+                let mut factors = state.prepare_factors(
+                    group,
+                    Some(metrics),
+                    &inputs,
+                    &candidate.config.resource_incarnation(),
+                );
                 let report = factors
                     .core
                     .evaluate(&inputs, &candidate.policy, &queries, now);
@@ -298,6 +414,31 @@ impl Router {
             .get(backend_id)
             .and_then(|backend| state.ledger.counts(&backend.account))
     }
+}
+
+fn now_nanos() -> Result<i64, RouteError> {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RouteError::ControlUnavailable)?
+            .as_nanos(),
+    )
+    .map_err(|_| RouteError::ControlUnavailable)
+}
+
+fn read_queries(
+    metrics: &control_topology::MetricSnapshot,
+) -> Result<crate::factors::Queries, RouteError> {
+    let mut queries = crate::factors::Queries::new();
+    for spec in control_topology::metrics::query_catalog() {
+        if let Some(query) = metrics
+            .query_result(spec.id)
+            .map_err(|_| RouteError::ControlUnavailable)?
+        {
+            queries.insert(spec.id, query);
+        }
+    }
+    Ok(queries)
 }
 
 fn match_type(rule: RoutingRule) -> MatchType {
@@ -398,8 +539,9 @@ impl State {
     fn prepare_factors(
         &self,
         group: u64,
-        metrics: &control_topology::MetricSnapshot,
+        metrics: Option<&control_topology::MetricSnapshot>,
         inputs: &[crate::factors::Input],
+        incarnation: &control_config::ResourceIncarnation,
     ) -> GroupFactors {
         let owners = self
             .backends
@@ -407,6 +549,15 @@ impl State {
             .map(|(id, backend)| (Arc::clone(id), Arc::clone(&backend.account)))
             .collect();
         let mut factors = self.factors.get(&group).cloned().unwrap_or_default();
+        if factors
+            .incarnation
+            .as_ref()
+            .is_none_or(|old| !old.same_as(incarnation))
+        {
+            factors.core.clear_resources();
+            factors.lineages.clear();
+        }
+        factors.incarnation = Some(incarnation.clone());
         factors.core.retain_owners(&owners);
         let clusters: BTreeSet<String> = inputs
             .iter()
@@ -414,7 +565,7 @@ impl State {
             .chain(factors.lineages.keys().cloned())
             .collect();
         for cluster in clusters {
-            let next = metrics.cache_lineage(&cluster);
+            let next = metrics.and_then(|metrics| metrics.cache_lineage(&cluster));
             let previous = factors.lineages.get(&cluster);
             if !matches!((&next, previous), (Some(next), Some(old)) if next.same_history(old)) {
                 factors.core.clear_cluster(&cluster);
@@ -427,6 +578,36 @@ impl State {
         }
         factors
     }
+    fn resource_inputs(
+        &self,
+        group: u64,
+        candidate: &Candidate,
+        excluded: &[&str],
+    ) -> Vec<crate::factors::Input> {
+        let inputs = self.factor_inputs(group, candidate);
+        let ignore_failed = inputs
+            .iter()
+            .filter(|input| input.healthy && input.label_matches)
+            .all(|input| {
+                self.backends[&input.id]
+                    .routing_identity
+                    .failed(&candidate.policy)
+            });
+        // Group.Route filters health/failover/retries BEFORE factors. Label
+        // isolation stays in FactorLabel so CPU sees the same candidate pool.
+        inputs
+            .into_iter()
+            .filter(|input| {
+                input.healthy
+                    && !excluded.contains(&input.id.as_ref())
+                    && (ignore_failed
+                        || !self.backends[&input.id]
+                            .routing_identity
+                            .failed(&candidate.policy))
+            })
+            .collect()
+    }
+
     fn routeable(
         &self,
         group: u64,

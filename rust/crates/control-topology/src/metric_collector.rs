@@ -48,7 +48,20 @@ pub enum MetricCollectorError {
     Bind(#[source] std::io::Error),
 }
 
+#[derive(Clone)]
+struct QueryLifetime {
+    source: MetricSourceHandle,
+    incarnation: control_config::ResourceIncarnation,
+}
+impl QueryLifetime {
+    fn is_live(&self) -> bool {
+        self.incarnation
+            .same_as(&self.source.resource_incarnation())
+    }
+}
+
 struct ClusterResult {
+    queries: Option<QueryLifetime>,
     lineage: Arc<()>,
     gate: GenerationGate,
     reader: ReaderState,
@@ -57,6 +70,9 @@ struct ClusterResult {
     export: Arc<[u8]>,
 }
 impl ClusterResult {
+    fn queries_current(&self) -> bool {
+        self.queries.as_ref().is_none_or(QueryLifetime::is_live)
+    }
     fn selected_proofs(&self) -> &[owner::Proof] {
         if self.reader.source() == Source::Backend {
             &self.backend_proofs
@@ -85,6 +101,7 @@ struct Shared {
     source: MetricSourceHandle,
     serving: Arc<service::Binding>,
     queries: Mutex<BTreeSet<QueryId>>,
+    routing_queries: bool,
     published: Mutex<Published>,
 }
 impl Shared {
@@ -93,7 +110,20 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
-    fn queries(&self) -> Vec<QueryId> {
+    fn query_lifetime(&self) -> Option<QueryLifetime> {
+        self.routing_queries.then(|| QueryLifetime {
+            source: self.source.clone(),
+            incarnation: self.source.resource_incarnation(),
+        })
+    }
+    fn queries(&self, lifetime: Option<&QueryLifetime>) -> Vec<QueryId> {
+        if let Some(lifetime) = lifetime {
+            return crate::metrics::query_catalog()
+                .iter()
+                .filter(|_| lifetime.incarnation.enabled())
+                .map(|spec| spec.id)
+                .collect();
+        }
         self.queries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -117,6 +147,9 @@ impl Shared {
             .collect();
         let put = || {
             let mut published = self.lock();
+            if !result.queries_current() {
+                return false;
+            }
             if !published
                 .capture
                 .as_ref()
@@ -186,7 +219,9 @@ impl MetricSnapshot {
         self.capture.still_current()
             && self.serving.is_live()
             && self.clusters.values().all(|result| {
-                result.gate.is_live() && result.selected_proofs().iter().all(owner::Proof::is_live)
+                result.queries_current()
+                    && result.gate.is_live()
+                    && result.selected_proofs().iter().all(owner::Proof::is_live)
             })
     }
     /// The original topology capture for final pairing with a routing decision.
@@ -227,7 +262,10 @@ impl MetricSnapshot {
                         owner::with_retained(&proofs, || {
                             if self.serving.is_live()
                                 && self.capture.still_current()
-                                && self.clusters.values().all(|result| result.gate.is_live())
+                                && self
+                                    .clusters
+                                    .values()
+                                    .all(|result| result.gate.is_live() && result.queries_current())
                             {
                                 Some(use_result())
                             } else {
@@ -248,7 +286,8 @@ pub struct MetricOverlayHandle {
     shared: Arc<Shared>,
 }
 impl MetricOverlayHandle {
-    /// Registers one of the six supported routing expressions for the next round.
+    /// Registers an expression for a manually bound collector. Routing-bound
+    /// collectors own their query set and ignore manual registration.
     pub fn add_query(&self, query: QueryId) {
         self.shared
             .queries
@@ -256,13 +295,34 @@ impl MetricOverlayHandle {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(query);
     }
-    /// Removes one expression; backend history is purged in the next round.
+    /// Removes a manual expression; backend history is purged in the next round.
     pub fn remove_query(&self, query: QueryId) {
         self.shared
             .queries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&query);
+    }
+    /// Captures routing inputs from the automatic collector only, paired with
+    /// the actual routing snapshot and policy lifetime. None means unavailable
+    /// metrics, never unavailable routing authority.
+    #[must_use]
+    pub fn routing_current_for(
+        &self,
+        routing: &Arc<crate::RoutingSnapshot>,
+        incarnation: &control_config::ResourceIncarnation,
+    ) -> Option<MetricSnapshot> {
+        if !self.shared.routing_queries
+            || !incarnation.enabled()
+            || !incarnation.same_as(&self.shared.source.resource_incarnation())
+        {
+            return None;
+        }
+        let capture = self.shared.source.capture()?;
+        if !Arc::ptr_eq(routing, capture.routing()) {
+            return None;
+        }
+        self.current_for(&capture)
     }
     /// Captures current results only for this exact retained material/source.
     #[must_use]
@@ -304,6 +364,24 @@ impl MetricCollector {
         source: MetricSourceHandle,
         address: SocketAddr,
     ) -> Result<(Self, MetricOverlayHandle), MetricCollectorError> {
+        Self::bind_queries(source, address, false).await
+    }
+    /// Binds an opt-in routing collector. The accepted config owns all six
+    /// expressions while Resource/Location factors exist; Connection removes
+    /// them. Every transition is retained even if watch notifications coalesce.
+    /// # Errors
+    /// Returns a listener bind failure before any worker starts.
+    pub async fn bind_for_routing(
+        source: MetricSourceHandle,
+        address: SocketAddr,
+    ) -> Result<(Self, MetricOverlayHandle), MetricCollectorError> {
+        Self::bind_queries(source, address, true).await
+    }
+    async fn bind_queries(
+        source: MetricSourceHandle,
+        address: SocketAddr,
+        routing_queries: bool,
+    ) -> Result<(Self, MetricOverlayHandle), MetricCollectorError> {
         let listener = TcpListener::bind(address)
             .await
             .map_err(MetricCollectorError::Bind)?;
@@ -312,6 +390,7 @@ impl MetricCollector {
             source,
             serving: Arc::new(service::Binding::new(address)),
             queries: Mutex::new(BTreeSet::new()),
+            routing_queries,
             published: Mutex::new(Published::default()),
         });
         Ok((
