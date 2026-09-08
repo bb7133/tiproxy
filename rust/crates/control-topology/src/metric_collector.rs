@@ -49,6 +49,7 @@ pub enum MetricCollectorError {
 }
 
 struct ClusterResult {
+    lineage: Arc<()>,
     gate: GenerationGate,
     reader: ReaderState,
     backend_proofs: Vec<owner::Proof>,
@@ -148,6 +149,19 @@ impl Shared {
     }
 }
 
+/// Opaque continuity of one cluster's selected metric history.
+/// This is a cache key, never an authorization to use data without a current
+/// snapshot. Only the collector can issue it, and equality is object identity.
+#[derive(Clone)]
+pub struct MetricCacheLineage(Arc<()>);
+impl MetricCacheLineage {
+    /// Whether two captures belong to the exact same selected history lifetime.
+    #[must_use]
+    pub fn same_history(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// An immutable metric result carrying its actual source and owner provenance.
 /// Query values remain data; retain this snapshot and use `with_current` at the
 /// routing publication boundary after reading a value.
@@ -157,6 +171,15 @@ pub struct MetricSnapshot {
     clusters: BTreeMap<String, Arc<ClusterResult>>,
 }
 impl MetricSnapshot {
+    /// Cache continuity for a cluster with a completed selected result. Retain
+    /// only alongside ledger-owned factor state; final use requires `with_current`.
+    #[must_use]
+    pub fn cache_lineage(&self, cluster: &str) -> Option<MetricCacheLineage> {
+        self.clusters
+            .get(cluster)
+            .map(|result| MetricCacheLineage(Arc::clone(&result.lineage)))
+    }
+
     /// Checks source, serving lifetime, result replacement and selected owners.
     #[must_use]
     pub fn still_current(&self) -> bool {

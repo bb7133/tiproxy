@@ -36,8 +36,15 @@ struct Backend {
     group: Option<u64>,
 }
 
+#[derive(Clone, Default)]
+struct GroupFactors {
+    core: crate::factors::State,
+    lineages: BTreeMap<String, control_topology::MetricCacheLineage>,
+}
+
 struct State {
     ledger: Ledger,
+    factors: BTreeMap<u64, GroupFactors>,
     backends: BTreeMap<Arc<str>, Backend>,
     groups: BTreeMap<u64, GroupMatcher>,
     ports: PortRoutes<u64>,
@@ -80,6 +87,7 @@ impl Router {
             next_lock: Mutex::new(None),
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
+                factors: BTreeMap::new(),
                 backends: BTreeMap::new(),
                 groups: BTreeMap::new(),
                 ports: PortRoutes::default(),
@@ -216,6 +224,58 @@ impl Router {
             .map_err(Into::into)
     }
 
+    /// Evaluates staged Resource/Location factors using this router's actual
+    /// ledger counts and a producer-issued metric snapshot. Returns diagnostic
+    /// data only; capture/reserve still reject these policies until composition.
+    ///
+    /// # Errors
+    /// Rejects mismatched/stale C/R/H/metric authority, missing groups, and
+    /// bounded metric merge errors. No counts are reserved by this operation.
+    pub fn factor_report(
+        &self,
+        metrics: &control_topology::MetricSnapshot,
+        client: ClientInfo<'_>,
+        listener_port: &str,
+    ) -> Result<crate::FactorReport, RouteError> {
+        let candidate = self.sources.capture_factors()?;
+        if !Arc::ptr_eq(&candidate.routing, metrics.source().routing()) {
+            return Err(RouteError::StaleCandidate);
+        }
+        let mut queries = crate::factors::Queries::new();
+        for spec in control_topology::metrics::query_catalog() {
+            if let Some(query) = metrics
+                .query_result(spec.id)
+                .map_err(|_| RouteError::ControlUnavailable)?
+            {
+                queries.insert(spec.id, query);
+            }
+        }
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| RouteError::ControlUnavailable)?
+                .as_nanos(),
+        )
+        .map_err(|_| RouteError::ControlUnavailable)?;
+        let mut state = self.lock();
+        self.sources.validate(&candidate)?;
+        metrics
+            .with_current(|| {
+                self.sources.validate(&candidate)?;
+                state.refresh(&candidate)?;
+                let group = state.factor_group(&candidate, client, listener_port)?;
+                let inputs = state.factor_inputs(group, &candidate);
+                let mut factors = state.prepare_factors(group, metrics, &inputs);
+                let report = factors
+                    .core
+                    .evaluate(&inputs, &candidate.policy, &queries, now);
+                self.sources.validate(&candidate)?;
+                state.factors.insert(group, factors);
+                Ok(report)
+            })
+            .ok_or(RouteError::StaleCandidate)?
+    }
+
     /// Settles an exact pending attempt, even after its C/R/H inputs retire.
     /// Duplicate, foreign and late results have no effect.
     pub fn finish(&self, reservation: &Reservation, connected: bool) -> Settlement {
@@ -287,6 +347,86 @@ fn group_values(backend: &MergedBackend, rule: MatchType) -> Vec<String> {
 }
 
 impl State {
+    fn factor_group(
+        &self,
+        candidate: &Candidate,
+        client: ClientInfo<'_>,
+        listener_port: &str,
+    ) -> Result<u64, RouteError> {
+        let group = if candidate.policy.routing_rule == RoutingRule::ListenerPort {
+            self.ports
+                .group_for(listener_port)
+                .map_err(|_| RouteError::PortConflict)?
+                .copied()
+        } else {
+            self.groups
+                .iter()
+                .find(|(_, matcher)| matcher.matches(client))
+                .map(|(id, _)| *id)
+        };
+        group.ok_or(RouteError::NoBackend)
+    }
+
+    fn factor_inputs(&self, group: u64, candidate: &Candidate) -> Vec<crate::factors::Input> {
+        self.backends
+            .values()
+            .filter(|backend| backend.group == Some(group))
+            .filter_map(|backend| {
+                self.ledger
+                    .counts(&backend.account)
+                    .map(|counts| crate::factors::Input {
+                        id: Arc::clone(&backend.source.backend_id),
+                        owner: Arc::clone(&backend.account),
+                        instance: control_topology::metrics::instance_label(
+                            &backend.source.backend.addr,
+                            &backend.source.backend.ip,
+                            backend.source.backend.status_port,
+                        ),
+                        cluster: backend.source.cluster_name.to_string(),
+                        counts,
+                        healthy: backend.healthy,
+                        local: candidate.health.get(&backend.source.backend_id).local,
+                        label_matches: label_matches(
+                            &candidate.policy,
+                            &backend.source.backend.labels,
+                        ),
+                    })
+            })
+            .collect()
+    }
+
+    fn prepare_factors(
+        &self,
+        group: u64,
+        metrics: &control_topology::MetricSnapshot,
+        inputs: &[crate::factors::Input],
+    ) -> GroupFactors {
+        let owners = self
+            .backends
+            .iter()
+            .map(|(id, backend)| (Arc::clone(id), Arc::clone(&backend.account)))
+            .collect();
+        let mut factors = self.factors.get(&group).cloned().unwrap_or_default();
+        factors.core.retain_owners(&owners);
+        let clusters: BTreeSet<String> = inputs
+            .iter()
+            .map(|input| input.cluster.clone())
+            .chain(factors.lineages.keys().cloned())
+            .collect();
+        for cluster in clusters {
+            let next = metrics.cache_lineage(&cluster);
+            let previous = factors.lineages.get(&cluster);
+            if !matches!((&next, previous), (Some(next), Some(old)) if next.same_history(old)) {
+                factors.core.clear_cluster(&cluster);
+            }
+            if let Some(next) = next {
+                factors.lineages.insert(cluster, next);
+            } else {
+                factors.lineages.remove(&cluster);
+            }
+        }
+        factors
+    }
     fn routeable(
         &self,
         group: u64,
@@ -357,6 +497,7 @@ impl State {
             .filter_map(|backend| backend.group)
             .collect();
         self.groups.retain(|id, _| occupied.contains(id));
+        self.factors.retain(|id, _| occupied.contains(id));
         let rule = match_type(candidate.policy.routing_rule);
         for backend in self
             .backends

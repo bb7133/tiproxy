@@ -167,12 +167,22 @@ impl Sources {
     }
 
     pub(crate) fn capture(&self) -> Result<Candidate, RouteError> {
+        self.capture_inputs(false)
+    }
+
+    pub(crate) fn capture_factors(&self) -> Result<Candidate, RouteError> {
+        self.capture_inputs(true)
+    }
+
+    fn capture_inputs(&self, factors_only: bool) -> Result<Candidate, RouteError> {
         let config = self.admit()?;
         let policy = config
             .effective()
             .routing()
             .map_err(|_| RouteError::InvalidConfig)?;
-        supported(&policy)?;
+        if !factors_only {
+            supported(&policy)?;
+        }
         let backend = self
             .backend
             .current()
