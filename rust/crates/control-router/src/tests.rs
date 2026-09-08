@@ -487,34 +487,63 @@ impl Harness {
     }
 
     async fn applied(&self) {
+        must(self.applied_at("FIXTURE", Duration::from_secs(5)).await);
+    }
+
+    async fn applied_at(&self, stage: &str, timeout: Duration) -> TestResult {
         let wanted = self.source.store.current().generation();
         let mut status = self.topology.status();
-        let _ = must(must(
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                status.wait_for(|status| status.observed_generation == wanted),
-            )
-            .await,
-        ));
+        tokio::time::timeout(
+            timeout,
+            status.wait_for(|status| status.observed_generation == wanted),
+        )
+        .await
+        .map_err(|err| format!("CONFIG_MATERIAL_{stage}_TIMEOUT: {err}"))?
+        .map_err(|err| format!("CONFIG_MATERIAL_{stage}_CLOSED: {err}"))?;
+        Ok(())
     }
 
     fn reserve(&self, candidate: &Candidate) -> (crate::Session, Reservation) {
-        let session = must(self.router.open());
-        let assignment =
-            must(
-                self.router
-                    .reserve(&session, candidate, ClientInfo::default(), "", &[]),
-            );
-        (session, assignment)
+        must(self.reserve_at(candidate, "FIXTURE"))
+    }
+
+    fn reserve_at(
+        &self,
+        candidate: &Candidate,
+        stage: &str,
+    ) -> TestResult<(crate::Session, Reservation)> {
+        let session = self
+            .router
+            .open()
+            .map_err(|err| format!("CONFIG_MATERIAL_{stage}_OPEN: {err:?}"))?;
+        let reservation = self
+            .router
+            .reserve(&session, candidate, ClientInfo::default(), "", &[])
+            .map_err(|err| format!("CONFIG_MATERIAL_{stage}_RESERVE: {err:?}"))?;
+        Ok((session, reservation))
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_config_pending_rejected_and_committed_material_are_distinguished() -> TestResult
 {
-    let harness = Harness::new("", "connection").await?;
+    // Config delivery and client-epoch changes own this test's interleaving.
+    // Keep the real initial health snapshot stable between capture and reserve;
+    // periodic replacement is covered by the separate health-boundary tests.
+    let harness = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
     let first = harness.ready().await;
-    let (old_session, old_reservation) = harness.reserve(&first);
+    let (old_session, old_reservation) = harness.reserve_at(&first, "INITIAL")?;
     assert_eq!(
         harness.router.finish(&old_reservation, true),
         Settlement::Applied
@@ -530,7 +559,7 @@ async fn independent_config_pending_rejected_and_committed_material_are_distingu
         pending.policy.selection_policy,
         control_config::RoutingSelectionPolicy::Random
     );
-    let (pending_session, _) = harness.reserve(&pending);
+    let (pending_session, _) = harness.reserve_at(&pending, "PENDING")?;
     harness.router.close(&pending_session);
     assert!(matches!(
         harness
@@ -540,16 +569,20 @@ async fn independent_config_pending_rejected_and_committed_material_are_distingu
     ));
     harness.reject.store(true, Ordering::SeqCst);
     harness.source.deliver();
-    harness.applied().await;
+    harness
+        .applied_at("REJECTED", Duration::from_secs(30))
+        .await?;
     assert!(harness.topology.status().borrow().last_rejection.is_some());
     let rejected = must(harness.router.capture());
     assert!(Arc::ptr_eq(&rejected.routing, &first.routing));
-    let (rejected_session, _) = harness.reserve(&rejected);
+    let (rejected_session, _) = harness.reserve_at(&rejected, "REJECTED")?;
     harness.router.close(&rejected_session);
     harness.reject.store(false, Ordering::SeqCst);
     harness.patch("[proxy]\nmax-connections = 101", 4);
     harness.source.deliver();
-    harness.applied().await;
+    harness
+        .applied_at("COMMITTED", Duration::from_secs(30))
+        .await?;
     // New etcd channel committed, but its Range responses are held. Old R is
     // still published and H was synchronously revoked before epoch commit.
     let current_r = harness
@@ -573,7 +606,7 @@ async fn independent_config_pending_rejected_and_committed_material_are_distingu
     second_fixture.service.release.send_replace(true);
     let recovered = harness.ready().await;
     assert!(recovered.routing.client_epoch > first.routing.client_epoch);
-    let (session, reservation) = harness.reserve(&recovered);
+    let (session, reservation) = harness.reserve_at(&recovered, "RECOVERED")?;
     assert_eq!(
         harness.router.finish(&reservation, true),
         Settlement::Applied
