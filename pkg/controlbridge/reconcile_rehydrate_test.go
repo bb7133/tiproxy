@@ -452,6 +452,41 @@ func TestDrainIdBindingAndSequenceExhaustion(t *testing.T) {
 	require.ErrorIs(t, err, ErrDrainSequenceExhausted)
 }
 
+// Fix the interleaving that the concurrent stress test can only hit by chance:
+// reconcile observed an absent connection, then orphan resolution completed
+// before reconcile acquired its rehydration claim. A released in-flight claim
+// does not mean that a second accounting attachment is now permitted.
+func TestRehydrationClaimAfterCompletedOrphanResolution(t *testing.T) {
+	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
+	adapter := newTestAdapter(t, &recordingHandler{rt: rt})
+	peer := newFakeSender(60,
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE))
+	remote := reconciledConnection(86, "tidb-a:4000", "")
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(903, remote)))
+	require.Equal(t, 1, adapter.OrphanCount())
+
+	// This is reconcile's earlier lookup, before its claim. Advance the other
+	// real entrypoint to completion while this observation is outstanding.
+	require.Nil(t, adapter.get(86))
+	adapter.AttachRouterLookup(func(string) (router.Router, error) { return rt, nil })
+	require.NoError(t, adapter.ResolveOrphans(context.Background()))
+	recovered := adapter.get(86)
+	require.NotNil(t, recovered)
+	require.Zero(t, adapter.OrphanCount())
+	require.Equal(t, 1, rt.ConnCount())
+
+	// Admission must atomically revalidate the now-completed connection, before
+	// RehydrateConn can acquire accounting a second time. No timer or test hook
+	// is needed to exercise this formerly open window.
+	require.False(t, adapter.claimRehydration(86), "REHYDRATION_COMPLETED_CLAIM")
+	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcileRequestEnvelope(904, remote)))
+	require.NoError(t, adapter.ResolveOrphans(context.Background()))
+	require.Same(t, recovered, adapter.get(86))
+	require.Equal(t, 1, rt.ConnCount(), "REHYDRATION_SINGLE_ATTACHMENT")
+}
+
 // Concurrent ResolveOrphans and reconcile cannot double-attach or kill
 // a freshly recovered session: the rehydration claim spans the whole
 // resolution lifecycle.

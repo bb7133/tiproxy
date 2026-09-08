@@ -1049,6 +1049,12 @@ func (adapter *RouterAdapter) rehydrateReconciled(remote *controlpb.ReconcileCon
 func (adapter *RouterAdapter) claimRehydration(id uint64) bool {
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
+	// The previous connection lookup can precede another resolver's complete
+	// attachment and claim release. Revalidate presence under the same lock as
+	// admission, before RehydrateConn has any router-accounting side effects.
+	if _, exists := adapter.connections[id]; exists {
+		return false
+	}
 	if _, claimed := adapter.rehydrating[id]; claimed {
 		return false
 	}
