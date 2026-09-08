@@ -1657,14 +1657,16 @@ mod tests {
     // B2: rotation fails closed FIRST, then aborts + drains, then starts.
     // ================================================================
 
-    async fn wait_until(predicate: impl Fn() -> bool) {
+    /// Polls a causal condition with a hang guard. The label names the exact
+    /// wait in the failure so a timeout is attributable without inference.
+    async fn wait_until(label: &'static str, predicate: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if predicate() {
                 return;
             }
             if Instant::now() > deadline {
-                unreachable!("a B2 condition was not reached in time");
+                unreachable!("a B2 condition was not reached in time: {label}");
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -1800,12 +1802,19 @@ mod tests {
         {
             let overlay_handle = overlay_handle.clone();
             let r1 = Arc::clone(&r1);
-            wait_until(move || overlay_handle.current_for(&r1).is_some()).await;
+            wait_until("round 0 published H1", move || {
+                overlay_handle.current_for(&r1).is_some()
+            })
+            .await;
         }
         // Round 1 is fully in flight: all N probes blocked, each holding a guard.
+        // `round1_started` is bounded by N (only round-1 probes increment it).
         {
             let round1_started = Arc::clone(&round1_started);
-            wait_until(move || round1_started.load(Ordering::SeqCst) == N).await;
+            wait_until("round 1 fully in flight", move || {
+                round1_started.load(Ordering::SeqCst) == N
+            })
+            .await;
         }
 
         // Rotate to a new generation reusing the still-live r1. `set` synchronously
@@ -1813,17 +1822,24 @@ mod tests {
         // revision (so the loop preempts round 1).
         feeder.set(generation(&r1, true));
 
-        // The new generation publishes H2 for r1 once the old round is collected.
+        // The new generation probes every backend once the old round is collected.
+        // Later 20ms rounds keep appending, so this is a lower bound: an exact
+        // count can be overshot between two polls under load.
         {
             let gen2 = Arc::clone(&gen2_dropcount_at_start);
-            wait_until(move || gen2.lock().unwrap_or_else(PoisonError::into_inner).len() == N)
-                .await;
+            wait_until("generation 2 probed every backend", move || {
+                gen2.lock().unwrap_or_else(PoisonError::into_inner).len() >= N
+            })
+            .await;
         }
         // And a fresh overlay is republished.
         {
             let overlay_handle = overlay_handle.clone();
             let r1 = Arc::clone(&r1);
-            wait_until(move || overlay_handle.current_for(&r1).is_some()).await;
+            wait_until("generation 2 republished H2", move || {
+                overlay_handle.current_for(&r1).is_some()
+            })
+            .await;
         }
         task.abort();
 
@@ -1843,10 +1859,13 @@ mod tests {
         let gen2 = gen2_dropcount_at_start
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(gen2.len(), N, "the new generation probed every backend");
+        assert!(
+            gen2.len() >= N,
+            "the new generation probed every backend (later rounds may append)"
+        );
         assert!(
             gen2.iter().all(|&dropped| dropped == N),
-            "the new generation started no probe until every old probe was collected"
+            "no new-generation probe started until every old probe was collected"
         );
     }
 
@@ -1908,19 +1927,28 @@ mod tests {
         // Every probe of the first round is in flight, holding a guard.
         {
             let started = Arc::clone(&started);
-            wait_until(move || started.load(Ordering::SeqCst) == N).await;
+            wait_until("every probe started", move || {
+                started.load(Ordering::SeqCst) == N
+            })
+            .await;
         }
         // A hard outer abort: the RAII guard must terminal-clear the overlay and
         // abort every in-flight child — no detached task can leak.
         task.abort();
         {
             let drop_count = Arc::clone(&drop_count);
-            wait_until(move || drop_count.load(Ordering::SeqCst) == N).await;
+            wait_until("every guard dropped", move || {
+                drop_count.load(Ordering::SeqCst) == N
+            })
+            .await;
         }
         {
             let overlay_handle = overlay_handle.clone();
             let r1 = Arc::clone(&r1);
-            wait_until(move || overlay_handle.current_for(&r1).is_none()).await;
+            wait_until("overlay withdrawn", move || {
+                overlay_handle.current_for(&r1).is_none()
+            })
+            .await;
         }
         assert_eq!(
             drop_count.load(Ordering::SeqCst),
@@ -2378,10 +2406,16 @@ mod tests {
         ));
 
         // Round 1 is in flight (captured zone az-1); flip the zone, then release it.
-        wait_until(|| started.load(Ordering::SeqCst) >= 1).await;
+        wait_until("first round started", || {
+            started.load(Ordering::SeqCst) >= 1
+        })
+        .await;
         zone.set(Some("az-2"));
         permits.add_permits(1);
-        wait_until(|| overlay_handle.current_for(&source).is_some()).await;
+        wait_until("first round published", || {
+            overlay_handle.current_for(&source).is_some()
+        })
+        .await;
         let h1 = overlay_handle
             .current_for(&source)
             .unwrap_or_else(|| unreachable!("round 1 published"));
@@ -2391,9 +2425,12 @@ mod tests {
         );
 
         // Round 2 (same R, no rotation) captures az-2: the backend is no longer local.
-        wait_until(|| started.load(Ordering::SeqCst) >= 2).await;
+        wait_until("second round started", || {
+            started.load(Ordering::SeqCst) >= 2
+        })
+        .await;
         permits.add_permits(1);
-        wait_until(|| {
+        wait_until("second round published the new zone", || {
             overlay_handle
                 .current_for(&source)
                 .is_some_and(|h| !Arc::ptr_eq(&h, &h1))
