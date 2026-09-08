@@ -1355,6 +1355,8 @@ func TestWatchFailoverConfig(t *testing.T) {
 	bo.addBackend(addr2, nil)
 	bo.notify(nil)
 	require.Eventually(t, func() bool {
+		router.Lock()
+		defer router.Unlock()
 		backend := router.backends[addr]
 		return backend != nil && backend.Healthy()
 	}, 3*time.Second, 10*time.Millisecond)
@@ -1368,6 +1370,8 @@ func TestWatchFailoverConfig(t *testing.T) {
 		},
 	}
 	require.Eventually(t, func() bool {
+		router.Lock()
+		defer router.Unlock()
 		backend := router.backends[addr]
 		return backend != nil && !backend.Healthy()
 	}, 3*time.Second, 10*time.Millisecond)
@@ -1381,6 +1385,8 @@ func TestWatchFailoverConfig(t *testing.T) {
 		},
 	}
 	require.Eventually(t, func() bool {
+		router.Lock()
+		defer router.Unlock()
 		backend := router.backends[addr]
 		return backend != nil && !backend.Healthy()
 	}, 3*time.Second, 10*time.Millisecond)
@@ -1393,6 +1399,8 @@ func TestWatchFailoverConfig(t *testing.T) {
 		},
 	}
 	require.Eventually(t, func() bool {
+		router.Lock()
+		defer router.Unlock()
 		backend := router.backends[addr]
 		return backend != nil && backend.Healthy()
 	}, 3*time.Second, 10*time.Millisecond)
@@ -1442,10 +1450,14 @@ func TestNewGroupUsesLatestConfigGetter(t *testing.T) {
 	bo.addBackend(addr3, map[string]string{config.TiProxyPortLabelName: "10081"})
 	bo.notify(nil)
 	require.Eventually(t, func() bool {
+		router.Lock()
+		defer router.Unlock()
 		backend := router.backends[addr2]
 		return backend != nil && !backend.Healthy()
 	}, 3*time.Second, 10*time.Millisecond)
 	require.Eventually(t, func() bool {
+		router.Lock()
+		defer router.Unlock()
 		backend := router.backends[addr3]
 		return backend != nil && backend.Healthy()
 	}, 3*time.Second, 10*time.Millisecond)
