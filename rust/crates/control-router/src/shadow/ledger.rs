@@ -226,6 +226,18 @@ pub(super) struct Mirror {
     hidden_sessions: usize,
 }
 impl Mirror {
+    // Borrow the independent physical list; caller visit witnesses never seed it.
+    pub(super) fn caller_physical(&self, account: u64) -> Option<&[u64]> {
+        self.accounts
+            .get(&account)
+            .filter(|account| !account.removed)
+            .map(|account| account.physical_order.as_slice())
+    }
+
+    pub(super) fn caller_redirect_watermark(&self, session: u64) -> Option<u64> {
+        self.sessions.get(&session).map(|s| s.redirect_watermark)
+    }
+
     // The complete retained Group inventory, never seeded from filtered native inputs.
     pub(super) fn caller_account_ids(&self, group: u64) -> impl Iterator<Item = u64> + '_ {
         self.accounts

@@ -7,6 +7,8 @@
 
 /// Go-compatible caller arithmetic, independent of production effects.
 pub mod arithmetic;
+/// Group-local Balance comparison and redirect-time history; not installed yet.
+pub mod balance;
 /// Bounded router pass boundary and order comparison; not installed yet.
 pub mod pass;
 /// Group-local Route capture and independent atomic comparison; not installed yet.
@@ -161,6 +163,7 @@ impl LiveState {
                 scope.group,
                 Stored {
                     state: old.state.clone(),
+                    timing: old.timing.clone(),
                     charge: old.charge,
                 },
             );

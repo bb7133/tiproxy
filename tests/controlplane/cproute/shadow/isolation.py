@@ -39,6 +39,9 @@ for path in shadow.rglob('*.rs'):
         'live/caller/arithmetic.rs': [
             'use crate::shadow::native::{BalanceRate, GoArch};',
         ],
+        'live/caller/balance.rs': [
+            'use crate::shadow::native::{Entry, Evaluation};',
+        ],
         'live/caller/pass.rs': [
             'use crate::shadow::{Epoch, InvalidReason};',
         ],

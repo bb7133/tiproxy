@@ -331,6 +331,7 @@ impl LiveState {
                 return Err(InvalidReason::Witness);
             }
         }
+        self.update_balance_terminals(batch);
         Ok(())
     }
 

@@ -19,6 +19,7 @@ pub(super) struct NativeOwner {
 }
 pub(super) struct Stored {
     pub(super) state: FactorState,
+    pub(super) timing: super::caller::balance::Timing,
     pub(super) charge: usize,
 }
 impl LiveState {
@@ -186,7 +187,8 @@ impl LiveState {
             |stored| stored.state.clone(),
         );
         let decision = staged.compare(e).map_err(|_| InvalidReason::Witness)?;
-        let charge = staged.retained_bytes() + GROUP_CHARGE;
+        let timing_charge = old.map_or(0, |stored| stored.timing.entry_charge());
+        let charge = staged.retained_bytes() + GROUP_CHARGE + timing_charge;
         if charge > old_charge + staging + STAGE_OVERHEAD {
             return Err(InvalidReason::Capacity);
         }
@@ -195,10 +197,19 @@ impl LiveState {
             .native
             .get_mut(&e.epoch)
             .ok_or(InvalidReason::Identity)?;
+        // A policy/config update replaces factor history, not the Group's
+        // accepted-redirect watermark or connection attempt lifetimes.
+        let timing = native
+            .groups
+            .get_mut(&e.group)
+            .map_or_else(super::caller::balance::Timing::default, |old| {
+                std::mem::take(&mut old.timing)
+            });
         native.groups.insert(
             e.group,
             Stored {
                 state: staged,
+                timing,
                 charge,
             },
         );
