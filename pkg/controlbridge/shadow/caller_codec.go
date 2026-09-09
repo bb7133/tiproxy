@@ -9,7 +9,7 @@ import (
 	"github.com/pingcap/tiproxy/pkg/balance/observation"
 )
 
-// EncodeCaller currently accepts typed router pass and Group route boundaries. It does not
+// EncodeCaller currently accepts typed router pass, Group route and Group Balance boundaries. It does not
 // install a v4 transport or grant selection/scheduler coverage. The returned
 // bytes borrow the parent's charged arena until the final writer releases it.
 func EncodeCaller(record observation.Record) (frame []byte, err error) {
@@ -24,7 +24,7 @@ func EncodeCaller(record observation.Record) (frame []byte, err error) {
 		return nil, errSchema
 	}
 	p, buffer := c.Pass(), c.EncodingBuffer()
-	if len(buffer) != observation.MaxCallerFrameBytes || p != nil && (c.Span() != 1 || len(c.Children()) != 0 || !validPass(p)) || p == nil && c.Route() == nil {
+	if len(buffer) != observation.MaxCallerFrameBytes || p != nil && (c.Span() != 1 || len(c.Children()) != 0 || !validPass(p)) || p == nil && c.Route() == nil && c.Balance() == nil {
 		return nil, errSchema
 	}
 	w := nativeEncoder{buffer: buffer, used: 4}
@@ -39,7 +39,11 @@ func EncodeCaller(record observation.Record) (frame []byte, err error) {
 	w.literal(`,"span":`)
 	w.uint(c.Span())
 	w.literal(`,"payload":{`)
-	if p == nil {
+	if c.Balance() != nil {
+		if p != nil || c.Route() != nil || !w.groupBalance(record) {
+			return nil, errSchema
+		}
+	} else if p == nil {
 		if !w.groupRoute(record) {
 			return nil, errSchema
 		}

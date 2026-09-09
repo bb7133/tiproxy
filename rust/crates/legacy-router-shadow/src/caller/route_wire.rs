@@ -8,7 +8,7 @@ use serde::{
     de::{Error as _, SeqAccess, Visitor},
 };
 
-struct Bounded<T, const N: usize>(Vec<T>);
+pub(super) struct Bounded<T, const N: usize>(pub(super) Vec<T>);
 impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Bounded<T, N> {
     fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
         struct Values<T, const N: usize>(std::marker::PhantomData<T>);

@@ -3,11 +3,12 @@
 
 //! Preparatory strict v4 router pass boundaries. This codec is deliberately not
 //! selected by the existing v2/v3 consumer and confers no coverage capability.
+mod balance_wire;
 mod route_wire;
 use crate::{Error, native::Decimal};
 use control_router::shadow::{
     Epoch,
-    live::caller::{Budget, MAX_CALLER_FRAME, pass, route},
+    live::caller::{Budget, MAX_CALLER_FRAME, balance, pass, route},
 };
 use control_routing::go_time::Origin;
 use serde::{
@@ -58,6 +59,8 @@ impl<'de> Deserialize<'de> for Groups {
 #[serde(deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // The full fixed variant is included in the decode budget.
 enum Payload {
+    #[serde(rename = "group_balance")]
+    GroupBalance(balance_wire::WireBalance),
     #[serde(rename = "group_route")]
     GroupRoute(route_wire::WireRoute),
     #[serde(rename = "pass_begin")]
@@ -101,6 +104,14 @@ impl Wire {
             owner: self.owner.0,
             nonce: self.nonce.0,
         };
+        if let Payload::GroupBalance(value) = self.payload {
+            return Ok(Frame::GroupBalance(value.domain(
+                epoch,
+                self.sequence.0,
+                self.span.0,
+                origin,
+            )?));
+        }
         if let Payload::GroupRoute(value) = self.payload {
             let envelope = value.domain(epoch, self.sequence.0, self.span.0, origin)?;
             return Ok(Frame::GroupRoute(envelope));
@@ -109,7 +120,7 @@ impl Wire {
             return Err(Error::Schema);
         }
         let event = match self.payload {
-            Payload::GroupRoute(_) => return Err(Error::Schema),
+            Payload::GroupRoute(_) | Payload::GroupBalance(_) => return Err(Error::Schema),
             Payload::Begin {
                 pass,
                 support_redirection,
@@ -157,6 +168,8 @@ impl Wire {
 /// A strictly decoded caller, still requiring its independent domain comparator.
 #[allow(clippy::large_enum_variant)] // Bounded fixed pass storage is included in 32F + S.
 pub enum Frame {
+    /// Group Balance with its native evaluation and paired lifecycle batches.
+    GroupBalance(balance::Envelope),
     /// Router pass boundary; independently derived inventory/gate required.
     Pass(pass::Boundary),
     /// Group Route with complete nested v3/v2 children.
@@ -187,7 +200,7 @@ pub fn admission(frame_bytes: usize, retained: usize) -> Result<Budget, Error> {
 pub fn decode(frame: &[u8], retained: usize) -> Result<pass::Boundary, Error> {
     match decode_caller(frame, None, retained)? {
         Frame::Pass(pass) => Ok(pass),
-        Frame::GroupRoute(_) => Err(Error::Schema),
+        Frame::GroupRoute(_) | Frame::GroupBalance(_) => Err(Error::Schema),
     }
 }
 
@@ -216,3 +229,6 @@ pub fn decode_caller(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod balance_tests;

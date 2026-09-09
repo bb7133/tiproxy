@@ -6,7 +6,7 @@ use control_router::shadow::live::native::{HISTORY_LIMIT, STAGE_OVERHEAD};
 const BEGIN: &str =
     include_str!("../../../../../tests/controlplane/cproute/shadow/v4-pass-begin.json");
 const END: &str = include_str!("../../../../../tests/controlplane/cproute/shadow/v4-pass-end.json");
-fn frame(body: &str) -> Vec<u8> {
+pub(super) fn frame(body: &str) -> Vec<u8> {
     let mut value = u32::try_from(body.len())
         .unwrap_or_else(|_| unreachable!("valid fixture"))
         .to_be_bytes()
@@ -170,7 +170,7 @@ fn prefix_inclusive_size_and_admission_before_decode() {
 
 const ROUTE: &str =
     include_str!("../../../../../tests/controlplane/cproute/shadow/v4-group-route.json");
-fn origin() -> Origin {
+pub(super) fn origin() -> Origin {
     Origin::new(control_routing::go_time::SUPPORTED_GO_VERSION, false, 0)
         .unwrap_or_else(|| unreachable!("origin"))
 }
@@ -179,7 +179,7 @@ fn route_frame(body: &str) -> route::Envelope {
         .unwrap_or_else(|e| unreachable!("fixture {e:?}"))
     {
         Frame::GroupRoute(e) => e,
-        Frame::Pass(_) => unreachable!("route fixture"),
+        Frame::Pass(_) | Frame::GroupBalance(_) => unreachable!("route fixture"),
     }
 }
 fn route_state(e: &route::Envelope) -> control_router::shadow::live::LiveState {

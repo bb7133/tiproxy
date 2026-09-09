@@ -28,6 +28,7 @@ type CallerChild struct {
 }
 
 type callerStorage struct {
+	balance     GroupBalance
 	route       GroupRoute
 	pass        RouterPass
 	input       [MaxCallerDataBytes]byte
@@ -103,7 +104,7 @@ func (c *Caller) Append(value []byte) bool {
 	if !c.writable() {
 		return false
 	}
-	if c.storage.pass.Kind != 0 || c.storage.route.ID != 0 {
+	if c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
@@ -126,7 +127,7 @@ func (c *Caller) BeginEvaluation() *Evaluation {
 	if !c.writable() {
 		return nil
 	}
-	if c.storage.pass.Kind != 0 || c.storage.route.ResultSet {
+	if c.storage.pass.Kind != 0 || c.storage.route.ResultSet || c.storage.balance.ResultSet || c.storage.balance.ID != 0 && c.evaluations != 0 {
 		c.owner.Invalidate(Malformed)
 		return nil
 	}
@@ -150,9 +151,16 @@ func (c *Caller) CompleteEvaluation(e *Evaluation) bool {
 	if !c.writable() {
 		return false
 	}
-	if c.storage.route.ResultSet || e == nil || e.parent != c || !e.sealed || e.published || e.lease.released.Load() {
+	if c.storage.balance.ResultSet || c.storage.route.ResultSet || e == nil || e.parent != c || !e.sealed || e.published || e.lease.released.Load() {
 		c.owner.Invalidate(Malformed)
 		return false
+	}
+	if c.storage.balance.ID != 0 {
+		n := e.Native()
+		if c.children != 0 || n == nil || n.Entry != EntryBalance || n.Group != c.storage.balance.Group {
+			c.Fail(Malformed)
+			return false
+		}
 	}
 	for _, earlier := range c.storage.children[:c.children] {
 		if earlier.Evaluation == e {
@@ -172,7 +180,18 @@ func (c *Caller) AppendBatch(batch Batch) bool {
 	if !c.writable() {
 		return false
 	}
-	if c.storage.pass.Kind != 0 || c.storage.route.ResultSet || batch.EventCount == 0 || batch.EventCount > MaxEvents || batch.Witness.AccountCount > MaxWitnesses {
+	if c.storage.balance.ID != 0 {
+		c.Fail(Malformed)
+		return false
+	}
+	return c.appendBatch(batch)
+}
+
+func (c *Caller) appendBatch(batch Batch) bool {
+	if !c.writable() {
+		return false
+	}
+	if c.storage.pass.Kind != 0 || c.storage.route.ResultSet || c.storage.balance.ResultSet || batch.EventCount == 0 || batch.EventCount > MaxEvents || batch.Witness.AccountCount > MaxWitnesses {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
@@ -191,7 +210,7 @@ func (c *Caller) Seal() bool {
 	if !c.writable() {
 		return false
 	}
-	if c.length == 0 && c.storage.pass.Kind == 0 && c.storage.route.ID == 0 || c.storage.route.ID != 0 && !c.storage.route.ResultSet || c.children != c.evaluations+c.batches {
+	if c.length == 0 && c.storage.pass.Kind == 0 && c.storage.route.ID == 0 && c.storage.balance.ID == 0 || c.storage.route.ID != 0 && !c.storage.route.ResultSet || c.storage.balance.ID != 0 && !c.storage.balance.ResultSet || c.children != c.evaluations+c.batches {
 		c.owner.Invalidate(Malformed)
 		return false
 	}

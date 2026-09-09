@@ -74,9 +74,9 @@ impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Bounded<T, N
 }
 
 #[derive(Deserialize)]
-struct WireTime(String, Signed, u32, Decimal, bool, Signed);
+pub(crate) struct WireTime(String, Signed, u32, Decimal, bool, Signed);
 impl WireTime {
-    fn domain(self, origin: Origin) -> Result<GoTime, Error> {
+    pub(crate) fn domain(self, origin: Origin) -> Result<GoTime, Error> {
         let Self(domain, seconds, nanos, location, monotonic, relative) = self;
         if domain != "go" || !monotonic && relative.0 != 0 {
             return Err(Error::Schema);
