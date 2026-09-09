@@ -167,3 +167,290 @@ fn prefix_inclusive_size_and_admission_before_decode() {
         "PASS_ADMISSION_BEFORE_PARSE"
     );
 }
+
+const ROUTE: &str =
+    include_str!("../../../../../tests/controlplane/cproute/shadow/v4-group-route.json");
+fn origin() -> Origin {
+    Origin::new(control_routing::go_time::SUPPORTED_GO_VERSION, false, 0)
+        .unwrap_or_else(|| unreachable!("origin"))
+}
+fn route_frame(body: &str) -> route::Envelope {
+    match decode_caller(&frame(body), Some(origin()), 0)
+        .unwrap_or_else(|e| unreachable!("fixture {e:?}"))
+    {
+        Frame::GroupRoute(e) => e,
+        Frame::Pass(_) => unreachable!("route fixture"),
+    }
+}
+fn route_state(e: &route::Envelope) -> control_router::shadow::live::LiveState {
+    use control_router::shadow::{
+        Event, Status,
+        live::{AccountWitness, Batch, LiveEvent, LiveState, Witness},
+        native::{Coverage, Entry, GoArch},
+    };
+    let mut state = LiveState::new(control_router::shadow::Limits::default());
+    state
+        .install_native(Coverage {
+            epoch: e.epoch,
+            origin: origin(),
+            go_arch: GoArch::Arm64,
+            zero_time: control_routing::go_time::GoTime::new(0, 0, 1, None)
+                .unwrap_or_else(|| unreachable!("time")),
+        })
+        .unwrap_or_else(|_| unreachable!("coverage"));
+    for (sequence, event) in [
+        (
+            1,
+            LiveEvent::Lifecycle {
+                event: Event::Begin,
+                source: 0,
+                target: 0,
+            },
+        ),
+        (2, LiveEvent::GroupCreated(2)),
+    ] {
+        assert_eq!(
+            state
+                .observe(&Batch {
+                    epoch: e.epoch,
+                    sequence,
+                    events: vec![event],
+                    witness: Witness::default()
+                })
+                .status,
+            Status::Comparing
+        );
+    }
+    let route::Child::Evaluation(native) = &e.children[0] else {
+        unreachable!("native")
+    };
+    let mut config = native.as_ref().clone();
+    config.sequence = 3;
+    config.evaluation = 1;
+    config.entry = Entry::Config;
+    config.accounts.clear();
+    config.reads.clear();
+    config.sorted.clear();
+    config.returned.clear();
+    assert_eq!(
+        state.observe_native(&config, 4096).status,
+        Status::Comparing
+    );
+    assert_eq!(
+        state
+            .observe(&Batch {
+                epoch: e.epoch,
+                sequence: 4,
+                events: vec![LiveEvent::Lifecycle {
+                    event: Event::Account { id: 9, group: 2 },
+                    source: 0,
+                    target: 0
+                }],
+                witness: Witness {
+                    accounts: vec![AccountWitness {
+                        id: 9,
+                        score: 0,
+                        physical: 0,
+                        head: 0,
+                        tail: 0
+                    }],
+                    ..Witness::default()
+                }
+            })
+            .status,
+        Status::Comparing
+    );
+    state
+}
+#[test]
+fn complete_go_nested_fixture_drives_atomic_domain_comparator() {
+    use control_router::shadow::Status;
+    let e = route_frame(ROUTE);
+    assert_eq!(
+        (e.sequence, e.span, e.route.members.as_slice()),
+        (5, 4, &[9][..]),
+        "ROUTE_WIRE_IDENTITY_SPAN"
+    );
+    let mut state = route_state(&e);
+    let p = state.observe_group_route(&e, frame(ROUTE).len());
+    assert_eq!(
+        (p.status, p.compared_sequence),
+        (Status::Comparing, 8),
+        "ROUTE_GO_WIRE_DOMAIN_COMMIT"
+    );
+    assert_eq!(
+        state.totals(e.epoch),
+        Some((1, 0)),
+        "ROUTE_GO_WIRE_RESERVATION"
+    );
+    assert!(
+        decode_caller(&frame(ROUTE), None, 0).is_err(),
+        "ROUTE_NESTED_ORIGIN_REQUIRED"
+    );
+    assert!(decode(&frame(ROUTE), 0).is_err(), "ROUTE_NOT_PASS_DIALECT");
+    let mut late = e.clone();
+    late.route.result.completed = 1;
+    let mut state = route_state(&e);
+    assert_eq!(
+        state
+            .observe_group_route(&late, frame(ROUTE).len())
+            .compared_sequence,
+        4,
+        "ROUTE_GO_WIRE_LATE_FAILURE_ATOMIC"
+    );
+    assert_eq!(state.totals(e.epoch), Some((0, 0)));
+}
+#[test]
+fn caller_nested_bodies_preserve_strict_v2_v3_allowlists() {
+    let source: serde_json::Value =
+        serde_json::from_str(ROUTE).unwrap_or_else(|_| unreachable!("json"));
+    for fault in 0..20 {
+        let mut value = source.clone();
+        let r = &mut value["payload"]["group_route"];
+        let children = &mut r["children"];
+        match fault {
+            0 => children[0]["evaluation"]["version"] = 2.into(),
+            1 => children[0]["evaluation"]["owner"] = "99".into(),
+            2 => children[0]["evaluation"]["sequence"] = "05".into(),
+            3 => children[0]["evaluation"]["group"] = "99".into(),
+            4 => children[0]["evaluation"]["extra"] = true.into(),
+            5 => children[1]["batch"]["factors"] = true.into(),
+            6 => children[1]["batch"]["events"][0]["target"] = "9".into(),
+            7 => children[1]["batch"]["witness"]["accounts"][0]["score"] = "01".into(),
+            8 => {
+                children[1]["batch"]["witness"]
+                    .as_object_mut()
+                    .unwrap_or_else(|| unreachable!("object"))
+                    .remove("before");
+            }
+            9 => children[1]["batch"]["sequence"] = "5".into(),
+            10 => children[1]["batch"]["kind"] = "invalid".into(),
+            11 => value["span"] = "5".into(),
+            12 => r["members"] = serde_json::json!(["9", "9"]),
+            13 => r["reads"][0]["healthy"]["completed"] = 256.into(),
+            14 => r["reads"][0]["healthy"]["extra"] = false.into(),
+            15 => r["reads"][0]["healthy"]["account"] = "0".into(),
+            16 => {
+                r["reads"] = serde_json::json!([{"backend_id":{"completed":0,"account":"9","value":"x".repeat(513)}}]);
+            }
+            17 => {
+                let old = r["reads"][0].clone();
+                r["reads"] = vec![old; 129].into();
+            }
+            18 => {
+                let old = children[0].clone();
+                children
+                    .as_array_mut()
+                    .unwrap_or_else(|| unreachable!("array"))
+                    .push(old);
+            }
+            _ => r["excluded_count"] = 65.into(),
+        }
+        assert!(
+            decode_caller(&frame(&value.to_string()), Some(origin()), 0).is_err(),
+            "ROUTE_STRICT_NESTED_SCHEMA {fault}"
+        );
+    }
+    for (from, to) in [
+        (
+            r#""excluded_count":0"#,
+            r#""excluded_count":0,"excluded_count":0"#,
+        ),
+        (r#""entry":"route""#, r#""entry":"route","entry":"route""#),
+        (
+            r#""lifecycle_only":true"#,
+            r#""lifecycle_only":true,"lifecycle_only":true"#,
+        ),
+        (
+            r#""healthy":{"completed":0"#,
+            r#""healthy":{"completed":0,"completed":0"#,
+        ),
+    ] {
+        let bad = ROUTE.replace(from, to);
+        assert_ne!(bad, ROUTE);
+        assert!(
+            decode_caller(&frame(&bad), Some(origin()), 0).is_err(),
+            "ROUTE_DUPLICATE_KEYS {from}"
+        );
+    }
+}
+
+#[test]
+fn nested_child_cross_product_and_decode_layout_are_bounded() {
+    let base: serde_json::Value =
+        serde_json::from_str(ROUTE).unwrap_or_else(|_| unreachable!("json"));
+    for (evaluations, batches, valid) in [(4, 64, true), (5, 64, false), (4, 65, false)] {
+        let mut value = base.clone();
+        let r = &mut value["payload"]["group_route"];
+        let native = r["children"][0].clone();
+        let batch = r["children"][1].clone();
+        let mut children = Vec::new();
+        let mut next = 5;
+        for _ in 0..evaluations {
+            let mut n = native.clone();
+            n["evaluation"]["sequence"] = next.to_string().into();
+            children.push(n);
+            next += 1;
+        }
+        for _ in 0..batches {
+            let mut b = batch.clone();
+            b["batch"]["sequence"] = next.to_string().into();
+            let mut event = b["batch"]["events"][0].clone();
+            event["kind"] = "watermark".into();
+            event["session"] = "0".into();
+            b["batch"]["events"] = vec![event; 4].into();
+            children.push(b);
+            next += 4;
+        }
+        r["children"] = children.into();
+        r["result"]["completed"] = (evaluations + batches).into();
+        value["span"] = (next - 5 + 1).to_string().into();
+        let wire = frame(&value.to_string());
+        assert_eq!(
+            decode_caller(&wire, Some(origin()), 0).is_ok(),
+            valid,
+            "ROUTE_NESTED_CHILD_BOUNDS"
+        );
+        if valid {
+            let Frame::GroupRoute(e) =
+                decode_caller(&wire, Some(origin()), 0).unwrap_or_else(|_| unreachable!("bounded"))
+            else {
+                unreachable!("group")
+            };
+            assert_eq!(e.span, 261, "ROUTE_NESTED_FULL_SPAN");
+            // Only a codec/ownership stress body: not a legal semantic Group.Route.
+            assert!(
+                size_of::<Wire>()
+                    + size_of::<route::Envelope>()
+                    + 68 * size_of::<route::Child>()
+                    + 256 * size_of::<route::Read>()
+                    + 2 * 64 * size_of::<u64>()
+                    < STAGE_OVERHEAD,
+                "ROUTE_FIXED_DECODE_TEMPORARIES"
+            );
+            eprintln!(
+                "route_wire={} envelope={} child={} read={} full_child_frame={} decode32F={}",
+                size_of::<Wire>(),
+                size_of::<route::Envelope>(),
+                size_of::<route::Child>(),
+                size_of::<route::Read>(),
+                wire.len(),
+                32 * wire.len()
+            );
+        }
+    }
+    let mut body = ROUTE.to_owned();
+    body.extend(std::iter::repeat_n(' ', MAX_CALLER_FRAME - 4 - body.len()));
+    assert!(
+        decode_caller(&frame(&body), Some(origin()), 0).is_ok(),
+        "ROUTE_PREFIX_EQUAL"
+    );
+    body.push(' ');
+    assert!(
+        matches!(
+            decode_caller(&frame(&body), Some(origin()), 0),
+            Err(Error::Oversized)
+        ),
+        "ROUTE_PREFIX_PLUS_ONE"
+    );
+}

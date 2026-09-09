@@ -3,11 +3,13 @@
 
 //! Preparatory strict v4 router pass boundaries. This codec is deliberately not
 //! selected by the existing v2/v3 consumer and confers no coverage capability.
+mod route_wire;
 use crate::{Error, native::Decimal};
 use control_router::shadow::{
     Epoch,
-    live::caller::{Budget, MAX_CALLER_FRAME, pass},
+    live::caller::{Budget, MAX_CALLER_FRAME, pass, route},
 };
+use control_routing::go_time::Origin;
 use serde::{
     Deserialize, Deserializer,
     de::{Error as _, SeqAccess, Visitor},
@@ -56,6 +58,8 @@ impl<'de> Deserialize<'de> for Groups {
 #[serde(deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // The full fixed variant is included in the decode budget.
 enum Payload {
+    #[serde(rename = "group_route")]
+    GroupRoute(route_wire::WireRoute),
     #[serde(rename = "pass_begin")]
     Begin {
         pass: Decimal,
@@ -82,17 +86,30 @@ struct Wire {
     payload: Payload,
 }
 impl Wire {
-    fn domain(self) -> Result<pass::Boundary, Error> {
+    fn domain(self, origin: Option<Origin>) -> Result<Frame, Error> {
         let Kind::Caller = self.kind;
         if self.version != 4 {
             return Err(Error::Version);
         }
         if [self.process.0, self.owner.0, self.nonce.0, self.sequence.0].contains(&0)
-            || self.span.0 != 1
+            || self.span.0 == 0
         {
             return Err(Error::Schema);
         }
+        let epoch = Epoch {
+            process: self.process.0,
+            owner: self.owner.0,
+            nonce: self.nonce.0,
+        };
+        if let Payload::GroupRoute(value) = self.payload {
+            let envelope = value.domain(epoch, self.sequence.0, self.span.0, origin)?;
+            return Ok(Frame::GroupRoute(envelope));
+        }
+        if self.span.0 != 1 {
+            return Err(Error::Schema);
+        }
         let event = match self.payload {
+            Payload::GroupRoute(_) => return Err(Error::Schema),
             Payload::Begin {
                 pass,
                 support_redirection,
@@ -125,7 +142,7 @@ impl Wire {
                 })
             }
         };
-        Ok(pass::Boundary {
+        Ok(Frame::Pass(pass::Boundary {
             epoch: Epoch {
                 process: self.process.0,
                 owner: self.owner.0,
@@ -133,8 +150,17 @@ impl Wire {
             },
             sequence: self.sequence.0,
             event,
-        })
+        }))
     }
+}
+
+/// A strictly decoded caller, still requiring its independent domain comparator.
+#[allow(clippy::large_enum_variant)] // Bounded fixed pass storage is included in 32F + S.
+pub enum Frame {
+    /// Router pass boundary; independently derived inventory/gate required.
+    Pass(pass::Boundary),
+    /// Group Route with complete nested v3/v2 children.
+    GroupRoute(route::Envelope),
 }
 
 /// Reserve BEFORE allocating an incoming body. `frame_bytes` includes the four
@@ -159,6 +185,21 @@ pub fn admission(frame_bytes: usize, retained: usize) -> Result<Budget, Error> {
 /// # Errors
 /// Rejects bad framing, strict schema violations or exceeded shared budgets.
 pub fn decode(frame: &[u8], retained: usize) -> Result<pass::Boundary, Error> {
+    match decode_caller(frame, None, retained)? {
+        Frame::Pass(pass) => Ok(pass),
+        Frame::GroupRoute(_) => Err(Error::Schema),
+    }
+}
+
+/// Decode a complete caller; native children require the already accepted Go origin.
+///
+/// # Errors
+/// Rejects malformed bounded values, foreign/non-contiguous children and admission failure.
+pub fn decode_caller(
+    frame: &[u8],
+    origin: Option<Origin>,
+    retained: usize,
+) -> Result<Frame, Error> {
     admission(frame.len(), retained)?;
     let prefix: [u8; 4] = frame[..4].try_into().map_err(|_| Error::Framing)?;
     let body = usize::try_from(u32::from_be_bytes(prefix)).map_err(|_| Error::Oversized)?;
@@ -170,7 +211,7 @@ pub fn decode(frame: &[u8], retained: usize) -> Result<pass::Boundary, Error> {
     }
     serde_json::from_slice::<Wire>(&frame[4..])
         .map_err(|_| Error::Schema)?
-        .domain()
+        .domain(origin)
 }
 
 #[cfg(test)]

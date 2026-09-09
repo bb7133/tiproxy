@@ -28,6 +28,7 @@ type CallerChild struct {
 }
 
 type callerStorage struct {
+	route       GroupRoute
 	pass        RouterPass
 	input       [MaxCallerDataBytes]byte
 	output      [MaxCallerFrameBytes]byte
@@ -102,10 +103,14 @@ func (c *Caller) Append(value []byte) bool {
 	if !c.writable() {
 		return false
 	}
-	if c.storage.pass.Kind != 0 {
+	if c.storage.pass.Kind != 0 || c.storage.route.ID != 0 {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
+	return c.appendBytes(value)
+}
+
+func (c *Caller) appendBytes(value []byte) bool {
 	if len(value) > MaxCallerDataBytes-c.length {
 		c.owner.Invalidate(Capacity)
 		return false
@@ -121,7 +126,7 @@ func (c *Caller) BeginEvaluation() *Evaluation {
 	if !c.writable() {
 		return nil
 	}
-	if c.storage.pass.Kind != 0 {
+	if c.storage.pass.Kind != 0 || c.storage.route.ResultSet {
 		c.owner.Invalidate(Malformed)
 		return nil
 	}
@@ -145,7 +150,7 @@ func (c *Caller) CompleteEvaluation(e *Evaluation) bool {
 	if !c.writable() {
 		return false
 	}
-	if e == nil || e.parent != c || !e.sealed || e.published || e.lease.released.Load() {
+	if c.storage.route.ResultSet || e == nil || e.parent != c || !e.sealed || e.published || e.lease.released.Load() {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
@@ -167,7 +172,7 @@ func (c *Caller) AppendBatch(batch Batch) bool {
 	if !c.writable() {
 		return false
 	}
-	if c.storage.pass.Kind != 0 || batch.EventCount == 0 || batch.EventCount > MaxEvents || batch.Witness.AccountCount > MaxWitnesses {
+	if c.storage.pass.Kind != 0 || c.storage.route.ResultSet || batch.EventCount == 0 || batch.EventCount > MaxEvents || batch.Witness.AccountCount > MaxWitnesses {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
@@ -186,7 +191,7 @@ func (c *Caller) Seal() bool {
 	if !c.writable() {
 		return false
 	}
-	if c.length == 0 && c.storage.pass.Kind == 0 || c.children != c.evaluations+c.batches {
+	if c.length == 0 && c.storage.pass.Kind == 0 && c.storage.route.ID == 0 || c.storage.route.ID != 0 && !c.storage.route.ResultSet || c.children != c.evaluations+c.batches {
 		c.owner.Invalidate(Malformed)
 		return false
 	}

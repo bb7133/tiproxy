@@ -9,7 +9,7 @@ import (
 	"github.com/pingcap/tiproxy/pkg/balance/observation"
 )
 
-// EncodeCaller currently accepts only typed router pass boundaries. It does not
+// EncodeCaller currently accepts typed router pass and Group route boundaries. It does not
 // install a v4 transport or grant selection/scheduler coverage. The returned
 // bytes borrow the parent's charged arena until the final writer releases it.
 func EncodeCaller(record observation.Record) (frame []byte, err error) {
@@ -20,11 +20,11 @@ func EncodeCaller(record observation.Record) (frame []byte, err error) {
 		}
 	}()
 	if !record.Native || c == nil || record.Evaluation != nil || record.Batch.EventCount != 0 ||
-		record.Sequence == 0 || record.Epoch.Process == 0 || record.Epoch.Owner == 0 || record.Epoch.Nonce == 0 || c.Span() != 1 || len(c.Children()) != 0 {
+		record.Sequence == 0 || record.Epoch.Process == 0 || record.Epoch.Owner == 0 || record.Epoch.Nonce == 0 || c.Span() == 0 {
 		return nil, errSchema
 	}
 	p, buffer := c.Pass(), c.EncodingBuffer()
-	if p == nil || len(buffer) != observation.MaxCallerFrameBytes || !validPass(p) {
+	if len(buffer) != observation.MaxCallerFrameBytes || p != nil && (c.Span() != 1 || len(c.Children()) != 0 || !validPass(p)) || p == nil && c.Route() == nil {
 		return nil, errSchema
 	}
 	w := nativeEncoder{buffer: buffer, used: 4}
@@ -36,29 +36,38 @@ func EncodeCaller(record observation.Record) (frame []byte, err error) {
 	w.uint(record.Epoch.Nonce)
 	w.literal(`,"sequence":`)
 	w.uint(record.Sequence)
-	w.literal(`,"span":"1","payload":{`)
-	if p.Kind == observation.RouterPassBegin {
-		w.literal(`"pass_begin":{"pass":`)
-		w.uint(p.ID)
-		w.literal(`,"support_redirection":`)
-		w.boolean(p.SupportRedirection)
-		w.literal(`,"groups":[`)
-		for i, group := range p.Groups[:p.GroupCount] {
-			if i > 0 {
-				w.literal(",")
-			}
-			w.uint(group)
+	w.literal(`,"span":`)
+	w.uint(c.Span())
+	w.literal(`,"payload":{`)
+	if p == nil {
+		if !w.groupRoute(record) {
+			return nil, errSchema
 		}
-		w.literal(`]`)
 	} else {
-		w.literal(`"pass_end":{"pass":`)
-		w.uint(p.ID)
-		w.literal(`,"balanced":`)
-		w.small(int64(p.Balanced))
-		w.literal(`,"closed":`)
-		w.small(int64(p.Closed))
+		if p.Kind == observation.RouterPassBegin {
+			w.literal(`"pass_begin":{"pass":`)
+			w.uint(p.ID)
+			w.literal(`,"support_redirection":`)
+			w.boolean(p.SupportRedirection)
+			w.literal(`,"groups":[`)
+			for i, group := range p.Groups[:p.GroupCount] {
+				if i > 0 {
+					w.literal(",")
+				}
+				w.uint(group)
+			}
+			w.literal(`]`)
+		} else {
+			w.literal(`"pass_end":{"pass":`)
+			w.uint(p.ID)
+			w.literal(`,"balanced":`)
+			w.small(int64(p.Balanced))
+			w.literal(`,"closed":`)
+			w.small(int64(p.Closed))
+		}
+		w.literal(`}`)
 	}
-	w.literal(`}}}`)
+	w.literal(`}}`)
 	if w.failed {
 		c.Fail(observation.Capacity)
 		return nil, errSchema

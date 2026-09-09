@@ -71,7 +71,7 @@ func (c *Caller) passWritable(id uint64) bool {
 	if !c.writable() {
 		return false
 	}
-	if id == 0 || c.storage.pass.Kind != 0 || c.length != 0 || c.evaluations != 0 || c.batches != 0 {
+	if id == 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.length != 0 || c.evaluations != 0 || c.batches != 0 {
 		c.owner.Invalidate(Malformed)
 		return false
 	}

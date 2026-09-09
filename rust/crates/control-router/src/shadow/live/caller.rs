@@ -9,6 +9,8 @@
 pub mod arithmetic;
 /// Bounded router pass boundary and order comparison; not installed yet.
 pub mod pass;
+/// Group-local Route capture and independent atomic comparison; not installed yet.
+pub mod route;
 
 use super::native::{HISTORY_LIMIT, NativeOwner, STAGE_OVERHEAD, Stored};
 use super::{Batch, Epoch, Event, InvalidReason, LiveEvent, LiveState, Progress, Status};

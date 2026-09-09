@@ -356,7 +356,6 @@ pub enum InvalidCause {
 /// # Errors
 /// Rejects unknown versions/fields, missing/duplicate keys, noncanonical IDs,
 /// oversized frames, oversized collections and witness-free v1 records.
-#[allow(clippy::too_many_lines)] // Three strict envelopes share the same mandatory coverage checks.
 pub fn decode(frame: &[u8]) -> Result<Frame, Error> {
     let prefix: [u8; 4] = frame
         .get(..4)
@@ -371,138 +370,158 @@ pub fn decode(frame: &[u8]) -> Result<Frame, Error> {
         return Err(Error::Framing);
     }
     let value: WireFrame = serde_json::from_slice(&frame[4..]).map_err(|_| Error::Schema)?;
-    let (version, epoch, coverage, result) = match value {
-        WireFrame::Batch {
-            version,
-            process,
-            owner,
-            nonce,
-            lifecycle_only,
-            factors,
-            selection,
-            scheduler,
-            sequence,
-            events,
-            witness,
-        } => {
-            let epoch = Epoch {
-                process: process.0,
-                owner: owner.0,
-                nonce: nonce.0,
-            };
-            if sequence.0 == 0 || events.0.is_empty() {
-                return Err(Error::Schema);
-            }
-            let events = events
-                .0
-                .into_iter()
-                .map(WireEvent::domain)
-                .collect::<Result<Vec<_>, _>>()?;
-            let accounts = witness
-                .accounts
-                .0
-                .into_iter()
-                .map(|a| AccountWitness {
-                    id: a.id.0,
-                    score: a.score.0,
-                    physical: a.physical.0,
-                    head: a.head.0,
-                    tail: a.tail.0,
-                })
-                .collect();
-            let batch = Batch {
-                epoch,
-                sequence: sequence.0,
+    value.domain()
+}
+
+// Nested bodies reuse every v2 event/witness/coverage check; invalid and coverage
+// messages remain out-of-band and are never accepted as caller children.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub(crate) struct NestedBatch(WireFrame);
+impl NestedBatch {
+    pub(crate) fn domain(self) -> Result<Batch, Error> {
+        match self.0.domain()? {
+            Frame::Batch(batch) => Ok(batch),
+            _ => Err(Error::Schema),
+        }
+    }
+}
+impl WireFrame {
+    #[allow(clippy::too_many_lines)] // Complete existing allowlist remains shared with v2.
+    fn domain(self) -> Result<Frame, Error> {
+        let (version, epoch, coverage, result) = match self {
+            WireFrame::Batch {
+                version,
+                process,
+                owner,
+                nonce,
+                lifecycle_only,
+                factors,
+                selection,
+                scheduler,
+                sequence,
                 events,
-                witness: Witness {
-                    accounts,
-                    session: witness.session.0,
-                    predecessor: witness.predecessor.0,
-                    before: witness.before.into(),
-                    after: witness.after.into(),
-                },
-            };
-            (
-                version,
-                epoch,
-                (lifecycle_only, factors, selection, scheduler),
-                Frame::Batch(batch),
-            )
-        }
-        WireFrame::Invalid {
-            version,
-            process,
-            owner,
-            nonce,
-            lifecycle_only,
-            factors,
-            selection,
-            scheduler,
-            last_admitted,
-            reason,
-        } => {
-            let epoch = Epoch {
-                process: process.0,
-                owner: owner.0,
-                nonce: nonce.0,
-            };
-            let reason = match reason.as_str() {
-                "capacity" => InvalidCause::Capacity,
-                "malformed" => InvalidCause::Malformed,
-                "sequence_exhausted" => InvalidCause::SequenceExhausted,
-                "transport_lost" => InvalidCause::TransportLost,
-                "owner_disappeared" => InvalidCause::OwnerDisappeared,
-                "shutdown" => InvalidCause::Shutdown,
-                "stale" => InvalidCause::Stale,
-                "unpaired_discard" => InvalidCause::UnpairedDiscard,
-                _ => return Err(Error::Schema),
-            };
-            (
-                version,
-                epoch,
-                (lifecycle_only, factors, selection, scheduler),
-                Frame::Invalid {
-                    epoch,
-                    last_admitted: last_admitted.0,
-                    reason,
-                },
-            )
-        }
-        WireFrame::Coverage {
-            version,
-            process,
-            owner,
-            nonce,
-            lifecycle_only,
-            factors,
-            selection,
-            scheduler,
-        } => {
-            let epoch = Epoch {
-                process: process.0,
-                owner: owner.0,
-                nonce: nonce.0,
-            };
-            (
-                version,
-                epoch,
-                (lifecycle_only, factors, selection, scheduler),
-                Frame::Coverage {
+                witness,
+            } => {
+                let epoch = Epoch {
                     process: process.0,
+                    owner: owner.0,
                     nonce: nonce.0,
-                },
-            )
+                };
+                if sequence.0 == 0 || events.0.is_empty() {
+                    return Err(Error::Schema);
+                }
+                let events = events
+                    .0
+                    .into_iter()
+                    .map(WireEvent::domain)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let accounts = witness
+                    .accounts
+                    .0
+                    .into_iter()
+                    .map(|a| AccountWitness {
+                        id: a.id.0,
+                        score: a.score.0,
+                        physical: a.physical.0,
+                        head: a.head.0,
+                        tail: a.tail.0,
+                    })
+                    .collect();
+                let batch = Batch {
+                    epoch,
+                    sequence: sequence.0,
+                    events,
+                    witness: Witness {
+                        accounts,
+                        session: witness.session.0,
+                        predecessor: witness.predecessor.0,
+                        before: witness.before.into(),
+                        after: witness.after.into(),
+                    },
+                };
+                (
+                    version,
+                    epoch,
+                    (lifecycle_only, factors, selection, scheduler),
+                    Frame::Batch(batch),
+                )
+            }
+            WireFrame::Invalid {
+                version,
+                process,
+                owner,
+                nonce,
+                lifecycle_only,
+                factors,
+                selection,
+                scheduler,
+                last_admitted,
+                reason,
+            } => {
+                let epoch = Epoch {
+                    process: process.0,
+                    owner: owner.0,
+                    nonce: nonce.0,
+                };
+                let reason = match reason.as_str() {
+                    "capacity" => InvalidCause::Capacity,
+                    "malformed" => InvalidCause::Malformed,
+                    "sequence_exhausted" => InvalidCause::SequenceExhausted,
+                    "transport_lost" => InvalidCause::TransportLost,
+                    "owner_disappeared" => InvalidCause::OwnerDisappeared,
+                    "shutdown" => InvalidCause::Shutdown,
+                    "stale" => InvalidCause::Stale,
+                    "unpaired_discard" => InvalidCause::UnpairedDiscard,
+                    _ => return Err(Error::Schema),
+                };
+                (
+                    version,
+                    epoch,
+                    (lifecycle_only, factors, selection, scheduler),
+                    Frame::Invalid {
+                        epoch,
+                        last_admitted: last_admitted.0,
+                        reason,
+                    },
+                )
+            }
+            WireFrame::Coverage {
+                version,
+                process,
+                owner,
+                nonce,
+                lifecycle_only,
+                factors,
+                selection,
+                scheduler,
+            } => {
+                let epoch = Epoch {
+                    process: process.0,
+                    owner: owner.0,
+                    nonce: nonce.0,
+                };
+                (
+                    version,
+                    epoch,
+                    (lifecycle_only, factors, selection, scheduler),
+                    Frame::Coverage {
+                        process: process.0,
+                        nonce: nonce.0,
+                    },
+                )
+            }
+        };
+        if version != 2 {
+            return Err(Error::Version);
         }
-    };
-    if version != 2 {
-        return Err(Error::Version);
+        if epoch.process == 0
+            || epoch.nonce == 0
+            || coverage != (true, false, false, false)
+            || matches!(result, Frame::Coverage { .. }) != (epoch.owner == 0)
+        {
+            return Err(Error::Schema);
+        }
+        Ok(result)
     }
-    if epoch.process == 0
-        || epoch.nonce == 0
-        || coverage != (true, false, false, false)
-        || matches!(result, Frame::Coverage { .. }) != (epoch.owner == 0)
-    {
-        return Err(Error::Schema);
-    }
-    Ok(result)
 }

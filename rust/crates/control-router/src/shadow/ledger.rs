@@ -226,6 +226,14 @@ pub(super) struct Mirror {
     hidden_sessions: usize,
 }
 impl Mirror {
+    // The complete retained Group inventory, never seeded from filtered native inputs.
+    pub(super) fn caller_account_ids(&self, group: u64) -> impl Iterator<Item = u64> + '_ {
+        self.accounts
+            .iter()
+            .filter(move |(_, a)| a.group == group && !a.removed)
+            .map(|(id, _)| *id)
+    }
+
     // Callers validate the scope and reserve this charge before cloning. Four
     // times physical capacity also covers a temporary vector reallocation when
     // a staged lifecycle transition appends. New bounded keys fit the separate

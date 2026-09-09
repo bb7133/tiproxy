@@ -449,6 +449,16 @@ struct WireEvaluation {
     balance_count: Decimal,
     reason: String,
 }
+// Reuse the strict v3 body inside an externally tagged caller child.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub(crate) struct NestedEvaluation(WireEvaluation);
+impl NestedEvaluation {
+    pub(crate) fn domain(self, origin: Origin) -> Result<domain::Evaluation, Error> {
+        self.0.domain(origin)
+    }
+}
+
 impl WireEvaluation {
     fn domain(self, origin: Origin) -> Result<domain::Evaluation, Error> {
         if self.version != 3 {
