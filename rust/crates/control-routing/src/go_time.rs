@@ -206,6 +206,19 @@ impl SampleTime {
         self.0.wrapping_sub(other.0).wrapping_mul(1_000_000)
     }
 
+    /// Project sample ticks using a previously validated location identity.
+    /// No monotonic component is invented for a Unix timestamp.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn as_go_time_at(self, reference: GoTime) -> GoTime {
+        GoTime {
+            seconds: self.0.div_euclid(1000) + UNIX_TO_INTERNAL,
+            nanoseconds: (self.0.rem_euclid(1000) * 1_000_000) as u32,
+            location: reference.location,
+            monotonic: None,
+        }
+    }
+
     /// Project the instant as Go `UnixMilli` does, preserving the caller's actual
     /// Location identity. Sample arithmetic must still use the original ticks.
     #[must_use]

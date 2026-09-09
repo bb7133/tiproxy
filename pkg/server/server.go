@@ -129,7 +129,7 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 			lg.Warn("routing lifecycle observation disabled", zap.Error(shadowErr))
 		} else {
 			srv.routingShadow = shadow
-			srv.namespaceManager = mgrns.NewNamespaceManagerWithObservation(shadow.Recorder())
+			srv.namespaceManager = mgrns.NewNamespaceManagerWithNativeObservation(shadow.Recorder())
 			defer func() {
 				if err != nil {
 					shadow.Close()

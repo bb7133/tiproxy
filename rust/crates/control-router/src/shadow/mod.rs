@@ -17,6 +17,9 @@
 mod ledger;
 /// Actual-capture batches and independent output-witness comparison.
 pub mod live;
+/// Owned native factor read windows and separate output witnesses.
+pub mod native;
+mod native_compute;
 
 use std::collections::BTreeMap;
 

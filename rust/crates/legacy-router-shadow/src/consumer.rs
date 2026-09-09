@@ -34,6 +34,16 @@ pub struct Report {
     pub batches: u64,
     /// Number of lifecycle events in those batches.
     pub events: u64,
+    /// Independently compared complete native evaluations.
+    pub evaluations: u64,
+    /// Independently accepted complete native configuration evaluations.
+    pub native_configurations: u64,
+    /// Current charged native metadata/history, excluding transient staging.
+    pub native_retained_bytes: usize,
+    /// Highest admitted native retained plus decoder/clone/staging charge.
+    pub native_peak_bytes: usize,
+    /// Owners whose immutable factory installed native factor capture.
+    pub native_owners: std::collections::BTreeSet<Epoch>,
     /// Qualified accepted lifecycle transitions, excluding identity/coverage events.
     pub operations: u64,
     /// Independently derived retained score count across known exact owners.
@@ -134,9 +144,16 @@ async fn run(path: &Path, mut shutdown: watch::Receiver<bool>, diagnostics: &Dia
                 _=shutdown.changed()=>Ok(()),
                 result=consume(&mut stream,&mut state,&mut epochs,diagnostics)=>result,
             };
-            if result == Err("stale") {
+            if result == Err("stale") || result == Err("history_capacity") {
                 for epoch in epochs.keys() {
-                    state.invalidate(*epoch, InvalidReason::Stale);
+                    state.invalidate(
+                        *epoch,
+                        if result == Err("history_capacity") {
+                            InvalidReason::Capacity
+                        } else {
+                            InvalidReason::Stale
+                        },
+                    );
                 }
             }
             state.transport_lost();
@@ -146,7 +163,7 @@ async fn run(path: &Path, mut shutdown: watch::Receiver<bool>, diagnostics: &Dia
             }
             if let Err(reason) = result {
                 eprintln!(
-                    "routing_shadow lifecycle_only=true factors=false selection=false scheduler=false interval_invalid={reason}"
+                    "routing_shadow selection=false scheduler=false interval_invalid={reason}"
                 );
             }
         }
@@ -158,7 +175,7 @@ async fn run(path: &Path, mut shutdown: watch::Receiver<bool>, diagnostics: &Dia
             report.transport_errors += 1;
             if report.transport_errors % 20 == 1 {
                 eprintln!(
-                    "routing_shadow lifecycle_only=true factors=false selection=false scheduler=false connection_unavailable=true transport_errors={}",
+                    "routing_shadow selection=false scheduler=false connection_unavailable=true transport_errors={}",
                     report.transport_errors
                 );
             }
@@ -202,57 +219,72 @@ async fn consume(
     let mut identity = None;
     let mut last_report = Instant::now();
     loop {
-        let frame = read_frame(stream).await?;
-        let changed = match live::decode(&frame).map_err(|_| "schema")? {
-            Frame::Coverage { process, nonce } => {
-                if identity.replace((process, nonce)).is_some() {
-                    return Err("duplicate_coverage");
-                }
-                None
+        let frame = read_frame(stream, state).await?;
+        let staging = frame
+            .len()
+            .checked_mul(crate::native::DECODE_MULTIPLIER)
+            .ok_or("history_capacity")?;
+        let changed = if let Some(epoch) = crate::native::envelope(&frame).map_err(|_| "schema")? {
+            if identity != Some((epoch.process, epoch.nonce)) {
+                return Err("identity");
             }
-            Frame::Batch(batch) => {
-                if identity != Some((batch.epoch.process, batch.epoch.nonce)) {
-                    return Err("identity");
+            consume_native(&frame, epoch, state, epochs, diagnostics, staging)?
+        } else {
+            match live::decode(&frame).map_err(|_| "schema")? {
+                Frame::Coverage { process, nonce } => {
+                    if identity.replace((process, nonce)).is_some() {
+                        return Err("duplicate_coverage");
+                    }
+                    None
                 }
-                if !epochs.contains_key(&batch.epoch) && epochs.len() >= Limits::default().owners {
-                    return Err("owner_capacity");
+                Frame::Batch(batch) => {
+                    if identity != Some((batch.epoch.process, batch.epoch.nonce)) {
+                        return Err("identity");
+                    }
+                    if !epochs.contains_key(&batch.epoch)
+                        && epochs.len() >= Limits::default().owners
+                    {
+                        return Err("owner_capacity");
+                    }
+                    epochs.insert(batch.epoch, Instant::now());
+                    let progress = state.observe(&batch);
+                    let operations = if progress.status == Status::Comparing {
+                        business_operations(&batch.events)
+                    } else {
+                        0
+                    };
+                    let mut report = diagnostics
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    report.batches += 1;
+                    report.operations +=
+                        u64::try_from(operations).map_err(|_| "operation_count")?;
+                    report.events +=
+                        u64::try_from(batch.events.len()).map_err(|_| "event_count")?;
+                    Some(batch.epoch)
                 }
-                epochs.insert(batch.epoch, Instant::now());
-                let progress = state.observe(&batch);
-                let operations = if progress.status == Status::Comparing {
-                    business_operations(&batch.events)
-                } else {
-                    0
-                };
-                let mut report = diagnostics
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                report.batches += 1;
-                report.operations += u64::try_from(operations).map_err(|_| "operation_count")?;
-                report.events += u64::try_from(batch.events.len()).map_err(|_| "event_count")?;
-                Some(batch.epoch)
-            }
-            Frame::Invalid {
-                epoch,
-                reason,
-                last_admitted,
-            } => {
-                if identity != Some((epoch.process, epoch.nonce)) {
-                    return Err("identity");
+                Frame::Invalid {
+                    epoch,
+                    reason,
+                    last_admitted,
+                } => {
+                    if identity != Some((epoch.process, epoch.nonce)) {
+                        return Err("identity");
+                    }
+                    if !epochs.contains_key(&epoch) && epochs.len() >= Limits::default().owners {
+                        return Err("owner_capacity");
+                    }
+                    epochs.insert(epoch, Instant::now());
+                    state.invalidate(epoch, InvalidReason::Transport);
+                    diagnostics
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .producer_invalid
+                        .insert(epoch, (reason, last_admitted));
+                    Some(epoch)
                 }
-                if !epochs.contains_key(&epoch) && epochs.len() >= Limits::default().owners {
-                    return Err("owner_capacity");
-                }
-                epochs.insert(epoch, Instant::now());
-                state.invalidate(epoch, InvalidReason::Transport);
-                diagnostics
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .producer_invalid
-                    .insert(epoch, (reason, last_admitted));
-                Some(epoch)
             }
         };
         let mut expired = false;
@@ -272,22 +304,78 @@ async fn consume(
             if expired { None } else { changed },
         );
         if last_report.elapsed() >= Duration::from_secs(10) {
-            let report = diagnostics.snapshot();
-            let invalid = report
-                .owners
-                .values()
-                .filter(|p| matches!(p.status, Status::Invalid(_)))
-                .count();
-            eprintln!(
-                "routing_shadow lifecycle_only=true factors=false selection=false scheduler=false owners={} batches={} events={} invalid={invalid}",
-                report.owners.len(),
-                report.batches,
-                report.events
-            );
+            log_progress(diagnostics);
             last_report = Instant::now();
         }
     }
 }
+fn log_progress(diagnostics: &Diagnostics) {
+    let report = diagnostics.snapshot();
+    let invalid = report
+        .owners
+        .values()
+        .filter(|p| matches!(p.status, Status::Invalid(_)))
+        .count();
+    eprintln!(
+        "routing_shadow native_owners={} factors_compared={} selection=false scheduler=false owners={} batches={} events={} invalid={invalid}",
+        report.native_owners.len(),
+        report.evaluations,
+        report.owners.len(),
+        report.batches,
+        report.events
+    );
+}
+
+fn consume_native(
+    frame: &[u8],
+    epoch: Epoch,
+    state: &mut LiveState,
+    epochs: &mut BTreeMap<Epoch, Instant>,
+    diagnostics: &Diagnostics,
+    staging: usize,
+) -> Result<Option<Epoch>, &'static str> {
+    let origin = state.native_coverage(epoch).map(|coverage| coverage.origin);
+    let owner = match crate::native::decode(frame, origin).map_err(|_| "native_schema")? {
+        crate::native::Frame::Coverage(coverage) => {
+            state
+                .install_native(coverage)
+                .map_err(|_| "native_coverage")?;
+            diagnostics
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .native_owners
+                .insert(epoch);
+            None
+        }
+        crate::native::Frame::Evaluation(e) => {
+            if !epochs.contains_key(&epoch) && epochs.len() >= Limits::default().owners {
+                return Err("owner_capacity");
+            }
+            epochs.insert(epoch, Instant::now());
+            let progress = state.observe_native(&e, staging);
+            if progress.status == Status::Comparing {
+                let mut report = diagnostics
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                report.evaluations += 1;
+                if e.entry == control_router::shadow::native::Entry::Config {
+                    report.native_configurations += 1;
+                }
+            }
+            Some(epoch)
+        }
+    };
+    let mut report = diagnostics
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    report.native_retained_bytes = state.native_retained_bytes();
+    report.native_peak_bytes = state.native_peak_bytes();
+    Ok(owner)
+}
+
 fn business_operations(events: &[control_router::shadow::live::LiveEvent]) -> usize {
     events
         .iter()
@@ -331,7 +419,7 @@ fn publish(
                 .is_none_or(|old| !matches!(old.status, Status::Invalid(_)))
         {
             eprintln!(
-                "routing_shadow lifecycle_only=true owner={} process={} compared={} invalid={:?} producer={:?}",
+                "routing_shadow owner={} process={} compared={} invalid={:?} producer={:?}",
                 epoch.owner,
                 epoch.process,
                 progress.compared_sequence,
@@ -354,7 +442,10 @@ fn publish(
 #[path = "consumer_tests.rs"]
 mod tests;
 
-async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, &'static str> {
+async fn read_frame(
+    stream: &mut UnixStream,
+    state: &mut LiveState,
+) -> Result<Vec<u8>, &'static str> {
     let mut prefix = [0; 4];
     timeout(STALE_DEADLINE, stream.read_exact(&mut prefix))
         .await
@@ -364,7 +455,14 @@ async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, &'static str> {
     if size == 0 || size > MAX_FRAME_BYTES {
         return Err("size");
     }
-    // One owned frame, released before the next read. No consumer backlog.
+    let staging = (size + 4)
+        .checked_mul(crate::native::DECODE_MULTIPLIER)
+        .ok_or("history_capacity")?;
+    if !state.native_admit_stage(staging) {
+        return Err("history_capacity");
+    }
+    // Admission precedes allocation. The frame and decoder staging are released
+    // before the next read; no consumer backlog exists.
     let mut frame = vec![0; size + 4];
     frame[..4].copy_from_slice(&prefix);
     timeout(

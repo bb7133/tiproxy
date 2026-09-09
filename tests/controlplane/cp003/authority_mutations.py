@@ -31,7 +31,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cpauthority-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
-        environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
+        environment = dict(os.environ, CARGO_TARGET_DIR=os.environ.get("CARGO_TARGET_DIR", str(root / "target")))
         command = ["cargo", "build", "--locked", "--offline", "--manifest-path", str(root / "rust/Cargo.toml"), "-p", "control-etcd", "--example", "cpauthority_observer"]
 
         def compile_candidate():
@@ -41,7 +44,7 @@ def main():
 
         def observe():
             reset()
-            return subprocess.run([str(root / "target/debug/examples/cpauthority_observer")], env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+            return subprocess.run([str(Path(environment["CARGO_TARGET_DIR"]) / "debug/examples/cpauthority_observer")], env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
 
         def baseline():
             compile_candidate()

@@ -51,6 +51,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='cproute-time-') as temporary:
         directory = Path(temporary)/'repo'
         shutil.copytree(ROOT,directory,ignore=shutil.ignore_patterns('.git','target','bin','artifacts','__pycache__'))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in (directory / "rust").rglob("*.rs"):
+            fresh_source.touch()
         env = dict(os.environ,CARGO_TARGET_DIR=str(ROOT/'rust/target'))
         env.pop('TIPROXY_CLOCK_ORACLE',None)
         cargo = ['cargo','test','--locked','--offline','--manifest-path','rust/Cargo.toml','-p','control-routing','--lib']

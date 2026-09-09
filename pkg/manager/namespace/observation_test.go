@@ -16,6 +16,7 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
+	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
 	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 	shadowwire "github.com/pingcap/tiproxy/pkg/controlbridge/shadow"
@@ -25,10 +26,13 @@ import (
 )
 
 func TestObservedNamespaceFactoryAndRealReplacement(t *testing.T) {
-	t.Run("queued_values", func(t *testing.T) { observedNamespaceReplacement(t, false) })
-	t.Run("queued_old_and_new_over_socket", func(t *testing.T) { observedNamespaceReplacement(t, true) })
+	t.Run("queued_values", func(t *testing.T) { observedNamespaceReplacement(t, false, false) })
+	t.Run("queued_old_and_new_over_socket", func(t *testing.T) { observedNamespaceReplacement(t, true, false) })
 }
-func observedNamespaceReplacement(t *testing.T, socket bool) {
+func TestNativeNamespaceFactoryPrecedesInitAndReplacement(t *testing.T) {
+	observedNamespaceReplacement(t, false, true)
+}
+func observedNamespaceReplacement(t *testing.T, socket, native bool) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -67,9 +71,16 @@ func observedNamespaceReplacement(t *testing.T, socket bool) {
 		defer recorder.Close()
 	}
 	mgr := NewNamespaceManagerWithObservation(recorder)
+	var reader metricsreader.MetricsQuerier
+	if native {
+		mgr = NewNamespaceManagerWithNativeObservation(recorder)
+		metrics := metricsreader.NewDefaultMetricsReader(zap.NewNop(), nil, nil, nil, nil, config.NewDefaultHealthCheckConfig(), cfg)
+		defer metrics.Close()
+		reader = metrics
+	}
 	defer mgr.Close()
 	nsConfig := &config.Namespace{Namespace: "same-name", Backend: config.BackendNamespace{Instances: []string{listener.Addr().String()}}}
-	require.NoError(t, mgr.Init(zap.NewNop(), []*config.Namespace{nsConfig}, &mockTopologyFetcher{}, nil, nil, cfg, nil))
+	require.NoError(t, mgr.Init(zap.NewNop(), []*config.Namespace{nsConfig}, &mockTopologyFetcher{}, nil, nil, cfg, reader))
 	require.Eventually(t, mgr.Ready, 5*time.Second, time.Millisecond)
 	old, ok := mgr.GetNamespace("same-name")
 	require.True(t, ok)
@@ -97,18 +108,33 @@ func observedNamespaceReplacement(t *testing.T, socket bool) {
 		assertNamespaceSocketTail(t, socketPath, old.observation.Epoch(), fresh.observation.Epoch())
 	} else {
 		kinds := map[uint64][]observation.Kind{}
+		firstEvaluation := map[uint64]uint64{}
+		firstAccount := map[uint64]uint64{}
 		for count, _ := recorder.Retained(); count > 0; count, _ = recorder.Retained() {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			delivery, err := recorder.Next(ctx)
 			cancel()
 			require.NoError(t, err)
 			record := delivery.Record
+			if native && record.Evaluation != nil && firstEvaluation[record.Epoch.Owner] == 0 {
+				firstEvaluation[record.Epoch.Owner] = record.Sequence
+				value := record.Evaluation.Native()
+				require.Equal(t, observation.EntryConfig, value.Entry, "NATIVE_NAMESPACE_FIRST_CONFIG")
+				require.Equal(t, "connection", string(record.Evaluation.Range(value.Configuration.BalancePolicy)), "NATIVE_NAMESPACE_APPLIED_CONFIG")
+			}
 			for i := uint8(0); i < record.Batch.EventCount; i++ {
 				kinds[record.Epoch.Owner] = append(kinds[record.Epoch.Owner], record.Batch.Events[i].Kind)
+				if record.Batch.Events[i].Kind == observation.Account && firstAccount[record.Epoch.Owner] == 0 {
+					firstAccount[record.Epoch.Owner] = record.Sequence
+				}
 			}
 			delivery.Release()
 		}
 		for _, owner := range []uint64{old.observation.Epoch().Owner, fresh.observation.Epoch().Owner} {
+			if native {
+				require.Positive(t, firstEvaluation[owner], "NATIVE_NAMESPACE_FACTORY")
+				require.Less(t, firstEvaluation[owner], firstAccount[owner], "NATIVE_NAMESPACE_BEFORE_ACCOUNT")
+			}
 			require.Equal(t, observation.Begin, kinds[owner][0])
 			require.Equal(t, observation.GroupCreated, kinds[owner][1])
 			require.Equal(t, observation.Account, kinds[owner][2])

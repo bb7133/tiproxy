@@ -17,7 +17,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cpmetrics-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
-        environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
+        environment = dict(os.environ, CARGO_TARGET_DIR=os.environ.get("CARGO_TARGET_DIR", str(root / "target")))
         # Select the data core, excluding module::tests::metrics runtime tests.
         command = ["cargo", "test", "--locked", "--offline", "--manifest-path", str(root / "rust/Cargo.toml"), "-p", "control-topology", "--lib", "metrics::tests::"]
         def run(arguments):

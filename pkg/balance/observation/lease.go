@@ -3,7 +3,10 @@
 
 package observation
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 const (
 	// EvaluationCharge covers bounded copied values and the writer's encoding
@@ -19,6 +22,8 @@ const (
 type EvaluationLease struct {
 	once     sync.Once
 	recorder *Recorder
+	storage  *evaluationStorage
+	released atomic.Bool
 }
 
 // LeaseEvaluation atomically reserves one record and the full variable-size
@@ -45,6 +50,15 @@ func (o *Owner) LeaseEvaluation() *EvaluationLease {
 // until their owners finish, including after owner invalidation.
 func (l *EvaluationLease) Release() {
 	if l != nil {
-		l.once.Do(func() { l.recorder.release(EvaluationCharge) })
+		l.once.Do(func() {
+			l.released.Store(true)
+			if l.storage != nil {
+				storage := l.storage
+				l.storage = nil
+				l.recorder.releaseEvaluationStorage(storage)
+			} else {
+				l.recorder.release(EvaluationCharge)
+			}
+		})
 	}
 }

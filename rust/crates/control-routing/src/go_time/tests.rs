@@ -112,6 +112,13 @@ fn actual_go_oracle() {
                     .as_go_time(expected.location)
                     .unwrap_or_else(|| unreachable!("sample time"));
                 assert_eq!(av, expected, "TIME_SAMPLE_WALL_CONVERSION");
+                let reference = GoTime::new(PACKED_MIN, 0, expected.location, Some(17))
+                    .unwrap_or_else(|| unreachable!("reference"));
+                assert_eq!(
+                    a.as_go_time_at(reference),
+                    expected,
+                    "TIME_SAMPLE_REFERENCE_CONVERSION"
+                );
                 assert_eq!(
                     av.sub_nanoseconds(bv),
                     integer(fields[5]),

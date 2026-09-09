@@ -50,7 +50,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `pkg/balance/observer/` - Queries backend list and checks backend health, then notifies the router.
 - `pkg/balance/policy/` - The `BalancePolicy` interface and implementations such as `SimpleBalancePolicy`.
 - `pkg/balance/router/` - Load-balance and routing service. Rebalances and routes connections based on a `BalancePolicy`.
-- `pkg/controlbridge/shadow/` - Strict v2 actual routing observation codec and optional local UDS lifecycle; has no production command or accounting authority.
+- `pkg/controlbridge/shadow/` - Strict v2 lifecycle/v3 native factor observation codecs and optional local UDS; has no production command or accounting authority.
 - `pkg/controlbridge/` - Versioned Go/Rust control-protocol codecs, bounded transport, and control-plane adapters; SQL packet payloads never enter this package.
 - `pkg/manager/cert/` - Auto-reloads certificates and provides interfaces to query them.
 - `pkg/manager/config/` - Auto-reloads configuration files and provides interfaces to query them.
@@ -81,7 +81,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/session-core/` - Protocol-independent session lifecycle and migration state.
 - `rust/crates/control-router/` - Staged namespace-scoped routing selection, exact config/topology/health capture, and reservation accounting. Production dataplane/binary wiring remains prohibited until full routing parity is complete.
 - `rust/crates/control-routing/` - Protocol-independent route values, pure group matching/port-conflict primitives, and Go-compatible time arithmetic; it owns no reservation or production selector yet and carries no wire payloads.
-- `rust/crates/legacy-router-shadow/` - Temporary read-only routing observation codecs and optional bounded UDS consumer inside the existing Rust process. Domain mirror state stays in `control-router::shadow`; it has no production routing authority.
+- `rust/crates/legacy-router-shadow/` - Temporary read-only routing observation codecs, native factor read-window decoding and bounded UDS consumption inside the existing Rust process. Domain mirror state stays in `control-router::shadow`; it has no production routing authority.
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
 - `rust/crates/control-topology/src/metric_collector/` - Opt-in in-process metrics rounds, scoped owner tasks, qualified overlay and bounded real owner HTTP service; production composition remains off until the control-plane integration slice.
 - `rust/crates/control-topology/src/metrics/` - Bounded query/history data core for staged backend resource metrics; runtime source/election authority is supplied separately by the collector.

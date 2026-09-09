@@ -9,6 +9,7 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/metrics"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
@@ -185,6 +186,7 @@ type errIndicator struct {
 }
 
 type FactorHealth struct {
+	capture             *nativeCapture
 	snapshot            map[string]healthBackendSnapshot
 	indicators          []errIndicator
 	mr                  metricsreader.MetricsQuerier
@@ -238,10 +240,12 @@ func (fh *FactorHealth) UpdateScore(backends []scoredBackend) {
 	needUpdateSnapshot, latestTime := false, time.Time{}
 	for i := 0; i < len(fh.indicators); i++ {
 		failureQR := fh.mr.GetQueryResult(fh.indicators[i].failureKey)
+		fh.capture.query(observation.QueryHealthFailure0+observation.QueryKind(i*2), failureQR)
 		if failureQR.Empty() {
 			continue
 		}
 		totalQR := fh.mr.GetQueryResult(fh.indicators[i].totalKey)
+		fh.capture.query(observation.QueryHealthTotal0+observation.QueryKind(i*2), totalQR)
 		if totalQR.Empty() {
 			continue
 		}
@@ -260,7 +264,9 @@ func (fh *FactorHealth) UpdateScore(backends []scoredBackend) {
 			latestTime = totalQR.UpdateTime
 		}
 	}
-	if time.Since(latestTime) > errMetricExpDuration {
+	expiryNow := time.Now()
+	fh.capture.clock(observation.ClockHealthExpiry, expiryNow)
+	if expiryNow.Sub(latestTime) > errMetricExpDuration {
 		// The metrics have not been updated for a long time (maybe Prometheus is unavailable).
 		return
 	}
@@ -279,6 +285,7 @@ func (fh *FactorHealth) UpdateScore(backends []scoredBackend) {
 // - Exist in the backends and metric is updated: update the snapshot
 func (fh *FactorHealth) updateSnapshot(backends []scoredBackend) {
 	now := time.Now()
+	fh.capture.clock(observation.ClockHealthSnapshot, now)
 	for _, backend := range backends {
 		addr := backend.Addr()
 		key := backend.ID()

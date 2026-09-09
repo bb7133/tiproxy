@@ -20,6 +20,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-locality-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
         # The isolated build shares a target directory across runs for dependency
         # reuse. copytree preserves source mtimes, so a workspace crate could
         # otherwise be judged "fresh" against a fingerprint left by a previous
@@ -31,7 +34,7 @@ def main():
         # Keep the isolated build under the repository target directory so the
         # dependency artifacts are reused across runs (and by the CI cache); the
         # mutated sources themselves live only in the temporary copy.
-        target = repo / "rust/target/cproute-locality-mutations"
+        target = Path(os.environ.get("CARGO_TARGET_DIR", repo / "rust/target/cproute-locality-mutations"))
         environment = dict(
             os.environ,
             CARGO_TARGET_DIR=str(target),

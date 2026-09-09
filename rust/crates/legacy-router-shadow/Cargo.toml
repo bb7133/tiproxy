@@ -12,6 +12,8 @@ default = []
 
 [dependencies]
 control-router.workspace = true
+control-routing.workspace = true
+control-topology.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

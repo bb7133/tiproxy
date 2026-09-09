@@ -1154,6 +1154,8 @@ name = "legacy-router-shadow"
 version = "0.1.0"
 dependencies = [
  "control-router",
+ "control-routing",
+ "control-topology",
  "rustix",
  "serde",
  "serde_json",

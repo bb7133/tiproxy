@@ -946,8 +946,7 @@ fn choose(scores: &[u64], policy: &RoutingConfig, ticket: u128) -> Option<usize>
         return Some(0);
     }
     if policy.selection_policy == RoutingSelectionPolicy::Random {
-        let modulus = n as u128 * 10 + 1;
-        return usize::try_from(ticket % modulus % n as u128).ok();
+        return crate::factors::phases::ticket(n, true, ticket);
     }
     let ratio = if policy.connection.count_ratio_threshold > 1.0 {
         policy.connection.count_ratio_threshold
@@ -972,9 +971,7 @@ fn choose(scores: &[u64], policy: &RoutingConfig, ticket: u128) -> Option<usize>
         }
     }
     choices.push(0);
-    usize::try_from(ticket % choices.len() as u128)
-        .ok()
-        .map(|index| choices[index])
+    crate::factors::phases::ticket(choices.len(), false, ticket).map(|index| choices[index])
 }
 
 fn assignment(source: &MergedBackend, local: bool) -> RouteAssignment {

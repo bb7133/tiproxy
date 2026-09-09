@@ -4,6 +4,7 @@
 package factor
 
 import (
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
 	"github.com/pingcap/tiproxy/pkg/metrics"
 	"go.uber.org/zap"
@@ -26,6 +28,7 @@ var _ policy.BalancePolicy = (*FactorBasedBalance)(nil)
 
 // FactorBasedBalance is the default balance policy.
 type FactorBasedBalance struct {
+	capture *nativeCapture
 	sync.Mutex
 	factors []Factor
 	// to reduce memory allocation
@@ -147,21 +150,25 @@ func (fbb *FactorBasedBalance) updateBitNum() error {
 // updateScore updates backend scores and return the sorted backends.
 func (fbb *FactorBasedBalance) updateScore(backends []policy.BackendCtx) []scoredBackend {
 	scoredBackends := fbb.cachedList[:0]
-	for _, backend := range backends {
-		scoredBackends = append(scoredBackends, newScoredBackend(backend, fbb.lg))
+	for i, backend := range backends {
+		scored := newScoredBackend(backend, fbb.lg)
+		scored.capture, scored.captureIndex = fbb.capture, i
+		scoredBackends = append(scoredBackends, scored)
 	}
 	needUpdateMetric := false
 	now := time.Now()
+	fbb.capture.clock(observation.ClockMetricCadence, now)
 	if now.Sub(fbb.lastMetricTime) > updateMetricInterval {
 		needUpdateMetric = true
 		fbb.lastMetricTime = now
 	}
-	for _, factor := range fbb.factors {
+	for factorIndex, factor := range fbb.factors {
 		bitNum := factor.ScoreBitNum()
 		for j := 0; j < len(scoredBackends); j++ {
 			scoredBackends[j].prepareScore(bitNum)
 		}
 		factor.UpdateScore(scoredBackends)
+		fbb.capture.score(factorIndex, scoredBackends, bitNum)
 		if needUpdateMetric {
 			for j := 0; j < len(scoredBackends); j++ {
 				metrics.BackendScoreGauge.WithLabelValues(backends[j].Addr(), factor.Name()).Set(float64(scoredBackends[j].factorScore(bitNum)))
@@ -171,22 +178,27 @@ func (fbb *FactorBasedBalance) updateScore(backends []policy.BackendCtx) []score
 	sort.Slice(scoredBackends, func(i int, j int) bool {
 		return scoredBackends[i].scoreBits < scoredBackends[j].scoreBits
 	})
+	fbb.capture.sorted(scoredBackends)
 	return scoredBackends
 }
 
 // BackendToRoute returns one backend to route a new connection to.
-func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) policy.BackendCtx {
+func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) (result policy.BackendCtx) {
 	fields := []zap.Field{zap.Int("backend_num", len(backends))}
 	defer func() {
 		fbb.lg.Debug("route", fields...)
 	}()
 
+	if len(backends) == 0 && fbb.capture == nil {
+		return nil
+	}
+	fbb.Lock()
+	defer fbb.Unlock()
+	fbb.beginObservation(observation.EntryRoute, backends)
+	defer func() { fbb.capture.routeResult([]policy.BackendCtx{result}); fbb.capture.finish() }()
 	if len(backends) == 0 {
 		return nil
 	}
-
-	fbb.Lock()
-	defer fbb.Unlock()
 	scoredBackends := fbb.updateScore(backends)
 	for _, backend := range scoredBackends {
 		fields = append(fields, zap.String(backend.Addr(), strconv.FormatUint(backend.scoreBits, 16)))
@@ -202,17 +214,21 @@ func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) poli
 	}
 }
 
-func (fbb *FactorBasedBalance) RouteableBackends(backends []policy.BackendCtx) []policy.BackendCtx {
+func (fbb *FactorBasedBalance) RouteableBackends(backends []policy.BackendCtx) (result []policy.BackendCtx) {
+	if len(backends) == 0 && fbb.capture == nil {
+		return nil
+	}
+	fbb.Lock()
+	defer fbb.Unlock()
+	fbb.beginObservation(observation.EntryRouteable, backends)
+	defer func() { fbb.capture.routeResult(result); fbb.capture.finish() }()
 	if len(backends) == 0 {
 		return nil
 	}
-
-	fbb.Lock()
-	defer fbb.Unlock()
 	scoredBackends := fbb.updateScore(backends)
 	routeable := make([]policy.BackendCtx, 0, len(scoredBackends))
 	for _, backend := range scoredBackends {
-		if fbb.canBeRouted(backend.scoreBits) {
+		if fbb.canBeRoutedBackend(backend) {
 			routeable = append(routeable, backend.BackendCtx)
 		}
 	}
@@ -224,7 +240,7 @@ func (fbb *FactorBasedBalance) routeIdlest(scoredBackends []scoredBackend, field
 	// It's like least-connection algorithm.
 	idx := -1
 	for i := range scoredBackends {
-		if fbb.canBeRouted(scoredBackends[i].scoreBits) {
+		if fbb.canBeRoutedBackend(scoredBackends[i]) {
 			idx = i
 			break
 		}
@@ -245,7 +261,7 @@ func (fbb *FactorBasedBalance) routeRandom(scoredBackends []scoredBackend, field
 	// One problem is that connections may be routed to a remote backend even when the local one is idle.
 	idxes := make([]int, 0, len(scoredBackends))
 	for i := range scoredBackends {
-		if fbb.canBeRouted(scoredBackends[i].scoreBits) {
+		if fbb.canBeRoutedBackend(scoredBackends[i]) {
 			idxes = append(idxes, i)
 		}
 	}
@@ -257,7 +273,9 @@ func (fbb *FactorBasedBalance) routeRandom(scoredBackends []scoredBackend, field
 	if len(idxes) > 1 {
 		// math/rand can not pass security scanning while crypto/rand is too slow for short connections, so use the current time as a seed.
 		// Some platforms only produce microseconds, so use microseconds.
-		seed := time.Now().UnixMicro()
+		ticketNow := time.Now()
+		fbb.capture.clock(observation.ClockRandomTicket, ticketNow)
+		seed := ticketNow.UnixMicro()
 		// The first backend (the idlest one) has 10% higher possibility so that the connection count can finally catch up.
 		// The possibility for the idlest backend: 11/(N*10+1). The possibility for the others: 10/(N*10+1).
 		idx = idxes[int(seed%int64(len(idxes)*10+1)%int64(len(idxes)))]
@@ -267,7 +285,7 @@ func (fbb *FactorBasedBalance) routeRandom(scoredBackends []scoredBackend, field
 }
 
 func (fbb *FactorBasedBalance) routePreferIdle(scoredBackends []scoredBackend, fields *[]zap.Field) policy.BackendCtx {
-	if !fbb.canBeRouted(scoredBackends[0].scoreBits) {
+	if !fbb.canBeRoutedBackend(scoredBackends[0]) {
 		return nil
 	}
 	if len(scoredBackends) == 1 {
@@ -293,6 +311,7 @@ func (fbb *FactorBasedBalance) routePreferIdle(scoredBackends []scoredBackend, f
 				var balanceFields []zap.Field
 				var advice BalanceAdvice
 				advice, balanceCount, balanceFields = factor.BalanceCount(scoredBackends[i], scoredBackends[0])
+				fbb.capture.advice(factor, scoredBackends[i], scoredBackends[0], advice, balanceCount)
 				if advice == AdvicePositive && balanceCount > 0.0001 {
 					// This backend is too busy. If it's routed, migration may happen.
 					*fields = append(*fields, zap.String(scoredBackends[i].Addr(), factor.Name()))
@@ -315,7 +334,9 @@ func (fbb *FactorBasedBalance) routePreferIdle(scoredBackends []scoredBackend, f
 	if len(idxes) > 1 {
 		// math/rand can not pass security scanning while crypto/rand is too slow for short connections, so use the current time as a seed.
 		// Some platforms only produce microseconds, so use microseconds.
-		idx = idxes[int(time.Now().UnixMicro()%int64(len(idxes)))]
+		ticketNow := time.Now()
+		fbb.capture.clock(observation.ClockPreferIdleTicket, ticketNow)
+		idx = idxes[int(ticketNow.UnixMicro()%int64(len(idxes)))]
 	}
 	*fields = append(*fields, zap.String("target", scoredBackends[idx].Addr()), zap.Ints("rand", idxes))
 	return scoredBackends[idx].BackendCtx
@@ -325,14 +346,31 @@ func (fbb *FactorBasedBalance) routePreferIdle(scoredBackends []scoredBackend, f
 // balanceCount: the count of connections to migrate in this round. 0 indicates no need to balance.
 // reason: the debug information to be logged.
 func (fbb *FactorBasedBalance) BackendsToBalance(backends []policy.BackendCtx) (from, to policy.BackendCtx, balanceCount float64, reason string, logFields []zap.Field) {
+	if len(backends) <= 1 && fbb.capture == nil {
+		return
+	}
+	fbb.Lock()
+	defer fbb.Unlock()
+	fbb.beginObservation(observation.EntryBalance, backends)
+	defer func() {
+		c := fbb.capture
+		if c.enabled() && c.current != nil {
+			n := c.current.Native()
+			n.From, n.To = c.returned(from), c.returned(to)
+			n.BalanceCount = math.Float64bits(balanceCount)
+			for _, f := range fbb.factors {
+				if f.Name() == reason {
+					n.Reason = nativeFactor(f)
+				}
+			}
+		}
+		c.finish()
+	}()
 	if len(backends) <= 1 {
 		return
 	}
-
-	fbb.Lock()
-	defer fbb.Unlock()
 	scoredBackends := fbb.updateScore(backends)
-	if !fbb.canBeRouted(scoredBackends[0].scoreBits) {
+	if !fbb.canBeRoutedBackend(scoredBackends[0]) {
 		return
 	}
 	if scoredBackends[0].scoreBits == scoredBackends[len(scoredBackends)-1].scoreBits {
@@ -358,6 +396,7 @@ func (fbb *FactorBasedBalance) BackendsToBalance(backends []policy.BackendCtx) (
 				// The factors with higher priorities are ordered, so this factor shouldn't violate them.
 				// E.g. if the CPU usage of A is higher than B, don't migrate from B to A even if A is preferred in location.
 				advice, count, fields := factor.BalanceCount(scoredBackends[i], scoredBackends[0])
+				fbb.capture.advice(factor, scoredBackends[i], scoredBackends[0], advice, count)
 				if advice == AdviceNegtive {
 					// If the factor will be unbalanced after migration, skip the rest factors.
 					// E.g. if the CPU usage of A will be much higher than B after migration,
@@ -407,12 +446,17 @@ func (fbb *FactorBasedBalance) SetConfig(cfg *config.Config) {
 	defer fbb.Unlock()
 	fbb.setFactors(cfg)
 	fbb.routePolicy = cfg.Balance.RoutingPolicy
+	fbb.appliedObservationConfig(cfg)
+	fbb.beginObservation(observation.EntryConfig, nil)
+	fbb.capture.finish()
 }
 
 func (fbb *FactorBasedBalance) Close() {
 	fbb.Lock()
 	defer fbb.Unlock()
+	fbb.beginObservation(observation.EntryClose, nil)
 	for _, factor := range fbb.factors {
 		factor.Close()
 	}
+	fbb.capture.finish()
 }

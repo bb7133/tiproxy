@@ -14,7 +14,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-selector-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
-        environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
+        environment = dict(os.environ, CARGO_TARGET_DIR=os.environ.get("CARGO_TARGET_DIR", str(root / "target")))
         # Fresh actual-Go observations are asserted inside the Rust runtime
         # tests, so new policy mutations must compile and fail a real test.
         for kind, fixture in [("COMPOSITION", "eligibility"), ("RETRY", "retry")]:

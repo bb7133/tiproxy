@@ -15,7 +15,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-migration-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
-        target = root / "target"
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
+        target = Path(os.environ.get("CARGO_TARGET_DIR", root / "target"))
         # Optional local acceleration. The caller must provide an IDLE target;
         # CI uses a fresh target. Never modify or build in the seed directory.
         seed = os.environ.get("CPROUTE_MIGRATION_TARGET_SEED")
@@ -46,7 +49,7 @@ def main():
             ("rejected-offer-consumes-sequence", "ledger.rs", "pub(crate) fn admit_redirect", "pub(crate) fn finish_redirect", [("if admitted {\n            self.next_redirect += 1;", "self.next_redirect += 1;\n        if admitted {", 1)], "redirect_rejected_offer_records_cooldown_without_consuming_watermark_or_capacity"),
             ("final-offer-skips-source-validation", "selector.rs", "fn prepare_offer_locked", "pub(crate) fn finish_redirect", [("self.sources.validate(&prepared.candidate)?;", "", 4)], "migration_final_lock_rechecks_config_routing_and_health"),
             ("offer-releases-lock-before-commit", "selector.rs", "pub(crate) fn offer_redirect", "pub(crate) fn finish_redirect", [("let accepted = sender.try_send(redirect.clone()).is_ok();", "drop(state); let accepted = sender.try_send(redirect.clone()).is_ok();", 1), ("state.ledger.admit_redirect(redirect, accepted, now);", "let mut state = self.lock(); state.ledger.admit_redirect(redirect, accepted, now);", 1)], "migration_immediate_terminal_waits_for_accepted_ledger_commit"),
-            ("connection-factor-uses-physical", "factors.rs", "fn score(", "fn advice(", [("Factor::Connection => input.counts.connection_score()", "Factor::Connection => input.counts.active()", 1)], "redirect_connection_factor_reads_transferred_score_not_physical_count"),
+            ("connection-factor-uses-physical", "factors.rs", "fn score(", "fn advice_values(", [("connections: input.counts.connection_score(),", "connections: if factor == Factor::Connection { input.counts.active() } else { input.counts.connection_score() },", 1)], "redirect_connection_factor_reads_transferred_score_not_physical_count"),
             ("outgoing-score-zero-pruned", "ledger.rs", "pub(crate) fn prune", "fn account(", [("self.counts(identity) != Some(Accounting::default())", "self.counts(identity).map(Accounting::connection_score) != Some(0)", 1)], "redirect_transfers_score_then_physical_and_failure_returns_only_score"),
         ]
         for name, file, begin, end, changes, expected in cases:

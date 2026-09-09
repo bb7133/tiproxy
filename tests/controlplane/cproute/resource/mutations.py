@@ -66,10 +66,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-resource-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(live.ROOT / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
         fixture = Path("tests/controlplane/cp004/testdata/full.toml")
         (root / fixture).parent.mkdir(parents=True)
         shutil.copyfile(live.ROOT / fixture, root / fixture)
-        environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+        environment = dict(os.environ, CARGO_TARGET_DIR=os.environ.get("CARGO_TARGET_DIR", str(root / "target")))
         live.baseline(root, environment)
         for name, edits, family, marker in cases:
             originals = {}

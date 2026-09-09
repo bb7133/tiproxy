@@ -336,3 +336,7 @@ func backendPodNameFromAddr(addr string) string {
 	}
 	return host
 }
+
+// ObservationAccount is only a diagnostic incarnation read under Group's lock.
+// It does not read health/metrics or confer a production reservation capability.
+func (b *backendWrapper) ObservationAccount() uint64 { return b.observationID }

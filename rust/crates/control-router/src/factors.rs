@@ -14,7 +14,7 @@
 
 //! Go factor state owned by a router group, never by the metric collector.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use control_config::{RoutingBalancePolicy, RoutingConfig, RoutingSelectionPolicy};
@@ -23,7 +23,9 @@ use control_topology::metrics::{QueryId, QueryResult};
 use crate::ledger::{AccountIdentity, Accounting};
 
 mod balance;
+pub(crate) mod phases;
 mod resource;
+pub(crate) mod window;
 
 /// One Go factor, in score-composition order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,16 +132,13 @@ impl FactorReport {
         } else {
             self.preferred.iter().map(AsRef::as_ref).collect()
         };
-        let n = choices.len() as u128;
-        if n == 0 {
-            return None;
-        }
-        let index = if policy == RoutingSelectionPolicy::Random {
-            ticket % (n * 10 + 1) % n
-        } else {
-            ticket % n
-        };
-        choices.get(usize::try_from(index).ok()?).copied()
+        choices
+            .get(phases::ticket(
+                choices.len(),
+                policy == RoutingSelectionPolicy::Random,
+                ticket,
+            )?)
+            .copied()
     }
 }
 
@@ -155,41 +154,29 @@ pub(crate) struct Input {
 }
 
 #[derive(Clone)]
-struct Cache {
-    owner: Arc<AccountIdentity>,
+struct Owner {
+    identity: Arc<AccountIdentity>,
     cluster: String,
-    cpu: Option<resource::Cpu>,
-    memory: Option<resource::Memory>,
-    health: Option<resource::Health>,
-    status: Option<(i64, f64)>,
 }
-impl Cache {
-    fn new(input: &Input) -> Self {
+
+/// The production adapter owns account fences; the history holds values only.
+#[derive(Clone)]
+pub(crate) struct State {
+    owners: BTreeMap<Arc<str>, Owner>,
+    history: window::History<QueryResult>,
+}
+impl Default for State {
+    fn default() -> Self {
         Self {
-            owner: Arc::clone(&input.owner),
-            cluster: input.cluster.clone(),
-            cpu: None,
-            memory: None,
-            health: None,
-            status: None,
+            owners: BTreeMap::new(),
+            history: window::History::new(0),
         }
     }
 }
 
-/// Cloned before evaluation; the router commits it only under current authority.
-#[derive(Clone, Default)]
-pub(crate) struct State {
-    cache: BTreeMap<Arc<str>, Cache>,
-    cpu_time: Option<i64>,
-    memory_time: Option<i64>,
-    health_queries: BTreeMap<QueryId, QueryResult>,
-    health_dirty: BTreeSet<QueryId>,
-    usage_per_conn: f64,
-}
-
 pub(crate) type Queries = BTreeMap<QueryId, QueryResult>;
 
-fn order(policy: &RoutingConfig) -> Vec<Factor> {
+pub(crate) fn order(policy: &RoutingConfig) -> Vec<Factor> {
     let mut factors = Vec::new();
     if !policy.label_name.is_empty() {
         factors.push(Factor::Label);
@@ -218,36 +205,35 @@ impl State {
     // Accounts outlive a temporary omission from the group, but never a retired
     // ledger owner. A same-text backend replacement must get an empty cache.
     pub(crate) fn retain_owners(&mut self, owners: &BTreeMap<Arc<str>, Arc<AccountIdentity>>) {
-        let previous = self.cache.len();
-        self.cache.retain(|id, cache| {
+        let previous = self.owners.len();
+        self.owners.retain(|id, stored| {
             owners
                 .get(id)
-                .is_some_and(|owner| Arc::ptr_eq(owner, &cache.owner))
+                .is_some_and(|owner| Arc::ptr_eq(owner, &stored.identity))
         });
-        if self.cache.len() != previous {
-            self.cpu_time = None;
-            self.usage_per_conn = 0.0;
+        self.history
+            .cache
+            .retain(|id, _| self.owners.contains_key(id));
+        if self.owners.len() != previous {
+            self.history.cpu_time = None;
+            self.history.usage_per_conn = 0.0;
         }
     }
 
     pub(crate) fn clear_cluster(&mut self, cluster: &str) {
-        for cache in self
-            .cache
-            .values_mut()
-            .filter(|cache| cache.cluster == cluster)
-        {
-            cache.cpu = None;
-            cache.memory = None;
-            cache.health = None;
+        for (id, owner) in &self.owners {
+            if owner.cluster == cluster
+                && let Some(cache) = self.history.cache.get_mut(id)
+            {
+                cache.cpu = None;
+                cache.memory = None;
+                cache.health = None;
+            }
         }
-        // Force a read of the new authoritative map, even if wall time repeated.
-        // Unchanged sibling caches retain their original sample times/counts.
-        self.cpu_time = None;
-        self.memory_time = None;
-        // Cached indicators from an unchanged sibling remain reusable when a
-        // current round temporarily omits that query. Remove only revoked data.
+        self.history.cpu_time = None;
+        self.history.memory_time = None;
         let label = control_topology::metrics::cluster_label(cluster);
-        for query in self.health_queries.values_mut() {
+        for query in self.history.health_queries.values_mut() {
             query.series.retain(|series| {
                 series
                     .labels
@@ -255,26 +241,17 @@ impl State {
                     .is_some_and(|value| value != &label)
             });
         }
-        self.health_dirty.extend([
+        self.history.health_dirty.extend([
             QueryId::FailurePd,
             QueryId::TotalPd,
             QueryId::FailureTikv,
             QueryId::TotalTikv,
         ]);
-        self.usage_per_conn = 0.0;
+        self.history.usage_per_conn = 0.0;
     }
 
     pub(crate) fn clear_resources(&mut self) {
-        for cache in self.cache.values_mut() {
-            cache.cpu = None;
-            cache.memory = None;
-            cache.health = None;
-        }
-        self.cpu_time = None;
-        self.memory_time = None;
-        self.health_queries.clear();
-        self.health_dirty.clear();
-        self.usage_per_conn = 0.0;
+        self.history.clear_resources();
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -285,10 +262,44 @@ impl State {
         queries: &Queries,
         now: i64,
     ) -> FactorReport {
-        self.update_status(inputs, now);
+        let mut window = resource::RepeatedTime { queries, now };
+        match self.evaluate_window(inputs, policy, &mut window) {
+            Ok(report) => report,
+            Err(never) => match never {},
+        }
+    }
+
+    fn evaluate_window<'a, W: window::Window<'a, QueryResult>>(
+        &mut self,
+        inputs: &[Input],
+        policy: &RoutingConfig,
+        window: &mut W,
+    ) -> Result<FactorReport, W::Error> {
+        for input in inputs {
+            if self
+                .owners
+                .get(&input.id)
+                .is_none_or(|owner| !Arc::ptr_eq(&owner.identity, &input.owner))
+            {
+                self.history.cache.remove(&input.id);
+                self.owners.insert(
+                    Arc::clone(&input.id),
+                    Owner {
+                        identity: Arc::clone(&input.owner),
+                        cluster: input.cluster.clone(),
+                    },
+                );
+            }
+        }
+        self.history
+            .status(inputs, window.clock(window::ClockSite::StatusSnapshot)?);
         let resource = policy.balance_policy != RoutingBalancePolicy::Connection;
         let active = if resource && inputs.len() > 1 {
-            self.update_resources(inputs, queries, now)
+            [
+                self.history.health(inputs, window)?,
+                self.history.memory(inputs, window)?,
+                self.history.cpu(inputs, window)?,
+            ]
         } else {
             [false; 3]
         };
@@ -299,19 +310,14 @@ impl State {
         let mut sorted: Vec<_> = inputs
             .iter()
             .map(|input| {
-                let mut score = 0;
-                let mut routeable = true;
-                let parts = factors
+                let parts: Vec<_> = factors
                     .iter()
                     .map(|&factor| {
                         let part = self.score(factor, input, active, inputs.len() > 1);
-                        score = (score << factor.bits()) + part;
-                        if matches!(factor, Factor::Label | Factor::Status) && part != 0 {
-                            routeable = false;
-                        }
                         (factor, part)
                     })
                     .collect();
+                let (score, routeable) = phases::compose(&parts);
                 (
                     input,
                     FactorScore {
@@ -325,30 +331,15 @@ impl State {
             })
             .collect();
         sorted.sort_by_key(|(_, row)| row.score);
-        let mut preferred = Vec::new();
-        if let Some(&(best, ref best_row)) = sorted.first() {
-            if best_row.routeable {
-                for (input, row) in sorted.iter().skip(1).rev() {
-                    let mut count = 0.0;
-                    for ((factor, from_score), (_, to_score)) in
-                        row.parts.iter().zip(&best_row.parts)
-                    {
-                        if from_score > to_score {
-                            let advice = self.advice(*factor, input, best, policy);
-                            count = advice.count;
-                            if advice.advice == BalanceAdvice::Positive && count > 0.0001 {
-                                break;
-                            }
-                        } else if from_score < to_score {
-                            break;
-                        }
-                    }
-                    if count <= 0.0001 {
-                        preferred.push(Arc::clone(&row.backend_id));
-                    }
-                }
-                preferred.push(Arc::clone(&best.id));
-            }
+        let preferred = phases::preferred(
+            sorted.len(),
+            |i| &sorted[i].1,
+            |i, factor| self.advice(factor, sorted[i].0, sorted[0].0, policy),
+        )
+        .into_iter()
+        .map(|i| Arc::clone(&sorted[i].1.backend_id))
+        .collect();
+        if let Some(&(best, _)) = sorted.first() {
             for (input, row) in &mut sorted {
                 row.advice_to_best = factors
                     .iter()
@@ -357,80 +348,52 @@ impl State {
             }
         }
         let balance = balance::select(&sorted);
-        FactorReport {
+        Ok(FactorReport {
             balance,
             rows: sorted.into_iter().map(|(_, row)| row).collect(),
             preferred,
-        }
+        })
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    fn update_status(&mut self, inputs: &[Input], now: i64) {
-        for input in inputs {
-            let cache = self
-                .cache
-                .entry(Arc::clone(&input.id))
-                .or_insert_with(|| Cache::new(input));
-            if !Arc::ptr_eq(&cache.owner, &input.owner) {
-                *cache = Cache::new(input);
-            }
-            if input.healthy {
-                cache.status = None;
-            } else {
-                let count = cache.status.map_or(0.0, |(_, count)| count);
-                cache.status = Some((
-                    now,
-                    if count > 0.0001 {
-                        count
-                    } else {
-                        input.counts.connection_score() as f64 / 5.0
-                    },
-                ));
-            }
-        }
-        for cache in self.cache.values_mut() {
-            if cache
-                .status
-                .is_some_and(|(time, _)| resource::expired(time, now, 60))
-            {
-                cache.status = None;
-            }
-        }
-    }
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn score(&self, factor: Factor, input: &Input, active: [bool; 3], multiple: bool) -> u64 {
-        let cache = &self.cache[&input.id];
-        match factor {
-            Factor::Label => u64::from(!input.label_matches),
-            Factor::Status => u64::from(!input.healthy),
-            Factor::Location => u64::from(multiple && !input.local),
-            Factor::Connection => input.counts.connection_score().min(u64::from(u16::MAX)),
-            Factor::Health => {
-                if active[0] {
-                    u64::from(cache.health.map_or(0, |value| value.risk))
+        let cache = &self.history.cache[&input.id];
+        phases::score(
+            factor,
+            phases::ScoreValues {
+                go_arch: self.history.go_arch,
+                label_matches: input.label_matches,
+                healthy: input.healthy,
+                local: input.local,
+                connections: input.counts.connection_score(),
+                health_risk: cache.health.map_or(0, |value| value.risk),
+                memory_risk: cache.memory.map_or(0, |value| value.risk),
+                cpu_usage: if factor == Factor::Cpu && active[2] {
+                    self.history.usage(input).1
                 } else {
-                    0
-                }
-            }
-            Factor::Memory => {
-                if active[1] {
-                    u64::from(cache.memory.map_or(0, |value| value.risk))
-                } else {
-                    0
-                }
-            }
-            Factor::Cpu => {
-                if active[2] {
-                    ((self.usage(input).1 * 100.0) as i64 / 5).clamp(0, 31) as u64
-                } else {
-                    0
-                }
-            }
-        }
+                    0.0
+                },
+            },
+            active,
+            multiple,
+        )
     }
 
     #[allow(clippy::cast_precision_loss)]
+    fn advice_values(&self, input: &Input) -> phases::AdviceValues {
+        let cache = &self.history.cache[&input.id];
+        phases::AdviceValues {
+            connections: window::Count::Legacy(input.counts.connection_score()),
+            status_count: cache.status.map_or(0.0, |(_, count)| count),
+            health: cache
+                .health
+                .map_or((0, 0.0), |value| (value.risk, value.balance)),
+            memory: cache
+                .memory
+                .map_or((0, 0.0), |value| (value.risk, value.balance)),
+            cpu: self.history.usage(input),
+        }
+    }
+
     fn advice(
         &self,
         factor: Factor,
@@ -438,90 +401,13 @@ impl State {
         to: &Input,
         policy: &RoutingConfig,
     ) -> FactorAdvice {
-        use BalanceAdvice::{Negative, Neutral, Positive};
-        let a = &self.cache[&from.id];
-        let b = &self.cache[&to.id];
-        let configured = |rate: f64, default: f64| if rate > 0.0 { rate } else { default };
-        let (advice, count) = match factor {
-            Factor::Label => (Positive, 1.0),
-            Factor::Status => (
-                Positive,
-                configured(
-                    policy.status.migrations_per_second,
-                    a.status.map_or(0.0, |(_, count)| count),
-                ),
-            ),
-            Factor::Location => (
-                Positive,
-                configured(policy.location.migrations_per_second, 1.0),
-            ),
-            Factor::Health => {
-                let from = a.health.unwrap_or_default();
-                let to = b.health.unwrap_or_default();
-                if i16::from(from.risk) - i16::from(to.risk) <= 1 {
-                    (Neutral, 0.0)
-                } else {
-                    (
-                        Positive,
-                        configured(policy.health.migrations_per_second, from.balance),
-                    )
-                }
-            }
-            Factor::Memory => {
-                let from = a.memory.unwrap_or_default();
-                let to = b.memory.unwrap_or_default();
-                if i16::from(from.risk) - i16::from(to.risk) <= 1 {
-                    (Neutral, 0.0)
-                } else {
-                    (
-                        Positive,
-                        configured(policy.memory.migrations_per_second, from.balance),
-                    )
-                }
-            }
-            Factor::Cpu => {
-                let (fa, fl) = self.usage(from);
-                let (ta, tl) = self.usage(to);
-                let per = self.usage_per_conn;
-                if (1.3 - (ta + per)) * 1.1 < 1.3 - (fa - per)
-                    || (1.3 - (tl + per)) * 1.1 < 1.3 - (fl - per)
-                {
-                    (Negative, 0.0)
-                } else if 1.3 - ta < (1.3 - fa) * 1.2 || 1.3 - tl < (1.3 - fl) * 1.2 {
-                    (Neutral, 0.0)
-                } else {
-                    (
-                        Positive,
-                        configured(policy.cpu.migrations_per_second, 1.0 / per / 600.0),
-                    )
-                }
-            }
-            Factor::Connection => {
-                let from = from.counts.connection_score() as f64;
-                let to = to.counts.connection_score() as f64;
-                let ratio = if policy.connection.count_ratio_threshold > 1.0 {
-                    policy.connection.count_ratio_threshold
-                } else {
-                    1.2
-                };
-                if from <= (to + 1.0) * ratio {
-                    (Neutral, 0.0)
-                } else {
-                    (
-                        Positive,
-                        configured(
-                            policy.connection.migrations_per_second,
-                            (((from + to + 1.0) / (1.0 + ratio) - (to + 1.0)) / 120.0).max(0.0),
-                        ),
-                    )
-                }
-            }
-        };
-        FactorAdvice {
+        phases::advice(
             factor,
-            advice,
-            count,
-        }
+            self.advice_values(from),
+            self.advice_values(to),
+            self.history.usage_per_conn,
+            policy,
+        )
     }
 }
 

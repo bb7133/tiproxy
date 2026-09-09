@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Limits struct {
@@ -25,30 +27,39 @@ func DefaultLimits() Limits {
 // An enabled recorder is installed before namespace creation; it has no attach
 // operation that can reconstruct an existing production owner's history.
 type Recorder struct {
-	registry sync.Mutex
-	owners   []*Owner
-	closed   bool
-	process  uint64
-	nonce    uint64
-	limits   Limits
-	queue    chan Record
-	changed  chan struct{}
-	budgetMu sync.Mutex // leaf: never held while calling an owner or production code
-	records  int64
-	bytes    int64
+	origin         *ClockOrigin
+	clockInvalid   bool
+	nativeFailed   bool
+	registry       sync.Mutex
+	owners         []*Owner
+	closed         bool
+	process        uint64
+	nonce          uint64
+	limits         Limits
+	queue          chan Record
+	changed        chan struct{}
+	budgetMu       sync.Mutex // leaf: never held while calling an owner or production code
+	records        int64
+	bytes          int64
+	freeArenas     [maxEvaluationArenas]*evaluationStorage
+	freeArenaCount int
+	budgetStopped  bool
 }
 
 // Owner serializes the sequence and queue admission of all groups in one owner.
 // Its Mutex is a leaf. No caller may acquire a production lock while holding it.
 // The drain never takes this Mutex; normal producer contention is serialized.
 type Owner struct {
-	recorder *Recorder
-	epoch    Epoch
-	mu       sync.Mutex
-	sequence uint64
-	reason   atomic.Uint32
-	admitted atomic.Uint64
-	identity uint64
+	native         bool
+	zeroTime       GoTimeValue
+	timeProjection *TimeProjection
+	recorder       *Recorder
+	epoch          Epoch
+	mu             sync.Mutex
+	sequence       uint64
+	reason         atomic.Uint32
+	admitted       atomic.Uint64
+	identity       uint64
 }
 
 func NewRecorder(limits Limits, process, nonce uint64) (*Recorder, error) {
@@ -57,7 +68,9 @@ func NewRecorder(limits Limits, process, nonce uint64) (*Recorder, error) {
 		return nil, errors.New("invalid routing observation identity or limits")
 	}
 	capacity := min(limits.Records, int(limits.Bytes/BatchCharge))
+	origin, clockErr := CaptureClockOrigin(time.Now(), time.Now())
 	return &Recorder{
+		origin: origin, clockInvalid: clockErr != nil,
 		process: process, nonce: nonce, limits: limits,
 		queue: make(chan Record, capacity), changed: make(chan struct{}, 1),
 	}, nil
@@ -65,7 +78,13 @@ func NewRecorder(limits Limits, process, nonce uint64) (*Recorder, error) {
 
 // NewOwner is a factory-only operation, before any router/policy initialization.
 // Registry entries are never evicted, including after invalidation or retirement.
-func (r *Recorder) NewOwner() *Owner {
+func (r *Recorder) NewOwner() *Owner { return r.newOwner(false) }
+
+// NewNativeOwner fixes capabilities before any Group or policy initialization.
+// Existing custom-policy owners continue using NewOwner and the v2 dialect.
+func (r *Recorder) NewNativeOwner() *Owner { return r.newOwner(true) }
+
+func (r *Recorder) newOwner(native bool) *Owner {
 	r.registry.Lock()
 	defer r.registry.Unlock()
 	if r.closed {
@@ -78,8 +97,23 @@ func (r *Recorder) NewOwner() *Owner {
 		}
 		return nil
 	}
-	owner := &Owner{recorder: r, epoch: Epoch{Process: r.process, Owner: uint64(len(r.owners)) + 1, Nonce: r.nonce}}
+	if native && (r.clockInvalid || runtime.GOARCH != "arm64" && runtime.GOARCH != "amd64") {
+		r.nativeFailed = true
+		for _, existing := range r.owners {
+			existing.Invalidate(Malformed)
+		}
+	}
+	owner := &Owner{native: native, recorder: r, epoch: Epoch{Process: r.process, Owner: uint64(len(r.owners)) + 1, Nonce: r.nonce}}
 	r.owners = append(r.owners, owner)
+	if r.nativeFailed {
+		owner.Invalidate(Malformed)
+	}
+	if r.origin != nil {
+		owner.timeProjection = NewTimeProjection(owner, r.origin)
+	}
+	if native && owner.Enabled() {
+		owner.zeroTime, _ = owner.timeProjection.Project(time.Time{})
+	}
 	owner.Emit(Batch{EventCount: 1, Events: [MaxEvents]Event{{Kind: Begin}}})
 	return owner
 }
@@ -149,7 +183,7 @@ func (o *Owner) Emit(batch Batch) bool {
 		o.Invalidate(Capacity)
 		return false
 	}
-	record := Record{Epoch: o.epoch, Sequence: o.sequence + 1, Batch: batch}
+	record := Record{Epoch: o.epoch, Sequence: o.sequence + 1, Batch: batch, Native: o.native}
 	select {
 	case r.queue <- record:
 		o.sequence += uint64(batch.EventCount)
@@ -204,13 +238,25 @@ type Delivery struct {
 }
 
 func (d *Delivery) Release() {
-	d.once.Do(func() { d.owner.release(BatchCharge) })
+	d.once.Do(func() { d.owner.releaseRecord(d.Record) })
+}
+
+func (r *Recorder) releaseRecord(record Record) {
+	if record.Evaluation != nil {
+		record.Evaluation.Release()
+	} else {
+		r.release(BatchCharge)
+	}
 }
 
 func (r *Recorder) reserve(charge int64) bool {
 	r.budgetMu.Lock()
 	defer r.budgetMu.Unlock()
-	if charge <= 0 || r.records >= int64(r.limits.Records) || charge > r.limits.Bytes-r.bytes {
+	if r.budgetStopped || charge <= 0 || r.records >= int64(r.limits.Records) {
+		return false
+	}
+	r.evictEvaluationStorageLocked(charge)
+	if charge > r.limits.Bytes-r.bytes {
 		return false
 	}
 	r.records++
@@ -257,10 +303,11 @@ func (r *Recorder) Close() {
 		owner.admitted.Store(owner.sequence)
 		owner.mu.Unlock()
 	}
+	r.closeEvaluationStorage()
 	for {
 		select {
-		case <-r.queue:
-			r.release(BatchCharge)
+		case record := <-r.queue:
+			r.releaseRecord(record)
 		default:
 			return
 		}
@@ -299,4 +346,28 @@ func (r *Recorder) IsInvalid(epoch Epoch) bool {
 		return true
 	}
 	return !r.owners[epoch.Owner-1].Enabled()
+}
+
+// Native is immutable factory metadata, independent of the current valid prefix.
+func (o *Owner) Native() bool { return o != nil && o.native }
+
+type NativeMetadata struct {
+	GoArch string
+	Epoch  Epoch
+	Origin ClockOriginValue
+	Zero   GoTimeValue
+}
+
+// NativeMetadata acquires only the recorder registry, never a producer lock.
+func (r *Recorder) NativeMetadata(epoch Epoch) (NativeMetadata, bool) {
+	r.registry.Lock()
+	defer r.registry.Unlock()
+	if epoch.Owner == 0 || epoch.Owner > uint64(len(r.owners)) {
+		return NativeMetadata{}, false
+	}
+	owner := r.owners[epoch.Owner-1]
+	if owner.epoch != epoch || !owner.native || r.origin == nil {
+		return NativeMetadata{}, false
+	}
+	return NativeMetadata{GoArch: runtime.GOARCH, Epoch: epoch, Origin: r.origin.Value(), Zero: owner.zeroTime}, true
 }

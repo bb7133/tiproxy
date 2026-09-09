@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/pingcap/tiproxy/lib/config"
+	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
 	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	shadowwire "github.com/pingcap/tiproxy/pkg/controlbridge/shadow"
@@ -63,10 +64,10 @@ func TestObservationSustained(t *testing.T) {
 		if enabled {
 			name = "enabled"
 		}
-		t.Run(name, func(t *testing.T) { runObservationLoad(t, binary, enabled) })
+		t.Run(name, func(t *testing.T) { runObservationLoad(t, binary, enabled, nil) })
 	}
 }
-func runObservationLoad(t *testing.T, binary string, enabled bool) {
+func runObservationLoad(t *testing.T, binary string, enabled bool, nativeConfig *config.Config) {
 	t.Helper()
 	var service *shadowwire.Service
 	var recorder *observation.Recorder
@@ -76,6 +77,8 @@ func runObservationLoad(t *testing.T, binary string, enabled bool) {
 		Close() error
 	}
 	var output bytes.Buffer
+	connected := make(chan struct{})
+	writer := &nativeLoadOutput{buffer: &output, connected: connected}
 	if enabled {
 		dir, err := os.MkdirTemp("/tmp", "routing-load-")
 		require.NoError(t, err)
@@ -88,8 +91,11 @@ func runObservationLoad(t *testing.T, binary string, enabled bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		command = exec.CommandContext(ctx, binary, path)
-		command.Stdout = &output
-		command.Stderr = &output
+		if nativeConfig != nil {
+			command.Args = append(command.Args, "native")
+		}
+		command.Stdout = writer
+		command.Stderr = writer
 		pipe, err := command.StdinPipe()
 		require.NoError(t, err)
 		input = pipe
@@ -99,19 +105,40 @@ func runObservationLoad(t *testing.T, binary string, enabled bool) {
 				_ = command.Process.Kill()
 				_ = command.Wait()
 			}
+			if t.Failed() {
+				t.Log(output.String())
+			}
 		}()
+		if nativeConfig != nil {
+			timer := time.NewTimer(10 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-connected:
+			case <-timer.C:
+				t.Fatal("NATIVE_CONSUMER_STARTUP: no connection before fixed workload")
+			}
+		}
 	}
 	var routers [2]*ScoreBasedRouter
 	var stable [2][2][2]*backendWrapper
+	var nativeReaders [2]*metricsreader.ClusterReader
+	var nativeTimings nativeLoadTimings
 	for owner := range 2 {
 		var observed *observation.Owner
 		if enabled {
-			observed = recorder.NewOwner()
+			if nativeConfig == nil {
+				observed = recorder.NewOwner()
+			} else {
+				observed = recorder.NewNativeOwner()
+			}
 		}
 		r := NewScoreBasedRouterWithObservation(zap.NewNop(), observed)
 		r.bpCreator = simpleBpCreator
+		if nativeConfig != nil {
+			r, nativeReaders[owner] = nativeLoadRouter(t, observed, nativeConfig, &nativeTimings)
+		}
 		r.matchType = MatchClientCIDR
-		r.updateBackendHealth(loadHealth(owner, false))
+		r.updateBackendHealth(observationLoadHealth(owner, false, nativeConfig != nil))
 		require.Len(t, r.groups, 2)
 		routers[owner] = r
 		defer r.Close()
@@ -125,21 +152,28 @@ func runObservationLoad(t *testing.T, binary string, enabled bool) {
 	defer cancel()
 	var publishers sync.WaitGroup
 	var publications atomic.Uint64
+	var configUpdates atomic.Uint64
 	publishers.Add(1)
 	go func() {
 		defer publishers.Done()
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		extra := false
-		for {
+		for rounds := 0; nativeConfig == nil || rounds < 600; rounds++ {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				extra = !extra
 				for owner, r := range routers {
-					r.updateBackendHealth(loadHealth(owner, extra))
+					r.updateBackendHealth(observationLoadHealth(owner, extra, nativeConfig != nil))
 					publications.Add(1)
+					if nativeConfig != nil && rounds%10 == 0 {
+						cfg := nativeConfig.Clone()
+						cfg.Balance.ConnCount.CountRatioThreshold = 1.2 + float64((rounds/10)%2)*0.1
+						r.setConfig(cfg)
+						configUpdates.Add(1)
+					}
 				}
 			}
 		}
@@ -218,15 +252,32 @@ func runObservationLoad(t *testing.T, binary string, enabled bool) {
 	}
 	workers.Wait()
 	duration := time.Since(started)
+	if nativeConfig != nil {
+		publishers.Wait()
+	}
 	cancel()
 	publishers.Wait()
 	sampler.Wait()
 	require.GreaterOrEqual(t, duration, 60*time.Second)
 	require.EqualValues(t, 12000, operations.Load(), "200 accepted lifecycle operations/s for 60s")
 	require.GreaterOrEqual(t, publications.Load(), uint64(1000), "concurrent backend publication must run throughout")
+	if nativeConfig != nil {
+		require.EqualValues(t, 1200, publications.Load(), "native full publication window")
+		require.EqualValues(t, 120, configUpdates.Load(), "native concurrent config updates")
+		t.Logf("native_config_updates=%d", configUpdates.Load())
+	}
 	for owner, r := range routers {
-		r.updateBackendHealth(loadHealth(owner, false))
+		if nativeConfig != nil {
+			for _, group := range r.groups {
+				group.Balance(context.Background())
+			}
+			assertNativeLoadQueries(t, nativeReaders[owner], nativeConfig)
+		}
+		r.updateBackendHealth(observationLoadHealth(owner, false, nativeConfig != nil))
 		require.Zero(t, r.ConnCount())
+	}
+	if nativeConfig != nil && os.Getenv("CP_ROUTE_NATIVE_TIMINGS") == "1" {
+		nativeTimings.report(t)
 	}
 	var cycleSamples, holdSamples []time.Duration
 	for i := range 8 {
@@ -247,6 +298,10 @@ func runObservationLoad(t *testing.T, binary string, enabled bool) {
 		t.Log(output.String())
 		require.NoError(t, err, "independent Rust comparison")
 		require.Contains(t, output.String(), "owners=2 operations=12000")
+		if nativeConfig != nil {
+			require.Contains(t, output.String(), "factors=true selection=false scheduler=false")
+			require.Contains(t, output.String(), "native_configurations=244", "all four initial and 240 per-group config updates independently compared")
+		}
 		require.Contains(t, output.String(), "score=0 physical=0 invalid=0 mismatch=0 connections=1 transport_errors=0")
 	}
 }

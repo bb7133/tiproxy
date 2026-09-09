@@ -9,6 +9,7 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/metrics"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
@@ -103,6 +104,7 @@ type memBackendSnapshot struct {
 }
 
 type FactorMemory struct {
+	capture *nativeCapture
 	// The snapshot of backend statistics when the matrix was updated.
 	snapshot map[string]memBackendSnapshot
 	// The updated time of the metric that we've read last time.
@@ -140,6 +142,7 @@ func (fm *FactorMemory) UpdateScore(backends []scoredBackend) {
 		return
 	}
 	qr := fm.mr.GetQueryResult(fm.Name())
+	fm.capture.query(observation.QueryMemory, qr)
 	if qr.Empty() {
 		return
 	}
@@ -149,7 +152,9 @@ func (fm *FactorMemory) UpdateScore(backends []scoredBackend) {
 		fm.lastMetricTime = qr.UpdateTime
 		fm.updateSnapshot(qr, backends)
 	}
-	if time.Since(fm.lastMetricTime) > memMetricExpDuration {
+	expiryNow := time.Now()
+	fm.capture.clock(observation.ClockMemoryExpiry, expiryNow)
+	if expiryNow.Sub(fm.lastMetricTime) > memMetricExpDuration {
 		// The metrics have not been updated for a long time (maybe Prometheus is unavailable).
 		return
 	}
@@ -168,6 +173,7 @@ func (fm *FactorMemory) UpdateScore(backends []scoredBackend) {
 // - Exist in the backends and metric is updated: update the snapshot
 func (fm *FactorMemory) updateSnapshot(qr metricsreader.QueryResult, backends []scoredBackend) {
 	now := time.Now()
+	fm.capture.clock(observation.ClockMemorySnapshot, now)
 	for _, backend := range backends {
 		addr := backend.Addr()
 		key := backend.ID()

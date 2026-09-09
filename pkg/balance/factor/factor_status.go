@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pingcap/tiproxy/lib/config"
+	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"go.uber.org/zap"
 )
 
@@ -30,6 +31,7 @@ type statusBackendSnapshot struct {
 var _ Factor = (*FactorStatus)(nil)
 
 type FactorStatus struct {
+	capture             *nativeCapture
 	snapshot            map[string]statusBackendSnapshot
 	bitNum              int
 	migrationsPerSecond float64
@@ -61,6 +63,7 @@ func (fs *FactorStatus) UpdateScore(backends []scoredBackend) {
 
 func (fs *FactorStatus) updateSnapshot(backends []scoredBackend) {
 	now := time.Now()
+	fs.capture.clock(observation.ClockStatusSnapshot, now)
 	for i := range backends {
 		addr := backends[i].Addr()
 		key := backends[i].ID()

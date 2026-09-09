@@ -43,7 +43,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-worker-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
-        target = root / "target"
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
+        target = Path(os.environ.get("CARGO_TARGET_DIR", root / "target"))
         seed = os.environ.get("CPROUTE_WORKER_TARGET_SEED")
         if seed:
             cp = ["cp", "-cR"] if sys.platform == "darwin" else ["cp", "-a", "--reflink=auto"]

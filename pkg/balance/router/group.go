@@ -14,6 +14,7 @@ import (
 	glist "github.com/bahlo/generic-list-go"
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/pkg/balance/factor"
 	"github.com/pingcap/tiproxy/pkg/balance/observation"
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
@@ -79,6 +80,10 @@ func NewGroup(values []string, bpCreator func(lg *zap.Logger) policy.BalancePoli
 }
 
 func newGroupObserved(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner) (*Group, error) {
+	return newGroupCaptured(values, bpCreator, matchType, lg, owner, nil)
+}
+
+func newGroupCaptured(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator) (*Group, error) {
 	var observationID uint64
 	if owner.Enabled() {
 		observationID = owner.NextIdentity()
@@ -89,6 +94,12 @@ func newGroupObserved(values []string, bpCreator func(lg *zap.Logger) policy.Bal
 	}
 	lg.Info("new group created")
 
+	var balancePolicy policy.BalancePolicy
+	if native != nil && owner.Enabled() {
+		balancePolicy = native(lg.Named("policy"), owner, observationID)
+	} else {
+		balancePolicy = bpCreator(lg.Named("policy"))
+	}
 	group := &Group{
 		observation: owner, observationID: observationID,
 		matchType:       matchType,
@@ -96,8 +107,9 @@ func newGroupObserved(values []string, bpCreator func(lg *zap.Logger) policy.Bal
 		values:          values,
 		backends:        make(map[string]*backendWrapper),
 		failoverTargets: make(map[string]struct{}),
-		policy:          bpCreator(lg.Named("policy")),
+		policy:          balancePolicy,
 	}
+	group.publishPolicyObservationLocked() // construction is still private, before group publication
 	err := group.parseValues()
 	if err != nil {
 		if owner.Enabled() {
@@ -249,7 +261,9 @@ func (g *Group) routeableObservedBackendsLocked(failoverBackendIDs map[string]st
 			healthy:        healthy,
 		})
 	}
-	return g.policy.RouteableBackends(backends)
+	result := g.policy.RouteableBackends(backends)
+	g.publishPolicyObservationLocked()
+	return result
 }
 
 func (g *Group) backendInFailoverListLocked(backend *backendWrapper) bool {
@@ -363,6 +377,7 @@ func (g *Group) routeObserved(excluded []BackendInst, selection *selectionObserv
 	}
 
 	idlestBackend := g.policy.BackendToRoute(backends)
+	g.publishPolicyObservationLocked()
 	if idlestBackend == nil || reflect.ValueOf(idlestBackend).IsNil() {
 		g.observeNoRoute(selection)
 		return nil, ErrNoBackend
@@ -410,6 +425,7 @@ func (g *Group) Balance(ctx context.Context) {
 	}
 
 	busiestBackend, idlestBackend, balanceCount, reason, logFields := g.policy.BackendsToBalance(backends)
+	g.publishPolicyObservationLocked()
 	if balanceCount == 0 {
 		return
 	}
@@ -779,6 +795,17 @@ func (g *Group) SetConfig(cfg *config.Config) {
 	g.Lock()
 	defer g.Unlock()
 	g.policy.SetConfig(cfg)
+	g.publishPolicyObservationLocked()
 	g.setFailoverConfigLocked(cfg)
 	g.updateFailoverLocked(time.Now())
+}
+
+// The actual call has returned; its Group critical section still protects both
+// the lifecycle ledger and input accounts until the complete record is queued.
+func (g *Group) publishPolicyObservationLocked() {
+	if native, ok := g.policy.(*factor.FactorBasedBalance); ok {
+		if evaluation := native.TakeObservation(); evaluation != nil {
+			g.observation.PublishEvaluation(evaluation)
+		}
+	}
 }

@@ -91,9 +91,9 @@ import sys
 root, temp = map(Path, sys.argv[1:])
 source = root / 'pkg/balance/factor/factor_balance.go'
 original = source.read_text()
-assert original.count('time.Now().UnixMicro()') == 2
+assert original.count('ticketNow.UnixMicro()') == 2
 copy = temp / 'factor_balance.go'
-copy.write_text(original.replace('time.Now().UnixMicro()', 'cprouteTicket'))
+copy.write_text(original.replace('ticketNow.UnixMicro()', 'cprouteTicket'))
 (temp / 'overlay.json').write_text(json.dumps({'Replace': {str(source): str(copy)}}))
 PY
 CPROUTE_CLOCK_OVERLAY=1 \

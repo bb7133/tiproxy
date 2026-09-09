@@ -29,6 +29,7 @@ var _ Router = &ScoreBasedRouter{}
 // ScoreBasedRouter is an implementation of Router interface.
 // It routes a connection based on score.
 type ScoreBasedRouter struct {
+	nativeCreator NativePolicyCreator
 	sync.Mutex
 	logger *zap.Logger
 	// Tests may use a different balance policy.
@@ -380,7 +381,7 @@ func (router *ScoreBasedRouter) updateGroups() {
 		switch router.matchType {
 		case MatchAll:
 			if len(router.groups) == 0 {
-				group, _ = newGroupObserved(nil, router.bpCreator, router.matchType, router.logger, router.observation)
+				group, _ = newGroupCaptured(nil, router.bpCreator, router.matchType, router.logger, router.observation, router.nativeCreator)
 				// A new group must observe the CURRENT config, exactly
 				// like the label/port branches below: without this a
 				// startup fail-backend-list (and failover-timeout) is
@@ -405,7 +406,7 @@ func (router *ScoreBasedRouter) updateGroups() {
 				}
 			}
 			if group == nil {
-				g, err := newGroupObserved(values, router.bpCreator, router.matchType, router.logger, router.observation)
+				g, err := newGroupCaptured(values, router.bpCreator, router.matchType, router.logger, router.observation, router.nativeCreator)
 				if err == nil {
 					group = g
 					if router.cfgGetter != nil {
@@ -511,4 +512,14 @@ func (router *ScoreBasedRouter) Close() {
 	if router.observer != nil {
 		router.observer.Unsubscribe("score_based_router")
 	}
+}
+
+// NativePolicyCreator constructs and initializes an observed native policy while
+// Group is still private. A recorder never retains or invokes this factory.
+type NativePolicyCreator func(*zap.Logger, *observation.Owner, uint64) policy.BalancePolicy
+
+func NewScoreBasedRouterWithNativeObservation(logger *zap.Logger, owner *observation.Owner, creator NativePolicyCreator) *ScoreBasedRouter {
+	router := NewScoreBasedRouterWithObservation(logger, owner)
+	router.nativeCreator = creator
+	return router
 }
