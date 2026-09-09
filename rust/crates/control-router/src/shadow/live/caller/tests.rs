@@ -39,7 +39,7 @@ fn account(score: i64, physical: bool) -> AccountWitness {
         tail: if physical { 10 } else { 0 },
     }
 }
-fn setup(limits: Limits) -> (LiveState, Evaluation) {
+pub(super) fn setup(limits: Limits) -> (LiveState, Evaluation) {
     let epoch = Epoch {
         process: 41,
         owner: 1,

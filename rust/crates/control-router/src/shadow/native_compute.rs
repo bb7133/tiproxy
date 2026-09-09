@@ -235,6 +235,50 @@ pub struct FactorState {
     closed: bool,
     cadence: GoTime,
 }
+/// An independently computed rate. Only the factor comparison can construct
+/// this value; a caller witness cannot become arithmetic input by conversion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BalanceRate(f64);
+impl BalanceRate {
+    pub(crate) const fn value(self) -> f64 {
+        self.0
+    }
+}
+
+/// Independently computed method result, preserved separately from the Go
+/// witness even when the legacy scalar output comparison allows tolerance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Decision {
+    entry: Entry,
+    returned: Vec<u8>,
+    from: i16,
+    to: i16,
+    rate: BalanceRate,
+    reason: Option<Factor>,
+}
+impl Decision {
+    /// Method whose native computation produced this result.
+    #[must_use]
+    pub const fn entry(&self) -> Entry {
+        self.entry
+    }
+    /// Native selected input indices, after independently validating tie order.
+    #[must_use]
+    pub fn returned(&self) -> &[u8] {
+        &self.returned
+    }
+    /// Independent balance pair indices and reason; -1/-1/None means no pair.
+    #[must_use]
+    pub const fn pair(&self) -> (i16, i16, Option<Factor>) {
+        (self.from, self.to, self.reason)
+    }
+    /// A Balance-only arithmetic input; config/route/close cannot stand in for it.
+    #[must_use]
+    pub fn balance_rate(&self) -> Option<BalanceRate> {
+        (self.entry == Entry::Balance).then_some(self.rate)
+    }
+}
+
 impl FactorState {
     /// Start an empty history from the accepted owner prelude.
     #[must_use]
@@ -262,6 +306,16 @@ impl FactorState {
     /// Rejects omitted/reordered reads, missing values, lifetime discontinuity,
     /// or any differing independently computed output.
     pub fn apply(&mut self, e: &Evaluation) -> Result<(), Failure> {
+        self.compare(e).map(|_| ())
+    }
+
+    /// Compare once and return the independent result for an enclosing caller.
+    /// The caller must discard the budgeted factor stage on any error.
+    ///
+    /// # Errors
+    /// Same lifetime/read/output validation as `apply`; no extra factor read or
+    /// second computation is performed to reconstruct the returned decision.
+    pub fn compare(&mut self, e: &Evaluation) -> Result<Decision, Failure> {
         let factors = self.prepare(e)?;
         let policy = configuration(&e.configuration)?;
         if matches!(e.entry, Entry::Config | Entry::Close)
@@ -269,7 +323,15 @@ impl FactorState {
             || e.entry == Entry::Balance && e.accounts.len() <= 1
         {
             self.closed = e.entry == Entry::Close;
-            return early(e);
+            early(e)?;
+            return Ok(Decision {
+                entry: e.entry,
+                returned: Vec::new(),
+                from: -1,
+                to: -1,
+                rate: BalanceRate(0.0),
+                reason: None,
+            });
         }
         let inputs: Vec<_> = e.accounts.iter().map(Values::new).collect();
         let mut tape = Tape::new(&e.reads);
@@ -346,7 +408,14 @@ impl FactorState {
         {
             return Err(Failure::Output);
         }
-        Ok(())
+        Ok(Decision {
+            entry: e.entry,
+            returned,
+            from,
+            to,
+            rate: BalanceRate(rate),
+            reason,
+        })
     }
     fn walk(
         &self,

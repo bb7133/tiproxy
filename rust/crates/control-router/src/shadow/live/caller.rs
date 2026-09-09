@@ -5,9 +5,12 @@
 //! The forthcoming typed caller comparator must supply its independent final
 //! result. Successfully comparing children alone does not verify a caller.
 
+/// Go-compatible caller arithmetic, independent of production effects.
+pub mod arithmetic;
+
 use super::native::{HISTORY_LIMIT, NativeOwner, STAGE_OVERHEAD, Stored};
 use super::{Batch, Epoch, Event, InvalidReason, LiveEvent, LiveState, Progress, Status};
-use crate::shadow::native::Evaluation;
+use crate::shadow::native::{Decision, Evaluation};
 use std::collections::BTreeMap;
 
 /// Complete caller frame limit, including its four-byte prefix.
@@ -231,7 +234,7 @@ impl Stage<'_> {
         self.failed.map_or(Ok(()), Err)
     }
 
-    fn remember(&mut self, result: Result<(), InvalidReason>) -> Result<(), InvalidReason> {
+    fn remember<T>(&mut self, result: Result<T, InvalidReason>) -> Result<T, InvalidReason> {
         if let Err(reason) = result {
             self.failed.get_or_insert(reason);
         }
@@ -251,13 +254,13 @@ impl Stage<'_> {
     ///
     /// # Errors
     /// A failed child permanently poisons the entire transaction.
-    pub fn evaluation(&mut self, evaluation: &Evaluation) -> Result<(), InvalidReason> {
+    pub fn evaluation(&mut self, evaluation: &Evaluation) -> Result<Decision, InvalidReason> {
         self.check()?;
         let result = self.evaluation_inner(evaluation);
         self.remember(result)
     }
 
-    fn evaluation_inner(&mut self, e: &Evaluation) -> Result<(), InvalidReason> {
+    fn evaluation_inner(&mut self, e: &Evaluation) -> Result<Decision, InvalidReason> {
         if self.evaluations >= 4 {
             return Err(InvalidReason::Capacity);
         }
@@ -271,10 +274,10 @@ impl Stage<'_> {
             .ok_or(InvalidReason::Capacity)?;
         let budget = Budget::new(self.frame_bytes, self.retained, clones)?;
         self.original.record_caller_budget(budget);
-        let progress = self.staged.observe_native(e, budget.decode);
+        let (progress, decision) = self.staged.observe_native_decision(e, budget.decode);
         checked_progress(progress)?;
         self.evaluations += 1;
-        Ok(())
+        decision.ok_or(InvalidReason::Witness)
     }
 
     /// Apply a complete compound lifecycle child in its actual mutation order.

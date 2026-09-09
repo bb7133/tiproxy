@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Native factor comparison shares the lifecycle owner's contiguous prefix.
-use super::super::native::{Coverage, Evaluation, FactorState};
+use super::super::native::{Coverage, Decision, Evaluation, FactorState};
 use super::{Epoch, InvalidReason, LiveState, Progress, Status};
 use std::collections::BTreeMap;
 
@@ -92,6 +92,14 @@ impl LiveState {
     /// Compare one complete evaluation and atomically advance history and prefix.
     /// `staging` includes the transport-owned frame and its decoder/derivation peak.
     pub fn observe_native(&mut self, e: &Evaluation, staging: usize) -> Progress {
+        self.observe_native_decision(e, staging).0
+    }
+    pub(super) fn observe_native_decision(
+        &mut self,
+        e: &Evaluation,
+        staging: usize,
+    ) -> (Progress, Option<Decision>) {
+        let mut decision = None;
         let key = (e.epoch.process, e.epoch.owner);
         match self.core.owners.get(&key) {
             None => {
@@ -101,8 +109,11 @@ impl LiveState {
                 self.invalidate(e.epoch, InvalidReason::Identity);
             }
             Some(owner) if owner.status == Status::Comparing => {
-                if let Err(reason) = self.compare_native(e, staging) {
-                    self.invalidate(e.epoch, reason);
+                match self.compare_native(e, staging) {
+                    Ok(computed) => decision = Some(computed),
+                    Err(reason) => {
+                        self.invalidate(e.epoch, reason);
+                    }
                 }
             }
             Some(owner) if matches!(owner.status, Status::Invalid(_)) => (),
@@ -110,9 +121,13 @@ impl LiveState {
                 self.invalidate(e.epoch, InvalidReason::Lifecycle);
             }
         }
-        self.progress(e.epoch)
+        (self.progress(e.epoch), decision)
     }
-    fn compare_native(&mut self, e: &Evaluation, staging: usize) -> Result<(), InvalidReason> {
+    fn compare_native(
+        &mut self,
+        e: &Evaluation,
+        staging: usize,
+    ) -> Result<Decision, InvalidReason> {
         let key = (e.epoch.process, e.epoch.owner);
         let owner = self
             .core
@@ -170,7 +185,7 @@ impl LiveState {
             || FactorState::new(native.coverage),
             |stored| stored.state.clone(),
         );
-        staged.apply(e).map_err(|_| InvalidReason::Witness)?;
+        let decision = staged.compare(e).map_err(|_| InvalidReason::Witness)?;
         let charge = staged.retained_bytes() + GROUP_CHARGE;
         if charge > old_charge + staging + STAGE_OVERHEAD {
             return Err(InvalidReason::Capacity);
@@ -193,7 +208,7 @@ impl LiveState {
             .get_mut(&key)
             .ok_or(InvalidReason::Identity)?
             .sequence = e.sequence;
-        Ok(())
+        Ok(decision)
     }
 }
 
