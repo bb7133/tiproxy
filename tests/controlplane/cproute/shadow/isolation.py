@@ -14,21 +14,41 @@ for path in shadow.rglob('*.rs'):
     if path.name == 'tests.rs' or path.name.endswith('_tests.rs'):
         continue
     source = path.read_text()
-    # Explicit value-only imports into the native comparer. An added Router,
-    # ledger owner, candidate or command import remains forbidden. The two
-    # shared phase modules are scanned independently below.
+    # Exact complete lines, scoped to their precise source path. Adding Router,
+    # production ledger owners, candidates or commands to any import still fails
+    # the unchanged prohibition below; a same-named file inherits no exception.
     allowed = {
-        'native.rs': [r'use crate::Factor;', r'pub use crate::factors::window::\{ClockSite, GoArch\};'],
+        'native.rs': [
+            'use crate::Factor;',
+            'pub use crate::factors::window::{ClockSite, GoArch};',
+        ],
         'native_compute.rs': [
-            r'use crate::factors::window::\{self, Backend, Count, Query, Time, Window\};',
-            r'use crate::factors::\{order, phases\};',
-            r'use crate::\{BalanceAdvice, Factor, FactorAdvice, FactorScore\};',
+            'use crate::factors::window::{self, Backend, Count, Query, Time, Window};',
+            'use crate::factors::{order, phases};',
+            'use crate::{BalanceAdvice, Factor, FactorAdvice, FactorScore};',
+        ],
+        'live/native.rs': [
+            'use super::super::native::{Coverage, Decision, Evaluation, FactorState};',
+        ],
+        'live/caller.rs': [
+            'use crate::shadow::native::{Decision, Evaluation};',
+            # This literal constructs the private shadow mirror owner, with only
+            # copied ledger/history values. It is not a production ledger owner.
+            'crate::shadow::Owner {',
+        ],
+        'live/caller/arithmetic.rs': [
+            'use crate::shadow::native::{BalanceRate, GoArch};',
+        ],
+        'live/caller/pass.rs': [
+            'use crate::shadow::{Epoch, InvalidReason};',
+        ],
+        'live/caller/route.rs': [
+            'use crate::shadow::native::{Entry, Evaluation};',
         ],
     }
-    for statement in allowed.get(path.name, []):
-        source = re.sub(statement, '', source)
-    if path.relative_to(shadow).as_posix() == 'live/native.rs':
-        source = source.replace('use super::super::native::{Coverage, Evaluation, FactorState};', '')
+    statements = allowed.get(path.relative_to(shadow).as_posix(), [])
+    source = '\n'.join('' if line.strip() in statements else line
+                       for line in source.splitlines())
     forbidden = r'(?:\bcrate\s*::|\bsuper\s*::\s*super\b|control_proto::|control_config::ConfigNamespaceStore|control_topology::BackendSource|tokio::|std::(?:net|thread)|mpsc::)'
     if re.search(forbidden, source):
         raise SystemExit(f'SHADOW_NO_EFFECT_CAPABILITY: {path.name}')
