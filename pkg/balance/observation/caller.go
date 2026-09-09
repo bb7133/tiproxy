@@ -28,6 +28,7 @@ type CallerChild struct {
 }
 
 type callerStorage struct {
+	pass        RouterPass
 	input       [MaxCallerDataBytes]byte
 	output      [MaxCallerFrameBytes]byte
 	evaluations [MaxCallerEvaluations]*Evaluation // Includes unfinished captures.
@@ -101,6 +102,10 @@ func (c *Caller) Append(value []byte) bool {
 	if !c.writable() {
 		return false
 	}
+	if c.storage.pass.Kind != 0 {
+		c.owner.Invalidate(Malformed)
+		return false
+	}
 	if len(value) > MaxCallerDataBytes-c.length {
 		c.owner.Invalidate(Capacity)
 		return false
@@ -114,6 +119,10 @@ func (c *Caller) Append(value []byte) bool {
 // or evaluate anything. An interrupted, unsealed child is still owned here.
 func (c *Caller) BeginEvaluation() *Evaluation {
 	if !c.writable() {
+		return nil
+	}
+	if c.storage.pass.Kind != 0 {
+		c.owner.Invalidate(Malformed)
 		return nil
 	}
 	if c.evaluations == MaxCallerEvaluations {
@@ -158,7 +167,7 @@ func (c *Caller) AppendBatch(batch Batch) bool {
 	if !c.writable() {
 		return false
 	}
-	if batch.EventCount == 0 || batch.EventCount > MaxEvents || batch.Witness.AccountCount > MaxWitnesses {
+	if c.storage.pass.Kind != 0 || batch.EventCount == 0 || batch.EventCount > MaxEvents || batch.Witness.AccountCount > MaxWitnesses {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
@@ -177,7 +186,7 @@ func (c *Caller) Seal() bool {
 	if !c.writable() {
 		return false
 	}
-	if c.length == 0 || c.children != c.evaluations+c.batches {
+	if c.length == 0 && c.storage.pass.Kind == 0 || c.children != c.evaluations+c.batches {
 		c.owner.Invalidate(Malformed)
 		return false
 	}

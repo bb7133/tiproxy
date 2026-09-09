@@ -7,6 +7,8 @@
 
 /// Go-compatible caller arithmetic, independent of production effects.
 pub mod arithmetic;
+/// Bounded router pass boundary and order comparison; not installed yet.
+pub mod pass;
 
 use super::native::{HISTORY_LIMIT, NativeOwner, STAGE_OVERHEAD, Stored};
 use super::{Batch, Epoch, Event, InvalidReason, LiveEvent, LiveState, Progress, Status};
@@ -52,7 +54,12 @@ pub struct Budget {
     pub peak: usize,
 }
 impl Budget {
-    fn new(frame: usize, retained: usize, clones: usize) -> Result<Self, InvalidReason> {
+    /// Check the complete incoming decode, retained history and simultaneous
+    /// affected clone allowance before allocating any of those staging values.
+    ///
+    /// # Errors
+    /// Rejects oversized frames, arithmetic overflow or the shared 64MiB bound.
+    pub fn new(frame: usize, retained: usize, clones: usize) -> Result<Self, InvalidReason> {
         if !(5..=MAX_CALLER_FRAME).contains(&frame) {
             return Err(InvalidReason::Capacity);
         }
