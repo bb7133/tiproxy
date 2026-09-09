@@ -65,7 +65,7 @@ func TestCallerCombinedOwnershipAndShutdown(t *testing.T) {
 	d := receive(t, r)
 	require.Same(t, c, d.Record.Caller)
 	require.EqualValues(t, 2, d.Record.Sequence)
-	require.EqualValues(t, 261, c.Span())
+	require.EqualValues(t, 261, c.Span(), "CALLER_PRODUCER_CLEANUP_KEEPS_TRANSFER")
 	require.EqualValues(t, 262, o.AdmittedSequence())
 	require.Len(t, c.Children(), 68)
 	require.Len(t, c.EncodingBuffer(), 1<<20)

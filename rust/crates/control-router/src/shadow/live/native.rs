@@ -14,12 +14,12 @@ pub const STAGE_OVERHEAD: usize = 1024 * 1024;
 const OWNER_CHARGE: usize = 16 * size_of::<(Epoch, NativeOwner)>();
 const GROUP_CHARGE: usize = 16 * size_of::<(u64, Stored)>();
 pub(super) struct NativeOwner {
-    coverage: Coverage,
-    groups: BTreeMap<u64, Stored>,
+    pub(super) coverage: Coverage,
+    pub(super) groups: BTreeMap<u64, Stored>,
 }
-struct Stored {
-    state: FactorState,
-    charge: usize,
+pub(super) struct Stored {
+    pub(super) state: FactorState,
+    pub(super) charge: usize,
 }
 impl LiveState {
     /// The producer capability must arrive before the owner's first Begin.
