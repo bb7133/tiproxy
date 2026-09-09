@@ -128,7 +128,7 @@ func EncodeEvaluation(record observation.Record) (frame []byte, err error) {
 		}
 	}()
 	e := record.Evaluation
-	if !record.Native || e == nil || record.Batch.EventCount != 0 || record.Sequence == 0 || record.Epoch.Process == 0 || record.Epoch.Owner == 0 || record.Epoch.Nonce == 0 {
+	if !record.Native || e == nil || record.Caller != nil || record.Batch.EventCount != 0 || record.Sequence == 0 || record.Epoch.Process == 0 || record.Epoch.Owner == 0 || record.Epoch.Nonce == 0 {
 		return nil, errSchema
 	}
 	n := e.Native()

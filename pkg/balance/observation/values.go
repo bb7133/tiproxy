@@ -105,6 +105,9 @@ type Record struct {
 	// An evaluation occupies one sequence. Its zero Batch is never interpreted
 	// as a v2 lifecycle record; the writer uses the separate native codec.
 	Evaluation *Evaluation
+	// Caller retains one complete span, including every nested child lease.
+	// Existing dialect encoders must reject it until the caller codec is used.
+	Caller *Caller
 }
 
 type InvalidReason uint32
