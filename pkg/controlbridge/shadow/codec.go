@@ -157,6 +157,9 @@ func eventValue(e observation.Event) (wireEvent, error) {
 // complete allocation and encoded length must fit the already-retained charge.
 func EncodeRecord(record observation.Record) ([]byte, error) {
 	b := record.Batch
+	if record.Evaluation != nil {
+		return nil, errSchema
+	}
 	if b.EventCount < 1 || b.EventCount > observation.MaxEvents || b.Witness.AccountCount > observation.MaxWitnesses || record.Sequence == 0 {
 		return nil, errSchema
 	}

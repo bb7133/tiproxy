@@ -74,6 +74,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='cproute-shadow-') as temporary:
         directory = Path(temporary) / 'repo'
         shutil.copytree(ROOT, directory, ignore=shutil.ignore_patterns('.git', 'target', 'bin', 'artifacts', '__pycache__'))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in (directory / "rust").rglob("*.rs"):
+            fresh_source.touch()
         # One caller-owned Cargo cache, reused sequentially; mutations still
         # touch only this isolated source copy. No duplicate multi-GB cache.
         target = ROOT / 'rust/target'

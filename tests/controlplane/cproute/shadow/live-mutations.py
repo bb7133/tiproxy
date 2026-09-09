@@ -43,7 +43,7 @@ CASES = [
  go('identity-wrap-reused','TestRecorderCountersNeverWrapAndMalformedBatchInvalidates','RECORDER_IDENTITY_OVERFLOW',[edit(REC,'o.identity == math.MaxUint64','false')]),
  go('batch-bound-expanded','TestRecorderCountersNeverWrapAndMalformedBatchInvalidates','RECORDER_BATCH_BOUND',[edit(REC,'batch.EventCount > MaxEvents','batch.EventCount > MaxEvents+1')]),
  go('witness-bound-expanded','TestRecorderCountersNeverWrapAndMalformedBatchInvalidates','RECORDER_WITNESS_BOUND',[edit(REC,'batch.Witness.AccountCount > MaxWitnesses','batch.Witness.AccountCount > MaxWitnesses+1')]),
- go('queued-credits-survive-close','TestRecorderCloseJoinsAdmissionAndReleasesOnlyOwnedCredits','RECORDER_CLOSE_JOIN',[edit(REC,'\n\tfor {\n\t\tselect {\n\t\tcase <-r.queue:', '\n return\n\tfor {\n\t\tselect {\n\t\tcase <-r.queue:', 'func (r *Recorder) Close()', '// NextOrChanged')]),
+ go('queued-credits-survive-close','TestRecorderCloseJoinsAdmissionAndReleasesOnlyOwnedCredits','RECORDER_CLOSE_JOIN',[edit(REC,'\n\tfor {\n\t\tselect {\n\t\tcase record := <-r.queue:', '\n return\n\tfor {\n\t\tselect {\n\t\tcase record := <-r.queue:', 'func (r *Recorder) Close()', '// NextOrChanged')]),
  go('discard-silently-accepted','TestObservationAbandonNeverRefunds','UnpairedDiscard must invalidate the entire owner',[edit(CAP,'s.owner.Invalidate(observation.UnpairedDiscard)','_ = s.owner','func (s *selectionObservation) finish()', 'func (s *selectionObservation) noRoute(')],'router'),
  go('invalid-still-copies-witness','TestObservationInvalidFastPathNeverReadsWitness','LIVE_INVALID_BEFORE_COPY',[edit(CAP,'if !g.observation.Enabled() {','if false {','func (g *Group) capture(', 'func (g *Group) observeRedirect(')],'router'),
  go('observer-writes-production-score','TestObservationActualLifecycle','LIVE_NO_ACCOUNTING_EFFECT',[edit(CAP,'witness := observation.AccountWitness{','b.connScore++\n witness := observation.AccountWitness{')],'router'),
@@ -78,6 +78,9 @@ def main(baseline_go=None):
     with tempfile.TemporaryDirectory(prefix='cproute-live-') as temporary:
         directory=Path(temporary)/'repo'
         shutil.copytree(ROOT,directory,ignore=shutil.ignore_patterns('.git','target','bin','artifacts','__pycache__'))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in (directory / "rust").rglob("*.rs"):
+            fresh_source.touch()
         env=dict(os.environ,CARGO_TARGET_DIR=str(ROOT/'rust/target'))
         for key in ['CP_ROUTE_LIVE_SOCKET_CHECK','CP_ROUTE_LIVE_FRAMES']:
             env.pop(key,None)

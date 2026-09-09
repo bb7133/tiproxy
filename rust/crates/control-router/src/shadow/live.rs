@@ -4,6 +4,8 @@
 //! Independent comparison of bounded batches captured at actual Go mutations.
 //! Witnesses are outputs only; they never initialize or repair the mirror.
 
+pub mod native;
+
 use super::{Epoch, Event, InvalidReason, Limits, Observation, Progress, ShadowState, Status};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -150,6 +152,9 @@ pub struct LiveState {
     core: ShadowState,
     groups: BTreeMap<(u64, u64), BTreeMap<u64, bool>>,
     limits: Limits,
+    native: BTreeMap<Epoch, native::NativeOwner>,
+    native_bytes: usize,
+    native_peak: usize,
 }
 impl LiveState {
     /// Empty observer; production state cannot be attached or reconstructed.
@@ -159,6 +164,9 @@ impl LiveState {
             core: ShadowState::new(limits),
             groups: BTreeMap::new(),
             limits,
+            native: BTreeMap::new(),
+            native_bytes: 0,
+            native_peak: 0,
         }
     }
 

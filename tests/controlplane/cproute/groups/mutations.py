@@ -27,7 +27,7 @@ def main():
             '[workspace]\nmembers = ["control-routing"]\nresolver = "3"\n'
             + '[workspace.package]' + package + lints
         )
-        environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+        environment = dict(os.environ, CARGO_TARGET_DIR=os.environ.get("CARGO_TARGET_DIR", str(root / "target")))
         subprocess.run(["cargo", "generate-lockfile", "--offline", "--manifest-path", str(root / "Cargo.toml")], check=True, env=environment)
         source = root / "control-routing/src/group.rs"
         original = source.read_text()

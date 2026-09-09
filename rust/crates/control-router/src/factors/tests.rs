@@ -343,7 +343,7 @@ fn retained_cache_requires_exact_ledger_owner() {
     let policy = must(EffectiveConfig::default().routing());
     let mut state = State::default();
     let _ = state.evaluate(&inputs, &policy, &queries, now);
-    assert!(state.cache["a"].cpu.is_some());
+    assert!(state.history.cache["a"].cpu.is_some());
     let previous_owner = Arc::clone(&inputs[0].owner);
     inputs[0].owner = must(ledger.add_account());
     let owners = inputs
@@ -352,7 +352,7 @@ fn retained_cache_requires_exact_ledger_owner() {
         .collect();
     state.retain_owners(&owners);
     assert!(
-        !state.cache.contains_key("a"),
+        !state.history.cache.contains_key("a"),
         "FACTOR_ACCOUNT_ABA_NO_REUSE"
     );
     let cpu = must(queries.get_mut(&QueryId::Cpu).ok_or("cpu"));
@@ -370,10 +370,14 @@ fn retained_cache_requires_exact_ledger_owner() {
         Some(&(Factor::Cpu, 20)),
         "FACTOR_NEW_ACCOUNT_MISSING_CPU"
     );
-    assert!(!Arc::ptr_eq(&state.cache["a"].owner, &previous_owner));
+    assert!(!Arc::ptr_eq(&state.owners["a"].identity, &previous_owner));
     state.clear_cluster("default");
     assert!(
-        state.cache.values().all(|cache| cache.cpu.is_none()),
+        state
+            .history
+            .cache
+            .values()
+            .all(|cache| cache.cpu.is_none()),
         "FACTOR_COLD_START_CLEARS_CACHE"
     );
 }
@@ -435,4 +439,188 @@ fn other_cluster_lineage_preserves_cached_health_indicator() {
         b.parts.contains(&(Factor::Health, 2)),
         "FACTOR_UNCHANGED_CLUSTER_RETAINS_HEALTH"
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadKey {
+    Query(QueryId),
+    Clock(window::ClockSite),
+}
+struct RecordedWindow<'a> {
+    queries: &'a Queries,
+    now: i64,
+    reads: Vec<ReadKey>,
+}
+impl<'a> window::Window<'a, QueryResult> for RecordedWindow<'a> {
+    type Error = std::convert::Infallible;
+    fn query(&mut self, id: QueryId) -> Result<Option<&'a QueryResult>, Self::Error> {
+        self.reads.push(ReadKey::Query(id));
+        Ok(self.queries.get(&id))
+    }
+    fn clock(&mut self, site: window::ClockSite) -> Result<i64, Self::Error> {
+        self.reads.push(ReadKey::Clock(site));
+        Ok(self.now)
+    }
+}
+fn same_history(left: &State, right: &State) {
+    let snapshot = |state: &State| {
+        state
+            .history
+            .cache
+            .iter()
+            .map(|(id, c)| {
+                (
+                    id.to_string(),
+                    c.cpu.map(|v| {
+                        (
+                            v.time,
+                            v.avg.to_bits(),
+                            v.latest.to_bits(),
+                            v.connections.value().to_bits(),
+                        )
+                    }),
+                    c.memory.map(|v| (v.time, v.risk, v.balance.to_bits())),
+                    c.health.map(|v| (v.time, v.risk, v.balance.to_bits())),
+                    c.status.map(|(t, v)| (t, v.to_bits())),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        snapshot(left),
+        snapshot(right),
+        "NATIVE_SINGLE_TIME_NEXT_HISTORY"
+    );
+    assert_eq!(
+        (
+            left.history.cpu_time,
+            left.history.memory_time,
+            left.history.usage_per_conn.to_bits()
+        ),
+        (
+            right.history.cpu_time,
+            right.history.memory_time,
+            right.history.usage_per_conn.to_bits()
+        ),
+        "NATIVE_SINGLE_TIME_QUERY_KEYS"
+    );
+    assert_eq!(left.history.health_dirty, right.history.health_dirty);
+    let queries = |state: &State| {
+        state
+            .history
+            .health_queries
+            .iter()
+            .map(|(id, q)| {
+                (
+                    *id,
+                    q.updated_nanos,
+                    q.kind,
+                    q.series
+                        .iter()
+                        .map(|s| {
+                            (
+                                s.labels.clone(),
+                                s.samples
+                                    .iter()
+                                    .map(|p| (p.timestamp_ms, p.value.to_bits()))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        queries(left),
+        queries(right),
+        "NATIVE_SINGLE_TIME_RETAINED_QUERY"
+    );
+}
+
+#[test]
+fn single_time_entry_matches_ordered_windows_and_next_history() {
+    let mut ledger = Ledger::new(1);
+    let inputs: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|id| Input {
+            id: Arc::from(id),
+            owner: must(ledger.add_account()),
+            instance: format!("{id}:10080"),
+            cluster: "default".into(),
+            counts: Accounting::for_factor_test(if id == "a" { 10 } else { 100 }, 2),
+            healthy: id == "a",
+            local: true,
+            label_matches: true,
+        })
+        .collect();
+    let policy = must(EffectiveConfig::default().routing());
+    let mut direct = State::default();
+    let mut ordered = State::default();
+    let mut query_map = Queries::new();
+    for round in 0..5_i64 {
+        let now = 1_000_000_000_000 + round * 30_000_000_000;
+        if round == 0 || round == 3 {
+            for id in [
+                QueryId::Cpu,
+                QueryId::Memory,
+                QueryId::FailurePd,
+                QueryId::TotalPd,
+                QueryId::FailureTikv,
+                QueryId::TotalTikv,
+            ] {
+                query_map.insert(
+                    id,
+                    QueryResult {
+                        updated_nanos: now,
+                        kind: if matches!(id, QueryId::Cpu | QueryId::Memory) {
+                            ValueKind::Matrix
+                        } else {
+                            ValueKind::Vector
+                        },
+                        series: inputs
+                            .iter()
+                            .map(|input| Series {
+                                labels: BTreeMap::from([(
+                                    "instance".into(),
+                                    input.instance.clone(),
+                                )]),
+                                samples: vec![Sample {
+                                    timestamp_ms: now / 1_000_000,
+                                    value: 0.8,
+                                }],
+                            })
+                            .collect(),
+                    },
+                );
+            }
+        }
+        if round == 2 {
+            query_map.remove(&QueryId::FailurePd);
+        }
+        let report = direct.evaluate(&inputs, &policy, &query_map, now);
+        let mut window = RecordedWindow {
+            queries: &query_map,
+            now,
+            reads: Vec::new(),
+        };
+        let repeated = must(ordered.evaluate_window(&inputs, &policy, &mut window));
+        assert_eq!(report, repeated, "NATIVE_SINGLE_TIME_REPORT");
+        same_history(&direct, &ordered);
+        let position = |site| {
+            window
+                .reads
+                .iter()
+                .position(|read| *read == ReadKey::Clock(site))
+        };
+        if let Some(snapshot) = position(window::ClockSite::HealthSnapshot) {
+            assert!(position(window::ClockSite::HealthExpiry) < Some(snapshot));
+        }
+        if let Some(snapshot) = position(window::ClockSite::CpuSnapshot) {
+            assert!(Some(snapshot) < position(window::ClockSite::CpuExpiry));
+        }
+        if let Some(snapshot) = position(window::ClockSite::MemorySnapshot) {
+            assert!(Some(snapshot) < position(window::ClockSite::MemoryExpiry));
+        }
+    }
 }

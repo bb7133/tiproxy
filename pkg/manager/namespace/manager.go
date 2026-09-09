@@ -40,7 +40,8 @@ type NamespaceManager interface {
 }
 
 type namespaceManager struct {
-	observation *observation.Recorder
+	nativeObservation bool
+	observation       *observation.Recorder
 	sync.RWMutex
 	nsm            map[string]*Namespace
 	tpFetcher      observer.TopologyFetcher
@@ -62,6 +63,12 @@ func NewNamespaceManagerWithObservation(recorder *observation.Recorder) *namespa
 	return &namespaceManager{observation: recorder}
 }
 
+// NewNamespaceManagerWithNativeObservation fixes native factor capture before
+// any namespace, router or policy initialization.
+func NewNamespaceManagerWithNativeObservation(recorder *observation.Recorder) *namespaceManager {
+	return &namespaceManager{observation: recorder, nativeObservation: true}
+}
+
 func (mgr *namespaceManager) buildNamespace(cfg *config.Namespace) (*Namespace, error) {
 	logger := mgr.logger.With(zap.String("namespace", cfg.Namespace))
 
@@ -73,9 +80,20 @@ func (mgr *namespaceManager) buildNamespace(cfg *config.Namespace) (*Namespace, 
 	// init Router
 	var owner *observation.Owner
 	if mgr.observation != nil {
-		owner = mgr.observation.NewOwner()
+		if mgr.nativeObservation {
+			owner = mgr.observation.NewNativeOwner()
+		} else {
+			owner = mgr.observation.NewOwner()
+		}
 	}
 	rt := router.NewScoreBasedRouterWithObservation(logger.Named("router"), owner)
+	if mgr.nativeObservation {
+		rt = router.NewScoreBasedRouterWithNativeObservation(logger.Named("router"), owner, func(lg *zap.Logger, owner *observation.Owner, group uint64) policy.BalancePolicy {
+			native := factor.NewFactorBasedBalanceObserved(lg, mgr.metricsReader, owner, group)
+			native.Init(mgr.cfgMgr.GetConfig())
+			return native
+		})
+	}
 	hc := observer.NewDefaultHealthCheckWithNetwork(mgr.backendNetwork, healthCheckCfg, logger.Named("hc"))
 	bo := observer.NewDefaultBackendObserver(logger.Named("observer"), healthCheckCfg, fetcher, hc, mgr.cfgMgr)
 	bo.Start(context.Background())

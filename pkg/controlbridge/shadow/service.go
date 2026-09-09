@@ -178,7 +178,7 @@ func (s *Service) serve(conn *net.UnixConn) {
 	reader.RunWithRecover(func() { defer cancel(); var unexpected [1]byte; _, _ = conn.Read(unexpected[:]) }, func(any) { cancel() }, s.logger)
 	err := s.write(ctx, conn)
 	if err != nil && s.ctx.Err() == nil {
-		s.logger.Warn("routing lifecycle observation interval lost", zap.Error(err), zap.Bool("lifecycle_only", true))
+		s.logger.Warn("routing observation interval lost", zap.Error(err))
 	}
 }
 func (s *Service) write(ctx context.Context, conn *net.UnixConn) error {
@@ -190,6 +190,7 @@ func (s *Service) write(ctx context.Context, conn *net.UnixConn) error {
 		return err
 	}
 	sent := make(map[observation.Epoch]observation.InvalidSummary)
+	nativeSent := make(map[observation.Epoch]bool)
 	for {
 		for _, summary := range s.recorder.InvalidOwners() {
 			if previous, ok := sent[summary.Epoch]; ok && previous == summary {
@@ -215,7 +216,28 @@ func (s *Service) write(ctx context.Context, conn *net.UnixConn) error {
 			delivery.Release()
 			continue
 		}
-		frame, err := EncodeRecord(delivery.Record)
+		if delivery.Record.Native && !nativeSent[delivery.Record.Epoch] {
+			metadata, ok := s.recorder.NativeMetadata(delivery.Record.Epoch)
+			if !ok {
+				delivery.Release()
+				return errSchema
+			}
+			frame, err := EncodeNativeCoverage(metadata)
+			if err == nil {
+				err = writeFrame(conn, frame)
+			}
+			if err != nil {
+				delivery.Release()
+				return err
+			}
+			nativeSent[delivery.Record.Epoch] = true
+		}
+		var frame []byte
+		if delivery.Record.Evaluation != nil {
+			frame, err = EncodeEvaluation(delivery.Record)
+		} else {
+			frame, err = EncodeRecord(delivery.Record)
+		}
 		if err == nil {
 			err = writeFrame(conn, frame)
 		}

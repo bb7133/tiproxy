@@ -243,3 +243,11 @@ func (p *TimeProjection) Project(t time.Time) (GoTimeValue, bool) {
 func ProjectSampleTime(milliseconds int64) SampleTimeValue {
 	return SampleTimeValue{Domain: SampleTimeDomain, Milliseconds: milliseconds}
 }
+
+// TimeProjection is allocated once per owner at its factory boundary.
+func (o *Owner) TimeProjection() *TimeProjection {
+	if o == nil {
+		return nil
+	}
+	return o.timeProjection
+}

@@ -22,6 +22,8 @@
 pub mod consumer;
 /// Strict v2 actual-capture codec, independent of the immutable v1 corpus.
 pub mod live;
+/// Strict native-factor v3 dialect, separate from v1/v2.
+pub mod native;
 mod wire;
 use control_router::shadow::Observation;
 use std::collections::VecDeque;
@@ -151,3 +153,6 @@ mod tests;
 
 #[cfg(test)]
 mod live_tests;
+
+#[cfg(test)]
+mod native_tests;

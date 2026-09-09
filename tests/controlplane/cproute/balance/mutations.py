@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 import live
 
@@ -15,11 +14,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cproute-balance-") as directory:
         root = Path(directory)
         shutil.copytree(repo / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
-        target = root / "target"
-        seed = os.environ.get("CPROUTE_BALANCE_TARGET_SEED")
-        if seed:
-            cp = ["cp", "-cR"] if sys.platform == "darwin" else ["cp", "-a", "--reflink=auto"]
-            subprocess.run(cp + [seed, str(target)], check=True)
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
+        target = repo / "rust/target"
         env = dict(os.environ, CARGO_TARGET_DIR=str(target), CPROUTE_ARRIVAL_OUTPUT=str(root / "arrival.tsv"))
         def run(binary, selection):
             return subprocess.run([binary, selection, "--nocapture", "--test-threads=1"],
@@ -36,13 +34,13 @@ def main():
         baseline()
         source = root / "rust/crates/control-router/src"
         cases = [
-            ("physical-zero", "factors/balance.rs", [("source.counts.active() == 0", "false", 1)], "shared_go_factor_observations"),
-            ("score-zero", "factors/balance.rs", [("source.counts.connection_score() == 0", "false", 1)], "shared_go_factor_observations"),
-            ("best-unrouteable", "factors/balance.rs", [("!best.routeable", "false", 1)], "shared_go_factor_observations"),
-            ("source-order", "factors/balance.rs", [(".skip(1).rev()", ".skip(1)", 1)], "shared_go_factor_observations"),
-            ("inverted-priority", "factors/balance.rs", [("from < to", "false", 1)], "shared_go_factor_observations"),
-            ("negative-equal-veto", "factors/balance.rs", [("advice.advice == BalanceAdvice::Negative", "(from > to && advice.advice == BalanceAdvice::Negative)", 1)], "shared_go_factor_observations"),
-            ("strict-cutoff", "factors/balance.rs", [("advice.count > 0.0001", "advice.count >= 0.0001", 1)], "shared_go_factor_observations"),
+            ("physical-zero", "factors/balance.rs", [("sorted[i].0.counts.active() > 0", "true", 1)], "shared_go_factor_observations"),
+            ("score-zero", "factors/balance.rs", [("sorted[i].0.counts.connection_score() > 0", "true", 1)], "shared_go_factor_observations"),
+            ("best-unrouteable", "factors/phases.rs", [("!row(0).routeable", "false", 1)], "shared_go_factor_observations"),
+            ("source-order", "factors/phases.rs", [("(1..n).rev()", "(1..n)", 1)], "shared_go_factor_observations"),
+            ("inverted-priority", "factors/phases.rs", [("from < to", "false", 1)], "shared_go_factor_observations"),
+            ("negative-equal-veto", "factors/phases.rs", [("answer.advice == BalanceAdvice::Negative", "(from > to && answer.advice == BalanceAdvice::Negative)", 1)], "shared_go_factor_observations"),
+            ("strict-cutoff", "factors/phases.rs", [("answer.count > 0.0001", "answer.count >= 0.0001", 1)], "shared_go_factor_observations"),
             ("arrival-prepend", "ledger.rs", [("target.physical.push(redirect.session.sequence);", "target.physical.insert(0, redirect.session.sequence);", 1)], "shared_go_physical_arrival_order"),
             ("arrival-id-sort", "ledger.rs", [("target.physical.push(redirect.session.sequence);", "target.physical.push(redirect.session.sequence); target.physical.sort_unstable();", 1)], "shared_go_physical_arrival_order"),
             ("arrival-source-not-removed", "ledger.rs", [("source\n                .physical\n                .retain(|id| *id != redirect.session.sequence);", "", 1)], "shared_go_physical_arrival_order"),
@@ -58,12 +56,16 @@ def main():
         for name, file, changes, selection in cases:
             path = source / file
             original = originals[file]
-            changed = original
+            # The shared file also contains preferred(); preserve this catalog
+            # as faults in the balance walk only.
+            start = original.index("pub(crate) fn balance") if file == "factors/phases.rs" else 0
+            end = original.index("pub(crate) fn ticket") if file == "factors/phases.rs" else len(original)
+            changed = original[start:end]
             for before, after, count in changes:
                 if changed.count(before) < count:
                     raise RuntimeError(f"missing mutation anchor {name}: {before}")
                 changed = changed.replace(before, after, count)
-            path.write_text(changed)
+            path.write_text(original[:start] + changed + original[end:])
             binary = live.compile_binary(root, env) # compile failure is not a kill
             r = live.observe(binary, env) if selection == "live" else run(binary, selection)
             marker = "BALANCE_EMPTY_SOURCE" if selection == "live" else "FAILED"

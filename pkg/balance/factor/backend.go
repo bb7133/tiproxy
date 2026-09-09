@@ -9,6 +9,8 @@ import (
 )
 
 type scoredBackend struct {
+	capture      *nativeCapture
+	captureIndex int
 	policy.BackendCtx
 	// The score composed by all factors. Each factor sets some bits of the score.
 	// The higher the score is, the more unhealthy / busy the backend is.

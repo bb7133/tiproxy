@@ -8,8 +8,19 @@ use std::{io, path::PathBuf, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = PathBuf::from(std::env::args().nth(1).ok_or("socket path required")?);
+    let native = std::env::args().nth(2).as_deref() == Some("native");
     let task = Task::spawn(path);
     let diagnostics = task.diagnostics();
+    if native {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while diagnostics.snapshot().connections == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        // Test-process startup coordination; the observation UDS remains one-way.
+        println!("native_consumer_connected");
+    }
     // The parent supplies the completed business-operation total through the
     // test process's stdin. Nothing travels back through the observation UDS.
     let mut line = String::new();
@@ -49,11 +60,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || report.owners.len() != 2
         || report.transport_errors != 0
         || report.connections != 1
+        || native
+            && (report.native_owners.len() != 2
+                || report.evaluations < expected / 5
+                || expected == 12000 && report.native_configurations != 244
+                || report.native_retained_bytes == 0
+                || report.native_peak_bytes > 64 * 1024 * 1024)
     {
         return Err(format!("unexpected live report: {report:?}").into());
     }
     println!(
-        "lifecycle_only=true owners={} operations={} batches={} events={} score={} physical={} invalid=0 mismatch=0 connections={} transport_errors={} compared_tail=true",
+        "lifecycle_only={} owners={} operations={} batches={} events={} score={} physical={} invalid=0 mismatch=0 connections={} transport_errors={} compared_tail=true factors={} selection=false scheduler=false evaluations={} native_configurations={} native_retained_bytes={} native_peak_bytes={}",
+        !native,
         report.owners.len(),
         report.operations,
         report.batches,
@@ -61,7 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.score,
         report.physical,
         report.connections,
-        report.transport_errors
+        report.transport_errors,
+        native,
+        report.evaluations,
+        report.native_configurations,
+        report.native_retained_bytes,
+        report.native_peak_bytes
     );
     Ok(())
 }

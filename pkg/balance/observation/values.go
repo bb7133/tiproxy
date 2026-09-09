@@ -98,9 +98,13 @@ type Batch struct {
 }
 
 type Record struct {
+	Native   bool // immutable owner factory capability; v2 records still encode as v2
 	Epoch    Epoch
 	Sequence uint64 // sequence of Events[0]; the last is Sequence+EventCount-1
 	Batch    Batch
+	// An evaluation occupies one sequence. Its zero Batch is never interpreted
+	// as a v2 lifecycle record; the writer uses the separate native codec.
+	Evaluation *Evaluation
 }
 
 type InvalidReason uint32

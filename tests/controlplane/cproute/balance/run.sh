@@ -17,7 +17,7 @@ for name in ['cpu', 'memory', 'health', 'status', 'balance']:
     path = root / f'pkg/balance/factor/factor_{name}.go'
     original = path.read_text()
     assert 'time.Now()' in original
-    revised = original.replace('time.Now().UnixMicro()', 'cpFactorTicket')
+    revised = original.replace('ticketNow.UnixMicro()', 'cpFactorTicket')
     revised = revised.replace('time.Now()', 'cpFactorNow').replace('time.Since(', 'cpFactorNow.Sub(')
     copied = temp / path.name
     copied.write_text(revised)

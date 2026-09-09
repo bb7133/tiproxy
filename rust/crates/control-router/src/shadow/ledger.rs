@@ -582,6 +582,10 @@ impl Mirror {
         }
     }
 
+    pub(super) fn account_group(&self, id: u64) -> Option<u64> {
+        self.accounts.get(&id).map(|account| account.group)
+    }
+
     pub(super) fn compact_account(&self, id: u64) -> Option<super::live::AccountWitness> {
         self.accounts.get(&id).and_then(|a| {
             Some(super::live::AccountWitness {

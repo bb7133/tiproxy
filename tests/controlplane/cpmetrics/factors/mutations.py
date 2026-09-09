@@ -13,7 +13,8 @@ import live
 
 ROUTER = "crates/control-router/src/"
 TOPOLOGY = "crates/control-topology/src/"
-RESOURCE = ROUTER + "factors/resource.rs"
+RESOURCE = ROUTER + "factors/window.rs"
+PHASES = ROUTER + "factors/phases.rs"
 FACTORS = ROUTER + "factors.rs"
 SELECTOR = ROUTER + "selector.rs"
 COLLECTOR = TOPOLOGY + "metric_collector.rs"
@@ -46,14 +47,14 @@ def main():
     cases = [
         ("cpu-ewma", RESOURCE, "avg * 0.5 + latest * 0.5", "avg * 0.4 + latest * 0.6", "core", "cpu-ewma", "FACTOR_"),
         ("cpu-missing-default", RESOURCE, "return (1.0, 1.0);", "return (0.0, 0.0);", "core", "two-cluster-global-fresh-stale-cache", "FACTOR_"),
-        ("cpu-snapshot-count-includes-pending", RESOURCE, "connections: input.counts.active(),", "connections: input.counts.connection_score(),", "core", "cpu-pending-active-only-snapshot", "FACTOR_"),
-        ("cpu-extrapolation-excludes-pending", RESOURCE, "input.counts.connection_score() as f64 - cache.connections as f64", "input.counts.active() as f64 - cache.connections as f64", "core", "cpu-pending-active-only-snapshot", "FACTOR_"),
+        ("cpu-snapshot-count-includes-pending", RESOURCE, "connections: input.physical(),", "connections: input.score_count(),", "core", "cpu-pending-active-only-snapshot", "FACTOR_"),
+        ("cpu-extrapolation-excludes-pending", RESOURCE, "input.score_count().difference(value.connections)", "input.physical().difference(value.connections)", "core", "cpu-pending-active-only-snapshot", "FACTOR_"),
         ("cpu-idle-estimate-reset", RESOURCE, "per = self.usage_per_conn;", "per = 0.001;", "core", "cpu-idle-per-connection-reuse", "FACTOR_"),
-        ("strict-expiry", RESOURCE, "* i128::from(NS) < i128::from(now)", "* i128::from(NS) <= i128::from(now)", "core", "cpu-global-expiry-strict", "FACTOR_"),
-        ("cpu-per-sample-expiry", RESOURCE, "expired(value.time, now, 120)", "expired(query.updated_nanos, now, 120)", "core", "two-cluster-global-fresh-stale-cache", "FACTOR_"),
-        ("cpu-equal-sample-replaced", RESOURCE, "old.time >= time", "old.time > time", "core", "cpu-equal-sample-time-keeps-cache", "FACTOR_"),
-        ("cpu-empty-keeps-score", RESOURCE, "let Some(query) = nonempty(queries, QueryId::Cpu) else {\n            return false;", "let Some(query) = nonempty(queries, QueryId::Cpu) else {\n            return true;", "core", "cpu-empty-contributes-zero", "FACTOR_"),
-        ("cpu-global-expiry-ignored", RESOURCE, "!expired(query.updated_nanos, now, 120)", "true", "core", "cpu-global-expiry-strict", "FACTOR_"),
+        ("strict-expiry", RESOURCE, "* 1_000_000_000 < i128::from(now)", "* 1_000_000_000 <= i128::from(now)", "core", "cpu-global-expiry-strict", "FACTOR_"),
+        ("cpu-per-sample-expiry", RESOURCE, "v.time.expired(now, 120)", "query.time().expired(now, 120)", "core", "two-cluster-global-fresh-stale-cache", "FACTOR_"),
+        ("cpu-equal-sample-replaced", RESOURCE, "!old.before(time)", "old != time && !old.before(time)", "core", "cpu-equal-sample-time-keeps-cache", "FACTOR_"),
+        ("cpu-empty-keeps-score", RESOURCE, "let Some(query) = window.query(QueryId::Cpu)?.filter(|q| !q.empty()) else {\n            return Ok(false);", "let Some(query) = window.query(QueryId::Cpu)?.filter(|q| !q.empty()) else {\n            return Ok(true);", "core", "cpu-empty-contributes-zero", "FACTOR_"),
+        ("cpu-global-expiry-ignored", RESOURCE, "Ok(!query.time().stale(now, 120))", "Ok(true)", "core", "cpu-global-expiry-strict", "FACTOR_"),
         ("memory-high-threshold-inclusive", RESOURCE, "usage > 0.75", "usage >= 0.75", "core", "memory-value-0.75", "FACTOR_"),
         ("memory-history-window", RESOURCE, "delta < 10 * NS", "delta < 11 * NS", "core", "memory-history-min-10000", "FACTOR_"),
         ("memory-oom-adjustment", RESOURCE, "horizon as f64 / latest * 0.6", "horizon as f64 / latest * 0.5", "core", "memory-horizon-threshold-0.340000001", "FACTOR_"),
@@ -62,8 +63,8 @@ def main():
         ("health-zero-total-normal", RESOURCE, "if total == 0.0 {\n        return 2;", "if total == 0.0 {\n        return 0;", "core", "health-pd-1-0", "FACTOR_"),
         ("cpu-bit-width", FACTORS, "Self::Cpu => 5,", "Self::Cpu => 4,", "core", "order-resource", "FACTOR_"),
         ("resource-factor-order", FACTORS, "Factor::Health,\n            Factor::Memory,\n            Factor::Cpu,\n            Factor::Location,", "Factor::Location,\n            Factor::Health,\n            Factor::Memory,\n            Factor::Cpu,", "core", "order-resource", "FACTOR_"),
-        ("prefer-idle-minimum-only", FACTORS, "if count <= 0.0001 {", "if false && count <= 0.0001 {", "core", "connection-clamp", "FACTOR_"),
-        ("ledger-owner-compared-by-id", FACTORS, ".is_some_and(|owner| Arc::ptr_eq(owner, &cache.owner))", ".is_some_and(|_owner| true)", "account", "", "FACTOR_ACCOUNT_ABA_NO_REUSE"),
+        ("prefer-idle-minimum-only", PHASES, "if count <= 0.0001 {", "if false && count <= 0.0001 {", "core", "connection-clamp", "FACTOR_"),
+        ("ledger-owner-compared-by-id", FACTORS, ".is_some_and(|owner| Arc::ptr_eq(owner, &stored.identity))", ".is_some_and(|_owner| true)", "account", "", "FACTOR_ACCOUNT_ABA_NO_REUSE"),
         ("lineage-compared-by-value", COLLECTOR, "Arc::ptr_eq(&self.0, &other.0)", "*self.0 == *other.0", "lineage", "", "FACTOR_LINEAGE_OPAQUE_IDENTITY"),
         ("prom-lineage-follows-unused-owner", COLLECT, "if self.reader.source() == crate::metrics::Source::Backend {", "if true {", "lineage", "", "FACTOR_PROM_UNUSED_OWNER_CONTINUITY"),
         ("backend-owner-keeps-lineage", COLLECT, "if self.reader.source() == crate::metrics::Source::Backend {", "if false {", "lineage", "", "FACTOR_BACKEND_OWNER_COLD_START"),
@@ -72,7 +73,7 @@ def main():
         ("prom-source-aba-keeps-lineage", COLLECT, "if state.reader.source() != crate::metrics::Source::Prometheus {", "if false {", "live", "", "FACTOR_SOURCE_ABA_NEW_LINEAGE"),
         ("metric-final-boundary-bypassed", SELECTOR, "metrics\n            .with_current(|| {", "Some((|| {", "live-boundary", "", "FACTOR_OLD_ROUND_REJECTED"),
     ]
-    cases.append(("unrelated-cluster-clears-health", FACTORS, "let label = control_topology::metrics::cluster_label(cluster);", "self.health_queries.clear(); let label = control_topology::metrics::cluster_label(cluster);", "account", "", "FACTOR_UNCHANGED_CLUSTER_RETAINS_HEALTH"))
+    cases.append(("unrelated-cluster-clears-health", FACTORS, "let label = control_topology::metrics::cluster_label(cluster);", "self.history.health_queries.clear(); let label = control_topology::metrics::cluster_label(cluster);", "account", "", "FACTOR_UNCHANGED_CLUSTER_RETAINS_HEALTH"))
     cases.extend([
         ("factor-consumer-ignores-H-local", SELECTOR, "local: candidate.health.get(&backend.source.backend_id).local,", "local: false,", "live", "", "FACTOR_REAL_H_LOCAL"),
         ("factor-consumer-accepts-foreign-R", SELECTOR, "if !Arc::ptr_eq(&candidate.routing, metrics.source().routing()) {", "if false && !Arc::ptr_eq(&candidate.routing, metrics.source().routing()) {", "live", "", "FACTOR_FOREIGN_CURRENT_R_REJECTED"),
@@ -85,7 +86,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cpmetrics-factor-mutations-") as directory:
         root = Path(directory)
         shutil.copytree(original_root / "rust", root / "rust", ignore=shutil.ignore_patterns("target", ".tools"))
-        environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+        # Shared Cargo caches key freshness by mtime; copied sources must rebuild.
+        for fresh_source in ((root / "rust")).rglob("*.rs"):
+            fresh_source.touch()
+        environment = dict(os.environ, CARGO_TARGET_DIR=str(original_root / "rust/target"))
         def baseline():
             binaries = compile_binaries(root, environment)
             core = run(binaries["control_router"], "factors::tests::", environment)

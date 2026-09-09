@@ -35,6 +35,9 @@ func dial(t *testing.T, path string) *net.UnixConn {
 	return conn
 }
 func receive(t *testing.T, conn *net.UnixConn) map[string]any {
+	return receiveDialect(t, conn, false)
+}
+func receiveDialect(t *testing.T, conn *net.UnixConn, native bool) map[string]any {
 	t.Helper()
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
 	var prefix [4]byte
@@ -46,7 +49,9 @@ func receive(t *testing.T, conn *net.UnixConn) map[string]any {
 	copy(frame, prefix[:])
 	_, err = io.ReadFull(conn, frame[4:])
 	require.NoError(t, err)
-	require.NoError(t, ValidateFrame(frame))
+	if !native {
+		require.NoError(t, ValidateFrame(frame))
+	}
 	var object map[string]any
 	require.NoError(t, json.Unmarshal(frame[4:], &object))
 	return object
@@ -132,15 +137,29 @@ func TestServiceRejectsExistingOrPublicPaths(t *testing.T) {
 }
 
 func TestServiceSlowReaderTimesOutAndRetainsWriterBudget(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) { serviceSlowReader(t, false) })
+	t.Run("native_after_begin", func(t *testing.T) { serviceSlowReader(t, true) })
+}
+func serviceSlowReader(t *testing.T, native bool) {
 	path := socketPath(t)
 	s, err := Start(context.Background(), path, zap.NewNop())
 	require.NoError(t, err)
 	defer s.Close()
-	owner := s.Recorder().NewOwner()
+	var owner *observation.Owner
+	if native {
+		owner = s.Recorder().NewNativeOwner()
+	} else {
+		owner = s.Recorder().NewOwner()
+	}
 	conn := dial(t, path)
 	require.NoError(t, conn.SetReadBuffer(1024))
 	require.Equal(t, "coverage", receive(t, conn)["kind"])
-	require.Equal(t, "batch", receive(t, conn)["kind"])
+	if native {
+		require.Equal(t, "native_coverage", receiveDialect(t, conn, true)["kind"])
+	}
+	begin := receive(t, conn)
+	require.Equal(t, "batch", begin["kind"])
+	require.Equal(t, "1", begin["sequence"], "NATIVE_SLOW_PEER_HAS_BEGIN")
 	s.mu.Lock()
 	require.NotNil(t, s.active)
 	require.NoError(t, s.active.SetWriteBuffer(1024))
@@ -153,7 +172,8 @@ func TestServiceSlowReaderTimesOutAndRetainsWriterBudget(t *testing.T) {
 	require.Eventually(t, func() bool { return !owner.Enabled() }, 2*time.Second, time.Millisecond)
 	summaries := s.Recorder().InvalidOwners()
 	require.Len(t, summaries, 1)
-	require.Equal(t, observation.TransportLost, summaries[0].Reason)
+	require.Equal(t, observation.TransportLost, summaries[0].Reason, "NATIVE_SLOW_PEER_TRANSPORT")
+	t.Logf("connected_slow_peer begin_sequence=1 reason=TransportLost last_admitted=%d", summaries[0].LastAdmitted)
 	records, bytes := s.Recorder().Retained()
 	require.LessOrEqual(t, records, int64(100))
 	require.LessOrEqual(t, bytes, int64(100*observation.BatchCharge))
@@ -161,4 +181,38 @@ func TestServiceSlowReaderTimesOutAndRetainsWriterBudget(t *testing.T) {
 	records, bytes = s.Recorder().Retained()
 	require.Zero(t, records)
 	require.Zero(t, bytes)
+}
+
+func TestNativeLatePeerCannotRepairCapacityBeforeBegin(t *testing.T) {
+	path := socketPath(t)
+	s, err := Start(context.Background(), path, zap.NewNop())
+	require.NoError(t, err)
+	defer s.Close()
+	owner := s.Recorder().NewNativeOwner()
+	// No peer is connected. Concurrent producers may retain leased evaluations;
+	// the production recorder neither waits for a peer nor resets the interval.
+	var leases []*observation.Evaluation
+	defer func() {
+		for _, lease := range leases {
+			lease.Release()
+		}
+	}()
+	for owner.Enabled() {
+		lease := owner.BeginEvaluation()
+		if lease != nil {
+			leases = append(leases, lease)
+		}
+	}
+	require.Len(t, leases, 63, "NATIVE_LATE_PEER_LEASE_CAPACITY")
+	records, bytes := s.Recorder().Retained()
+	require.EqualValues(t, 64, records)
+	require.EqualValues(t, 63*observation.EvaluationCharge+observation.BatchCharge, bytes)
+	conn := dial(t, path)
+	require.Equal(t, "coverage", receive(t, conn)["kind"])
+	first := receive(t, conn)
+	require.Equal(t, "invalid", first["kind"], "NATIVE_LATE_PEER_NO_BEGIN")
+	require.Equal(t, "capacity", first["reason"], "NATIVE_LATE_PEER_CAPACITY")
+	require.Equal(t, "1", first["last_admitted"])
+	require.False(t, owner.Enabled(), "NATIVE_LATE_PEER_NO_REPAIR")
+	t.Logf("late_peer first_owner_record=Capacity begin_seen=false retained_records=%d retained_bytes=%d", records, bytes)
 }
