@@ -73,6 +73,8 @@ type Group struct {
 	lastCrossKeyspaceWarn  time.Time
 	observation            *observation.Owner
 	observationID          uint64
+	balanceCapture         bool                // Fixed by the private factory; grants no scheduler capability.
+	balanceCaller          *observation.Caller // Accessed only under this Group lock.
 }
 
 func NewGroup(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger) (*Group, error) {
@@ -84,6 +86,14 @@ func newGroupObserved(values []string, bpCreator func(lg *zap.Logger) policy.Bal
 }
 
 func newGroupCaptured(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator) (*Group, error) {
+	return newGroupCapture(values, bpCreator, matchType, lg, owner, native, false)
+}
+
+func newGroupBalanceCaptured(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator) (*Group, error) {
+	return newGroupCapture(values, bpCreator, matchType, lg, owner, native, true)
+}
+
+func newGroupCapture(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator, balanceCapture bool) (*Group, error) {
 	var observationID uint64
 	if owner.Enabled() {
 		observationID = owner.NextIdentity()
@@ -100,8 +110,12 @@ func newGroupCaptured(values []string, bpCreator func(lg *zap.Logger) policy.Bal
 	} else {
 		balancePolicy = bpCreator(lg.Named("policy"))
 	}
+	if _, ok := balancePolicy.(*factor.FactorBasedBalance); balanceCapture && (!ok || native == nil || !owner.Native()) {
+		owner.Invalidate(observation.Malformed)
+	}
 	group := &Group{
-		observation: owner, observationID: observationID,
+		balanceCapture: balanceCapture,
+		observation:    owner, observationID: observationID,
 		matchType:       matchType,
 		lg:              lg,
 		values:          values,
@@ -419,14 +433,18 @@ func (g *Group) logCrossKeyspaceSkip(fromBackend, toBackend *backendWrapper,
 func (g *Group) Balance(ctx context.Context) {
 	g.Lock()
 	defer g.Unlock()
+	caller := g.beginBalanceObservation()
+	defer g.endBalanceObservation(caller)
 	backends := make([]policy.BackendCtx, 0, len(g.backends))
 	for _, backend := range g.backends {
 		backends = append(backends, backend)
 	}
 
-	busiestBackend, idlestBackend, balanceCount, reason, logFields := g.policy.BackendsToBalance(backends)
+	g.captureBalanceMembers(caller, backends)
+	busiestBackend, idlestBackend, balanceCount, reason, logFields := g.balancePolicy(backends, caller)
 	g.publishPolicyObservationLocked()
 	if balanceCount == 0 {
+		g.publishBalanceObservation(caller, 0)
 		return
 	}
 	fromBackend, toBackend := busiestBackend.(*backendWrapper), idlestBackend.(*backendWrapper)
@@ -438,8 +456,11 @@ func (g *Group) Balance(ctx context.Context) {
 	// attempt and one rate-limited record, never a warning per
 	// connection. The redirectConn backstop below remains for any
 	// future caller that bypasses Balance.
-	if fromKeyspace, toKeyspace := fromBackend.Keyspace(), toBackend.Keyspace(); fromKeyspace != toKeyspace {
+	fromKeyspace, toKeyspace := fromBackend.Keyspace(), toBackend.Keyspace()
+	g.captureBalanceClock(caller, curTime, fromKeyspace, toKeyspace)
+	if fromKeyspace != toKeyspace {
 		g.logCrossKeyspaceSkip(fromBackend, toBackend, fromKeyspace, toKeyspace, reason, curTime)
+		g.publishBalanceObservation(caller, 0)
 		return
 	}
 	migrationInterval := time.Duration(float64(time.Second) / balanceCount)
@@ -452,13 +473,17 @@ func (g *Group) Balance(ctx context.Context) {
 		if curTime.Sub(g.lastRedirectTime) >= migrationInterval {
 			count = 1
 		} else {
+			g.publishBalanceObservation(caller, 0)
 			return
 		}
 	}
 	// Migrate balanceCount connections.
 	i := 0
-	for ele := fromBackend.connList.Front(); ele != nil && ctx.Err() == nil && i < count; ele = ele.Next() {
+	for ele := fromBackend.connList.Front(); ele != nil && g.captureBalanceContext(ctx.Err()) && i < count; ele = ele.Next() {
 		conn := ele.Value
+		if caller != nil {
+			caller.CaptureBalanceVisit(conn.observationID)
+		}
 		if conn.forceClosing {
 			continue
 		}
@@ -477,6 +502,7 @@ func (g *Group) Balance(ctx context.Context) {
 			i++
 		}
 	}
+	g.publishBalanceObservation(caller, i)
 }
 
 func (g *Group) onCreateConn(backendInst BackendInst, conn RedirectableConn, succeed bool) {
@@ -751,7 +777,7 @@ func (g *Group) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toB
 		g.logCrossKeyspaceSkip(fromBackend, toBackend, fromKeyspace, toKeyspace, reason, curTime)
 		conn.phase = phaseRedirectFail
 		conn.lastRedirect = curTime
-		g.observeRedirect(conn, before, fromBackend, toBackend, false)
+		g.observeRedirect(conn, before, fromBackend, toBackend, fromKeyspace, toKeyspace, observation.BalanceCallbackSkipped)
 		return false
 	}
 	// Skip the connection if it's closing.
@@ -777,7 +803,11 @@ func (g *Group) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toB
 		g.lg.Debug("skip redirecting because it's closing", fields...)
 	}
 	conn.lastRedirect = curTime
-	g.observeRedirect(conn, before, fromBackend, toBackend, succeed)
+	callback := observation.BalanceCallbackRefused
+	if succeed {
+		callback = observation.BalanceCallbackAccepted
+	}
+	g.observeRedirect(conn, before, fromBackend, toBackend, fromKeyspace, toKeyspace, callback)
 	return succeed
 }
 
@@ -805,7 +835,11 @@ func (g *Group) SetConfig(cfg *config.Config) {
 func (g *Group) publishPolicyObservationLocked() {
 	if native, ok := g.policy.(*factor.FactorBasedBalance); ok {
 		if evaluation := native.TakeObservation(); evaluation != nil {
-			g.observation.PublishEvaluation(evaluation)
+			if g.balanceCaller != nil {
+				g.balanceCaller.CompleteEvaluation(evaluation)
+			} else {
+				g.observation.PublishEvaluation(evaluation)
+			}
 		}
 	}
 }

@@ -28,6 +28,8 @@ cargo test --locked --manifest-path rust/Cargo.toml -p control-router shadow::
 cargo test --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow
 python3 tests/controlplane/cproute/shadow/isolation.py "$root"
 python3 tests/controlplane/cproute/shadow/native-mutations.py
+# C1 uses actual Group.Balance calls, independently replayed as one v4 parent.
+bash tests/controlplane/cproute/shadow/balance-hooks-run.sh
 cargo build --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow --example live_socket_check
 export CP_ROUTE_LIVE_SOCKET_CHECK="$root/rust/target/debug/examples/live_socket_check"
 go test ./pkg/balance/router -run '^TestNativeObservationSocketSettlement$' -count=1 -v
@@ -43,7 +45,8 @@ source = path.read_text()
 old = 'g.policy.(*factor.FactorBasedBalance)'
 assert source.count(old) == 1
 source = source.replace(old, 'g.policy.(interface { TakeObservation() *observation.Evaluation })')
-source = source.replace('"github.com/pingcap/tiproxy/pkg/balance/factor"', '')
+# The concrete construction fence still needs the factor import. Only the
+# publication adapter is replaced for this test-only timing wrapper.
 copy = temp/'group.go'; copy.write_text(source)
 (temp/'timings-overlay.json').write_text(json.dumps({'Replace': {str(path): str(copy)}}))
 PYTIMING

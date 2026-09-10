@@ -346,12 +346,22 @@ func (fbb *FactorBasedBalance) routePreferIdle(scoredBackends []scoredBackend, f
 // balanceCount: the count of connections to migrate in this round. 0 indicates no need to balance.
 // reason: the debug information to be logged.
 func (fbb *FactorBasedBalance) BackendsToBalance(backends []policy.BackendCtx) (from, to policy.BackendCtx, balanceCount float64, reason string, logFields []zap.Field) {
+	return fbb.backendsToBalance(backends, nil)
+}
+
+// BackendsToBalanceCaptured runs the same native policy with a caller-owned
+// diagnostic loan. The enclosing Group owns that loan before any input is read.
+func (fbb *FactorBasedBalance) BackendsToBalanceCaptured(backends []policy.BackendCtx, caller *observation.Caller) (from, to policy.BackendCtx, balanceCount float64, reason string, logFields []zap.Field) {
+	return fbb.backendsToBalance(backends, caller)
+}
+
+func (fbb *FactorBasedBalance) backendsToBalance(backends []policy.BackendCtx, caller *observation.Caller) (from, to policy.BackendCtx, balanceCount float64, reason string, logFields []zap.Field) {
 	if len(backends) <= 1 && fbb.capture == nil {
 		return
 	}
 	fbb.Lock()
 	defer fbb.Unlock()
-	fbb.beginObservation(observation.EntryBalance, backends)
+	fbb.beginCallerObservation(observation.EntryBalance, backends, caller)
 	defer func() {
 		c := fbb.capture
 		if c.enabled() && c.current != nil {
