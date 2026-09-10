@@ -78,9 +78,9 @@ func TestSelectorTransitionOracle(t *testing.T) {
 		case "sentinel", "no-group", "observer-sentinel":
 			return ErrNoBackend
 		case "wrapped":
-			return errors.Wrap(ErrNoBackend, "wrapped fixture")
+			return errors.Wrapf(ErrNoBackend, "wrapped fixture")
 		case "conflict":
-			return errors.Wrap(ErrPortConflict, "conflict fixture")
+			return errors.Wrapf(ErrPortConflict, "conflict fixture")
 		default:
 			return errors.New("ordinary fixture")
 		}
