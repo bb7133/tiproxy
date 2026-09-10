@@ -82,6 +82,32 @@ func (c *Caller) routeWritable() bool {
 	return true
 }
 
+// CaptureRouteMember appends the member at the original map visit, before its
+// getters. The fixed inventory is complete before any native child allocation.
+func (c *Caller) CaptureRouteMember(account uint64) bool {
+	if !c.routeWritable() {
+		return false
+	}
+	if account == 0 || c.evaluations != 0 || c.batches != 0 || c.children != 0 {
+		c.Fail(Malformed)
+		return false
+	}
+	r := &c.storage.route
+	if r.MemberCount == MaxCallerGroups {
+		c.Fail(Capacity)
+		return false
+	}
+	for _, previous := range r.Members[:r.MemberCount] {
+		if previous == account {
+			c.Fail(Malformed)
+			return false
+		}
+	}
+	r.Members[r.MemberCount] = account
+	r.MemberCount++
+	return true
+}
+
 func (c *Caller) CaptureRouteHealthy(account uint64, healthy bool) bool {
 	if !c.routeWritable() {
 		return false

@@ -119,3 +119,37 @@ func TestGroupRouteInputBoundsAndFinalImmutability(t *testing.T) {
 	require.True(t, c.Seal())
 	require.EqualValues(t, 65536, c.Route().StringBytes, "ROUTE_TOTAL_STRING_EQUAL")
 }
+
+func TestGroupRouteIncrementalMembers(t *testing.T) {
+	for _, mode := range []string{"bound", "duplicate", "zero", "evaluation", "batch", "result"} {
+		t.Run(mode, func(t *testing.T) {
+			_, o := callerOwner(t, DefaultLimits())
+			c := o.BeginCaller()
+			defer c.Cleanup()
+			require.True(t, c.CaptureGroupRoute(1, 2, 3, 0, nil))
+			require.True(t, c.CaptureRouteMember(9))
+			require.True(t, c.CaptureRouteHealthy(9, true))
+			switch mode {
+			case "bound":
+				for i := 1; i < MaxCallerGroups; i++ {
+					require.True(t, c.CaptureRouteMember(uint64(i+10)), "ROUTE_MEMBER_BOUND_EQUAL")
+				}
+				require.False(t, c.CaptureRouteMember(100), "ROUTE_MEMBER_BOUND_PLUS_ONE")
+			case "duplicate":
+				require.False(t, c.CaptureRouteMember(9), "ROUTE_MEMBER_UNIQUE")
+			case "zero":
+				require.False(t, c.CaptureRouteMember(0), "ROUTE_MEMBER_NONZERO")
+			case "evaluation":
+				require.NotNil(t, c.BeginEvaluation())
+				require.False(t, c.CaptureRouteMember(10), "ROUTE_MEMBER_BEFORE_CHILD_ALLOCATION")
+			case "batch":
+				require.True(t, c.AppendBatch(watermark()))
+				require.False(t, c.CaptureRouteMember(10), "ROUTE_MEMBER_BEFORE_BATCH")
+			case "result":
+				require.True(t, c.CaptureRouteResult(0, 0))
+				require.False(t, c.CaptureRouteMember(10), "ROUTE_MEMBER_BEFORE_RESULT")
+			}
+			require.False(t, o.Enabled())
+		})
+	}
+}

@@ -36,7 +36,15 @@ func (s *selectionObservation) noRoute(group uint64) {
 	}
 }
 
-func (g *Group) observeNoRoute(s *selectionObservation) { s.noRoute(g.observationID) }
+func (g *Group) observeNoRoute(s *selectionObservation) {
+	if g.routeCaller != nil {
+		if s != nil && s.owner.Enabled() {
+			g.routeCaller.AppendBatch(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.RouteRejected, Session: s.session, Group: g.observationID}}})
+		}
+		return
+	}
+	s.noRoute(g.observationID)
+}
 
 func (g *Group) observeAccount(b *backendWrapper) {
 	if !g.observation.Enabled() {
@@ -117,7 +125,11 @@ func (g *Group) beforeObservation(cw *connWrapper) observation.ConnectionState {
 // completed values; neither it nor the drain can call back into this Group.
 func (g *Group) capture(batch observation.Batch, cw *connWrapper, before observation.ConnectionState, accounts ...*backendWrapper) {
 	if batch, ok := g.captureWitness(batch, cw, before, accounts...); ok {
-		g.observation.Emit(batch)
+		if g.routeCaller != nil {
+			g.routeCaller.AppendBatch(batch)
+		} else {
+			g.observation.Emit(batch)
+		}
 	}
 }
 

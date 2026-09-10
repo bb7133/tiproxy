@@ -75,6 +75,8 @@ type Group struct {
 	observationID          uint64
 	balanceCapture         bool                // Fixed by the private factory; grants no scheduler capability.
 	balanceCaller          *observation.Caller // Accessed only under this Group lock.
+	routeCapture           bool                // Private construction only; outer selector binding remains separate.
+	routeCaller            *observation.Caller // Accessed only under this Group lock.
 }
 
 func NewGroup(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger) (*Group, error) {
@@ -91,6 +93,14 @@ func newGroupCaptured(values []string, bpCreator func(lg *zap.Logger) policy.Bal
 
 func newGroupBalanceCaptured(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator) (*Group, error) {
 	return newGroupCapture(values, bpCreator, matchType, lg, owner, native, true)
+}
+
+// This private factory fixes both Group hooks before exposing the new Group.
+// It does not install router metadata, selector retries or caller capabilities.
+func newGroupRouteCaptured(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator) (*Group, error) {
+	g, err := newGroupCapture(values, bpCreator, matchType, lg, owner, native, true)
+	g.routeCapture = true
+	return g, err
 }
 
 func newGroupCapture(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator, balanceCapture bool) (*Group, error) {
@@ -366,20 +376,39 @@ func (g *Group) Route(excluded []BackendInst) (policy.BackendCtx, error) {
 func (g *Group) routeObserved(excluded []BackendInst, selection *selectionObservation) (policy.BackendCtx, error) {
 	g.Lock()
 	defer g.Unlock()
+	caller := g.beginRouteObservation()
+	defer g.endRouteObservation(caller)
+	g.captureRouteHeader(caller, selection, len(excluded))
 
 	if len(g.backends) == 0 {
 		g.observeNoRoute(selection)
+		g.publishRouteObservation(caller, selection, nil)
 		return nil, ErrNoBackend
 	}
 	backends := make([]policy.BackendCtx, 0, len(g.backends))
 	for _, backend := range g.backends {
-		if !backend.Healthy() {
+		if caller != nil {
+			caller.CaptureRouteMember(backend.observationID)
+		}
+		healthy := backend.Healthy()
+		if caller != nil {
+			caller.CaptureRouteHealthy(backend.observationID, healthy)
+		}
+		if !healthy {
 			continue
 		}
 		// Exclude the backends that are already tried.
 		found := false
-		for _, e := range excluded {
-			if backend.ID() == e.ID() {
+		for index, e := range excluded {
+			backendID := backend.ID()
+			if caller != nil {
+				caller.CaptureRouteBackendID(backend.observationID, backendID)
+			}
+			excludedID := e.ID()
+			if caller != nil {
+				caller.CaptureRouteExcludedID(uint16(index), excludedID)
+			}
+			if backendID == excludedID {
 				found = true
 				break
 			}
@@ -390,15 +419,17 @@ func (g *Group) routeObserved(excluded []BackendInst, selection *selectionObserv
 		backends = append(backends, backend)
 	}
 
-	idlestBackend := g.policy.BackendToRoute(backends)
+	idlestBackend := g.routePolicy(backends, caller)
 	g.publishPolicyObservationLocked()
 	if idlestBackend == nil || reflect.ValueOf(idlestBackend).IsNil() {
 		g.observeNoRoute(selection)
+		g.publishRouteObservation(caller, selection, nil)
 		return nil, ErrNoBackend
 	}
 	backend := idlestBackend.(*backendWrapper)
 	backend.connScore++
 	g.observeReserved(selection, backend)
+	g.publishRouteObservation(caller, selection, backend)
 	return backend, nil
 }
 
@@ -835,7 +866,9 @@ func (g *Group) SetConfig(cfg *config.Config) {
 func (g *Group) publishPolicyObservationLocked() {
 	if native, ok := g.policy.(*factor.FactorBasedBalance); ok {
 		if evaluation := native.TakeObservation(); evaluation != nil {
-			if g.balanceCaller != nil {
+			if g.routeCaller != nil {
+				g.routeCaller.CompleteEvaluation(evaluation)
+			} else if g.balanceCaller != nil {
 				g.balanceCaller.CompleteEvaluation(evaluation)
 			} else {
 				g.observation.PublishEvaluation(evaluation)

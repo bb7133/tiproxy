@@ -30,6 +30,8 @@ python3 tests/controlplane/cproute/shadow/isolation.py "$root"
 python3 tests/controlplane/cproute/shadow/native-mutations.py
 # C1 uses actual Group.Balance calls, independently replayed as one v4 parent.
 bash tests/controlplane/cproute/shadow/balance-hooks-run.sh
+# C2 first checkpoint: actual Group-local Route, not outer selector metadata.
+bash tests/controlplane/cproute/shadow/route-hooks-run.sh
 cargo build --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow --example live_socket_check
 export CP_ROUTE_LIVE_SOCKET_CHECK="$root/rust/target/debug/examples/live_socket_check"
 go test ./pkg/balance/router -run '^TestNativeObservationSocketSettlement$' -count=1 -v

@@ -437,7 +437,17 @@ jobs:
             rust/target
           key: rust-routing-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
       - name: Compare native factors and all nine enabled/disabled policies
+        env:
+          CP_ROUTE_ROUTE_HOOK_EVIDENCE: ${{ runner.temp }}/route-hook-evidence
         run: make controlplane-cproute-native-evidence
+      - name: Upload actual Group Route checkpoint evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: group-route-hooks-${{ github.sha }}
+          path: ${{ runner.temp }}/route-hook-evidence
+          if-no-files-found: warn
+          retention-days: 14
 
   supply-chain:
     name: Audit dependencies and policy

@@ -183,7 +183,17 @@ func (fbb *FactorBasedBalance) updateScore(backends []policy.BackendCtx) []score
 }
 
 // BackendToRoute returns one backend to route a new connection to.
-func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) (result policy.BackendCtx) {
+func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) policy.BackendCtx {
+	return fbb.backendToRoute(backends, nil)
+}
+
+// BackendToRouteCaptured lends the native child from the already-live Group
+// caller. Selection still executes the same body exactly once.
+func (fbb *FactorBasedBalance) BackendToRouteCaptured(backends []policy.BackendCtx, caller *observation.Caller) policy.BackendCtx {
+	return fbb.backendToRoute(backends, caller)
+}
+
+func (fbb *FactorBasedBalance) backendToRoute(backends []policy.BackendCtx, caller *observation.Caller) (result policy.BackendCtx) {
 	fields := []zap.Field{zap.Int("backend_num", len(backends))}
 	defer func() {
 		fbb.lg.Debug("route", fields...)
@@ -194,7 +204,7 @@ func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) (res
 	}
 	fbb.Lock()
 	defer fbb.Unlock()
-	fbb.beginObservation(observation.EntryRoute, backends)
+	fbb.beginCallerObservation(observation.EntryRoute, backends, caller)
 	defer func() { fbb.capture.routeResult([]policy.BackendCtx{result}); fbb.capture.finish() }()
 	if len(backends) == 0 {
 		return nil
