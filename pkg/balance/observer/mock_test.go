@@ -67,7 +67,12 @@ func (mbf *mockBackendFetcher) setBackend(addr string, info *BackendInfo) {
 func (mbf *mockBackendFetcher) setLabels(addr string, labels map[string]string) {
 	mbf.Lock()
 	defer mbf.Unlock()
-	mbf.backends[addr].Labels = labels
+	// GetBackendList hands out the same *BackendInfo pointers to the observer,
+	// which reads them concurrently in checkHealth. Replace the entry instead of
+	// mutating the shared struct so the test does not race with that read.
+	info := *mbf.backends[addr]
+	info.Labels = labels
+	mbf.backends[addr] = &info
 }
 
 func (mbf *mockBackendFetcher) removeBackend(addr string) {
