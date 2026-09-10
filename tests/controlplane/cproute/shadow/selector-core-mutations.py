@@ -15,7 +15,9 @@ GO_CASES = [
  ('second-attempt-omitted','exact-retry',[('backend, err = bs.routeOnce(bs.excluded)','_ = bs.excluded')]),
  ('append-old-current','success-append',[('bs.cur = backend\n\tbs.excluded = append(bs.excluded, backend)','bs.excluded = append(bs.excluded, bs.cur)\n bs.cur = backend')]),
  ('error-backend-lost','ordinary-error',[('if err != nil {\n\t\treturn backend, err','if err != nil {\n\t\treturn nil, err')]),
- ('error-overwrites-current','ordinary-error',[('if err != nil {\n\t\treturn backend, err','if err != nil {\n bs.cur = backend\n\t\treturn backend, err')]),
+ # The wrapped error is the first error after a successful Next in oracle order;
+ # overwriting cur already diverges there, before the ordinary-error case.
+ ('error-overwrites-current','wrapped-sentinel',[('if err != nil {\n\t\treturn backend, err','if err != nil {\n bs.cur = backend\n\t\treturn backend, err')]),
  ('finish-loses-current','success-append',[('bs.onCreate(bs.cur, conn, succeed)','bs.onCreate(nil, conn, succeed)')]),
  ('history-deduplicated','duplicate-history',[('bs.excluded = append(bs.excluded, backend)','if len(bs.excluded) == 0 || bs.excluded[len(bs.excluded)-1] != backend { bs.excluded = append(bs.excluded, backend) }')]),
 ]
