@@ -4,7 +4,7 @@
 //! Bounded Go BackendSelector.Next transitions. Inputs must be independently
 //! derived routeOnce results, never the observed return values being checked.
 //! This component has no factory, wire dispatch, ledger or effect capability.
-use crate::shadow::InvalidReason;
+use super::InvalidReason;
 
 /// The exclusion limit is diagnostic only; Go must keep running on overflow.
 pub const MAX_EXCLUDED: usize = 64;
