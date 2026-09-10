@@ -13,6 +13,8 @@ pub mod balance;
 pub mod pass;
 /// Group-local Route capture and independent atomic comparison; not installed yet.
 pub mod route;
+/// Pure selector transition core; routeOnce and metadata binding remain separate.
+pub mod selection;
 
 use super::native::{HISTORY_LIMIT, NativeOwner, STAGE_OVERHEAD, Stored};
 use super::{Batch, Epoch, Event, InvalidReason, LiveEvent, LiveState, Progress, Status};
