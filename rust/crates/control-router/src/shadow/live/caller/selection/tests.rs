@@ -174,8 +174,10 @@ fn selection_missing_duplicate_foreign_and_open_tail_fail() {
         assert!(t.excluded().is_empty());
         assert_eq!(t.current(), None);
     }
-    let mut t = Tracker::default();
-    t.last_next = u64::MAX;
+    let mut t = Tracker {
+        last_next: u64::MAX,
+        ..Tracker::default()
+    };
     assert_eq!(
         t.begin(0, 0, &[]),
         Err(InvalidReason::Sequence),

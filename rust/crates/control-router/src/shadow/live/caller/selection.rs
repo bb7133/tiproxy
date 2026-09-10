@@ -25,15 +25,15 @@ impl Binding {
     }
 }
 
-/// Error equality as used by Next. Wrapped ErrNoBackend is Other, even though
+/// Error equality as used by Next. Wrapped `ErrNoBackend` is Other, even though
 /// the separate router refresh effect uses errors.Is. Error text is not input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorClass {
     /// Successful call.
     None,
-    /// The exact ErrNoBackend singleton, regardless of its origin.
+    /// The exact `ErrNoBackend` singleton, regardless of its origin.
     NoBackend,
-    /// Any other error, including a wrapper around ErrNoBackend.
+    /// Any other error, including a wrapper around `ErrNoBackend`.
     Other,
 }
 
@@ -103,7 +103,7 @@ struct Open {
 /// staged until its completion witness matches. A failure is sticky and leaves
 /// the last completed state intact. Integration must charge CHARGE in shared R
 /// before retaining each instance, and feed only independently checked attempts.
-/// This is not yet installed in LiveState or the production caller transport.
+/// This is not yet installed in `LiveState` or the production caller transport.
 #[derive(Default)]
 pub struct Tracker {
     last_next: u64,
