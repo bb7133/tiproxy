@@ -182,6 +182,10 @@ controlplane-cproute-read-foundation-evidence:
 controlplane-cproute-time-evidence:
 	$(RUST_BUILD_ENV) bash tests/controlplane/cproute/shadow/time-run.sh
 
+.PHONY: controlplane-cproute-native-anchors
+controlplane-cproute-native-anchors:
+	python3 tests/controlplane/cproute/shadow/native-anchors.py
+
 controlplane-cproute-native-evidence:
 	$(RUST_BUILD_ENV) bash tests/controlplane/cproute/shadow/native-run.sh
 

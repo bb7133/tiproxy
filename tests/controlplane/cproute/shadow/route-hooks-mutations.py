@@ -9,6 +9,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -22,7 +23,7 @@ CASES = [
  ('standalone-at-allocation', 'router', 'TestRouteHooksParentOwnsChildAtRead', 'ROUTE_HOOK_OWNED_AT_ALLOCATION', NATIVE, 'e = caller.BeginEvaluation()', 'e = c.owner.BeginEvaluation()'),
  ('double-native-publication', 'router', 'TestRouteHooksActualOutcomes/selected', 'ROUTE_HOOK_OWNER_VALID', GROUP, 'g.routeCaller.CompleteEvaluation(evaluation)', 'g.routeCaller.CompleteEvaluation(evaluation)\n g.observation.PublishEvaluation(evaluation)'),
  ('cleanup-normal-only', 'router', 'TestRouteHooksUnsealedChildBeforeUnlock', 'ROUTE_HOOK_INVALID_BEFORE_UNLOCK', GROUP, 'defer g.endRouteObservation(caller)', '_ = caller'),
- ('cleanup-after-unlock', 'router', 'TestRouteHooksUnsealedChildBeforeUnlock', 'ROUTE_HOOK_INVALID_BEFORE_UNLOCK', GROUP, 'defer g.Unlock()\n\tcaller := g.beginRouteObservation()\n\tdefer g.endRouteObservation(caller)', 'caller := g.beginRouteObservation()\n defer func() { g.Unlock(); time.Sleep(time.Millisecond); g.endRouteObservation(caller) }()'),
+ ('cleanup-after-unlock', 'router', 'TestRouteHooksUnsealedChildBeforeUnlock', 'ROUTE_HOOK_INVALID_BEFORE_UNLOCK', GROUP, 'defer g.Unlock()\n\tcaller := parent\n\tif caller == nil {\n\t\tcaller = g.beginRouteObservation()\n\t} else {\n\t\tg.routeCaller = caller\n\t}\n\tdefer g.endRouteObservation(caller)', 'caller := parent\n\tif caller == nil {\n\t\tcaller = g.beginRouteObservation()\n\t} else {\n\t\tg.routeCaller = caller\n\t}\n defer func() { g.Unlock(); time.Sleep(time.Millisecond); g.endRouteObservation(caller) }()'),
  ('unsealed-child-forgotten', 'router', 'TestRouteHooksUnsealedChildBeforeUnlock', 'ROUTE_HOOK_UNSEALED_RELEASE_BEFORE_UNLOCK', 'pkg/balance/observation/caller.go', 'c.evaluations++', '_ = c.evaluations'),
  ('parent-released-at-admission', 'router', 'TestRouteHooksActualOutcomes/selected', 'ROUTE_HOOK_PARENT_UNTIL_WRITER', HOOK, 'g.observation.PublishCaller(c)', 'g.observation.PublishCaller(c)\n c.Release()'),
  ('members-omitted', 'router', 'TestRouteHooksActualOutcomes/selected', 'ROUTE_HOOK_FULL_INVENTORY', GROUP, 'caller.CaptureRouteMember(backend.observationID)', '_ = backend.observationID'),
@@ -44,7 +45,17 @@ CASES = [
 ]
 
 
+def check_anchors():
+    for name, _, _, _, path, old, _ in CASES:
+        if (ROOT/path).read_text().count(old) != 1:
+            raise RuntimeError('stale/ambiguous anchor: '+name)
+    print(f'{len(CASES)} route-hook fault anchors unique at their sites')
+
+
 def main():
+    check_anchors()
+    if '--check-anchors' in sys.argv:
+        return
     originals = {path: (ROOT/path).read_bytes() for *_, path, old, new in CASES}
     evidence = Path(os.environ.get('CP_ROUTE_ROUTE_HOOK_EVIDENCE') or tempfile.mkdtemp(prefix='route-hook-evidence-')).resolve()
     evidence.mkdir(parents=True, exist_ok=True)

@@ -4,6 +4,7 @@
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 cd "$root"
+python3 tests/controlplane/cproute/shadow/route-hooks-mutations.py --check-anchors
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
 evidence="${CP_ROUTE_ROUTE_HOOK_EVIDENCE:-$temporary/evidence}"
