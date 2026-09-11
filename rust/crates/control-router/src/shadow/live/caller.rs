@@ -9,6 +9,8 @@
 pub mod arithmetic;
 /// Group-local Balance comparison and redirect-time history; not installed yet.
 pub mod balance;
+/// Actual Finish plus Created comparison in the same affected-view transaction.
+pub mod finish;
 /// Bounded router pass boundary and order comparison; not installed yet.
 pub mod pass;
 /// Group-local Route capture and independent atomic comparison; not installed yet.

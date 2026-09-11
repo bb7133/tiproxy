@@ -84,7 +84,7 @@ func selectorRouteActualFrames(t *testing.T, captureBoundaries bool) {
 		for records, _ := f.r.Retained(); records > 0; records, _ = f.r.Retained() {
 			d := f.take(t)
 			if captureBoundaries && d.Record.Caller != nil {
-				require.NotNil(t, d.Record.Caller.Selector(), "SELECTOR_BOUNDARY_FAMILY")
+				require.True(t, d.Record.Caller.Selector() != nil || d.Record.Caller.Finish() != nil, "SELECTOR_BOUNDARY_FAMILY")
 				writeFrame(shadowwire.EncodeCaller(d.Record))
 			} else if d.Record.Evaluation != nil {
 				require.Equal(t, observation.EntryConfig, d.Record.Evaluation.Native().Entry, "SELECTOR_ROUTE_ONLY_CONSTRUCTION_NATIVE")
@@ -176,9 +176,15 @@ func selectorRouteActualFrames(t *testing.T, captureBoundaries bool) {
 		} else {
 			require.NoError(t, routeErr)
 			successes++
-			write(map[string]any{"kind": "finish", "backend": account(bs.cur)})
-			bs.Finish(newMockRedirectableConn(t, next), false)
+			created := captureBoundaries && next == 6
+			write(map[string]any{"kind": "finish", "backend": account(bs.cur), "success": created})
+			conn := newMockRedirectableConn(t, next)
+			bs.Finish(conn, created)
 			drain()
+			if created {
+				require.NoError(t, expected.(*backendWrapper).group.OnConnClosed(expected.ID(), conn))
+				drain()
+			}
 		}
 	}
 	run(nil, 1) // A genuinely empty Group: no native evaluation.

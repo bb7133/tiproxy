@@ -9,8 +9,10 @@ import os
 import signal
 import subprocess
 import time
+import sys
 
 ROOT = Path(__file__).resolve().parents[4]
+FINISH_SOURCE = 'rust/crates/control-router/src/shadow/live/caller/finish.rs'
 STATE_SOURCE = 'rust/crates/control-router/src/shadow/live/caller/selector_state.rs'
 SOURCE = 'rust/crates/control-router/src/shadow/live/caller/route.rs'
 CASES = [
@@ -20,11 +22,38 @@ CASES = [
     ('missing-binding', 'binding: (selected != 0).then_some(Binding {', 'binding: false.then_some(Binding {', 'SELECTOR_ROUTE_TRANSITION'),
 ]
 
+STATE_CASES = [
+        ('selector-ordinal', '.attempt(next, ordinal, excluded, derived)', '.attempt(next, ordinal + 1, excluded, derived)', 'SELECTOR_ROUTE_GROUP_COMPARISON'),
+        ('selector-close', 'stored.closed = true;', 'stored.closed = false;', 'SELECTOR_STATE_UNSETTLED'),
+    ]
+FINISH_CASES = [
+        ('finish-child', 'self.batch(&envelope.created)?;', '// fault: omit the complete Created child'),
+        ('finish-group', 'binding.group != envelope.group', 'binding.group == envelope.group'),
+    ]
+
+def check_anchors():
+    source = (ROOT / SOURCE).read_text()
+    tail = source[source.index('        Ok(DerivedResult {'):]
+    for name, old, new, marker in CASES:
+        if tail.count(old) != 1:
+            raise RuntimeError('stale result anchor: ' + name)
+    for path, cases in [(STATE_SOURCE, STATE_CASES), (FINISH_SOURCE, FINISH_CASES)]:
+        source = (ROOT / path).read_text()
+        for row in cases:
+            if source.count(row[1]) != 1:
+                raise RuntimeError('stale caller anchor: ' + row[0])
+    print('SELECTOR_ROUTE_ANCHORS 8 unique fault anchors; static check only', flush=True)
+
 
 def main():
+    check_anchors()
     evidence = Path(os.environ['CP_ROUTE_SELECTOR_ROUTE_EVIDENCE']).resolve()
     evidence.mkdir(parents=True, exist_ok=True)
-    paths = [SOURCE, STATE_SOURCE,
+    paths = [SOURCE, STATE_SOURCE, FINISH_SOURCE,
+             'pkg/balance/router/finish_observation.go',
+             'pkg/balance/router/group.go',
+             'pkg/controlbridge/shadow/caller_finish_codec.go',
+             'rust/crates/legacy-router-shadow/src/caller/finish_wire.rs',
              'pkg/balance/observation/caller_selection.go',
              'pkg/balance/router/selector_observation.go',
              'pkg/controlbridge/shadow/caller_selection_codec.go',
@@ -120,10 +149,7 @@ def main():
             print('SELECTOR_ROUTE_MUTATION detected: ' + name, flush=True)
         finally:
             (ROOT / SOURCE).write_bytes(originals[SOURCE])
-    for name, old, new, marker in [
-        ('selector-ordinal', '.attempt(next, ordinal, excluded, derived)', '.attempt(next, ordinal + 1, excluded, derived)', 'SELECTOR_ROUTE_GROUP_COMPARISON'),
-        ('selector-close', 'stored.closed = true;', 'stored.closed = false;', 'SELECTOR_STATE_UNSETTLED'),
-    ]:
+    for name, old, new, marker in STATE_CASES:
         try:
             text = originals[STATE_SOURCE].decode()
             if text.count(old) != 1:
@@ -133,11 +159,26 @@ def main():
             print('SELECTOR_ROUTE_MUTATION detected: ' + name, flush=True)
         finally:
             (ROOT / STATE_SOURCE).write_bytes(originals[STATE_SOURCE])
+    for name, old, new in FINISH_CASES:
+        try:
+            text = originals[FINISH_SOURCE].decode()
+            if text.count(old) != 1:
+                raise RuntimeError('stale Finish fault anchor: ' + name)
+            (ROOT / FINISH_SOURCE).write_text(text.replace(old, new, 1))
+            attempt(name, None, 'SELECTOR_ROUTE_FINISH_ATOMIC')
+            print('SELECTOR_ROUTE_MUTATION detected: ' + name, flush=True)
+        finally:
+            (ROOT / FINISH_SOURCE).write_bytes(originals[FINISH_SOURCE])
     attempt('restored')
     if any((ROOT / p).read_bytes() != data for p, data in originals.items()):
         raise RuntimeError('source not restored')
-    print('SELECTOR_ROUTE_MUTATIONS 6/6 compiled faults detected; baseline/restored and 4 witness corruptions passed', flush=True)
+    print('SELECTOR_ROUTE_MUTATIONS 8/8 compiled faults detected; baseline/restored and 4 witness corruptions passed', flush=True)
 
 
 if __name__ == '__main__':
-    main()
+    if sys.argv[1:] == ['--check-anchors']:
+        check_anchors()
+    elif sys.argv[1:]:
+        raise SystemExit('usage: selector-route-mutations.py [--check-anchors]')
+    else:
+        main()

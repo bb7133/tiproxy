@@ -484,3 +484,131 @@ fn late_selector_attempt_failure_rolls_back_group_factor_and_reservation() {
         }
     }
 }
+
+fn finish_fixture(wrong_operation: bool) -> (LiveState, super::super::finish::Envelope) {
+    use super::super::{
+        finish,
+        selection::{Boundary, BoundaryEvent},
+    };
+    let (mut state, mut route) = fixture();
+    let epoch = route.epoch;
+    let begin = Boundary {
+        epoch,
+        sequence: 5,
+        session: 10,
+        event: BoundaryEvent::Begin {
+            next: 1,
+            current: 0,
+            excluded: vec![],
+        },
+    };
+    assert_eq!(
+        state.observe_selector_boundary(&begin, 128).status,
+        Status::Comparing
+    );
+    route.sequence += 1;
+    for child in &mut route.children {
+        match child {
+            Child::Evaluation(e) => e.sequence += 1,
+            Child::Batch(b) => b.sequence += 1,
+        }
+    }
+    assert_eq!(
+        state
+            .observe_selector_group_route_result(&route, 1, 1, &[], 4096)
+            .0
+            .status,
+        Status::Comparing
+    );
+    let end = Boundary {
+        epoch,
+        sequence: 10,
+        session: 10,
+        event: BoundaryEvent::End {
+            next: 1,
+            current: 9,
+            excluded: vec![9],
+            backend: 9,
+            error: ErrorClass::None,
+        },
+    };
+    assert_eq!(
+        state.observe_selector_boundary(&end, 128).status,
+        Status::Comparing
+    );
+    let envelope = finish::Envelope {
+        epoch,
+        sequence: 11,
+        span: 2,
+        caller: 3,
+        group: 2,
+        session: 10,
+        backend: 9,
+        operation: if wrong_operation { 2 } else { 1 },
+        success: false,
+        created: Batch {
+            epoch,
+            sequence: 11,
+            events: vec![life(Event::Created {
+                session: 10,
+                operation: 1,
+                success: false,
+            })],
+            witness: Witness {
+                accounts: vec![AccountWitness {
+                    id: 9,
+                    score: 0,
+                    physical: 0,
+                    head: 0,
+                    tail: 0,
+                }],
+                session: 10,
+                ..Witness::default()
+            },
+        },
+    };
+    (state, envelope)
+}
+
+#[test]
+fn finish_late_binding_failure_cannot_refund_or_advance() {
+    for wrong_operation in [false, true] {
+        let (mut state, envelope) = finish_fixture(wrong_operation);
+        let epoch = envelope.epoch;
+        let retained = state.native_retained_bytes();
+        let progress = state.observe_selector_finish(&envelope, 1024);
+        if wrong_operation {
+            assert_eq!(
+                progress.status,
+                Status::Invalid(InvalidReason::Witness),
+                "FINISH_LATE_OPERATION_WITNESS"
+            );
+            assert_eq!(progress.compared_sequence, 10, "FINISH_NO_PREFIX_ESCAPE");
+            assert_eq!(state.totals(epoch), Some((1, 0)), "FINISH_NO_REFUND_ESCAPE");
+            assert_eq!(
+                state.native_retained_bytes(),
+                retained,
+                "FINISH_NO_RETAINED_ESCAPE"
+            );
+        } else {
+            assert_eq!(
+                progress.status,
+                Status::Comparing,
+                "FINISH_ACTUAL_REFUND_COMMIT"
+            );
+            assert_eq!(progress.compared_sequence, 12);
+            assert_eq!(state.totals(epoch), Some((0, 0)));
+            let mut duplicate = envelope;
+            duplicate.sequence = 13;
+            duplicate.created.sequence = 13;
+            assert!(
+                matches!(
+                    state.observe_selector_finish(&duplicate, 1024).status,
+                    Status::Invalid(_)
+                ),
+                "FINISH_NO_DUPLICATE_REFUND"
+            );
+            assert_eq!(state.progress(epoch).compared_sequence, 12);
+        }
+    }
+}

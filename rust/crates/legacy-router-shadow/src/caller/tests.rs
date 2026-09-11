@@ -179,7 +179,7 @@ fn route_frame(body: &str) -> route::Envelope {
         .unwrap_or_else(|e| unreachable!("fixture {e:?}"))
     {
         Frame::GroupRoute(e) => e,
-        Frame::Selector(_) | Frame::Pass(_) | Frame::GroupBalance(_) => {
+        Frame::Finish(_) | Frame::Selector(_) | Frame::Pass(_) | Frame::GroupBalance(_) => {
             unreachable!("route fixture")
         }
     }
@@ -481,6 +481,40 @@ fn selector_wire_is_strict_bounded_and_preserves_duplicate_exclusions() {
         assert!(
             decode_caller(&frame(&bad), None, 0).is_err(),
             "SELECTOR_STATE_STRICT_WIRE"
+        );
+    }
+}
+
+#[test]
+fn finish_wire_rejects_foreign_extra_or_incomplete_children() {
+    use serde_json::json;
+    let mut body: serde_json::Value =
+        serde_json::from_str(ROUTE).unwrap_or_else(|_| unreachable!("route fixture"));
+    let mut created = body["payload"]["group_route"]["children"][1]["batch"].clone();
+    created["sequence"] = json!("5");
+    created["events"] = json!([{"kind":"created","id":"0","group":"0","session":"10","operation":"1","account":"0","target":"0","success":false}]);
+    created["witness"]["accounts"][0]["score"] = json!("0");
+    body["span"] = json!("2");
+    body["payload"] = json!({"group_finish":{"caller":"7","group":"2","session":"10","backend":"9","operation":"1","success":false,"created":created}});
+    assert!(
+        matches!(
+            decode_caller(&frame(&body.to_string()), None, 0),
+            Ok(Frame::Finish(_))
+        ),
+        "FINISH_COMPLETE_WIRE"
+    );
+    for fault in 0..5 {
+        let mut bad = body.clone();
+        match fault {
+            0 => bad["span"] = json!("1"),
+            1 => bad["payload"]["group_finish"]["created"]["nonce"] = json!("99"),
+            2 => bad["payload"]["group_finish"]["created"]["sequence"] = json!("6"),
+            3 => bad["payload"]["group_finish"]["created"]["events"] = json!([]),
+            _ => bad["payload"]["group_finish"]["ignored"] = json!(true),
+        }
+        assert!(
+            decode_caller(&frame(&bad.to_string()), None, 0).is_err(),
+            "FINISH_STRICT_CHILD_SHAPE {fault}"
         );
     }
 }

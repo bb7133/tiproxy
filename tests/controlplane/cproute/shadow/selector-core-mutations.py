@@ -3,21 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Actual-Go oracle and compiling selector faults, with every attempt retained."""
 from pathlib import Path
-import hashlib, json, os, shutil, signal, subprocess, tempfile, time
+import hashlib, json, os, shutil, signal, subprocess, tempfile, time, sys
 
 ROOT = Path(__file__).resolve().parents[4]
 GO = 'pkg/balance/router/backend_selector.go'
 RUST = 'rust/crates/control-router/src/shadow/live/caller/selection.rs'
 GO_CASES = [
- ('wrapped-is-retried', 'wrapped-sentinel', [('import "net"','import ("net"; "github.com/pingcap/tiproxy/lib/util/errors")'),('err == ErrNoBackend && len(bs.excluded) > 0','errors.Is(err, ErrNoBackend) && len(bs.excluded) > 0')]),
+ ('wrapped-is-retried', 'wrapped-sentinel', [('\t"net"', '\t"net"\n\t"github.com/pingcap/tiproxy/lib/util/errors"'),('err == ErrNoBackend && len(bs.excluded) > 0','errors.Is(err, ErrNoBackend) && len(bs.excluded) > 0')]),
  ('empty-sentinel-is-retried','empty-sentinel',[('err == ErrNoBackend && len(bs.excluded) > 0','err == ErrNoBackend')]),
  ('exclusions-not-reset','exact-retry',[('bs.excluded = bs.excluded[:0]','_ = bs.excluded')]),
  ('second-attempt-omitted','exact-retry',[('backend, err = bs.routeOnce(bs.excluded)','_ = bs.excluded')]),
  ('append-old-current','success-append',[('bs.cur = backend\n\tbs.excluded = append(bs.excluded, backend)','bs.excluded = append(bs.excluded, bs.cur)\n bs.cur = backend')]),
- ('error-backend-lost','ordinary-error',[('if err != nil {\n\t\treturn backend, err','if err != nil {\n\t\treturn nil, err')]),
+ ('error-backend-lost','ordinary-error',[('\t\treturn backend, err', '\t\treturn nil, err')]),
  # The wrapped error is the first error after a successful Next in oracle order;
  # overwriting cur already diverges there, before the ordinary-error case.
- ('error-overwrites-current','wrapped-sentinel',[('if err != nil {\n\t\treturn backend, err','if err != nil {\n bs.cur = backend\n\t\treturn backend, err')]),
+ ('error-overwrites-current','wrapped-sentinel',[('if err != nil {', 'if err != nil {\n bs.cur = backend')]),
  ('finish-loses-current','success-append',[('bs.onCreate(bs.cur, conn, succeed)','bs.onCreate(nil, conn, succeed)')]),
  ('history-deduplicated','duplicate-history',[('bs.excluded = append(bs.excluded, backend)','if len(bs.excluded) == 0 || bs.excluded[len(bs.excluded)-1] != backend { bs.excluded = append(bs.excluded, backend) }')]),
 ]
@@ -32,7 +32,21 @@ RUST_CASES = [
 ]
 
 
+def check_anchors():
+    for name, marker, edits in GO_CASES:
+        source = (ROOT / GO).read_text()
+        for old, new in edits:
+            if source.count(old) != 1:
+                raise RuntimeError('stale anchor: ' + name)
+            source = source.replace(old, new, 1)
+    for name, test, marker, old, new in RUST_CASES:
+        if (ROOT / RUST).read_text().count(old) != 1:
+            raise RuntimeError('stale anchor: ' + name)
+    print('SELECTOR_ANCHORS 16 unique fault anchors; static check only', flush=True)
+
+
 def main():
+    check_anchors()
     evidence=Path(os.environ['CP_ROUTE_SELECTOR_EVIDENCE']).resolve();evidence.mkdir(parents=True,exist_ok=True)
     originals={path:(ROOT/path).read_bytes() for path in [GO,RUST]}
     (evidence/'source-hashes.json').write_text(json.dumps({p:hashlib.sha256(b).hexdigest() for p,b in originals.items()},indent=2)+'\n')
@@ -105,4 +119,10 @@ def main():
     if any((ROOT/p).read_bytes()!=data for p,data in originals.items()): raise RuntimeError('source changed')
     print(f'SELECTOR_MUTATIONS {len(GO_CASES)+len(RUST_CASES)}/{len(GO_CASES)+len(RUST_CASES)} compiled faults killed; restored Go/Rust baselines passed',flush=True)
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    if sys.argv[1:] == ['--check-anchors']:
+        check_anchors()
+    elif sys.argv[1:]:
+        raise SystemExit('usage: selector-core-mutations.py [--check-anchors]')
+    else:
+        main()

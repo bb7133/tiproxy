@@ -40,3 +40,28 @@ func TestSelectorBoundarySharesCallerLease(t *testing.T) {
 		})
 	}
 }
+
+func TestFinishParentRetainsCompleteCreated(t *testing.T) {
+	r, o := callerOwner(t, DefaultLimits())
+	c := o.BeginCaller()
+	require.NotNil(t, c)
+	require.True(t, c.CaptureGroupFinish(1, 2, 10, 9, 3, false))
+	batch := Batch{EventCount: 1, Events: [MaxEvents]Event{{Kind: Created, Session: 10, Operation: 3}}}
+	require.True(t, c.AppendBatch(batch))
+	batch.Events[0].Operation = 99
+	require.True(t, c.CaptureFinishResult())
+	require.True(t, c.Seal())
+	require.True(t, o.PublishCaller(c))
+	c.Cleanup()
+	d := receive(t, r)
+	require.EqualValues(t, 2, d.Record.Caller.Span())
+	require.EqualValues(t, 3, d.Record.Caller.Finish().Operation)
+	require.EqualValues(t, 3, d.Record.Caller.Children()[0].Batch.Events[0].Operation)
+	records, bytes := r.Retained()
+	require.EqualValues(t, 2, records)
+	require.EqualValues(t, CallerCharge+BatchCharge, bytes, "FINISH_PARENT_CHILD_RETAINED")
+	d.Release()
+	records, bytes = r.Retained()
+	require.Zero(t, records)
+	require.Zero(t, bytes, "FINISH_PARENT_CHILD_RELEASE_ONCE")
+}

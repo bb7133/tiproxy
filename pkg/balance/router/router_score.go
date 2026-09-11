@@ -113,6 +113,9 @@ func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) Backen
 	var selectorCapture *selectionObservation
 	if router.selectorCapture {
 		selectorCapture = selection
+		if selection != nil {
+			selection.capture = true
+		}
 	}
 	return BackendSelector{
 		selectionCapture: selectorCapture,

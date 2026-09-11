@@ -543,6 +543,9 @@ func (g *Group) onCreateConn(backendInst BackendInst, conn RedirectableConn, suc
 func (g *Group) onCreateConnObserved(backendInst BackendInst, conn RedirectableConn, succeed bool, selection *selectionObservation) {
 	g.Lock()
 	defer g.Unlock()
+	caller := g.beginFinishObservation(selection)
+	defer g.endFinishObservation(caller)
+	g.captureFinishHeader(caller, selection, backendInst, succeed)
 	backend := g.ensureBackend(backendInst.ID())
 	if succeed {
 		connWrapper := &connWrapper{
@@ -561,6 +564,9 @@ func (g *Group) onCreateConnObserved(backendInst BackendInst, conn RedirectableC
 		backend.connScore--
 	}
 	g.observeCreated(selection, backend, conn, succeed)
+	if caller != nil && caller.CaptureFinishResult() && caller.Seal() {
+		g.observation.PublishCaller(caller)
+	}
 }
 
 // RehydrateConn implements the group half of AssignmentRehydrator: the

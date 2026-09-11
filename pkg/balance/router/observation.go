@@ -9,6 +9,7 @@ import "github.com/pingcap/tiproxy/pkg/balance/observation"
 // token follows that same lifetime, including attempts before a conn exists.
 // It never supplies an identity or decision to production routing.
 type selectionObservation struct {
+	capture                       bool
 	owner                         *observation.Owner
 	session, operation            uint64
 	next                          uint64

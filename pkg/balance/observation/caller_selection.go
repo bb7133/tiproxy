@@ -40,7 +40,7 @@ func (c *Caller) CaptureSelector(value *SelectorBoundary) bool {
 	if !c.writable() {
 		return false
 	}
-	if value == nil || value.Session == 0 || c.length != 0 || c.children != 0 ||
+	if c.storage.finish.ID != 0 || value == nil || value.Session == 0 || c.length != 0 || c.children != 0 ||
 		c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.selector.Kind != 0 {
 		c.Fail(Malformed)
 		return false
@@ -85,4 +85,44 @@ func (c *Caller) Selector() *SelectorBoundary {
 		return nil
 	}
 	return &c.storage.selector
+}
+
+// GroupFinish binds the actual creation callback to its original reservation.
+// The complete Created batch is retained in the same Group critical section.
+type GroupFinish struct {
+	ID, Group, Session, Backend, Operation uint64
+	Success, ResultSet                     bool
+}
+
+func (c *Caller) CaptureGroupFinish(id, group, session, backend, operation uint64, success bool) bool {
+	if !c.writable() {
+		return false
+	}
+	if id == 0 || group == 0 || session == 0 || backend == 0 || operation == 0 ||
+		c.length != 0 || c.children != 0 || c.evaluations != 0 || c.storage.pass.Kind != 0 ||
+		c.storage.selector.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.finish.ID != 0 {
+		c.Fail(Malformed)
+		return false
+	}
+	c.storage.finish = GroupFinish{ID: id, Group: group, Session: session, Backend: backend, Operation: operation, Success: success}
+	return true
+}
+
+func (c *Caller) CaptureFinishResult() bool {
+	if !c.writable() {
+		return false
+	}
+	if c.storage.finish.ID == 0 || c.storage.finish.ResultSet || c.children != 1 || c.batches != 1 || c.evaluations != 0 {
+		c.Fail(Malformed)
+		return false
+	}
+	c.storage.finish.ResultSet = true
+	return true
+}
+
+func (c *Caller) Finish() *GroupFinish {
+	if c == nil || !c.sealed || c.released.Load() || c.storage.finish.ID == 0 {
+		return nil
+	}
+	return &c.storage.finish
 }

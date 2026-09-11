@@ -7,7 +7,10 @@ use control_router::shadow::{
     Epoch, Event, Limits, Status,
     live::{
         LiveEvent, LiveState,
-        caller::selection::{Binding, ErrorClass, Tracker},
+        caller::{
+            finish,
+            selection::{Binding, ErrorClass, Tracker},
+        },
     },
 };
 use legacy_router_shadow::{caller, live};
@@ -62,6 +65,8 @@ enum Record {
     },
     Finish {
         backend: u64,
+        #[serde(default)]
+        success: bool,
     },
     Tail {
         next: u64,
@@ -79,6 +84,9 @@ fn check<T>(value: std::result::Result<T, control_router::shadow::InvalidReason>
 struct Replay {
     tracker: Tracker,
     captured_boundaries: usize,
+    captured_finishes: usize,
+    finish_successes: usize,
+    finish_success: bool,
     session: Option<u64>,
     pending: Option<Binding>,
     next: u64,
@@ -149,6 +157,33 @@ impl Replay {
         Ok(())
     }
 
+    fn finish(
+        &mut self,
+        state: &mut LiveState,
+        envelope: &finish::Envelope,
+        frame_bytes: usize,
+    ) -> Result<()> {
+        let binding = self.pending.ok_or("SELECTOR_ROUTE_FINISH_BATCH")?;
+        if Some(envelope.session) != self.session
+            || envelope.group != binding.group
+            || envelope.backend != binding.account
+            || envelope.operation != binding.operation
+            || envelope.success != self.finish_success
+        {
+            return Err("SELECTOR_ROUTE_FINISH_BINDING".into());
+        }
+        let progress = state.observe_selector_finish(envelope, frame_bytes);
+        if progress.status != Status::Comparing
+            || progress.compared_sequence != envelope.sequence + 1
+        {
+            return Err("SELECTOR_ROUTE_FINISH_ATOMIC".into());
+        }
+        self.pending = None;
+        self.captured_finishes += 1;
+        self.finish_successes += usize::from(envelope.success);
+        Ok(())
+    }
+
     fn lifecycle(&mut self, bytes: &[u8]) -> Result<()> {
         let Some(binding) = self.pending else {
             return Ok(());
@@ -157,8 +192,8 @@ impl Replay {
             return Err("SELECTOR_ROUTE_FINISH_BATCH".into());
         };
         if !matches!(batch.events.as_slice(), [LiveEvent::Lifecycle {
-            event: Event::Created { session, operation, success: false }, ..
-        }] if Some(*session) == self.session && *operation == binding.operation)
+            event: Event::Created { session, operation, success }, ..
+        }] if Some(*session) == self.session && *operation == binding.operation && *success == self.finish_success)
             || batch.witness.accounts.len() != 1
             || batch.witness.accounts[0].id != binding.account
         {
@@ -195,7 +230,8 @@ impl Replay {
                     self.rejected += 1;
                 }
             }
-            Record::Finish { backend } => {
+            Record::Finish { backend, success } => {
+                self.finish_success = *success;
                 if self.pending.is_some() {
                     return Err("SELECTOR_ROUTE_DUPLICATE_FINISH".into());
                 }
@@ -218,6 +254,8 @@ impl Replay {
                 }
                 if self.captured_boundaries != 0 {
                     if self.captured_boundaries != 13
+                        || self.captured_finishes != 4
+                        || self.finish_successes != 1
                         || !state.selectors_settled(owner.ok_or("owner")?)
                     {
                         return Err("SELECTOR_STATE_UNSETTLED".into());
@@ -263,6 +301,12 @@ fn replay(records: &[Record]) -> Result<()> {
                     replay.captured_boundaries += 1;
                     continue;
                 }
+                if let Ok(caller::Frame::Finish(envelope)) =
+                    caller::decode_caller(bytes, origin, state.native_retained_bytes())
+                {
+                    replay.finish(&mut state, &envelope, bytes.len())?;
+                    continue;
+                }
                 replay.lifecycle(bytes)?;
                 prefix::observe_prefix(&mut state, bytes, &mut origin, &mut owner)?;
             }
@@ -287,7 +331,7 @@ fn corrupt(record: &mut Record, fault: u8) -> bool {
                 ..
             },
         )
-        | (3, Record::Finish { backend }) => *backend = 0,
+        | (3, Record::Finish { backend, .. }) => *backend = 0,
         (
             1,
             Record::Attempt {

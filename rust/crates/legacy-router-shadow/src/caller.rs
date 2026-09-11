@@ -4,12 +4,13 @@
 //! Preparatory strict v4 router pass boundaries. This codec is deliberately not
 //! selected by the existing v2/v3 consumer and confers no coverage capability.
 mod balance_wire;
+mod finish_wire;
 mod route_wire;
 mod selection_wire;
 use crate::{Error, native::Decimal};
 use control_router::shadow::{
     Epoch,
-    live::caller::{Budget, MAX_CALLER_FRAME, balance, pass, route, selection},
+    live::caller::{Budget, MAX_CALLER_FRAME, balance, finish, pass, route, selection},
 };
 use control_routing::go_time::Origin;
 use serde::{
@@ -60,6 +61,8 @@ impl<'de> Deserialize<'de> for Groups {
 #[serde(deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // The full fixed variant is included in the decode budget.
 enum Payload {
+    #[serde(rename = "group_finish")]
+    GroupFinish(finish_wire::WireFinish),
     #[serde(rename = "selector_begin")]
     SelectorBegin(selection_wire::State),
     #[serde(rename = "selector_end")]
@@ -123,6 +126,13 @@ impl Wire {
             let envelope = value.domain(epoch, self.sequence.0, self.span.0, origin)?;
             return Ok(Frame::GroupRoute(envelope));
         }
+        if let Payload::GroupFinish(value) = self.payload {
+            return Ok(Frame::Finish(value.domain(
+                epoch,
+                self.sequence.0,
+                self.span.0,
+            )?));
+        }
         if self.span.0 != 1 {
             return Err(Error::Schema);
         }
@@ -144,7 +154,9 @@ impl Wire {
                     true,
                 )?));
             }
-            Payload::GroupRoute(_) | Payload::GroupBalance(_) => return Err(Error::Schema),
+            Payload::GroupFinish(_) | Payload::GroupRoute(_) | Payload::GroupBalance(_) => {
+                return Err(Error::Schema);
+            }
             Payload::Begin {
                 pass,
                 support_redirection,
@@ -192,6 +204,8 @@ impl Wire {
 /// A strictly decoded caller, still requiring its independent domain comparator.
 #[allow(clippy::large_enum_variant)] // Bounded fixed pass storage is included in 32F + S.
 pub enum Frame {
+    /// Actual Finish with its complete Created batch.
+    Finish(finish::Envelope),
     /// Actual selector entry/return/end requiring retained-state comparison.
     Selector(selection::Boundary),
     /// Group Balance with its native evaluation and paired lifecycle batches.
@@ -226,7 +240,9 @@ pub fn admission(frame_bytes: usize, retained: usize) -> Result<Budget, Error> {
 pub fn decode(frame: &[u8], retained: usize) -> Result<pass::Boundary, Error> {
     match decode_caller(frame, None, retained)? {
         Frame::Pass(pass) => Ok(pass),
-        Frame::Selector(_) | Frame::GroupRoute(_) | Frame::GroupBalance(_) => Err(Error::Schema),
+        Frame::Finish(_) | Frame::Selector(_) | Frame::GroupRoute(_) | Frame::GroupBalance(_) => {
+            Err(Error::Schema)
+        }
     }
 }
 
