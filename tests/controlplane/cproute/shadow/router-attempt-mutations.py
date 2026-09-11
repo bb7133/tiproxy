@@ -16,6 +16,14 @@ import time
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = 'rust/crates/control-router/src/shadow/live/caller/router_route.rs'
 SCENARIOS = ['all', 'cidr', 'proxy', 'port']
+# Coverage contract, checked against computed evidence rather than printed as
+# a result. Update deliberately when adding scenarios or compiled faults.
+EXPECTED_SUMMARY = {
+    'faults': 6, 'records': 41, 'streams': 4, 'strict': 36,
+    'corruptions': 12, 'atomic': 4, 'comparisons': 32,
+    'detected_failures': 14, 'successful_comparisons': 18,
+    'failure_status_counts': {'Sequence': 4, 'Witness': 10},
+}
 # The unmodified real stream must fail before the diagnostic corruptions run.
 # (name, exact old/new source, affected scenarios, first domain status)
 CASES = [
@@ -82,16 +90,21 @@ def summarize(rows, evidence):
         observed_atomic = len(re.findall(r'^ROUTER_ATTEMPT_ATOMIC late-next rejected prefix=\d+ retained=\d+$', output, re.MULTILINE))
         if len(footer) != 1 or strict_lines != [footer[0][0]] or observed_corruptions != int(footer[0][1]) or observed_atomic == 0:
             raise RuntimeError('inconsistent replay evidence: ' + row['name'])
+        if (int(strict_lines[0]), observed_corruptions, observed_atomic) != (9, 3, 1):
+            raise RuntimeError('unexpected per-stream coverage: ' + row['name'])
         strict += int(strict_lines[0])
         corruptions += observed_corruptions
         atomic += observed_atomic
-    return dict(faults=sum(row['name'].startswith('compile-') and row['name'] not in
+    summary = dict(faults=sum(row['name'].startswith('compile-') and row['name'] not in
                           {'compile-baseline', 'compile-restored'} for row in rows),
                 records=len(rows), streams=len(baseline), strict=strict,
                 corruptions=corruptions, atomic=atomic, comparisons=len(comparisons),
                 detected_failures=sum(statuses.values()),
                 successful_comparisons=sum(row['rc'] == 0 for row in comparisons),
                 failure_status_counts=dict(sorted(statuses.items())))
+    if summary != EXPECTED_SUMMARY:
+        raise RuntimeError('unexpected replay coverage: ' + json.dumps(summary, sort_keys=True))
+    return summary
 
 
 def main():
