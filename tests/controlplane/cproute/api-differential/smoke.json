@@ -1,0 +1,171 @@
+{
+  "version": 1,
+  "id": "adapter-smoke",
+  "config": {
+    "policy": "connection",
+    "selection": "random",
+    "rule": ""
+  },
+  "provenance": {
+    "kind": "synthetic"
+  },
+  "events": [
+    {
+      "op": "open",
+      "session": "empty",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "empty",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "empty",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {}
+        },
+        {
+          "address": "127.0.0.1:4001",
+          "labels": {}
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "retry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "retry",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "retry",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "retry",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_previous": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "retry",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "retry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {}
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "only",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "only",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "only",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "only",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"invalid-public-policy\"",
+      "expect": {
+        "outcome": "invalid_config"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    }
+  ]
+}
