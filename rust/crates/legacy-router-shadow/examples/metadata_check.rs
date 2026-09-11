@@ -85,7 +85,8 @@ impl Replay {
                     &mut self.origin,
                     &mut self.owner,
                 );
-                if let Some(owner) = self.owner
+                if result.is_err()
+                    && let Some(owner) = self.owner
                     && let Status::Invalid(reason) = self.state.progress(owner).status
                 {
                     return Err(self.fail(reason));

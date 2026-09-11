@@ -192,3 +192,29 @@ fn metadata_group_event_rejects_late_lifecycle_witness_without_retaining_it() {
         "METADATA_LIVE_NO_CREATED_ESCAPE"
     );
 }
+
+#[test]
+fn metadata_prefix_commit_checks_retained_limit_before_publication() {
+    for excess in [0, 1, usize::MAX] {
+        let (mut state, epoch) = initial();
+        let stored = StoredMetadata::fork(None);
+        let charge = stored.retained_charge();
+        state.native_bytes = if excess == usize::MAX {
+            usize::MAX
+        } else {
+            super::super::HISTORY_LIMIT - charge + excess
+        };
+        let before = state.native_bytes;
+        let result = state.commit_metadata_prefix(epoch, stored);
+        if excess == 0 {
+            assert_eq!(result, Ok(()));
+            assert_eq!(state.native_bytes, super::super::HISTORY_LIMIT);
+            assert!(state.router_metadata(epoch).is_some());
+        } else {
+            assert_eq!(result, Err(InvalidReason::Capacity));
+            assert_eq!(state.native_bytes, before);
+            assert!(state.router_metadata(epoch).is_none());
+        }
+        assert_eq!(state.progress(epoch).compared_sequence, 1);
+    }
+}

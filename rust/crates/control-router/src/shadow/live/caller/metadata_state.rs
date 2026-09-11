@@ -61,13 +61,39 @@ impl LiveState {
         Ok(Some(StoredMetadata::fork(self.metadata.get(&epoch))))
     }
 
-    fn commit_metadata_prefix(&mut self, epoch: super::Epoch, stored: StoredMetadata) {
+    fn commit_metadata_prefix(
+        &mut self,
+        epoch: super::Epoch,
+        stored: StoredMetadata,
+    ) -> Result<(), InvalidReason> {
         let old = self
             .metadata
             .get(&epoch)
             .map_or(0, StoredMetadata::retained_charge);
-        self.native_bytes = self.native_bytes - old + stored.retained_charge();
+        let retained = self
+            .native_bytes
+            .checked_sub(old)
+            .and_then(|n| n.checked_add(stored.retained_charge()))
+            .filter(|n| *n <= super::HISTORY_LIMIT)
+            .ok_or(InvalidReason::Capacity)?;
         self.metadata.insert(epoch, stored);
+        self.native_bytes = retained;
+        Ok(())
+    }
+
+    fn finish_metadata_prefix(
+        &mut self,
+        epoch: super::Epoch,
+        previous: u64,
+        stored: StoredMetadata,
+    ) -> Progress {
+        if let Err(reason) = self.commit_metadata_prefix(epoch, stored) {
+            self.invalidate(epoch, reason);
+            if let Some(owner) = self.core.owners.get_mut(&(epoch.process, epoch.owner)) {
+                owner.sequence = previous;
+            }
+        }
+        self.progress(epoch)
     }
 
     /// Compare Group lifecycle records with both the metadata generation and
@@ -98,11 +124,12 @@ impl LiveState {
             Ok(stored) => stored,
             Err(reason) => return self.invalidate(batch.epoch, reason),
         };
+        let previous = self.progress(batch.epoch).compared_sequence;
         let progress = self.observe(batch);
         if progress.status == Status::Comparing
             && let Some(stored) = stored
         {
-            self.commit_metadata_prefix(batch.epoch, stored);
+            return self.finish_metadata_prefix(batch.epoch, previous, stored);
         }
         progress
     }
@@ -132,17 +159,28 @@ impl LiveState {
             Err(reason) => return self.invalidate(epoch, reason),
         };
         let extra = stored.as_ref().map_or(0, StoredMetadata::retained_charge);
-        let Some(staging) = frame_bytes
-            .checked_mul(super::DECODE_MULTIPLIER)
-            .and_then(|n| n.checked_add(extra))
-        else {
+        let factor = self
+            .native
+            .get(&epoch)
+            .and_then(|n| n.groups.get(&evaluation.group))
+            .map_or(0, |g| g.charge);
+        let budget = extra
+            .checked_add(factor)
+            .ok_or(InvalidReason::Capacity)
+            .and_then(|copies| Budget::new(frame_bytes, self.native_bytes, copies));
+        match budget {
+            Ok(budget) => self.record_caller_budget(budget),
+            Err(reason) => return self.invalidate(epoch, reason),
+        }
+        let Some(staging) = frame_bytes.checked_mul(super::DECODE_MULTIPLIER) else {
             return self.invalidate(epoch, InvalidReason::Capacity);
         };
-        let progress = self.observe_native(evaluation, staging);
+        let previous = self.progress(epoch).compared_sequence;
+        let progress = self.observe_native_copies(evaluation, staging, extra).0;
         if progress.status == Status::Comparing
             && let Some(stored) = stored
         {
-            self.commit_metadata_prefix(epoch, stored);
+            return self.finish_metadata_prefix(epoch, previous, stored);
         }
         progress
     }

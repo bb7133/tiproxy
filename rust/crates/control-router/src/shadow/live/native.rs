@@ -100,6 +100,16 @@ impl LiveState {
         e: &Evaluation,
         staging: usize,
     ) -> (Progress, Option<Decision>) {
+        self.observe_native_copies(e, staging, 0)
+    }
+    // Copies of unrelated metadata remain live during this factor comparison.
+    // They count toward peak admission but can never fund new factor history.
+    pub(super) fn observe_native_copies(
+        &mut self,
+        e: &Evaluation,
+        staging: usize,
+        concurrent_copies: usize,
+    ) -> (Progress, Option<Decision>) {
         let mut decision = None;
         let key = (e.epoch.process, e.epoch.owner);
         match self.core.owners.get(&key) {
@@ -110,7 +120,7 @@ impl LiveState {
                 self.invalidate(e.epoch, InvalidReason::Identity);
             }
             Some(owner) if owner.status == Status::Comparing => {
-                match self.compare_native(e, staging) {
+                match self.compare_native(e, staging, concurrent_copies) {
                     Ok(computed) => decision = Some(computed),
                     Err(reason) => {
                         self.invalidate(e.epoch, reason);
@@ -128,6 +138,7 @@ impl LiveState {
         &mut self,
         e: &Evaluation,
         staging: usize,
+        concurrent_copies: usize,
     ) -> Result<Decision, InvalidReason> {
         let key = (e.epoch.process, e.epoch.owner);
         let owner = self
@@ -173,9 +184,12 @@ impl LiveState {
             .ok_or(InvalidReason::MissingBegin)?;
         let old = native.groups.get(&e.group);
         let old_charge = old.map_or(0, |stored| stored.charge);
-        let peak = staging
+        let growth_limit = staging
             .checked_add(old_charge)
             .and_then(|v| v.checked_add(STAGE_OVERHEAD))
+            .ok_or(InvalidReason::Capacity)?;
+        let peak = growth_limit
+            .checked_add(concurrent_copies)
             .ok_or(InvalidReason::Capacity)?;
         if !self.native_can_stage(peak) {
             return Err(InvalidReason::Capacity);
@@ -189,7 +203,7 @@ impl LiveState {
         let decision = staged.compare(e).map_err(|_| InvalidReason::Witness)?;
         let timing_charge = old.map_or(0, |stored| stored.timing.entry_charge());
         let charge = staged.retained_bytes() + GROUP_CHARGE + timing_charge;
-        if charge > old_charge + staging + STAGE_OVERHEAD {
+        if charge > growth_limit {
             return Err(InvalidReason::Capacity);
         }
         self.native_bytes = self.native_bytes - old_charge + charge;
