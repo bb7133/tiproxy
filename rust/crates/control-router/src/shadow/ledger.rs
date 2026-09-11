@@ -220,8 +220,109 @@ pub(super) struct Mirror {
     next_factor: u64,
     accounts: BTreeMap<u64, AccountView>,
     sessions: BTreeMap<u64, Session>,
+    // A caller fork copies only its affected keys. Omitted retained entries,
+    // including tombstones, still consume the original population limits.
+    hidden_accounts: usize,
+    hidden_sessions: usize,
 }
 impl Mirror {
+    // Borrow the independent physical list; caller visit witnesses never seed it.
+    pub(super) fn caller_physical(&self, account: u64) -> Option<&[u64]> {
+        self.accounts
+            .get(&account)
+            .filter(|account| !account.removed)
+            .map(|account| account.physical_order.as_slice())
+    }
+
+    pub(super) fn caller_redirect_watermark(&self, session: u64) -> Option<u64> {
+        self.sessions.get(&session).map(|s| s.redirect_watermark)
+    }
+
+    // The complete retained Group inventory, never seeded from filtered native inputs.
+    pub(super) fn caller_account_ids(&self, group: u64) -> impl Iterator<Item = u64> + '_ {
+        self.accounts
+            .iter()
+            .filter(move |(_, a)| a.group == group && !a.removed)
+            .map(|(id, _)| *id)
+    }
+
+    // Callers validate the scope and reserve this charge before cloning. Four
+    // times physical capacity also covers a temporary vector reallocation when
+    // a staged lifecycle transition appends. New bounded keys fit the separate
+    // caller stage allowance; original population limits still apply.
+    pub(super) fn caller_clone_charge(
+        &self,
+        group: u64,
+        sessions: &[u64],
+    ) -> Result<usize, InvalidReason> {
+        if self.hidden_accounts != 0 || self.hidden_sessions != 0 {
+            return Err(InvalidReason::Lifecycle);
+        }
+        if sessions.len() > 64 {
+            return Err(InvalidReason::Capacity);
+        }
+        for (index, id) in sessions.iter().enumerate() {
+            if *id == 0 || sessions[..index].contains(id) {
+                return Err(InvalidReason::Identity);
+            }
+        }
+        let mut charge = size_of::<Self>();
+        let mut accounts = 0;
+        for account in self
+            .accounts
+            .values()
+            .filter(|a| a.group == group && !a.removed)
+        {
+            accounts += 1;
+            if accounts > 64 {
+                return Err(InvalidReason::Capacity);
+            }
+            let vector = account
+                .physical_order
+                .capacity()
+                .checked_mul(4 * size_of::<u64>())
+                .ok_or(InvalidReason::Capacity)?;
+            charge = charge
+                .checked_add(16 * size_of::<(u64, AccountView)>())
+                .and_then(|n| n.checked_add(vector))
+                .ok_or(InvalidReason::Capacity)?;
+        }
+        charge
+            .checked_add(sessions.len() * 16 * size_of::<(u64, Session)>())
+            .ok_or(InvalidReason::Capacity)
+    }
+
+    pub(super) fn fork_caller(&self, group: u64, sessions: &[u64]) -> Self {
+        let accounts: BTreeMap<_, _> = self
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.group == group && !account.removed)
+            .map(|(id, account)| (*id, account.clone()))
+            .collect();
+        let sessions: BTreeMap<_, _> = sessions
+            .iter()
+            .filter_map(|id| self.sessions.get(id).map(|state| (*id, state.clone())))
+            .collect();
+        Self {
+            limits: self.limits,
+            retired: self.retired,
+            factor_lifetime: self.factor_lifetime,
+            next_factor: self.next_factor,
+            hidden_accounts: self.accounts.len() - accounts.len(),
+            hidden_sessions: self.sessions.len() - sessions.len(),
+            accounts,
+            sessions,
+        }
+    }
+
+    // A caller cannot create/remove accounts, retire an owner or change a
+    // policy. Only validated affected account/session entries are merged. All
+    // other owner history, including omitted tombstones, remains untouched.
+    pub(super) fn commit_caller(&mut self, staged: Self) {
+        self.accounts.extend(staged.accounts);
+        self.sessions.extend(staged.sessions);
+    }
+
     pub(super) fn new(limits: Limits) -> Self {
         Self {
             limits,
@@ -230,6 +331,8 @@ impl Mirror {
             next_factor: 1,
             accounts: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            hidden_accounts: 0,
+            hidden_sessions: 0,
         }
     }
 
@@ -281,7 +384,7 @@ impl Mirror {
         if id == 0 || self.sessions.contains_key(&id) {
             return Err(InvalidReason::Identity);
         }
-        if self.sessions.len() >= self.limits.sessions {
+        if self.hidden_sessions + self.sessions.len() >= self.limits.sessions {
             return Err(InvalidReason::Capacity);
         }
         self.sessions.insert(id, Session::default());
@@ -545,7 +648,7 @@ impl Mirror {
         if session == 0 || self.sessions.contains_key(&session) {
             return Err(InvalidReason::Identity);
         }
-        if self.sessions.len() >= self.limits.sessions {
+        if self.hidden_sessions + self.sessions.len() >= self.limits.sessions {
             return Err(InvalidReason::Capacity);
         }
         self.change(&[(account, [1, 0, 0, 0])], None, Some((account, session)))?;
@@ -683,7 +786,7 @@ impl Mirror {
                 if id == 0 || group == 0 || self.accounts.contains_key(&id) {
                     return Err(InvalidReason::Identity);
                 }
-                if self.accounts.len() >= self.limits.accounts {
+                if self.hidden_accounts + self.accounts.len() >= self.limits.accounts {
                     return Err(InvalidReason::Capacity);
                 }
                 self.accounts.insert(

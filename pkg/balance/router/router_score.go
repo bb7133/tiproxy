@@ -29,7 +29,8 @@ var _ Router = &ScoreBasedRouter{}
 // ScoreBasedRouter is an implementation of Router interface.
 // It routes a connection based on score.
 type ScoreBasedRouter struct {
-	nativeCreator NativePolicyCreator
+	nativeCreator   NativePolicyCreator
+	selectorCapture bool // Private construction only, before any selector exists.
 	sync.Mutex
 	logger *zap.Logger
 	// Tests may use a different balance policy.
@@ -54,6 +55,12 @@ type ScoreBasedRouter struct {
 	// The backend supports redirection only when they have signing certs.
 	supportRedirection bool
 	observation        *observation.Owner
+	// metadataCapture is set only by the private metadata-captured factory;
+	// metadataGeneration counts the health refreshes captured as frames.
+	startupCapture, startupStarted, startupRecorded bool
+	attemptCapture                                  bool
+	metadataCapture                                 bool
+	metadataGeneration                              uint64
 }
 
 // NewScoreBasedRouter creates a ScoreBasedRouter.
@@ -74,6 +81,12 @@ func NewScoreBasedRouterWithObservation(logger *zap.Logger, owner *observation.O
 
 func (r *ScoreBasedRouter) Init(ctx context.Context, ob observer.BackendObserver, bpCreator func(lg *zap.Logger) policy.BalancePolicy,
 	cfgGetter config.ConfigGetter, cfgCh <-chan *config.Config) {
+	var initial *observation.Caller
+	if r.startupCapture && r.observation.Enabled() {
+		initial = r.observation.BeginCaller()
+		defer initial.Cleanup()
+		r.beginStartupObservation(initial)
+	}
 	r.observer = ob
 	r.bpCreator = bpCreator
 	r.cfgGetter = cfgGetter
@@ -82,7 +95,8 @@ func (r *ScoreBasedRouter) Init(ctx context.Context, ob observer.BackendObserver
 	cfg := cfgGetter.GetConfig()
 
 	r.matchType = MatchAll
-	switch strings.ToLower(cfg.Balance.RoutingRule) {
+	routingRule := cfg.Balance.RoutingRule
+	switch strings.ToLower(routingRule) {
 	case config.MatchClientCIDRStr:
 		r.matchType = MatchClientCIDR
 	case config.MatchProxyCIDRStr:
@@ -94,6 +108,7 @@ func (r *ScoreBasedRouter) Init(ctx context.Context, ob observer.BackendObserver
 		r.logger.Error("unsupported routing rule, use the default rule", zap.String("rule", cfg.Balance.RoutingRule))
 	}
 
+	r.endStartupObservation(initial, routingRule)
 	childCtx, cancelFunc := context.WithCancel(ctx)
 	r.cancelFunc = cancelFunc
 	// Failing to route connections may cause even more serious problems than TiProxy reboot, so we don't recover panics.
@@ -109,12 +124,23 @@ func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) Backen
 	if router.observation.Enabled() {
 		selection = &selectionObservation{owner: router.observation, session: router.observation.NextIdentity()}
 	}
+	var selectorCapture *selectionObservation
+	if router.selectorCapture {
+		selectorCapture = selection
+		if selection != nil {
+			selection.capture = true
+		}
+	}
 	return BackendSelector{
+		selectionCapture: selectorCapture,
 		closeObservation: func() { selection.finish() },
 		routeOnce: func(excluded []BackendInst) (backend BackendInst, err error) {
 			// Prevent the group from being removed after it's chosen. In that case,
 			// the connection will be on a orphan group.
 			router.Lock()
+			if selectorCapture != nil && selectorCapture.owner.Enabled() {
+				selectorCapture.attempt++
+			}
 			defer func() {
 				router.Unlock()
 				if errors.Is(err, ErrNoBackend) {
@@ -125,25 +151,34 @@ func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) Backen
 					}
 				}
 			}()
+			var parent *observation.Caller
+			if router.attemptCapture && router.observation.Enabled() {
+				parent = router.observation.BeginCaller()
+				defer parent.Cleanup()
+				router.captureRouterAttempt(parent, selection, excluded)
+			}
 			if router.observeError != nil {
-				selection.noRoute(0)
+				router.rejectRouterAttempt(parent, selection, router.observeError)
 				err = router.observeError
 				return
 			}
 			// The group may change from round to round because the backends are updated.
-			group, err = router.routeToGroup(clientInfo)
+			group, err = router.routeToGroupObserved(clientInfo, parent)
 			if err != nil {
-				selection.noRoute(0)
+				router.rejectRouterAttempt(parent, selection, err)
 				return
 			}
 			if group == nil {
-				selection.noRoute(0)
+				router.rejectRouterAttempt(parent, selection, ErrNoBackend)
 				err = ErrNoBackend
 				return
 			}
 			// The router may remove this group concurrently, make sure the group can be accessed after it's removed.
 			var backendCtx policy.BackendCtx
-			backendCtx, err = group.routeObserved(excluded, selection)
+			if parent != nil {
+				parent.CaptureRouterTarget(group.observationID)
+			}
+			backendCtx, err = group.routeWithParent(excluded, selection, parent)
 			if err == nil && backendCtx != nil {
 				backend = backendCtx.(BackendInst)
 			}
@@ -198,16 +233,22 @@ func (router *ScoreBasedRouter) HealthyBackendCount() int {
 }
 
 // called in the lock
-func (router *ScoreBasedRouter) routeToGroup(clientInfo ClientInfo) (*Group, error) {
+func (router *ScoreBasedRouter) routeToGroupObserved(clientInfo ClientInfo, parent *observation.Caller) (*Group, error) {
 	if router.matchType == MatchPort {
 		if router.portConflictDetector == nil {
+			if parent != nil {
+				parent.CaptureRouterPort(false, "")
+			}
 			return nil, nil
+		}
+		if parent != nil {
+			parent.CaptureRouterPort(true, clientInfo.ListenerPort)
 		}
 		return router.portConflictDetector.groupFor(clientInfo.ListenerPort)
 	}
 	// TODO: binary search
 	for _, group := range router.groups {
-		if group.Match(clientInfo) {
+		if group.matchObserved(clientInfo, parent) {
 			return group, nil
 		}
 	}
@@ -236,7 +277,12 @@ func (router *ScoreBasedRouter) updateBackendHealth(healthResults observer.Healt
 	router.Lock()
 	defer router.Unlock()
 	router.observeError = healthResults.Error()
+	// Metadata Begin is leased before anything is allocated or copied; its
+	// inputs are written from inside the health loop below.
+	refresh := router.beginMetadataRefresh(router.observeError)
+	defer refresh.cleanup()
 	if router.observeError != nil {
+		refresh.end(router.supportRedirection, 0, 0)
 		return
 	}
 
@@ -245,6 +291,7 @@ func (router *ScoreBasedRouter) updateBackendHealth(healthResults observer.Healt
 	// If some backends are removed from the list, add them to `backends`.
 	for backendID, backend := range router.backends {
 		if _, ok := backends[backendID]; !ok {
+			refresh.dropped(backend)
 			health := backend.getHealth()
 			router.logger.Debug("backend is removed from the list, add it back to router",
 				zap.String("backend_id", backendID), zap.String("addr", backend.Addr()), zap.Stringer("health", &health))
@@ -281,9 +328,14 @@ func (router *ScoreBasedRouter) updateBackendHealth(healthResults observer.Healt
 				zap.String("backend_id", backendID), zap.String("addr", health.Addr), zap.Stringer("health", health))
 		}
 		supportRedirection = health.SupportRedirection && supportRedirection
+		refresh.input(backend, health)
 	}
 
-	router.updateGroups()
+	// Every input the refresh actually read is published before the first
+	// Group lock in updateGroups so Group batches keep their order.
+	refresh.publishBegin()
+	refreshFailed, conflicts := router.updateGroups(refresh)
+	refresh.end(supportRedirection, refreshFailed, conflicts)
 	for _, group := range router.groups {
 		group.UpdateFailover(now)
 	}
@@ -336,8 +388,10 @@ func (router *ScoreBasedRouter) rebuildPortConflictDetector() {
 }
 
 // Update the groups after the backend list is updated.
-// called in the lock.
-func (router *ScoreBasedRouter) updateGroups() {
+// called in the lock. refresh (nil without metadata capture) receives one
+// Assign witness per actual backend decision and one Refresh per Group; the
+// CIDR refresh failures and port conflicts are returned for the End witness.
+func (router *ScoreBasedRouter) updateGroups(refresh *metadataRefresh) (refreshFailed, conflicts uint16) {
 	for _, backend := range router.backends {
 		// An unhealthy backend can be removed once it has no connections. connList and connScore are
 		// protected by the group lock instead of the router lock, so read them through
@@ -346,7 +400,21 @@ func (router *ScoreBasedRouter) updateGroups() {
 		if !backend.ObservedHealthy() {
 			removed, empty := true, false
 			if backend.group != nil {
-				removed, empty = backend.group.removeBackendIfIdle(backend.id, backend)
+				// The witness is published inside the Group critical section.
+				removed, empty = backend.group.removeBackendIfIdle(backend.id, backend, func(removed, _ bool) {
+					if removed {
+						refresh.assign(backend, nil, true, false, false, nil)
+					} else {
+						// Kept because busy: witnessed in the same critical
+						// section as the idle decision. Go then falls through
+						// to the ordinary group branch below, which reads the
+						// values and is witnessed again as a revisit.
+						refresh.assign(backend, backend.group, false, false, false, nil)
+					}
+				})
+			} else {
+				// No group: no Group lock and no connection callback can interleave.
+				refresh.assign(backend, nil, true, false, false, nil)
 			}
 			if removed {
 				delete(router.backends, backend.id)
@@ -361,9 +429,12 @@ func (router *ScoreBasedRouter) updateGroups() {
 		}
 		// If the labels were correctly set, we won't update its group even if the labels change.
 		if backend.group != nil {
+			var values []string
+			valuesRead := false
 			switch router.matchType {
 			case MatchClientCIDR, MatchProxyCIDR, MatchPort:
-				values := router.backendGroupValues(backend)
+				values = router.backendGroupValues(backend)
+				valuesRead = true
 				if !backend.group.EqualValues(values) {
 					router.logger.Warn("backend routing values changed, keep the existing group until it is removed",
 						zap.String("backend_id", backend.id),
@@ -372,16 +443,21 @@ func (router *ScoreBasedRouter) updateGroups() {
 						zap.Strings("group_values", backend.group.values))
 				}
 			}
+			refresh.assign(backend, backend.group, false, false, valuesRead, values)
 			continue
 		}
 
 		// If the backend is not in any group, add it to a new group if its label is set.
 		// In operator deployment, the labels are set dynamically.
 		var group *Group
+		created := false
+		var values []string
+		valuesRead := false
 		switch router.matchType {
 		case MatchAll:
 			if len(router.groups) == 0 {
-				group, _ = newGroupCaptured(nil, router.bpCreator, router.matchType, router.logger, router.observation, router.nativeCreator)
+				group, _ = router.newRouteGroup(nil)
+				created = true
 				// A new group must observe the CURRENT config, exactly
 				// like the label/port branches below: without this a
 				// startup fail-backend-list (and failover-timeout) is
@@ -395,7 +471,8 @@ func (router *ScoreBasedRouter) updateGroups() {
 			}
 			group = router.groups[0]
 		case MatchClientCIDR, MatchProxyCIDR, MatchPort:
-			values := router.backendGroupValues(backend)
+			values = router.backendGroupValues(backend)
+			valuesRead = true
 			if len(values) == 0 {
 				break
 			}
@@ -406,9 +483,10 @@ func (router *ScoreBasedRouter) updateGroups() {
 				}
 			}
 			if group == nil {
-				g, err := newGroupCaptured(values, router.bpCreator, router.matchType, router.logger, router.observation, router.nativeCreator)
+				g, err := router.newRouteGroup(values)
 				if err == nil {
 					group = g
+					created = true
 					if router.cfgGetter != nil {
 						if cfg := router.cfgGetter.GetConfig(); cfg != nil {
 							group.SetConfig(cfg)
@@ -420,14 +498,23 @@ func (router *ScoreBasedRouter) updateGroups() {
 			}
 		}
 		if group == nil {
+			refresh.assign(backend, nil, false, false, valuesRead, values)
 			continue
 		}
-		group.AddBackend(backend.id, backend)
+		group.addBackendObserved(backend.id, backend, func() {
+			refresh.assign(backend, group, false, created, valuesRead, values)
+		})
 	}
 	for _, group := range router.groups {
-		group.RefreshCidr()
+		if !group.refreshCidrObserved(refresh.refreshObserver()) {
+			refreshFailed++
+		}
 	}
 	router.rebuildPortConflictDetector()
+	if router.portConflictDetector != nil {
+		conflicts = uint16(router.portConflictDetector.conflictCount())
+	}
+	return refreshFailed, conflicts
 }
 
 func (router *ScoreBasedRouter) rebalanceLoop(ctx context.Context) {
@@ -521,5 +608,14 @@ type NativePolicyCreator func(*zap.Logger, *observation.Owner, uint64) policy.Ba
 func NewScoreBasedRouterWithNativeObservation(logger *zap.Logger, owner *observation.Owner, creator NativePolicyCreator) *ScoreBasedRouter {
 	router := NewScoreBasedRouterWithObservation(logger, owner)
 	router.nativeCreator = creator
+	return router
+}
+
+// newScoreBasedRouterMetadataCaptured is the private factory that installs
+// router metadata capture on top of native observation. No public factory
+// enables it; the installed routers keep their existing behaviour.
+func newScoreBasedRouterMetadataCaptured(logger *zap.Logger, owner *observation.Owner, creator NativePolicyCreator) *ScoreBasedRouter {
+	router := NewScoreBasedRouterWithNativeObservation(logger, owner, creator)
+	router.metadataCapture = true
 	return router
 }

@@ -26,6 +26,7 @@ CAP = 'pkg/balance/observation/native_capture.go'
 REC = 'pkg/balance/observation/recorder.go'
 WIRE = 'rust/crates/legacy-router-shadow/src/native.rs'
 LIVE = 'rust/crates/control-router/src/shadow/live/native.rs'
+COMPUTE = 'rust/crates/control-router/src/shadow/native_compute.rs'
 WINDOW = 'rust/crates/control-router/src/factors/window.rs'
 
 def rust(name, package, test, marker, edits):
@@ -54,15 +55,26 @@ runner.CASES += [
     codec('native-empty-witness-trusted', 'native_query_preserves_labels_samples_and_empty_semantics', 'NATIVE_EMPTY_RECOMPUTED', [edit(WIRE, 'if empty != expected_empty', 'if false && empty != expected_empty')]),
     codec('native-total-samples-expanded', 'native_read_clock_sample_and_string_bounds', 'NATIVE_SAMPLE_TOTAL_PLUS_ONE', [edit(WIRE, 'budget.samples > 4096', 'budget.samples > 4097')]),
     codec('native-wire-clock-cap-expanded', 'native_read_clock_sample_and_string_bounds', 'NATIVE_CLOCK_PLUS_ONE', [edit(WIRE, 'budget.clocks > 64', 'budget.clocks > 65')]),
-    native('native-comparison-bypassed', 'bad_native_output_does_not_commit_history_or_prefix', 'NATIVE_ATOMIC_INVALID', [edit(LIVE, 'staged.apply(e).map_err(|_| InvalidReason::Witness)?;', 'let _ = staged.apply(e);')]),
+    # Swallow the comparison error and still run the original history/sequence
+    # commit. The isolated mutant's helper supplies the newly required Decision
+    # by trusting the witness, without adding a second comparison or validation.
+    native('native-comparison-bypassed', 'bad_native_output_does_not_commit_history_or_prefix', 'NATIVE_ATOMIC_INVALID', [
+        edit(LIVE, 'let decision = staged.compare(e).map_err(|_| InvalidReason::Witness)?;', 'let _ = staged.compare(e);\n        let decision = staged.mutation_unchecked_decision(e);'),
+        edit(COMPUTE, 'impl FactorState {\n    /// Start an empty history', 'impl FactorState {\n    pub(crate) fn mutation_unchecked_decision(&self, e: &Evaluation) -> Decision {\n        Decision { entry: e.entry, returned: e.returned.clone(), from: e.from, to: e.to, rate: BalanceRate(f64::from_bits(e.balance_count)), reason: e.reason }\n    }\n    /// Start an empty history'),
+    ]),
     native('native-old-clone-uncharged', 'native_budget_includes_old_history_clone_and_stage_at_equality', 'NATIVE_HISTORY_PLUS_ONE', [edit(LIVE, '.checked_add(old_charge)', '.checked_add(0)')]),
-    native('native-stage-uncharged', 'native_budget_includes_old_history_clone_and_stage_at_equality', 'NATIVE_HISTORY_PLUS_ONE', [edit(LIVE, '.and_then(|v| v.checked_add(STAGE_OVERHEAD))', '.and_then(|v| v.checked_add(0))')]),
+    # Omit fixed staging only from peak admission. The independent retained
+    # growth ceiling stays intact, so configuration setup remains valid and
+    # the first failure tests the intended one-byte-over-budget admission.
+    native('native-stage-uncharged', 'native_budget_includes_old_history_clone_and_stage_at_equality', 'NATIVE_HISTORY_PLUS_ONE', [
+        edit(LIVE, 'let peak = growth_limit\n            .checked_add(concurrent_copies)',
+             'let peak = growth_limit\n            .checked_sub(STAGE_OVERHEAD)\n            .and_then(|v| v.checked_add(concurrent_copies))'),
+    ]),
     native('native-equality-rejected', 'native_budget_includes_old_history_clone_and_stage_at_equality', 'NATIVE_HISTORY_EQUAL', [edit(LIVE, 'charge <= HISTORY_LIMIT.saturating_sub(self.native_bytes)', 'charge < HISTORY_LIMIT.saturating_sub(self.native_bytes)')]),
     native('native-arch-conflict-accepted', 'conflicting_native_preludes_are_sticky', 'NATIVE_ARCH_PROCESS_CONFLICT', [edit(LIVE, ' || old.coverage.go_arch != coverage.go_arch', '')]),
     native('native-failed-prelude-repairable', 'conflicting_native_preludes_are_sticky', 'NATIVE_PRELUDE_NO_REPAIR', [edit(LIVE, 'self.invalidate(coverage.epoch, reason);', 'let _ = reason;')]),
     native('native-history-mutated-before-comparison', 'bad_native_output_does_not_commit_history_or_prefix', 'NATIVE_ATOMIC_CONTENT', [edit(LIVE, '        let native = self\n            .native\n            .get(&e.epoch)', '        if let Some(stored) = self.native.get_mut(&e.epoch).and_then(|owner| owner.groups.get_mut(&e.group)) { let _ = stored.state.apply(e); }\n        let native = self\n            .native\n            .get(&e.epoch)')]),
 ]
-COMPUTE = 'rust/crates/control-router/src/shadow/native_compute.rs'
 for name, old in [
     ('native-score-witness-ignored', 'account.score_count != counts.score'),
     ('native-physical-witness-ignored', 'u64::try_from(account.physical).ok() != Some(counts.physical)'),
@@ -88,7 +100,9 @@ def actual(name, edits):
 
 PHASES = 'rust/crates/control-router/src/factors/phases.rs'
 runner.CASES += [
-    actual('native-routeable-history-skipped', [edit(COMPUTE, '        let factors = self.prepare(e)?;', '        if e.entry == Entry::Routeable { return Ok(()); }\n        let factors = self.prepare(e)?;')]),
+    # Keep this fault compiling after compare gained a Decision result: echo the
+    # witness without preparing/computing Routeable or advancing its history.
+    actual('native-routeable-history-skipped', [edit(COMPUTE, '        let factors = self.prepare(e)?;', '        if e.entry == Entry::Routeable { return Ok(Decision { entry: e.entry, returned: e.returned.clone(), from: e.from, to: e.to, rate: BalanceRate(f64::from_bits(e.balance_count)), reason: e.reason }); }\n        let factors = self.prepare(e)?;')]),
     actual('native-clock-instants-merged', [edit(COMPUTE, 'Ok(*time)', 'Ok(self.reads.iter().find_map(|read| if let Read::Clock { time, .. } = read { Some(*time) } else { None }).unwrap_or(*time))')]),
     actual('native-health-read-order-swapped', [edit(WINDOW, '(QueryId::FailurePd, QueryId::TotalPd, 0.5)', '(QueryId::TotalPd, QueryId::FailurePd, 0.5)')]),
     actual('native-cpu-series-last-only', [edit(WINDOW, 'cpu_usage(samples)', 'cpu_usage(&samples[samples.len()-1..])')]),

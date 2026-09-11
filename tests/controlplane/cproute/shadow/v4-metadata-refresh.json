@@ -1,0 +1,1 @@
+{"version":4,"kind":"caller","process":"1","owner":"1","nonce":"2","sequence":"2","span":"1","payload":{"metadata_refresh":{"generation":"3","group":"12","values_read":true,"members":[{"account":"9","values":["10.0.0.0/8","192.168.1.0/24"]},{"account":"7","values":["10.0.0.0/8","bad-cidr"]}],"values":["192.168.1.0/24","10.0.0.0/8","bad-cidr"],"parsed":false}}}

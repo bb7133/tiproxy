@@ -4,6 +4,7 @@
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 cd "$root"
+python3 tests/controlplane/cproute/shadow/native-anchors.py
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
 
@@ -28,6 +29,17 @@ cargo test --locked --manifest-path rust/Cargo.toml -p control-router shadow::
 cargo test --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow
 python3 tests/controlplane/cproute/shadow/isolation.py "$root"
 python3 tests/controlplane/cproute/shadow/native-mutations.py
+# C1 uses actual Group.Balance calls, independently replayed as one v4 parent.
+bash tests/controlplane/cproute/shadow/balance-hooks-run.sh
+# C2 first checkpoint: actual Group-local Route, not outer selector metadata.
+bash tests/controlplane/cproute/shadow/route-hooks-run.sh
+# Pure Next transitions use actual Go oracles; outer metadata binding remains separate.
+bash tests/controlplane/cproute/shadow/selector-core-run.sh
+# Actual routeOnce Group results feed the selector; router metadata is not installed.
+bash tests/controlplane/cproute/shadow/selector-route-run.sh
+# Router metadata refreshes are rebuilt independently from actual health-loop
+# inputs and read values; the private metadata-captured factory is fixture-only.
+bash tests/controlplane/cproute/shadow/metadata-run.sh
 cargo build --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow --example live_socket_check
 export CP_ROUTE_LIVE_SOCKET_CHECK="$root/rust/target/debug/examples/live_socket_check"
 go test ./pkg/balance/router -run '^TestNativeObservationSocketSettlement$' -count=1 -v
@@ -43,8 +55,12 @@ source = path.read_text()
 old = 'g.policy.(*factor.FactorBasedBalance)'
 assert source.count(old) == 1
 source = source.replace(old, 'g.policy.(interface { TakeObservation() *observation.Evaluation })')
-source = source.replace('"github.com/pingcap/tiproxy/pkg/balance/factor"', '')
+# The concrete construction fence still needs the factor import. Only the
+# publication adapter is replaced for this test-only timing wrapper.
 copy = temp/'group.go'; copy.write_text(source)
 (temp/'timings-overlay.json').write_text(json.dumps({'Replace': {str(path): str(copy)}}))
 PYTIMING
 CP_ROUTE_NATIVE_TIMINGS=1 go test -overlay "$temporary/timings-overlay.json" ./pkg/balance/router -run '^TestNativeObservationSustained$' -count=1 -failfast -timeout=25m -v
+
+# Actual raw router/Group/selector attempt composition, using the same native prefix.
+bash tests/controlplane/cproute/shadow/router-attempt-run.sh

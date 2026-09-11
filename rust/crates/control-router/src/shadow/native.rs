@@ -5,7 +5,7 @@
 //! they carry no production account, source, candidate or command capability.
 
 use super::Epoch;
-pub use super::native_compute::{FactorState, Failure};
+pub use super::native_compute::{BalanceRate, Decision, FactorState, Failure};
 use crate::Factor;
 use control_routing::go_time::{GoTime, Origin};
 use control_topology::metrics::{QueryId, Sample};

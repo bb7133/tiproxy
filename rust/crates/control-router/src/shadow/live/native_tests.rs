@@ -111,17 +111,17 @@ fn bad_native_output_does_not_commit_history_or_prefix() {
 }
 #[test]
 fn native_budget_includes_old_history_clone_and_stage_at_equality() {
-    for extra in [1, 0] {
+    for (extra, copies) in [(1, 0), (0, 0), (1, 16_384), (0, 16_384)] {
         let (mut state, mut e) = initial();
         assert_eq!(state.observe_native(&e, 4096).compared_sequence, 3);
         let retained = state.native[&e.epoch].groups[&2].charge;
         let incoming = 4096;
-        state.native_bytes = HISTORY_LIMIT - retained - STAGE_OVERHEAD - incoming + extra;
+        state.native_bytes = HISTORY_LIMIT - retained - STAGE_OVERHEAD - incoming - copies + extra;
         let before = state.native_bytes;
         e.sequence = 4;
         e.evaluation = 2;
         e.entry = Entry::Route;
-        let progress = state.observe_native(&e, incoming);
+        let progress = state.observe_native_copies(&e, incoming, copies).0;
         if extra == 0 {
             assert_eq!(progress.status, Status::Comparing, "NATIVE_HISTORY_EQUAL");
             assert_eq!(progress.compared_sequence, 4);

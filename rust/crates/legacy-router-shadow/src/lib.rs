@@ -18,6 +18,8 @@
 //! The bounded inbox is a consumer-side primitive, not the Go hot-path recorder.
 //! Lifecycle comparison alone never qualifies a complete routing shadow interval.
 
+/// Preparatory strict v4 router pass codec; no consumer capability installed.
+pub mod caller;
 /// Optional same-process local-socket consumer with explicit cancellation/join.
 pub mod consumer;
 /// Strict v2 actual-capture codec, independent of the immutable v1 corpus.

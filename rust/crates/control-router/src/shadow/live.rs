@@ -4,6 +4,8 @@
 //! Independent comparison of bounded batches captured at actual Go mutations.
 //! Witnesses are outputs only; they never initialize or repair the mirror.
 
+/// Private affected-view transactions for the forthcoming caller composition.
+pub mod caller;
 pub mod native;
 
 use super::{Epoch, Event, InvalidReason, Limits, Observation, Progress, ShadowState, Status};
@@ -153,8 +155,11 @@ pub struct LiveState {
     groups: BTreeMap<(u64, u64), BTreeMap<u64, bool>>,
     limits: Limits,
     native: BTreeMap<Epoch, native::NativeOwner>,
+    selectors: BTreeMap<(Epoch, u64), caller::selection::StoredSelection>,
+    metadata: BTreeMap<Epoch, caller::metadata::StoredMetadata>,
     native_bytes: usize,
     native_peak: usize,
+    caller_peak: Option<caller::Budget>,
 }
 impl LiveState {
     /// Empty observer; production state cannot be attached or reconstructed.
@@ -165,8 +170,11 @@ impl LiveState {
             groups: BTreeMap::new(),
             limits,
             native: BTreeMap::new(),
+            selectors: BTreeMap::new(),
+            metadata: BTreeMap::new(),
             native_bytes: 0,
             native_peak: 0,
+            caller_peak: None,
         }
     }
 
@@ -327,6 +335,7 @@ impl LiveState {
                 return Err(InvalidReason::Witness);
             }
         }
+        self.update_balance_terminals(batch);
         Ok(())
     }
 

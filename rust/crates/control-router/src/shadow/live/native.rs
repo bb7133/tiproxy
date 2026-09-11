@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Native factor comparison shares the lifecycle owner's contiguous prefix.
-use super::super::native::{Coverage, Evaluation, FactorState};
+use super::super::native::{Coverage, Decision, Evaluation, FactorState};
 use super::{Epoch, InvalidReason, LiveState, Progress, Status};
 use std::collections::BTreeMap;
 
@@ -14,12 +14,13 @@ pub const STAGE_OVERHEAD: usize = 1024 * 1024;
 const OWNER_CHARGE: usize = 16 * size_of::<(Epoch, NativeOwner)>();
 const GROUP_CHARGE: usize = 16 * size_of::<(u64, Stored)>();
 pub(super) struct NativeOwner {
-    coverage: Coverage,
-    groups: BTreeMap<u64, Stored>,
+    pub(super) coverage: Coverage,
+    pub(super) groups: BTreeMap<u64, Stored>,
 }
-struct Stored {
-    state: FactorState,
-    charge: usize,
+pub(super) struct Stored {
+    pub(super) state: FactorState,
+    pub(super) timing: super::caller::balance::Timing,
+    pub(super) charge: usize,
 }
 impl LiveState {
     /// The producer capability must arrive before the owner's first Begin.
@@ -92,6 +93,24 @@ impl LiveState {
     /// Compare one complete evaluation and atomically advance history and prefix.
     /// `staging` includes the transport-owned frame and its decoder/derivation peak.
     pub fn observe_native(&mut self, e: &Evaluation, staging: usize) -> Progress {
+        self.observe_native_decision(e, staging).0
+    }
+    pub(super) fn observe_native_decision(
+        &mut self,
+        e: &Evaluation,
+        staging: usize,
+    ) -> (Progress, Option<Decision>) {
+        self.observe_native_copies(e, staging, 0)
+    }
+    // Copies of unrelated metadata remain live during this factor comparison.
+    // They count toward peak admission but can never fund new factor history.
+    pub(super) fn observe_native_copies(
+        &mut self,
+        e: &Evaluation,
+        staging: usize,
+        concurrent_copies: usize,
+    ) -> (Progress, Option<Decision>) {
+        let mut decision = None;
         let key = (e.epoch.process, e.epoch.owner);
         match self.core.owners.get(&key) {
             None => {
@@ -101,8 +120,11 @@ impl LiveState {
                 self.invalidate(e.epoch, InvalidReason::Identity);
             }
             Some(owner) if owner.status == Status::Comparing => {
-                if let Err(reason) = self.compare_native(e, staging) {
-                    self.invalidate(e.epoch, reason);
+                match self.compare_native(e, staging, concurrent_copies) {
+                    Ok(computed) => decision = Some(computed),
+                    Err(reason) => {
+                        self.invalidate(e.epoch, reason);
+                    }
                 }
             }
             Some(owner) if matches!(owner.status, Status::Invalid(_)) => (),
@@ -110,9 +132,14 @@ impl LiveState {
                 self.invalidate(e.epoch, InvalidReason::Lifecycle);
             }
         }
-        self.progress(e.epoch)
+        (self.progress(e.epoch), decision)
     }
-    fn compare_native(&mut self, e: &Evaluation, staging: usize) -> Result<(), InvalidReason> {
+    fn compare_native(
+        &mut self,
+        e: &Evaluation,
+        staging: usize,
+        concurrent_copies: usize,
+    ) -> Result<Decision, InvalidReason> {
         let key = (e.epoch.process, e.epoch.owner);
         let owner = self
             .core
@@ -157,9 +184,12 @@ impl LiveState {
             .ok_or(InvalidReason::MissingBegin)?;
         let old = native.groups.get(&e.group);
         let old_charge = old.map_or(0, |stored| stored.charge);
-        let peak = staging
+        let growth_limit = staging
             .checked_add(old_charge)
             .and_then(|v| v.checked_add(STAGE_OVERHEAD))
+            .ok_or(InvalidReason::Capacity)?;
+        let peak = growth_limit
+            .checked_add(concurrent_copies)
             .ok_or(InvalidReason::Capacity)?;
         if !self.native_can_stage(peak) {
             return Err(InvalidReason::Capacity);
@@ -170,9 +200,10 @@ impl LiveState {
             || FactorState::new(native.coverage),
             |stored| stored.state.clone(),
         );
-        staged.apply(e).map_err(|_| InvalidReason::Witness)?;
-        let charge = staged.retained_bytes() + GROUP_CHARGE;
-        if charge > old_charge + staging + STAGE_OVERHEAD {
+        let decision = staged.compare(e).map_err(|_| InvalidReason::Witness)?;
+        let timing_charge = old.map_or(0, |stored| stored.timing.entry_charge());
+        let charge = staged.retained_bytes() + GROUP_CHARGE + timing_charge;
+        if charge > growth_limit {
             return Err(InvalidReason::Capacity);
         }
         self.native_bytes = self.native_bytes - old_charge + charge;
@@ -180,10 +211,19 @@ impl LiveState {
             .native
             .get_mut(&e.epoch)
             .ok_or(InvalidReason::Identity)?;
+        // A policy/config update replaces factor history, not the Group's
+        // accepted-redirect watermark or connection attempt lifetimes.
+        let timing = native
+            .groups
+            .get_mut(&e.group)
+            .map_or_else(super::caller::balance::Timing::default, |old| {
+                std::mem::take(&mut old.timing)
+            });
         native.groups.insert(
             e.group,
             Stored {
                 state: staged,
+                timing,
                 charge,
             },
         );
@@ -193,7 +233,7 @@ impl LiveState {
             .get_mut(&key)
             .ok_or(InvalidReason::Identity)?
             .sequence = e.sequence;
-        Ok(())
+        Ok(decision)
     }
 }
 

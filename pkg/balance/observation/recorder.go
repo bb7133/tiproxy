@@ -242,7 +242,9 @@ func (d *Delivery) Release() {
 }
 
 func (r *Recorder) releaseRecord(record Record) {
-	if record.Evaluation != nil {
+	if record.Caller != nil {
+		record.Caller.Release()
+	} else if record.Evaluation != nil {
 		record.Evaluation.Release()
 	} else {
 		r.release(BatchCharge)

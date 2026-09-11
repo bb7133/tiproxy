@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,4 +80,46 @@ func TestNativeEncodedBodyEqualityAndPlusOne(t *testing.T) {
 	w.literal("x")
 	require.True(t, w.failed, "NATIVE_ENCODED_BODY_PLUS_ONE")
 	require.Equal(t, observation.MaxEvaluationBodyBytes+4, w.used, "NATIVE_ENCODE_NO_PARTIAL_APPEND")
+}
+
+func TestNativeTextBytesBorrowsInput(t *testing.T) {
+	for _, value := range []string{"", strings.Repeat("x", 33), strings.Repeat("x", 512), strings.Repeat("世\"\\\t\n\x00", 64)} {
+		input := []byte(value)
+		original := append([]byte(nil), input...)
+		buffer := make([]byte, 6*len(input)+2)
+		w := nativeEncoder{buffer: buffer}
+		w.textBytes(input)
+		require.False(t, w.failed)
+		var decoded string
+		require.NoError(t, json.Unmarshal(buffer[:w.used], &decoded))
+		require.Equal(t, value, decoded)
+		require.Equal(t, original, append([]byte(nil), input...), "NATIVE_TEXT_BYTES_PRESERVES_ARENA")
+		require.Zero(t, testing.AllocsPerRun(100, func() {
+			w.used, w.failed = 0, false
+			w.textBytes(input)
+		}), "NATIVE_TEXT_BYTES_BORROWS_ARENA")
+		require.False(t, w.failed)
+		// The string and borrowed-byte entry points preserve the same escaping.
+		stringWriter := nativeEncoder{buffer: make([]byte, len(buffer))}
+		stringWriter.text(value)
+		require.Equal(t, stringWriter.buffer[:stringWriter.used], buffer[:w.used])
+	}
+}
+
+func TestNativeTextBytesRejectsInvalidUTF8AndCapacity(t *testing.T) {
+	for _, value := range [][]byte{{0xff}, {'a', 0xc3}, {0xed, 0xa0, 0x80}} {
+		w := nativeEncoder{buffer: make([]byte, 32)}
+		w.textBytes(value)
+		require.True(t, w.failed)
+		require.Zero(t, w.used, "NATIVE_TEXT_BYTES_INVALID_UTF8_ATOMIC")
+	}
+	for _, capacity := range []int{0, 1, 7, 8} {
+		w := nativeEncoder{buffer: make([]byte, capacity)}
+		w.textBytes([]byte{0}) // A control byte requires six escaped bytes plus quotes.
+		require.Equal(t, capacity < 8, w.failed)
+		require.LessOrEqual(t, w.used, capacity)
+		if !w.failed {
+			require.Equal(t, `"\u0000"`, string(w.buffer[:w.used]))
+		}
+	}
 }

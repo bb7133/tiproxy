@@ -183,7 +183,17 @@ func (fbb *FactorBasedBalance) updateScore(backends []policy.BackendCtx) []score
 }
 
 // BackendToRoute returns one backend to route a new connection to.
-func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) (result policy.BackendCtx) {
+func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) policy.BackendCtx {
+	return fbb.backendToRoute(backends, nil)
+}
+
+// BackendToRouteCaptured lends the native child from the already-live Group
+// caller. Selection still executes the same body exactly once.
+func (fbb *FactorBasedBalance) BackendToRouteCaptured(backends []policy.BackendCtx, caller *observation.Caller) policy.BackendCtx {
+	return fbb.backendToRoute(backends, caller)
+}
+
+func (fbb *FactorBasedBalance) backendToRoute(backends []policy.BackendCtx, caller *observation.Caller) (result policy.BackendCtx) {
 	fields := []zap.Field{zap.Int("backend_num", len(backends))}
 	defer func() {
 		fbb.lg.Debug("route", fields...)
@@ -194,7 +204,7 @@ func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) (res
 	}
 	fbb.Lock()
 	defer fbb.Unlock()
-	fbb.beginObservation(observation.EntryRoute, backends)
+	fbb.beginCallerObservation(observation.EntryRoute, backends, caller)
 	defer func() { fbb.capture.routeResult([]policy.BackendCtx{result}); fbb.capture.finish() }()
 	if len(backends) == 0 {
 		return nil
@@ -346,12 +356,22 @@ func (fbb *FactorBasedBalance) routePreferIdle(scoredBackends []scoredBackend, f
 // balanceCount: the count of connections to migrate in this round. 0 indicates no need to balance.
 // reason: the debug information to be logged.
 func (fbb *FactorBasedBalance) BackendsToBalance(backends []policy.BackendCtx) (from, to policy.BackendCtx, balanceCount float64, reason string, logFields []zap.Field) {
+	return fbb.backendsToBalance(backends, nil)
+}
+
+// BackendsToBalanceCaptured runs the same native policy with a caller-owned
+// diagnostic loan. The enclosing Group owns that loan before any input is read.
+func (fbb *FactorBasedBalance) BackendsToBalanceCaptured(backends []policy.BackendCtx, caller *observation.Caller) (from, to policy.BackendCtx, balanceCount float64, reason string, logFields []zap.Field) {
+	return fbb.backendsToBalance(backends, caller)
+}
+
+func (fbb *FactorBasedBalance) backendsToBalance(backends []policy.BackendCtx, caller *observation.Caller) (from, to policy.BackendCtx, balanceCount float64, reason string, logFields []zap.Field) {
 	if len(backends) <= 1 && fbb.capture == nil {
 		return
 	}
 	fbb.Lock()
 	defer fbb.Unlock()
-	fbb.beginObservation(observation.EntryBalance, backends)
+	fbb.beginCallerObservation(observation.EntryBalance, backends, caller)
 	defer func() {
 		c := fbb.capture
 		if c.enabled() && c.current != nil {

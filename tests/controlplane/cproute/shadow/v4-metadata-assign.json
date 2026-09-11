@@ -1,0 +1,1 @@
+{"version":4,"kind":"caller","process":"1","owner":"1","nonce":"2","sequence":"2","span":"1","payload":{"metadata_assign":{"generation":"3","index":1,"account":"9","group":"12","removed":false,"created":true,"values_read":true,"values":["10.0.0.0/8","192.168.1.0/24"]}}}

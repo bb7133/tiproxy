@@ -24,7 +24,7 @@ pub const DECODE_MULTIPLIER: usize = 32;
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(try_from = "String")]
-struct Decimal(u64);
+pub(crate) struct Decimal(pub(crate) u64);
 impl TryFrom<String> for Decimal {
     type Error = &'static str;
     fn try_from(text: String) -> Result<Self, Self::Error> {
@@ -74,9 +74,9 @@ impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Bounded<T, N
 }
 
 #[derive(Deserialize)]
-struct WireTime(String, Signed, u32, Decimal, bool, Signed);
+pub(crate) struct WireTime(String, Signed, u32, Decimal, bool, Signed);
 impl WireTime {
-    fn domain(self, origin: Origin) -> Result<GoTime, Error> {
+    pub(crate) fn domain(self, origin: Origin) -> Result<GoTime, Error> {
         let Self(domain, seconds, nanos, location, monotonic, relative) = self;
         if domain != "go" || !monotonic && relative.0 != 0 {
             return Err(Error::Schema);
@@ -449,6 +449,16 @@ struct WireEvaluation {
     balance_count: Decimal,
     reason: String,
 }
+// Reuse the strict v3 body inside an externally tagged caller child.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub(crate) struct NestedEvaluation(WireEvaluation);
+impl NestedEvaluation {
+    pub(crate) fn domain(self, origin: Origin) -> Result<domain::Evaluation, Error> {
+        self.0.domain(origin)
+    }
+}
+
 impl WireEvaluation {
     fn domain(self, origin: Origin) -> Result<domain::Evaluation, Error> {
         if self.version != 3 {

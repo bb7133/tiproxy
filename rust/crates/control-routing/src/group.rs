@@ -4,6 +4,7 @@
 //! Pure Go-compatible group matching, with no backend or reservation ownership.
 
 use std::collections::BTreeMap;
+use std::mem::{MaybeUninit, size_of, size_of_val};
 use std::net::{IpAddr, Ipv6Addr};
 
 /// The router's immutable grouping rule.
@@ -162,6 +163,52 @@ impl GroupMatcher {
         Ok(())
     }
 
+    /// Bytes of one parsed network element, as retained by the matcher.
+    pub const NETWORK_SIZE: usize = size_of::<IpNetwork>();
+
+    /// Heap bytes this matcher holds right now: the value list by capacity,
+    /// each string by capacity, and the parsed network list by capacity.
+    #[must_use]
+    pub fn retained_heap(&self) -> usize {
+        vec_heap(&self.values) + self.networks.capacity() * size_of::<IpNetwork>()
+    }
+
+    /// Heap bytes the network list of a matcher over `values` CIDRs holds
+    /// once built: `collect` grows it from four upwards while parsing a
+    /// fallible iterator. All/port rules parse nothing.
+    #[must_use]
+    pub const fn networks_heap(rule: MatchType, values: usize) -> usize {
+        if matches!(rule, MatchType::ClientCidr | MatchType::ProxyCidr) {
+            collect_capacity(values) * size_of::<IpNetwork>()
+        } else {
+            0
+        }
+    }
+
+    /// Peak heap bytes [`GroupMatcher::new`] requests beyond the value list it
+    /// is given: the final network list plus the previous buffer that is still
+    /// live while the last doubling copies into the new one.
+    #[must_use]
+    pub const fn construction_peak(rule: MatchType, values: usize) -> usize {
+        let final_heap = Self::networks_heap(rule, values);
+        let previous = collect_capacity(values);
+        if final_heap != 0 && previous > 4 {
+            final_heap + (previous / 2) * size_of::<IpNetwork>()
+        } else {
+            final_heap
+        }
+    }
+
+    /// Heap bytes [`GroupMatcher::refresh_values`] requests beyond the new
+    /// value list while the old network list is still alive: its internal
+    /// clone of the values and the freshly parsed network list.
+    #[must_use]
+    pub fn refresh_peak(&self, values: &[String]) -> usize {
+        size_of_val(values)
+            + values.iter().map(String::len).sum::<usize>()
+            + Self::construction_peak(self.rule, values.len())
+    }
+
     /// Original, unnormalized group values.
     #[must_use]
     pub fn values(&self) -> &[String] {
@@ -272,6 +319,89 @@ impl<G> PortRoutes<G> {
             Some(PortBinding::Bound { group, .. }) => Ok(Some(group)),
             None => Ok(None),
         }
+    }
+}
+
+/// Heap bytes a `Vec<String>` holds: its buffer by capacity plus each string.
+fn vec_heap(values: &Vec<String>) -> usize {
+    values.capacity() * size_of::<String>() + values.iter().map(String::capacity).sum::<usize>()
+}
+
+/// Capacity `collect` reaches for `len` elements pushed through a fallible
+/// iterator with no size hint: zero stays unallocated, then four, doubling.
+const fn collect_capacity(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let mut capacity = 4;
+    while capacity < len {
+        capacity *= 2;
+    }
+    capacity
+}
+
+/// Layout mirror of a full `BTreeMap` internal node holding this table's key
+/// and value types: the leaf part (parent link, index, length and eleven
+/// key/value slots) plus twelve child edges. Every node allocation of the map
+/// is at most this large, so charging one such node per bound entry bounds
+/// the real tree from above.
+#[repr(C)]
+struct InternalNodeMirror<G> {
+    _parent: *const (),
+    _parent_idx: u16,
+    _len: u16,
+    _keys: [MaybeUninit<String>; 11],
+    _vals: [MaybeUninit<PortBinding<G>>; 11],
+    _edges: [*const (); 12],
+}
+
+impl<G> PortRoutes<G> {
+    /// Nodes a single insertion may allocate transiently beyond the one node
+    /// charged per entry: a split along the whole path of a tree that holds
+    /// up to 16384 entries (height at most six with the minimum fill of five)
+    /// plus a new root.
+    pub const SPLIT_ALLOWANCE_NODES: usize = 8;
+
+    /// Heap bytes one bound entry is charged: its key and cluster strings plus
+    /// one full node, which bounds every node allocation the map makes.
+    #[must_use]
+    pub const fn entry_charge(port: usize, cluster: usize) -> usize {
+        port + cluster + size_of::<InternalNodeMirror<G>>()
+    }
+
+    /// Transient bytes a rebuild may request beyond the sum of its entry
+    /// charges: the split allowance.
+    #[must_use]
+    pub const fn rebuild_allowance() -> usize {
+        Self::SPLIT_ALLOWANCE_NODES * size_of::<InternalNodeMirror<G>>()
+    }
+
+    /// Upper bound of the heap bytes this table holds: every entry's strings
+    /// by capacity plus one full node per entry.
+    #[must_use]
+    pub fn retained_heap(&self) -> usize {
+        self.ports
+            .iter()
+            .map(|(port, binding)| {
+                let cluster = match binding {
+                    PortBinding::Bound { cluster, .. } => cluster.capacity(),
+                    PortBinding::Conflict => 0,
+                };
+                port.capacity() + cluster + size_of::<InternalNodeMirror<G>>()
+            })
+            .sum()
+    }
+
+    /// Number of bound ports, conflicts included.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ports.len()
+    }
+
+    /// Whether no port is bound.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ports.is_empty()
     }
 }
 

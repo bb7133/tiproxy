@@ -73,7 +73,24 @@ func (fbb *FactorBasedBalance) TakeObservation() *observation.Evaluation {
 	return e
 }
 
+// DiscardObservation drops the policy's diagnostic reference during the
+// enclosing Group's unconditional cleanup. A parent-owned lease stays with its
+// parent, including a child interrupted before TakeObservation could seal it.
+func (fbb *FactorBasedBalance) DiscardObservation() {
+	fbb.Lock()
+	defer fbb.Unlock()
+	if c := fbb.capture; c != nil && c.current != nil {
+		e := c.current
+		c.current, c.complete = nil, false
+		e.Release()
+	}
+}
+
 func (fbb *FactorBasedBalance) beginObservation(entry observation.EntryPoint, backends []policy.BackendCtx) {
+	fbb.beginCallerObservation(entry, backends, nil)
+}
+
+func (fbb *FactorBasedBalance) beginCallerObservation(entry observation.EntryPoint, backends []policy.BackendCtx, caller *observation.Caller) {
 	c := fbb.capture
 	if c == nil {
 		return
@@ -85,7 +102,12 @@ func (fbb *FactorBasedBalance) beginObservation(entry observation.EntryPoint, ba
 	if !c.enabled() {
 		return
 	}
-	e := c.owner.BeginEvaluation()
+	var e *observation.Evaluation
+	if caller != nil {
+		e = caller.BeginEvaluation()
+	} else {
+		e = c.owner.BeginEvaluation()
+	}
 	if e == nil {
 		return
 	}

@@ -73,6 +73,10 @@ type Group struct {
 	lastCrossKeyspaceWarn  time.Time
 	observation            *observation.Owner
 	observationID          uint64
+	balanceCapture         bool                // Fixed by the private factory; grants no scheduler capability.
+	balanceCaller          *observation.Caller // Accessed only under this Group lock.
+	routeCapture           bool                // Private construction only; outer selector binding remains separate.
+	routeCaller            *observation.Caller // Accessed only under this Group lock.
 }
 
 func NewGroup(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger) (*Group, error) {
@@ -84,6 +88,22 @@ func newGroupObserved(values []string, bpCreator func(lg *zap.Logger) policy.Bal
 }
 
 func newGroupCaptured(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator) (*Group, error) {
+	return newGroupCapture(values, bpCreator, matchType, lg, owner, native, false)
+}
+
+func newGroupBalanceCaptured(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator) (*Group, error) {
+	return newGroupCapture(values, bpCreator, matchType, lg, owner, native, true)
+}
+
+// This private factory fixes both Group hooks before exposing the new Group.
+// It does not install router metadata, selector retries or caller capabilities.
+func newGroupRouteCaptured(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator) (*Group, error) {
+	g, err := newGroupCapture(values, bpCreator, matchType, lg, owner, native, true)
+	g.routeCapture = true
+	return g, err
+}
+
+func newGroupCapture(values []string, bpCreator func(lg *zap.Logger) policy.BalancePolicy, matchType MatchType, lg *zap.Logger, owner *observation.Owner, native NativePolicyCreator, balanceCapture bool) (*Group, error) {
 	var observationID uint64
 	if owner.Enabled() {
 		observationID = owner.NextIdentity()
@@ -100,8 +120,12 @@ func newGroupCaptured(values []string, bpCreator func(lg *zap.Logger) policy.Bal
 	} else {
 		balancePolicy = bpCreator(lg.Named("policy"))
 	}
+	if _, ok := balancePolicy.(*factor.FactorBasedBalance); balanceCapture && (!ok || native == nil || !owner.Native()) {
+		owner.Invalidate(observation.Malformed)
+	}
 	group := &Group{
-		observation: owner, observationID: observationID,
+		balanceCapture: balanceCapture,
+		observation:    owner, observationID: observationID,
 		matchType:       matchType,
 		lg:              lg,
 		values:          values,
@@ -133,24 +157,41 @@ func (g *Group) parseValues() error {
 }
 
 func (g *Group) Match(clientInfo ClientInfo) bool {
+	return g.matchObserved(clientInfo, nil)
+}
+
+func (g *Group) matchObserved(clientInfo ClientInfo, caller *observation.Caller) bool {
+	if caller != nil {
+		caller.BeginRouterMatch(g.observationID)
+	}
+	finish := func(value bool) bool {
+		if caller != nil {
+			caller.EndRouterMatch(value)
+		}
+		return value
+	}
 	switch g.matchType {
 	case MatchClientCIDR, MatchProxyCIDR:
 		addr := clientInfo.ProxyAddr
 		if g.matchType == MatchClientCIDR {
 			addr = clientInfo.ClientAddr
 		}
-		ip, err := netutil.NetAddr2IP(addr)
+		var read func(string)
+		if caller != nil {
+			read = func(value string) { caller.CaptureRouterAddress(value) }
+		}
+		ip, err := netutil.NetAddr2IPObserved(addr, read)
 		if err != nil {
 			g.lg.Error("checking CIDR failed", zap.Stringer("addr", addr), zap.Error(err))
-			return false
+			return finish(false)
 		}
 		contains, err := netutil.CIDRContainsIP(g.cidrList, ip)
 		if err != nil {
 			g.lg.Error("checking CIDR failed", zap.Stringer("addr", addr), zap.Error(err))
 		}
-		return contains
+		return finish(contains)
 	}
-	return true
+	return finish(true)
 }
 
 func (g *Group) EqualValues(values []string) bool {
@@ -186,14 +227,28 @@ func (g *Group) Intersect(values []string) bool {
 }
 
 // Backend CIDRs may change anytime.
-func (g *Group) RefreshCidr() {
+// RefreshCidr recomputes CIDR values from members. It reports whether the
+// refreshed values parsed; on failure the previously parsed networks stay in
+// effect while g.values already holds the new raw values.
+func (g *Group) RefreshCidr() bool {
+	return g.refreshCidrObserved(nil)
+}
+
+// refreshCidrObserved is RefreshCidr with a metadata witness taken inside the
+// Group lock: the frame is leased before the first member read, every actual
+// Cidr() read is copied where it happens, and the stored result closes it.
+func (g *Group) refreshCidrObserved(observe *refreshObserver) (parsed bool) {
 	g.Lock()
 	defer g.Unlock()
+	parsed = true
 	switch g.matchType {
 	case MatchClientCIDR, MatchProxyCIDR:
+		observe.begin(g, true)
+		defer observe.cleanup()
 		valueMap := make(map[string]struct{}, len(g.values))
 		for _, b := range g.backends {
 			cidrs := b.Cidr()
+			observe.member(b.observationID, cidrs)
 			for _, cidr := range cidrs {
 				valueMap[cidr] = struct{}{}
 			}
@@ -205,23 +260,44 @@ func (g *Group) RefreshCidr() {
 		g.values = values
 		if err := g.parseValues(); err != nil {
 			g.lg.Error("failed to parse values", zap.Error(err))
+			parsed = false
 		}
+		observe.result(values, parsed)
+		return parsed
 	}
+	observe.begin(g, false)
+	defer observe.cleanup()
+	observe.result(nil, true)
+	return parsed
 }
 
 func (g *Group) AddBackend(backendID string, backend *backendWrapper) {
+	g.addBackendObserved(backendID, backend, nil)
+}
+
+// addBackendObserved runs observe while the Group lock is still held, so a
+// metadata witness for this decision is sequenced before any later callback.
+func (g *Group) addBackendObserved(backendID string, backend *backendWrapper, observe func()) {
 	g.Lock()
 	defer g.Unlock()
 	g.backends[backendID] = backend
 	backend.group = g
 	g.observeAccount(backend)
+	if observe != nil {
+		observe()
+	}
 }
 
 // removeBackendIfIdle removes the backend from the group only if it has no connections and no
-// pending incoming/outgoing scores.
-func (g *Group) removeBackendIfIdle(backendID string, backend *backendWrapper) (removed, empty bool) {
+// pending incoming/outgoing scores. observe(removed, empty), when set, runs
+// before the Group lock is released: the idle decision and its witness share
+// one critical section, so a connection callback cannot slip between them.
+func (g *Group) removeBackendIfIdle(backendID string, backend *backendWrapper, observe func(removed, empty bool)) (removed, empty bool) {
 	g.Lock()
 	defer g.Unlock()
+	if observe != nil {
+		defer func() { observe(removed, empty) }()
+	}
 	if backend.connList.Len() != 0 || backend.connScore > 0 {
 		return false, false
 	}
@@ -350,22 +426,50 @@ func (g *Group) Route(excluded []BackendInst) (policy.BackendCtx, error) {
 }
 
 func (g *Group) routeObserved(excluded []BackendInst, selection *selectionObservation) (policy.BackendCtx, error) {
+	return g.routeWithParent(excluded, selection, nil)
+}
+
+func (g *Group) routeWithParent(excluded []BackendInst, selection *selectionObservation, parent *observation.Caller) (policy.BackendCtx, error) {
 	g.Lock()
 	defer g.Unlock()
+	caller := parent
+	if caller == nil {
+		caller = g.beginRouteObservation()
+	} else {
+		g.routeCaller = caller
+	}
+	defer g.endRouteObservation(caller)
+	g.captureRouteHeader(caller, selection, len(excluded))
 
 	if len(g.backends) == 0 {
 		g.observeNoRoute(selection)
+		g.publishRouteObservation(caller, selection, nil)
 		return nil, ErrNoBackend
 	}
 	backends := make([]policy.BackendCtx, 0, len(g.backends))
 	for _, backend := range g.backends {
-		if !backend.Healthy() {
+		if caller != nil {
+			caller.CaptureRouteMember(backend.observationID)
+		}
+		healthy := backend.Healthy()
+		if caller != nil {
+			caller.CaptureRouteHealthy(backend.observationID, healthy)
+		}
+		if !healthy {
 			continue
 		}
 		// Exclude the backends that are already tried.
 		found := false
-		for _, e := range excluded {
-			if backend.ID() == e.ID() {
+		for index, e := range excluded {
+			backendID := backend.ID()
+			if caller != nil {
+				caller.CaptureRouteBackendID(backend.observationID, backendID)
+			}
+			excludedID := e.ID()
+			if caller != nil {
+				caller.CaptureRouteExcludedID(uint16(index), excludedID)
+			}
+			if backendID == excludedID {
 				found = true
 				break
 			}
@@ -376,15 +480,17 @@ func (g *Group) routeObserved(excluded []BackendInst, selection *selectionObserv
 		backends = append(backends, backend)
 	}
 
-	idlestBackend := g.policy.BackendToRoute(backends)
+	idlestBackend := g.routePolicy(backends, caller)
 	g.publishPolicyObservationLocked()
 	if idlestBackend == nil || reflect.ValueOf(idlestBackend).IsNil() {
 		g.observeNoRoute(selection)
+		g.publishRouteObservation(caller, selection, nil)
 		return nil, ErrNoBackend
 	}
 	backend := idlestBackend.(*backendWrapper)
 	backend.connScore++
 	g.observeReserved(selection, backend)
+	g.publishRouteObservation(caller, selection, backend)
 	return backend, nil
 }
 
@@ -419,14 +525,18 @@ func (g *Group) logCrossKeyspaceSkip(fromBackend, toBackend *backendWrapper,
 func (g *Group) Balance(ctx context.Context) {
 	g.Lock()
 	defer g.Unlock()
+	caller := g.beginBalanceObservation()
+	defer g.endBalanceObservation(caller)
 	backends := make([]policy.BackendCtx, 0, len(g.backends))
 	for _, backend := range g.backends {
 		backends = append(backends, backend)
 	}
 
-	busiestBackend, idlestBackend, balanceCount, reason, logFields := g.policy.BackendsToBalance(backends)
+	g.captureBalanceMembers(caller, backends)
+	busiestBackend, idlestBackend, balanceCount, reason, logFields := g.balancePolicy(backends, caller)
 	g.publishPolicyObservationLocked()
 	if balanceCount == 0 {
+		g.publishBalanceObservation(caller, 0)
 		return
 	}
 	fromBackend, toBackend := busiestBackend.(*backendWrapper), idlestBackend.(*backendWrapper)
@@ -438,8 +548,11 @@ func (g *Group) Balance(ctx context.Context) {
 	// attempt and one rate-limited record, never a warning per
 	// connection. The redirectConn backstop below remains for any
 	// future caller that bypasses Balance.
-	if fromKeyspace, toKeyspace := fromBackend.Keyspace(), toBackend.Keyspace(); fromKeyspace != toKeyspace {
+	fromKeyspace, toKeyspace := fromBackend.Keyspace(), toBackend.Keyspace()
+	g.captureBalanceClock(caller, curTime, fromKeyspace, toKeyspace)
+	if fromKeyspace != toKeyspace {
 		g.logCrossKeyspaceSkip(fromBackend, toBackend, fromKeyspace, toKeyspace, reason, curTime)
+		g.publishBalanceObservation(caller, 0)
 		return
 	}
 	migrationInterval := time.Duration(float64(time.Second) / balanceCount)
@@ -452,13 +565,17 @@ func (g *Group) Balance(ctx context.Context) {
 		if curTime.Sub(g.lastRedirectTime) >= migrationInterval {
 			count = 1
 		} else {
+			g.publishBalanceObservation(caller, 0)
 			return
 		}
 	}
 	// Migrate balanceCount connections.
 	i := 0
-	for ele := fromBackend.connList.Front(); ele != nil && ctx.Err() == nil && i < count; ele = ele.Next() {
+	for ele := fromBackend.connList.Front(); ele != nil && g.captureBalanceContext(ctx.Err()) && i < count; ele = ele.Next() {
 		conn := ele.Value
+		if caller != nil {
+			caller.CaptureBalanceVisit(conn.observationID)
+		}
 		if conn.forceClosing {
 			continue
 		}
@@ -477,6 +594,7 @@ func (g *Group) Balance(ctx context.Context) {
 			i++
 		}
 	}
+	g.publishBalanceObservation(caller, i)
 }
 
 func (g *Group) onCreateConn(backendInst BackendInst, conn RedirectableConn, succeed bool) {
@@ -486,6 +604,9 @@ func (g *Group) onCreateConn(backendInst BackendInst, conn RedirectableConn, suc
 func (g *Group) onCreateConnObserved(backendInst BackendInst, conn RedirectableConn, succeed bool, selection *selectionObservation) {
 	g.Lock()
 	defer g.Unlock()
+	caller := g.beginFinishObservation(selection)
+	defer g.endFinishObservation(caller)
+	g.captureFinishHeader(caller, selection, backendInst, succeed)
 	backend := g.ensureBackend(backendInst.ID())
 	if succeed {
 		connWrapper := &connWrapper{
@@ -504,6 +625,9 @@ func (g *Group) onCreateConnObserved(backendInst BackendInst, conn RedirectableC
 		backend.connScore--
 	}
 	g.observeCreated(selection, backend, conn, succeed)
+	if caller != nil && caller.CaptureFinishResult() && caller.Seal() {
+		g.observation.PublishCaller(caller)
+	}
 }
 
 // RehydrateConn implements the group half of AssignmentRehydrator: the
@@ -751,7 +875,7 @@ func (g *Group) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toB
 		g.logCrossKeyspaceSkip(fromBackend, toBackend, fromKeyspace, toKeyspace, reason, curTime)
 		conn.phase = phaseRedirectFail
 		conn.lastRedirect = curTime
-		g.observeRedirect(conn, before, fromBackend, toBackend, false)
+		g.observeRedirect(conn, before, fromBackend, toBackend, fromKeyspace, toKeyspace, observation.BalanceCallbackSkipped)
 		return false
 	}
 	// Skip the connection if it's closing.
@@ -777,7 +901,11 @@ func (g *Group) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toB
 		g.lg.Debug("skip redirecting because it's closing", fields...)
 	}
 	conn.lastRedirect = curTime
-	g.observeRedirect(conn, before, fromBackend, toBackend, succeed)
+	callback := observation.BalanceCallbackRefused
+	if succeed {
+		callback = observation.BalanceCallbackAccepted
+	}
+	g.observeRedirect(conn, before, fromBackend, toBackend, fromKeyspace, toKeyspace, callback)
 	return succeed
 }
 
@@ -805,7 +933,13 @@ func (g *Group) SetConfig(cfg *config.Config) {
 func (g *Group) publishPolicyObservationLocked() {
 	if native, ok := g.policy.(*factor.FactorBasedBalance); ok {
 		if evaluation := native.TakeObservation(); evaluation != nil {
-			g.observation.PublishEvaluation(evaluation)
+			if g.routeCaller != nil {
+				g.routeCaller.CompleteEvaluation(evaluation)
+			} else if g.balanceCaller != nil {
+				g.balanceCaller.CompleteEvaluation(evaluation)
+			} else {
+				g.observation.PublishEvaluation(evaluation)
+			}
 		}
 	}
 }

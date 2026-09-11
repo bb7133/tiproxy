@@ -31,6 +31,7 @@ type evaluationStorage struct {
 // arena's new lease.
 type Evaluation struct {
 	owner     *Owner
+	parent    *Caller // Non-nil transfers lifetime to the enclosing caller at acquisition.
 	lease     *EvaluationLease
 	length    int
 	sealed    bool
@@ -111,6 +112,14 @@ func (e *Evaluation) EncodingBuffer() []byte {
 
 func (e *Evaluation) Release() {
 	if e != nil {
+		if e.parent != nil {
+			// The enclosing producer defer/writer owns even an unfinished child.
+			// A child cannot reclaim storage while its parent is being encoded.
+			if !e.lease.released.Load() {
+				e.owner.Invalidate(UnpairedDiscard)
+			}
+			return
+		}
 		if !e.published && !e.lease.released.Load() {
 			e.owner.Invalidate(UnpairedDiscard)
 		}
@@ -123,6 +132,11 @@ func (e *Evaluation) Release() {
 // Failure leaves no partial sequence and returns the private lease immediately.
 func (o *Owner) PublishEvaluation(e *Evaluation) bool {
 	if e == nil {
+		return false
+	}
+	if e.parent != nil {
+		o.Invalidate(Malformed)
+		e.owner.Invalidate(Malformed)
 		return false
 	}
 	if o == nil || e.owner != o || !e.sealed || e.published || e.lease.released.Load() {

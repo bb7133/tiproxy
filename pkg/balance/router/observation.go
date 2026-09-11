@@ -9,8 +9,11 @@ import "github.com/pingcap/tiproxy/pkg/balance/observation"
 // token follows that same lifetime, including attempts before a conn exists.
 // It never supplies an identity or decision to production routing.
 type selectionObservation struct {
+	capture                       bool
 	owner                         *observation.Owner
 	session, operation            uint64
+	next                          uint64
+	attempt                       uint8
 	opened, pending, bound, ended bool
 }
 
@@ -36,16 +39,27 @@ func (s *selectionObservation) noRoute(group uint64) {
 	}
 }
 
-func (g *Group) observeNoRoute(s *selectionObservation) { s.noRoute(g.observationID) }
+func (g *Group) observeNoRoute(s *selectionObservation) {
+	if g.routeCaller != nil {
+		if s != nil && s.owner.Enabled() {
+			g.routeCaller.AppendBatch(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.RouteRejected, Session: s.session, Group: g.observationID}}})
+		}
+		return
+	}
+	s.noRoute(g.observationID)
+}
 
 func (g *Group) observeAccount(b *backendWrapper) {
 	if !g.observation.Enabled() {
 		return
 	}
-	if b.observationID != 0 {
+	if b.accounted {
 		return
 	}
-	b.observationID = g.observation.NextIdentity()
+	if b.observationID == 0 {
+		b.observationID = g.observation.NextIdentity()
+	}
+	b.accounted = true
 	g.capture(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.Account, ID: b.observationID, Group: g.observationID}}}, nil, observation.ConnectionState{}, b)
 }
 
@@ -116,8 +130,18 @@ func (g *Group) beforeObservation(cw *connWrapper) observation.ConnectionState {
 // the caller's existing Group critical section. Owner.Emit only serializes the
 // completed values; neither it nor the drain can call back into this Group.
 func (g *Group) capture(batch observation.Batch, cw *connWrapper, before observation.ConnectionState, accounts ...*backendWrapper) {
+	if batch, ok := g.captureWitness(batch, cw, before, accounts...); ok {
+		if g.routeCaller != nil {
+			g.routeCaller.AppendBatch(batch)
+		} else {
+			g.observation.Emit(batch)
+		}
+	}
+}
+
+func (g *Group) captureWitness(batch observation.Batch, cw *connWrapper, before observation.ConnectionState, accounts ...*backendWrapper) (observation.Batch, bool) {
 	if !g.observation.Enabled() {
-		return
+		return batch, false
 	}
 	batch.Witness.Before = before
 	if cw != nil {
@@ -140,7 +164,7 @@ func (g *Group) capture(batch observation.Batch, cw *connWrapper, before observa
 		}
 		if batch.Witness.AccountCount == observation.MaxWitnesses || b.observationID == 0 {
 			g.observation.Invalidate(observation.Malformed)
-			return
+			return batch, false
 		}
 		witness := observation.AccountWitness{ID: b.observationID, Score: int64(b.connScore), Physical: uint64(b.connList.Len())}
 		if head := b.connList.Front(); head != nil {
@@ -161,20 +185,28 @@ func (g *Group) capture(batch observation.Batch, cw *connWrapper, before observa
 		batch.Witness.Accounts[batch.Witness.AccountCount] = witness
 		batch.Witness.AccountCount++
 	}
-	g.observation.Emit(batch)
+	return batch, true
 }
 
-func (g *Group) observeRedirect(cw *connWrapper, before observation.ConnectionState, from, to *backendWrapper, accepted bool) {
+func (g *Group) observeRedirect(cw *connWrapper, before observation.ConnectionState, from, to *backendWrapper, fromKeyspace, toKeyspace string, callback observation.BalanceCallback) {
 	if !g.observation.Enabled() {
 		return
 	}
 	kind := observation.Rejected
 	operation := g.observation.NextIdentity()
-	if accepted {
+	if callback == observation.BalanceCallbackAccepted {
 		kind = observation.Redirect
 		cw.observationRedirect = operation
 	}
-	g.capture(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: kind, Session: cw.observationID, Operation: operation, Account: from.observationID, Target: to.observationID}}}, cw, before, from, to)
+	batch, ok := g.captureWitness(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: kind, Session: cw.observationID, Operation: operation, Account: from.observationID, Target: to.observationID}}}, cw, before, from, to)
+	if !ok {
+		return
+	}
+	if g.balanceCaller != nil {
+		g.balanceCaller.CaptureBalanceRedirect(fromKeyspace, toKeyspace, callback, batch)
+	} else {
+		g.observation.Emit(batch)
+	}
 }
 
 func (g *Group) observeRedirected(cw *connWrapper, before observation.ConnectionState, from, to *backendWrapper, success bool) {
