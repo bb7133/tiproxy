@@ -2,6 +2,7 @@
 # Copyright 2026 PingCAP, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Actual four-router streams with compiled independent-comparison faults."""
+from collections import Counter
 from pathlib import Path
 import hashlib
 import json
@@ -38,6 +39,59 @@ def check_anchors():
         if original.count(old) != 1:
             raise RuntimeError('stale anchor: ' + name)
     print(f'{len(CASES)} router-attempt anchors unique; markers statically derived')
+
+
+def summarize(rows, evidence):
+    """Count completed execution records and their source-bound replay logs."""
+    phases = ['baseline', *(case[0] for case in CASES), 'restored']
+    expected_names = {'go-actual'} | {'compile-' + phase for phase in phases} | {
+        phase + '-' + scenario for phase in phases for scenario in SCENARIOS}
+    names = [row['name'] for row in rows]
+    if len(names) != len(expected_names) or set(names) != expected_names:
+        raise RuntimeError('incomplete or duplicate execution records')
+    comparisons = [row for row in rows if 'marker_matched' in row]
+    if len(comparisons) != len(phases) * len(SCENARIOS):
+        raise RuntimeError('missing comparison records')
+    statuses = Counter()
+    for row in rows:
+        if row['timeout'] or ('marker_matched' not in row and row['rc'] != 0):
+            raise RuntimeError('unsuccessful execution: ' + row['name'])
+        if 'marker_matched' not in row:
+            continue
+        if not row['marker_matched']:
+            raise RuntimeError('unmatched comparison: ' + row['name'])
+        if row['rc'] != 0:
+            actual = re.search(r'ROUTER_ATTEMPT_REJECTED status=Invalid\((\w+)\)', row['actual_error'])
+            if not actual or not row['expected_marker'] or row['expected_marker'] not in row['actual_error']:
+                raise RuntimeError('unverified domain failure: ' + row['name'])
+            statuses[actual.group(1)] += 1
+        elif row['expected_marker']:
+            raise RuntimeError('expected failure did not occur: ' + row['name'])
+    baseline = [row for row in comparisons if row['name'].startswith('baseline-')]
+    strict = corruptions = atomic = 0
+    for row in baseline:
+        log = (evidence / (row['name'] + '.log')).read_bytes()
+        if hashlib.sha256(log).hexdigest() != row['log_sha256']:
+            raise RuntimeError('baseline log hash mismatch: ' + row['name'])
+        output = log.decode()
+        scenario = row['name'].removeprefix('baseline-')
+        footer = re.findall(r'^ROUTER_ATTEMPT_INDEPENDENT scenario=' + re.escape(scenario)
+                            + r' frames=\d+ strict=(\d+) corruptions=(\d+)$', output, re.MULTILINE)
+        strict_lines = re.findall(r'^ROUTER_ATTEMPT_STRICT rejected=(\d+)$', output, re.MULTILINE)
+        observed_corruptions = len(re.findall(r'^ROUTER_ATTEMPT_CORRUPTION \S+ rejected$', output, re.MULTILINE))
+        observed_atomic = len(re.findall(r'^ROUTER_ATTEMPT_ATOMIC late-next rejected prefix=\d+ retained=\d+$', output, re.MULTILINE))
+        if len(footer) != 1 or strict_lines != [footer[0][0]] or observed_corruptions != int(footer[0][1]) or observed_atomic == 0:
+            raise RuntimeError('inconsistent replay evidence: ' + row['name'])
+        strict += int(strict_lines[0])
+        corruptions += observed_corruptions
+        atomic += observed_atomic
+    return dict(faults=sum(row['name'].startswith('compile-') and row['name'] not in
+                          {'compile-baseline', 'compile-restored'} for row in rows),
+                records=len(rows), streams=len(baseline), strict=strict,
+                corruptions=corruptions, atomic=atomic, comparisons=len(comparisons),
+                detected_failures=sum(statuses.values()),
+                successful_comparisons=sum(row['rc'] == 0 for row in comparisons),
+                failure_status_counts=dict(sorted(statuses.items())))
 
 
 def main():
@@ -155,9 +209,10 @@ def main():
     identity = compile_source('compile-restored')
     for scenario in SCENARIOS:
         compare('restored-' + scenario, scenario, identity)
-    # One Go execution, eight compiles, 32 scenario comparisons.
-    assert len(rows) == 41, len(rows)
-    print('ROUTER_ATTEMPT_FAULTS faults=6 records=41 streams=4 strict=36 corruptions=12 atomic=4')
+    summary = summarize(rows, evidence)
+    (evidence / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    print('ROUTER_ATTEMPT_FAULTS ' + ' '.join(
+        f'{key}={summary[key]}' for key in ['faults', 'records', 'streams', 'strict', 'corruptions', 'atomic']))
 
 
 if __name__ == '__main__':

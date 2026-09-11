@@ -63,7 +63,13 @@ runner.CASES += [
         edit(COMPUTE, 'impl FactorState {\n    /// Start an empty history', 'impl FactorState {\n    pub(crate) fn mutation_unchecked_decision(&self, e: &Evaluation) -> Decision {\n        Decision { entry: e.entry, returned: e.returned.clone(), from: e.from, to: e.to, rate: BalanceRate(f64::from_bits(e.balance_count)), reason: e.reason }\n    }\n    /// Start an empty history'),
     ]),
     native('native-old-clone-uncharged', 'native_budget_includes_old_history_clone_and_stage_at_equality', 'NATIVE_HISTORY_PLUS_ONE', [edit(LIVE, '.checked_add(old_charge)', '.checked_add(0)')]),
-    native('native-stage-uncharged', 'native_budget_includes_old_history_clone_and_stage_at_equality', 'NATIVE_HISTORY_PLUS_ONE', [edit(LIVE, '.and_then(|v| v.checked_add(STAGE_OVERHEAD))', '.and_then(|v| v.checked_add(0))')]),
+    # Omit fixed staging only from peak admission. The independent retained
+    # growth ceiling stays intact, so configuration setup remains valid and
+    # the first failure tests the intended one-byte-over-budget admission.
+    native('native-stage-uncharged', 'native_budget_includes_old_history_clone_and_stage_at_equality', 'NATIVE_HISTORY_PLUS_ONE', [
+        edit(LIVE, 'let peak = growth_limit\n            .checked_add(concurrent_copies)',
+             'let peak = growth_limit\n            .checked_sub(STAGE_OVERHEAD)\n            .and_then(|v| v.checked_add(concurrent_copies))'),
+    ]),
     native('native-equality-rejected', 'native_budget_includes_old_history_clone_and_stage_at_equality', 'NATIVE_HISTORY_EQUAL', [edit(LIVE, 'charge <= HISTORY_LIMIT.saturating_sub(self.native_bytes)', 'charge < HISTORY_LIMIT.saturating_sub(self.native_bytes)')]),
     native('native-arch-conflict-accepted', 'conflicting_native_preludes_are_sticky', 'NATIVE_ARCH_PROCESS_CONFLICT', [edit(LIVE, ' || old.coverage.go_arch != coverage.go_arch', '')]),
     native('native-failed-prelude-repairable', 'conflicting_native_preludes_are_sticky', 'NATIVE_PRELUDE_NO_REPAIR', [edit(LIVE, 'self.invalidate(coverage.epoch, reason);', 'let _ = reason;')]),
