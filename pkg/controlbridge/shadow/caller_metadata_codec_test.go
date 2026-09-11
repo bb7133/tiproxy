@@ -6,6 +6,7 @@ package shadow
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -258,4 +259,68 @@ func TestCallerMetadataCaptureIsExclusiveAndBounded(t *testing.T) {
 	require.True(t, c.CaptureMetadataEnd(1, true, 1, 0, 0, 0, 0))
 	require.False(t, c.CaptureMetadataBegin(1, observation.SelectorNoError, observation.MetadataRuleAll), "METADATA_ONE_KIND_PER_FRAME")
 	require.False(t, o.Enabled())
+}
+
+// Init is the only metadata family whose valid wire form has no generation.
+// Compare its original string through JSON escaping, including the byte limit.
+func TestCallerMetadataInitCodec(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		rule      observation.MetadataRule
+	}{
+		{"empty", "", observation.MetadataRuleAll},
+		{"port", "PORT", observation.MetadataRulePort},
+		{"simple-lower", "CLİENT_CİDR", observation.MetadataRuleClientCIDR},
+		{"proxy", "proxy_cidr", observation.MetadataRuleProxyCIDR},
+		{"escaped", "\"port\\\t\n", observation.MetadataRuleAll},
+		{"byte-limit", strings.Repeat("x", 512), observation.MetadataRuleAll},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, record, c := metadataCaller(t, func(c *observation.Caller) bool {
+				return c.CaptureMetadataInit(tc.raw, tc.rule)
+			})
+			defer r.Close()
+			defer c.Cleanup()
+			frame, err := EncodeCaller(record)
+			require.NoError(t, err)
+			expected, err := json.Marshal(map[string]any{
+				"version": 4, "kind": "caller", "process": "1", "owner": "1", "nonce": "2", "sequence": "2", "span": "1",
+				"payload": map[string]any{"metadata_init": map[string]any{"raw_rule": tc.raw, "rule": tc.rule}},
+			})
+			require.NoError(t, err)
+			require.JSONEq(t, string(expected), string(frame[4:]), "STARTUP_GO_CODEC_WIRE")
+			require.EqualValues(t, len(frame)-4, binary.BigEndian.Uint32(frame))
+			require.Same(t, &c.EncodingBuffer()[0], &frame[0])
+			require.Zero(t, testing.AllocsPerRun(100, func() { _, err = EncodeCaller(record) }), "STARTUP_GO_CODEC_BORROWS_PARENT")
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestCallerMetadataInitCodecRejectsMalformedReference(t *testing.T) {
+	for _, kind := range []string{"generation", "rule", "offset", "length"} {
+		t.Run(kind, func(t *testing.T) {
+			r, record, c := metadataCaller(t, func(c *observation.Caller) bool {
+				return c.CaptureMetadataInit("port", observation.MetadataRulePort)
+			})
+			defer r.Close()
+			defer c.Cleanup()
+			// Deliberately corrupt the sealed view to exercise the encoder's
+			// validation independently of the capture-time guards.
+			m := c.Metadata()
+			switch kind {
+			case "generation":
+				m.Generation = 1
+			case "rule":
+				m.Rule = 0
+			case "offset":
+				m.RawRule.Offset = 1
+			case "length":
+				m.RawRule.Length++
+			}
+			frame, err := EncodeCaller(record)
+			require.ErrorIs(t, err, errSchema, "STARTUP_GO_CODEC_REJECTS_REFERENCE")
+			require.Nil(t, frame)
+		})
+	}
 }

@@ -446,3 +446,81 @@ fn startup_budget_bounds_use_current_layout() {
     );
     assert!(state.router_metadata(epoch).is_none());
 }
+
+#[test]
+fn startup_rejects_health_rule_change_atomically() {
+    let (mut state, epoch) = initial();
+    assert_eq!(
+        state
+            .observe_router_metadata(&startup(epoch, "PORT", Rule::Port), 512)
+            .status,
+        Status::Comparing
+    );
+    let before = state.native_retained_bytes();
+    // The first health result cannot replace Init's independently derived rule.
+    let mut changed = begin(epoch);
+    changed.sequence = 3;
+    let progress = state.observe_router_metadata(&changed, 128);
+    assert_eq!(progress.status, Status::Invalid(InvalidReason::Witness));
+    assert_eq!(progress.compared_sequence, 2);
+    assert_eq!(state.native_retained_bytes(), before);
+    let metadata = state
+        .router_metadata(epoch)
+        .unwrap_or_else(|| unreachable!("metadata"));
+    assert_eq!(metadata.route_header(0), Ok((Rule::Port, ErrorClass::None)));
+    assert!(!metadata.detector_present());
+}
+
+#[test]
+fn startup_rejects_init_after_metadata_only_stream() {
+    let (mut state, epoch) = initial();
+    assert_eq!(
+        state.observe_router_metadata(&begin(epoch), 128).status,
+        Status::Comparing
+    );
+    assert_eq!(
+        state.observe_router_metadata(&end(epoch), 128).status,
+        Status::Comparing
+    );
+    let before = state.native_retained_bytes();
+    let mut late = startup(epoch, "port", Rule::Port);
+    late.sequence = 4; // Valid next owner sequence, but Init is no longer legal.
+    let progress = state.observe_router_metadata(&late, 512);
+    assert_eq!(progress.status, Status::Invalid(InvalidReason::Sequence));
+    assert_eq!(progress.compared_sequence, 3);
+    assert_eq!(state.native_retained_bytes(), before);
+    let metadata = state
+        .router_metadata(epoch)
+        .unwrap_or_else(|| unreachable!("metadata"));
+    assert_eq!(metadata.generation(), 1);
+    assert_eq!(metadata.route_header(1), Ok((Rule::All, ErrorClass::None)));
+    assert!(!metadata.detector_present());
+}
+
+#[test]
+fn startup_rejects_foreign_identity_without_retaining_metadata() {
+    for component in 0..3 {
+        let (mut state, epoch) = initial();
+        let mut foreign = epoch;
+        match component {
+            0 => foreign.process += 1,
+            1 => foreign.owner += 1,
+            _ => foreign.nonce += 1,
+        }
+        let before = state.native_retained_bytes();
+        let old = state.progress(foreign).compared_sequence;
+        let progress = state.observe_router_metadata(&startup(foreign, "port", Rule::Port), 512);
+        let reason = if component == 2 {
+            InvalidReason::Identity
+        } else {
+            InvalidReason::MissingBegin
+        };
+        assert_eq!(progress.status, Status::Invalid(reason));
+        assert_eq!(progress.compared_sequence, old);
+        assert_eq!(state.progress(epoch).compared_sequence, 1);
+        assert_eq!(state.totals(epoch), Some((0, 0)));
+        assert_eq!(state.native_retained_bytes(), before);
+        assert!(state.router_metadata(epoch).is_none());
+        assert!(state.router_metadata(foreign).is_none());
+    }
+}
