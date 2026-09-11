@@ -42,7 +42,7 @@ def check_anchors():
     for name, test, marker, old, new in RUST_CASES:
         if (ROOT / RUST).read_text().count(old) != 1:
             raise RuntimeError('stale anchor: ' + name)
-    print('SELECTOR_ANCHORS 16 unique fault anchors; static check only', flush=True)
+    print('SELECTOR_ANCHORS 16 cases / 17 unique anchor strings; static check only', flush=True)
 
 
 def main():

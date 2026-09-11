@@ -612,3 +612,54 @@ fn finish_late_binding_failure_cannot_refund_or_advance() {
         }
     }
 }
+
+#[test]
+fn finish_after_actual_selection_done_and_close_is_rejected() {
+    use super::super::selection::{Boundary, BoundaryEvent};
+    let (mut state, mut envelope) = finish_fixture(false);
+    let epoch = envelope.epoch;
+    assert_eq!(
+        state.observe_selector_finish(&envelope, 1024).status,
+        Status::Comparing
+    );
+    let done = Batch {
+        epoch,
+        sequence: 13,
+        events: vec![LiveEvent::SelectionDone(10)],
+        witness: Witness {
+            session: 10,
+            ..Witness::default()
+        },
+    };
+    assert_eq!(state.observe(&done).status, Status::Comparing);
+    let close = Boundary {
+        epoch,
+        sequence: 14,
+        session: 10,
+        event: BoundaryEvent::Close {
+            next: 1,
+            current: 9,
+            excluded: vec![9],
+        },
+    };
+    assert_eq!(
+        state.observe_selector_boundary(&close, 128).status,
+        Status::Comparing
+    );
+    assert!(state.selectors_settled(epoch));
+    let retained = state.native_retained_bytes();
+    envelope.sequence = 15;
+    envelope.created.sequence = 15;
+    let progress = state.observe_selector_finish(&envelope, 1024);
+    assert_eq!(
+        progress.status,
+        Status::Invalid(InvalidReason::Lifecycle),
+        "FINISH_CLOSED_SELECTOR_REJECTED"
+    );
+    assert_eq!(
+        progress.compared_sequence, 14,
+        "FINISH_CLOSED_PREFIX_UNCHANGED"
+    );
+    assert_eq!(state.totals(epoch), Some((0, 0)), "FINISH_CLOSED_NO_REFUND");
+    assert_eq!(state.native_retained_bytes(), retained);
+}
