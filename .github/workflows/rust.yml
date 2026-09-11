@@ -440,6 +440,7 @@ jobs:
         env:
           CP_ROUTE_ROUTE_HOOK_EVIDENCE: ${{ runner.temp }}/route-hook-evidence
           CP_ROUTE_SELECTOR_EVIDENCE: ${{ runner.temp }}/selector-core-evidence
+          CP_ROUTE_SELECTOR_ROUTE_EVIDENCE: ${{ runner.temp }}/selector-route-evidence
         run: make controlplane-cproute-native-evidence
       - name: Upload actual Group Route checkpoint evidence
         if: always()
@@ -456,6 +457,15 @@ jobs:
         with:
           name: selector-core-${{ github.sha }}
           path: ${{ runner.temp }}/selector-core-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload actual selector and Group Route composition evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: selector-route-${{ github.sha }}
+          path: ${{ runner.temp }}/selector-route-evidence
           if-no-files-found: warn
           retention-days: 14
 

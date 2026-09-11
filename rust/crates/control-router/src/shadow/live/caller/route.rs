@@ -3,6 +3,7 @@
 
 //! Group-local Route comparison. Router match/metadata and selector retry
 //! binding are separate forthcoming callers; this grants no installed coverage.
+use super::selection::{Binding, DerivedResult, ErrorClass};
 use super::{Batch, Epoch, Event, InvalidReason, LiveEvent, LiveState, Progress, Scope, Stage};
 use crate::shadow::native::{Entry, Evaluation};
 
@@ -186,9 +187,22 @@ impl LiveState {
     /// together. No successful child or observed output grants its own commit.
     #[must_use]
     pub fn observe_group_route(&mut self, envelope: &Envelope, frame_bytes: usize) -> Progress {
+        self.observe_group_route_result(envelope, frame_bytes).0
+    }
+
+    /// Return the independently selected account and validated reservation only
+    /// after the entire Group caller commits. Failed or replayed callers expose
+    /// no result. This does not validate the router's choice of Group or install
+    /// selector history; those remain separate caller integration boundaries.
+    #[must_use]
+    pub fn observe_group_route_result(
+        &mut self,
+        envelope: &Envelope,
+        frame_bytes: usize,
+    ) -> (Progress, Option<DerivedResult>) {
         if let Err(reason) = envelope.validate() {
             self.invalidate(envelope.epoch, reason);
-            return self.progress(envelope.epoch);
+            return (self.progress(envelope.epoch), None);
         }
         let sessions = [envelope.route.session];
         let previous = self.progress(envelope.epoch).compared_sequence;
@@ -203,13 +217,22 @@ impl LiveState {
         match result {
             Ok(mut stage) => {
                 let comparison = stage.compare_route(envelope);
-                stage.finish(comparison)
+                let progress = stage.finish(comparison.map(|_| ()));
+                let derived = if progress.status == super::Status::Comparing {
+                    comparison.ok()
+                } else {
+                    None
+                };
+                (progress, derived)
             }
-            Err(reason) => Progress {
-                status: super::Status::Invalid(reason),
-                compared_sequence: previous,
-                transition: None,
-            },
+            Err(reason) => (
+                Progress {
+                    status: super::Status::Invalid(reason),
+                    compared_sequence: previous,
+                    transition: None,
+                },
+                None,
+            ),
         }
     }
 }
@@ -265,7 +288,7 @@ impl Route {
     }
 }
 impl Stage<'_> {
-    fn compare_route(&mut self, e: &Envelope) -> Result<(), InvalidReason> {
+    fn compare_route(&mut self, e: &Envelope) -> Result<DerivedResult, InvalidReason> {
         let r = &e.route;
         let key = (e.epoch.process, e.epoch.owner);
         let ledger = &self.staged.core.owners[&key].ledger;
@@ -307,10 +330,19 @@ impl Stage<'_> {
         let Some(Child::Batch(batch)) = children.next() else {
             return Err(InvalidReason::Witness);
         };
+        // The reservation child supplies its operation; the caller's return is
+        // only a witness. The ledger below validates this operation's lifetime.
+        let operation = match batch.events.last() {
+            Some(LiveEvent::Lifecycle {
+                event: Event::Reserve { operation, .. },
+                ..
+            }) => *operation,
+            _ => 0,
+        };
         let expected = LiveEvent::Lifecycle {
             event: Event::Reserve {
                 session: r.session,
-                operation: r.result.operation,
+                operation,
                 account: selected,
             },
             source: 0,
@@ -334,7 +366,7 @@ impl Stage<'_> {
                         expected,
                     ]
         };
-        if !paired || selected != r.result.account {
+        if !paired || selected != r.result.account || operation != r.result.operation {
             return Err(InvalidReason::Witness);
         }
         self.batch(batch)?;
@@ -343,7 +375,19 @@ impl Stage<'_> {
         if children.next().is_some() || usize::from(r.result.completed) != e.children.len() {
             return Err(InvalidReason::Witness);
         }
-        Ok(())
+        Ok(DerivedResult {
+            backend: selected,
+            error: if selected == 0 {
+                ErrorClass::NoBackend
+            } else {
+                ErrorClass::None
+            },
+            binding: (selected != 0).then_some(Binding {
+                account: selected,
+                group: r.group,
+                operation,
+            }),
+        })
     }
 }
 

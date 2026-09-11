@@ -93,7 +93,20 @@ fn empty_result(e: &mut Envelope) {
 #[test]
 fn independent_route_result_and_reservation_commit_together() {
     let (mut state, e) = fixture();
-    let progress = state.observe_group_route(&e, 4096);
+    let (progress, derived) = state.observe_group_route_result(&e, 4096);
+    assert_eq!(
+        derived,
+        Some(DerivedResult {
+            backend: 9,
+            error: ErrorClass::None,
+            binding: Some(Binding {
+                account: 9,
+                group: 2,
+                operation: 1,
+            }),
+        }),
+        "ROUTE_DERIVED_COMMITTED_BINDING"
+    );
     assert_eq!(
         (progress.status, progress.compared_sequence),
         (Status::Comparing, 8),
@@ -104,11 +117,9 @@ fn independent_route_result_and_reservation_commit_together() {
         Some((1, 0)),
         "ROUTE_COMMIT_RESERVATION"
     );
-    assert_eq!(
-        state.observe_group_route(&e, 4096).compared_sequence,
-        8,
-        "ROUTE_REPLAY_NO_PREFIX"
-    );
+    let (replayed, derived) = state.observe_group_route_result(&e, 4096);
+    assert_eq!(replayed.compared_sequence, 8, "ROUTE_REPLAY_NO_PREFIX");
+    assert_eq!(derived, None, "ROUTE_REPLAY_NO_BINDING");
 }
 #[test]
 fn late_result_failure_rolls_back_native_and_ledger() {
@@ -148,7 +159,8 @@ fn late_result_failure_rolls_back_native_and_ledger() {
                 e.route.result.completed = 3;
             }
         }
-        let p = state.observe_group_route(&e, 4096);
+        let (p, derived) = state.observe_group_route_result(&e, 4096);
+        assert_eq!(derived, None, "ROUTE_FAILED_NO_BINDING");
         assert_eq!(
             (p.status, p.compared_sequence),
             (Status::Invalid(InvalidReason::Witness), 4),
