@@ -244,8 +244,9 @@ func TestMetadataRefreshPanicReleasesLease(t *testing.T) {
 	require.Equal(t, metadataCounts{1, 1, 1, 1}, counts)
 	require.Len(t, cidr.router.groups, 1)
 	_, before := cidr.r.Retained()
-	// The getter panics on the second member; the first member read was
-	// already copied into the open frame.
+	// The getter panics when the loop reaches the nil wrapper; Go's map order
+	// decides whether the real member was read first, so the test relies only
+	// on the panic happening inside the loop with the frame leased.
 	cidr.router.groups[0].backends["nil"] = nil
 	require.Panics(t, func() {
 		cidr.router.updateBackendHealth(observer.NewHealthResult(map[string]*observer.BackendHealth{
