@@ -142,8 +142,12 @@ func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) Backen
 					}
 				}
 			}()
-			parent := router.beginRouterAttempt(selection, excluded)
-			defer parent.Cleanup()
+			var parent *observation.Caller
+			if router.attemptCapture && router.observation.Enabled() {
+				parent = router.observation.BeginCaller()
+				defer parent.Cleanup()
+				router.captureRouterAttempt(parent, selection, excluded)
+			}
 			if router.observeError != nil {
 				router.rejectRouterAttempt(parent, selection, router.observeError)
 				err = router.observeError

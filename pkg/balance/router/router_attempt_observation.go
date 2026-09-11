@@ -25,47 +25,42 @@ func (router *ScoreBasedRouter) newRouteGroup(values []string) (*Group, error) {
 	return newGroupCaptured(values, router.bpCreator, router.matchType, router.logger, router.observation, router.nativeCreator)
 }
 
-// Called under router.Lock before copying any inventory, address or exclusion.
-// The caller registers cleanup before doing any further production work.
-func (router *ScoreBasedRouter) beginRouterAttempt(s *selectionObservation, excluded []BackendInst) *observation.Caller {
-	if !router.attemptCapture || !router.observation.Enabled() {
-		return nil
-	}
-	c := router.observation.BeginCaller()
+// Called under router.Lock only after the parent has been leased and its
+// cleanup registered, before copying any inventory, address or exclusion.
+func (router *ScoreBasedRouter) captureRouterAttempt(c *observation.Caller, s *selectionObservation, excluded []BackendInst) {
 	if c == nil {
-		return nil
+		return
 	}
 	if s == nil || s.owner != router.observation || !s.capture || s.pending || s.bound || s.ended {
 		c.Fail(observation.UnpairedDiscard)
-		return c
+		return
 	}
 	if len(router.groups) > observation.MaxCallerGroups || len(excluded) > observation.MaxCallerGroups {
 		c.Fail(observation.Capacity)
-		return c
+		return
 	}
 	if !c.CaptureRouterRoute(router.observation.NextIdentity(), router.metadataGeneration, s.session, s.next, s.attempt, metadataRule(router.matchType), selectorErrorClass(router.observeError)) {
-		return c
+		return
 	}
 	for _, group := range router.groups {
 		if group == nil {
 			c.Fail(observation.Malformed)
-			return c
+			return
 		}
 		if !c.CaptureRouterIdentity(group.observationID, false) {
-			return c
+			return
 		}
 	}
 	for _, candidate := range excluded {
 		backend, ok := candidate.(*backendWrapper)
 		if !ok || backend == nil {
 			c.Fail(observation.Malformed)
-			return c
+			return
 		}
 		if !c.CaptureRouterIdentity(backend.observationID, true) {
-			return c
+			return
 		}
 	}
-	return c
 }
 
 func (router *ScoreBasedRouter) rejectRouterAttempt(c *observation.Caller, s *selectionObservation, err error) {

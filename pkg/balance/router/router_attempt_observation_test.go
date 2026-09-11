@@ -76,7 +76,11 @@ func (f *routerAttemptFixture) drain(t *testing.T) {
 			}
 			f.write(t)(shadowwire.EncodeCaller(d.Record))
 		case d.Record.Evaluation != nil:
-			require.Equal(t, observation.EntryConfig, d.Record.Evaluation.Native().Entry, "ROUTER_ATTEMPT_ONLY_CONSTRUCTION_PREFIX")
+			// Group construction also calls SetConfig: its failover scan uses
+			// the original RouteableBackends entry before any Route caller.
+			entry := d.Record.Evaluation.Native().Entry
+			require.True(t, entry == observation.EntryConfig || entry == observation.EntryRouteable,
+				"ROUTER_ATTEMPT_CONFIG_OR_ROUTEABLE_PREFIX: got %v", entry)
 			f.write(t)(shadowwire.EncodeEvaluation(d.Record))
 		default:
 			f.write(t)(shadowwire.EncodeRecord(d.Record))
