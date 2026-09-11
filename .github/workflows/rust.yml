@@ -367,7 +367,7 @@ jobs:
         run: |
           python3 tests/controlplane/cproute/api-differential/run.py \
             tests/controlplane/cproute/api-differential/smoke.json \
-            --output "${RUNNER_TEMP}/routing-api"
+            --output "${RUNNER_TEMP}/routing-api" --comparator-check
       - name: Preserve API inputs, outputs and first failure
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -4,14 +4,15 @@
 //! Test-only API adapter. Real modules consume source inputs and Router/Selector
 //! own every selection/reservation. Go observations never enter this adapter.
 
-use super::{Harness, TestResult};
-use crate::{Reservation, RouteError, Router, Selector, Settlement};
+use super::{Harness, TestResult, must};
+use crate::scheduler::{CommandQueue, RoundClock};
+use crate::{Accounting, MigrationCommand, Reservation, RouteError, Router, Selector, Settlement};
 use control_routing::group::ClientInfo;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 struct Slot {
     selector: Selector,
@@ -20,6 +21,30 @@ struct Slot {
     client: String,
     proxy: String,
     port: String,
+}
+
+#[derive(Default)]
+struct ClientEffects {
+    names: BTreeMap<u64, String>,
+    ordinals: BTreeMap<String, u64>,
+    refused: BTreeSet<String>,
+    offered: Vec<(Value, MigrationCommand)>,
+}
+impl ClientEffects {
+    fn accept(&mut self, command: &MigrationCommand) -> bool {
+        let (kind, from, to) = match command {
+            MigrationCommand::Redirect(r) => ("redirect", r.from(), r.to().backend_id.as_str()),
+            MigrationCommand::ForceClose(c) => ("force_close", c.assignment(), ""),
+        };
+        let id = &self.names[&from.connection_id];
+        let ordinal = self.ordinals.entry(id.clone()).or_default();
+        *ordinal += 1;
+        let accepted = !self.refused.contains(id);
+        let effect = json!({"kind":kind,"session":id,"operation":format!("{id}/{ordinal}"),
+            "from":from.backend_id,"to":to,"accepted":accepted});
+        self.offered.push((effect, command.clone()));
+        accepted
+    }
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -36,6 +61,8 @@ fn outcome(error: RouteError) -> String {
     }
 }
 
+// One finite external event dispatcher keeps the lifecycle readable in order.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay() -> TestResult {
     let Ok(input) = std::env::var("CPROUTE_API_INPUT") else {
@@ -67,12 +94,23 @@ async fn replay() -> TestResult {
     let mut sessions: BTreeMap<String, Slot> = BTreeMap::new();
     let mut known = BTreeSet::new();
     let mut output = Vec::new();
+    let start = Instant::now();
+    let effects = Arc::new(Mutex::new(ClientEffects::default()));
+    let sink = Arc::clone(&effects);
+    let queue = CommandQueue::with_api_sink(
+        100_000,
+        Box::new(move |command| must(sink.lock()).accept(command)),
+    );
+    let mut operations: BTreeMap<String, (String, MigrationCommand, bool)> = BTreeMap::new();
+    let (_stop, stop) = tokio::sync::watch::channel(false);
     let events = trace["events"].as_array().ok_or("missing events")?;
     for (index, event) in events.iter().enumerate() {
         let id = text(event, "session");
         let op = text(event, "op");
         let mut row =
             json!({"seq":index,"op":op,"session":id,"outcome":"ok","backend":"","effects":[]});
+        let elapsed = event["at_nanos"].as_u64().unwrap_or(0);
+        let now = start + Duration::from_nanos(elapsed);
         match op {
             "health" => {
                 let backends = event["backends"].as_array().ok_or("health backends")?;
@@ -98,19 +136,32 @@ async fn replay() -> TestResult {
                     .collect();
                 known.extend(wanted.iter().cloned());
                 h.fixture.backends(&values);
-                // Await the real source delivery. This barrier checks source
-                // inventory, never a selected group/factor/internal shortlist.
+                // Wait on the public source handles; the adapter never reads
+                // the router's candidate or shortlist to derive expectations.
+                let routing = h.topology.routing_handle();
+                let health = h.topology.health_overlay_handle();
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
-                        if let Ok(candidate) = h.router.capture() {
-                            let seen: BTreeSet<String> = candidate
-                                .routing
+                        if let Some(source) = routing.current() {
+                            let seen: BTreeSet<String> = source
                                 .backends
                                 .backends
                                 .iter()
                                 .map(|b| b.backend_id.to_string())
                                 .collect();
-                            if seen == wanted {
+                            let labels_match = source.backends.backends.iter().all(|b| {
+                                backends.iter().any(|expected| {
+                                    b.backend_id.as_ref()
+                                        == format!("default/{}", text(expected, "address"))
+                                        && json!(&b.backend.labels) == expected["labels"]
+                                })
+                            });
+                            if seen == wanted
+                                && labels_match
+                                && let Some(verdicts) = health.current_for(&source)
+                                && wanted.iter().all(|id| verdicts.get(id).healthy)
+                                && health.still_current_for(&verdicts, &source, &routing)
+                            {
                                 break;
                             }
                         }
@@ -118,6 +169,13 @@ async fn replay() -> TestResult {
                     }
                 })
                 .await?;
+                let candidate = h
+                    .router
+                    .capture()
+                    .map_err(|e| format!("health apply: {e:?}"))?;
+                h.router
+                    .refresh_failover(&candidate, now)
+                    .map_err(|e| format!("failover: {e:?}"))?;
             }
             "config" => {
                 if h.source
@@ -134,6 +192,10 @@ async fn replay() -> TestResult {
                 } else {
                     h.source.deliver();
                     h.applied().await;
+                    let candidate = h.ready().await;
+                    h.router
+                        .refresh_failover(&candidate, now)
+                        .map_err(|e| format!("failover config: {e:?}"))?;
                 }
             }
             "open" => {
@@ -151,6 +213,79 @@ async fn replay() -> TestResult {
                 );
                 assert!(prior.is_none(), "duplicate logical session");
             }
+            "lookup" => match h.router.lookup_backend(text(event, "backend")) {
+                Ok(assignment) => row["backend"] = json!(assignment.backend_id),
+                Err(RouteError::NoBackend) => row["outcome"] = json!("unknown_backend"),
+                Err(error) => row["outcome"] = json!(outcome(error)),
+            },
+            "rehydrate" => {
+                let s = sessions.get_mut(id).ok_or("missing session")?;
+                match s.selector.rehydrate(text(event, "backend")) {
+                    Ok(assignment) => {
+                        row["backend"] = json!(assignment.backend_id);
+                        s.active = Some(assignment.backend_id);
+                        must(effects.lock())
+                            .names
+                            .insert(assignment.connection_id, id.into());
+                    }
+                    Err(RouteError::NoBackend) => row["outcome"] = json!("unknown_backend"),
+                    Err(error) => row["outcome"] = json!(outcome(error)),
+                }
+            }
+            "tick" => {
+                must(effects.lock()).refused = event["refuse"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect();
+                let candidate = h
+                    .router
+                    .capture()
+                    .map_err(|e| format!("tick capture: {e:?}"))?;
+                let clock = RoundClock {
+                    fixed: Some((
+                        now,
+                        now,
+                        1_700_000_000_000_000_000 + i64::try_from(elapsed)?,
+                    )),
+                };
+                h.router
+                    .migration_round(&candidate, &queue, true, &stop, &clock)
+                    .map_err(|e| format!("tick: {e:?}"))?;
+                let mut rows = Vec::new();
+                for (effect, command) in must(effects.lock()).offered.drain(..) {
+                    if effect["accepted"] == true {
+                        assert!(queue.take().is_some());
+                        operations.insert(
+                            text(&effect, "operation").into(),
+                            (text(&effect, "session").into(), command, false),
+                        );
+                    }
+                    rows.push(effect);
+                }
+                assert!(queue.take().is_none());
+                row["effects"] = json!(rows);
+            }
+            "redirect_result" => {
+                let (session, command, completed) = operations
+                    .get_mut(text(event, "operation"))
+                    .ok_or("unknown operation")?;
+                let MigrationCommand::Redirect(redirect) = command else {
+                    return Err("not a redirect".into());
+                };
+                let success = event["success"].as_bool().ok_or("missing success")?;
+                let settlement = h.router.finish_redirect(redirect, success, now);
+                if !*completed && let Some(s) = sessions.get_mut(session) {
+                    assert_eq!(settlement, Settlement::Applied);
+                    if success {
+                        s.active = Some(redirect.to().backend_id.clone());
+                    }
+                } else {
+                    assert_eq!(settlement, Settlement::Ignored);
+                }
+                *completed = true;
+            }
             "next" => {
                 let s = sessions.get_mut(id).ok_or("missing session")?;
                 let client = ClientInfo {
@@ -160,6 +295,9 @@ async fn replay() -> TestResult {
                 match s.selector.next(client, &s.port) {
                     Ok(reservation) => {
                         row["backend"] = json!(reservation.assignment().backend_id);
+                        must(effects.lock())
+                            .names
+                            .insert(reservation.assignment().connection_id, id.into());
                         s.pending = Some(reservation);
                     }
                     Err(error) => row["outcome"] = json!(outcome(error)),
@@ -188,7 +326,7 @@ async fn replay() -> TestResult {
                 let count: u64 = known
                     .iter()
                     .filter_map(|id| h.router.accounting(id))
-                    .map(|a| a.active())
+                    .map(Accounting::active)
                     .sum();
                 row["assignments"] = json!(assignments);
                 row["conn_count"] = json!(count);
@@ -205,7 +343,7 @@ async fn replay() -> TestResult {
         known
             .iter()
             .filter_map(|id| h.router.accounting(id))
-            .map(|a| a.active())
+            .map(Accounting::active)
             .sum::<u64>(),
         0
     );

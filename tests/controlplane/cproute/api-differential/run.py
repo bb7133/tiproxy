@@ -4,6 +4,8 @@
 """One external-API replay/comparison entrypoint; smoke evidence is not corpus acceptance."""
 
 import argparse
+import ast
+import copy
 import hashlib
 import json
 import os
@@ -14,7 +16,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[4]
 MAX_BYTES = 32 * 1024 * 1024
-OPS = {"health", "config", "open", "next", "finish", "close", "checkpoint"}
+OPS = {"health", "config", "open", "next", "finish", "close", "checkpoint", "tick", "redirect_result", "lookup", "rehydrate"}
 
 
 class Difference(ValueError):
@@ -47,21 +49,38 @@ def validate(trace):
     require(isinstance(trace, dict) and set(trace) == {"version", "id", "config", "provenance", "events"}, "INPUT", "trace fields")
     require(type(trace["version"]) is int and trace["version"] == 1 and isinstance(trace["id"], str), "INPUT", "version/id")
     config = trace["config"]
-    require(set(config) == {"policy", "selection", "rule"}, "INPUT", "config fields")
+    require(isinstance(config,dict) and set(config) == {"policy", "selection", "rule"}, "INPUT", "config fields")
     require(config["policy"] in {"connection", "resource", "location"}, "INPUT", "policy")
     require(config["selection"] in {"random", "prefer-idle"}, "INPUT", "selection")
     require(config["rule"] in {"", "client_cidr", "proxy_cidr", "port"}, "INPUT", "rule")
-    require(trace["provenance"].get("kind") in {"synthetic", "recorded"}, "INPUT", "provenance kind")
+    require(isinstance(trace["provenance"],dict) and trace["provenance"].get("kind") in {"synthetic", "recorded"}, "INPUT", "provenance kind")
     events = trace["events"]
     require(isinstance(events, list) and 0 < len(events) <= 100_000, "INPUT", "event count")
-    allowed = {"op", "session", "client", "proxy", "port", "backends", "success", "toml", "expect"}
-    sessions, pending, active = set(), set(), set()
+    allowed = {
+        "health":{"backends"},"config":{"toml"},"open":{"client","proxy","port"},
+        "next":set(),"finish":{"success"},"close":set(),"checkpoint":set(),
+        "tick":{"refuse"},"redirect_result":{"operation","success"},
+        "lookup":{"backend"},"rehydrate":{"backend"},
+    }
+    sessions, pending, active, operations = set(), set(), set(), {}
+    at = 0
     for index, event in enumerate(events):
-        require(isinstance(event, dict) and set(event) <= allowed and event.get("op") in OPS, "INPUT", f"event {index}")
+        require(isinstance(event, dict) and event.get("op") in OPS, "INPUT", f"event {index}")
         op, session = event["op"], event.get("session", "")
+        require(set(event) <= allowed[op] | {"op","session","at_nanos","expect"} and isinstance(session,str),"INPUT",f"event fields {index}")
+        timestamp = event.get("at_nanos",at)
+        require(type(timestamp) is int and at <= timestamp <= 86_400_000_000_000,"INPUT","monotonic public clock")
+        at = timestamp
         expect = event.get("expect")
         require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "exclude_previous"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
         require("exclude_previous" not in expect or (op == "next" and type(expect["exclude_previous"]) is bool), "INPUT", "retry expectation")
+        effects = expect.get("effects",[])
+        require(isinstance(effects,list),"INPUT","effects")
+        for effect in effects:
+            require(isinstance(effect,dict) and set(effect) == {"kind","session","operation","from","to","accepted"},"INPUT","effect fields")
+            require(effect["kind"] in {"redirect","force_close"} and effect["session"] in active and type(effect["accepted"]) is bool,"INPUT","effect owner/acceptance")
+            require(all(isinstance(effect[key],str) for key in ("session","operation","from","to")) and effect["operation"] not in operations,"INPUT","effect identity")
+            operations[effect["operation"]] = effect
         if op == "health":
             backends = event.get("backends")
             require(isinstance(backends, list), "INPUT", "health inventory")
@@ -73,62 +92,90 @@ def validate(trace):
             require(len(set(addresses)) == len(addresses), "INPUT", "duplicate backend")
         elif op == "config":
             require(isinstance(event.get("toml"), str), "INPUT", "config update")
+        elif op == "tick":
+            require(isinstance(event.get("refuse",[]),list) and all(id in active for id in event.get("refuse",[])),"INPUT","effect refusal inputs")
+        elif op == "redirect_result":
+            effect = operations.get(event.get("operation"))
+            require(effect is not None and effect["kind"] == "redirect" and effect["accepted"] and type(event.get("success")) is bool,"INPUT","callback authority")
+            require(session == effect["session"],"INPUT","callback owner")
         elif op == "open":
-            require(isinstance(session, str) and session and session not in sessions, "INPUT", "open identity")
+            require(session and session not in sessions, "INPUT", "open identity")
             require(all(isinstance(event.get(key,""), str) for key in ("client","proxy","port")), "INPUT", "client addresses")
             sessions.add(session)
-        elif op in {"next", "finish", "close"}:
+        elif op in {"next", "finish", "close","rehydrate"}:
             require(session in sessions, "INPUT", f"unknown session {session}")
-            if op == "next":
-                require(session not in pending and session not in active, "INPUT", "next before prior Finish")
+            if op in {"next","rehydrate"}:
+                require(session not in pending and session not in active, "INPUT", "attempt requires idle session")
                 if expect["outcome"] == "ok":
                     exact, legal = expect.get("backend"), expect.get("legal_backends")
                     require((isinstance(exact,str) and bool(exact) and legal is None) or (exact is None and isinstance(legal,list) and legal and all(isinstance(x,str) and x for x in legal) and len(set(legal)) == len(legal)), "INPUT", "declare exact backend or legal set")
-                    pending.add(session)
+                    (pending if op == "next" else active).add(session)
             elif op == "finish":
                 require(session in pending and type(event.get("success")) is bool, "INPUT", "Finish without pending attempt")
                 pending.remove(session)
-                if event["success"]:
-                    active.add(session)
+                if event["success"]: active.add(session)
             else:
                 require(session not in pending, "INPUT", "close requires creation completion")
                 sessions.remove(session)
                 active.discard(session)
+        if op in {"lookup","rehydrate"}:
+            require(isinstance(event.get("backend"),str) and event["backend"],"INPUT","named backend")
     require(not sessions and not pending and not active and events[-1]["op"] == "checkpoint", "INPUT", "trace must end at an empty checkpoint")
+
+
+def causal(effects):
+    require(isinstance(effects,list),"EFFECTS","effect array")
+    per_session = {}
+    for effect in effects:
+        require(isinstance(effect,dict) and isinstance(effect.get("session"),str),"EFFECTS","effect identity")
+        require(set(effect) == {"kind","session","operation","from","to","accepted"} and type(effect["accepted"]) is bool and all(isinstance(effect[k],str) for k in ("kind","session","operation","from","to")),"EFFECTS","effect fields/types")
+        per_session.setdefault(effect["session"],[]).append(effect)
+    return per_session
 
 
 def observe(trace, rows, engine):
     events = trace["events"]
     require(isinstance(rows,list) and len(rows) == len(events), "MISSING_RESULT", engine)
-    pending, ledger, previous = {}, {}, {}
+    pending, ledger, previous, operations, settled = {}, {}, {}, {}, set()
     for index, (event,row) in enumerate(zip(events,rows)):
         op, session, expect = event["op"], event.get("session",""), event["expect"]
         fields = {"seq","op","session","outcome","backend","effects"} | ({"assignments","conn_count"} if op == "checkpoint" else set())
         require(isinstance(row,dict) and set(row) == fields and type(row.get("seq")) is int and row.get("seq") == index and row.get("op") == op and row.get("session") == session, "RESULT_IDENTITY", f"{engine} event {index}")
         require(row.get("outcome") == expect["outcome"], "ERROR_OUTCOME", f"{engine} event {index}: {row.get('outcome')} != {expect['outcome']}")
-        require(row.get("effects") == expect.get("effects",[]), "EFFECTS", f"{engine} event {index}")
-        if op == "next" and row["outcome"] == "ok":
+        require(causal(row["effects"]) == causal(expect.get("effects",[])), "EFFECTS", f"{engine} event {index}")
+        for effect in row["effects"]:
+            require(effect["from"] == ledger.get(effect["session"]) and effect["operation"] not in operations,"EFFECT_LEDGER",f"{engine} {index}")
+            operations[effect["operation"]] = effect
+            if not effect["accepted"]: settled.add(effect["operation"])
+        if op in {"next","lookup","rehydrate"} and row["outcome"] == "ok":
             backend = row.get("backend")
             if "backend" in expect:
                 require(backend == expect["backend"], "BACKEND_RESULT", f"{engine} event {index}")
             else:
-                require(backend in expect["legal_backends"], "ILLEGAL_CHOICE", f"{engine} event {index}")
+                require(backend in expect.get("legal_backends",[]), "ILLEGAL_CHOICE", f"{engine} event {index}")
             if expect.get("exclude_previous"):
                 require(session in previous and backend != previous[session], "RETRY_RESULT", f"{engine} event {index} repeated excluded result")
-            pending[session] = backend
-            previous[session] = backend
+            if op == "next":
+                pending[session] = backend
+                previous[session] = backend
+            elif op == "rehydrate": ledger[session] = backend
         else:
             require(row.get("backend") == "", "BACKEND_RESULT", f"unexpected {engine} backend at {index}")
         if op == "finish":
             require(session in pending, "LEDGER", f"{engine} missing attempt")
             backend = pending.pop(session)
-            if event["success"]:
-                ledger[session] = backend
+            if event["success"]: ledger[session] = backend
+        elif op == "redirect_result":
+            key = event["operation"]
+            require(key in operations,"EFFECT_LEDGER",f"{engine} missing accepted effect")
+            if key not in settled and session in ledger and event["success"]: ledger[session] = operations[key]["to"]
+            settled.add(key)
         elif op == "close":
             ledger.pop(session,None)
+            settled.update(key for key,effect in operations.items() if effect["session"] == session)
         elif op == "checkpoint":
             require(row.get("assignments") == ledger and type(row.get("conn_count")) is int and row["conn_count"] == len(ledger), "LEDGER", f"{engine} checkpoint {index}")
-    require(not ledger and not pending, "LEDGER", f"{engine} final state")
+    require(not ledger and not pending and set(operations) <= settled, "LEDGER", f"{engine} final state")
 
 
 def compare(trace, go, rust):
@@ -139,6 +186,88 @@ def compare(trace, go, rust):
     # Legal random backend divergence is retained in raw results; never feed
     # one engine's result into the other's input or compare private scores.
     return {"events":len(trace["events"]),"violations":0,"provenance":trace["provenance"]["kind"]}
+
+
+def comparator_checks(trace, reference, destination):
+    """Eight mutations of this comparator, one external assertion per row.
+
+    An invalid observation must be rejected by the ordinary checker. Disabling
+    the targeted check must make that assertion fail (the mutation is killed);
+    restoring the original source must reject it again. The raw adapter output
+    used as the valid control is retained, not manufactured by the comparator.
+    """
+    source = Path(__file__).read_text()
+    rows = []
+    cases = [
+        ("wrong_backend","BACKEND_RESULT"),
+        ("illegal_random_backend","ILLEGAL_CHOICE"),
+        ("erase_error_distinction","ERROR_OUTCOME"),
+        ("omit_retry_result_check","RETRY_RESULT"),
+        ("drop_effect","EFFECTS"),
+        ("duplicate_terminal_result","MISSING_RESULT"),
+        ("ignore_final_ledger","LEDGER"),
+        ("accept_missing_input","INPUT"),
+    ]
+    destination.mkdir()
+    for name,code in cases:
+        bad_trace, bad = copy.deepcopy(trace), copy.deepcopy(reference)
+        if name == "wrong_backend":
+            index = next(i for i,e in enumerate(trace["events"]) if e["op"] == "lookup" and e["expect"]["outcome"] == "ok")
+            bad[index]["backend"] = "default/wrong"
+        elif name == "illegal_random_backend":
+            index = next(i for i,e in enumerate(trace["events"]) if "legal_backends" in e["expect"])
+            bad[index]["backend"] = "default/illegal"
+        elif name == "erase_error_distinction":
+            index = next(i for i,e in enumerate(trace["events"]) if e["expect"]["outcome"] == "no_backend")
+            bad[index]["outcome"] = "wrapped_no_backend"
+        elif name == "omit_retry_result_check":
+            index = next(i for i,e in enumerate(trace["events"]) if e["expect"].get("exclude_previous"))
+            session = trace["events"][index]["session"]
+            old = next(r["backend"] for r in reversed(bad[:index]) if r["op"] == "next" and r["session"] == session)
+            bad[index]["backend"] = old
+            for row in bad[index+1:]:
+                if row["op"] == "checkpoint" and session in row["assignments"]: row["assignments"][session] = old
+                if row["op"] == "close" and row["session"] == session: break
+        elif name == "drop_effect":
+            index = next(i for i,r in enumerate(bad) if r["effects"] and not r["effects"][0]["accepted"])
+            bad[index]["effects"] = []
+        elif name == "duplicate_terminal_result":
+            bad.append(copy.deepcopy(bad[-1]))
+        elif name == "ignore_final_ledger":
+            bad[-1]["conn_count"] = 1
+        else:
+            # The complete event stream is required; a missing header also
+            # fails at the sole import boundary, before any adapter runs.
+            bad_trace.pop("id")
+        def rejects(checker):
+            try: checker(bad_trace,bad,reference)
+            except ValueError as error:
+                require(str(error).startswith(code+":"),"MUTATION_ASSERTION",f"{name}: unexpected {error}")
+                return True
+            return False
+        require(rejects(compare),"MUTATION_ASSERTION",f"{name}: original accepted invalid observation")
+        class Disable(ast.NodeTransformer):
+            def visit_Call(self,node):
+                self.generic_visit(node)
+                if isinstance(node.func,ast.Name) and node.func.id == "require" and len(node.args) >= 2 and isinstance(node.args[1],ast.Constant) and node.args[1].value == code:
+                    return ast.copy_location(ast.Constant(value=None),node)
+                return node
+        tree = ast.fix_missing_locations(Disable().visit(ast.parse(source)))
+        mutant_source = ast.unparse(tree)
+        mutant = destination / (name+".py")
+        mutant.write_text(mutant_source+"\n")
+        scope = {"__name__":"comparator_mutant","__file__":str(Path(__file__))}
+        exec(compile(tree,str(mutant),"exec"),scope)
+        # This is the intended negative assertion: the disabled comparator
+        # admits the invalid observation, so its rejection test fails.
+        require(not rejects(scope["compare"]),"MUTATION_NOT_EXERCISED",name)
+        require(rejects(compare),"RESTORATION",name)
+        compare(trace,reference,reference)
+        rows.append({"fault":name,"assertion":code,"mutant_assertion":"failed_as_required",
+                     "restored":"passed","mutant_sha256":hashlib.sha256(mutant.read_bytes()).hexdigest()})
+    result = {"source_sha256":hashlib.sha256(source.encode()).hexdigest(),"faults":rows,"passed":len(rows)}
+    (destination/"results.json").write_text(json.dumps(result,indent=2)+"\n")
+    return result
 
 
 def execute(command, env, log, timeout):
@@ -163,6 +292,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace",type=Path)
     parser.add_argument("--output",type=Path,required=True)
+    parser.add_argument("--comparator-check",action="store_true")
     args = parser.parse_args()
     trace = load(args.trace)
     validate(trace)
@@ -170,19 +300,36 @@ def main():
     destination.mkdir(parents=True,exist_ok=False)
     # Deliberately omit oracle expectations and provenance from engine inputs.
     inputs = {key:trace[key] for key in ("version","id","config")}
-    inputs["events"] = [{k:v for k,v in event.items() if k != "expect"} for event in trace["events"]]
+    inputs["events"] = []
+    timestamp = 0
+    for event in trace["events"]:
+        timestamp = event.get("at_nanos",timestamp)
+        inputs["events"].append({**{k:v for k,v in event.items() if k != "expect"},"at_nanos":timestamp})
+    # Test build only: every router/group time read sees the one public event
+    # clock. No caller/getter trace is introduced, and random tickets elsewhere
+    # remain independent real wall-clock reads in both engines.
+    replacements = {}
+    for name in ("group.go","router_score.go"):
+        original = ROOT / "pkg/balance/router" / name
+        replacement = destination / name
+        replacement.write_text(original.read_text().replace("time.Now()","apiReplayNow()"))
+        replacements[str(original)] = str(replacement)
+    overlay = destination / "go-overlay.json"
+    overlay.write_text(json.dumps({"Replace":replacements},sort_keys=True))
     source = destination / "input.json"
     source.write_text(json.dumps(inputs,sort_keys=True))
     records, failure = {}, None
     result = {"provenance":trace["provenance"]["kind"],"status":"failed"}
     try:
         for engine, command in (
-            ("go",["go","test","-race","./pkg/balance/router","-run","^TestRouterAPIDifferential$","-count=1"]),
+            ("go",["go","test","-overlay",str(overlay),"-race","./pkg/balance/router","-run","^TestRouterAPIDifferential$","-count=1"]),
             ("rust",["cargo","test","--locked","--manifest-path","rust/Cargo.toml","-p","control-router","tests::api_differential::replay","--","--exact"]),
         ):
             env = {**os.environ,"CPROUTE_API_INPUT":str(source),"CPROUTE_API_OUTPUT":str(destination/f"{engine}.json")}
             records[engine] = execute(command,env,destination/f"{engine}.log",900)
         result.update(compare(trace,load(destination/"go.json"),load(destination/"rust.json")))
+        if args.comparator_check:
+            result["comparator"] = comparator_checks(trace,load(destination/"go.json"),destination/"comparator")
         result["status"] = "passed"
     except (Difference,OSError) as error:
         failure = error
@@ -196,7 +343,7 @@ def main():
                        "trace_sha256":hashlib.sha256(args.trace.read_bytes()).hexdigest(),
                        "input_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"engines":records,
                        "files":{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in destination.iterdir() if p.is_file()},
-                       "acceptance":{"recorded":0,"rounds":0,"special_suites":0,"comparator_mutants":0}})
+                       "acceptance":{"recorded":0,"rounds":0,"special_suites":0,"comparator_mutants":result.get("comparator",{}).get("passed",0)}})
         (destination/"manifest.json").write_text(json.dumps(result,indent=2)+"\n")
         print(json.dumps(result,indent=2))
     if failure:

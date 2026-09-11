@@ -166,6 +166,347 @@
       "expect": {
         "outcome": "ok"
       }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {}
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "migrate"
+    },
+    {
+      "op": "next",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4000"
+      },
+      "session": "migrate"
+    },
+    {
+      "op": "finish",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "migrate"
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {}
+        },
+        {
+          "address": "127.0.0.1:4001",
+          "labels": {}
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=10\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "refuse": [
+        "migrate"
+      ],
+      "expect": {
+        "outcome": "ok",
+        "effects": [
+          {
+            "session": "migrate",
+            "operation": "migrate/1",
+            "kind": "redirect",
+            "from": "default/127.0.0.1:4000",
+            "to": "default/127.0.0.1:4001",
+            "accepted": false
+          }
+        ]
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 2999999999,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 3000000000,
+      "expect": {
+        "outcome": "ok",
+        "effects": [
+          {
+            "session": "migrate",
+            "operation": "migrate/2",
+            "kind": "redirect",
+            "from": "default/127.0.0.1:4000",
+            "to": "default/127.0.0.1:4001",
+            "accepted": true
+          }
+        ]
+      }
+    },
+    {
+      "op": "redirect_result",
+      "operation": "migrate/2",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "migrate"
+    },
+    {
+      "op": "tick",
+      "at_nanos": 6000000000,
+      "expect": {
+        "outcome": "ok",
+        "effects": [
+          {
+            "session": "migrate",
+            "operation": "migrate/3",
+            "kind": "redirect",
+            "from": "default/127.0.0.1:4000",
+            "to": "default/127.0.0.1:4001",
+            "accepted": true
+          }
+        ]
+      }
+    },
+    {
+      "op": "redirect_result",
+      "operation": "migrate/3",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "migrate"
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "migrate"
+    },
+    {
+      "op": "redirect_result",
+      "operation": "migrate/3",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "migrate"
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[proxy]\nfail-backend-list=[]\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {}
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "drain"
+    },
+    {
+      "op": "next",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4000"
+      },
+      "session": "drain"
+    },
+    {
+      "op": "finish",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "drain"
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {}
+        },
+        {
+          "address": "127.0.0.1:4001",
+          "labels": {}
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 7000000000,
+      "expect": {
+        "outcome": "ok",
+        "effects": [
+          {
+            "session": "drain",
+            "operation": "drain/1",
+            "kind": "redirect",
+            "from": "default/127.0.0.1:4000",
+            "to": "default/127.0.0.1:4001",
+            "accepted": true
+          },
+          {
+            "session": "drain",
+            "operation": "drain/2",
+            "kind": "force_close",
+            "from": "default/127.0.0.1:4000",
+            "to": "",
+            "accepted": true
+          }
+        ]
+      }
+    },
+    {
+      "op": "close",
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "drain"
+    },
+    {
+      "op": "redirect_result",
+      "operation": "drain/1",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "drain"
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[proxy]\nfail-backend-list=[]\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "restore"
+    },
+    {
+      "op": "rehydrate",
+      "backend": "default/unknown",
+      "expect": {
+        "outcome": "unknown_backend"
+      },
+      "session": "restore"
+    },
+    {
+      "op": "lookup",
+      "backend": "default/unknown",
+      "expect": {
+        "outcome": "unknown_backend"
+      }
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4000",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "rehydrate",
+      "backend": "default/127.0.0.1:4000",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4000"
+      },
+      "session": "restore"
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "expect": {
+        "outcome": "ok"
+      },
+      "session": "restore"
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
     }
   ]
 }

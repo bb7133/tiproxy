@@ -10,7 +10,9 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/pkg/balance/factor"
@@ -34,14 +36,70 @@ type apiTraceBackend struct {
 }
 
 type apiTraceEvent struct {
-	Op       string            `json:"op"`
-	Session  string            `json:"session,omitempty"`
-	Client   string            `json:"client,omitempty"`
-	Proxy    string            `json:"proxy,omitempty"`
-	Port     string            `json:"port,omitempty"`
-	Backends []apiTraceBackend `json:"backends,omitempty"`
-	Success  bool              `json:"success,omitempty"`
-	TOML     string            `json:"toml,omitempty"`
+	Op        string            `json:"op"`
+	Session   string            `json:"session,omitempty"`
+	Client    string            `json:"client,omitempty"`
+	Proxy     string            `json:"proxy,omitempty"`
+	Port      string            `json:"port,omitempty"`
+	Backends  []apiTraceBackend `json:"backends,omitempty"`
+	Success   bool              `json:"success,omitempty"`
+	TOML      string            `json:"toml,omitempty"`
+	AtNanos   int64             `json:"at_nanos,omitempty"`
+	Backend   string            `json:"backend,omitempty"`
+	Operation string            `json:"operation,omitempty"`
+	Refuse    []string          `json:"refuse,omitempty"`
+}
+
+// The runner's Go build overlay substitutes only clock calls in router/group.
+// One public event timestamp drives the clock; no internal read sequence is recorded.
+var apiReplayNanos atomic.Int64
+
+//nolint:unused // Called by the generated test build overlay, absent from ordinary builds.
+func apiReplayNow() time.Time { return time.Unix(1_700_000_000, apiReplayNanos.Load()) }
+
+type apiEffect struct {
+	Kind      string `json:"kind"`
+	Session   string `json:"session"`
+	Operation string `json:"operation"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Accepted  bool   `json:"accepted"`
+}
+type apiOperation struct {
+	effect    apiEffect
+	conn      *apiConn
+	from, to  BackendInst
+	completed bool
+}
+type apiConn struct {
+	*mockRedirectableConn
+	id         string
+	ordinal    int
+	refuse     bool
+	effects    *[]apiEffect
+	operations map[string]*apiOperation
+}
+
+func (c *apiConn) record(kind string, to BackendInst, accepted bool) {
+	c.ordinal++
+	effect := apiEffect{Kind: kind, Session: c.id, Operation: fmt.Sprintf("%s/%d", c.id, c.ordinal), From: c.from.ID(), Accepted: accepted}
+	if to != nil {
+		effect.To = to.ID()
+	}
+	*c.effects = append(*c.effects, effect)
+	if accepted {
+		c.operations[effect.Operation] = &apiOperation{effect: effect, conn: c, from: c.from, to: to}
+	}
+}
+func (c *apiConn) Redirect(to BackendInst) bool {
+	accepted := !c.refuse && c.mockRedirectableConn.Redirect(to)
+	c.record("redirect", to, accepted)
+	return accepted
+}
+func (c *apiConn) ForceClose() bool {
+	accepted := !c.refuse && c.mockRedirectableConn.ForceClose()
+	c.record("force_close", nil, accepted)
+	return accepted
 }
 
 type apiEmptyMetrics struct{}
@@ -116,13 +174,17 @@ func TestRouterAPIDifferential(t *testing.T) {
 	t.Cleanup(r.Close)
 	type slot struct {
 		selector BackendSelector
-		conn     *mockRedirectableConn
+		conn     *apiConn
 		current  BackendInst
 		active   bool
 	}
 	sessions := make(map[string]*slot)
 	output := make([]map[string]any, 0, len(trace.Events))
+	effects := []apiEffect{}
+	operations := make(map[string]*apiOperation)
 	for index, event := range trace.Events {
+		apiReplayNanos.Store(event.AtNanos)
+		effects = []apiEffect{}
 		row := map[string]any{"seq": index, "op": event.Op, "session": event.Session, "outcome": "ok", "backend": "", "effects": []any{}}
 		s := sessions[event.Session]
 		switch event.Op {
@@ -144,7 +206,51 @@ func TestRouterAPIDifferential(t *testing.T) {
 			require.Nil(t, s, "duplicate logical session")
 			sessions[event.Session] = &slot{selector: r.GetBackendSelector(ClientInfo{
 				ClientAddr: apiClientAddress(event.Client), ProxyAddr: apiClientAddress(event.Proxy), ListenerPort: event.Port,
-			}), conn: newMockRedirectableConn(t, uint64(index+1))}
+			}), conn: &apiConn{mockRedirectableConn: newMockRedirectableConn(t, uint64(index+1)), id: event.Session, effects: &effects, operations: operations}}
+		case "lookup":
+			backend, ok := r.LookupBackend(event.Backend)
+			if !ok {
+				row["outcome"] = "unknown_backend"
+			} else {
+				row["backend"] = backend.ID()
+			}
+		case "rehydrate":
+			require.NotNil(t, s)
+			require.False(t, s.active)
+			backend, ok := r.RehydrateConn(event.Backend, s.conn)
+			if !ok {
+				row["outcome"] = "unknown_backend"
+			} else {
+				row["backend"] = backend.ID()
+				s.conn.from = backend
+				s.active = true
+			}
+		case "tick":
+			for id, live := range sessions {
+				live.conn.refuse = false
+				for _, refused := range event.Refuse {
+					if id == refused {
+						live.conn.refuse = true
+					}
+				}
+			}
+			r.rebalance(context.Background())
+		case "redirect_result":
+			operation := operations[event.Operation]
+			require.NotNil(t, operation)
+			require.Equal(t, "redirect", operation.effect.Kind)
+			if event.Success {
+				require.NoError(t, operation.conn.receiver.OnRedirectSucceed(operation.from.ID(), operation.to.ID(), operation.conn))
+			} else {
+				require.NoError(t, operation.conn.receiver.OnRedirectFail(operation.from.ID(), operation.to.ID(), operation.conn))
+			}
+			if !operation.completed && sessions[operation.effect.Session] != nil {
+				if event.Success {
+					operation.conn.from = operation.to
+				}
+				operation.conn.to = nil
+			}
+			operation.completed = true
 		case "next":
 			require.NotNil(t, s)
 			backend, routeErr := s.selector.Next()
@@ -182,6 +288,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 		default:
 			t.Fatalf("unsupported API input %q", event.Op)
 		}
+		row["effects"] = effects
 		output = append(output, row)
 	}
 	require.Empty(t, sessions, "trace must settle and close all logical sessions")

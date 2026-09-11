@@ -220,6 +220,45 @@ impl Router {
         state.ledger.open().map_err(Into::into)
     }
 
+    /// Looks up a known assignment without selecting or charging a connection.
+    /// Retained unhealthy backends remain addressable while they own sessions.
+    /// # Errors
+    /// Returns source/admission errors or `NoBackend` for an unknown identity.
+    pub fn lookup_backend(&self, id: &str) -> Result<RouteAssignment, RouteError> {
+        let candidate = self.capture()?;
+        let mut state = self.lock();
+        self.sources.validate(&candidate)?;
+        state.refresh(&candidate)?;
+        let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
+        let result = assignment(&backend.source, candidate.health.get(id).local);
+        self.sources.validate(&candidate)?;
+        Ok(result)
+    }
+
+    /// Restores an existing connection onto its named backend without selection.
+    /// The supplied session must be idle. The whole charge and activation is
+    /// atomic; duplicate restoration cannot charge an already active session.
+    /// # Errors
+    /// Returns source/session errors or `NoBackend` for an unknown backend.
+    pub fn rehydrate(&self, session: &Session, id: &str) -> Result<RouteAssignment, RouteError> {
+        let candidate = self.capture()?;
+        let mut state = self.lock();
+        self.sources.validate(&candidate)?;
+        state.refresh(&candidate)?;
+        if state.ledger.pending(session)?.is_some() {
+            return Err(RouteError::AlreadyActive);
+        }
+        let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
+        let account = Arc::clone(&backend.account);
+        let result = assignment(&backend.source, candidate.health.get(id).local);
+        self.sources.validate(&candidate)?;
+        let reservation = state.ledger.reserve(session, &account, result)?;
+        let result = reservation.assignment().clone();
+        let settled = state.ledger.finish(&reservation, true);
+        debug_assert_eq!(settled, Settlement::Applied);
+        Ok(result)
+    }
+
     /// Captures candidate C/R/H inputs without retaining authority.
     ///
     /// # Errors

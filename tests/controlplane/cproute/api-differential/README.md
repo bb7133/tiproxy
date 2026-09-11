@@ -33,7 +33,7 @@ TiDB/PD/Prometheus sources, preserving values at these external boundaries.
 Implementation is limited to three increments of the same replacement PR:
 
 1. Common input validation, Go/Rust API adapters and basic selection/retry/
-   Finish/close comparison. This initial smoke has 19 events; it verifies empty
+   Finish/close comparison. The initial smoke had 19 events; it verifies empty
    initialization, two-backend selection/retry, unique selection after removal,
    invalid config rejection and the final empty connection ledger.
 2. External health/config/metric/error inputs, migration/close callbacks,
@@ -49,3 +49,20 @@ it does not silently treat missing implementation as a passing observation.
 Old instrumentation deletion stays in a separate PR after replacement
 acceptance. No old per-getter, caller-envelope or per-boundary fault work is
 part of these increments.
+
+The next adapter delta expands smoke to 55 events. It includes a refused
+redirect, the three-second cooldown boundary, failed and successful terminal
+callbacks, a redirect followed by force-close and late completion, and named
+lookup/rehydration with unknown-backend rejection. These remain synthetic.
+The single comparator groups effects by logical session, retaining each
+session's causal order while permitting independent sessions to commute.
+`--comparator-check` mutates this comparator at eight labelled assertions and
+restores it against the retained actual Go output. The artifact includes each
+mutated source and verdict; it does not create per-API mutation families.
+
+Go uses a build overlay for the one logical event clock in router/group code;
+all values and overlay hashes are preserved. No private state is seeded and
+no clock-read tape is recorded. Rust uses its existing test round clock.
+Rust's new lookup/rehydration methods operate on its real source and ledger,
+without routing a new selection; duplicate or non-idle restoration is rejected.
+Health readiness is checked through public topology/health source handles.
