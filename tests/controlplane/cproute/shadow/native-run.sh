@@ -36,6 +36,9 @@ bash tests/controlplane/cproute/shadow/route-hooks-run.sh
 bash tests/controlplane/cproute/shadow/selector-core-run.sh
 # Actual routeOnce Group results feed the selector; router metadata is not installed.
 bash tests/controlplane/cproute/shadow/selector-route-run.sh
+# Router metadata refreshes are rebuilt independently from actual health-loop
+# inputs and read values; the private metadata-captured factory is fixture-only.
+bash tests/controlplane/cproute/shadow/metadata-run.sh
 cargo build --locked --manifest-path rust/Cargo.toml -p legacy-router-shadow --example live_socket_check
 export CP_ROUTE_LIVE_SOCKET_CHECK="$root/rust/target/debug/examples/live_socket_check"
 go test ./pkg/balance/router -run '^TestNativeObservationSocketSettlement$' -count=1 -v

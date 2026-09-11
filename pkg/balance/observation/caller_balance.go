@@ -52,7 +52,7 @@ func (c *Caller) CaptureGroupBalance(id, group uint64, members []uint64) bool {
 	if !c.writable() {
 		return false
 	}
-	if id == 0 || group == 0 || c.length != 0 || c.evaluations != 0 || c.batches != 0 || c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 {
+	if id == 0 || group == 0 || c.length != 0 || c.evaluations != 0 || c.batches != 0 || c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.metadata.Kind != 0 {
 		c.Fail(Malformed)
 		return false
 	}

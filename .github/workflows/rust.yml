@@ -441,6 +441,7 @@ jobs:
           CP_ROUTE_ROUTE_HOOK_EVIDENCE: ${{ runner.temp }}/route-hook-evidence
           CP_ROUTE_SELECTOR_EVIDENCE: ${{ runner.temp }}/selector-core-evidence
           CP_ROUTE_SELECTOR_ROUTE_EVIDENCE: ${{ runner.temp }}/selector-route-evidence
+          CP_ROUTE_METADATA_EVIDENCE: ${{ runner.temp }}/metadata-evidence
         run: make controlplane-cproute-native-evidence
       - name: Upload actual Group Route checkpoint evidence
         if: always()
@@ -466,6 +467,15 @@ jobs:
         with:
           name: selector-route-${{ github.sha }}
           path: ${{ runner.temp }}/selector-route-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload independent router metadata rebuild evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metadata-${{ github.sha }}
+          path: ${{ runner.temp }}/metadata-evidence
           if-no-files-found: warn
           retention-days: 14
 

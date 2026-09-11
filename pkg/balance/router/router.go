@@ -119,6 +119,9 @@ type backendWrapper struct {
 	// The group that this backend belongs to.
 	group         *Group
 	observationID uint64 // diagnostic incarnation, protected by its group lock
+	// accounted is set by the first Group Account event. Metadata capture may
+	// assign observationID earlier for a backend that has no group yet.
+	accounted bool
 }
 
 func newBackendWrapper(id string, health observer.BackendHealth) *backendWrapper {

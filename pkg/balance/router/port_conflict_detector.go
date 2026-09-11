@@ -47,3 +47,8 @@ func (v *portConflictDetector) groupFor(port string) (*Group, error) {
 	}
 	return v.routes[port], nil
 }
+
+// conflictCount reports how many listener ports are blocked by cluster conflicts.
+func (v *portConflictDetector) conflictCount() int {
+	return len(v.blocked)
+}

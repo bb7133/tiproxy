@@ -210,14 +210,28 @@ func (g *Group) Intersect(values []string) bool {
 }
 
 // Backend CIDRs may change anytime.
-func (g *Group) RefreshCidr() {
+// RefreshCidr recomputes CIDR values from members. It reports whether the
+// refreshed values parsed; on failure the previously parsed networks stay in
+// effect while g.values already holds the new raw values.
+func (g *Group) RefreshCidr() bool {
+	return g.refreshCidrObserved(nil)
+}
+
+// refreshCidrObserved is RefreshCidr with a metadata witness taken inside the
+// Group lock: the frame is leased before the first member read, every actual
+// Cidr() read is copied where it happens, and the stored result closes it.
+func (g *Group) refreshCidrObserved(observe *refreshObserver) (parsed bool) {
 	g.Lock()
 	defer g.Unlock()
+	parsed = true
 	switch g.matchType {
 	case MatchClientCIDR, MatchProxyCIDR:
+		observe.begin(g, true)
+		defer observe.cleanup()
 		valueMap := make(map[string]struct{}, len(g.values))
 		for _, b := range g.backends {
 			cidrs := b.Cidr()
+			observe.member(b.observationID, cidrs)
 			for _, cidr := range cidrs {
 				valueMap[cidr] = struct{}{}
 			}
@@ -229,23 +243,44 @@ func (g *Group) RefreshCidr() {
 		g.values = values
 		if err := g.parseValues(); err != nil {
 			g.lg.Error("failed to parse values", zap.Error(err))
+			parsed = false
 		}
+		observe.result(values, parsed)
+		return parsed
 	}
+	observe.begin(g, false)
+	defer observe.cleanup()
+	observe.result(nil, true)
+	return parsed
 }
 
 func (g *Group) AddBackend(backendID string, backend *backendWrapper) {
+	g.addBackendObserved(backendID, backend, nil)
+}
+
+// addBackendObserved runs observe while the Group lock is still held, so a
+// metadata witness for this decision is sequenced before any later callback.
+func (g *Group) addBackendObserved(backendID string, backend *backendWrapper, observe func()) {
 	g.Lock()
 	defer g.Unlock()
 	g.backends[backendID] = backend
 	backend.group = g
 	g.observeAccount(backend)
+	if observe != nil {
+		observe()
+	}
 }
 
 // removeBackendIfIdle removes the backend from the group only if it has no connections and no
-// pending incoming/outgoing scores.
-func (g *Group) removeBackendIfIdle(backendID string, backend *backendWrapper) (removed, empty bool) {
+// pending incoming/outgoing scores. observe(removed, empty), when set, runs
+// before the Group lock is released: the idle decision and its witness share
+// one critical section, so a connection callback cannot slip between them.
+func (g *Group) removeBackendIfIdle(backendID string, backend *backendWrapper, observe func(removed, empty bool)) (removed, empty bool) {
 	g.Lock()
 	defer g.Unlock()
+	if observe != nil {
+		defer func() { observe(removed, empty) }()
+	}
 	if backend.connList.Len() != 0 || backend.connScore > 0 {
 		return false, false
 	}

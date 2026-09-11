@@ -10,7 +10,7 @@ mod selection_wire;
 use crate::{Error, native::Decimal};
 use control_router::shadow::{
     Epoch,
-    live::caller::{Budget, MAX_CALLER_FRAME, balance, finish, pass, route, selection},
+    live::caller::{Budget, MAX_CALLER_FRAME, balance, finish, metadata, pass, route, selection},
 };
 use control_routing::go_time::Origin;
 use serde::{
@@ -85,6 +85,60 @@ enum Payload {
         balanced: u16,
         closed: u16,
     },
+    #[serde(rename = "metadata_begin")]
+    MetadataBegin {
+        generation: Decimal,
+        observer_error: u8,
+        rule: u8,
+        inputs: Vec<MetadataInput>,
+    },
+    #[serde(rename = "metadata_assign")]
+    MetadataAssign {
+        generation: Decimal,
+        index: u16,
+        account: Decimal,
+        group: Decimal,
+        removed: bool,
+        created: bool,
+        values_read: bool,
+        values: Vec<String>,
+    },
+    #[serde(rename = "metadata_refresh")]
+    MetadataRefresh {
+        generation: Decimal,
+        group: Decimal,
+        values_read: bool,
+        members: Vec<MetadataMember>,
+        values: Vec<String>,
+        parsed: bool,
+    },
+    #[serde(rename = "metadata_end")]
+    MetadataEnd {
+        generation: Decimal,
+        support_redirection: bool,
+        groups: u16,
+        created: u16,
+        removed: u16,
+        refresh_failed: u16,
+        conflicts: u16,
+    },
+}
+/// One member `Cidr()` read inside `RefreshCidr`, at its read site.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataMember {
+    account: Decimal,
+    values: Vec<String>,
+}
+/// One health-loop input; grouping values travel with the decision that read
+/// them, and a nonzero account is the held-wrapper statement.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataInput {
+    account: Decimal,
+    healthy: bool,
+    support_redirection: bool,
+    present: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,69 +190,75 @@ impl Wire {
         if self.span.0 != 1 {
             return Err(Error::Schema);
         }
-        let event = match self.payload {
-            Payload::SelectorBegin(value) => {
-                return Ok(Frame::Selector(value.domain(
-                    epoch,
-                    self.sequence.0,
-                    false,
-                )?));
-            }
-            Payload::SelectorEnd(value) => {
-                return Ok(Frame::Selector(value.domain(epoch, self.sequence.0)?));
-            }
-            Payload::SelectorClose(value) => {
-                return Ok(Frame::Selector(value.domain(
-                    epoch,
-                    self.sequence.0,
-                    true,
-                )?));
-            }
-            Payload::GroupFinish(_) | Payload::GroupRoute(_) | Payload::GroupBalance(_) => {
+        if let Some(event) = metadata_event(&self.payload)? {
+            return Ok(Frame::Metadata(metadata::Boundary {
+                epoch,
+                sequence: self.sequence.0,
+                event,
+            }));
+        }
+        span_one_boundary(self.payload, epoch, self.sequence.0)
+    }
+}
+
+/// Convert the remaining span-one payloads: selector boundaries and pass boundaries.
+fn span_one_boundary(payload: Payload, epoch: Epoch, sequence: u64) -> Result<Frame, Error> {
+    let event = match payload {
+        Payload::SelectorBegin(value) => {
+            return Ok(Frame::Selector(value.domain(epoch, sequence, false)?));
+        }
+        Payload::SelectorEnd(value) => {
+            return Ok(Frame::Selector(value.domain(epoch, sequence)?));
+        }
+        Payload::SelectorClose(value) => {
+            return Ok(Frame::Selector(value.domain(epoch, sequence, true)?));
+        }
+        Payload::GroupFinish(_)
+        | Payload::GroupRoute(_)
+        | Payload::GroupBalance(_)
+        | Payload::MetadataBegin { .. }
+        | Payload::MetadataAssign { .. }
+        | Payload::MetadataRefresh { .. }
+        | Payload::MetadataEnd { .. } => {
+            return Err(Error::Schema);
+        }
+        Payload::Begin {
+            pass,
+            support_redirection,
+            groups,
+        } => {
+            if pass.0 == 0 {
                 return Err(Error::Schema);
             }
-            Payload::Begin {
-                pass,
+            pass::Event::Begin(pass::Begin {
+                pass: pass.0,
                 support_redirection,
-                groups,
-            } => {
-                if pass.0 == 0 {
-                    return Err(Error::Schema);
-                }
-                pass::Event::Begin(pass::Begin {
-                    pass: pass.0,
-                    support_redirection,
-                    groups: groups.0,
-                })
+                groups: groups.0,
+            })
+        }
+        Payload::End {
+            pass,
+            balanced,
+            closed,
+        } => {
+            if pass.0 == 0
+                || usize::from(balanced) > pass::MAX_GROUPS
+                || usize::from(closed) > pass::MAX_GROUPS
+            {
+                return Err(Error::Schema);
             }
-            Payload::End {
-                pass,
+            pass::Event::End(pass::End {
+                pass: pass.0,
                 balanced,
                 closed,
-            } => {
-                if pass.0 == 0
-                    || usize::from(balanced) > pass::MAX_GROUPS
-                    || usize::from(closed) > pass::MAX_GROUPS
-                {
-                    return Err(Error::Schema);
-                }
-                pass::Event::End(pass::End {
-                    pass: pass.0,
-                    balanced,
-                    closed,
-                })
-            }
-        };
-        Ok(Frame::Pass(pass::Boundary {
-            epoch: Epoch {
-                process: self.process.0,
-                owner: self.owner.0,
-                nonce: self.nonce.0,
-            },
-            sequence: self.sequence.0,
-            event,
-        }))
-    }
+            })
+        }
+    };
+    Ok(Frame::Pass(pass::Boundary {
+        epoch,
+        sequence,
+        event,
+    }))
 }
 
 /// A strictly decoded caller, still requiring its independent domain comparator.
@@ -214,6 +274,8 @@ pub enum Frame {
     Pass(pass::Boundary),
     /// Group Route with complete nested v3/v2 children.
     GroupRoute(route::Envelope),
+    /// Router metadata refresh boundary; independently derived inventory required.
+    Metadata(metadata::Boundary),
 }
 
 /// Reserve BEFORE allocating an incoming body. `frame_bytes` includes the four
@@ -240,9 +302,11 @@ pub fn admission(frame_bytes: usize, retained: usize) -> Result<Budget, Error> {
 pub fn decode(frame: &[u8], retained: usize) -> Result<pass::Boundary, Error> {
     match decode_caller(frame, None, retained)? {
         Frame::Pass(pass) => Ok(pass),
-        Frame::Finish(_) | Frame::Selector(_) | Frame::GroupRoute(_) | Frame::GroupBalance(_) => {
-            Err(Error::Schema)
-        }
+        Frame::Finish(_)
+        | Frame::Selector(_)
+        | Frame::GroupRoute(_)
+        | Frame::GroupBalance(_)
+        | Frame::Metadata(_) => Err(Error::Schema),
     }
 }
 
@@ -270,7 +334,141 @@ pub fn decode_caller(
 }
 
 #[cfg(test)]
+mod metadata_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod balance_tests;
+
+/// Strict conversion of the four header-only metadata payloads. Bounds mirror
+/// the Go capture: 64 backends, 256 values per frame, 512-byte strings, 64 KiB
+/// aggregate, held == identified, and an observer error without inputs. The
+/// domain validators are the single source of the shape rules.
+fn metadata_event(payload: &Payload) -> Result<Option<metadata::Event>, Error> {
+    let event = match payload {
+        Payload::MetadataBegin {
+            generation,
+            observer_error,
+            rule,
+            inputs,
+        } => metadata::Event::Begin(metadata_begin(
+            generation.0,
+            *observer_error,
+            *rule,
+            inputs,
+        )?),
+        Payload::MetadataAssign {
+            generation,
+            index,
+            account,
+            group,
+            removed,
+            created,
+            values_read,
+            values,
+        } => {
+            let assign = metadata::Assign {
+                generation: generation.0,
+                index: *index,
+                account: account.0,
+                group: group.0,
+                removed: *removed,
+                created: *created,
+                values_read: *values_read,
+                values: values.clone(),
+            };
+            assign.validate().map_err(|_| Error::Schema)?;
+            metadata::Event::Assign(assign)
+        }
+        Payload::MetadataRefresh {
+            generation,
+            group,
+            values_read,
+            members,
+            values,
+            parsed,
+        } => {
+            let refresh = metadata::Refresh {
+                generation: generation.0,
+                group: group.0,
+                values_read: *values_read,
+                members: members
+                    .iter()
+                    .map(|m| metadata::Member {
+                        account: m.account.0,
+                        values: m.values.clone(),
+                    })
+                    .collect(),
+                values: values.clone(),
+                parsed: *parsed,
+            };
+            refresh.validate().map_err(|_| Error::Schema)?;
+            metadata::Event::Refresh(refresh)
+        }
+        Payload::MetadataEnd {
+            generation,
+            support_redirection,
+            groups,
+            created,
+            removed,
+            refresh_failed,
+            conflicts,
+        } => {
+            if generation.0 == 0
+                || usize::from(*groups) > metadata::MAX_GROUPS
+                || usize::from(*created) > metadata::MAX_GROUPS
+                || usize::from(*removed) > metadata::MAX_GROUPS
+                || usize::from(*refresh_failed) > metadata::MAX_GROUPS
+                || usize::from(*conflicts) > metadata::MAX_VALUES
+            {
+                return Err(Error::Schema);
+            }
+            metadata::Event::End(metadata::End {
+                generation: generation.0,
+                support_redirection: *support_redirection,
+                groups: *groups,
+                created: *created,
+                removed: *removed,
+                refresh_failed: *refresh_failed,
+                conflicts: *conflicts,
+            })
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
+}
+
+fn metadata_begin(
+    generation: u64,
+    observer_error: u8,
+    rule: u8,
+    inputs: &[MetadataInput],
+) -> Result<metadata::Begin, Error> {
+    let observer_error = match observer_error {
+        1 => selection::ErrorClass::None,
+        2 => selection::ErrorClass::NoBackend,
+        3 => selection::ErrorClass::Other,
+        _ => return Err(Error::Schema),
+    };
+    let rule = metadata::Rule::from_wire(rule).ok_or(Error::Schema)?;
+    if inputs.len() > metadata::MAX_BACKENDS {
+        return Err(Error::Schema);
+    }
+    let begin = metadata::Begin {
+        generation,
+        observer_error,
+        rule,
+        inputs: inputs
+            .iter()
+            .map(|input| metadata::Input {
+                account: input.account.0,
+                healthy: input.healthy,
+                support_redirection: input.support_redirection,
+                present: input.present,
+            })
+            .collect(),
+    };
+    begin.validate().map_err(|_| Error::Schema)?;
+    Ok(begin)
+}

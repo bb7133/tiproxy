@@ -33,6 +33,7 @@ type callerStorage struct {
 	pass        RouterPass
 	selector    SelectorBoundary
 	finish      GroupFinish
+	metadata    RouterMetadata
 	input       [MaxCallerDataBytes]byte
 	output      [MaxCallerFrameBytes]byte
 	evaluations [MaxCallerEvaluations]*Evaluation // Includes unfinished captures.
@@ -106,7 +107,7 @@ func (c *Caller) Append(value []byte) bool {
 	if !c.writable() {
 		return false
 	}
-	if c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 {
+	if c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.metadata.Kind != 0 {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
@@ -212,7 +213,7 @@ func (c *Caller) Seal() bool {
 	if !c.writable() {
 		return false
 	}
-	if c.length == 0 && c.storage.finish.ID == 0 && c.storage.selector.Kind == 0 && c.storage.pass.Kind == 0 && c.storage.route.ID == 0 && c.storage.balance.ID == 0 || c.storage.route.ID != 0 && !c.storage.route.ResultSet || c.storage.balance.ID != 0 && !c.storage.balance.ResultSet || c.storage.finish.ID != 0 && !c.storage.finish.ResultSet || c.children != c.evaluations+c.batches {
+	if c.length == 0 && c.storage.finish.ID == 0 && c.storage.selector.Kind == 0 && c.storage.pass.Kind == 0 && c.storage.route.ID == 0 && c.storage.balance.ID == 0 && c.storage.metadata.Kind == 0 || c.storage.route.ID != 0 && !c.storage.route.ResultSet || c.storage.balance.ID != 0 && !c.storage.balance.ResultSet || c.storage.finish.ID != 0 && !c.storage.finish.ResultSet || c.storage.metadata.Kind == MetadataRefresh && !c.storage.metadata.ResultSet || c.children != c.evaluations+c.batches {
 		c.owner.Invalidate(Malformed)
 		return false
 	}

@@ -179,7 +179,11 @@ fn route_frame(body: &str) -> route::Envelope {
         .unwrap_or_else(|e| unreachable!("fixture {e:?}"))
     {
         Frame::GroupRoute(e) => e,
-        Frame::Finish(_) | Frame::Selector(_) | Frame::Pass(_) | Frame::GroupBalance(_) => {
+        Frame::Finish(_)
+        | Frame::Selector(_)
+        | Frame::Pass(_)
+        | Frame::GroupBalance(_)
+        | Frame::Metadata(_) => {
             unreachable!("route fixture")
         }
     }

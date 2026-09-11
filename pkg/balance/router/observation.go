@@ -53,10 +53,13 @@ func (g *Group) observeAccount(b *backendWrapper) {
 	if !g.observation.Enabled() {
 		return
 	}
-	if b.observationID != 0 {
+	if b.accounted {
 		return
 	}
-	b.observationID = g.observation.NextIdentity()
+	if b.observationID == 0 {
+		b.observationID = g.observation.NextIdentity()
+	}
+	b.accounted = true
 	g.capture(observation.Batch{EventCount: 1, Events: [observation.MaxEvents]observation.Event{{Kind: observation.Account, ID: b.observationID, Group: g.observationID}}}, nil, observation.ConnectionState{}, b)
 }
 

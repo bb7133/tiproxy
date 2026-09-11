@@ -12,6 +12,9 @@ pub mod balance;
 /// Actual Finish plus Created comparison in the same affected-view transaction.
 pub mod finish;
 /// Bounded router pass boundary and order comparison; not installed yet.
+/// Router metadata rebuilt from original refresh inputs; classification only, not installed.
+pub mod metadata;
+mod metadata_state;
 pub mod pass;
 /// Group-local Route capture and independent atomic comparison; not installed yet.
 pub mod route;

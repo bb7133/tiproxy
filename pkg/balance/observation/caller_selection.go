@@ -41,7 +41,7 @@ func (c *Caller) CaptureSelector(value *SelectorBoundary) bool {
 		return false
 	}
 	if c.storage.finish.ID != 0 || value == nil || value.Session == 0 || c.length != 0 || c.children != 0 ||
-		c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.selector.Kind != 0 {
+		c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.selector.Kind != 0 || c.storage.metadata.Kind != 0 {
 		c.Fail(Malformed)
 		return false
 	}
@@ -100,7 +100,7 @@ func (c *Caller) CaptureGroupFinish(id, group, session, backend, operation uint6
 	}
 	if id == 0 || group == 0 || session == 0 || backend == 0 || operation == 0 ||
 		c.length != 0 || c.children != 0 || c.evaluations != 0 || c.storage.pass.Kind != 0 ||
-		c.storage.selector.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.finish.ID != 0 {
+		c.storage.selector.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.finish.ID != 0 || c.storage.metadata.Kind != 0 {
 		c.Fail(Malformed)
 		return false
 	}
