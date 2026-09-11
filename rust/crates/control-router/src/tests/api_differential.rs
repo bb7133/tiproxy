@@ -355,3 +355,41 @@ async fn replay() -> TestResult {
         .begin_shutdown(control_plane::ShutdownReason::Requested)?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rehydration_rejects_non_idle_or_closed_sessions_without_extra_charge() -> TestResult {
+    let h = Harness::new("", "connection").await?;
+    let backend = "default/127.0.0.1:4000";
+    let session = h.router.open().map_err(|e| format!("open: {e:?}"))?;
+    assert!(matches!(
+        h.router.lookup_backend("missing"),
+        Err(RouteError::NoBackend)
+    ));
+    assert!(matches!(
+        h.router.rehydrate(&session, "missing"),
+        Err(RouteError::NoBackend)
+    ));
+    let assignment = h
+        .router
+        .rehydrate(&session, backend)
+        .map_err(|e| format!("restore: {e:?}"))?;
+    assert_eq!(assignment.backend_id, backend);
+    assert!(matches!(
+        h.router.rehydrate(&session, backend),
+        Err(RouteError::AlreadyActive)
+    ));
+    assert_eq!(
+        h.router.accounting(backend).map(Accounting::active),
+        Some(1)
+    );
+    assert_eq!(h.router.close(&session), Settlement::Applied);
+    assert!(matches!(
+        h.router.rehydrate(&session, backend),
+        Err(RouteError::InvalidSession)
+    ));
+    assert_eq!(
+        h.router.accounting(backend).map(Accounting::active),
+        Some(0)
+    );
+    Ok(())
+}

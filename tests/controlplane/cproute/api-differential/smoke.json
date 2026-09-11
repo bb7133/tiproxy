@@ -220,7 +220,7 @@
     },
     {
       "op": "config",
-      "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=10\n",
+      "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=10\n[balance.status]\nmigrations-per-second=1.0\n",
       "expect": {
         "outcome": "ok"
       }

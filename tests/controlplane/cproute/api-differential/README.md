@@ -66,3 +66,12 @@ no clock-read tape is recorded. Rust uses its existing test round clock.
 Rust's new lookup/rehydration methods operate on its real source and ledger,
 without routing a new selection; duplicate or non-idle restoration is rejected.
 Health readiness is checked through public topology/health source handles.
+
+The first 55-event CI run at ad2920cc failed before `migrate/3`: the
+scenario attempted another migration three seconds after the last accepted
+one, while the default one-connection status migration cadence was five
+seconds. The original input/output failure is preserved. The synthetic
+cooldown scenario now explicitly configures one migration per second, so the
+three-second retry boundary can be checked independently. This does not change
+the acceptance contract or a recorded corpus trace. Rust's non-idle/closed
+rehydration rejection is also covered by a direct public-API unit test.

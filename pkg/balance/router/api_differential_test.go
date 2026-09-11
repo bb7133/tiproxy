@@ -182,10 +182,19 @@ func TestRouterAPIDifferential(t *testing.T) {
 	output := make([]map[string]any, 0, len(trace.Events))
 	effects := []apiEffect{}
 	operations := make(map[string]*apiOperation)
+	t.Cleanup(func() {
+		if len(output) > 0 {
+			output[len(output)-1]["effects"] = effects
+		}
+		encoded, err := json.Marshal(output)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(os.Getenv("CPROUTE_API_OUTPUT"), encoded, 0o600))
+	})
 	for index, event := range trace.Events {
 		apiReplayNanos.Store(event.AtNanos)
 		effects = []apiEffect{}
 		row := map[string]any{"seq": index, "op": event.Op, "session": event.Session, "outcome": "ok", "backend": "", "effects": []any{}}
+		output = append(output, row)
 		s := sessions[event.Session]
 		switch event.Op {
 		case "health":
@@ -237,7 +246,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 			r.rebalance(context.Background())
 		case "redirect_result":
 			operation := operations[event.Operation]
-			require.NotNil(t, operation)
+			require.NotNil(t, operation, "seq=%d operation=%s", index, event.Operation)
 			require.Equal(t, "redirect", operation.effect.Kind)
 			if event.Success {
 				require.NoError(t, operation.conn.receiver.OnRedirectSucceed(operation.from.ID(), operation.to.ID(), operation.conn))
@@ -289,11 +298,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 			t.Fatalf("unsupported API input %q", event.Op)
 		}
 		row["effects"] = effects
-		output = append(output, row)
 	}
 	require.Empty(t, sessions, "trace must settle and close all logical sessions")
 	require.Zero(t, r.ConnCount())
-	encoded, err := json.Marshal(output)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(os.Getenv("CPROUTE_API_OUTPUT"), encoded, 0o600))
 }
