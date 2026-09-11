@@ -16,10 +16,12 @@ FINISH_SOURCE = 'rust/crates/control-router/src/shadow/live/caller/finish.rs'
 STATE_SOURCE = 'rust/crates/control-router/src/shadow/live/caller/selector_state.rs'
 SOURCE = 'rust/crates/control-router/src/shadow/live/caller/route.rs'
 CASES = [
-    ('wrong-account', 'backend: selected,', 'backend: selected + 1,', 'SELECTOR_ROUTE_RETURN_WITNESS'),
-    ('wrong-group', 'group: r.group,', 'group: 0,', 'SELECTOR_ROUTE_TRANSITION'),
-    ('wrong-operation', 'operation,', 'operation: operation + 1,', 'SELECTOR_ROUTE_FINISH_BINDING'),
-    ('missing-binding', 'binding: (selected != 0).then_some(Binding {', 'binding: false.then_some(Binding {', 'SELECTOR_ROUTE_TRANSITION'),
+    # The first attempt is empty/sentinel. Error returns may carry a backend,
+    # so both streams first reject at the independent return witness.
+    ('wrong-account', 'backend: selected,', 'backend: selected + 1,', 'SELECTOR_ROUTE_RETURN_WITNESS', 'SELECTOR_ROUTE_RETURN_WITNESS'),
+    ('wrong-group', 'group: r.group,', 'group: 0,', 'SELECTOR_ROUTE_TRANSITION', 'SELECTOR_ROUTE_GROUP_COMPARISON'),
+    ('wrong-operation', 'operation,', 'operation: operation + 1,', 'SELECTOR_ROUTE_FINISH_BINDING', 'SELECTOR_ROUTE_FINISH_BINDING'),
+    ('missing-binding', 'binding: (selected != 0).then_some(Binding {', 'binding: false.then_some(Binding {', 'SELECTOR_ROUTE_TRANSITION', 'SELECTOR_ROUTE_GROUP_COMPARISON'),
 ]
 
 STATE_CASES = [
@@ -31,10 +33,25 @@ FINISH_CASES = [
         ('finish-group', 'binding.group != envelope.group', 'binding.group == envelope.group'),
     ]
 
+def error_marker(output):
+    errors = [line.removeprefix('Error: ').strip().strip('"')
+              for line in output.splitlines() if line.startswith('Error: ')]
+    return errors[0].split()[0] if errors and errors[0] else None
+
+
+def marker_expectations():
+    return ([dict(name=name, plain=marker, boundary=bound_marker)
+             for name, old, new, marker, bound_marker in CASES]
+            + [dict(name=name, plain=None, boundary=marker)
+               for name, old, new, marker in STATE_CASES]
+            + [dict(name=name, plain=None, boundary='SELECTOR_ROUTE_FINISH_ATOMIC')
+               for name, old, new in FINISH_CASES])
+
+
 def check_anchors():
     source = (ROOT / SOURCE).read_text()
     tail = source[source.index('        Ok(DerivedResult {'):]
-    for name, old, new, marker in CASES:
+    for name, old, new, marker, bound_marker in CASES:
         if tail.count(old) != 1:
             raise RuntimeError('stale result anchor: ' + name)
     for path, cases in [(STATE_SOURCE, STATE_CASES), (FINISH_SOURCE, FINISH_CASES)]:
@@ -42,6 +59,11 @@ def check_anchors():
         for row in cases:
             if source.count(row[1]) != 1:
                 raise RuntimeError('stale caller anchor: ' + row[0])
+    replay = (ROOT / 'rust/crates/legacy-router-shadow/examples/selector_route_check.rs').read_text()
+    for row in marker_expectations():
+        for stream in ['plain', 'boundary']:
+            if row[stream] is not None and row[stream] not in replay:
+                raise RuntimeError('stale replay marker: ' + row['name'] + '/' + stream)
     print('SELECTOR_ROUTE_ANCHORS 8 unique fault anchors; static check only', flush=True)
 
 
@@ -49,7 +71,9 @@ def main():
     check_anchors()
     evidence = Path(os.environ['CP_ROUTE_SELECTOR_ROUTE_EVIDENCE']).resolve()
     evidence.mkdir(parents=True, exist_ok=True)
+    (evidence / 'marker-expectations.json').write_text(json.dumps(marker_expectations(), indent=2) + '\n')
     paths = [SOURCE, STATE_SOURCE, FINISH_SOURCE,
+             'tests/controlplane/cproute/shadow/selector-route-mutations.py',
              'pkg/balance/router/finish_observation.go',
              'pkg/balance/router/group.go',
              'pkg/controlbridge/shadow/caller_finish_codec.go',
@@ -118,6 +142,16 @@ def main():
     go_binary.unlink()
     binary = ROOT / 'rust/target/debug/examples/selector_route_check'
 
+    def record_marker(expected, output):
+        # Record the exact first Error payload emitted by the replay binary.
+        # Failed compilation/timeouts never reach this detection check.
+        actual = error_marker(output)
+        rows[-1]['expected_marker'] = expected
+        rows[-1]['actual_marker'] = actual
+        rows[-1]['marker_matched'] = expected == actual
+        save()
+        return expected == actual
+
     def attempt(name, marker=None, bound_marker=None):
         rc, output = run(name + '-compile', ['cargo', 'build', '--locked', '--manifest-path', 'rust/Cargo.toml', '-p', 'legacy-router-shadow', '--example', 'selector_route_check'])
         if rc:
@@ -127,17 +161,21 @@ def main():
         if marker is None:
             if rc or 'SELECTOR_ROUTE_INDEPENDENT next=6 attempts=9 successes=4 rejected=2' not in output or output.count('SELECTOR_ROUTE_CORRUPTION ') != 4:
                 raise RuntimeError('baseline failed: ' + name + '\n' + output)
-        elif rc == 0 or marker not in output:
-            raise RuntimeError('survived/wrong failure: ' + name + '\n' + output)
+        else:
+            matched = record_marker(marker, output)
+            if rc == 0 or not matched:
+                raise RuntimeError('survived/wrong failure: ' + name + '\n' + output)
         rc, output = run(name + '-boundary-compare', [str(binary), str(bound_fixture)])
         if bound_marker is None:
             if rc or 'SELECTOR_STATE_RETAINED boundaries=13' not in output or output.count('SELECTOR_ROUTE_CORRUPTION ') != 4:
                 raise RuntimeError('retained selector baseline failed: ' + name + '\n' + output)
-        elif rc == 0 or bound_marker not in output:
-            raise RuntimeError('retained selector survived/wrong failure: ' + name + '\n' + output)
+        else:
+            matched = record_marker(bound_marker, output)
+            if rc == 0 or not matched:
+                raise RuntimeError('retained selector survived/wrong failure: ' + name + '\n' + output)
 
     attempt('baseline')
-    for name, old, new, marker in CASES:
+    for name, old, new, marker, bound_marker in CASES:
         try:
             text = originals[SOURCE].decode()
             offset = text.index('        Ok(DerivedResult {')
@@ -145,7 +183,7 @@ def main():
             if tail.count(old) != 1:
                 raise RuntimeError('stale fault anchor: ' + name)
             (ROOT / SOURCE).write_text(prefix + tail.replace(old, new, 1))
-            attempt(name, marker, 'SELECTOR_ROUTE_FINISH_BINDING' if name == 'wrong-operation' else 'SELECTOR_ROUTE_GROUP_COMPARISON')
+            attempt(name, marker, bound_marker)
             print('SELECTOR_ROUTE_MUTATION detected: ' + name, flush=True)
         finally:
             (ROOT / SOURCE).write_bytes(originals[SOURCE])
