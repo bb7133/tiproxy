@@ -182,6 +182,6 @@ func (w *nativeEncoder) balanceText(c *observation.Caller, ref observation.DataR
 	if *total > observation.MaxEvaluationStringsBytes {
 		return false
 	}
-	w.text(string(value))
+	w.textBytes(value)
 	return !w.failed
 }

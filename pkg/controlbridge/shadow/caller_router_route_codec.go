@@ -148,6 +148,6 @@ func (w *nativeEncoder) routerText(c *observation.Caller, ref observation.DataRe
 		return false
 	}
 	*count += ref.Length
-	w.text(string(value))
+	w.textBytes(value)
 	return true
 }

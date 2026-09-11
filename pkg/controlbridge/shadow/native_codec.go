@@ -57,13 +57,39 @@ func (w *nativeEncoder) text(value string) {
 	w.literal(value[start:])
 	w.literal(`"`)
 }
+
+// textBytes escapes borrowed arena bytes without allocating an intermediate string.
+func (w *nativeEncoder) textBytes(value []byte) {
+	if !utf8.Valid(value) {
+		w.failed = true
+		return
+	}
+	w.literal(`"`)
+	const hex = "0123456789abcdef"
+	start := 0
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b >= 0x20 && b != '"' && b != '\\' {
+			continue
+		}
+		w.raw(value[start:i])
+		if b == '"' || b == '\\' {
+			w.raw([]byte{'\\', b})
+		} else {
+			w.raw([]byte{'\\', 'u', '0', '0', hex[b>>4], hex[b&15]})
+		}
+		start = i + 1
+	}
+	w.raw(value[start:])
+	w.literal(`"`)
+}
 func (w *nativeEncoder) ref(value observation.DataRef) {
 	bytes := w.evaluation.Range(value)
 	if len(bytes) != int(value.Length) {
 		w.failed = true
 		return
 	}
-	w.text(string(bytes))
+	w.textBytes(bytes)
 }
 func (w *nativeEncoder) uint(value uint64) {
 	var scratch [20]byte

@@ -88,7 +88,7 @@ func (w *nativeEncoder) groupRoute(record observation.Record) bool {
 				w.small(int64(read.Index))
 			}
 			w.literal(`,"value":`)
-			w.text(string(value))
+			w.textBytes(value)
 		default:
 			return false
 		}

@@ -21,7 +21,7 @@ func (w *nativeEncoder) routerMetadata(record observation.Record) bool {
 			return false
 		}
 		w.literal(`"metadata_init":{"raw_rule":`)
-		w.text(string(c.Bytes()))
+		w.textBytes(c.Bytes())
 		w.literal(`,"rule":`)
 		w.small(int64(m.Rule))
 		w.literal(`}`)
@@ -208,7 +208,7 @@ func (w *nativeEncoder) metadataValueRange(c *observation.Caller, m *observation
 		if j > 0 {
 			w.literal(",")
 		}
-		w.text(string(value))
+		w.textBytes(value)
 	}
 	return true
 }
