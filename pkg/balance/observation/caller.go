@@ -28,6 +28,7 @@ type CallerChild struct {
 }
 
 type callerStorage struct {
+	routerRoute RouterRoute
 	balance     GroupBalance
 	route       GroupRoute
 	pass        RouterPass
@@ -107,7 +108,7 @@ func (c *Caller) Append(value []byte) bool {
 	if !c.writable() {
 		return false
 	}
-	if c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.metadata.Kind != 0 {
+	if c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.metadata.Kind != 0 || c.storage.routerRoute.ID != 0 {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
@@ -213,7 +214,7 @@ func (c *Caller) Seal() bool {
 	if !c.writable() {
 		return false
 	}
-	if c.length == 0 && c.storage.finish.ID == 0 && c.storage.selector.Kind == 0 && c.storage.pass.Kind == 0 && c.storage.route.ID == 0 && c.storage.balance.ID == 0 && c.storage.metadata.Kind == 0 || c.storage.route.ID != 0 && !c.storage.route.ResultSet || c.storage.balance.ID != 0 && !c.storage.balance.ResultSet || c.storage.finish.ID != 0 && !c.storage.finish.ResultSet || c.storage.metadata.Kind == MetadataRefresh && !c.storage.metadata.ResultSet || c.children != c.evaluations+c.batches {
+	if c.length == 0 && c.storage.finish.ID == 0 && c.storage.selector.Kind == 0 && c.storage.pass.Kind == 0 && c.storage.route.ID == 0 && c.storage.balance.ID == 0 && c.storage.metadata.Kind == 0 && c.storage.routerRoute.ID == 0 || c.storage.routerRoute.ID != 0 && !c.storage.routerRoute.ResultSet || c.storage.route.ID != 0 && !c.storage.route.ResultSet || c.storage.balance.ID != 0 && !c.storage.balance.ResultSet || c.storage.finish.ID != 0 && !c.storage.finish.ResultSet || c.storage.metadata.Kind == MetadataRefresh && !c.storage.metadata.ResultSet || c.children != c.evaluations+c.batches {
 		c.owner.Invalidate(Malformed)
 		return false
 	}

@@ -227,7 +227,7 @@ func (c *Caller) metadataWritable(generation uint64) bool {
 	if !c.writable() {
 		return false
 	}
-	if generation == 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.selector.Kind != 0 || c.storage.finish.ID != 0 || c.evaluations != 0 || c.batches != 0 {
+	if generation == 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.routerRoute.ID != 0 || c.storage.balance.ID != 0 || c.storage.selector.Kind != 0 || c.storage.finish.ID != 0 || c.evaluations != 0 || c.batches != 0 {
 		c.owner.Invalidate(Malformed)
 		return false
 	}

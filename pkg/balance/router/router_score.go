@@ -57,6 +57,7 @@ type ScoreBasedRouter struct {
 	observation        *observation.Owner
 	// metadataCapture is set only by the private metadata-captured factory;
 	// metadataGeneration counts the health refreshes captured as frames.
+	attemptCapture     bool
 	metadataCapture    bool
 	metadataGeneration uint64
 }
@@ -141,25 +142,30 @@ func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) Backen
 					}
 				}
 			}()
+			parent := router.beginRouterAttempt(selection, excluded)
+			defer parent.Cleanup()
 			if router.observeError != nil {
-				selection.noRoute(0)
+				router.rejectRouterAttempt(parent, selection, router.observeError)
 				err = router.observeError
 				return
 			}
 			// The group may change from round to round because the backends are updated.
-			group, err = router.routeToGroup(clientInfo)
+			group, err = router.routeToGroupObserved(clientInfo, parent)
 			if err != nil {
-				selection.noRoute(0)
+				router.rejectRouterAttempt(parent, selection, err)
 				return
 			}
 			if group == nil {
-				selection.noRoute(0)
+				router.rejectRouterAttempt(parent, selection, ErrNoBackend)
 				err = ErrNoBackend
 				return
 			}
 			// The router may remove this group concurrently, make sure the group can be accessed after it's removed.
 			var backendCtx policy.BackendCtx
-			backendCtx, err = group.routeObserved(excluded, selection)
+			if parent != nil {
+				parent.CaptureRouterTarget(group.observationID)
+			}
+			backendCtx, err = group.routeWithParent(excluded, selection, parent)
 			if err == nil && backendCtx != nil {
 				backend = backendCtx.(BackendInst)
 			}
@@ -214,16 +220,22 @@ func (router *ScoreBasedRouter) HealthyBackendCount() int {
 }
 
 // called in the lock
-func (router *ScoreBasedRouter) routeToGroup(clientInfo ClientInfo) (*Group, error) {
+func (router *ScoreBasedRouter) routeToGroupObserved(clientInfo ClientInfo, parent *observation.Caller) (*Group, error) {
 	if router.matchType == MatchPort {
 		if router.portConflictDetector == nil {
+			if parent != nil {
+				parent.CaptureRouterPort(false, "")
+			}
 			return nil, nil
+		}
+		if parent != nil {
+			parent.CaptureRouterPort(true, clientInfo.ListenerPort)
 		}
 		return router.portConflictDetector.groupFor(clientInfo.ListenerPort)
 	}
 	// TODO: binary search
 	for _, group := range router.groups {
-		if group.Match(clientInfo) {
+		if group.matchObserved(clientInfo, parent) {
 			return group, nil
 		}
 	}
@@ -431,7 +443,7 @@ func (router *ScoreBasedRouter) updateGroups(refresh *metadataRefresh) (refreshF
 		switch router.matchType {
 		case MatchAll:
 			if len(router.groups) == 0 {
-				group, _ = newGroupCaptured(nil, router.bpCreator, router.matchType, router.logger, router.observation, router.nativeCreator)
+				group, _ = router.newRouteGroup(nil)
 				created = true
 				// A new group must observe the CURRENT config, exactly
 				// like the label/port branches below: without this a
@@ -458,7 +470,7 @@ func (router *ScoreBasedRouter) updateGroups(refresh *metadataRefresh) (refreshF
 				}
 			}
 			if group == nil {
-				g, err := newGroupCaptured(values, router.bpCreator, router.matchType, router.logger, router.observation, router.nativeCreator)
+				g, err := router.newRouteGroup(values)
 				if err == nil {
 					group = g
 					created = true

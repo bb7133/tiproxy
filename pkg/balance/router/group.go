@@ -157,24 +157,41 @@ func (g *Group) parseValues() error {
 }
 
 func (g *Group) Match(clientInfo ClientInfo) bool {
+	return g.matchObserved(clientInfo, nil)
+}
+
+func (g *Group) matchObserved(clientInfo ClientInfo, caller *observation.Caller) bool {
+	if caller != nil {
+		caller.BeginRouterMatch(g.observationID)
+	}
+	finish := func(value bool) bool {
+		if caller != nil {
+			caller.EndRouterMatch(value)
+		}
+		return value
+	}
 	switch g.matchType {
 	case MatchClientCIDR, MatchProxyCIDR:
 		addr := clientInfo.ProxyAddr
 		if g.matchType == MatchClientCIDR {
 			addr = clientInfo.ClientAddr
 		}
-		ip, err := netutil.NetAddr2IP(addr)
+		var read func(string)
+		if caller != nil {
+			read = func(value string) { caller.CaptureRouterAddress(value) }
+		}
+		ip, err := netutil.NetAddr2IPObserved(addr, read)
 		if err != nil {
 			g.lg.Error("checking CIDR failed", zap.Stringer("addr", addr), zap.Error(err))
-			return false
+			return finish(false)
 		}
 		contains, err := netutil.CIDRContainsIP(g.cidrList, ip)
 		if err != nil {
 			g.lg.Error("checking CIDR failed", zap.Stringer("addr", addr), zap.Error(err))
 		}
-		return contains
+		return finish(contains)
 	}
-	return true
+	return finish(true)
 }
 
 func (g *Group) EqualValues(values []string) bool {
@@ -409,9 +426,18 @@ func (g *Group) Route(excluded []BackendInst) (policy.BackendCtx, error) {
 }
 
 func (g *Group) routeObserved(excluded []BackendInst, selection *selectionObservation) (policy.BackendCtx, error) {
+	return g.routeWithParent(excluded, selection, nil)
+}
+
+func (g *Group) routeWithParent(excluded []BackendInst, selection *selectionObservation, parent *observation.Caller) (policy.BackendCtx, error) {
 	g.Lock()
 	defer g.Unlock()
-	caller := g.beginRouteObservation()
+	caller := parent
+	if caller == nil {
+		caller = g.beginRouteObservation()
+	} else {
+		g.routeCaller = caller
+	}
 	defer g.endRouteObservation(caller)
 	g.captureRouteHeader(caller, selection, len(excluded))
 

@@ -24,7 +24,7 @@ func EncodeCaller(record observation.Record) (frame []byte, err error) {
 		return nil, errSchema
 	}
 	p, buffer := c.Pass(), c.EncodingBuffer()
-	if len(buffer) != observation.MaxCallerFrameBytes || p != nil && (c.Span() != 1 || len(c.Children()) != 0 || !validPass(p)) || p == nil && c.Route() == nil && c.Balance() == nil && c.Selector() == nil && c.Finish() == nil && c.Metadata() == nil {
+	if len(buffer) != observation.MaxCallerFrameBytes || p != nil && (c.Span() != 1 || len(c.Children()) != 0 || !validPass(p)) || p == nil && c.Route() == nil && c.Balance() == nil && c.Selector() == nil && c.Finish() == nil && c.Metadata() == nil && c.RouterRoute() == nil {
 		return nil, errSchema
 	}
 	w := nativeEncoder{buffer: buffer, used: 4}
@@ -39,7 +39,11 @@ func EncodeCaller(record observation.Record) (frame []byte, err error) {
 	w.literal(`,"span":`)
 	w.uint(c.Span())
 	w.literal(`,"payload":{`)
-	if c.Finish() != nil {
+	if c.RouterRoute() != nil {
+		if p != nil || c.Finish() != nil || c.Balance() != nil || c.Selector() != nil || c.Metadata() != nil || !w.routerRoute(record) {
+			return nil, errSchema
+		}
+	} else if c.Finish() != nil {
 		if p != nil || c.Route() != nil || c.Balance() != nil || c.Selector() != nil || c.Metadata() != nil || !w.groupFinish(record) {
 			return nil, errSchema
 		}

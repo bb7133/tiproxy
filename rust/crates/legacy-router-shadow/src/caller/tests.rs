@@ -183,7 +183,8 @@ fn route_frame(body: &str) -> route::Envelope {
         | Frame::Selector(_)
         | Frame::Pass(_)
         | Frame::GroupBalance(_)
-        | Frame::Metadata(_) => {
+        | Frame::Metadata(_)
+        | Frame::RouterRoute(_) => {
             unreachable!("route fixture")
         }
     }

@@ -29,10 +29,20 @@ func ParseCIDRList(strList []string) ([]*net.IPNet, error) {
 }
 
 func NetAddr2IP(addr net.Addr) (net.IP, error) {
+	return NetAddr2IPObserved(addr, nil)
+}
+
+// NetAddr2IPObserved observes the original String result before parsing it.
+// Nil/typed-nil handling and panics are identical to NetAddr2IP; observe never
+// causes an additional address method call.
+func NetAddr2IPObserved(addr net.Addr, observe func(string)) (net.IP, error) {
 	if addr == nil || reflect.ValueOf(addr).IsNil() {
 		return nil, errors.New("address is nil")
 	}
 	value := addr.String()
+	if observe != nil {
+		observe(value)
+	}
 	ipStr, _, err := net.SplitHostPort(value)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to parse address '%s'", value)

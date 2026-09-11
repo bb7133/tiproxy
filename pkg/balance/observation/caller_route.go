@@ -45,7 +45,7 @@ func (c *Caller) CaptureGroupRoute(id, group, session uint64, excludedCount uint
 	if !c.writable() {
 		return false
 	}
-	if id == 0 || group == 0 || session == 0 || c.length != 0 || c.evaluations != 0 || c.batches != 0 || c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.metadata.Kind != 0 {
+	if id == 0 || group == 0 || session == 0 || c.length != 0 && c.storage.routerRoute.ID == 0 || c.evaluations != 0 || c.batches != 0 || c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.metadata.Kind != 0 {
 		c.Fail(Malformed)
 		return false
 	}
@@ -64,6 +64,10 @@ func (c *Caller) CaptureGroupRoute(id, group, session uint64, excludedCount uint
 				return false
 			}
 		}
+	}
+	if outer := &c.storage.routerRoute; outer.ID != 0 && (outer.ID != id || outer.Target != group || outer.Session != session || outer.ExcludedCount != excludedCount || outer.ResultSet) {
+		c.Fail(Malformed)
+		return false
 	}
 	r := &c.storage.route
 	r.ID, r.Group, r.Session, r.ExcludedCount, r.MemberCount = id, group, session, excludedCount, uint16(len(members))
@@ -143,7 +147,7 @@ func (c *Caller) CaptureRouteExcludedID(index uint16, value string) bool {
 
 func (c *Caller) captureRouteText(read RouteRead, value string) bool {
 	r := &c.storage.route
-	if len(value) > MaxEvaluationStringBytes || len(value) > MaxEvaluationStringsBytes-int(r.StringBytes) {
+	if len(value) > MaxEvaluationStringBytes || len(value) > MaxEvaluationStringsBytes-int(r.StringBytes)-int(c.storage.routerRoute.StringBytes) {
 		c.Fail(Capacity)
 		return false
 	}

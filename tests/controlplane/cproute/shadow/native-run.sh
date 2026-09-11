@@ -60,3 +60,6 @@ copy = temp/'group.go'; copy.write_text(source)
 (temp/'timings-overlay.json').write_text(json.dumps({'Replace': {str(path): str(copy)}}))
 PYTIMING
 CP_ROUTE_NATIVE_TIMINGS=1 go test -overlay "$temporary/timings-overlay.json" ./pkg/balance/router -run '^TestNativeObservationSustained$' -count=1 -failfast -timeout=25m -v
+
+# Actual raw router/Group/selector attempt composition, using the same native prefix.
+bash tests/controlplane/cproute/shadow/router-attempt-run.sh

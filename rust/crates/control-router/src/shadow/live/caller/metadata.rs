@@ -1098,6 +1098,21 @@ impl Tracker {
         Ok(())
     }
 
+    /// Original rule/error gates for a complete committed generation.
+    ///
+    /// # Errors
+    /// Rejects an open, failed, absent or stale metadata generation.
+    pub fn route_header(&self, generation: u64) -> Result<(Rule, ErrorClass), InvalidReason> {
+        self.tail()?;
+        if generation == 0 || generation != self.last_generation {
+            return Err(InvalidReason::Identity);
+        }
+        Ok((
+            self.state.rule.ok_or(InvalidReason::MissingBegin)?,
+            self.state.observer_error,
+        ))
+    }
+
     /// Classify a client against the last committed metadata of `generation`.
     ///
     /// # Errors

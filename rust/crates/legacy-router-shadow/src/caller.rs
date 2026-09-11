@@ -6,11 +6,14 @@
 mod balance_wire;
 mod finish_wire;
 mod route_wire;
+mod router_route_wire;
 mod selection_wire;
 use crate::{Error, native::Decimal};
 use control_router::shadow::{
     Epoch,
-    live::caller::{Budget, MAX_CALLER_FRAME, balance, finish, metadata, pass, route, selection},
+    live::caller::{
+        Budget, MAX_CALLER_FRAME, balance, finish, metadata, pass, route, router_route, selection,
+    },
 };
 use control_routing::go_time::Origin;
 use serde::{
@@ -61,6 +64,8 @@ impl<'de> Deserialize<'de> for Groups {
 #[serde(deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // The full fixed variant is included in the decode budget.
 enum Payload {
+    #[serde(rename = "router_route")]
+    RouterRoute(router_route_wire::WireRouterRoute),
     #[serde(rename = "group_finish")]
     GroupFinish(finish_wire::WireFinish),
     #[serde(rename = "selector_begin")]
@@ -176,6 +181,14 @@ impl Wire {
                 origin,
             )?));
         }
+        if let Payload::RouterRoute(value) = self.payload {
+            return Ok(Frame::RouterRoute(value.domain(
+                epoch,
+                self.sequence.0,
+                self.span.0,
+                origin,
+            )?));
+        }
         if let Payload::GroupRoute(value) = self.payload {
             let envelope = value.domain(epoch, self.sequence.0, self.span.0, origin)?;
             return Ok(Frame::GroupRoute(envelope));
@@ -213,7 +226,8 @@ fn span_one_boundary(payload: Payload, epoch: Epoch, sequence: u64) -> Result<Fr
         Payload::SelectorClose(value) => {
             return Ok(Frame::Selector(value.domain(epoch, sequence, true)?));
         }
-        Payload::GroupFinish(_)
+        Payload::RouterRoute(_)
+        | Payload::GroupFinish(_)
         | Payload::GroupRoute(_)
         | Payload::GroupBalance(_)
         | Payload::MetadataBegin { .. }
@@ -264,6 +278,8 @@ fn span_one_boundary(payload: Payload, epoch: Epoch, sequence: u64) -> Result<Fr
 /// A strictly decoded caller, still requiring its independent domain comparator.
 #[allow(clippy::large_enum_variant)] // Bounded fixed pass storage is included in 32F + S.
 pub enum Frame {
+    /// Actual router reads with a complete atomic Group or rejected path.
+    RouterRoute(router_route::Envelope),
     /// Actual Finish with its complete Created batch.
     Finish(finish::Envelope),
     /// Actual selector entry/return/end requiring retained-state comparison.
@@ -302,7 +318,8 @@ pub fn admission(frame_bytes: usize, retained: usize) -> Result<Budget, Error> {
 pub fn decode(frame: &[u8], retained: usize) -> Result<pass::Boundary, Error> {
     match decode_caller(frame, None, retained)? {
         Frame::Pass(pass) => Ok(pass),
-        Frame::Finish(_)
+        Frame::RouterRoute(_)
+        | Frame::Finish(_)
         | Frame::Selector(_)
         | Frame::GroupRoute(_)
         | Frame::GroupBalance(_)

@@ -18,6 +18,8 @@ mod metadata_state;
 pub mod pass;
 /// Group-local Route capture and independent atomic comparison; not installed yet.
 pub mod route;
+/// Actual router input binding and atomic Group/selector comparison.
+pub mod router_route;
 /// Pure selector transition core; routeOnce and metadata binding remain separate.
 pub mod selection;
 

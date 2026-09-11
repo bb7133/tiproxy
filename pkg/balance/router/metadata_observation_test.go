@@ -33,6 +33,10 @@ type metadataFixture struct {
 }
 
 func newMetadataFixture(t *testing.T, matchType MatchType, path string) *metadataFixture {
+	return newMetadataFixtureWithFactory(t, matchType, path, newScoreBasedRouterMetadataCaptured)
+}
+
+func newMetadataFixtureWithFactory(t *testing.T, matchType MatchType, path string, factory func(*zap.Logger, *observation.Owner, NativePolicyCreator) *ScoreBasedRouter) *metadataFixture {
 	t.Helper()
 	r, err := observation.NewRecorder(observation.DefaultLimits(), 41, 43)
 	require.NoError(t, err)
@@ -46,7 +50,7 @@ func newMetadataFixture(t *testing.T, matchType MatchType, path string) *metadat
 		p.Init(cfg)
 		return p
 	}
-	router := newScoreBasedRouterMetadataCaptured(zap.NewNop(), o, nativeCreator)
+	router := factory(zap.NewNop(), o, nativeCreator)
 	router.bpCreator = simpleBpCreator
 	router.matchType = matchType
 	t.Cleanup(router.Close)

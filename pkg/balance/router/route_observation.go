@@ -43,7 +43,11 @@ func (g *Group) captureRouteHeader(c *observation.Caller, s *selectionObservatio
 		c.Fail(observation.Capacity)
 		return
 	}
-	c.CaptureGroupRoute(g.observation.NextIdentity(), g.observationID, s.session, uint16(excluded), nil)
+	id := c.RouterRouteID()
+	if id == 0 {
+		id = g.observation.NextIdentity()
+	}
+	c.CaptureGroupRoute(id, g.observationID, s.session, uint16(excluded), nil)
 }
 
 func (g *Group) routePolicy(backends []policy.BackendCtx, c *observation.Caller) policy.BackendCtx {
@@ -70,7 +74,19 @@ func (g *Group) publishRouteObservation(c *observation.Caller, s *selectionObser
 		}
 		account, operation = backend.observationID, s.operation
 	}
-	if c.CaptureRouteResult(account, operation) && c.Seal() {
+	if !c.CaptureRouteResult(account, operation) {
+		return
+	}
+	if c.RouterRouteID() != 0 {
+		kind := observation.SelectorNoError
+		if account == 0 {
+			kind = observation.SelectorExactNoBackend
+		}
+		if !c.CaptureRouterResult(account, kind) {
+			return
+		}
+	}
+	if c.Seal() {
 		g.observation.PublishCaller(c)
 	}
 }
