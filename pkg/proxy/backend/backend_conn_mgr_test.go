@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1437,27 +1438,79 @@ func TestBackendStatusChange(t *testing.T) {
 }
 
 func TestCloseWhileConnect(t *testing.T) {
+	// The concurrent order is decided by the scheduler; the sequential order
+	// pins the "Close wins" branch so that its expectations are exercised on
+	// every run, not only under load.
+	t.Run("concurrent", func(t *testing.T) { closeWhileConnect(t, false) })
+	t.Run("close first", func(t *testing.T) { closeWhileConnect(t, true) })
+}
+
+// closeWhileConnect runs the first handshake while the manager is force
+// closed. Either side may win the race: when Close wins before Connect dials,
+// nothing ever reaches the backend listener and the client sees the proxy
+// hang up. A plain Accept would then wait forever, so the backend runner
+// polls the listener until the proxy runner has returned.
+func closeWhileConnect(t *testing.T, closeFirst bool) {
 	ts := newBackendMgrTester(t)
-	runners := []runner{
-		// 1st handshake while force close
-		{
-			client: ts.mc.authenticate,
-			proxy: func(clientIO, backendIO pnet.PacketIO) error {
+	proxyDone := make(chan struct{})
+	r := runner{
+		client: ts.mc.authenticate,
+		proxy: func(clientIO, backendIO pnet.PacketIO) error {
+			defer close(proxyDone)
+			if closeFirst {
+				require.NoError(ts.t, ts.mp.BackendConnManager.Close())
+			} else {
 				go func() {
 					require.NoError(ts.t, ts.mp.BackendConnManager.Close())
 				}()
-				err := ts.mp.Connect(context.Background(), clientIO, ts.mp.frontendTLSConfig, ts.mp.backendTLSConfig, "", "", "")
-				if err == nil {
-					mer := newMockEventReceiver()
-					ts.mp.SetEventReceiver(mer)
+			}
+			err := ts.mp.Connect(context.Background(), clientIO, ts.mp.frontendTLSConfig, ts.mp.backendTLSConfig, "", "", "")
+			if err == nil {
+				mer := newMockEventReceiver()
+				ts.mp.SetEventReceiver(mer)
+			}
+			return err
+		},
+		backend: func(packetIO pnet.PacketIO) error {
+			listener, ok := ts.tc.backendListener.(*net.TCPListener)
+			require.True(ts.t, ok)
+			defer func() { _ = listener.SetDeadline(time.Time{}) }()
+			for {
+				final := false
+				select {
+				case <-proxyDone:
+					final = true
+				default:
 				}
-				return err
-			},
-			backend: ts.handshake4Backend,
+				require.NoError(ts.t, listener.SetDeadline(time.Now().Add(100*time.Millisecond)))
+				conn, err := listener.Accept()
+				if err == nil {
+					ts.tc.backendIO = pnet.NewPacketIO(conn, ts.lg, pnet.DefaultConnBufferSize)
+					return ts.mb.authenticate(ts.tc.backendIO)
+				}
+				if !errors.Is(err, os.ErrDeadlineExceeded) {
+					return err
+				}
+				if final {
+					// The proxy returned without dialing: no backend handshake.
+					return nil
+				}
+			}
 		},
 	}
-
-	ts.runTests(runners)
+	ts.runAndCheck(ts.t, func(t *testing.T, _ *testSuite) {
+		if ts.mp.err == nil {
+			require.False(t, closeFirst, "connect succeeded after close")
+			require.NoError(t, ts.mc.err)
+			require.NoError(t, ts.mb.err)
+			return
+		}
+		// Close won: the proxy refused the connection and hung up on the client.
+		require.True(t, ts.mc.err == nil || pnet.IsDisconnectError(ts.mc.err), "client error: %v", ts.mc.err)
+		require.NoError(t, ts.mb.err)
+	}, r.client, r.backend, r.proxy)
+	require.Equal(ts.t, ts.tc.clientIO.InBytes(), ts.mp.ClientOutBytes())
+	require.Equal(ts.t, ts.tc.clientIO.OutBytes(), ts.mp.ClientInBytes())
 }
 
 // TestExecuteCmdStreamingForwardLargeQuery exercises the path where the first physical
