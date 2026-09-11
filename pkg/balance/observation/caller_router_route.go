@@ -36,7 +36,7 @@ func (c *Caller) CaptureRouterRoute(id, generation, session, next uint64, attemp
 	if !c.writable() {
 		return false
 	}
-	if id == 0 || generation == 0 || session == 0 || next == 0 || attempt < 1 || attempt > 2 || rule < MetadataRuleAll || rule > MetadataRulePort || !validSelectorErrorClass(observerError) || c.length != 0 || c.children != 0 || c.storage.routerRoute.ID != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.metadata.Kind != 0 {
+	if id == 0 || session == 0 || next == 0 || attempt < 1 || attempt > 2 || rule < MetadataRuleAll || rule > MetadataRulePort || !validSelectorErrorClass(observerError) || c.length != 0 || c.children != 0 || c.storage.routerRoute.ID != 0 || c.storage.route.ID != 0 || c.storage.balance.ID != 0 || c.storage.finish.ID != 0 || c.storage.selector.Kind != 0 || c.storage.pass.Kind != 0 || c.storage.metadata.Kind != 0 {
 		c.Fail(Malformed)
 		return false
 	}

@@ -260,3 +260,7 @@ docker:
 
 docker-release:
 	docker buildx build --platform linux/amd64,linux/arm64 --push -t "$(DOCKERPREFIX)tiproxy:$(IMAGE_TAG)" --build-arg "GOPROXY=$(shell $(GO) env GOPROXY)" --build-arg "VERSION=$(VERSION)" --build-arg "COMMIT=$(COMMIT)" --build-arg "BRANCH=$(BRANCH)" -f docker/Dockerfile .
+
+.PHONY: controlplane-cproute-startup-evidence
+controlplane-cproute-startup-evidence:
+	bash tests/controlplane/cproute/shadow/startup-run.sh

@@ -189,7 +189,16 @@ impl LiveState {
 impl Stage<'_> {
     fn compare_metadata(&mut self, boundary: &Boundary) -> Result<(), InvalidReason> {
         let old = self.original.metadata.get(&self.epoch);
-        if old.is_none() && !matches!(&boundary.event, Event::Begin(begin) if begin.generation == 1)
+        if matches!(&boundary.event, Event::Init(_))
+            && (boundary.sequence != 2
+                || self.original.progress(self.epoch).compared_sequence != 1
+                || old.is_some())
+        {
+            return Err(InvalidReason::Sequence);
+        }
+        if old.is_none()
+            && !matches!(&boundary.event, Event::Init(_))
+            && !matches!(&boundary.event, Event::Begin(begin) if begin.generation == 1)
         {
             return Err(InvalidReason::MissingBegin);
         }
@@ -222,6 +231,7 @@ impl Stage<'_> {
         let key = (self.epoch.process, self.epoch.owner);
         let owner = &self.original.core.owners[&key];
         let result = match &boundary.event {
+            Event::Init(init) => stored.tracker.initialize(init),
             Event::Begin(begin) => stored.tracker.begin(begin.clone(), &mut admit),
             Event::Assign(assign) => stored.tracker.assign(
                 assign,

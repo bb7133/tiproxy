@@ -153,6 +153,7 @@ const (
 	MetadataAssign
 	MetadataRefresh
 	MetadataEnd
+	MetadataInit
 )
 
 // MetadataRule mirrors the router's fixed match type.
@@ -192,6 +193,8 @@ type RouterMetadata struct {
 	Generation    uint64
 	ObserverError SelectorErrorClass
 	Rule          MetadataRule
+	// Init carries the original switch input, within the existing string lease.
+	RawRule DataRef
 	// Begin.
 	InputCount uint16
 	Inputs     [MaxMetadataBackends]MetadataInput
@@ -223,15 +226,48 @@ type RouterMetadata struct {
 	ConflictCount      uint16
 }
 
-func (c *Caller) metadataWritable(generation uint64) bool {
+func (c *Caller) metadataHeaderWritable() bool {
 	if !c.writable() {
 		return false
 	}
-	if generation == 0 || c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.routerRoute.ID != 0 || c.storage.balance.ID != 0 || c.storage.selector.Kind != 0 || c.storage.finish.ID != 0 || c.evaluations != 0 || c.batches != 0 {
+	if c.storage.pass.Kind != 0 || c.storage.route.ID != 0 || c.storage.routerRoute.ID != 0 || c.storage.balance.ID != 0 || c.storage.selector.Kind != 0 || c.storage.finish.ID != 0 || c.evaluations != 0 || c.batches != 0 {
 		c.owner.Invalidate(Malformed)
 		return false
 	}
 	return true
+}
+
+func (c *Caller) metadataWritable(generation uint64) bool {
+	if !c.metadataHeaderWritable() {
+		return false
+	}
+	if generation == 0 {
+		c.Fail(Malformed)
+		return false
+	}
+	return true
+}
+
+// CaptureMetadataInit copies the actual Init switch input, never a second
+// config read. It is the only metadata variant whose generation is zero.
+func (c *Caller) CaptureMetadataInit(rawRule string, rule MetadataRule) bool {
+	if !c.metadataHeaderWritable() {
+		return false
+	}
+	if c.storage.metadata.Kind != 0 || c.length != 0 || !validMetadataRule(rule) {
+		c.Fail(Malformed)
+		return false
+	}
+	if len(rawRule) > MaxEvaluationStringBytes {
+		c.Fail(Capacity)
+		return false
+	}
+	if !utf8.ValidString(rawRule) {
+		c.Fail(Malformed)
+		return false
+	}
+	c.storage.metadata = RouterMetadata{Kind: MetadataInit, Rule: rule, RawRule: DataRef{Length: uint32(len(rawRule))}}
+	return c.appendBytes([]byte(rawRule))
 }
 
 func validMetadataRule(rule MetadataRule) bool {

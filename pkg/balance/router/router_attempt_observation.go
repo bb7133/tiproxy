@@ -31,6 +31,10 @@ func (router *ScoreBasedRouter) captureRouterAttempt(c *observation.Caller, s *s
 	if c == nil {
 		return
 	}
+	if router.metadataGeneration == 0 && !router.startupRecorded {
+		c.Fail(observation.Malformed)
+		return
+	}
 	if s == nil || s.owner != router.observation || !s.capture || s.pending || s.bound || s.ended {
 		c.Fail(observation.UnpairedDiscard)
 		return

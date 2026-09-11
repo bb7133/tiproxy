@@ -305,6 +305,11 @@ func (o *Owner) PublishCaller(c *Caller) bool {
 		c.Cleanup()
 		return false
 	}
+	if c.storage.metadata.Kind == MetadataInit && o.sequence != 1 {
+		c.Fail(Malformed)
+		c.Cleanup()
+		return false
+	}
 	if c.span > math.MaxUint64-o.sequence {
 		o.Invalidate(SequenceExhausted)
 		c.Cleanup()

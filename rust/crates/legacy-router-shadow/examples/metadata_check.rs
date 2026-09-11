@@ -117,6 +117,7 @@ impl Replay {
                 self.generation = begin.generation;
                 self.counts.begins += 1;
             }
+            Event::Init(_) => return Err("METADATA_LEGACY_INIT_UNEXPECTED".into()),
             Event::Assign(_) => self.counts.assigns += 1,
             Event::Refresh(_) => self.counts.refreshes += 1,
             Event::End(_) => self.counts.ends += 1,

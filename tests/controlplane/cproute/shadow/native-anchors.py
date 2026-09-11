@@ -7,7 +7,7 @@ import runpy
 
 ROOT = Path(__file__).resolve().parents[4]
 RUNNERS = ['native', 'balance-hooks', 'route-hooks', 'selector-core',
-           'selector-route', 'metadata', 'router-attempt']
+           'selector-route', 'metadata', 'router-attempt', 'startup']
 
 
 def check_edits(name, edits):

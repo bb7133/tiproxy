@@ -90,6 +90,8 @@ enum Payload {
         balanced: u16,
         closed: u16,
     },
+    #[serde(rename = "metadata_init")]
+    MetadataInit { raw_rule: String, rule: u8 },
     #[serde(rename = "metadata_begin")]
     MetadataBegin {
         generation: Decimal,
@@ -230,6 +232,7 @@ fn span_one_boundary(payload: Payload, epoch: Epoch, sequence: u64) -> Result<Fr
         | Payload::GroupFinish(_)
         | Payload::GroupRoute(_)
         | Payload::GroupBalance(_)
+        | Payload::MetadataInit { .. }
         | Payload::MetadataBegin { .. }
         | Payload::MetadataAssign { .. }
         | Payload::MetadataRefresh { .. }
@@ -364,6 +367,15 @@ mod balance_tests;
 /// domain validators are the single source of the shape rules.
 fn metadata_event(payload: &Payload) -> Result<Option<metadata::Event>, Error> {
     let event = match payload {
+        Payload::MetadataInit { raw_rule, rule } => {
+            if raw_rule.len() > metadata::MAX_VALUE_BYTES {
+                return Err(Error::Schema);
+            }
+            metadata::Event::Init(metadata::Init {
+                raw_rule: raw_rule.clone(),
+                rule: metadata::Rule::from_wire(*rule).ok_or(Error::Schema)?,
+            })
+        }
         Payload::MetadataBegin {
             generation,
             observer_error,

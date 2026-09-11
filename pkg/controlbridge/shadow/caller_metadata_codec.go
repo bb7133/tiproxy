@@ -12,10 +12,19 @@ import "github.com/pingcap/tiproxy/pkg/balance/observation"
 // inventory independently and treats every Go outcome here as a witness.
 func (w *nativeEncoder) routerMetadata(record observation.Record) bool {
 	c, m := record.Caller, record.Caller.Metadata()
-	if m == nil || m.Generation == 0 || c.Span() != 1 || len(c.Children()) != 0 {
+	if m == nil || m.Kind != observation.MetadataInit && m.Generation == 0 || c.Span() != 1 || len(c.Children()) != 0 {
 		return false
 	}
 	switch m.Kind {
+	case observation.MetadataInit:
+		if m.Generation != 0 || m.Rule < observation.MetadataRuleAll || m.Rule > observation.MetadataRulePort || m.RawRule.Offset != 0 || int(m.RawRule.Length) != len(c.Bytes()) || m.RawRule.Length > observation.MaxEvaluationStringBytes {
+			return false
+		}
+		w.literal(`"metadata_init":{"raw_rule":`)
+		w.text(string(c.Bytes()))
+		w.literal(`,"rule":`)
+		w.small(int64(m.Rule))
+		w.literal(`}`)
 	case observation.MetadataBegin:
 		return w.metadataBegin(c, m)
 	case observation.MetadataAssign:

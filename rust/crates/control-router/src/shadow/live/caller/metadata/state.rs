@@ -63,6 +63,8 @@ pub(super) struct BackendState {
 #[derive(Clone, Debug)]
 pub(super) struct State {
     pub rule: Option<Rule>,
+    pub initialized: bool,
+    pub detector_present: bool,
     pub observer_error: ErrorClass,
     pub support_redirection: bool,
     /// Live groups in Go's slice order: creation order with deletions.
@@ -75,6 +77,8 @@ impl Default for State {
     fn default() -> Self {
         Self {
             rule: None,
+            initialized: false,
+            detector_present: false,
             observer_error: ErrorClass::None,
             support_redirection: false,
             groups: Vec::new(),
@@ -137,6 +141,8 @@ impl State {
         }));
         Self {
             rule: self.rule,
+            initialized: self.initialized,
+            detector_present: self.detector_present,
             observer_error: self.observer_error,
             support_redirection: self.support_redirection,
             groups,

@@ -7,7 +7,7 @@ import "github.com/pingcap/tiproxy/pkg/balance/observation"
 
 func (w *nativeEncoder) routerRoute(record observation.Record) bool {
 	c, r := record.Caller, record.Caller.RouterRoute()
-	if r == nil || r.ID == 0 || r.Generation == 0 || r.Session == 0 || r.Next == 0 || r.Attempt < 1 || r.Attempt > 2 || !r.ResultSet || r.GroupCount > observation.MaxCallerGroups || r.ExcludedCount > observation.MaxCallerGroups || r.ReadCount > r.GroupCount || r.Rule < observation.MetadataRuleAll || r.Rule > observation.MetadataRulePort || r.ObserverError < observation.SelectorNoError || r.ObserverError > observation.SelectorOtherError || r.Error < observation.SelectorNoError || r.Error > observation.SelectorOtherError || (r.Backend == 0) != (r.Error != observation.SelectorNoError) {
+	if r == nil || r.ID == 0 || r.Session == 0 || r.Next == 0 || r.Attempt < 1 || r.Attempt > 2 || !r.ResultSet || r.GroupCount > observation.MaxCallerGroups || r.ExcludedCount > observation.MaxCallerGroups || r.ReadCount > r.GroupCount || r.Rule < observation.MetadataRuleAll || r.Rule > observation.MetadataRulePort || r.ObserverError < observation.SelectorNoError || r.ObserverError > observation.SelectorOtherError || r.Error < observation.SelectorNoError || r.Error > observation.SelectorOtherError || (r.Backend == 0) != (r.Error != observation.SelectorNoError) {
 		return false
 	}
 	w.literal(`"router_route":{"caller":`)

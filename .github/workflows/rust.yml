@@ -577,3 +577,49 @@ jobs:
             dist/tiproxy-rs-linux-${{ matrix.arch }}.sha256
           if-no-files-found: error
           retention-days: 14
+
+  routing-startup:
+    name: Router initialization and first health evidence
+    runs-on: ubuntu-24.04
+    # Independent from the 18 sustained native windows; keep both complete.
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            bin/control-codegen
+            bin/control-codegen-rust
+            rust/target
+          key: rust-routing-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Compare actual initialization and twelve compiled faults
+        env:
+          CP_ROUTE_STARTUP_EVIDENCE: ${{ runner.temp }}/startup-evidence
+        run: make controlplane-cproute-startup-evidence
+      - name: Upload initialization evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: startup-${{ github.sha }}
+          path: ${{ runner.temp }}/startup-evidence
+          if-no-files-found: warn
+          retention-days: 14

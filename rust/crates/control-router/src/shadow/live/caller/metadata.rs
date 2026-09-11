@@ -79,6 +79,52 @@ impl Rule {
     }
 }
 
+/// The actual Init switch input and its Go rule witness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Init {
+    /// Original UTF-8 input, bounded to 512 bytes before decoding growth.
+    pub raw_rule: String,
+    /// Go result, independently checked with the pinned simple-lower semantics.
+    pub rule: Rule,
+}
+impl Init {
+    /// Validate bounded inputs; comparison of the rule belongs to the stage.
+    ///
+    /// # Errors
+    /// Capacity when the original string exceeds the fixed caller string bound.
+    pub fn validate(&self) -> Result<(), InvalidReason> {
+        if self.raw_rule.len() > MAX_VALUE_BYTES {
+            return Err(InvalidReason::Capacity);
+        }
+        Ok(())
+    }
+    /// Independently derive Go's three keywords, without expanding Unicode case
+    /// mappings or trimming. U+0130 is the only non-ASCII simple-lower alias in
+    /// this keyword alphabet in pinned Go 1.25.12 / Unicode 15.
+    #[must_use]
+    pub fn derived_rule(&self) -> Rule {
+        let matches = |keyword: &str| {
+            self.raw_rule
+                .chars()
+                .map(|ch| match ch {
+                    'A'..='Z' => ch.to_ascii_lowercase(),
+                    '\u{130}' => 'i',
+                    other => other,
+                })
+                .eq(keyword.chars())
+        };
+        if matches("client_cidr") {
+            Rule::ClientCidr
+        } else if matches("proxy_cidr") {
+            Rule::ProxyCidr
+        } else if matches("port") {
+            Rule::Port
+        } else {
+            Rule::All
+        }
+    }
+}
+
 /// One backend exactly as the health loop read it, before any Group lock. The
 /// router holds a wrapper for it exactly when `account` is nonzero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +350,8 @@ pub struct End {
 /// A decoded metadata frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Actual initialization before the first health refresh.
+    Init(Init),
     /// Refresh header.
     Begin(Begin),
     /// One decision.
@@ -421,6 +469,35 @@ impl Tracker {
             require_native_init: true,
             ..Self::default()
         }
+    }
+
+    /// Bind an actual fresh router Init; no synthetic refresh is introduced.
+    ///
+    /// # Errors
+    /// Repeated/late initialization, bounded inputs or a wrong rule witness.
+    pub fn initialize(&mut self, init: &Init) -> Result<(), InvalidReason> {
+        self.check()?;
+        init.validate()?;
+        if self.state.initialized
+            || self.state.rule.is_some()
+            || self.last_generation != 0
+            || self.open.is_some()
+        {
+            return Err(InvalidReason::Lifecycle);
+        }
+        let rule = init.derived_rule();
+        if rule != init.rule {
+            return Err(InvalidReason::Witness);
+        }
+        self.state.rule = Some(rule);
+        self.state.initialized = true;
+        Ok(())
+    }
+
+    /// Whether an accepted successful Port refresh constructed the detector.
+    #[must_use]
+    pub const fn detector_present(&self) -> bool {
+        self.state.detector_present
     }
 
     /// Bytes currently retained: own layout plus every heap capacity of the
@@ -1076,6 +1153,7 @@ impl Tracker {
             let ports_heap = open.working.ports_plan(open.begin.rule)?;
             admit(retained + ports_heap)?;
             open.working.rebuild_ports(open.begin.rule);
+            open.working.detector_present = open.begin.rule == Rule::Port;
             let expected = End {
                 generation: end.generation,
                 support_redirection: open.working.support_redirection,
@@ -1103,8 +1181,17 @@ impl Tracker {
     /// # Errors
     /// Rejects an open, failed, absent or stale metadata generation.
     pub fn route_header(&self, generation: u64) -> Result<(Rule, ErrorClass), InvalidReason> {
+        self.check()?;
+        if generation == 0 {
+            if self.open.is_some() || self.last_generation != 0 {
+                return Err(InvalidReason::Sequence);
+            }
+            if !self.state.initialized {
+                return Err(InvalidReason::MissingBegin);
+            }
+        }
         self.tail()?;
-        if generation == 0 || generation != self.last_generation {
+        if generation != self.last_generation {
             return Err(InvalidReason::Identity);
         }
         Ok((
@@ -1123,13 +1210,7 @@ impl Tracker {
         client: ClientInfo<'_>,
         listener_port: &str,
     ) -> Result<Classification, InvalidReason> {
-        self.check()?;
-        if self.open.is_some() {
-            return Err(InvalidReason::Lifecycle);
-        }
-        if generation != self.last_generation || generation == 0 {
-            return Err(InvalidReason::Identity);
-        }
+        self.route_header(generation)?;
         if self.state.observer_error != ErrorClass::None {
             return Ok(Classification::ObserverError(self.state.observer_error));
         }

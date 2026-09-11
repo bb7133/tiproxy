@@ -92,7 +92,6 @@ impl Envelope {
             self.epoch.nonce,
             self.sequence,
             p.caller,
-            p.generation,
             p.session,
             p.next,
         ]
@@ -100,6 +99,9 @@ impl Envelope {
             || !(1..=2).contains(&p.attempt)
             || (p.backend == 0) != (p.error != ErrorClass::None)
         {
+            return Err(InvalidReason::Identity);
+        }
+        if p.generation == 0 && (!p.groups.is_empty() || !p.reads.is_empty()) {
             return Err(InvalidReason::Identity);
         }
         if p.groups.len() > 64 || p.excluded.len() > 64 || p.reads.len() > p.groups.len() {
@@ -263,11 +265,17 @@ impl LiveState {
             return Ok((0, observer_error));
         }
         if rule == Rule::Port {
-            // An accepted non-error refresh always rebuilds the Go detector,
-            // including the empty table. Before that refresh, no generation is
-            // qualified for this preparatory route comparator.
-            if !p.port_visited || !p.detector_present || !p.reads.is_empty() {
+            if !p.port_visited
+                || p.detector_present != metadata.detector_present()
+                || !p.reads.is_empty()
+            {
                 return Err(InvalidReason::Witness);
+            }
+            if !metadata.detector_present() {
+                if p.listener.is_some() {
+                    return Err(InvalidReason::Witness);
+                }
+                return Ok((0, ErrorClass::NoBackend));
             }
             let listener = p.listener.as_deref().ok_or(InvalidReason::Witness)?;
             return match metadata.classify(p.generation, ClientInfo::default(), listener)? {

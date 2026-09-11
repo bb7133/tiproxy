@@ -57,9 +57,10 @@ type ScoreBasedRouter struct {
 	observation        *observation.Owner
 	// metadataCapture is set only by the private metadata-captured factory;
 	// metadataGeneration counts the health refreshes captured as frames.
-	attemptCapture     bool
-	metadataCapture    bool
-	metadataGeneration uint64
+	startupCapture, startupStarted, startupRecorded bool
+	attemptCapture                                  bool
+	metadataCapture                                 bool
+	metadataGeneration                              uint64
 }
 
 // NewScoreBasedRouter creates a ScoreBasedRouter.
@@ -80,6 +81,12 @@ func NewScoreBasedRouterWithObservation(logger *zap.Logger, owner *observation.O
 
 func (r *ScoreBasedRouter) Init(ctx context.Context, ob observer.BackendObserver, bpCreator func(lg *zap.Logger) policy.BalancePolicy,
 	cfgGetter config.ConfigGetter, cfgCh <-chan *config.Config) {
+	var initial *observation.Caller
+	if r.startupCapture && r.observation.Enabled() {
+		initial = r.observation.BeginCaller()
+		defer initial.Cleanup()
+		r.beginStartupObservation(initial)
+	}
 	r.observer = ob
 	r.bpCreator = bpCreator
 	r.cfgGetter = cfgGetter
@@ -88,7 +95,8 @@ func (r *ScoreBasedRouter) Init(ctx context.Context, ob observer.BackendObserver
 	cfg := cfgGetter.GetConfig()
 
 	r.matchType = MatchAll
-	switch strings.ToLower(cfg.Balance.RoutingRule) {
+	routingRule := cfg.Balance.RoutingRule
+	switch strings.ToLower(routingRule) {
 	case config.MatchClientCIDRStr:
 		r.matchType = MatchClientCIDR
 	case config.MatchProxyCIDRStr:
@@ -100,6 +108,7 @@ func (r *ScoreBasedRouter) Init(ctx context.Context, ob observer.BackendObserver
 		r.logger.Error("unsupported routing rule, use the default rule", zap.String("rule", cfg.Balance.RoutingRule))
 	}
 
+	r.endStartupObservation(initial, routingRule)
 	childCtx, cancelFunc := context.WithCancel(ctx)
 	r.cancelFunc = cancelFunc
 	// Failing to route connections may cause even more serious problems than TiProxy reboot, so we don't recover panics.
