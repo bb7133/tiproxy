@@ -24,7 +24,7 @@ func EncodeCaller(record observation.Record) (frame []byte, err error) {
 		return nil, errSchema
 	}
 	p, buffer := c.Pass(), c.EncodingBuffer()
-	if len(buffer) != observation.MaxCallerFrameBytes || p != nil && (c.Span() != 1 || len(c.Children()) != 0 || !validPass(p)) || p == nil && c.Route() == nil && c.Balance() == nil {
+	if len(buffer) != observation.MaxCallerFrameBytes || p != nil && (c.Span() != 1 || len(c.Children()) != 0 || !validPass(p)) || p == nil && c.Route() == nil && c.Balance() == nil && c.Selector() == nil {
 		return nil, errSchema
 	}
 	w := nativeEncoder{buffer: buffer, used: 4}
@@ -39,7 +39,11 @@ func EncodeCaller(record observation.Record) (frame []byte, err error) {
 	w.literal(`,"span":`)
 	w.uint(c.Span())
 	w.literal(`,"payload":{`)
-	if c.Balance() != nil {
+	if c.Selector() != nil {
+		if p != nil || c.Route() != nil || c.Balance() != nil || !w.selectorBoundary(c) {
+			return nil, errSchema
+		}
+	} else if c.Balance() != nil {
 		if p != nil || c.Route() != nil || !w.groupBalance(record) {
 			return nil, errSchema
 		}

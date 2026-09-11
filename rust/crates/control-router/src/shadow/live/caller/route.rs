@@ -288,7 +288,7 @@ impl Route {
     }
 }
 impl Stage<'_> {
-    fn compare_route(&mut self, e: &Envelope) -> Result<DerivedResult, InvalidReason> {
+    pub(super) fn compare_route(&mut self, e: &Envelope) -> Result<DerivedResult, InvalidReason> {
         let r = &e.route;
         let key = (e.epoch.process, e.epoch.owner);
         let ledger = &self.staged.core.owners[&key].ledger;

@@ -106,6 +106,7 @@ pub struct Stage<'a> {
     retained: usize,
     ledger_clone: usize,
     original_factor: usize,
+    original_selectors: usize,
     failed: Option<InvalidReason>,
     finished: bool,
 }
@@ -177,6 +178,14 @@ impl LiveState {
                 groups,
             },
         );
+        let mut original_selectors = 0;
+        for session in scope.sessions {
+            let key = (scope.epoch, *session);
+            if let Some(value) = self.selectors.get(&key) {
+                staged.selectors.insert(key, value.clone());
+                original_selectors += selection::StoredSelection::CHARGE;
+            }
+        }
         // Original history remains alive. The staged factor group is an extra
         // copy, not a replacement, until the final caller check commits.
         staged.native_bytes = budget.retained + ledger_clone + original_factor;
@@ -196,6 +205,7 @@ impl LiveState {
             frame_bytes: scope.frame_bytes,
             ledger_clone,
             original_factor,
+            original_selectors,
             failed: None,
             finished: false,
         })
@@ -234,9 +244,16 @@ impl LiveState {
             .get(&scope.epoch)
             .ok_or(InvalidReason::MissingBegin)?;
         let factor = native.groups.get(&scope.group).map_or(0, |old| old.charge);
-        let ledger = owner
+        let mut ledger = owner
             .ledger
             .caller_clone_charge(scope.group, scope.sessions)?;
+        for session in scope.sessions {
+            if self.selectors.contains_key(&(scope.epoch, *session)) {
+                ledger = ledger
+                    .checked_add(selection::StoredSelection::CHARGE)
+                    .ok_or(InvalidReason::Capacity)?;
+            }
+        }
         let clones = ledger.checked_add(factor).ok_or(InvalidReason::Capacity)?;
         let budget = Budget::new(scope.frame_bytes, self.native_bytes, clones)?;
         Ok((ledger, factor, last, budget))
@@ -377,7 +394,18 @@ impl Stage<'_> {
             .checked_sub(self.original_factor)
             .and_then(|n| n.checked_add(current_factor))
             .ok_or(InvalidReason::Capacity)?;
-        // Validate both destinations before the first mutation of original state.
+        let selector_charge = self
+            .staged
+            .selectors
+            .len()
+            .checked_mul(selection::StoredSelection::CHARGE)
+            .ok_or(InvalidReason::Capacity)?;
+        let retained = retained
+            .checked_sub(self.original_selectors)
+            .and_then(|n| n.checked_add(selector_charge))
+            .filter(|n| *n <= HISTORY_LIMIT)
+            .ok_or(InvalidReason::Capacity)?;
+        // Validate every destination before the first mutation of original state.
         if !self.original.core.owners.contains_key(&key)
             || !self.original.native.contains_key(&self.epoch)
         {
@@ -399,6 +427,9 @@ impl Stage<'_> {
             self.original.native.get_mut(&self.epoch),
         ) {
             original.ledger.commit_caller(owner.ledger);
+            for (key, value) in std::mem::take(&mut self.staged.selectors) {
+                self.original.selectors.insert(key, value);
+            }
             if let Some(factor) = factor {
                 native.groups.insert(self.group, factor);
             }
@@ -430,3 +461,5 @@ fn checked_progress(progress: Progress) -> Result<(), InvalidReason> {
 
 #[cfg(test)]
 mod tests;
+
+mod selector_state;

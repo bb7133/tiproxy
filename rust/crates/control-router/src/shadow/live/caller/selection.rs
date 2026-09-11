@@ -103,8 +103,8 @@ struct Open {
 /// staged until its completion witness matches. A failure is sticky and leaves
 /// the last completed state intact. Integration must charge CHARGE in shared R
 /// before retaining each instance, and feed only independently checked attempts.
-/// This is not yet installed in `LiveState` or the production caller transport.
-#[derive(Default)]
+/// `LiveState` retains and stages this charge; production transport stays gated.
+#[derive(Clone, Default)]
 pub struct Tracker {
     last_next: u64,
     state: State,
@@ -298,3 +298,110 @@ impl Tracker {
 
 #[cfg(test)]
 mod tests;
+
+// Box the large tracker so an otherwise sparse BTree node does not duplicate
+// its full inline size. Reserve sixteen key/value slots per retained entry,
+// matching the existing native history's conservative map-node accounting.
+#[derive(Clone, Default)]
+pub(crate) struct StoredSelection {
+    pub(super) tracker: Box<Tracker>,
+    pub(super) closed: bool,
+}
+impl StoredSelection {
+    pub(super) const CHARGE: usize =
+        Tracker::CHARGE + 16 * size_of::<((super::Epoch, u64), Self)>();
+}
+
+/// One actual selector entry, normal return, or explicit observation close.
+#[derive(Clone, Debug)]
+pub enum BoundaryEvent {
+    /// Pre-call witnesses, before the first routeOnce invocation.
+    Begin {
+        /// Contiguous Next ordinal.
+        next: u64,
+        /// Actual previously retained backend.
+        current: u64,
+        /// Actual ordered exclusions at entry.
+        excluded: Vec<u64>,
+    },
+    /// Normal return witnesses, after all completed routeOnce invocations.
+    End {
+        /// Matching Next ordinal.
+        next: u64,
+        /// Actual retained backend after normal return.
+        current: u64,
+        /// Actual ordered exclusions after normal return.
+        excluded: Vec<u64>,
+        /// Actual returned backend; zero is nil.
+        backend: u64,
+        /// Exact returned error classification.
+        error: ErrorClass,
+    },
+    /// End of selection, retaining the closed identity to reject future reuse.
+    Close {
+        /// Last completed Next, zero when Next was never called.
+        next: u64,
+        /// Actual retained backend at close.
+        current: u64,
+        /// Actual remaining exclusions at close.
+        excluded: Vec<u64>,
+    },
+}
+/// A bounded selector boundary occupies one sequence and no Group lock span.
+#[derive(Clone, Debug)]
+pub struct Boundary {
+    /// Immutable owner identity.
+    pub epoch: super::Epoch,
+    /// Actual owner sequence at publication.
+    pub sequence: u64,
+    /// Existing selector/session incarnation.
+    pub session: u64,
+    /// Actual boundary values, never an independently derived route result.
+    pub event: BoundaryEvent,
+}
+impl Boundary {
+    /// Validate fixed identities and exclusion bounds before staging.
+    ///
+    /// # Errors
+    /// Invalid identity or more than 64 exclusion identities.
+    pub fn validate(&self) -> Result<(), InvalidReason> {
+        if [
+            self.epoch.process,
+            self.epoch.owner,
+            self.epoch.nonce,
+            self.sequence,
+            self.session,
+        ]
+        .contains(&0)
+        {
+            return Err(InvalidReason::Identity);
+        }
+        let (next, excluded, close) = match &self.event {
+            BoundaryEvent::Begin { next, excluded, .. }
+            | BoundaryEvent::End { next, excluded, .. } => (*next, excluded, false),
+            BoundaryEvent::Close { next, excluded, .. } => (*next, excluded, true),
+        };
+        if !close && next == 0 || excluded.contains(&0) {
+            return Err(InvalidReason::Identity);
+        }
+        if excluded.len() > MAX_EXCLUDED {
+            return Err(InvalidReason::Capacity);
+        }
+        Ok(())
+    }
+}
+impl Tracker {
+    pub(super) fn close_witness(
+        &self,
+        next: u64,
+        current: u64,
+        excluded: &[u64],
+    ) -> Result<(), InvalidReason> {
+        self.tail()?;
+        if next != self.last_next || current != self.state.current() || excluded != self.excluded()
+        {
+            return Err(InvalidReason::Witness);
+        }
+        Ok(())
+    }
+}

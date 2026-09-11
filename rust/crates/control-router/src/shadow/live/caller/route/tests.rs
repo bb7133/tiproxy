@@ -425,3 +425,62 @@ fn retry_reservation_uses_existing_session_and_new_operation() {
         assert_eq!(state.totals(e.epoch), Some((u64::from(!replay), 0)));
     }
 }
+
+#[test]
+fn late_selector_attempt_failure_rolls_back_group_factor_and_reservation() {
+    use super::super::selection::{Boundary, BoundaryEvent};
+    for ordinal in [1, 2] {
+        let (mut state, mut envelope) = fixture();
+        assert_eq!(
+            state
+                .observe_selector_boundary(
+                    &Boundary {
+                        epoch: envelope.epoch,
+                        sequence: 5,
+                        session: 10,
+                        event: BoundaryEvent::Begin {
+                            next: 1,
+                            current: 0,
+                            excluded: vec![]
+                        }
+                    },
+                    128
+                )
+                .status,
+            Status::Comparing
+        );
+        envelope.sequence += 1;
+        for child in &mut envelope.children {
+            match child {
+                Child::Evaluation(e) => e.sequence += 1,
+                Child::Batch(b) => b.sequence += 1,
+            }
+        }
+        let before = state.native_retained_bytes();
+        let (progress, derived) =
+            state.observe_selector_group_route_result(&envelope, 1, ordinal, &[], 4096);
+        if ordinal == 1 {
+            assert_eq!(progress.status, Status::Comparing);
+            assert!(derived.is_some());
+            assert_eq!(state.totals(envelope.epoch), Some((1, 0)));
+        } else {
+            assert_eq!(
+                progress.status,
+                Status::Invalid(InvalidReason::Sequence),
+                "SELECTOR_GROUP_LATE_FAILURE"
+            );
+            assert_eq!(progress.compared_sequence, 5);
+            assert!(derived.is_none());
+            assert_eq!(
+                state.totals(envelope.epoch),
+                Some((0, 0)),
+                "SELECTOR_GROUP_NO_RESERVATION_ESCAPE"
+            );
+            assert_eq!(
+                state.native_retained_bytes(),
+                before,
+                "SELECTOR_GROUP_NO_FACTOR_ESCAPE"
+            );
+        }
+    }
+}

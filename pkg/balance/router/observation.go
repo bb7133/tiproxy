@@ -11,6 +11,8 @@ import "github.com/pingcap/tiproxy/pkg/balance/observation"
 type selectionObservation struct {
 	owner                         *observation.Owner
 	session, operation            uint64
+	next                          uint64
+	attempt                       uint8
 	opened, pending, bound, ended bool
 }
 

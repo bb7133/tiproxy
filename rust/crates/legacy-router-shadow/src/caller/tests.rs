@@ -179,7 +179,9 @@ fn route_frame(body: &str) -> route::Envelope {
         .unwrap_or_else(|e| unreachable!("fixture {e:?}"))
     {
         Frame::GroupRoute(e) => e,
-        Frame::Pass(_) | Frame::GroupBalance(_) => unreachable!("route fixture"),
+        Frame::Selector(_) | Frame::Pass(_) | Frame::GroupBalance(_) => {
+            unreachable!("route fixture")
+        }
     }
 }
 fn route_state(e: &route::Envelope) -> control_router::shadow::live::LiveState {
@@ -453,4 +455,32 @@ fn nested_child_cross_product_and_decode_layout_are_bounded() {
         ),
         "ROUTE_PREFIX_PLUS_ONE"
     );
+}
+
+#[test]
+fn selector_wire_is_strict_bounded_and_preserves_duplicate_exclusions() {
+    let body = r#"{"version":4,"kind":"caller","process":"41","owner":"1","nonce":"43","sequence":"5","span":"1","payload":{"selector_end":{"session":"10","next":"1","current":"9","excluded":["9","9"],"backend":"9","error":1}}}"#;
+    let Frame::Selector(value) =
+        decode_caller(&frame(body), None, 0).unwrap_or_else(|e| unreachable!("selector {e:?}"))
+    else {
+        unreachable!("family")
+    };
+    assert!(
+        matches!(value.event, selection::BoundaryEvent::End { excluded, .. } if excluded == [9, 9])
+    );
+    for bad in [
+        body.replace("\"error\":1", "\"error\":0"),
+        body.replace("\"error\":1", "\"error\":4"),
+        body.replace("\"span\":\"1\"", "\"span\":\"2\""),
+        body.replace("\"current\":\"9\"", "\"current\":\"9\",\"unknown\":1"),
+        body.replace(
+            "[\"9\",\"9\"]",
+            &format!("[{}]", vec!["\"9\""; 65].join(",")),
+        ),
+    ] {
+        assert!(
+            decode_caller(&frame(&bad), None, 0).is_err(),
+            "SELECTOR_STATE_STRICT_WIRE"
+        );
+    }
 }

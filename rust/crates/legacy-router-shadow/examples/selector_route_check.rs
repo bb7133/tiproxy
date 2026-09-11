@@ -78,6 +78,7 @@ fn check<T>(value: std::result::Result<T, control_router::shadow::InvalidReason>
 #[derive(Default)]
 struct Replay {
     tracker: Tracker,
+    captured_boundaries: usize,
     session: Option<u64>,
     pending: Option<Binding>,
     next: u64,
@@ -119,7 +120,11 @@ impl Replay {
             return Err("SELECTOR_ROUTE_SCOPE".into());
         }
         self.session = Some(e.route.session);
-        let (progress, derived) = state.observe_group_route_result(&e, bytes.len());
+        let (progress, derived) = if self.captured_boundaries == 0 {
+            state.observe_group_route_result(&e, bytes.len())
+        } else {
+            state.observe_selector_group_route_result(&e, *next, *ordinal, excluded, bytes.len())
+        };
         if progress.status != Status::Comparing
             || progress.compared_sequence != e.sequence + e.span - 1
         {
@@ -211,6 +216,23 @@ impl Replay {
                 {
                     return Err("SELECTOR_ROUTE_POPULATION_AND_SETTLED_TAIL".into());
                 }
+                if self.captured_boundaries != 0 {
+                    if self.captured_boundaries != 13
+                        || !state.selectors_settled(owner.ok_or("owner")?)
+                    {
+                        return Err("SELECTOR_STATE_UNSETTLED".into());
+                    }
+                    let budget = state.caller_peak_budget().ok_or("selector budget")?;
+                    println!(
+                        "SELECTOR_STATE_RETAINED boundaries=13 F={} D={} R={} C={} S={} P={}",
+                        budget.frame,
+                        budget.decode,
+                        budget.retained,
+                        budget.clones,
+                        budget.fixed,
+                        budget.peak
+                    );
+                }
                 self.tail = true;
             }
             _ => return Err("unexpected boundary".into()),
@@ -229,6 +251,18 @@ fn replay(records: &[Record]) -> Result<()> {
         }
         match record {
             Record::Frame { bytes } => {
+                if let Ok(caller::Frame::Selector(boundary)) =
+                    caller::decode_caller(bytes, origin, state.native_retained_bytes())
+                {
+                    let progress = state.observe_selector_boundary(&boundary, bytes.len());
+                    if progress.status != Status::Comparing
+                        || progress.compared_sequence != boundary.sequence
+                    {
+                        return Err("SELECTOR_STATE_BOUNDARY".into());
+                    }
+                    replay.captured_boundaries += 1;
+                    continue;
+                }
                 replay.lifecycle(bytes)?;
                 prefix::observe_prefix(&mut state, bytes, &mut origin, &mut owner)?;
             }

@@ -29,7 +29,8 @@ var _ Router = &ScoreBasedRouter{}
 // ScoreBasedRouter is an implementation of Router interface.
 // It routes a connection based on score.
 type ScoreBasedRouter struct {
-	nativeCreator NativePolicyCreator
+	nativeCreator   NativePolicyCreator
+	selectorCapture bool // Private construction only, before any selector exists.
 	sync.Mutex
 	logger *zap.Logger
 	// Tests may use a different balance policy.
@@ -109,12 +110,20 @@ func (router *ScoreBasedRouter) GetBackendSelector(clientInfo ClientInfo) Backen
 	if router.observation.Enabled() {
 		selection = &selectionObservation{owner: router.observation, session: router.observation.NextIdentity()}
 	}
+	var selectorCapture *selectionObservation
+	if router.selectorCapture {
+		selectorCapture = selection
+	}
 	return BackendSelector{
+		selectionCapture: selectorCapture,
 		closeObservation: func() { selection.finish() },
 		routeOnce: func(excluded []BackendInst) (backend BackendInst, err error) {
 			// Prevent the group from being removed after it's chosen. In that case,
 			// the connection will be on a orphan group.
 			router.Lock()
+			if selectorCapture != nil && selectorCapture.owner.Enabled() {
+				selectorCapture.attempt++
+			}
 			defer func() {
 				router.Unlock()
 				if errors.Is(err, ErrNoBackend) {
