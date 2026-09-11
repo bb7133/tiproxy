@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -34,9 +35,11 @@ FINISH_CASES = [
     ]
 
 def error_marker(output):
-    errors = [line.removeprefix('Error: ').strip().strip('"')
-              for line in output.splitlines() if line.startswith('Error: ')]
-    return errors[0].split()[0] if errors and errors[0] else None
+    # Rust main prints string errors quoted, but io::Error uses a Custom Debug
+    # wrapper. Read the domain marker only from the first actual Error line.
+    first = next((line for line in output.splitlines() if line.startswith('Error: ')), '')
+    marker = re.search(r'\bSELECTOR_[A-Z_]+\b', first)
+    return marker.group(0) if marker else None
 
 
 def marker_expectations():

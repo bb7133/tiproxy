@@ -42,7 +42,10 @@ def check_anchors():
     for name, test, marker, old, new in RUST_CASES:
         if (ROOT / RUST).read_text().count(old) != 1:
             raise RuntimeError('stale anchor: ' + name)
-    print('SELECTOR_ANCHORS 16 cases / 17 unique anchor strings; static check only', flush=True)
+    anchors = [old for name, marker, edits in GO_CASES for old, new in edits]
+    anchors += [old for name, test, marker, old, new in RUST_CASES]
+    print(f'SELECTOR_ANCHORS {len(GO_CASES) + len(RUST_CASES)} cases / '
+          f'{len(anchors)} checks / {len(set(anchors))} distinct strings; static check only', flush=True)
 
 
 def main():
