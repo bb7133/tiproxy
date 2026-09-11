@@ -73,19 +73,25 @@ both engines make different legal random choices.
   real discrepancy; it cannot be dismissed as an internal difference.
 
 Random choice has one additional bounded distribution check: each of the six
-public balance/routing policy pairs runs 10,000 independent selections per
+public balance/routing policy pairs runs 50,000 independent selections per
 engine on a fixed, declared, multi-backend scenario. Close/failed-Finish resets
 each trial so input population is stable. Every selected backend must be legal;
 for each backend, the absolute Go/Rust selection-frequency difference must be
-at most 0.05. The manifest fixes candidates, source inputs and arrival schedule
+at most 0.02. The manifest fixes candidates, source inputs and arrival schedule
 before running. This is an engineering acceptance threshold, not a proof of
-identical distributions. A failure is recorded and diagnosed, not rerun until
+identical distributions or a guarantee of no sampling failures. The two-engine
+frequency difference has sampling variance from both engines; time-derived
+choices are not assumed to be IID. A failure is recorded and diagnosed, not rerun until
 it happens to pass. No internal ticket injection is used to force equality.
 
 ## 3. Recorded corpus: N = 18, K = 3
 
 [trace-matrix.tsv](trace-matrix.tsv) fixes 18 slots:
 These are required recording slots, not already recorded or passing traces.
+Every row is currently pending. Before the first qualifying run, fill all
+recorded_at_utc, trace_sha256, go_source_sha and environment_manifest_sha256
+fields, bind them to the raw trace files, and freeze the complete manifest.
+No pending row or substituted recording can count toward N or K.
 The three trace families (normal, failover, config/source change) are multiplied by
 six publicly accepted policy pairs (Connection/Resource/Location times
 prefer-idle/random). The internal-only `idlest` configuration is not a new
