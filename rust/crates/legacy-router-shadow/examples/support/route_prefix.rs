@@ -26,15 +26,13 @@ pub fn observe_prefix(
                     .map_err(|e| io::Error::other(format!("coverage {e:?}")))?;
                 return Ok(());
             }
-            native::Frame::Evaluation(e) => {
-                state.observe_native(&e, frame.len() * native::DECODE_MULTIPLIER)
-            }
+            native::Frame::Evaluation(e) => state.observe_router_metadata_native(&e, frame.len()),
         }
     } else {
         match live::decode(frame)? {
             live::Frame::Coverage { .. } => return Ok(()),
             live::Frame::Invalid { .. } => return Err("producer invalid".into()),
-            live::Frame::Batch(batch) => state.observe(&batch),
+            live::Frame::Batch(batch) => state.observe_router_metadata_batch(&batch, frame.len()),
         }
     };
     if !matches!(progress.status, Status::Comparing | Status::CleanEnded) {

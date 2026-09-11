@@ -14,10 +14,18 @@ import time
 ROOT = Path(__file__).resolve().parents[4]
 TRACKER = 'rust/crates/control-router/src/shadow/live/caller/metadata.rs'
 STATE = 'rust/crates/control-router/src/shadow/live/caller/metadata/state.rs'
+LIVE = 'rust/crates/control-router/src/shadow/live/caller/metadata_state.rs'
+SNAPSHOT = 'rust/crates/control-router/src/shadow/live/caller/metadata/snapshot.rs'
 SCENARIOS = ['all', 'cidr', 'port']
 # (name, source, old, new, {scenario that must fail: frozen marker}); every
 # other actual stream must still pass unchanged.
 CASES = [
+    ('drop-live-group-event', LIVE, 'stored.tracker.group_event(event)?;', 'let _ = event;',
+     {s: 'METADATA_REPLAY_FAILED scenario=%s generation=1 reason=Lifecycle' % s for s in SCENARIOS}),
+    ('drop-live-native-init', LIVE, 'stored.tracker.native_init(evaluation.group)?;', 'let _ = evaluation.group;',
+     {s: 'METADATA_REPLAY_FAILED scenario=%s generation=1 reason=Lifecycle' % s for s in SCENARIOS}),
+    ('lose-snapshot-generation', SNAPSHOT, 'last_generation: self.last_generation,', 'last_generation: 0,',
+     {s: 'METADATA_REPLAY_FAILED scenario=%s generation=2 reason=Sequence' % s for s in ['all', 'cidr']}),
     ('wrong-idle', STATE, 'current_group == 0 || idle(visit.account)', 'current_group == 0 || idle(visit.account) || true',
      {'all': 'METADATA_REPLAY_FAILED scenario=all generation=2 reason=Witness'}),
     ('wrong-intersect', STATE, '.find(|g| g.matcher.intersects(values))', '.find(|g| !g.matcher.intersects(values))',
@@ -41,7 +49,11 @@ CASES = [
 def main():
     evidence = Path(os.environ['CP_ROUTE_METADATA_EVIDENCE']).resolve()
     evidence.mkdir(parents=True, exist_ok=True)
-    paths = [TRACKER, STATE, 'pkg/balance/router/metadata_observation.go',
+    paths = [TRACKER, STATE,
+             'rust/crates/control-router/src/shadow/live/caller/metadata/snapshot.rs',
+             'rust/crates/control-routing/src/group.rs',
+             'rust/crates/control-router/src/shadow/live.rs',
+             'rust/crates/control-router/src/shadow/live/caller.rs', 'pkg/balance/router/metadata_observation.go',
              'pkg/balance/router/metadata_observation_test.go', 'pkg/balance/router/router_score.go',
              'pkg/balance/router/group.go', 'pkg/balance/observation/caller_metadata.go',
              'pkg/controlbridge/shadow/caller_metadata_codec.go',

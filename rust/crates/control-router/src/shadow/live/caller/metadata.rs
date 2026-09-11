@@ -19,6 +19,7 @@ use super::{Epoch, InvalidReason, LiveEvent};
 use control_routing::group::{ClientInfo, GroupMatcher, MatchType};
 use std::mem::size_of;
 
+mod snapshot;
 mod state;
 
 /// Backends per refresh; more is a Capacity failure, never truncation.
@@ -397,7 +398,8 @@ impl Open {
 
 /// Retained router metadata plus one open refresh. All changes are staged
 /// until the End witness matches; a failure is sticky and keeps the last
-/// committed state. Not installed in `LiveState` or any transport yet.
+/// committed state. `LiveState` owns the charged tracker; production transport
+/// dispatch remains uninstalled.
 #[derive(Default)]
 pub struct Tracker {
     last_generation: u64,
@@ -1166,3 +1168,27 @@ impl Open {
 
 #[cfg(test)]
 mod tests;
+
+/// One owner-scoped retained tracker, including a conservative full map-node
+/// allowance. Invalid/retired owners retain it just like native factor history.
+pub(crate) struct StoredMetadata {
+    pub tracker: Box<Tracker>,
+}
+impl StoredMetadata {
+    const MAP_CHARGE: usize = 16 * size_of::<(Epoch, Self)>();
+
+    pub fn retained_charge(&self) -> usize {
+        Self::MAP_CHARGE + self.tracker.retained_charge()
+    }
+
+    pub fn fork_charge(old: Option<&Self>) -> usize {
+        Self::MAP_CHARGE + old.map_or(size_of::<Tracker>(), |old| old.tracker.snapshot_charge())
+    }
+
+    /// The caller must admit `fork_charge` before entering this allocation path.
+    pub fn fork(old: Option<&Self>) -> Self {
+        Self {
+            tracker: Box::new(old.map_or_else(Tracker::native, |old| old.tracker.snapshot())),
+        }
+    }
+}

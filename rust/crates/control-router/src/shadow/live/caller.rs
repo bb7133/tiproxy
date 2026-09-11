@@ -23,7 +23,7 @@ pub mod selection;
 
 use super::native::{HISTORY_LIMIT, NativeOwner, STAGE_OVERHEAD, Stored};
 use super::{Batch, Epoch, Event, InvalidReason, LiveEvent, LiveState, Progress, Status};
-use crate::shadow::native::{Decision, Evaluation};
+use crate::shadow::native::{Decision, Entry, Evaluation};
 use std::collections::BTreeMap;
 
 /// Complete caller frame limit, including its four-byte prefix.
@@ -112,6 +112,7 @@ pub struct Stage<'a> {
     ledger_clone: usize,
     original_factor: usize,
     original_selectors: usize,
+    metadata: Option<metadata::StoredMetadata>,
     failed: Option<InvalidReason>,
     finished: bool,
 }
@@ -211,6 +212,7 @@ impl LiveState {
             ledger_clone,
             original_factor,
             original_selectors,
+            metadata: None,
             failed: None,
             finished: false,
         })
@@ -410,6 +412,7 @@ impl Stage<'_> {
             .and_then(|n| n.checked_add(selector_charge))
             .filter(|n| *n <= HISTORY_LIMIT)
             .ok_or(InvalidReason::Capacity)?;
+        let retained = self.metadata_commit_charge(retained)?;
         // Validate every destination before the first mutation of original state.
         if !self.original.core.owners.contains_key(&key)
             || !self.original.native.contains_key(&self.epoch)
@@ -437,6 +440,9 @@ impl Stage<'_> {
             }
             if let Some(factor) = factor {
                 native.groups.insert(self.group, factor);
+            }
+            if let Some(metadata) = self.metadata.take() {
+                self.original.metadata.insert(self.epoch, metadata);
             }
             original.sequence = self.last_sequence;
             self.original.native_bytes = retained;

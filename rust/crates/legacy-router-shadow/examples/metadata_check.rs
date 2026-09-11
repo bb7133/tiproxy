@@ -5,21 +5,18 @@
 //! inventory, membership, the redirection gate and client classification from
 //! the Begin inputs and the values each decision actually read; Go's Assign,
 //! Refresh and End frames are witnesses only, and every group identity binds to
-//! its real `GroupCreated` / native Init / `GroupRemoved` records. Runtime
-//! dispatch and shared retention are not installed.
+//! its real `GroupCreated` / native Init / `GroupRemoved` records. The owner
+//! tracker lives in `LiveState` and shares the retained budget;
+//! production transport dispatch remains uninstalled.
 use control_router::shadow::{
     InvalidReason, Limits, Status,
     live::{
-        LiveEvent, LiveState,
-        caller::{
-            Budget,
-            metadata::{Classification, Event, Tracker},
-        },
+        LiveState,
+        caller::metadata::{Classification, Event, Tracker},
     },
-    native::Entry,
 };
 use control_routing::group::ClientInfo;
-use legacy_router_shadow::{caller, live, native};
+use legacy_router_shadow::caller;
 use serde::Deserialize;
 use std::{env, fs, process};
 #[path = "support/route_prefix.rs"]
@@ -42,7 +39,6 @@ struct Counts {
 
 struct Replay {
     scenario: String,
-    tracker: Tracker,
     state: LiveState,
     origin: Option<control_routing::go_time::Origin>,
     owner: Option<control_router::shadow::Epoch>,
@@ -61,7 +57,6 @@ impl Replay {
     fn new(scenario: &str) -> Self {
         Self {
             scenario: scenario.to_string(),
-            tracker: Tracker::native(),
             state: LiveState::new(Limits::default()),
             origin: None,
             owner: None,
@@ -83,84 +78,59 @@ impl Replay {
         let version: Version = serde_json::from_slice(body)?;
         match version.version {
             4 => self.metadata(bytes),
-            3 => {
-                if let native::Frame::Evaluation(e) = native::decode(bytes, self.origin)?
-                    && e.entry == Entry::Config
+            2 | 3 => {
+                let result = prefix::observe_prefix(
+                    &mut self.state,
+                    bytes,
+                    &mut self.origin,
+                    &mut self.owner,
+                );
+                if let Some(owner) = self.owner
+                    && let Status::Invalid(reason) = self.state.progress(owner).status
                 {
-                    self.tracker
-                        .native_init(e.group)
-                        .map_err(|r| self.fail(r))?;
+                    return Err(self.fail(reason));
                 }
-                prefix::observe_prefix(&mut self.state, bytes, &mut self.origin, &mut self.owner)
-            }
-            2 => {
-                if let live::Frame::Batch(batch) = live::decode(bytes)? {
-                    for event in &batch.events {
-                        if matches!(
-                            event,
-                            LiveEvent::GroupCreated(_) | LiveEvent::GroupRemoved(_)
-                        ) {
-                            self.tracker.group_event(event).map_err(|r| self.fail(r))?;
-                        }
-                    }
-                }
-                prefix::observe_prefix(&mut self.state, bytes, &mut self.origin, &mut self.owner)
+                result
             }
             _ => Err("METADATA_UNKNOWN_FRAME_VERSION".into()),
         }
     }
 
+    fn tracker(&self) -> std::result::Result<&Tracker, InvalidReason> {
+        self.owner
+            .and_then(|owner| self.state.router_metadata(owner))
+            .ok_or(InvalidReason::MissingBegin)
+    }
+
     fn metadata(&mut self, bytes: &[u8]) -> Result<()> {
-        let retained = self.state.native_retained_bytes() + self.tracker.retained_charge();
         let caller::Frame::Metadata(boundary) =
-            caller::decode_caller(bytes, self.origin, retained)?
+            caller::decode_caller(bytes, self.origin, self.state.native_retained_bytes())?
         else {
             return Err("METADATA_FAMILY".into());
         };
         if self.owner.is_some_and(|owner| owner != boundary.epoch) {
             return Err("METADATA_FOREIGN_OWNER".into());
         }
-        let clones = self.tracker.clone_charge();
-        let frame = bytes.len();
-        let mut admit = |charge: usize| Budget::new(frame, retained + charge, clones).map(|_| ());
-        let sequence = boundary.sequence;
-        let result = match &boundary.event {
+        match &boundary.event {
             Event::Begin(begin) => {
                 self.generation = begin.generation;
                 self.counts.begins += 1;
-                self.tracker.begin(begin.clone(), &mut admit)
             }
-            Event::Assign(assign) => {
-                self.counts.assigns += 1;
-                // The ledger view at the actual Group critical section: Go's
-                // idle test is no physical connection and zero score.
-                let view = self.owner.and_then(|owner| self.state.view(owner));
-                let idle = |account: u64| {
-                    view.as_ref().is_none_or(|v| {
-                        v.accounts
-                            .iter()
-                            .find(|a| a.id == account)
-                            .is_none_or(|a| a.counts.active() == 0 && a.counts.score() == 0)
-                    })
-                };
-                self.tracker.assign(assign, idle, &mut admit)
-            }
-            Event::Refresh(refresh) => {
-                self.counts.refreshes += 1;
-                self.tracker.refresh(refresh, &mut admit)
-            }
-            Event::End(end) => {
-                self.counts.ends += 1;
-                self.tracker
-                    .end(*end, &mut admit)
-                    .and_then(|()| self.expect())
-            }
-        };
-        let progress = self
-            .state
-            .observe_metadata_boundary(&boundary, frame, result);
-        if progress.status != Status::Comparing || progress.compared_sequence != sequence {
-            return Err(self.fail(result.err().unwrap_or(InvalidReason::Sequence)));
+            Event::Assign(_) => self.counts.assigns += 1,
+            Event::Refresh(_) => self.counts.refreshes += 1,
+            Event::End(_) => self.counts.ends += 1,
+        }
+        let progress = self.state.observe_router_metadata(&boundary, bytes.len());
+        if progress.status != Status::Comparing || progress.compared_sequence != boundary.sequence {
+            let reason = if let Status::Invalid(reason) = progress.status {
+                reason
+            } else {
+                InvalidReason::Sequence
+            };
+            return Err(self.fail(reason));
+        }
+        if matches!(boundary.event, Event::End(_)) {
+            self.expect().map_err(|reason| self.fail(reason))?;
         }
         Ok(())
     }
@@ -168,7 +138,7 @@ impl Replay {
     /// Scenario expectations after each committed generation, computed only
     /// from the tracker's independently derived state.
     fn expect(&self) -> std::result::Result<(), InvalidReason> {
-        let t = &self.tracker;
+        let t = self.tracker()?;
         let groups = t.known_groups()?;
         let ids = groups.as_slice();
         let classify =
@@ -221,7 +191,8 @@ impl Replay {
     }
 
     fn finish(&self) -> Result<()> {
-        self.tracker.tail().map_err(|r| self.fail(r))?;
+        let tracker = self.tracker().map_err(|r| self.fail(r))?;
+        tracker.tail().map_err(|r| self.fail(r))?;
         let (generations, expected): (u64, (usize, usize, usize, usize)) =
             match self.scenario.as_str() {
                 "all" => (3, (3, 7, 2, 3)),
@@ -231,7 +202,7 @@ impl Replay {
             };
         let c = &self.counts;
         if (c.begins, c.assigns, c.refreshes, c.ends) != expected
-            || self.tracker.generation() != generations
+            || tracker.generation() != generations
         {
             return Err(format!(
                 "METADATA_POPULATION scenario={} begins={} assigns={} refreshes={} ends={}",

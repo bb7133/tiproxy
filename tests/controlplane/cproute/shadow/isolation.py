@@ -31,7 +31,7 @@ for path in shadow.rglob('*.rs'):
             'use super::super::native::{Coverage, Decision, Evaluation, FactorState};',
         ],
         'live/caller.rs': [
-            'use crate::shadow::native::{Decision, Evaluation};',
+            'use crate::shadow::native::{Decision, Entry, Evaluation};',
             # This literal constructs the private shadow mirror owner, with only
             # copied ledger/history values. It is not a production ledger owner.
             'crate::shadow::Owner {',
