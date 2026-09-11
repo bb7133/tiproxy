@@ -252,7 +252,8 @@ fn corrupt(record: &mut Record, fault: u8) -> bool {
                 backend,
                 ..
             },
-        ) => *backend = 0,
+        )
+        | (3, Record::Finish { backend }) => *backend = 0,
         (
             1,
             Record::Attempt {
@@ -268,7 +269,6 @@ fn corrupt(record: &mut Record, fault: u8) -> bool {
                 next: 3, current, ..
             },
         ) => *current = 0,
-        (3, Record::Finish { backend }) => *backend = 0,
         _ => return false,
     }
     true

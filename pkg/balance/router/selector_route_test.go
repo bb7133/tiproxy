@@ -70,8 +70,12 @@ func TestSelectorRouteActualFrames(t *testing.T) {
 		for records, _ := f.r.Retained(); records > 0; records, _ = f.r.Retained() {
 			d := f.take(t)
 			require.Nil(t, d.Record.Caller, "SELECTOR_ROUTE_NO_ESCAPED_ATTEMPT")
-			require.Nil(t, d.Record.Evaluation, "SELECTOR_ROUTE_NO_ESCAPED_NATIVE")
-			writeFrame(shadowwire.EncodeRecord(d.Record))
+			if d.Record.Evaluation != nil {
+				require.Equal(t, observation.EntryConfig, d.Record.Evaluation.Native().Entry, "SELECTOR_ROUTE_ONLY_CONSTRUCTION_NATIVE")
+				writeFrame(shadowwire.EncodeEvaluation(d.Record))
+			} else {
+				writeFrame(shadowwire.EncodeRecord(d.Record))
+			}
 			d.Release()
 		}
 	}
