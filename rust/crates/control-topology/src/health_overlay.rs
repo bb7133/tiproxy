@@ -45,6 +45,23 @@ use control_plane::OwnerToken;
 use crate::backend_health::BackendHealth;
 use crate::routing_snapshot::{RoutingSnapshot, RoutingSnapshotHandle};
 
+/// Payload-free error identity delivered by an external backend observer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObserverError {
+    /// Exact no-backend sentinel, which permits the selector's retry reset.
+    NoBackend,
+    /// A wrapped no-backend error, which does not reset that retry cycle.
+    WrappedNoBackend,
+    /// Conflicting cluster claims for a listener port.
+    PortConflict,
+    /// The backend topology source could not produce a result.
+    TopologyUnavailable,
+    /// The observer's request was cancelled.
+    Cancelled,
+    /// The observer's request exceeded its deadline.
+    DeadlineExceeded,
+}
+
 /// One immutable, generation-fenced health verdict for the backends of one exact
 /// [`RoutingSnapshot`] generation.
 ///
@@ -73,9 +90,26 @@ pub struct HealthSnapshot {
     /// The whole-map verdict, keyed by `backend_id`. A missing id is fail-closed
     /// unhealthy at [`Self::get`].
     health: HashMap<Arc<str>, BackendHealth>,
+    redirection: HashMap<Arc<str>, bool>,
+    observer_error: Option<ObserverError>,
 }
 
 impl HealthSnapshot {
+    /// A failed observer result blocks new selection without erasing the last
+    /// backend inventory or preventing existing connections from settling.
+    #[must_use]
+    pub fn observer_error(&self) -> Option<ObserverError> {
+        self.observer_error
+    }
+
+    /// Protocol migration capability delivered with this observer result.
+    /// Existing probe producers predate explicit capability publication and
+    /// retain their current enabled behavior when no value is supplied.
+    #[must_use]
+    pub fn supports_redirection(&self, backend_id: &str) -> bool {
+        self.redirection.get(backend_id).copied().unwrap_or(true)
+    }
+
     /// The health verdict for `backend_id`, **fail-closed** unhealthy when the id
     /// is absent from this round's map.
     ///
@@ -263,6 +297,17 @@ impl HealthOverlayPublisher {
         feed_gate: GenerationGate,
         owner: &OwnerToken,
     ) -> HealthPublishOutcome {
+        self.publish_result(source, health, HashMap::new(), feed_gate, owner)
+    }
+
+    pub(crate) fn publish_result(
+        &self,
+        source: &Arc<RoutingSnapshot>,
+        health: HashMap<Arc<str>, BackendHealth>,
+        redirection: HashMap<Arc<str>, bool>,
+        feed_gate: GenerationGate,
+        owner: &OwnerToken,
+    ) -> HealthPublishOutcome {
         let state = self.lock();
         if state.retired {
             return HealthPublishOutcome::Retired;
@@ -273,6 +318,8 @@ impl HealthOverlayPublisher {
             feed_gate,
             owner: owner.clone(),
             health,
+            redirection,
+            observer_error: None,
         });
         // Revoke the PREVIOUS published round's gate so a retained overlay loses
         // authority immediately, then swap the new snapshot in atomically.
@@ -280,6 +327,41 @@ impl HealthOverlayPublisher {
         if let Some(previous) = &previous {
             previous.gate.revoke();
         }
+        self.published.send_replace(Some(new));
+        HealthPublishOutcome::Published
+    }
+
+    /// Publishes an observer failure while retaining the last successful data.
+    /// Error delivery has the same owner/source/round fencing as health data;
+    /// recovery requires an explicit successful observer result.
+    #[cfg(feature = "api-replay")]
+    pub(crate) fn publish_error(
+        &self,
+        source: &Arc<RoutingSnapshot>,
+        error: ObserverError,
+    ) -> HealthPublishOutcome {
+        let state = self.lock();
+        let previous = self.published.borrow().clone();
+        let Some(previous) = previous.filter(|h| {
+            !state.retired
+                && Arc::ptr_eq(&h.source, source)
+                && source.source_gate().is_live()
+                && h.gate.is_live()
+                && h.feed_gate.is_live()
+                && h.owner.is_current()
+        }) else {
+            return HealthPublishOutcome::Retired;
+        };
+        let new = Arc::new(HealthSnapshot {
+            source: Arc::clone(source),
+            gate: GenerationGate::new(),
+            feed_gate: previous.feed_gate.clone(),
+            owner: previous.owner.clone(),
+            health: previous.health.clone(),
+            redirection: previous.redirection.clone(),
+            observer_error: Some(error),
+        });
+        previous.gate.revoke();
         self.published.send_replace(Some(new));
         HealthPublishOutcome::Published
     }

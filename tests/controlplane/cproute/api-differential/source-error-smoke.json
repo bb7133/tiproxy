@@ -1,0 +1,768 @@
+{
+  "version": 1,
+  "id": "api-source-error-smoke",
+  "config": {
+    "policy": "connection",
+    "selection": "prefer-idle",
+    "rule": ""
+  },
+  "provenance": {
+    "kind": "synthetic"
+  },
+  "events": [
+    {
+      "op": "source_error",
+      "error": "topology_unavailable",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "initial-error",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "initial-error",
+      "expect": {
+        "outcome": "source_error:topology_unavailable"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "initial-error",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          ""
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {},
+          "cluster": "default",
+          "keyspace": "",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 1,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "held",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "held",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "source_error",
+      "error": "cancelled",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "finish",
+      "session": "held",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "source_error",
+      "error": "no_backend",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "error-0",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "error-0",
+      "expect": {
+        "outcome": "no_backend"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "error-0",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "source_error",
+      "error": "wrapped_no_backend",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "error-1",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "error-1",
+      "expect": {
+        "outcome": "wrapped_no_backend"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "error-1",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "source_error",
+      "error": "port_conflict",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "error-2",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "error-2",
+      "expect": {
+        "outcome": "port_conflict"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "error-2",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "source_error",
+      "error": "topology_unavailable",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "error-3",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "error-3",
+      "expect": {
+        "outcome": "source_error:topology_unavailable"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "error-3",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "source_error",
+      "error": "cancelled",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "error-4",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "error-4",
+      "expect": {
+        "outcome": "source_error:cancelled"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "error-4",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "source_error",
+      "error": "deadline_exceeded",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "error-5",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "error-5",
+      "expect": {
+        "outcome": "source_error:deadline_exceeded"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "error-5",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "restored",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "rehydrate",
+      "session": "restored",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "restored",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"invalid-api-policy\"\n",
+      "expect": {
+        "outcome": "invalid_config"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "after-invalid-config",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "after-invalid-config",
+      "expect": {
+        "outcome": "source_error:deadline_exceeded"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "after-invalid-config",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "config",
+      "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4020\"]\nfailover-timeout=1\n",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "open",
+      "session": "after-valid-config",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "next",
+      "session": "after-valid-config",
+      "expect": {
+        "outcome": "source_error:deadline_exceeded"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "close",
+      "session": "after-valid-config",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 0
+    },
+    {
+      "op": "tick",
+      "at_nanos": 999999999,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {},
+          "cluster": "default",
+          "keyspace": "",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": false,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        }
+      ],
+      "at_nanos": 1000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "source_error",
+      "error": "deadline_exceeded",
+      "at_nanos": 1000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1999999999,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 2000000000,
+      "expect": {
+        "outcome": "ok",
+        "effects": [
+          {
+            "kind": "force_close",
+            "session": "held",
+            "operation": "held/1",
+            "from": "default/127.0.0.1:4020",
+            "to": "",
+            "accepted": true
+          }
+        ]
+      }
+    },
+    {
+      "op": "close",
+      "session": "held",
+      "at_nanos": 2000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "config",
+      "toml": "[proxy]\nfail-backend-list=[]\n",
+      "at_nanos": 2000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {},
+          "cluster": "default",
+          "keyspace": "",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        }
+      ],
+      "at_nanos": 2000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 1,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "open",
+      "session": "recovered",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "next",
+      "session": "recovered",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "finish",
+      "session": "recovered",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "next",
+      "session": "recovered",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "finish",
+      "session": "recovered",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "close",
+      "session": "recovered",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "health",
+      "backends": [],
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "open",
+      "session": "empty-success",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "next",
+      "session": "empty-success",
+      "expect": {
+        "outcome": "no_backend"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "close",
+      "session": "empty-success",
+      "expect": {
+        "outcome": "ok"
+      },
+      "at_nanos": 2000000000
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      },
+      "at_nanos": 2000000000
+    }
+  ]
+}

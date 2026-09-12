@@ -10,7 +10,11 @@ on:
       - "buf.gen.yaml"
       - "go.mod"
       - "pkg/controlbridge/**"
-      - "pkg/balance/metricsreader/**"
+      - "pkg/balance/**"
+      - "lib/config/**"
+      - "lib/go.mod"
+      - "lib/go.sum"
+      - "go.sum"
       - "proto/**"
       - "rust-toolchain.toml"
       - "rust/**"
@@ -27,7 +31,11 @@ on:
       - "buf.gen.yaml"
       - "go.mod"
       - "pkg/controlbridge/**"
-      - "pkg/balance/metricsreader/**"
+      - "pkg/balance/**"
+      - "lib/config/**"
+      - "lib/go.mod"
+      - "lib/go.sum"
+      - "go.sum"
       - "proto/**"
       - "rust-toolchain.toml"
       - "rust/**"
@@ -326,6 +334,56 @@ jobs:
           key: rust-migration-worker-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
       - name: Compare worker clocks, source lifecycle and compiling mutations
         run: make controlplane-cproute-worker-evidence
+
+  routing-api:
+    name: Router API differential adapter smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Select pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/target
+          key: rust-routing-api-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Compare the actual API adapters
+        run: |
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            tests/controlplane/cproute/api-differential/smoke.json \
+            --output "${RUNNER_TEMP}/routing-api" --comparator-check
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            tests/controlplane/cproute/api-differential/port-smoke.json \
+            --output "${RUNNER_TEMP}/routing-api-port"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            tests/controlplane/cproute/api-differential/source-error-smoke.json \
+            --output "${RUNNER_TEMP}/routing-api-source-error"
+      - name: Preserve API inputs, outputs and first failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: routing-api-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/routing-api
+            ${{ runner.temp }}/routing-api-port
+            ${{ runner.temp }}/routing-api-source-error
+          if-no-files-found: error
 
   routing-shadow:
     name: Read-only routing observation ledger and framing

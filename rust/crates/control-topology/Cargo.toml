@@ -9,6 +9,8 @@ repository.workspace = true
 
 [features]
 default = []
+# External health-result delivery for the API differential test adapter only.
+api-replay = []
 
 [dependencies]
 control-config.workspace = true

@@ -38,6 +38,7 @@ struct Backend {
     routing_identity: RoutingIdentity,
     account: Arc<AccountIdentity>,
     healthy: bool,
+    supports_redirection: bool,
     group: Option<u64>,
     failover_since: Option<Instant>,
 }
@@ -58,6 +59,8 @@ struct State {
     ports: PortRoutes<u64>,
     next_group: u64,
     observed: Option<(Arc<RoutingSnapshot>, Arc<HealthSnapshot>)>,
+    server_version: String,
+    supports_redirection: bool,
 }
 
 #[cfg(test)]
@@ -123,6 +126,8 @@ impl Router {
                 ports: PortRoutes::default(),
                 next_group: 1,
                 observed: None,
+                server_version: String::new(),
+                supports_redirection: true,
             }),
         })
     }
@@ -220,6 +225,45 @@ impl Router {
         state.ledger.open().map_err(Into::into)
     }
 
+    /// Looks up a known assignment without selecting or charging a connection.
+    /// Retained unhealthy backends remain addressable while they own sessions.
+    /// # Errors
+    /// Returns source/admission errors or `NoBackend` for an unknown identity.
+    pub fn lookup_backend(&self, id: &str) -> Result<RouteAssignment, RouteError> {
+        let candidate = self.capture()?;
+        let mut state = self.lock();
+        self.sources.validate(&candidate)?;
+        state.refresh(&candidate)?;
+        let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
+        let result = assignment(&backend.source, candidate.health.get(id).local);
+        self.sources.validate(&candidate)?;
+        Ok(result)
+    }
+
+    /// Restores an existing connection onto its named backend without selection.
+    /// The supplied session must be idle. The whole charge and activation is
+    /// atomic; duplicate restoration cannot charge an already active session.
+    /// # Errors
+    /// Returns source/session errors or `NoBackend` for an unknown backend.
+    pub fn rehydrate(&self, session: &Session, id: &str) -> Result<RouteAssignment, RouteError> {
+        let candidate = self.capture()?;
+        let mut state = self.lock();
+        self.sources.validate(&candidate)?;
+        state.refresh(&candidate)?;
+        if state.ledger.pending(session)?.is_some() {
+            return Err(RouteError::AlreadyActive);
+        }
+        let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
+        let account = Arc::clone(&backend.account);
+        let result = assignment(&backend.source, candidate.health.get(id).local);
+        self.sources.validate(&candidate)?;
+        let reservation = state.ledger.reserve(session, &account, result)?;
+        let result = reservation.assignment().clone();
+        let settled = state.ledger.finish(&reservation, true);
+        debug_assert_eq!(settled, Settlement::Applied);
+        Ok(result)
+    }
+
     /// Captures candidate C/R/H inputs without retaining authority.
     ///
     /// # Errors
@@ -268,6 +312,9 @@ impl Router {
     ) -> Result<Reservation, RouteError> {
         let mut state = self.lock();
         self.sources.validate(candidate)?;
+        if let Some(error) = candidate.health.observer_error() {
+            return Err(error.into());
+        }
         if let Some(pending) = state.ledger.pending(session)? {
             return Ok(pending);
         }
@@ -568,6 +615,34 @@ impl Router {
         self.lock().ledger.close(session)
     }
 
+    /// Number of currently healthy backends, independent of matching groups.
+    /// An unavailable source reports zero, as Go's observer-error path does.
+    #[must_use]
+    pub fn healthy_backend_count(&self) -> usize {
+        let Ok(candidate) = self.capture() else {
+            return 0;
+        };
+        if candidate.health.observer_error().is_some() {
+            return 0;
+        }
+        let mut state = self.lock();
+        if self.sources.validate(&candidate).is_err() || state.refresh(&candidate).is_err() {
+            return 0;
+        }
+        state
+            .backends
+            .values()
+            .filter(|backend| backend.healthy && backend.failover_since.is_none())
+            .count()
+    }
+
+    /// The last nonempty version observed from a healthy backend. When a round
+    /// contains several versions either engine may retain any observed version.
+    #[must_use]
+    pub fn server_version(&self) -> String {
+        self.lock().server_version.clone()
+    }
+
     /// Observes accounting for the currently retained owner of an opaque ID.
     /// This is diagnostic only; a backend ID never authorizes settlement.
     #[must_use]
@@ -833,20 +908,37 @@ impl State {
         choices
     }
 
-    fn refresh(&mut self, candidate: &Candidate) -> Result<(), RouteError> {
-        if self.observed.as_ref().is_some_and(|(r, h)| {
-            Arc::ptr_eq(r, &candidate.routing) && Arc::ptr_eq(h, &candidate.health)
-        }) {
-            return Ok(());
-        }
+    fn refresh_backend_metadata(&mut self, candidate: &Candidate) -> Result<(), RouteError> {
+        let incoming: BTreeSet<&str> = candidate
+            .routing
+            .backends
+            .backends
+            .iter()
+            .map(|source| source.backend_id.as_ref())
+            .collect();
+        // Removed backends keep their last capability until this health update
+        // prunes them; Go includes those retained wrappers in the same round.
+        self.supports_redirection = self
+            .backends
+            .iter()
+            .filter(|(id, _)| !incoming.contains(id.as_ref()))
+            .all(|(_, backend)| backend.supports_redirection);
         for backend in self.backends.values_mut() {
             backend.healthy = false;
         }
+        let mut server_version = None;
         for source in &candidate.routing.backends.backends {
-            let healthy = candidate.health.get(&source.backend_id).healthy;
+            let health = candidate.health.get(&source.backend_id);
+            let healthy = health.healthy;
+            let supports_redirection = candidate.health.supports_redirection(&source.backend_id);
+            self.supports_redirection &= supports_redirection;
+            if healthy {
+                server_version = health.server_version;
+            }
             if let Some(backend) = self.backends.get_mut(&source.backend_id) {
                 backend.source = source.clone();
                 backend.healthy = healthy;
+                backend.supports_redirection = supports_redirection;
             } else if healthy {
                 let account = self.ledger.add_account()?;
                 self.backends.insert(
@@ -856,16 +948,30 @@ impl State {
                         routing_identity: RoutingIdentity::new(&source.backend.addr),
                         account,
                         healthy,
+                        supports_redirection,
                         group: None,
                         failover_since: None,
                     },
                 );
             }
         }
+        if let Some(version) = server_version.filter(|version| !version.is_empty()) {
+            self.server_version = version;
+        }
         // An outstanding reservation retains its original owner even if the
         // backend disappears, changes material epoch, or becomes unhealthy.
         self.backends
             .retain(|_, backend| backend.healthy || !self.ledger.prune(&backend.account));
+        Ok(())
+    }
+
+    fn refresh(&mut self, candidate: &Candidate) -> Result<(), RouteError> {
+        if self.observed.as_ref().is_some_and(|(r, h)| {
+            Arc::ptr_eq(r, &candidate.routing) && Arc::ptr_eq(h, &candidate.health)
+        }) {
+            return Ok(());
+        }
+        self.refresh_backend_metadata(candidate)?;
         let occupied: BTreeSet<u64> = self
             .backends
             .values()
