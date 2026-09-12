@@ -5,18 +5,38 @@
 
 Input : a recorded trace (events without `expect`) and the recorded Go rows for the same
         events (output evidence: per-event outcome/backend/effects).
-Output: the trace with `expect` per event, plus a `requires` list when a slot cannot be
-        qualified on the current runner (effects-v2, metrics-input, policy-constraint:*).
+Output: the trace with `expect` per event, plus a `requires` list naming every runner
+        dependency the slot needs before it can count (effects-v2, metrics-input,
+        exclusion-history, policy-constraint:<pair>). Dependencies are decided from the
+        public inputs and their history, never from what the recorded output happened to be.
 
-Rules (README §2): Next/Lookup/Rehydrate are derived separately; error classes map 1:1
-from inputs; ordinary exhaustion is exact `no_backend`; unprovable expectations are refused
-(the script exits non-zero and names the seq) — never "whatever was recorded".
+Rules (README §2, rev 3): Next / Lookup / Rehydrate are derived separately; error classes map
+1:1 from inputs; ordinary exhaustion is the exact `no_backend`; every unexplained outcome,
+backend or effect is refused (exit 2 naming the seq) — never "whatever was recorded".
+
+Public semantics mirrored (file:line at the reviewed tree):
+- selector exclusions are backend identities per attempt cycle; the reset happens only when
+  the legal candidates minus the *actual* excluded identities are empty and the exclusion
+  list is non-empty, and it also happens on an exact `ErrNoBackend` observer error
+  (backend_selector.go:24-37, router_score.go:127-130).
+- routing: observed-healthy, not in active failover, member of the routed group, not
+  excluded (group.go:352-386); the `random` selection may return any of them
+  (factor_balance.go:255-279); `prefer-idle` evicts by factor advice and is not derivable
+  from public inputs, so |candidates| > 1 under prefer-idle is a policy-constraint.
+- failover guard is evaluated per group: the list is ignored for a group only when it would
+  leave that group without a routeable backend (group.go:286-341); the timeout does not
+  gate the marking (router.go:160-165, Healthy = observed && not in failover).
+- retention: a backend enters `router.backends` when first consumed healthy; it leaves when
+  consumed unhealthy/absent and idle — no listed connection, no pending reservation, no
+  in-flight redirect score (router_score.go:264, 340-356, group.go:222-238). Rehydrate
+  additionally needs group ownership (group.go:514-520).
 """
 
 import argparse
 import copy
 import json
 import sys
+import tomllib
 from pathlib import Path
 
 SOURCE_ERROR_MAP = {
@@ -28,7 +48,8 @@ SOURCE_ERROR_MAP = {
     "deadline_exceeded": "source_error:deadline_exceeded",
 }
 PORT_LABEL = "tiproxy-port"
-RULES_SUPPORTED = {"", "port"}  # client_cidr / proxy_cidr derivation: policy-constraint until specified
+METRIC_POLICIES = {"resource", "location"}  # factor lists include health/memory/cpu (factor_balance.go:117-120)
+UNSUPPORTED_CONFIG_KEYS = (("balance", "label-name"), ("labels",))  # label isolation: not specified for derivation
 
 
 class Refuse(Exception):
@@ -40,115 +61,299 @@ def backend_id(b):
     return f"{cluster}/{b['address']}" if cluster else b["address"]
 
 
-def parse_toml_min(toml):
-    """Minimal TOML reader for the keys the derivation needs (fail-backend-list, failover-timeout,
-    routing-rule). Anything else is ignored; malformed documents return {}."""
-    out, section = {}, ""
-    for raw in toml.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip()
-            continue
-        if "=" not in line:
-            continue
-        key, value = (x.strip() for x in line.split("=", 1))
-        key = f"{section}.{key}" if section else key
-        if value.startswith("[") and value.endswith("]"):
-            items = [v.strip().strip('"') for v in value[1:-1].split(",") if v.strip()]
-            out[key] = items
-        else:
-            out[key] = value.strip('"')
-    return out
+def parse_toml(toml):
+    """Full TOML parse (tomllib). Returns the document; refuses unsupported routing inputs."""
+    try:
+        doc = tomllib.loads(toml)
+    except tomllib.TOMLDecodeError as e:
+        raise Refuse(f"config TOML does not parse ({e}); the validator accepted it, so the deriver cannot follow it")
+    for path in UNSUPPORTED_CONFIG_KEYS:
+        node = doc
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        if node is not None:
+            raise Refuse(f"config key {'.'.join(path)} affects routing and is not specified for derivation")
+    return doc
+
+
+def toml_get(doc, *path):
+    node = doc
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
+
+
+class Backend:
+    __slots__ = ("id", "address", "cluster", "labels", "local", "observed_healthy", "version", "group", "ambiguous")
+
+    def __init__(self, bid, b):
+        self.id = bid
+        self.group = None
+        self.ambiguous = False
+        self.update(b)
+
+    def update(self, b):
+        self.address = b["address"]
+        self.cluster = b.get("cluster", "default")
+        self.labels = dict(b.get("labels", {}) or {})
+        self.local = bool(b.get("local", True))
+        self.observed_healthy = bool(b.get("healthy", True))
+        self.version = b.get("server_version", "")
+
+
+class Session:
+    __slots__ = ("id", "port", "client", "proxy", "cycle", "pending", "assigned", "inflight")
+
+    def __init__(self, sid, event):
+        self.id = sid
+        self.port = event.get("port", "")
+        self.client = event.get("client", "")
+        self.proxy = event.get("proxy", "")
+        self.cycle = []  # [(backend_id, unique)] excluded identities of the current attempt cycle
+        self.pending = None  # frozenset of possible reserved backends (Next ok, Finish not yet)
+        self.assigned = None  # frozenset of possible current assignments
+        self.inflight = None  # frozenset of possible redirect destinations holding the score
+
+    def possible(self):
+        out = set()
+        for s in (self.pending, self.assigned, self.inflight):
+            if s:
+                out |= s
+        return out
+
+    def sure(self):
+        out = set()
+        for s in (self.pending, self.assigned, self.inflight):
+            if s and len(s) == 1:
+                out |= s
+        return out
 
 
 class State:
-    def __init__(self, config):
+    def __init__(self, config, provenance=None):
+        provenance = provenance or {}
+        # Metric factors only matter when the recording actually consumed metric data. The
+        # synthetic runner has no metrics input, so synthetic traces never did; recorded traces
+        # did unless the harness archived `metrics_observed: false`.
+        self.metrics_observed = bool(provenance.get("metrics_observed", provenance.get("kind") == "recorded"))
         self.rule = config["rule"]  # fixed at Init (router_score.go:90)
-        self.policy = config["policy"]  # [balance] policy: runtime-configurable via config events
-        self.selection = config["selection"]  # [balance] routing-policy: runtime-configurable
-        self.inventory = {}  # id -> backend dict (last consumed health)
+        self.policy = config["policy"]
+        self.selection = config["selection"]
+        self.backends = {}  # router.backends: id -> Backend
+        self.groups = {}  # group value -> set(ids); MatchAll uses ""
+        self.ignore_failover = {}  # group value -> bool
+        self.failover = set()  # ids currently marked (Healthy() false)
         self.observer_error = None
         self.fail_list = set()
-        self.failover_timeout = None
-        self.sessions = {}  # id -> {"retries": int, "active": bool, "port": str, "client": str, "proxy": str}
-        self.assignments = {}  # session -> backend (from recorded rows; evidence only)
-        self.retained = set()  # backends healthy in some consumed inventory and not removed since
-        self.unique_history = True  # every successful selection so far had a unique legal set
+        self.sessions = {}
+        self.unique_history = True
         self.requires = set()
         self.retained_version = ""
+        if self.rule not in ("", "port"):
+            self.requires.add(f"policy-constraint:{self.rule}")
 
-    # --- inputs -------------------------------------------------------------------------
-    def apply_health(self, backends):
-        self.inventory = {backend_id(b): b for b in backends}
-        self.observer_error = None
-        holding = {b for sid, b in self.assignments.items() if self.sessions.get(sid, {}).get("active")}
-        # A backend enters the router's retained set when first seen healthy; it leaves when a later
-        # inventory omits it and no connection holds it. A never-healthy backend is unknown.
-        self.retained = {i for i in self.retained if i in self.inventory or i in holding}
-        self.retained |= {i for i, b in self.inventory.items() if b.get("healthy", True)}
-        self.refresh_failover_guard()
-        healthy_versions = [b.get("server_version", "") for b in backends if b.get("healthy", True) and b.get("server_version", "")]
-        if healthy_versions:
-            self.retained_version = healthy_versions[-1]
+    # --- helpers -------------------------------------------------------------------------
+    def held_possible(self, bid):
+        return any(bid in s.possible() for s in self.sessions.values())
 
-    def apply_config(self, toml):
-        cfg = parse_toml_min(toml)
-        if "proxy.fail-backend-list" in cfg:
-            self.fail_list = set(cfg["proxy.fail-backend-list"])
-        if "proxy.failover-timeout" in cfg:
-            self.failover_timeout = cfg["proxy.failover-timeout"]
-        if "balance.policy" in cfg:
-            self.policy = cfg["balance.policy"]
-        if "balance.routing-policy" in cfg:
-            self.selection = cfg["balance.routing-policy"]
-        self.refresh_failover_guard()
+    def held_sure(self, bid):
+        return any(bid in s.sure() for s in self.sessions.values())
 
-    def refresh_failover_guard(self):
-        # group.go updateFailoverLocked: a list that would leave no routeable backend is ignored.
-        routeable = [i for i, b in self.inventory.items() if b.get("healthy", True)]
-        marked = [i for i in routeable if i.split("/", 1)[-1] in self.fail_list]
-        self.failover_ignored = bool(routeable) and len(marked) == len(routeable)
-
-    def failover_active(self, bid):
-        if self.failover_ignored or not self.failover_timeout:
-            return False
-        return bid.split("/", 1)[-1] in self.fail_list
-
-    # --- derived sets ---------------------------------------------------------------------
-    def healthy_ids(self):
-        return [i for i, b in self.inventory.items() if b.get("healthy", True)]
-
-    def routable_ids(self):
-        return [i for i in self.healthy_ids() if not self.failover_active(i)]
-
-    def port_owners(self, port):
-        owners = {}
-        for i, b in self.inventory.items():
-            if b.get("labels", {}).get(PORT_LABEL, "") == port:
-                owners.setdefault(b.get("cluster", "default"), []).append(i)
-        return owners
-
-    def match_rule(self, session):
+    def group_value(self, b):
         if self.rule == "":
-            return self.routable_ids(), None
+            return ""
         if self.rule == "port":
-            owners = self.port_owners(session["port"])
-            if len(owners) > 1:
-                return [], "port_conflict"
-            ids = [i for ids in owners.values() for i in ids]
-            return [i for i in ids if i in self.routable_ids()], None
-        self.requires.add(f"policy-constraint:{self.rule}")
+            port = b.labels.get(PORT_LABEL, "")
+            if not port:
+                return None
+            return f"{b.cluster}:{port}" if b.cluster else port
         raise Refuse(f"routing rule {self.rule!r} derivation not specified")
 
-    def retained_ids(self):
-        # router.backends: healthy at least once and still listed or holding connections (apply_health).
-        return set(self.retained)
+    def healthy(self, bid):
+        b = self.backends[bid]
+        return b.observed_healthy and bid not in self.failover
+
+    # --- inputs (router_score.go updateBackendHealth / updateGroups / group.UpdateFailover) ---
+    def apply_health(self, backends):
+        self.observer_error = None
+        seen = {}
+        for raw in backends:
+            bid = backend_id(raw)
+            seen[bid] = raw
+            if bid in self.backends:
+                self.backends[bid].update(raw)
+            elif raw.get("healthy", True):
+                self.backends[bid] = Backend(bid, raw)
+            # an unhealthy backend that was never healthy is not in the router (router_score.go:277-279)
+        for bid, b in self.backends.items():
+            if bid not in seen:
+                b.observed_healthy = False  # removed from the list → unhealthy (router_score.go:242-254)
+        self.update_groups()
+        self.update_failover()
+        versions = [b.version for b in self.backends.values() if b.observed_healthy and b.version]
+        if versions:
+            self.retained_version = versions[-1]
+
+    def update_groups(self):
+        for bid in list(self.backends):
+            b = self.backends[bid]
+            if not b.observed_healthy:
+                if not self.held_possible(bid):
+                    self.remove_backend(bid)
+                    continue
+                if not self.held_sure(bid):
+                    b.ambiguous = True  # retention depends on an engine-relative assignment
+            if b.group is None:
+                value = self.group_value(b)
+                if value is not None:
+                    b.group = value
+                    self.groups.setdefault(value, set()).add(bid)
+
+    def remove_backend(self, bid):
+        b = self.backends.pop(bid)
+        if b.group is not None:
+            members = self.groups.get(b.group)
+            if members is not None:
+                members.discard(bid)
+                if not members:
+                    del self.groups[b.group]
+                    self.ignore_failover.pop(b.group, None)
+
+    def apply_config(self, toml):
+        doc = parse_toml(toml)
+        v = toml_get(doc, "proxy", "fail-backend-list")
+        if v is not None:
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise Refuse("proxy.fail-backend-list must be an array of strings")
+            self.fail_list = set(v)
+        v = toml_get(doc, "balance", "policy")
+        if v is not None:
+            self.policy = v
+        v = toml_get(doc, "balance", "routing-policy")
+        if v is not None:
+            self.selection = v
+        # balance.routing-rule at runtime is ignored by the router (matchType fixed at Init).
+        self.update_failover()
+
+    def update_failover(self):
+        """group.go:286-341 per group; Healthy() = observed && not marked (router.go:160-165)."""
+        self.failover = set()
+        for value, members in self.groups.items():
+            routeable = [bid for bid in members if self.backends[bid].observed_healthy]
+            marked = {bid for bid in members if self.backends[bid].address in self.fail_list}
+            remaining = [bid for bid in routeable if bid not in marked]
+            if routeable and not remaining:
+                self.ignore_failover[value] = True
+                continue
+            self.ignore_failover[value] = False
+            self.failover |= marked
+
+    # --- derived sets ---------------------------------------------------------------------
+    def routed_group(self, session):
+        """router_score.go:201-215: the group for this client, or a port conflict."""
+        if self.rule == "":
+            return self.groups.get(""), None
+        if self.rule == "port":
+            owners = {}
+            for value, members in self.groups.items():
+                cluster, _, port = value.rpartition(":")
+                if port == session.port:
+                    owners[cluster] = members
+            if len(owners) > 1:
+                return None, "port_conflict"
+            return (next(iter(owners.values())) if owners else None), None
+        raise Refuse(f"routing rule {self.rule!r} derivation not specified")
+
+    def candidates(self, session):
+        """Healthy members of the routed group (group.go:359-364), before exclusions."""
+        members, conflict = self.routed_group(session)
+        if conflict:
+            return None, conflict
+        if not members:
+            return [], None
+        return sorted(bid for bid in members if self.healthy(bid)), None
+
+    def routable_ids(self):
+        return [bid for bid in self.backends if self.healthy(bid)]
+
+    def group_healthy(self, bid):
+        b = self.backends.get(bid)
+        if b is None or b.group is None:
+            return set()
+        return {m for m in self.groups.get(b.group, ()) if self.healthy(m)}
+
+
+def route_once(state, session, excluded):
+    """One routeOnce with a concrete excluded identity set. Returns (legal, error)."""
+    if state.observer_error is not None:
+        return None, SOURCE_ERROR_MAP[state.observer_error]
+    cands, conflict = state.candidates(session)
+    if conflict:
+        return None, conflict
+    legal = [c for c in cands if c not in excluded]
+    if not legal:
+        return None, "no_backend"
+    return legal, None
+
+
+def prefer_local(state, legal):
+    local = [bid for bid in legal if state.backends[bid].local]
+    return local if local else legal
+
+
+def derive_next(state, session, expect):
+    """Engine-independent expectation for one Next, plus Go's own legal set for validation."""
+    go_excluded = [b for b, _ in session.cycle]
+    unique_excluded = {b for b, u in session.cycle if u}
+    nonunique_in_cycle = any(not u for _, u in session.cycle)
+    legal_go, err = route_once(state, session, set(go_excluded))
+    reset = False
+    if err == "no_backend" and go_excluded:
+        reset = True  # exact ErrNoBackend with exclusions → reset and route again
+        session.cycle = []
+        legal_go, err = route_once(state, session, set())
+    if err is not None:
+        expect["outcome"] = err
+        return None
+    # cross-engine expression
+    if reset and nonunique_in_cycle:
+        legal = legal_go  # an engine without the reset has a subset; exact form needs the history
+        state.requires.add("exclusion-history")
+    elif not reset:
+        cands, _ = state.candidates(session)
+        legal = [c for c in cands if c not in unique_excluded]
+        if nonunique_in_cycle:
+            expect["exclude_previous"] = True  # covers the engine's own last exclusion only
+            if len(session.cycle) >= 2:
+                state.requires.add("exclusion-history")
+    else:
+        legal = legal_go
+    if state.selection == "prefer-idle":
+        # factor_balance.go:287-345 evicts a candidate when a higher-priority factor advises
+        # migration. Under `location` the location factor precedes every metric factor, so a
+        # remote candidate is evicted whenever a local one exists — deterministic from inputs.
+        # Every other eviction (conn-count, health/memory/cpu) is not derivable: constraint.
+        if state.policy == "location":
+            if nonunique_in_cycle and not reset:
+                state.requires.add("exclusion-history")  # the local/remote split depends on the engine's exclusions
+            else:
+                legal = prefer_local(state, legal)
+            legal_go = prefer_local(state, legal_go)
+        if len(legal) > 1:
+            state.requires.add(f"policy-constraint:{state.policy}/prefer-idle")
+            if state.policy in METRIC_POLICIES and state.metrics_observed:
+                state.requires.add("metrics-input")
+    if len(legal) == 1:
+        expect["backend"] = legal[0]
+    else:
+        expect["legal_backends"] = sorted(legal)
+    return legal_go
 
 
 def derive(trace, rows, args):
-    state = State(trace["config"])
+    state = State(trace["config"], trace.get("provenance"))
     events = trace["events"]
     if len(rows) != len(events):
         raise Refuse(f"rows {len(rows)} != events {len(events)}")
@@ -159,105 +364,100 @@ def derive(trace, rows, args):
         if op == "health":
             state.apply_health(event.get("backends", []))
         elif op == "source_error":
+            if event["error"] not in SOURCE_ERROR_MAP:
+                raise Refuse(f"seq {seq}: unknown source error identity {event['error']!r}")
             state.observer_error = event["error"]
         elif op == "config":
-            # Validator result is public behavior at the validation entry; the derivation cannot
-            # re-implement lib/config validation, so the recorded outcome is accepted only if it is
-            # one of the two public classes.
             if row["outcome"] not in ("ok", "invalid_config"):
                 raise Refuse(f"seq {seq}: config outcome {row['outcome']!r} not a public class")
-            expect["outcome"] = row["outcome"]
+            expect["outcome"] = row["outcome"]  # validator result at the validation entry (README §2)
             if row["outcome"] == "ok":
                 state.apply_config(event.get("toml", ""))
         elif op == "open":
-            state.sessions[sid] = {"retries": 0, "active": False, "port": event.get("port", ""),
-                                   "client": event.get("client", ""), "proxy": event.get("proxy", ""),
-                                   "go_excluded": []}
+            state.sessions[sid] = Session(sid, event)
         elif op == "next":
             s = state.sessions[sid]
-            if state.observer_error is not None:
-                expect["outcome"] = SOURCE_ERROR_MAP[state.observer_error]
-            else:
-                legal, conflict = state.match_rule(s)
-                if conflict:
-                    expect["outcome"] = conflict
-                elif not legal:
-                    expect["outcome"] = "no_backend"  # exact only (exclusion exhaustion never wraps)
-                else:
-                    if state.policy == "location":
-                        # Public rule of the location policy: a local backend is preferred whenever
-                        # one is legal; remote backends are legal only when no local one is.
-                        local = [i for i in legal if state.inventory[i].get("local", True)]
-                        if local:
-                            legal = local
-                    retrying = s["retries"] > 0
-                    if retrying and s["retries"] >= len(legal):
-                        # backend_selector.go:26-30: exhausted exclusions reset; a repeat is legal
-                        retrying = False
-                        s["go_excluded"] = []
-                    if len(legal) == 1:
-                        expect["backend"] = legal[0]
-                    else:
-                        expect["legal_backends"] = sorted(legal)
-                        state.unique_history = False
-                    if retrying:
-                        expect["exclude_previous"] = True
-                        if s["retries"] >= 2:
-                            # The engine must avoid every backend it excluded in this attempt cycle;
-                            # run.py's exclude_previous expresses only the last one. Engine-relative
-                            # multi-retry exclusion is a runner dependency (README §0), never a relaxed set.
-                            state.requires.add("exclusion-history")
+            legal_go = derive_next(state, s, expect)
+            if expect["outcome"] == "no_backend" and state.observer_error == "no_backend" and s.cycle:
+                s.cycle = []  # exact ErrNoBackend from the observer also resets (backend_selector.go:26-30)
             if expect["outcome"] != row["outcome"]:
                 raise Refuse(f"seq {seq}: recorded outcome {row['outcome']!r} is not explained by inputs (derived {expect['outcome']!r})")
             if row["outcome"] == "ok":
                 chosen = row.get("backend", "")
-                if "backend" in expect and chosen != expect["backend"]:
-                    raise Refuse(f"seq {seq}: recorded backend {chosen!r} contradicts the unique derivation {expect['backend']!r}")
-                if "legal_backends" in expect and chosen not in expect["legal_backends"]:
-                    raise Refuse(f"seq {seq}: recorded backend {chosen!r} is outside the derived legal set {expect['legal_backends']}")
-                if chosen in s["go_excluded"]:
-                    raise Refuse(f"seq {seq}: recorded backend {chosen!r} was already excluded in this attempt cycle {s['go_excluded']}")
-                s["go_excluded"].append(chosen)
-                state.assignments[sid] = chosen
+                if chosen not in legal_go:
+                    raise Refuse(f"seq {seq}: recorded backend {chosen!r} is outside Go's own legal set {legal_go} (excluded {[b for b, _ in s.cycle]})")
+                unique = "backend" in expect
+                if not unique:
+                    state.unique_history = False
+                s.cycle.append((chosen, unique))
+                s.pending = frozenset([chosen]) if unique else frozenset(expect["legal_backends"])
         elif op == "finish":
             s = state.sessions[sid]
+            if s.pending is None:
+                raise Refuse(f"seq {seq}: finish without a pending Next")
             if event["success"]:
-                s["active"], s["retries"], s["go_excluded"] = True, 0, []
-            else:
-                s["retries"] += 1
+                s.assigned, s.cycle = s.pending, []
+            s.pending = None
         elif op == "close":
             state.sessions.pop(sid, None)
-            state.assignments.pop(sid, None)
-        elif op in ("lookup", "rehydrate"):
+        elif op == "lookup":
             name = event["backend"]
-            retained = state.retained_ids()
-            ok = name in retained
-            if op == "rehydrate":
-                s = state.sessions[sid]
-                ok = ok and not s["active"]
+            b = state.backends.get(name)
+            if b is not None and b.ambiguous:
+                raise Refuse(f"seq {seq}: retention of {name!r} depends on an engine-relative assignment")
+            expect["outcome"] = "ok" if b is not None else "unknown_backend"
+            if b is not None:
+                expect["backend"] = name
+        elif op == "rehydrate":
+            name = event["backend"]
+            b = state.backends.get(name)
+            if b is not None and b.ambiguous:
+                raise Refuse(f"seq {seq}: retention of {name!r} depends on an engine-relative assignment")
+            s = state.sessions.get(sid) or Session(sid, event)
+            state.sessions[sid] = s
+            if s.assigned or s.pending:
+                raise Refuse(f"seq {seq}: rehydrate on a non-idle session")
+            ok = b is not None and b.group is not None  # group ownership (group.go:514-520)
             expect["outcome"] = "ok" if ok else "unknown_backend"
             if ok:
                 expect["backend"] = name
-                if op == "rehydrate":
-                    s["active"] = True
-                    state.assignments[sid] = name
-            if expect["outcome"] != row["outcome"]:
-                raise Refuse(f"seq {seq}: {op} outcome {row['outcome']!r} not explained by retained set {sorted(retained)}")
+                s.assigned = frozenset([name])
         elif op == "tick":
+            refused = set(event.get("refuse", []) or [])
             effects = row.get("effects", [])
             if state.unique_history:
+                for ef in effects:
+                    s = state.sessions.get(ef["session"])
+                    if s is None or not s.assigned or ef["from"] not in s.assigned:
+                        raise Refuse(f"seq {seq}: effect {ef['operation']} from {ef['from']!r} contradicts the derived assignment")
+                    if ef["accepted"] == (ef["session"] in refused):
+                        raise Refuse(f"seq {seq}: effect {ef['operation']} acceptance contradicts the scripted refusal")
+                    if ef["kind"] == "redirect":
+                        legal_to = state.group_healthy(ef["from"]) - {ef["from"]}
+                        if ef["to"] not in legal_to:
+                            raise Refuse(f"seq {seq}: redirect destination {ef['to']!r} not in the legal set {sorted(legal_to)}")
+                        if ef["accepted"]:
+                            s.inflight = frozenset([ef["to"]])
                 if effects:
-                    expect["effects"] = effects  # literal form is exact when every prior choice was unique
+                    expect["effects"] = effects  # literal form is exact while every prior choice was unique (README §0 D1)
             else:
-                # README §0 D1: once any choice was non-unique, both the presence and the absence of an
-                # effect at a tick depend on per-engine history; the slot needs effects-v2 regardless.
+                # Both presence and absence of effects depend on per-engine history (README §0 D1).
                 state.requires.add("effects-v2")
+                for ef in effects:
+                    s = state.sessions.get(ef["session"])
+                    if s is not None and ef["kind"] == "redirect" and ef["accepted"]:
+                        s.inflight = frozenset(state.group_healthy(ef["from"]) - {ef["from"]}) or None
+            if state.policy in METRIC_POLICIES and state.metrics_observed:
+                state.requires.add("metrics-input")  # migration advice consults metric factors
         elif op == "redirect_result":
-            pass
+            s = state.sessions.get(sid)
+            if s is not None and s.inflight:
+                if event["success"]:
+                    s.assigned = s.inflight
+                s.inflight = None
         elif op == "checkpoint":
-            healthy = 0 if state.observer_error is not None else len(state.routable_ids())
-            expect["healthy_backend_count"] = healthy
-            current = sorted({b.get("server_version", "") for i, b in state.inventory.items() if b.get("healthy", True) and b.get("server_version", "")})
+            expect["healthy_backend_count"] = 0 if state.observer_error is not None else len(state.routable_ids())
+            current = sorted({b.version for b in state.backends.values() if b.observed_healthy and b.version})
             expect["legal_server_versions"] = current if current else [state.retained_version]
         else:
             raise Refuse(f"seq {seq}: unsupported op {op!r}")
@@ -270,11 +470,9 @@ def derive(trace, rows, args):
 
 
 def compare_with_reference(derived, reference, requires):
-    """Strict regression: every hand-written expectation must be reproduced exactly. A declared
-    unique backend must be derived as that unique backend (a legal set containing it is a
-    relaxation and fails); a declared legal set must be derived as the same set; error classes,
-    exclude_previous, counts and versions must be equal; required effects must be equal unless the
-    slot is explicitly marked `requires: effects-v2`, which is reported as WITHHELD (not qualified)."""
+    """Strict regression against a hand-written trace: unique must be unique, sets equal,
+    error classes / exclude_previous / counts / versions equal; effects equal unless the slot
+    is marked effects-v2 (reported WITHHELD, never qualified)."""
     diffs, withheld = [], []
     for seq, (d, r) in enumerate(zip(derived["events"], reference["events"])):
         de, re_ = d["expect"], r["expect"]
@@ -304,25 +502,21 @@ def self_check(stripped, rows, reference, requires):
     results = {}
     def next_index(pred):
         return next(i for i, e in enumerate(reference["events"]) if e["op"] == "next" and pred(e["expect"]))
-    # wrong backend at a uniquely derived next
     bad = copy.deepcopy(rows); i = next_index(lambda x: "backend" in x); bad[i]["backend"] = "default/wrong"
     try:
         derive(copy.deepcopy(stripped), bad, None); results["wrong_backend"] = "NOT CAUGHT"
     except Refuse as e:
         results["wrong_backend"] = f"refused: {e}"
-    # wrong error class at a next expected to fail
     bad = copy.deepcopy(rows); i = next_index(lambda x: x["outcome"] != "ok"); bad[i]["outcome"] = "ok"; bad[i]["backend"] = "default/wrong"
     try:
         derive(copy.deepcopy(stripped), bad, None); results["wrong_error_class"] = "NOT CAUGHT"
     except Refuse as e:
         results["wrong_error_class"] = f"refused: {e}"
-    # dropped effect: recorded rows lose an effect the reference requires
     try:
         j = next(i for i, e in enumerate(reference["events"]) if e["op"] == "tick" and e["expect"].get("effects"))
         bad = copy.deepcopy(rows); bad[j]["effects"] = []
         derived, req = derive(copy.deepcopy(stripped), bad, None)
         diffs, withheld = compare_with_reference(derived, reference, req)
-        caught = any(d[0] == j and d[1] == "effects" for d in diffs) or (j in withheld)
         results["dropped_effect"] = "caught by regression" if any(d[0] == j and d[1] == "effects" for d in diffs) else ("withheld (effects-v2 required)" if j in withheld else "NOT CAUGHT")
     except StopIteration:
         results["dropped_effect"] = "no required effects in this trace"
@@ -332,52 +526,124 @@ def self_check(stripped, rows, reference, requires):
         sys.exit(3)
 
 
+def hb(addr, healthy=True, local=True, port=None, cluster="default"):
+    labels = {PORT_LABEL: port} if port else {}
+    return {"address": addr, "labels": labels, "cluster": cluster, "ip": "127.0.0.1", "status_port": 10080,
+            "healthy": healthy, "local": local, "server_version": "8.5.1", "support_redirection": True}
+
+
+def rows_for(ev, **backends):
+    rows = [{"op": e["op"], "outcome": "ok", "backend": "", "effects": []} for e in ev]
+    for i, b in backends.items():
+        rows[int(i[1:])]["backend"] = b
+    return rows
+
+
 def defect_checks():
-    """Mini traces for reviewer-reported defects (msg 3b98d666)."""
+    """Mini traces for reviewer-reported defects (msgs 3b98d666, 5fb72a0b, ba700a7d)."""
     out = {}
-    hb = lambda addr, healthy=True: {"address": addr, "labels": {}, "cluster": "default", "ip": "127.0.0.1", "status_port": 10080, "healthy": healthy, "local": True, "server_version": "8.5.1", "support_redirection": True}
     cfg = {"policy": "connection", "selection": "random", "rule": ""}
-    # 1) A fails, B fails, third Next returns the already-excluded A -> refused
-    ev = [{"op": "health", "backends": [hb("a:4000"), hb("b:4000"), hb("c:4000")]},
-          {"op": "open", "session": "s"}, {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False},
+    def attempt(name, cfg, ev, rows, want):
+        try:
+            d, req = derive({"config": cfg, "events": ev}, rows, None)
+            out[name] = want(d, req)
+        except Refuse as e:
+            out[name] = want(None, str(e))
+    # A fails, B fails, third Next returns the still-excluded A (C alive) -> refused
+    ev = [{"op": "health", "backends": [hb("a"), hb("b"), hb("c")]}, {"op": "open", "session": "s"},
           {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False},
-          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}, {"op": "checkpoint"}]
-    rows = [{"op": e["op"], "outcome": "ok", "backend": ""} for e in ev]
-    rows[2]["backend"], rows[4]["backend"], rows[6]["backend"] = "default/a:4000", "default/b:4000", "default/a:4000"
+          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False},
+          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}]
+    attempt("excluded_repeat_ABA", cfg, ev, rows_for(ev, e2="default/a", e4="default/b", e6="default/a"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    # A fails, B fails, health removes A (B/C remain), third returns B -> refused (C is the unique legal one)
+    ev = [{"op": "health", "backends": [hb("a"), hb("b"), hb("c")]}, {"op": "open", "session": "s"},
+          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False},
+          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False},
+          {"op": "health", "backends": [hb("b"), hb("c")]},
+          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}]
+    attempt("excluded_repeat_after_removal", cfg, ev, rows_for(ev, e2="default/a", e4="default/b", e7="default/b"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    # the same inputs with Go returning C are legal; cross-engine the third attempt can only be
+    # expressed as {b,c} minus the engine's own history → exclusion-history dependency, Go row validated
+    attempt("reset_only_when_exhausted", cfg, ev, rows_for(ev, e2="default/a", e4="default/b", e7="default/c"),
+            lambda d, r: ("ok: legal {b,c}+exclude_previous, requires " + str(r)) if d and d["events"][7]["expect"].get("legal_backends") == ["default/b", "default/c"] and d["events"][7]["expect"].get("exclude_previous") and "exclusion-history" in r else f"NOT CAUGHT ({r})")
+    # per-group failover guard: list hits only the 6000 group's single backend -> ignored there
+    ev = [{"op": "health", "backends": [hb("127.0.0.1:4001", port="6000"), hb("127.0.0.1:4002", port="6001")]},
+          {"op": "config", "toml": '[proxy]\nfail-backend-list = ["127.0.0.1:4001"]\nfailover-timeout = 1\n'},
+          {"op": "open", "session": "s", "port": "6000"}, {"op": "next", "session": "s"},
+          {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}, {"op": "checkpoint"}]
+    attempt("per_group_failover_guard", {"policy": "connection", "selection": "random", "rule": "port"}, ev,
+            rows_for(ev, e3="default/127.0.0.1:4001"),
+            lambda d, r: "ok: unique 4001" if d and d["events"][3]["expect"].get("backend") == "default/127.0.0.1:4001" and d["events"][6]["expect"]["healthy_backend_count"] == 2 else f"NOT CAUGHT ({r})")
+    # location/random: A local fails, retry legally returns remote B
+    ev = [{"op": "health", "backends": [hb("a", local=True), hb("b", local=False)]}, {"op": "open", "session": "s"},
+          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False},
+          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False}, {"op": "close", "session": "s"}]
+    attempt("location_random_retry", {"policy": "location", "selection": "random", "rule": ""}, ev,
+            rows_for(ev, e2="default/a", e4="default/b"),
+            lambda d, r: "ok: legal {a,b}, retry legal {a,b} excluding the engine's own previous" if d and d["events"][2]["expect"].get("legal_backends") == ["default/a", "default/b"] and d["events"][4]["expect"].get("legal_backends") == ["default/a", "default/b"] and d["events"][4]["expect"].get("exclude_previous") and not r else f"NOT CAUGHT ({r})")
+    # never-healthy backend is unknown to Lookup
+    ev = [{"op": "health", "backends": [hb("a"), hb("n", healthy=False)]}, {"op": "lookup", "backend": "default/n"}, {"op": "checkpoint"}]
+    rows = rows_for(ev); rows[1]["outcome"] = "unknown_backend"
+    attempt("never_healthy_lookup", cfg, ev, rows,
+            lambda d, r: "ok: unknown_backend derived" if d and d["events"][1]["expect"]["outcome"] == "unknown_backend" else f"NOT CAUGHT ({r})")
+    # pending reservation (Next ok, no Finish) keeps a removed backend retained
+    ev = [{"op": "health", "backends": [hb("a")]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
+          {"op": "health", "backends": []}, {"op": "lookup", "backend": "default/a"},
+          {"op": "finish", "session": "s", "success": False}, {"op": "health", "backends": []}, {"op": "lookup", "backend": "default/a"}, {"op": "close", "session": "s"}]
+    rows = rows_for(ev, e2="default/a"); rows[4]["backend"] = "default/a"; rows[7]["outcome"] = "unknown_backend"
+    attempt("pending_reservation_retains", cfg, ev, rows,
+            lambda d, r: "ok: retained while pending, removed once idle" if d and d["events"][4]["expect"]["outcome"] == "ok" and d["events"][7]["expect"]["outcome"] == "unknown_backend" else f"NOT CAUGHT ({r})")
+    # random history + tick without effects still requires effects-v2 (input/history decides)
+    ev = [{"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
+          {"op": "finish", "session": "s", "success": True}, {"op": "tick"}, {"op": "close", "session": "s"}]
+    attempt("effects_v2_without_effect", cfg, ev, rows_for(ev, e2="default/a"),
+            lambda d, r: "ok: requires effects-v2" if d and "effects-v2" in r else f"NOT CAUGHT ({r})")
+    # prefer-idle with two candidates is a policy constraint; resource adds metrics-input
+    ev = [{"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
+          {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}]
+    attempt("prefer_idle_policy_constraint", {"policy": "resource", "selection": "prefer-idle", "rule": ""}, ev, rows_for(ev, e2="default/a"),
+            lambda d, r: "ok: requires " + str(r) if d and r == ["policy-constraint:resource/prefer-idle"] else f"NOT CAUGHT ({r})")
     try:
-        derive({"config": cfg, "events": ev}, rows, None); out["excluded_repeat"] = "NOT CAUGHT"
+        _, req = derive({"config": {"policy": "resource", "selection": "prefer-idle", "rule": ""}, "provenance": {"kind": "recorded"}, "events": ev}, rows_for(ev, e2="default/a"), None)
+        out["prefer_idle_recorded_metrics_input"] = "ok: requires " + str(req) if "metrics-input" in req else f"NOT CAUGHT ({req})"
     except Refuse as e:
-        out["excluded_repeat"] = f"refused: {e}"
-    # 2) never-healthy backend must be unknown to Lookup
-    ev = [{"op": "health", "backends": [hb("a:4000"), hb("n:4000", healthy=False)]}, {"op": "lookup", "backend": "default/n:4000"}, {"op": "checkpoint"}]
-    rows = [{"op": "health", "outcome": "ok"}, {"op": "lookup", "outcome": "unknown_backend", "backend": ""}, {"op": "checkpoint", "outcome": "ok"}]
-    try:
-        d, _ = derive({"config": cfg, "events": ev}, rows, None)
-        out["never_healthy_lookup"] = "ok: unknown_backend derived" if d["events"][1]["expect"]["outcome"] == "unknown_backend" else "NOT CAUGHT"
-    except Refuse as e:
-        out["never_healthy_lookup"] = f"NOT CAUGHT (refused: {e})"
-    # 3) random history without an effect at the tick must still require effects-v2
-    ev = [{"op": "health", "backends": [hb("a:4000"), hb("b:4000")]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": True},
-          {"op": "tick"}, {"op": "close", "session": "s"}, {"op": "checkpoint"}]
-    rows = [{"op": e["op"], "outcome": "ok", "backend": "", "effects": []} for e in ev]; rows[2]["backend"] = "default/a:4000"
-    _, req = derive({"config": cfg, "events": ev}, rows, None)
-    out["effects_v2_without_effect"] = "ok: requires effects-v2" if "effects-v2" in req else "NOT CAUGHT"
+        out["prefer_idle_recorded_metrics_input"] = f"NOT CAUGHT (refused: {e})"
+    # location/prefer-idle: one local and one remote → the local is unique; two locals → constraint
+    ev = [{"op": "health", "backends": [hb("a", local=True), hb("b", local=False)]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
+          {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}]
+    attempt("location_prefer_idle_local_unique", {"policy": "location", "selection": "prefer-idle", "rule": ""}, ev, rows_for(ev, e2="default/a"),
+            lambda d, r: "ok: unique local a" if d and d["events"][2]["expect"].get("backend") == "default/a" and not r else f"NOT CAUGHT ({r})")
+    attempt("location_prefer_idle_remote_rejected", {"policy": "location", "selection": "prefer-idle", "rule": ""}, ev, rows_for(ev, e2="default/b"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    # full TOML: single-quoted strings and a multi-line array must be honoured
+    ev = [{"op": "health", "backends": [hb("a"), hb("b")]},
+          {"op": "config", "toml": "[proxy]\nfail-backend-list = [\n  'a', # comment with \"quotes\"\n]\nfailover-timeout = 1\n"},
+          {"op": "open", "session": "s"}, {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}]
+    attempt("toml_full_parser", cfg, ev, rows_for(ev, e3="default/b"),
+            lambda d, r: "ok: unique b after failover" if d and d["events"][3]["expect"].get("backend") == "default/b" else f"NOT CAUGHT ({r})")
+    ev2 = copy.deepcopy(ev); ev2[1]["toml"] = "[balance]\nlabel-name = 'zone'\n"
+    attempt("toml_unsupported_key_refused", cfg, ev2, rows_for(ev2, e3="default/b"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     return out
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("trace", type=Path, help="recorded trace (expect blocks ignored if present)")
     ap.add_argument("rows", type=Path, help="recorded Go rows (go.json) for the same events")
     ap.add_argument("--output", type=Path)
     ap.add_argument("--check-against", type=Path, help="hand-written trace with expect blocks (regression)")
-    ap.add_argument("--self-check", action="store_true", help="mutate the recorded rows and prove the deriver/regression reject wrong backend, wrong error class and a dropped effect")
+    ap.add_argument("--self-check", action="store_true", help="mutate the recorded rows and prove the deriver/regression reject wrong backend, wrong error class and a dropped effect; run the reviewer counterexamples")
     args = ap.parse_args()
     trace = json.loads(args.trace.read_text())
     stripped = copy.deepcopy(trace)
     for e in stripped["events"]:
         e.pop("expect", None)
     rows = json.loads(args.rows.read_text())
+    if isinstance(rows, dict):
+        rows = rows.get("rows", rows)
     try:
         derived, requires = derive(stripped, rows, args)
     except Refuse as error:

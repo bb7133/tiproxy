@@ -48,22 +48,60 @@ type Effect struct {
 // `Outcome`/`Backend`/`Effects` fields are the recorded public results and are
 // kept apart from the trace input by the writer).
 type Event struct {
-	Op        string   `json:"op"`
-	Session   string   `json:"session,omitempty"`
-	Client    string   `json:"client,omitempty"`
-	Proxy     string   `json:"proxy,omitempty"`
-	Port      string   `json:"port,omitempty"`
-	Backend   string   `json:"backend,omitempty"`
-	Success   *bool    `json:"success,omitempty"`
-	Operation string   `json:"operation,omitempty"`
-	Outcome   string   `json:"outcome,omitempty"`
-	Effects   []Effect `json:"effects,omitempty"`
+	Op        string          `json:"op"`
+	TOML      string          `json:"toml,omitempty"`
+	Backends  []HealthBackend `json:"backends,omitempty"`
+	Session   string          `json:"session,omitempty"`
+	Client    string          `json:"client,omitempty"`
+	Proxy     string          `json:"proxy,omitempty"`
+	Port      string          `json:"port,omitempty"`
+	Backend   string          `json:"backend,omitempty"`
+	Success   *bool           `json:"success,omitempty"`
+	Operation string          `json:"operation,omitempty"`
+	Outcome   string          `json:"outcome,omitempty"`
+	Effects   []Effect        `json:"effects,omitempty"`
 }
 
-// Sink receives events in real consumption order. The harness serializes all
-// callers; Record must not block on the harness scheduler.
+// HealthBackend is one explicit health inventory entry (every field written).
+type HealthBackend struct {
+	ID                 string            `json:"-"`
+	Address            string            `json:"address"`
+	Labels             map[string]string `json:"labels"`
+	Cluster            string            `json:"cluster"`
+	Keyspace           string            `json:"keyspace"`
+	IP                 string            `json:"ip"`
+	StatusPort         uint              `json:"status_port"`
+	Healthy            bool              `json:"healthy"`
+	Local              bool              `json:"local"`
+	ServerVersion      string            `json:"server_version"`
+	SupportRedirection bool              `json:"support_redirection"`
+}
+
+// ErrorIdentity maps an observer error to its trace identity.
+func ErrorIdentity(err error) string {
+	switch {
+	case err == router.ErrNoBackend:
+		return "no_backend"
+	case errors.Is(err, router.ErrNoBackend):
+		return "wrapped_no_backend"
+	case errors.Is(err, router.ErrPortConflict):
+		return "port_conflict"
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	default:
+		return "topology_unavailable"
+	}
+}
+
+// Sink receives events in real consumption order and owns the harness's
+// serialized critical section: Serialize runs fn while no other input delivery
+// or public call can interleave, so the real call and its record are one
+// atomic step (recorder README §1/§5).
 type Sink interface {
 	Record(Event)
+	Serialize(fn func())
 }
 
 // Clock returns the harness logical clock (nanoseconds since trace start).
@@ -97,6 +135,17 @@ func record(ev Event) {
 	}
 }
 
+func serialize(fn func()) {
+	sinkMu.Lock()
+	s := sink
+	sinkMu.Unlock()
+	if s == nil {
+		fn()
+		return
+	}
+	s.Serialize(fn)
+}
+
 type session struct {
 	id       string
 	current  router.BackendInst
@@ -109,14 +158,14 @@ type session struct {
 // returned selector must be addressed by the caller for Next/Finish; the
 // session identity is bound to that address (stable within the proxy's connect
 // function scope) and never reused: ids are `<prefix>-<n>` with a monotonic n.
-func Open(r router.Router, ci router.ClientInfo) router.BackendSelector {
-	sel := r.GetBackendSelector(ci)
-	s := &session{id: fmt.Sprintf("%s-%d", prefix, counter.Add(1))}
-	// The selector value is returned to the caller; Bind is invoked by the
-	// overlay on the caller's local variable address (see Next/Finish).
-	pending.Store(s.id, s)
-	record(Event{Op: "open", Session: s.id, Client: addr(ci.ClientAddr), Proxy: addr(ci.ProxyAddr), Port: ci.ListenerPort})
-	lastOpened.Store(s)
+func Open(r router.Router, ci router.ClientInfo) (sel router.BackendSelector) {
+	serialize(func() {
+		sel = r.GetBackendSelector(ci)
+		s := &session{id: fmt.Sprintf("%s-%d", prefix, counter.Add(1))}
+		pending.Store(s.id, s)
+		record(Event{Op: "open", Session: s.id, Client: addr(ci.ClientAddr), Proxy: addr(ci.ProxyAddr), Port: ci.ListenerPort})
+		lastOpened.Store(s)
+	})
 	return sel
 }
 
@@ -142,15 +191,17 @@ func bind(sel *router.BackendSelector) *session {
 
 // Next calls the real BackendSelector.Next and records exactly one `next`
 // event with the public result: the backend ID or the public error class.
-func Next(sel *router.BackendSelector) (router.BackendInst, error) {
-	s := bind(sel)
-	backend, err := sel.Next()
-	ev := Event{Op: "next", Session: s.id, Outcome: outcome(err)}
-	if err == nil && backend != nil {
-		ev.Backend = backend.ID()
-		s.current = backend
-	}
-	record(ev)
+func Next(sel *router.BackendSelector) (backend router.BackendInst, err error) {
+	serialize(func() {
+		s := bind(sel)
+		backend, err = sel.Next()
+		ev := Event{Op: "next", Session: s.id, Outcome: outcome(err)}
+		if err == nil && backend != nil {
+			ev.Backend = backend.ID()
+			s.current = backend
+		}
+		record(ev)
+	})
 	return backend, err
 }
 
@@ -158,13 +209,15 @@ func Next(sel *router.BackendSelector) (router.BackendInst, error) {
 // effects and the connection's callbacks are recorded, then calls the real
 // Finish and records the `finish` event.
 func Finish(sel *router.BackendSelector, conn router.RedirectableConn, succeed bool) {
-	s := bind(sel)
-	if s.conn == nil {
-		s.conn = &Conn{RedirectableConn: conn, session: s}
-	}
-	sel.Finish(s.conn, succeed)
-	ok := succeed
-	record(Event{Op: "finish", Session: s.id, Success: &ok})
+	serialize(func() {
+		s := bind(sel)
+		if s.conn == nil {
+			s.conn = &Conn{RedirectableConn: conn, session: s}
+		}
+		sel.Finish(s.conn, succeed)
+		ok := succeed
+		record(Event{Op: "finish", Session: s.id, Success: &ok})
+	})
 }
 
 // Conn is the recorded RedirectableConn: the router receives this wrapper from

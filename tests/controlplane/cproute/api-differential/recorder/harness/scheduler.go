@@ -1,0 +1,107 @@
+// Copyright 2026 PingCAP, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build apireplay
+
+// Package harness composes the real proxy, router and observer for recording
+// the API differential corpus (recorder README §1, §4, §5). Everything here is
+// test-build only and uses public APIs plus the build-tagged ReplayDriver.
+package harness
+
+import (
+	"encoding/json"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/pingcap/tiproxy/pkg/balance/router"
+	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
+)
+
+// Recorded is one archived line: the trace v1 input fields, the public result
+// fields and the consumption-time logical clock, in real order.
+type Recorded struct {
+	Seq     int             `json:"seq"`
+	AtNanos int64           `json:"at_nanos"`
+	Wall    time.Time       `json:"wall"`
+	Event   apireplay.Event `json:"event"`
+}
+
+// Scheduler is the single critical section of the recorder: every input
+// delivery (health, config, tick), every public router call reached through
+// the overlaid proxy call site and every record happen while it is held, so
+// the recorded order is the real consumption order and nothing interleaves
+// between a call and its record. It also owns the logical clock.
+type Scheduler struct {
+	mu      sync.Mutex
+	start   time.Time
+	nanos   int64
+	seq     int
+	log     []Recorded
+	archive *os.File
+}
+
+func NewScheduler(archivePath string) (*Scheduler, error) {
+	f, err := os.Create(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	s := &Scheduler{start: time.Now(), archive: f}
+	router.ReplayNanos.Store(0)
+	return s, nil
+}
+
+// Serialize implements apireplay.Sink.
+func (s *Scheduler) Serialize(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn()
+}
+
+// Record implements apireplay.Sink; it must be called with the lock held
+// (from Serialize or from Run).
+func (s *Scheduler) Record(ev apireplay.Event) {
+	r := Recorded{Seq: s.seq, AtNanos: s.nanos, Wall: time.Now(), Event: ev}
+	s.seq++
+	s.log = append(s.log, r)
+	if s.archive != nil {
+		b, _ := json.Marshal(r)
+		s.archive.Write(append(b, '\n'))
+	}
+}
+
+// Run executes an input delivery or harness-driven public call at logical
+// time `at` (nanoseconds since trace start), under the critical section.
+// The logical clock only moves forward; the proxy's overlaid time.Now reads it.
+func (s *Scheduler) Run(at int64, fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if at > s.nanos {
+		s.nanos = at
+		router.ReplayNanos.Store(at)
+	}
+	fn()
+}
+
+// Now returns the current logical time.
+func (s *Scheduler) Now() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nanos
+}
+
+// Log returns a copy of the recorded lines.
+func (s *Scheduler) Log() []Recorded {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Recorded, len(s.log))
+	copy(out, s.log)
+	return out
+}
+
+func (s *Scheduler) Close() error {
+	if s.archive != nil {
+		return s.archive.Close()
+	}
+	return nil
+}

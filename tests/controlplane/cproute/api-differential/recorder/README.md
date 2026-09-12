@@ -24,7 +24,8 @@ Input format: trace v1 as accepted by `../run.py` `validate()` at PR #258 `a98be
 - D2 `metrics` inputs: Prometheus responses observed by the proxy are archived raw (§3) but
   cannot be replayed until the metrics input op exists in the runner (CodexM5's metrics/time
   extension). Slots whose family outcomes depend on metric-driven balance are recorded
-  with the raw archive and marked `requires: ["metrics-input"]`.
+  with the raw archive and marked `requires: ["metrics-input"]`. The harness writes
+  `provenance.metrics_observed`; synthetic traces never consumed metrics.
 - D3 external timer delivery: replay must deliver the recorded `tick` schedule itself; the
   runner already treats `tick` as an input (adapter calls the real rebalance). No change.
 
@@ -62,10 +63,19 @@ seq, and the slot is not counted.
   consumed inventory, filtered by the routing rule fixed at Init (`all` /
   `client_cidr` / `proxy_cidr` / `port` with the session's ClientInfo and the
   `tiproxy-port` label), minus the selector's exclusions. Exclusion semantics follow
-  `backend_selector.go:24-37`: after a failed attempt the backend is excluded; when the
-  candidate set is exhausted an **exact** `ErrNoBackend` resets the exclusions and retries
-  once, a **wrapped** no-backend does not. The derivation therefore tracks the exclusion list
-  per session and emits `exclude_previous` only on a retry within the same attempt cycle.
+  `backend_selector.go:24-37`: after a failed attempt the backend **identity** is excluded
+  for the rest of the attempt cycle; the reset happens only when the legal candidates minus
+  the *actual* excluded identities are empty and the list is non-empty (an **exact**
+  `ErrNoBackend`, including an exact observer `no_backend`), a **wrapped** no-backend never
+  resets. The derivation keeps the per-session identity set, validates Go's row against
+  Go's own set, and expresses the cross-engine form as: candidates minus the uniquely
+  derived exclusions, plus `exclude_previous` when a non-unique exclusion exists; when an
+  earlier non-unique exclusion (or a reset after one) cannot be expressed by the runner the
+  slot is marked `requires: ["exclusion-history"]` and does not count.
+  The failover guard is evaluated **per group** (`group.go:286-341`): the list is ignored
+  only for a group it would leave without a routeable backend; the timeout never gates the
+  marking (`router.go:160-165`). Config documents are parsed with a full TOML parser;
+  routing inputs the derivation does not model (`balance.label-name`, `labels`) are refused.
   `|candidates| == 1` → `backend`; `> 1` → `legal_backends`; `== 0` → the expected error
   class is a **fixed mapping from inputs**, never "whatever was recorded": if an observer
   error is active (router `observeError`, `router_score.go:128-130,238`) the identity maps
@@ -75,16 +85,25 @@ seq, and the slot is not counted.
   candidate set (no observer error) can only be the **exact** `no_backend` (exclusion
   exhaustion never produces the wrapped sentinel). Any recorded outcome outside this
   mapping is a discrepancy candidate: the script refuses and keeps the raw record.
-  Public balance-policy constraints (`location` preferring local backends, etc.) restrict
-  the legal set only where the policy's public rule is deterministic from inputs; the real
-  `prefer-idle` chooses randomly within a threshold (`factor_balance.go:287-345`) and is
-  **not** a strict-idlest rule, so no such example is used. Where a constraint cannot be
-  proven, the slot is marked `requires: ["policy-constraint:<pair>"]` and **does not count
-  toward acceptance**; an "unrestricted" set is raw evidence only, never a qualified trace.
+  Public balance-policy constraints restrict the legal set only where the policy's rule is
+  deterministic from inputs. `random` may return **any** candidate under every policy
+  (`factor_balance.go:255-279`; the location factor only weights). `prefer-idle` evicts a
+  candidate when a higher-priority factor advises migration (`factor_balance.go:287-345`):
+  under `location` the location factor precedes every metric factor, so a remote candidate
+  is evicted whenever a local one exists (deterministic); every other eviction (conn-count,
+  health/memory/cpu) is not derivable, so `prefer-idle` with more than one remaining
+  candidate marks `requires: ["policy-constraint:<policy>/prefer-idle"]` (plus
+  `metrics-input` for `resource`/`location` when the recording consumed metrics) and
+  **does not count toward acceptance**; an "unrestricted" set is raw evidence only.
 - `lookup`: expectation is `ok` + the named backend iff that backend ID is **retained** by
-  the router (`router.backends`, `router_score.go:172-181`), which includes unhealthy
-  backends still holding connections and is unaffected by an observer error; otherwise
-  `unknown_backend`.
+  the router (`router.backends`, `router_score.go:172-181`): it entered when first consumed
+  healthy and leaves when consumed unhealthy/absent while idle — no listed connection, no
+  pending reservation (`Next` ok without `Finish`), no in-flight redirect score
+  (`router_score.go:340-356`, `group.go:222-238`); an observer error does not affect it.
+  Retention is reconstructed from the public assignment ledger (Next/Finish/close,
+  accepted redirects and their results). When the ledger is engine-relative for the queried
+  backend the script refuses rather than guess; the recording plan issues lookup/rehydrate
+  only on sessions with unique history.
 - `rehydrate`: `ok` + backend iff the named backend is retained by its group
   (`group.go:514-517`) **and** the session is idle; unhealthy retention and observer error do
   not by themselves make it fail. The recorder only issues rehydrate on idle sessions.
