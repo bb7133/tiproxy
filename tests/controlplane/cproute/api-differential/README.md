@@ -202,10 +202,10 @@ invalid updates preserve the last accepted configuration.
 
 The recorder deriver uses the same predicate to reject unexplained recorded Go
 choices. A non-unique choice does not by itself make every later tick ambiguous:
-a whole health input that disables redirection and no possibly-owned backend with
-a due failover deadline prove an empty effect set. Enabled redirection and ambiguous
+a disabled migration pass or absence of any possible session/destination, together
+with no possibly-owned backend at a due failover deadline, prove an empty effect set. Enabled redirection and ambiguous
 failover ownership still retain their effect/cadence dependencies. The retry fixture
 also exercises busy-backend exclusion, full-cycle exhaustion before preference,
 rate-cutoff equality, ratio updates and closing retained sessions. Twelve direct
-regressions and 27 derivation counterexamples cover these rules; recorded corpus
+regressions and 29 derivation counterexamples cover these rules; recorded corpus
 qualification and the eight common comparator faults remain separate gates.

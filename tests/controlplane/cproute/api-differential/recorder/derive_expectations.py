@@ -505,11 +505,12 @@ def derive(trace, rows, args):
             # session history. Deleting its observed output must not remove
             # this dependency. A whole health result can disable Balance,
             # while the independent failover-close pass still runs.
-            if state.support_redirection and any(
+            migration_possible = state.support_redirection and any(
                 s.assigned and not s.force_closing and not s.inflight
                 and any(state.group_healthy(bid) - {bid} for bid in s.assigned)
                 for s in state.sessions.values()
-            ):
+            )
+            if migration_possible:
                 state.requires.add("migration-cadence")
             # Redirects (group.Balance) are issued before the failover close pass in the same
             # iteration (router_score.go:471-483), so their ordinals come first.
@@ -540,9 +541,10 @@ def derive(trace, rows, args):
                 state.requires.add("migration-cadence")
                 if not state.unique_history:
                     state.requires.add("effects-v2")
-            if not state.unique_history and state.support_redirection:
-                # README §0 D1: after any non-unique choice the presence and absence of
-                # migrations depend on per-engine assignments; the slot needs effects-v2.
+            if not state.unique_history and migration_possible:
+                # A possible migration after non-unique routing depends on
+                # each engine's assignments. No session/destination means no
+                # migration for every engine, including empty-health ticks.
                 state.requires.add("effects-v2")
             derived = derive_tick_effects(state, refused)
             if key_effects(leftover) != key_effects(derived):
@@ -806,6 +808,15 @@ def defect_checks():
     due.insert(4, {"op": "config", "toml": '[proxy]\nfail-backend-list = ["a"]\nfailover-timeout = 0\n'})
     attempt("disabled_nonunique_due_still_requires_effects", cfg, due, rows_for(due, e2="default/a"),
             lambda d, r: "ok: due force-close needs engine-relative ownership" if d and "effects-v2" in r else f"NOT CAUGHT ({r})")
+    for mode in ("closed", "no_destination"):
+        exhausted = copy.deepcopy(no_effect)
+        exhausted[0]["backends"][0]["support_redirection"] = True
+        if mode == "closed":
+            exhausted[4:6] = [{"op": "close", "session": "s"}, {"op": "health", "backends": []}, {"op": "tick"}]
+        else:
+            exhausted.insert(4, {"op": "health", "backends": []})
+        attempt("nonunique_empty_tick_" + mode, cfg, exhausted, rows_for(exhausted, e2="default/a"),
+                lambda d, r: "ok: no connection/destination for migration" if d and not r else f"NOT CAUGHT ({r})")
     # Recorded preference must reject a busy result, not merely emit a flag.
     pref = [{"op": "health", "backends": [hb("a"), hb("b")]}]
     choices = {}
