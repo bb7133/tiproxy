@@ -159,6 +159,15 @@ guard. CI also derives their expectations from inputs plus recorded Go public
 history, checks them against the hand-written scenarios, and validates both
 engines again. These are adapter/deriver checks, not qualifying recordings.
 
+The first paired CIDR run after the Go address fix exposed two Rust differences:
+rejection of a valid routing-rule write and restoration onto an ungrouped backend.
+The config store now accepts routing-rule updates for future routers; each existing
+router keeps its construction rule, including when all of its groups are later
+removed and recreated. Other restart-required fields retain their existing checks.
+Rehydrate requires a known group before reserving or activating a connection;
+Lookup still exposes known ungrouped metadata. The original scenarios and failure
+artifacts are retained unchanged.
+
 The following dependencies withhold a slot from acceptance:
 
 - `effects-v2`: effects depend on each engine's own prior assignments, including which

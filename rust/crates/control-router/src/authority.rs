@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use control_config::{
     ConfigNamespaceSnapshot, ConfigNamespaceSource, RoutingBalancePolicy, RoutingConfig,
-    RoutingNamespace,
+    RoutingNamespace, RoutingRule,
 };
 use control_plane::{LifecyclePhase, LifecycleSnapshot, ModuleContext, OwnerToken};
 use control_topology::{
@@ -155,6 +155,7 @@ pub(crate) struct Sources {
     lifecycle: watch::Receiver<LifecycleSnapshot>,
     namespace: RoutingNamespace,
     namespace_origin: Arc<ConfigNamespaceSnapshot>,
+    routing_rule: RoutingRule,
 }
 
 impl Sources {
@@ -165,6 +166,11 @@ impl Sources {
         namespace: &str,
     ) -> Result<Self, RouteError> {
         let current = source.current();
+        let routing_rule = current
+            .effective()
+            .routing()
+            .map_err(|_| RouteError::InvalidConfig)?
+            .routing_rule;
         let namespace = current
             .namespaces()
             .iter()
@@ -181,6 +187,7 @@ impl Sources {
             lifecycle: context.lifecycle(),
             namespace,
             namespace_origin: current,
+            routing_rule,
         })
     }
 
@@ -264,10 +271,14 @@ impl Sources {
 
     fn capture_inputs(&self, factors_only: bool) -> Result<Candidate, RouteError> {
         let config = self.admit()?;
-        let policy = config
+        let mut policy = config
             .effective()
             .routing()
             .map_err(|_| RouteError::InvalidConfig)?;
+        // Go accepts the config write but fixes matchType during Router.Init.
+        // A new Sources incarnation reads the updated rule; this one keeps its
+        // existing groups and also uses that rule for later group admissions.
+        policy.routing_rule = self.routing_rule;
         if !factors_only {
             supported(&policy)?;
         }

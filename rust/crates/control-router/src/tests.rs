@@ -794,6 +794,19 @@ async fn invalid_new_cidr_is_unroutable_but_invalid_refresh_keeps_old_matcher_an
         harness.router.reserve(&b, &old, bad, "", &[]),
         Err(RouteError::NoBackend)
     ));
+    let ungrouped = "default/127.0.0.1:4001";
+    assert!(harness.router.lookup_backend(ungrouped).is_ok());
+    assert!(matches!(
+        harness.router.rehydrate(&b, ungrouped),
+        Err(RouteError::NoBackend)
+    ));
+    assert_eq!(
+        harness
+            .router
+            .accounting(ungrouped)
+            .map(|c| (c.active(), c.reserved())),
+        Some((0, 0))
+    );
     // The group retains old valid parsed networks when new raw values fail.
     harness
         .fixture
@@ -843,6 +856,56 @@ async fn invalid_new_cidr_is_unroutable_but_invalid_refresh_keeps_old_matcher_an
     );
     harness.router.finish(&third, true);
     harness.router.close(&idle);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_rule_update_only_affects_new_router_incarnations() -> TestResult {
+    let backends = [
+        ("127.0.0.1:4000", &[("cidr", "192.0.2.0/24")][..]),
+        ("127.0.0.1:4001", &[("cidr", "198.51.100.0/24")][..]),
+    ];
+    let h = Harness::with_backends("client_cidr", "connection", &backends).await?;
+    let old = h.ready().await;
+    let client = ClientInfo {
+        client_address: Some("192.0.2.9:8000"),
+        proxy_address: Some("198.51.100.9:8000"),
+    };
+    let select = |router: &Router, candidate: &Candidate| {
+        let session = must(router.open());
+        let reservation = must(router.reserve(&session, candidate, client, "", &[]));
+        let backend = reservation.assignment().backend_id.clone();
+        router.finish(&reservation, false);
+        router.close(&session);
+        backend
+    };
+    assert_eq!(select(&h.router, &old), "default/127.0.0.1:4000");
+    h.patch("[balance]\nrouting-rule = 'proxy_cidr'\n", 3);
+    h.source.deliver();
+    h.applied().await;
+    let updated = h.ready().await;
+    assert_eq!(select(&h.router, &updated), "default/127.0.0.1:4000");
+    // Recreating all groups inside the same router must also use its Init rule.
+    h.fixture.backends(&[]);
+    let empty = h.changed_r(&updated).await;
+    let session = must(h.router.open());
+    assert!(matches!(
+        h.router.reserve(&session, &empty, client, "", &[]),
+        Err(RouteError::NoBackend)
+    ));
+    h.router.close(&session);
+    h.fixture.backends(&backends);
+    let restored = h.changed_r(&empty).await;
+    assert_eq!(select(&h.router, &restored), "default/127.0.0.1:4000");
+    let replacement = must(Router::new(
+        Arc::new(h.source.clone()),
+        &h.topology,
+        &h.runtime.handle().module_context(),
+        "default",
+        10,
+    ));
+    let new = must(replacement.capture());
+    assert_eq!(select(&replacement, &new), "default/127.0.0.1:4001");
     Ok(())
 }
 

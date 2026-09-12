@@ -270,7 +270,7 @@ impl Router {
     /// The supplied session must be idle. The whole charge and activation is
     /// atomic; duplicate restoration cannot charge an already active session.
     /// # Errors
-    /// Returns source/session errors or `NoBackend` for an unknown backend.
+    /// Returns source/session errors or `NoBackend` for an unknown or ungrouped backend.
     pub fn rehydrate(&self, session: &Session, id: &str) -> Result<RouteAssignment, RouteError> {
         let candidate = self.capture()?;
         let mut state = self.lock();
@@ -280,6 +280,9 @@ impl Router {
             return Err(RouteError::AlreadyActive);
         }
         let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
+        // Known healthy metadata does not imply group ownership. Go refuses
+        // restoration until valid routing labels have admitted this backend.
+        backend.group.ok_or(RouteError::NoBackend)?;
         let account = Arc::clone(&backend.account);
         let result = assignment(&backend.source, candidate.health.get(id).local);
         self.sources.validate(&candidate)?;
