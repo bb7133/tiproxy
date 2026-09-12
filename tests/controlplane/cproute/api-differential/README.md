@@ -167,3 +167,27 @@ The corrected scenario first asserts no close in this protected state, then
 delivers an explicit unhealthy verdict and a new observer error. This activates
 failover at that health event and tests the before/equal timeout ticks while the
 observer is failing. No runtime algorithm changed to satisfy the scenario.
+
+
+The full retry-history increment adds `expect.exclude_history: true` on successful
+Next expectations. `backend` / `legal_backends` then declare the healthy candidate
+set before selector exclusions. Each engine's comparator tracks all successful Next
+results, preserves them across failed Finish and health/config updates, and subtracts
+that engine's complete cycle. Exhaustion resets the cycle before the same Next call;
+a returned exact no-backend also resets it, while wrapped no-backend and other errors
+retain it. Old `exclude_previous` expectations remain supported and are mutually
+exclusive with the new mode.
+
+An optional `expect.prefer_local` subset applies Location/prefer-idle's public
+locality rule after subtraction. It allows a remote backend once all remaining local
+choices have been tried, and requires a local backend again after full exhaustion.
+Both fields are assertion metadata only and are stripped from Go and Rust inputs.
+The deriver keeps uncertainty across a reset that happened only in Go, so it cannot
+mistakenly reuse Go's reset for Rust. Policy/effect and metrics dependencies remain
+explicit; this does not qualify the recorded corpus.
+
+`retry-smoke.json` contains 52 synthetic events for complete cycles, topology removal
+and restoration, exact/wrapped observer errors and local-to-remote fallback. CI uses
+the same replay/comparison entrypoint and uploads `routing-api-retry` with the other
+three smoke artifacts. Six direct comparator regressions reject invalid histories;
+the common comparator mutation table remains the same eight faults.

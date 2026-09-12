@@ -66,7 +66,12 @@ history, validates recorded Go choices against Go's own exclusion history, and
 refuses unexplained results. Next, Lookup and Rehydrate have distinct rules. Config
 uses a full TOML parser; unknown routing-affecting fields are refused. Retention
 includes pending reservations and accepted redirects. Health recovery clears prior
-retention ambiguity. Failover marking and its all-members guard are per group;
+retention ambiguity. `exclude_history` supplies the full pre-exclusion candidate
+set: each engine subtracts its own complete selector cycle and resets only on exact
+exhaustion/no-backend. A reset in Go does not erase the other engine's history.
+Location preference is evaluated on the remaining candidates using `prefer_local`,
+which contains only locality verdicts from the public health input. These expectation
+fields are removed from both replay inputs. Failover marking and its all-members guard are per group;
 force-close due time and acceptance come from inputs, logical time and public history.
 
 The following dependencies withhold a slot from acceptance:
@@ -74,8 +79,6 @@ The following dependencies withhold a slot from acceptance:
 - `effects-v2`: effects depend on each engine's own prior assignments, including which
   session should move and whether an effect is due. Copying Go's effect list with
   variable endpoints is insufficient.
-- `exclusion-history`: a complete engine-relative exclusion cycle/reset cannot yet be
-  represented by the common runner's single previous-choice constraint.
 - `policy-constraint:<policy>/prefer-idle`: not all factor advice can yet be derived
   from the available public inputs. An unrestricted candidate set is not qualification.
 - `metrics-input`: whole metrics inputs/history are not yet captured and replayed.

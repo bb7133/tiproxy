@@ -74,8 +74,16 @@ def validate(trace):
         require(type(timestamp) is int and at <= timestamp <= 86_400_000_000_000,"INPUT","monotonic public clock")
         at = timestamp
         expect = event.get("expect")
-        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "exclude_previous", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
+        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "exclude_previous", "exclude_history", "prefer_local", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
         require("exclude_previous" not in expect or (op == "next" and type(expect["exclude_previous"]) is bool), "INPUT", "retry expectation")
+        if "exclude_history" in expect:
+            require(op == "next" and expect["outcome"] == "ok" and expect["exclude_history"] is True and "exclude_previous" not in expect,
+                    "INPUT", "full exclusion expectation")
+        if "prefer_local" in expect:
+            preferred = expect["prefer_local"]
+            candidates = expect.get("legal_backends", [expect.get("backend")])
+            require(expect.get("exclude_history") is True and isinstance(candidates, list) and isinstance(preferred, list) and all(isinstance(x, str) and x in candidates for x in preferred)
+                    and len(preferred) == len(set(preferred)), "INPUT", "local candidates after exclusions")
         if "healthy_backend_count" in expect:
             require(op == "checkpoint" and type(expect["healthy_backend_count"]) is int and expect["healthy_backend_count"] >= 0,"INPUT","healthy count expectation")
         if "legal_server_versions" in expect:
@@ -152,6 +160,7 @@ def observe(trace, rows, engine):
     events = trace["events"]
     require(isinstance(rows,list) and len(rows) == len(events), "MISSING_RESULT", engine)
     pending, ledger, previous, operations, settled = {}, {}, {}, {}, set()
+    excluded = {}
     for index, (event,row) in enumerate(zip(events,rows)):
         op, session, expect = event["op"], event.get("session",""), event["expect"]
         fields = {"seq","op","session","outcome","backend","effects"} | ({"assignments","conn_count","healthy_backend_count","server_version"} if op == "checkpoint" else set())
@@ -168,14 +177,32 @@ def observe(trace, rows, engine):
                 require(backend == expect["backend"], "BACKEND_RESULT", f"{engine} event {index}")
             else:
                 require(backend in expect.get("legal_backends",[]), "ILLEGAL_CHOICE", f"{engine} event {index}")
+            if expect.get("exclude_history"):
+                candidates = set(expect.get("legal_backends", [expect.get("backend")]))
+                history = excluded.setdefault(session, set())
+                remaining = candidates - history
+                # Next retries internally only after exact exhaustion. Old identities
+                # remain excluded across health changes until that reset actually occurs.
+                if not remaining:
+                    history.clear()
+                    remaining = candidates
+                require(backend in remaining, "RETRY_RESULT", f"{engine} event {index} repeated a member of its exclusion cycle")
+                if "prefer_local" in expect:
+                    preferred = remaining.intersection(expect["prefer_local"])
+                    require(backend in (preferred or remaining), "POLICY_RESULT", f"{engine} event {index} bypassed an unexcluded local backend")
             if expect.get("exclude_previous"):
                 require(session in previous and backend != previous[session], "RETRY_RESULT", f"{engine} event {index} repeated excluded result")
             if op == "next":
                 pending[session] = backend
                 previous[session] = backend
+                excluded.setdefault(session, set()).add(backend)
             elif op == "rehydrate": ledger[session] = backend
         else:
             require(row.get("backend") == "", "BACKEND_RESULT", f"unexpected {engine} backend at {index}")
+        # A returned exact no-backend also clears every engine's own cycle,
+        # including an observer sentinel. Wrapped no-backend and other errors do not.
+        if op == "next" and row["outcome"] == "no_backend":
+            excluded.pop(session, None)
         if op == "finish":
             require(session in pending, "LEDGER", f"{engine} missing attempt")
             backend = pending.pop(session)
@@ -186,6 +213,8 @@ def observe(trace, rows, engine):
             if key not in settled and session in ledger and event["success"]: ledger[session] = operations[key]["to"]
             settled.add(key)
         elif op == "close":
+            excluded.pop(session, None)
+            previous.pop(session, None)
             ledger.pop(session,None)
             settled.update(key for key,effect in operations.items() if effect["session"] == session)
         elif op == "checkpoint":

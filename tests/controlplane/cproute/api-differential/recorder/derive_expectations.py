@@ -7,7 +7,7 @@ Input : a recorded trace (events without `expect`) and the recorded Go rows for 
         events (output evidence: per-event outcome/backend/effects).
 Output: the trace with `expect` per event, plus a `requires` list naming every runner
         dependency the slot needs before it can count (effects-v2, metrics-input,
-        exclusion-history, policy-constraint:<pair>). Dependencies are decided from the
+        policy-constraint:<pair>). Dependencies are decided from the
         public inputs and their history, never from what the recorded output happened to be.
 
 Rules (README §2, rev 3): Next / Lookup / Rehydrate are derived separately; error classes map
@@ -108,7 +108,7 @@ class Backend:
 
 
 class Session:
-    __slots__ = ("id", "port", "client", "proxy", "cycle", "pending", "assigned", "inflight", "force_closing", "ordinal", "created")
+    __slots__ = ("id", "port", "client", "proxy", "cycle", "relative_history", "pending", "assigned", "inflight", "force_closing", "ordinal", "created")
 
     def __init__(self, sid, event):
         self.id = sid
@@ -116,6 +116,9 @@ class Session:
         self.client = event.get("client", "")
         self.proxy = event.get("proxy", "")
         self.cycle = []  # [(backend_id, unique)] excluded identities of the current attempt cycle
+        # A reset in Go need not coincide with a reset in the other engine.
+        # Keep history relative until a public exact-no-backend resets both.
+        self.relative_history = False
         self.pending = None  # frozenset of possible reserved backends (Next ok, Finish not yet)
         self.assigned = None  # frozenset of possible current assignments
         self.inflight = None  # frozenset of possible redirect destinations holding the score
@@ -369,28 +372,20 @@ def prefer_local(state, legal):
 def derive_next(state, session, expect):
     """Engine-independent expectation for one Next, plus Go's own legal set for validation."""
     go_excluded = [b for b, _ in session.cycle]
-    unique_excluded = {b for b, u in session.cycle if u}
-    nonunique_in_cycle = any(not u for _, u in session.cycle)
     legal_go, err = route_once(state, session, set(go_excluded))
-    reset = False
     if err == "no_backend" and go_excluded:
-        reset = True  # exact ErrNoBackend with exclusions → reset and route again
-        session.cycle = []
+        session.cycle = []  # Go's real internal exhaustion/reset only
         legal_go, err = route_once(state, session, set())
     if err is not None:
         expect["outcome"] = err
+        if err == "no_backend":
+            session.relative_history = False
         return None
-    # cross-engine expression
-    if reset and nonunique_in_cycle:
-        legal = legal_go  # an engine without the reset has a subset; exact form needs the history
-        state.requires.add("exclusion-history")
-    elif not reset:
-        cands, _ = state.candidates(session)
-        legal = [c for c in cands if c not in unique_excluded]
-        if nonunique_in_cycle:
-            expect["exclude_previous"] = True  # covers the engine's own last exclusion only
-            if len(session.cycle) >= 2:
-                state.requires.add("exclusion-history")
+    if session.relative_history:
+        # Publish candidates before exclusions; the comparator subtracts each
+        # engine's complete cycle and resets only when its own set is exhausted.
+        legal, _ = state.candidates(session)
+        expect["exclude_history"] = True
     else:
         legal = legal_go
     if state.selection == "prefer-idle":
@@ -399,8 +394,8 @@ def derive_next(state, session, expect):
         # remote candidate is evicted whenever a local one exists — deterministic from inputs.
         # Every other eviction (conn-count, health/memory/cpu) is not derivable: constraint.
         if state.policy == "location":
-            if nonunique_in_cycle and not reset:
-                state.requires.add("exclusion-history")  # the local/remote split depends on the engine's exclusions
+            if session.relative_history:
+                expect["prefer_local"] = sorted(b for b in legal if state.backends[b].local)
             else:
                 legal = prefer_local(state, legal)
             legal_go = prefer_local(state, legal_go)
@@ -453,6 +448,7 @@ def derive(trace, rows, args):
                 unique = "backend" in expect
                 if not unique:
                     state.unique_history = False
+                    s.relative_history = True
                 s.cycle.append((chosen, unique))
                 s.pending = frozenset([chosen]) if unique else frozenset(expect["legal_backends"])
         elif op == "finish":
@@ -573,6 +569,8 @@ def compare_with_reference(derived, reference, requires):
         if "legal_backends" in re_ and sorted(de.get("legal_backends", [])) != sorted(re_["legal_backends"]):
             diffs.append((seq, "legal", de.get("legal_backends", de.get("backend")), sorted(re_["legal_backends"])))
         for k in ("exclude_previous", "healthy_backend_count"):
+            if k == "exclude_previous" and re_.get(k) and de.get("exclude_history"):
+                continue
             if k in re_ and de.get(k) != re_[k]:
                 diffs.append((seq, k, de.get(k), re_[k]))
             if k == "exclude_previous" and k not in re_ and de.get(k):
@@ -661,9 +659,9 @@ def defect_checks():
     attempt("excluded_repeat_after_removal", cfg, ev, rows_for(ev, e2="default/a", e4="default/b", e7="default/b"),
             lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     # the same inputs with Go returning C are legal; cross-engine the third attempt can only be
-    # expressed as {b,c} minus the engine's own history → exclusion-history dependency, Go row validated
+    # expressed as {b,c} minus the engine's complete history; Go's row is also validated
     attempt("reset_only_when_exhausted", cfg, ev, rows_for(ev, e2="default/a", e4="default/b", e7="default/c"),
-            lambda d, r: ("ok: legal {b,c}+exclude_previous, requires " + str(r)) if d and d["events"][7]["expect"].get("legal_backends") == ["default/b", "default/c"] and d["events"][7]["expect"].get("exclude_previous") and "exclusion-history" in r else f"NOT CAUGHT ({r})")
+            lambda d, r: ("ok: full engine-relative cycle over {b,c}") if d and d["events"][7]["expect"].get("legal_backends") == ["default/b", "default/c"] and d["events"][7]["expect"].get("exclude_history") and "exclusion-history" not in r else f"NOT CAUGHT ({r})")
     # per-group failover guard: list hits only the 6000 group's single backend -> ignored there
     ev = [{"op": "health", "backends": [hb("127.0.0.1:4001", port="6000"), hb("127.0.0.1:4002", port="6001")]},
           {"op": "config", "toml": '[proxy]\nfail-backend-list = ["127.0.0.1:4001"]\nfailover-timeout = 1\n'},
@@ -678,7 +676,7 @@ def defect_checks():
           {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False}, {"op": "close", "session": "s"}]
     attempt("location_random_retry", {"policy": "location", "selection": "random", "rule": ""}, ev,
             rows_for(ev, e2="default/a", e4="default/b"),
-            lambda d, r: "ok: legal {a,b}, retry legal {a,b} excluding the engine's own previous" if d and d["events"][2]["expect"].get("legal_backends") == ["default/a", "default/b"] and d["events"][4]["expect"].get("legal_backends") == ["default/a", "default/b"] and d["events"][4]["expect"].get("exclude_previous") and not r else f"NOT CAUGHT ({r})")
+            lambda d, r: "ok: legal {a,b} minus each engine's complete cycle" if d and d["events"][2]["expect"].get("legal_backends") == ["default/a", "default/b"] and d["events"][4]["expect"].get("legal_backends") == ["default/a", "default/b"] and d["events"][4]["expect"].get("exclude_history") and not r else f"NOT CAUGHT ({r})")
     # never-healthy backend is unknown to Lookup
     ev = [{"op": "health", "backends": [hb("a"), hb("n", healthy=False)]}, {"op": "lookup", "backend": "default/n"}, {"op": "checkpoint"}]
     rows = rows_for(ev); rows[1]["outcome"] = "unknown_backend"
@@ -756,6 +754,16 @@ def defect_checks():
             rows[5]["effects"] = [effect]
         attempt("migration_dependency_" + ("refused" if present else "deleted"), cfg, ev, rows,
                 lambda d, r: "ok: input-derived migration dependency" if d and "migration-cadence" in r else f"NOT CAUGHT ({r})")
+    # Go resets at the singleton-A update, while an engine that first chose B
+    # need not reset. Keep the later A/B/C constraint relative for both histories.
+    relative_ev = [{"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "open", "session": "s"},
+                   {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False},
+                   {"op": "health", "backends": [hb("a")]}, {"op": "next", "session": "s"},
+                   {"op": "finish", "session": "s", "success": False},
+                   {"op": "health", "backends": [hb("a"), hb("b"), hb("c")]}, {"op": "next", "session": "s"},
+                   {"op": "finish", "session": "s", "success": False}, {"op": "close", "session": "s"}]
+    attempt("relative_history_survives_one_engine_reset", cfg, relative_ev, rows_for(relative_ev, e2="default/a", e5="default/a", e8="default/b"),
+            lambda d, r: "ok: full cycle retained after Go-only reset" if d and d["events"][8]["expect"].get("exclude_history") and d["events"][8]["expect"].get("legal_backends") == ["default/a", "default/b", "default/c"] and not r else f"NOT CAUGHT ({r})")
     # Every delivered entry participates in Go's support-redirection AND,
     # including an unhealthy never-retained entry.
     disabled = copy.deepcopy(ev)

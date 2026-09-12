@@ -378,6 +378,7 @@ jobs:
           print(json.dumps(results, indent=2))
           assert all("NOT CAUGHT" not in result for result in results.values())
           PYTEST
+          python3 tests/controlplane/cproute/api-differential/test_run.py
       - name: Compare the actual API adapters
         run: |
           python3 tests/controlplane/cproute/api-differential/run.py \
@@ -389,6 +390,9 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             tests/controlplane/cproute/api-differential/source-error-smoke.json \
             --output "${RUNNER_TEMP}/routing-api-source-error"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            tests/controlplane/cproute/api-differential/retry-smoke.json \
+            --output "${RUNNER_TEMP}/routing-api-retry"
       - name: Preserve API inputs, outputs and first failure
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -398,6 +402,7 @@ jobs:
             ${{ runner.temp }}/routing-api
             ${{ runner.temp }}/routing-api-port
             ${{ runner.temp }}/routing-api-source-error
+            ${{ runner.temp }}/routing-api-retry
           if-no-files-found: error
 
   routing-shadow:
