@@ -4,7 +4,10 @@
 //! Whole merged external query delivery for the test-only API input adapter.
 //! This owns a real bound collector lifetime but never starts network workers.
 
-use super::*;
+use super::{
+    Arc, BTreeMap, GenerationGate, MetricCollector, MetricCollectorError, MetricOverlayHandle,
+    MetricSourceHandle, QueryId, QueryLifetime, QueryResult, SocketAddr,
+};
 
 pub(super) struct ExternalResult {
     pub queries: BTreeMap<QueryId, QueryResult>,
