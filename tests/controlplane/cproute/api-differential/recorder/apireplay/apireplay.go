@@ -80,6 +80,10 @@ type HealthBackend struct {
 	SupportRedirection bool              `json:"support_redirection"`
 }
 
+// ErrTopologyUnavailable identifies only the explicitly scripted source fault.
+// Unrelated external failures must not be relabelled as this declared outcome.
+var ErrTopologyUnavailable = errors.New("declared topology unavailable")
+
 // ErrorIdentity maps an observer error to its trace identity.
 func ErrorIdentity(err error) string {
 	switch {
@@ -93,8 +97,10 @@ func ErrorIdentity(err error) string {
 		return "cancelled"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "deadline_exceeded"
-	default:
+	case errors.Is(err, ErrTopologyUnavailable):
 		return "topology_unavailable"
+	default:
+		return "unclassified_source_error"
 	}
 }
 
@@ -345,8 +351,10 @@ func outcome(err error) string {
 		return "source_error:cancelled"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "source_error:deadline_exceeded"
-	default:
+	case errors.Is(err, ErrTopologyUnavailable):
 		return "source_error:topology_unavailable"
+	default:
+		return "unclassified_source_error"
 	}
 }
 

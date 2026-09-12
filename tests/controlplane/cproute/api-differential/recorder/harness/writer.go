@@ -39,6 +39,7 @@ type Checkpoint struct {
 // CaptureSummary identifies the recording build and workload; qualification
 // additionally requires schema validation and replay of the derived inputs.
 type CaptureSummary struct {
+	Synthetic            bool   `json:"synthetic,omitempty"`
 	Head                 string `json:"head"`
 	Tree                 string `json:"tree"`
 	SourceDirty          string `json:"source_dirty"`
@@ -114,6 +115,9 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			}
 			push(map[string]any{"op": "health", "backends": backends}, map[string]any{"op": "health", "outcome": "ok"}, r.AtNanos)
 		case "source_error":
+			if e.Outcome == "unclassified_source_error" {
+				incomplete = append(incomplete, fmt.Sprintf("seq %d: unclassified source error", r.Seq))
+			}
 			push(map[string]any{"op": "source_error", "error": e.Outcome}, map[string]any{"op": "source_error", "outcome": "ok"}, r.AtNanos)
 		case "config":
 			push(map[string]any{"op": "config", "toml": e.TOML}, map[string]any{"op": "config", "outcome": e.Outcome}, r.AtNanos)
@@ -152,12 +156,16 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	if inTick {
 		incomplete = append(incomplete, "trace ended inside a tick")
 	}
+	kind := "recorded"
+	if summary.Synthetic {
+		kind = "synthetic"
+	}
 	trace := map[string]any{
 		"version": 1,
 		"id":      slot + "-" + attempt,
 		"config":  cfg,
 		"provenance": map[string]any{
-			"kind": "recorded", "slot": slot, "attempt": attempt, "recorded_at_utc": time.Now().UTC().Format(time.RFC3339),
+			"kind": kind, "slot": slot, "attempt": attempt, "recorded_at_utc": time.Now().UTC().Format(time.RFC3339),
 			"metrics_observed": metricsObserved,
 		},
 		"events": events,

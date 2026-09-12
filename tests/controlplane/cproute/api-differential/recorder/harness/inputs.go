@@ -7,7 +7,7 @@ package harness
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/pingcap/tiproxy/lib/config"
@@ -109,16 +109,19 @@ func (in *Inputs) Raw() []observer.HealthResult {
 // FaultError maps a declared source-error identity to the injected error; ""
 // clears the window. Only the three fetcher-boundary identities are injectable
 // (README §4); no-backend and port-conflict come from the router itself.
-func FaultError(identity string) error {
+// The second result reports an invalid script name, before any fault is set.
+func FaultError(identity string) (error, error) {
 	switch identity {
 	case "":
-		return nil
+		return nil, nil
 	case "cancelled":
-		return context.Canceled
+		return context.Canceled, nil
 	case "deadline_exceeded":
-		return context.DeadlineExceeded
+		return context.DeadlineExceeded, nil
+	case "topology_unavailable":
+		return apireplay.ErrTopologyUnavailable, nil
 	default:
-		return errors.New("declared topology unavailable")
+		return nil, fmt.Errorf("unsupported source_error identity %q", identity)
 	}
 }
 

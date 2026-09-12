@@ -363,12 +363,15 @@ jobs:
             ~/.cargo/git/db
             rust/target
           key: rust-routing-api-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
-      - name: Check recorder lifecycle regressions
+      - name: Check recorder lifecycle and source error regressions
+        env:
+          CPROUTE_RECORDED_SOURCE_ERRORS: ${{ runner.temp }}/routing-api-recorded-source
         run: |
           go test -race -tags apireplay ./tests/controlplane/cproute/api-differential/recorder/... -count=1 -timeout=120s
           python3 - <<'PYTEST'
           import importlib.util
           import json
+          import os
           from pathlib import Path
           path = Path("tests/controlplane/cproute/api-differential/recorder/derive_expectations.py")
           spec = importlib.util.spec_from_file_location("derive", path)
@@ -377,6 +380,15 @@ jobs:
           results = module.defect_checks()
           print(json.dumps(results, indent=2))
           assert all("NOT CAUGHT" not in result for result in results.values())
+          capture = Path(os.environ["CPROUTE_RECORDED_SOURCE_ERRORS"])
+          trace = json.loads((capture / "trace.json").read_text())
+          rows = json.loads((capture / "go.json").read_text())
+          derived, requires = module.derive(trace, rows, None)
+          assert trace["provenance"]["kind"] == "synthetic" and not requires
+          module._RUNNER.validate(derived)
+          module._RUNNER.observe(derived, rows, "recorded-go")
+          (capture / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
+          (capture / "stored-validation.json").write_text(json.dumps({"status":"passed", "events":len(rows), "requires":requires}) + "\n")
           PYTEST
           python3 tests/controlplane/cproute/api-differential/test_run.py
       - name: Compare the actual API adapters
@@ -393,6 +405,9 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             tests/controlplane/cproute/api-differential/retry-smoke.json \
             --output "${RUNNER_TEMP}/routing-api-retry"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            "${RUNNER_TEMP}/routing-api-recorded-source/derived.json" \
+            --output "${RUNNER_TEMP}/routing-api-recorded-source-paired"
       - name: Preserve API inputs, outputs and first failure
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -403,6 +418,8 @@ jobs:
             ${{ runner.temp }}/routing-api-port
             ${{ runner.temp }}/routing-api-source-error
             ${{ runner.temp }}/routing-api-retry
+            ${{ runner.temp }}/routing-api-recorded-source
+            ${{ runner.temp }}/routing-api-recorded-source-paired
           if-no-files-found: error
 
   routing-shadow:

@@ -6,6 +6,9 @@
 package apireplay
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/pingcap/tiproxy/pkg/balance/router"
@@ -99,5 +102,26 @@ func TestLateRedirectDoesNotResurrectClosedSession(t *testing.T) {
 	}
 	if c.session.current.ID() != "A" || out.events[len(out.events)-1].Operation != "s/1" {
 		t.Fatalf("late callback: %+v", out.events)
+	}
+}
+
+func TestSourceErrorIdentityAndPublicReturn(t *testing.T) {
+	for _, tc := range []struct {
+		err           error
+		input, result string
+	}{
+		{router.ErrNoBackend, "no_backend", "no_backend"},
+		{fmt.Errorf("fetch: %w", router.ErrNoBackend), "wrapped_no_backend", "wrapped_no_backend"},
+		{fmt.Errorf("fetch: %w", context.Canceled), "cancelled", "source_error:cancelled"},
+		{fmt.Errorf("fetch: %w", context.DeadlineExceeded), "deadline_exceeded", "source_error:deadline_exceeded"},
+		{fmt.Errorf("fetch: %w", ErrTopologyUnavailable), "topology_unavailable", "source_error:topology_unavailable"},
+		{errors.New("unexpected source failure"), "unclassified_source_error", "unclassified_source_error"},
+	} {
+		if got := ErrorIdentity(tc.err); got != tc.input {
+			t.Errorf("input=%s, want %s", got, tc.input)
+		}
+		if got := outcome(tc.err); got != tc.result {
+			t.Errorf("result=%s, want %s", got, tc.result)
+		}
 	}
 }

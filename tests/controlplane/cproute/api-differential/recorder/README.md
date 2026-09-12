@@ -37,6 +37,22 @@ fetcher-boundary source-error windows and checkpoints. A fault wraps the real
 `BackendFetcher`; the real observer then publishes the error. Stopping PD alone is
 not guaranteed to publish an error because the production fetcher retries.
 
+Source-error scripts accept only `cancelled`, `deadline_exceeded`,
+`topology_unavailable`, or the empty string to clear a fault. Invalid names, unknown
+JSON fields, unsupported actions and negative offsets are rejected before opening
+an attempt or starting services. Only the declared topology sentinel (including a
+wrapped sentinel) has that identity. Other external failures remain
+`unclassified_source_error` in the raw and normalized evidence and make the capture
+incomplete; error payload text is never archived as a substitute identity.
+
+The API CI job also exercises the actual observer subscription, input forwarder,
+router and recorder with a fixed synthetic inventory: initial empty routing, all
+three fault windows and recovery after each. It checks the writer's stored Go rows
+with the common comparator and replays the resulting 36-event trace through both
+engines. The raw archive, derived inputs and paired outputs share the existing CI
+artifact. Its provenance is explicitly `synthetic`; it does not count toward N/K or
+replace live PD/TiDB/Prometheus recordings.
+
 ## Archive lifecycle
 
 Each attempt has a new directory; archive and output files are created exclusively.

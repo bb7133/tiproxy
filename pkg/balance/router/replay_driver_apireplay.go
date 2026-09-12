@@ -38,7 +38,8 @@ func replayNow() time.Time { return time.Unix(1_700_000_000, ReplayNanos.Load())
 
 // NewReplayDriver runs the real Init with an already-cancelled context so the
 // rebalance loop exits immediately, waits for it, and returns the driver.
-// bo may be nil when the harness forwards health results itself.
+// bo must be non-nil for Init; its automatic router subscription is removed
+// below because the harness forwards health results itself.
 func NewReplayDriver(router *ScoreBasedRouter, bo observer.BackendObserver, bpCreator func(*zap.Logger) policy.BalancePolicy, cfgGetter config.ConfigGetter) *ReplayDriver {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

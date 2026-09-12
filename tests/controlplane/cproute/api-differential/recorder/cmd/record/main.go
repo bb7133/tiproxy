@@ -14,12 +14,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -54,7 +56,7 @@ var sourceHead, sourceTree, sourceDirty string
 // Action is one scripted, declared operation at a wall offset from trace start.
 type Action struct {
 	AtMillis int64    `json:"at_ms"`
-	Kind     string   `json:"kind"` // env | config | source_error | checkpoint | refuse
+	Kind     string   `json:"kind"` // env | config | source_error | checkpoint
 	Args     []string `json:"args,omitempty"`
 	TOML     string   `json:"toml,omitempty"`
 	Error    string   `json:"error,omitempty"` // source_error identity; "" clears the fault window
@@ -92,6 +94,30 @@ func main() {
 func run(slot, attempt, policyName, selection, rule, listen, pd string, duration time.Duration, clients int, pause time.Duration, sources, out, script, envSh string, tickEvery time.Duration) (runErr error) {
 	if duration <= 0 || tickEvery <= 0 || clients <= 0 || pause < 0 {
 		return fmt.Errorf("duration, tick and clients must be positive; pause must be nonnegative")
+	}
+	// Validate the complete script before opening an attempt or starting live services.
+	var actions []Action
+	var scriptData []byte
+	scriptSHA := ""
+	if script != "" {
+		var err error
+		scriptData, err = os.ReadFile(script)
+		if err != nil {
+			return err
+		}
+		decoder := json.NewDecoder(bytes.NewReader(scriptData))
+		decoder.DisallowUnknownFields()
+		if err = decoder.Decode(&actions); err != nil {
+			return err
+		}
+		if err = decoder.Decode(new(any)); err != io.EOF {
+			return fmt.Errorf("action script must contain exactly one JSON array")
+		}
+		if err = validateActions(actions); err != nil {
+			return err
+		}
+		scriptSHA = fmt.Sprintf("%x", sha256.Sum256(scriptData))
+		sort.SliceStable(actions, func(i, j int) bool { return actions[i].AtMillis < actions[j].AtMillis })
 	}
 	dir := filepath.Join(out, slot+"-"+attempt)
 	if err := os.MkdirAll(out, 0o755); err != nil {
@@ -186,21 +212,10 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	inputWG.Run(func() { inputs.Forward(inputCtx, bo, "recorder") }, lg)
 	defer func() { stopInputs(); inputWG.Wait() }()
 
-	var actions []Action
-	scriptSHA := ""
 	if script != "" {
-		b, err := os.ReadFile(script)
-		if err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "actions.json"), scriptData, 0o600); err != nil {
 			return err
 		}
-		scriptSHA = fmt.Sprintf("%x", sha256.Sum256(b))
-		if err := os.WriteFile(filepath.Join(dir, "actions.json"), b, 0o600); err != nil {
-			return err
-		}
-		if err := json.Unmarshal(b, &actions); err != nil {
-			return err
-		}
-		sort.SliceStable(actions, func(i, j int) bool { return actions[i].AtMillis < actions[j].AtMillis })
 	}
 
 	// Declared timer schedule: every tickEvery from trace start, plus boundary
@@ -266,7 +281,12 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 				err := cfgMgr.SetTOMLConfig([]byte(a.TOML))
 				inputs.DeliverConfig(a.TOML, cfgMgr.GetConfig(), err)
 			case "source_error":
-				fetcher.Set(harness.FaultError(a.Error))
+				fault, err := harness.FaultError(a.Error)
+				if err != nil {
+					markIncomplete(err.Error())
+					return
+				}
+				fetcher.Set(fault)
 			case "checkpoint":
 				sched.RunNow(func() {
 					seq := sched.Seq()
@@ -329,6 +349,24 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		return err
 	}
 	fmt.Printf("%s: status=%s completed=%d failed=%d events=%d dir=%s\n", slot, status, wl.Completed(), wl.Failed(), len(sched.Log()), dir)
+	return nil
+}
+
+func validateActions(actions []Action) error {
+	for i, a := range actions {
+		if a.AtMillis < 0 {
+			return fmt.Errorf("action %d: negative at_ms", i)
+		}
+		switch a.Kind {
+		case "env", "config", "checkpoint":
+		case "source_error":
+			if _, err := harness.FaultError(a.Error); err != nil {
+				return fmt.Errorf("action %d: %w", i, err)
+			}
+		default:
+			return fmt.Errorf("action %d: unsupported kind %q", i, a.Kind)
+		}
+	}
 	return nil
 }
 
