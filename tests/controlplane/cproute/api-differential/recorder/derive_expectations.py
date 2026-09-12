@@ -86,7 +86,7 @@ def toml_get(doc, *path):
 
 
 class Backend:
-    __slots__ = ("id", "address", "cluster", "labels", "local", "observed_healthy", "version", "group", "ambiguous", "failover_since")
+    __slots__ = ("id", "address", "cluster", "labels", "local", "observed_healthy", "version", "group", "ambiguous", "failover_since", "support_redirection")
 
     def __init__(self, bid, b):
         self.id = bid
@@ -100,6 +100,7 @@ class Backend:
         self.cluster = b.get("cluster", "default")
         self.labels = dict(b.get("labels", {}) or {})
         self.local = bool(b.get("local", True))
+        self.support_redirection = bool(b.get("support_redirection", True))
         self.observed_healthy = bool(b.get("healthy", True))
         if self.observed_healthy:
             self.ambiguous = False  # consumed healthy: present in the router again, whatever the ledger said
@@ -152,6 +153,7 @@ class State:
         self.ignore_failover = {}  # group value -> bool
         self.failover = set()  # ids currently marked (Healthy() false)
         self.observer_error = None
+        self.support_redirection = False
         self.fail_list = set()
         self.failover_timeout = 60  # lib/config/proxy.go:171 default; seconds
         self.now = 0  # logical clock of the event being consumed
@@ -198,6 +200,11 @@ class State:
         for bid, b in self.backends.items():
             if bid not in seen:
                 b.observed_healthy = False  # removed from the list → unhealthy (router_score.go:242-254)
+        # Go includes every delivered entry and the previous capability of
+        # removed retained entries in its whole-result capability conjunction.
+        self.support_redirection = all(raw.get("support_redirection", True) for raw in seen.values()) and all(
+            b.support_redirection for bid, b in self.backends.items() if bid not in seen
+        )
         self.update_groups()
         self.update_failover()
         versions = [b.version for b in self.backends.values() if b.observed_healthy and b.version]
@@ -482,6 +489,16 @@ def derive(trace, rows, args):
         elif op == "tick":
             refused = set(event.get("refuse", []) or [])
             recorded = row.get("effects", [])
+            # Whether a migration could be due is a property of inputs and
+            # session history. Deleting its observed output must not remove
+            # this dependency. A whole health result can disable Balance,
+            # while the independent failover-close pass still runs.
+            if state.support_redirection and any(
+                s.assigned and not s.force_closing and not s.inflight
+                and any(state.group_healthy(bid) - {bid} for bid in s.assigned)
+                for s in state.sessions.values()
+            ):
+                state.requires.add("migration-cadence")
             # Redirects (group.Balance) are issued before the failover close pass in the same
             # iteration (router_score.go:471-483), so their ordinals come first.
             # Redirects: legality is checked (from = the session's listed backend, to in the
@@ -493,6 +510,8 @@ def derive(trace, rows, args):
                 if ef["kind"] == "force_close":
                     leftover.append(ef)
                     continue
+                if not state.support_redirection:
+                    raise Refuse(f"seq {seq}: redirect while the health input disables redirection")
                 s = state.sessions.get(ef["session"])
                 if s is None or not s.assigned:
                     raise Refuse(f"seq {seq}: effect {ef['operation']} on an unknown or idle session")
@@ -723,6 +742,30 @@ def defect_checks():
     rows = rows_for(ev, e2="default/a"); rows[6]["backend"] = "default/a"
     attempt("retention_recovery_lookup", cfg, ev, rows,
             lambda d, r: "ok: lookup a known after recovery" if d and d["events"][6]["expect"].get("backend") == "default/a" else f"NOT CAUGHT ({r})")
+    # Refused redirects have no callback authority: deleting the row must still
+    # leave migration-cadence unresolved, even when the initial choice was unique.
+    ev = [{"op": "health", "backends": [hb("a")]}, {"op": "open", "session": "s"},
+          {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": True},
+          {"op": "health", "backends": [hb("a"), hb("b")]},
+          {"op": "tick", "refuse": ["s"]}, {"op": "close", "session": "s"}]
+    base = rows_for(ev, e2="default/a")
+    effect = {"kind": "redirect", "session": "s", "operation": "s/1", "from": "default/a", "to": "default/b", "accepted": False}
+    for present in (True, False):
+        rows = copy.deepcopy(base)
+        if present:
+            rows[5]["effects"] = [effect]
+        attempt("migration_dependency_" + ("refused" if present else "deleted"), cfg, ev, rows,
+                lambda d, r: "ok: input-derived migration dependency" if d and "migration-cadence" in r else f"NOT CAUGHT ({r})")
+    # Every delivered entry participates in Go's support-redirection AND,
+    # including an unhealthy never-retained entry.
+    disabled = copy.deepcopy(ev)
+    unsupported = hb("never", healthy=False); unsupported["support_redirection"] = False
+    disabled[4]["backends"].append(unsupported)
+    attempt("unsupported_entry_disables_balance", cfg, disabled, copy.deepcopy(base),
+            lambda d, r: "ok: disabled by whole health input" if d and "migration-cadence" not in r else f"NOT CAUGHT ({r})")
+    injected = copy.deepcopy(base); injected[5]["effects"] = [effect]
+    attempt("redirect_while_disabled_refused", cfg, disabled, injected,
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     return out
 
 

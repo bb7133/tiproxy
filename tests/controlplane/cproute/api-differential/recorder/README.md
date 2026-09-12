@@ -1,235 +1,112 @@
-# Router API differential recorder (design, head 1 rev 3 — documentation only)
+# Router API differential recorder
 
-Status: revised design for review (addresses CodexM5 reviews dd0b295e and 8c02ac33);
-no code, no CI change, no frozen-file change. Owner: ClaudeHome (split C, bb7133
-2026-09-12). Reviewer: CodexM5. Baseline `a9c497c3` (`../contract.md` §1–§3).
-Input format: trace v1 as accepted by `../run.py` `validate()` at PR #258 `a98bee78`
-(12 ops; extended `health.backends`; checkpoint `healthy_backend_count` /
-`server_version`). Any new op or field is announced in #workflow before use.
+Test-build recorder for the frozen API-only contract at `a9c497c3`
+([contract](../contract.md), [recording plan](recording-plan.tsv)). CodexM5
+owns implementation and recording following the September 12 takeover. This
+implementation is incomplete; recording an archive does not qualify a corpus slot.
+The four frozen acceptance/inventory files are unchanged.
 
-## 0. Dependencies on the runner (owned by CodexM5) — stated explicitly
+## Implemented boundary
 
-- D1 `tick` and effect comparison: today `run.py` compares `effects` literally against
-  `expect.effects` (`causal()` equality, then `EFFECT_LEDGER` requires `from == ledger`). A
-  recorded trace with a **random** earlier choice can legally have Go and Rust on different
-  backends, so a literal `from`/`to` in `expect` would reject a correct engine. The recorder
-  will emit `expect.effects` with `from: "@session"` (the engine's own current assignment
-  for that session) and `to` as a declared destination **set** (`legal_to`), and the
-  runner needs to accept that form. **This is an interface draft, not a settled rule**: when
-  a random earlier choice also changes *which* session should migrate or *whether* a
-  migration is due, swapping `from`/`to` while copying Go's effect list is still wrong; the
-  constraint is handled in CodexM5's runner extension. Until D1 lands, recorded traces are
-  replayable only for slots whose prior selections are all unique; every other slot is
-  marked `requires: ["effects-v2"]` in the manifest and does not count toward N.
-- D2 `metrics` inputs: Prometheus responses observed by the proxy are archived raw (§3) but
-  cannot be replayed until the metrics input op exists in the runner (CodexM5's metrics/time
-  extension). Slots whose family outcomes depend on metric-driven balance are recorded
-  with the raw archive and marked `requires: ["metrics-input"]`. The harness writes
-  `provenance.metrics_observed`; synthetic traces never consumed metrics.
-- D3 external timer delivery: replay must deliver the recorded `tick` schedule itself; the
-  runner already treats `tick` as an input (adapter calls the real rebalance). No change.
-- D4 `migration-cadence`: the **timing** of balance-driven redirects (which tick a
-  conn-count / location / metric migration is issued at) follows the factors' migration
-  cadence (`group.go:419-481`, `BalanceCount` per factor). The deriver does not reproduce
-  that cadence: recorded redirects are checked for legality only (from = the session's
-  listed backend, to in the declared destination set, acceptance = the scripted refusal)
-  and are **withheld** from `expect`; every slot with such a redirect is marked
-  `requires: ["migration-cadence"]` and does not count until bb7133 decides whether
-  cadence is in scope (then a rule is added here) or out of scope (then the runner compares
-  redirect legality only). Failover force-close timing is not cadence: it is derived exactly
-  (§3).
+`record.py` generates exact-text overlays from the current source tree. The proxy's
+public `GetBackendSelector`, `Next` and `Finish` calls pass through `apireplay`;
+router clock reads use the declared logical timer schedule. Missing or duplicated
+anchors abort the build. Production files are never edited by the overlay.
 
-## 1. Time and ordering (review point 1)
+Every whole health/config input, timer iteration, public call and terminal callback
+executes with its record under one scheduler lock. Calls retain their public return
+values and errors. No private router state, getter tape or closure interception is
+used to reconstruct decisions. Real `BackendSelector.Next` owns its internal retry
+and exclusion reset; only its final public return is recorded.
 
-- **Ticks are inputs, not outputs.** The harness owns rebalance scheduling in the recorded
-  proxy: it disables the router's background `rebalanceLoop` (the same `Init`-with-cancelled
-  context technique the adapter uses) and drives `rebalance` itself from a **pre-declared
-  timer schedule** (every 10 ms, the production `rebalanceInterval`, plus the declared
-  boundary instants for each configured timeout: `timeout − 1 ns` and `timeout`). Every
-  scheduled iteration is recorded as a `tick` with its declared `at_nanos`, whether or not
-  Go produced an effect. Nothing is filtered by Go's output; nothing is added after the fact.
-  If a declared boundary instant did not actually run (harness fault), the recording is
-  **archived permanently as `incomplete`** together with the missing-boundary reason and all
-  raw inputs/outputs; it does not count toward N. A new capture gets a new attempt ID
-  (`<slot>-a<N>`) and never replaces or overwrites the first failure. Boundary events are
-  never synthesized.
-- **Consumption, not delivery.** `health` / `source_error` / `config` events carry the
-  `at_nanos` at which the router **finished applying** the input (recorded inside the
-  wrapper after the real handler returns), not the moment a channel tee saw the message.
-  The ordering of these events relative to `open`/`next`/`finish`/`close` is the real
-  consumption order under the router lock.
-- **Clocks.** `at_nanos` is the harness logical clock (monotonic since trace start) that
-  also feeds the proxy's clock overlay during recording, so the recorded timeouts are
-  exact by construction; the raw wall clock of every input and effect is archived
-  separately (§3) and never used for replay assertions.
+An established connection ends at its real `OnConnClosed` callback. An unsuccessful
+selector ends when the proxy returns from that selector's scope: the overlaid deferred
+`EndSelection` preserves `CloseObservation` and emits a terminal session event. It
+never invents `Finish(false)` or closes an established connection. A still-pending
+reservation or missing terminal event makes the recording incomplete.
 
-## 2. Public-semantics derivation (review point 2) — `derive_expectations.py`
+The connection wrapper gives each public effect a monotonically increasing operation
+ID. A terminal redirect callback binds to the accepted redirect's stored ID and
+endpoints, even if force-close issued another operation meanwhile. A successful first
+callback updates the public assignment; duplicates and callbacks after close do not
+resurrect a session. An unmatched callback is preserved as a recorder error.
 
-Separate rules per operation; when a rule cannot be proven from the recorded public
-inputs the script **refuses to emit an expectation**, keeps the raw record, prints the
-seq, and the slot is not counted.
+The harness composes a real proxy, factor policy, PD-backed observer and cluster
+manager. Scripted actions currently support environment commands, config changes,
+fetcher-boundary source-error windows and checkpoints. A fault wraps the real
+`BackendFetcher`; the real observer then publishes the error. Stopping PD alone is
+not guaranteed to publish an error because the production fetcher retries.
 
-- `next`: candidate set = backends **healthy and not in active failover** in the last
-  consumed inventory, filtered by the routing rule fixed at Init (`all` /
-  `client_cidr` / `proxy_cidr` / `port` with the session's ClientInfo and the
-  `tiproxy-port` label), minus the selector's exclusions. Exclusion semantics follow
-  `backend_selector.go:24-37`: after a failed attempt the backend **identity** is excluded
-  for the rest of the attempt cycle; the reset happens only when the legal candidates minus
-  the *actual* excluded identities are empty and the list is non-empty (an **exact**
-  `ErrNoBackend`, including an exact observer `no_backend`), a **wrapped** no-backend never
-  resets. The derivation keeps the per-session identity set, validates Go's row against
-  Go's own set, and expresses the cross-engine form as: candidates minus the uniquely
-  derived exclusions, plus `exclude_previous` when a non-unique exclusion exists; when an
-  earlier non-unique exclusion (or a reset after one) cannot be expressed by the runner the
-  slot is marked `requires: ["exclusion-history"]` and does not count.
-  The failover guard is evaluated **per group** (`group.go:286-341`): the list is ignored
-  only for a group it would leave without a routeable backend; the timeout never gates the
-  marking (`router.go:160-165`). Config documents are parsed with a full TOML parser;
-  routing inputs the derivation does not model (`balance.label-name`, `labels`) are refused.
-  `|candidates| == 1` → `backend`; `> 1` → `legal_backends`; `== 0` → the expected error
-  class is a **fixed mapping from inputs**, never "whatever was recorded": if an observer
-  error is active (router `observeError`, `router_score.go:128-130,238`) the identity maps
-  1:1 — `no_backend` → `no_backend`, `wrapped_no_backend` → `wrapped_no_backend`,
-  `port_conflict` → `port_conflict`, the other three → `source_error:<identity>`; if the
-  listener port is claimed by two clusters → `port_conflict`; ordinary exhaustion of the
-  candidate set (no observer error) can only be the **exact** `no_backend` (exclusion
-  exhaustion never produces the wrapped sentinel). Any recorded outcome outside this
-  mapping is a discrepancy candidate: the script refuses and keeps the raw record.
-  Public balance-policy constraints restrict the legal set only where the policy's rule is
-  deterministic from inputs. `random` may return **any** candidate under every policy
-  (`factor_balance.go:255-279`; the location factor only weights). `prefer-idle` evicts a
-  candidate when a higher-priority factor advises migration (`factor_balance.go:287-345`):
-  under `location` the location factor precedes every metric factor, so a remote candidate
-  is evicted whenever a local one exists (deterministic); every other eviction (conn-count,
-  health/memory/cpu) is not derivable, so `prefer-idle` with more than one remaining
-  candidate marks `requires: ["policy-constraint:<policy>/prefer-idle"]` (plus
-  `metrics-input` for `resource`/`location` when the recording consumed metrics) and
-  **does not count toward acceptance**; an "unrestricted" set is raw evidence only.
-- `lookup`: expectation is `ok` + the named backend iff that backend ID is **retained** by
-  the router (`router.backends`, `router_score.go:172-181`): it entered when first consumed
-  healthy and leaves when consumed unhealthy/absent while idle — no listed connection, no
-  pending reservation (`Next` ok without `Finish`), no in-flight redirect score
-  (`router_score.go:340-356`, `group.go:222-238`); an observer error does not affect it.
-  Retention is reconstructed from the public assignment ledger (Next/Finish/close,
-  accepted redirects and their results). When the ledger is engine-relative for the queried
-  backend the script refuses rather than guess; the recording plan issues lookup/rehydrate
-  only on sessions with unique history.
-- `rehydrate`: `ok` + backend iff the named backend is retained by its group
-  (`group.go:514-517`) **and** the session is idle; unhealthy retention and observer error do
-  not by themselves make it fail. The recorder only issues rehydrate on idle sessions.
-- `checkpoint`: `healthy_backend_count` = 0 if an observer error is active
-  (`router_score.go:187`), else count of healthy backends **not** in active failover
-  (fail-backend-list marking per `group.go` `updateFailoverLocked`, including its "ignore
-  the list when it would leave no routeable backend" guard); `legal_server_versions` = the
-  versions of the **current round's** healthy backends when that set is non-empty (a
-  superseded version is no longer legal once a new round has a definite non-empty healthy
-  version); only when the current round has no healthy backend is the previously retained
-  version the sole legal value. Never the union of all history.
-- `finish` / `close` / `config` / `source_error`: outcomes as recorded; `invalid_config`
-  is recorded at the **validation entry** (the config manager's `SetTOMLConfig` result),
-  not by inspecting the applied config.
+## Archive lifecycle
 
-## 3. Effects and random choices (review point 3)
+Each attempt has a new directory; archive and output files are created exclusively.
+The completed workload joins its clients. Finalization then cancels and joins tick,
+action, environment-command and health-forwarding producers, closes the real SQL
+server and waits for its connection callbacks, checks all open/pending/active
+sessions, and records the final checkpoint. Only then is the raw archive synced and
+closed and its immutable snapshot converted and hashed. Archive write/sync/close
+errors and unsettled sessions make the capture incomplete.
 
-Recorded Go effects (`redirect` / `force_close`, acceptance, callbacks) are **output
-evidence** only. `expect.effects` is derived as: kind, session, operation ordinal,
-`from: "@session"` (each engine's own current assignment), `legal_to` = the declared
-destination set derived from public inputs at that tick (healthy, not failover, in the
-group, ≠ from), `accepted` from the recorded client-side acceptance policy (refusals are
-scripted by the harness, not observed). This requires D1; until then the recorder marks
-every slot with a non-unique choice `requires: ["effects-v2"]`.
+Files are `archive.jsonl`, `trace.json` (inputs without expectations), `go.json`,
+`manifest.json`, `proxy.toml`, and the exact `actions.json` when supplied. The manifest
+records source head/tree/dirty status, workload duration, completed and failed
+connection counts, script hash, event count and all three data hashes. `record.py`
+embeds the build source identity; a dirty or unidentified build is incomplete.
+`qualified` is always false here: derivation, common schema validation, same-tree
+paired replay and the frozen corpus gates remain separate requirements.
 
-Effect **timing** is never copied from the recorded output:
+Original failed attempts are retained. N01-a1 panicked before output finalization;
+N01-a2 left 87 selectors open and fails the common validator's empty-final-checkpoint
+gate. Its original `recorded` manifest must not be interpreted as qualification.
 
-- `force_close` is derived from inputs and the logical clock
-  (`group.go:542-587`, run after `Balance` in every iteration, `router_score.go:471-483`):
-  a backend enters failover at the logical instant of the consuming health/config event and
-  keeps that instant while it stays marked (`router.go:178-190`); at every tick with
-  `now >= since + failover-timeout` (immediately when the timeout is 0) each connection
-  listed on that backend that has not yet accepted a force-close receives one
-  (`operation = <session>/<n>`, n continuing the session's effect ordinals after any
-  redirect issued earlier in the same iteration); an accepted one is not repeated, a refused
-  one is retried at the next tick. A recorded force-close set that differs from this
-  derivation (missing at the deadline, present before it) is refused. A session whose
-  assignment is non-unique cannot be placed on a backend: the slot needs `effects-v2`.
-- `redirect` timing is D4 (`migration-cadence`, §0): legality is checked, the effect is
-  withheld.
+## Expectation derivation and remaining dependencies
 
-## 4. Required outcomes — how each is actually triggered (review point 4)
+`derive_expectations.py` derives public legal sets and error classes from inputs and
+history, validates recorded Go choices against Go's own exclusion history, and
+refuses unexplained results. Next, Lookup and Rehydrate have distinct rules. Config
+uses a full TOML parser; unknown routing-affecting fields are refused. Retention
+includes pending reservations and accepted redirects. Health recovery clears prior
+retention ambiguity. Failover marking and its all-members guard are per group;
+force-close due time and acceptance come from inputs, logical time and public history.
 
-| Family / outcome (contract §3) | Real trigger and evidence |
-| --- | --- |
-| successful selection / Finish / close | mysql clients through the real listener; `Finish(true)` observed in `backend_conn_mgr.go:341`. |
-| failed creation and retry | a **real dial failure**: the harness adds a backend whose TiDB process is stopped but whose PD topology entry is still present (`env.sh tidb-stop` without deregistration → health check marks it unhealthy only after the check interval); within that window `Next` selects it, `dialBackend` fails, `Finish(false)` at `:341`, backoff retries `Next` with the backend excluded (`:330`). Evidence: the recorded `finish success=false` followed by `next` `exclude_previous`. |
-| no-backend followed by recovery | `env.sh tidb-stop` of every member of the routed group → `Next` returns `ErrNoBackend` (`:330` → `ErrProxyNoBackend`, no Finish); then `tidb-start` → recovery. |
-| initial empty state, first health | proxy started with the harness holding the first `HealthResult` until the first client attempt is recorded. |
-| health loss / recovery | `env.sh tidb-kill` / `tidb-start`; real health check transitions. |
-| drain activation / unchanged / clear / reentry | `fail-backend-list` + `failover-timeout` config updates via the real config manager; the "list would leave no routeable backend" guard is recorded as a no-op activation when it applies. |
-| refused then accepted redirect | the harness's `RedirectableConn` wrapper refuses the first `Redirect` for one scripted session (client-side acceptance is a public boundary), accepts the next. |
-| late completion after close, no duplicate settlement | the wrapper delays one `OnRedirectSucceed` until after the client closed. |
-| valid / invalid config | `SetTOMLConfig` with a valid and an invalid document; outcome from the validator's return. |
-| backend addition / removal | `env.sh tidb-add` / `tidb-remove`. |
-| source error and recovery | **Declared external fault wrapper at the `BackendFetcher` boundary** (`observer.BackendFetcher` interface, composed in `pkg/manager/namespace/manager.go:76-78`): the harness wraps the real `FallbackFetcher` and, for a scripted window, returns the declared error (`context.Canceled`, `context.DeadlineExceeded`, a topology-unavailable error); the real observer converts it into `HealthResult{err}` (`backend_observer.go:95-101`) and the real router consumes it. This is the only place a live-run source error can be produced deterministically: `PDFetcher` retries infinitely and never returns an error (`backend_fetcher.go:93-104`), and stopping Prometheus does not produce an observer error. Evidence: the wrapper logs the injected error and the recorded `source_error` carries the consumption `at_nanos`. Exact/wrapped no-backend and port-conflict identities are produced by the router itself, not injected. |
-| group-routing input change | config update of the group-routing inputs on the live config manager. |
-| close / recreate / rehydrate | **router-level**, not a process restart (a process restart cannot keep client sockets): the harness calls the real `ScoreBasedRouter.Close()`, constructs a new router with the same observer/config, and re-attaches the surviving connections via `RehydrateConn` (`AssignmentRehydrator`), then a pending redirect's terminal result exercises `LookupBackend`. Driver = the harness, using only the public `Router` / `AssignmentRehydrator` methods. |
-| CIDR match / no-match | clients from two loopback source addresses (`127.0.0.1`, `127.0.0.2`). |
-| port conflict and recovery | two listeners; a `tiproxy-port` label collision introduced through the topology (second cluster entry) and removed. |
+The following dependencies withhold a slot from acceptance:
 
-## 5. Compilable test-build wiring (review point 5)
+- `effects-v2`: effects depend on each engine's own prior assignments, including which
+  session should move and whether an effect is due. Copying Go's effect list with
+  variable endpoints is insufficient.
+- `exclusion-history`: a complete engine-relative exclusion cycle/reset cannot yet be
+  represented by the common runner's single previous-choice constraint.
+- `policy-constraint:<policy>/prefer-idle`: not all factor advice can yet be derived
+  from the available public inputs. An unrestricted candidate set is not qualification.
+- `metrics-input`: whole metrics inputs/history are not yet captured and replayed.
+  `metrics_observed` currently indicates a live metrics querier, not an archived
+  Prometheus response stream.
+- `migration-cadence`: explicitly required by contract §4. This dependency is derived
+  from input capability and session/destination history even if every observed
+  redirect is deleted. Whole-health support-redirection AND semantics disable the
+  balance pass; independent failover closes still run. Legal observed redirects are
+  withheld until exact cadence/effect eligibility is implemented. No further scope
+  approval is needed to implement this requirement.
 
-`BackendSelector` is a concrete struct with private closures (`backend_selector.go:16-22`)
-and `router.Router.GetBackendSelector` returns it by value, so the recording seam must
-live **inside package `router`** and is compiled only under a build tag:
+Additional planned work includes timer boundary expansion, scripted refusal/delayed
+callbacks, router Close/recreate/rehydrate, CIDR/no-match and multiple-listener/cluster
+scenarios. The presence of a row in `recording-plan.tsv` does not mean its driver is
+implemented. Captures with unresolved dependencies remain raw evidence and do not
+count toward the 18 slots, three rounds or focused acceptance groups.
 
-- **`next` / `finish` are recorded at the public method return, never inside the
-  selector's closures.** Wrapping `routeOnce` would record calls the caller never sees: with
-  one backend, after a `Finish(false)`, the next public `Next()` first hits the exact
-  `ErrNoBackend`, clears the exclusions and retries successfully inside a single call
-  (`backend_selector.go:24-31`); only the single public result is a recordable event.
-  Wiring: a test-build **overlay** of the proxy call site (the same `go -overlay` mechanism
-  `run.py` uses for the clock) substitutes, in `pkg/proxy/backend/backend_conn_mgr.go`,
-  `selector.Next()` → `apireplay.Next(&selector, ...)` and `selector.Finish(mgr, ok)` →
-  `apireplay.Finish(&selector, mgr, ok, ...)`, where the `apireplay` test package calls the
-  real public `BackendSelector.Next` / `Finish` and records the returned value or error
-  once per public call. `CloseObservation` is **not** a connection close; it ends the
-  selection call. Connection `close` is recorded only from the real
-  `ConnEventReceiver.OnConnClosed` (`backend_conn_mgr.go:286,935`) through the
-  `RedirectableConn` wrapper.
-- `pkg/balance/router/recording_apireplay.go` (`//go:build apireplay`): `RecordingRouter`
-  wraps `*ScoreBasedRouter`, implements `Router` and `AssignmentRehydrator`, records
-  `open` (ClientInfo) when `GetBackendSelector` is called, and records `lookup` /
-  `rehydrate` at their public returns. It adds no field to `ScoreBasedRouter`, no closure
-  wrapping and no call site in untagged production files.
-- `pkg/balance/observer` needs no tag: `BackendObserver` and `BackendFetcher` are
-  interfaces; `RecordingObserver` (tees consumed results) and `FaultFetcher` (§4) live in
-  the harness package.
-- Composition: `pkg/manager/namespace/recording_apireplay.go` (`//go:build apireplay`)
-  adds `NewNamespaceManagerForRecording(sink)` that composes exactly what
-  `manager.go:76-98` composes, substituting the fault fetcher, the recording observer and
-  the recording router. The harness (`tests/controlplane/cproute/api-differential/recorder/`,
-  same tag) builds the real proxy the way `pkg/server/server.go:65,201,212` does:
-  `proxy.NewSQLServer(...)` with a handshake handler whose `NsMgr` is the recording
-  manager. No private hook, no change to untagged production code.
-- Clock: the harness applies the same `apiReplayNow` overlay that `run.py` uses, driven by
-  the harness logical clock, so recorded `at_nanos` and replayed timing are the same basis.
-- Metrics: raw Prometheus responses seen by the proxy are archived (D2) and not replayed
-  until the metrics input op exists.
+## Commands
 
-## 6. Archive and manifest (contract §3)
+Run from the repository root, with build/output directories outside the source tree:
 
-Per slot: `go_source_sha`, build tag/flags, environment manifest (PD/TiKV/TiDB/Prometheus
-versions and topology, proxy TOML), the declared timer schedule, workload and fault
-operation log with wall-clock timestamps, raw `HealthResult`/config/Prometheus archive
-with hashes, event count, completed-session count, duration, normalized input/output
-hashes, `trace_sha256`, `environment_manifest_sha256`, `recorded_at_utc`, and
-`requires: [...]` (empty when replayable on the current runner). `trace-matrix.tsv` rows are
-filled after recording; the list is frozen before the first K run.
+```sh
+python3 tests/controlplane/cproute/api-differential/recorder/record.py build --out /tmp/api-record-build
+/tmp/api-record-build/record -slot N01 -attempt a3 -duration 150s -clients 8 \
+  -out /path/to/new-recordings -script /path/to/actions.json -env /path/to/env.sh
+python3 tests/controlplane/cproute/api-differential/recorder/derive_expectations.py \
+  /path/to/new-recordings/N01-a3/trace.json /path/to/new-recordings/N01-a3/go.json \
+  --output /path/to/new-recordings/N01-a3/derived.json
+go test -race -tags apireplay ./tests/controlplane/cproute/api-differential/recorder/...
+```
 
-## 7. Deliverables
-
-1. This design + `recording-plan.tsv` (head 1, rev 3).
-2. `derive_expectations.py` + the tagged wrappers/composition + harness driver (head 2),
-   validated by replaying a harness-recorded run of the existing `smoke.json` scenario shape
-   through `run.py` on both engines.
-3. N01 (`normal / connection / prefer-idle / all`) recorded, derived, replayed (head 3);
-   then the remaining 17 slots. Counts stay 0/18, 0/3, 0/3 until a slot passes replay.
+Run `run.py.validate()` on a derived trace before any replay claim. A nonempty
+`requires` list remains a blocker even when that structural validation passes.

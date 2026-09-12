@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,12 +36,26 @@ type Checkpoint struct {
 	ServerVersion       string            `json:"server_version"`
 }
 
+// CaptureSummary identifies the recording build and workload; qualification
+// additionally requires schema validation and replay of the derived inputs.
+type CaptureSummary struct {
+	Head                 string `json:"head"`
+	Tree                 string `json:"tree"`
+	SourceDirty          string `json:"source_dirty"`
+	DurationNanos        int64  `json:"duration_nanos"`
+	PlannedDurationNanos int64  `json:"planned_duration_nanos"`
+	Completed            int64  `json:"completed_connections"`
+	Failed               int64  `json:"failed_connections"`
+	Clients              int    `json:"clients"`
+	ScriptSHA256         string `json:"script_sha256"`
+}
+
 // Write converts the recorded log into the trace v1 input file (no expect
 // blocks), the Go rows file and a manifest with hashes. Ticks are folded:
 // `tick_begin` … effects … `tick_end` become one `tick` event whose row carries
 // the effects issued during that iteration; `effect` records outside a tick
 // (none expected) are refused into the manifest as `incomplete`.
-func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoints map[int]Checkpoint, incomplete []string, metricsObserved bool) (string, error) {
+func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoints map[int]Checkpoint, incomplete []string, metricsObserved bool, summary CaptureSummary) (string, error) {
 	events := make([]map[string]any, 0, len(log))
 	rows := make([]map[string]any, 0, len(log))
 	var inTick bool
@@ -65,8 +80,14 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 		e := r.Event
 		switch e.Op {
 		case "tick_begin":
+			if inTick {
+				incomplete = append(incomplete, fmt.Sprintf("seq %d: nested tick", r.Seq))
+			}
 			inTick, tickEffects, tickAt = true, nil, r.AtNanos
 		case "tick_end":
+			if !inTick {
+				incomplete = append(incomplete, fmt.Sprintf("seq %d: tick end without begin", r.Seq))
+			}
 			ev := map[string]any{"op": "tick"}
 			effects := tickEffects
 			if effects == nil {
@@ -122,6 +143,8 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			cp := checkpoints[r.Seq]
 			push(map[string]any{"op": "checkpoint"}, map[string]any{"op": "checkpoint", "outcome": "ok", "assignments": cp.Assignments,
 				"conn_count": cp.ConnCount, "healthy_backend_count": cp.HealthyBackendCount, "server_version": cp.ServerVersion}, r.AtNanos)
+		case "recorder_error":
+			incomplete = append(incomplete, fmt.Sprintf("seq %d: %s", r.Seq, e.Outcome))
 		default:
 			incomplete = append(incomplete, fmt.Sprintf("seq %d: unknown record %q", r.Seq, e.Op))
 		}
@@ -154,10 +177,23 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	if len(incomplete) > 0 {
 		status = "incomplete"
 	}
+	hashes := make(map[string]string)
+	for _, name := range []string{"trace", "go", "archive"} {
+		ext := ".json"
+		if name == "archive" {
+			ext = ".jsonl"
+		}
+		sum, err := fileSHA(filepath.Join(dir, name+ext))
+		if err != nil {
+			return "", err
+		}
+		hashes[name] = sum
+	}
 	manifest := map[string]any{
 		"slot": slot, "attempt": attempt, "status": status, "incomplete": incomplete,
-		"events": len(events), "trace_sha256": fileSHA(tracePath), "go_sha256": fileSHA(rowsPath),
-		"archive_sha256": fileSHA(filepath.Join(dir, "archive.jsonl")),
+		"capture": summary, "qualified": false,
+		"events": len(events), "trace_sha256": hashes["trace"], "go_sha256": hashes["go"],
+		"archive_sha256": hashes["archive"],
 	}
 	if err := writeJSON(filepath.Join(dir, "manifest.json"), manifest); err != nil {
 		return "", err
@@ -170,14 +206,19 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(append(b, '\n'))
+	return errors.Join(writeErr, f.Sync(), f.Close())
 }
 
-func fileSHA(path string) string {
+func fileSHA(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
 }

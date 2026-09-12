@@ -10,6 +10,8 @@ package harness
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -40,6 +42,8 @@ type Scheduler struct {
 	log     []Recorded
 	archive *os.File
 	observe func(apireplay.Event)
+	closed  bool
+	err     error
 }
 
 // Observe registers a hook invoked with every recorded event (lock held).
@@ -49,7 +53,7 @@ func (s *Scheduler) Observe(fn func(apireplay.Event)) { s.observe = fn }
 func (s *Scheduler) Seq() int { return s.seq }
 
 func NewScheduler(archivePath string) (*Scheduler, error) {
-	f, err := os.Create(archivePath)
+	f, err := os.OpenFile(archivePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +72,10 @@ func (s *Scheduler) Serialize(fn func()) {
 // Record implements apireplay.Sink; it must be called with the lock held
 // (from Serialize or from Run).
 func (s *Scheduler) Record(ev apireplay.Event) {
+	if s.closed {
+		s.err = errors.Join(s.err, fmt.Errorf("event %s after archive sealed", ev.Op))
+		return
+	}
 	r := Recorded{Seq: s.seq, AtNanos: s.nanos, Wall: time.Now(), Event: ev}
 	s.seq++
 	s.log = append(s.log, r)
@@ -75,8 +83,13 @@ func (s *Scheduler) Record(ev apireplay.Event) {
 		s.observe(ev)
 	}
 	if s.archive != nil {
-		b, _ := json.Marshal(r)
-		s.archive.Write(append(b, '\n'))
+		b, err := json.Marshal(r)
+		if err == nil {
+			_, err = s.archive.Write(append(b, '\n'))
+		}
+		if err != nil {
+			s.err = errors.Join(s.err, fmt.Errorf("archive seq %d: %w", r.Seq, err))
+		}
 	}
 }
 
@@ -120,9 +133,14 @@ func (s *Scheduler) Log() []Recorded {
 	return out
 }
 
+// Close seals the archive after every producer has been stopped and joined.
+// It is idempotent; write, sync and close failures prevent a qualified capture.
 func (s *Scheduler) Close() error {
-	if s.archive != nil {
-		return s.archive.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.closed = true
+		s.err = errors.Join(s.err, s.archive.Sync(), s.archive.Close())
 	}
-	return nil
+	return s.err
 }

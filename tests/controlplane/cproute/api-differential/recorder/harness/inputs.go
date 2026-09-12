@@ -22,7 +22,6 @@ import (
 type Inputs struct {
 	sched  *Scheduler
 	driver *router.ReplayDriver
-	health map[string]any // last delivered inventory (archived raw)
 	mu     sync.Mutex
 	raw    []observer.HealthResult
 }

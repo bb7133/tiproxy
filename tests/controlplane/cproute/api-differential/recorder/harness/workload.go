@@ -11,11 +11,11 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/pingcap/tiproxy/lib/util/waitgroup"
 )
 
 // Workload drives real MySQL connection lifecycles through the recorded proxy
@@ -53,15 +53,13 @@ func (w *Workload) connector(source string) (driver.Connector, error) {
 
 // Run drives the clients until ctx ends.
 func (w *Workload) Run(ctx context.Context) {
-	var wg sync.WaitGroup
+	var wg waitgroup.WaitGroup
 	for i := 0; i < w.Clients; i++ {
 		source := ""
 		if len(w.Sources) > 0 {
 			source = w.Sources[i%len(w.Sources)]
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Run(func() {
 			for ctx.Err() == nil {
 				if err := w.once(ctx, source); err != nil {
 					w.failed.Add(1)
@@ -73,7 +71,7 @@ func (w *Workload) Run(ctx context.Context) {
 				case <-time.After(w.Pause):
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }

@@ -363,6 +363,21 @@ jobs:
             ~/.cargo/git/db
             rust/target
           key: rust-routing-api-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Check recorder lifecycle regressions
+        run: |
+          go test -race -tags apireplay ./tests/controlplane/cproute/api-differential/recorder/... -count=1 -timeout=120s
+          python3 - <<'PYTEST'
+          import importlib.util
+          import json
+          from pathlib import Path
+          path = Path("tests/controlplane/cproute/api-differential/recorder/derive_expectations.py")
+          spec = importlib.util.spec_from_file_location("derive", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          results = module.defect_checks()
+          print(json.dumps(results, indent=2))
+          assert all("NOT CAUGHT" not in result for result in results.values())
+          PYTEST
       - name: Compare the actual API adapters
         run: |
           python3 tests/controlplane/cproute/api-differential/run.py \

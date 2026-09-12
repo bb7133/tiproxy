@@ -6,7 +6,7 @@
 The recording build never edits the production tree: it uses `go build -overlay` with
 generated copies of three files:
 
-  pkg/proxy/backend/backend_conn_mgr.go   selector call sites -> apireplay.Open/Next/Finish
+  pkg/proxy/backend/backend_conn_mgr.go   selector call sites -> apireplay.Open/Next/Finish/EndSelection
   pkg/balance/router/group.go             time.Now() -> replayNow()  (harness logical clock)
   pkg/balance/router/router_score.go      time.Now() -> replayNow()
 
@@ -32,6 +32,7 @@ APIREPLAY = "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-different
 SUBSTITUTIONS = {
     "pkg/proxy/backend/backend_conn_mgr.go": [
         ("selector := r.GetBackendSelector(ci)", "selector, apiSession := apireplay.Open(r, ci)", 1),
+        ("defer selector.CloseObservation()", "defer apireplay.EndSelection(&selector, apiSession)", 1),
         ("if backend, err = selector.Next(); err == router.ErrNoBackend {", "if backend, err = apireplay.Next(&selector, apiSession); err == router.ErrNoBackend {", 1),
         ("selector.Finish(mgr, err == nil)", "apireplay.Finish(&selector, apiSession, mgr, err == nil)", 1),
         ('\t"github.com/pingcap/tiproxy/pkg/balance/router"\n', '\t"github.com/pingcap/tiproxy/pkg/balance/router"\n\t"' + APIREPLAY + '"\n', 1),
@@ -67,7 +68,11 @@ def overlay(out):
 def build(out):
     path = overlay(out)
     binary = out / "record"
-    cmd = ["go", "build", "-tags", "apireplay", "-overlay", str(path), "-o", str(binary), PKG]
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip()
+    dirty = bool(subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=ROOT, text=True).strip())
+    ldflags = f"-X main.sourceHead={head} -X main.sourceTree={tree} -X main.sourceDirty={str(dirty).lower()}"
+    cmd = ["go", "build", "-ldflags", ldflags, "-tags", "apireplay", "-overlay", str(path), "-o", str(binary), PKG]
     print("+", " ".join(cmd), file=sys.stderr)
     subprocess.run(cmd, cwd=ROOT, check=True)
     return binary

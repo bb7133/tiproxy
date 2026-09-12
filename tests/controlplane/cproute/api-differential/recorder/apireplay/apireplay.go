@@ -155,6 +155,10 @@ type Session struct {
 	current router.BackendInst
 	ordinal atomic.Uint64
 	conn    *Conn
+	// A successful Finish transfers the session's terminal event to the real
+	// connection callback. An abandoned selector ends at its caller's return.
+	established bool
+	closed      bool
 }
 
 // ID returns the recorded session id.
@@ -194,8 +198,24 @@ func Finish(sel *router.BackendSelector, s *Session, conn router.RedirectableCon
 			s.conn = &Conn{RedirectableConn: conn, session: s}
 		}
 		sel.Finish(s.conn, succeed)
+		if succeed {
+			s.established = true
+		}
 		ok := succeed
 		record(Event{Op: "finish", Session: s.id, Success: &ok})
+	})
+}
+
+// EndSelection is called at the real selector scope's deferred cleanup. It
+// preserves CloseObservation and never fabricates a Finish or closes a live
+// connection. Only attempts that did not establish a connection end here.
+func EndSelection(sel *router.BackendSelector, s *Session) {
+	serialize(func() {
+		sel.CloseObservation()
+		if !s.established && !s.closed {
+			s.closed = true
+			record(Event{Op: "close", Session: s.id})
+		}
 	})
 }
 
@@ -208,13 +228,20 @@ type Conn struct {
 	session  *Session
 	receiver router.ConnEventReceiver
 	refuse   atomic.Bool
+	redirect *redirectOperation
+}
+
+type redirectOperation struct {
+	id       string
+	from, to router.BackendInst
+	settled  bool
 }
 
 // Refuse makes the next Redirect/ForceClose be refused at the client boundary
 // (a scripted, declared refusal — recorder README §4).
 func (c *Conn) Refuse(v bool) { c.refuse.Store(v) }
 
-func (c *Conn) effect(kind string, to router.BackendInst, accepted bool) {
+func (c *Conn) effect(kind string, to router.BackendInst, accepted bool) string {
 	n := c.session.ordinal.Add(1)
 	e := Effect{Kind: kind, Session: c.session.id, Operation: fmt.Sprintf("%s/%d", c.session.id, n), Accepted: accepted}
 	if c.session.current != nil {
@@ -224,11 +251,15 @@ func (c *Conn) effect(kind string, to router.BackendInst, accepted bool) {
 		e.To = to.ID()
 	}
 	record(Event{Op: "effect", Session: c.session.id, Effects: []Effect{e}})
+	return e.Operation
 }
 
 func (c *Conn) Redirect(to router.BackendInst) bool {
 	accepted := !c.refuse.Load() && c.RedirectableConn.Redirect(to)
-	c.effect("redirect", to, accepted)
+	op := c.effect("redirect", to, accepted)
+	if accepted {
+		c.redirect = &redirectOperation{id: op, from: c.session.current, to: to}
+	}
 	return accepted
 }
 
@@ -256,11 +287,7 @@ type receiverWrapper struct {
 func (w *receiverWrapper) OnRedirectSucceed(from, to string, conn router.RedirectableConn) (err error) {
 	serialize(func() {
 		err = w.inner.OnRedirectSucceed(from, to, w.conn)
-		if b, ok := w.conn.RedirectableConn.Value(backendKey{}).(router.BackendInst); ok {
-			w.conn.session.current = b
-		}
-		ok := true
-		record(Event{Op: "redirect_result", Session: w.conn.session.id, Success: &ok, Operation: w.lastOp(), Backend: to})
+		w.recordRedirectResult(from, to, true)
 	})
 	return err
 }
@@ -268,8 +295,7 @@ func (w *receiverWrapper) OnRedirectSucceed(from, to string, conn router.Redirec
 func (w *receiverWrapper) OnRedirectFail(from, to string, conn router.RedirectableConn) (err error) {
 	serialize(func() {
 		err = w.inner.OnRedirectFail(from, to, w.conn)
-		ok := false
-		record(Event{Op: "redirect_result", Session: w.conn.session.id, Success: &ok, Operation: w.lastOp(), Backend: to})
+		w.recordRedirectResult(from, to, false)
 	})
 	return err
 }
@@ -277,16 +303,26 @@ func (w *receiverWrapper) OnRedirectFail(from, to string, conn router.Redirectab
 func (w *receiverWrapper) OnConnClosed(backendID string, conn router.RedirectableConn) (err error) {
 	serialize(func() {
 		err = w.inner.OnConnClosed(backendID, w.conn)
+		w.conn.session.closed = true
 		record(Event{Op: "close", Session: w.conn.session.id})
 	})
 	return err
 }
 
-func (w *receiverWrapper) lastOp() string {
-	return fmt.Sprintf("%s/%d", w.conn.session.id, w.conn.session.ordinal.Load())
+func (w *receiverWrapper) recordRedirectResult(from, to string, success bool) {
+	op := w.conn.redirect
+	if op == nil || op.from.ID() != from || op.to.ID() != to {
+		// Keep unexpected callbacks in the raw archive and mark the capture
+		// incomplete. Do not invent authority from the most recent effect.
+		record(Event{Op: "recorder_error", Session: w.conn.session.id, Outcome: "redirect_callback_without_matching_operation"})
+		return
+	}
+	if !op.settled && success && !w.conn.session.closed {
+		w.conn.session.current = op.to
+	}
+	op.settled = true
+	record(Event{Op: "redirect_result", Session: w.conn.session.id, Success: &success, Operation: op.id, Backend: to})
 }
-
-type backendKey struct{}
 
 func addr(a interface{ String() string }) string {
 	if a == nil {

@@ -15,7 +15,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -40,10 +42,14 @@ import (
 	"github.com/pingcap/tiproxy/pkg/manager/memory"
 	"github.com/pingcap/tiproxy/pkg/proxy"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
+	"github.com/pingcap/tiproxy/pkg/util/waitgroup"
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/harness"
 	"go.uber.org/zap"
 )
+
+// Set by record.py from the exact source tree used for this build.
+var sourceHead, sourceTree, sourceDirty string
 
 // Action is one scripted, declared operation at a wall offset from trace start.
 type Action struct {
@@ -83,20 +89,26 @@ func main() {
 	}
 }
 
-func run(slot, attempt, policyName, selection, rule, listen, pd string, duration time.Duration, clients int, pause time.Duration, sources, out, script, envSh string, tickEvery time.Duration) error {
-	dir := filepath.Join(out, slot+"-"+attempt)
-	if _, err := os.Stat(dir); err == nil {
-		return fmt.Errorf("%s exists; a new attempt needs a new id (README §1)", dir)
+func run(slot, attempt, policyName, selection, rule, listen, pd string, duration time.Duration, clients int, pause time.Duration, sources, out, script, envSh string, tickEvery time.Duration) (runErr error) {
+	if duration <= 0 || tickEvery <= 0 || clients <= 0 || pause < 0 {
+		return fmt.Errorf("duration, tick and clients must be positive; pause must be nonnegative")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir := filepath.Join(out, slot+"-"+attempt)
+	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
 	}
-	lg, _ := zap.NewDevelopment(zap.IncreaseLevel(zap.WarnLevel))
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		return err
+	}
+	lg, err := zap.NewDevelopment(zap.IncreaseLevel(zap.WarnLevel))
+	if err != nil {
+		return err
+	}
 	listeners := strings.Split(listen, ",")
 	toml := fmt.Sprintf("[proxy]\naddr = %q\npd-addrs = %q\n[balance]\npolicy = %q\nrouting-policy = %q\nrouting-rule = %q\n[log]\nlevel = \"warn\"\n",
 		listeners[0], pd, policyName, selection, rule)
 	cfgFile := filepath.Join(dir, "proxy.toml")
-	if err := os.WriteFile(cfgFile, []byte(toml), 0o644); err != nil {
+	if err := os.WriteFile(cfgFile, []byte(toml), 0o600); err != nil {
 		return err
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -106,11 +118,13 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	if err := cfgMgr.Init(ctx, cfgFile, ""); err != nil {
 		return err
 	}
+	defer func() { runErr = errors.Join(runErr, cfgMgr.Close()) }()
 	cfg := cfgMgr.GetConfig()
 	certMgr := cert.NewCertManager()
 	if err := certMgr.Init(cfg, lg.Named("cert"), cfgMgr.WatchConfig()); err != nil {
 		return err
 	}
+	defer certMgr.Close()
 	clusterMgr := backendcluster.NewManager(lg.Named("backendcluster"), certMgr.ClusterTLS)
 	if err := clusterMgr.Start(ctx, cfgMgr, cfgMgr.WatchConfig()); err != nil {
 		return err
@@ -121,7 +135,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	if err != nil {
 		return err
 	}
-	defer sched.Close()
+	defer func() { runErr = errors.Join(runErr, sched.Close()) }()
 
 	// Real observer over the real PD-backed fetcher, with the declared fault wrapper (README §4).
 	hcCfg := config.NewDefaultHealthCheckConfig()
@@ -137,6 +151,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		return p
 	}
 	driver := router.NewReplayDriver(rt, bo, bpCreator, cfgMgr)
+	defer rt.Close()
 	inputs := harness.NewInputs(sched, driver)
 	apireplay.Install(sched, slot)
 	ledger := newLedger()
@@ -147,26 +162,39 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	hsHandler := backend.NewDefaultHandshakeHandler(nsMgr)
 	memMgr := memory.NewMemManager(lg.Named("mem"), cfgMgr)
 	memMgr.Start(ctx)
+	defer memMgr.Close()
 	sqlSrv, err := proxy.NewSQLServer(lg.Named("proxy"), cfg, certMgr, id.NewIDManager(), nil, nil, hsHandler, memMgr)
 	if err != nil {
 		return err
 	}
 	sqlSrv.SetBackendDialer(clusterMgr.NetworkRouter())
 	sqlSrv.Run(ctx, cfgMgr.WatchConfig())
+	sqlClosed := false
 	defer func() {
+		if sqlClosed {
+			return
+		}
 		sqlSrv.PreClose() // closes the listeners so the accept loops exit (server.go preClose order)
-		_ = sqlSrv.Close()
+		runErr = errors.Join(runErr, sqlSrv.Close())
 	}()
 
 	// Inputs start flowing only now: the first HealthResult is consumed after the proxy is up.
 	bo.Start(ctx)
 	defer bo.Close()
-	go inputs.Forward(ctx, bo, "recorder")
+	inputCtx, stopInputs := context.WithCancel(ctx)
+	var inputWG waitgroup.WaitGroup
+	inputWG.Run(func() { inputs.Forward(inputCtx, bo, "recorder") }, lg)
+	defer func() { stopInputs(); inputWG.Wait() }()
 
 	var actions []Action
+	scriptSHA := ""
 	if script != "" {
 		b, err := os.ReadFile(script)
 		if err != nil {
+			return err
+		}
+		scriptSHA = fmt.Sprintf("%x", sha256.Sum256(b))
+		if err := os.WriteFile(filepath.Join(dir, "actions.json"), b, 0o600); err != nil {
 			return err
 		}
 		if err := json.Unmarshal(b, &actions); err != nil {
@@ -176,13 +204,20 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	}
 
 	// Declared timer schedule: every tickEvery from trace start, plus boundary
-	// instants registered when a failover timeout is consumed (Inputs reports them).
+	// instants supplied by the recording script. Automatic boundary expansion
+	// is not implemented by this recorder yet.
 	runCtx, stop := context.WithTimeout(ctx, duration)
 	defer stop()
 	var incomplete []string
-	var envMu sync.Mutex
+	var incompleteMu sync.Mutex
+	markIncomplete := func(reason string) {
+		incompleteMu.Lock()
+		defer incompleteMu.Unlock()
+		incomplete = append(incomplete, reason)
+	}
+	var producerWG, envWG waitgroup.WaitGroup
 	checkpoints := map[int]harness.Checkpoint{}
-	go func() {
+	producerWG.Run(func() {
 		var k int64
 		for runCtx.Err() == nil {
 			k++
@@ -197,9 +232,12 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 			}
 			inputs.Tick(declared)
 		}
-	}()
-	go func() {
+	}, lg)
+	producerWG.Run(func() {
 		for _, a := range actions {
+			if runCtx.Err() != nil {
+				return
+			}
 			wait := time.Duration(a.AtMillis)*time.Millisecond - sched.Elapsed()
 			if wait > 0 {
 				select {
@@ -211,18 +249,19 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 			switch a.Kind {
 			case "env":
 				// env.sh primitives block until their own readiness condition (e.g. topology
-				// key gone); run them detached so later declared actions keep their instants.
-				go func(a Action) {
-					cmd := exec.CommandContext(ctx, envSh, a.Args...)
+				// key gone); track them separately so later actions keep their instants
+				// and finalization joins every command before sealing the archive.
+				envWG.Run(func() {
+					// #nosec G204 -- The operator supplies the isolated environment driver and its argument vector; no shell or network payload is evaluated.
+					cmd := exec.CommandContext(runCtx, envSh, a.Args...)
+					cmd.WaitDelay = 2 * time.Second
 					cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 					fmt.Fprintf(os.Stderr, "[record] env %v at wall %s\n", a.Args, sched.Elapsed())
 					if err := cmd.Run(); err != nil {
-						envMu.Lock()
-						incomplete = append(incomplete, fmt.Sprintf("env %v: %v", a.Args, err))
-						envMu.Unlock()
+						markIncomplete(fmt.Sprintf("env %v: %v", a.Args, err))
 					}
 					fmt.Fprintf(os.Stderr, "[record] env %v done at wall %s\n", a.Args, sched.Elapsed())
-				}(a)
+				}, lg)
 			case "config":
 				err := cfgMgr.SetTOMLConfig([]byte(a.TOML))
 				inputs.DeliverConfig(a.TOML, cfgMgr.GetConfig(), err)
@@ -236,34 +275,56 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					sched.Record(apireplay.Event{Op: "checkpoint"})
 				})
 			default:
-				incomplete = append(incomplete, fmt.Sprintf("unknown action %q", a.Kind))
+				markIncomplete(fmt.Sprintf("unknown action %q", a.Kind))
 			}
 		}
-	}()
+	}, lg)
 
 	wl := &harness.Workload{Listener: listeners[0], Clients: clients, Pause: pause, User: "root"}
 	if sources != "" {
 		wl.Sources = strings.Split(sources, ",")
 	}
 	wl.Run(runCtx)
-	// Let the last lifecycles settle (close callbacks arrive asynchronously), then checkpoint.
-	for i := 0; i < 100; i++ {
-		var open bool
-		sched.RunNow(func() { open = len(ledger.active)+len(ledger.pending) > 0 })
-		if !open {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	// No producer may race the final checkpoint or the archive hash. The real
+	// SQL server's Close joins connection goroutines and their terminal callbacks.
+	stop()
+	producerWG.Wait() // finishes adding environment jobs before envWG.Wait
+	envWG.Wait()
+	stopInputs()
+	inputWG.Wait()
+	sqlSrv.PreClose()
+	closeErr := sqlSrv.Close()
+	sqlClosed = true
+	if closeErr != nil {
+		markIncomplete(fmt.Sprintf("close SQL server: %v", closeErr))
 	}
+	if ctx.Err() != nil {
+		markIncomplete("recording interrupted before normal duration elapsed")
+	}
+
 	sched.RunNow(func() {
 		seq := sched.Seq()
 		checkpoints[seq] = harness.Checkpoint{Seq: seq, Assignments: ledger.assignments(), ConnCount: rt.ConnCount(),
 			HealthyBackendCount: rt.HealthyBackendCount(), ServerVersion: rt.ServerVersion()}
 		sched.Record(apireplay.Event{Op: "checkpoint"})
 	})
-	stop()
+	if len(ledger.open) != 0 || len(ledger.pending) != 0 || len(ledger.active) != 0 {
+		markIncomplete(fmt.Sprintf("unsettled sessions: open=%d pending=%d active=%d", len(ledger.open), len(ledger.pending), len(ledger.active)))
+	}
+	if err := sched.Close(); err != nil {
+		markIncomplete(fmt.Sprintf("seal archive: %v", err))
+	}
+	for _, reason := range ledger.violations {
+		markIncomplete(reason)
+	}
+	if sourceHead == "" || sourceTree == "" || sourceDirty != "false" {
+		markIncomplete("capture requires a clean, identified source tree built by record.py")
+	}
+	meta := harness.CaptureSummary{Head: sourceHead, Tree: sourceTree, SourceDirty: sourceDirty,
+		DurationNanos: sched.Elapsed().Nanoseconds(), PlannedDurationNanos: duration.Nanoseconds(),
+		Completed: wl.Completed(), Failed: wl.Failed(), Clients: clients, ScriptSHA256: scriptSHA}
 	status, err := harness.Write(dir, slot, attempt, harness.TraceConfig{Policy: policyName, Selection: selection, Rule: rule}, sched.Log(), checkpoints, incomplete,
-		clusterMgr.MetricsQuerier() != nil)
+		clusterMgr.MetricsQuerier() != nil, meta)
 	if err != nil {
 		return err
 	}
@@ -274,14 +335,21 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 // ledger mirrors run.py's public assignment ledger from the recorded events so
 // checkpoints carry `assignments` the way the adapter reports them.
 type ledger struct {
-	pending map[string]string
-	active  map[string]string
+	open       map[string]bool
+	settled    map[string]bool
+	violations []string
+	pending    map[string]string
+	active     map[string]string
 }
 
-func newLedger() *ledger { return &ledger{pending: map[string]string{}, active: map[string]string{}} }
+func newLedger() *ledger {
+	return &ledger{open: map[string]bool{}, settled: map[string]bool{}, pending: map[string]string{}, active: map[string]string{}}
+}
 
 func (l *ledger) observe(ev apireplay.Event) {
 	switch ev.Op {
+	case "open":
+		l.open[ev.Session] = true
 	case "next":
 		if ev.Outcome == "ok" {
 			l.pending[ev.Session] = ev.Backend
@@ -293,10 +361,18 @@ func (l *ledger) observe(ev apireplay.Event) {
 			l.active[ev.Session] = b
 		}
 	case "redirect_result":
-		if ev.Success != nil && *ev.Success {
+		if ev.Success != nil && *ev.Success && l.open[ev.Session] && l.active[ev.Session] != "" && !l.settled[ev.Operation] {
 			l.active[ev.Session] = ev.Backend
 		}
+		l.settled[ev.Operation] = true
 	case "close":
+		if l.pending[ev.Session] != "" {
+			l.violations = append(l.violations, "close with pending reservation: "+ev.Session)
+		}
+		if !l.open[ev.Session] {
+			l.violations = append(l.violations, "close without open selector: "+ev.Session)
+		}
+		delete(l.open, ev.Session)
 		delete(l.active, ev.Session)
 		delete(l.pending, ev.Session)
 	}
