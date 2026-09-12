@@ -312,6 +312,9 @@ impl Router {
     ) -> Result<Reservation, RouteError> {
         let mut state = self.lock();
         self.sources.validate(candidate)?;
+        if let Some(error) = candidate.health.observer_error() {
+            return Err(error.into());
+        }
         if let Some(pending) = state.ledger.pending(session)? {
             return Ok(pending);
         }
@@ -619,6 +622,9 @@ impl Router {
         let Ok(candidate) = self.capture() else {
             return 0;
         };
+        if candidate.health.observer_error().is_some() {
+            return 0;
+        }
         let mut state = self.lock();
         if self.sources.validate(&candidate).is_err() || state.refresh(&candidate).is_err() {
             return 0;

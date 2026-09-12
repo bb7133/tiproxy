@@ -16,7 +16,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[4]
 MAX_BYTES = 32 * 1024 * 1024
-OPS = {"health", "config", "open", "next", "finish", "close", "checkpoint", "tick", "redirect_result", "lookup", "rehydrate"}
+OPS = {"health", "source_error", "config", "open", "next", "finish", "close", "checkpoint", "tick", "redirect_result", "lookup", "rehydrate"}
+SOURCE_ERRORS = {"no_backend", "wrapped_no_backend", "port_conflict", "topology_unavailable", "cancelled", "deadline_exceeded"}
 
 
 class Difference(ValueError):
@@ -61,6 +62,7 @@ def validate(trace):
         "next":set(),"finish":{"success"},"close":set(),"checkpoint":set(),
         "tick":{"refuse"},"redirect_result":{"operation","success"},
         "lookup":{"backend"},"rehydrate":{"backend"},
+        "source_error":{"error"},
     }
     sessions, pending, active, operations = set(), set(), set(), {}
     at = 0
@@ -86,7 +88,9 @@ def validate(trace):
             require(effect["kind"] in {"redirect","force_close"} and effect["session"] in active and type(effect["accepted"]) is bool,"INPUT","effect owner/acceptance")
             require(all(isinstance(effect[key],str) for key in ("session","operation","from","to")) and effect["operation"] not in operations,"INPUT","effect identity")
             operations[effect["operation"]] = effect
-        if op == "health":
+        if op == "source_error":
+            require(isinstance(event.get("error"),str) and event["error"] in SOURCE_ERRORS,"INPUT","observer error identity")
+        elif op == "health":
             backends = event.get("backends")
             require(isinstance(backends, list), "INPUT", "health inventory")
             addresses = []

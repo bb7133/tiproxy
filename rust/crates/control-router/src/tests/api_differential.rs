@@ -8,7 +8,7 @@ use super::{Harness, TestResult, must};
 use crate::scheduler::{CommandQueue, RoundClock};
 use crate::{Accounting, MigrationCommand, Reservation, RouteError, Router, Selector, Settlement};
 use control_routing::group::ClientInfo;
-use control_topology::{BackendHealth, BackendInfo, MergedBackend, MergedTopology};
+use control_topology::{BackendHealth, BackendInfo, MergedBackend, MergedTopology, ObserverError};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -55,11 +55,31 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str {
 fn outcome(error: RouteError) -> String {
     match error {
         RouteError::NoBackend => "no_backend".into(),
+        RouteError::WrappedNoBackend => "wrapped_no_backend".into(),
         RouteError::PortConflict => "port_conflict".into(),
+        RouteError::Observer(ObserverError::TopologyUnavailable) => {
+            "source_error:topology_unavailable".into()
+        }
+        RouteError::Observer(ObserverError::Cancelled) => "source_error:cancelled".into(),
+        RouteError::Observer(ObserverError::DeadlineExceeded) => {
+            "source_error:deadline_exceeded".into()
+        }
         // Preserve unexpected domain failures for comparison/diagnosis rather
         // than normalizing them into an allowed no-backend result.
         other => format!("rust:{other:?}"),
     }
+}
+
+fn source_error(name: &str) -> Result<ObserverError, &'static str> {
+    Ok(match name {
+        "no_backend" => ObserverError::NoBackend,
+        "wrapped_no_backend" => ObserverError::WrappedNoBackend,
+        "port_conflict" => ObserverError::PortConflict,
+        "topology_unavailable" => ObserverError::TopologyUnavailable,
+        "cancelled" => ObserverError::Cancelled,
+        "deadline_exceeded" => ObserverError::DeadlineExceeded,
+        _ => return Err("unsupported observer error input"),
+    })
 }
 
 // One finite external event dispatcher keeps the lifecycle readable in order.
@@ -123,6 +143,7 @@ async fn replay() -> TestResult {
         let elapsed = event["at_nanos"].as_u64().unwrap_or(0);
         let now = start + Duration::from_nanos(elapsed);
         match op {
+            "source_error" => health_input.deliver_error(source_error(text(event, "error"))?)?,
             "health" => {
                 let backends = event["backends"].as_array().ok_or("health backends")?;
                 let mut topology = Vec::new();

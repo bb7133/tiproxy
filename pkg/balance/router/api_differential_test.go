@@ -69,6 +69,7 @@ type apiTraceEvent struct {
 	Backend   string            `json:"backend,omitempty"`
 	Operation string            `json:"operation,omitempty"`
 	Refuse    []string          `json:"refuse,omitempty"`
+	Error     string            `json:"error,omitempty"`
 }
 
 // The runner's Go build overlay substitutes only clock calls in router/group.
@@ -154,8 +155,35 @@ func apiError(err error) string {
 		return "wrapped_no_backend"
 	case errors.Is(err, ErrPortConflict):
 		return "port_conflict"
+	case errors.Is(err, context.Canceled):
+		return "source_error:cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "source_error:deadline_exceeded"
+	case errors.Is(err, apiTopologyUnavailable):
+		return "source_error:topology_unavailable"
 	default:
-		return "source_error"
+		return "unclassified_source_error"
+	}
+}
+
+var apiTopologyUnavailable = errors.New("topology unavailable")
+
+func apiSourceError(name string) error {
+	switch name {
+	case "no_backend":
+		return ErrNoBackend
+	case "wrapped_no_backend":
+		return fmt.Errorf("observer: %w", ErrNoBackend)
+	case "port_conflict":
+		return ErrPortConflict
+	case "cancelled":
+		return context.Canceled
+	case "deadline_exceeded":
+		return context.DeadlineExceeded
+	case "topology_unavailable":
+		return apiTopologyUnavailable
+	default:
+		panic("unsupported observer error input")
 	}
 }
 
@@ -218,6 +246,8 @@ func TestRouterAPIDifferential(t *testing.T) {
 		output = append(output, row)
 		s := sessions[event.Session]
 		switch event.Op {
+		case "source_error":
+			r.updateBackendHealth(observer.NewHealthResult(nil, apiSourceError(event.Error)))
 		case "health":
 			backends := make(map[string]*observer.BackendHealth)
 			for _, b := range event.Backends {

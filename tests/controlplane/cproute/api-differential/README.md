@@ -46,7 +46,7 @@ Implementation is limited to three increments of the same replacement PR:
    tree. Diagnose actual failures without replacing traces or changing limits.
 
 Current acceptance counts: recordings 0/18, rounds 0/3, focused suites 0/3,
-comparator mutants 8/8 on reviewed 418e1b4a (repeat on the final candidate). The initial adapter rejects unsupported operations;
+comparator mutants 8/8 on reviewed a71d65b6 (repeat on the final candidate). The initial adapter rejects unsupported operations;
 it does not silently treat missing implementation as a passing observation.
 Old instrumentation deletion stays in a separate PR after replacement
 acceptance. No old per-getter, caller-envelope or per-boundary fault work is
@@ -130,3 +130,29 @@ The locality reversal explicitly selects `prefer-idle`: the trace's initial
 `random` selection intentionally permits a remote backend and cannot justify
 a unique-local expectation. That invalid synthetic assumption and its raw Go
 result are preserved with the second diagnosis.
+
+
+`source_error` delivers one failed observer result with an `error` identity:
+`no_backend`, `wrapped_no_backend`, `port_conflict`, `topology_unavailable`,
+`cancelled`, or `deadline_exceeded`. Unknown identities fail input validation.
+The first three preserve the existing routing error classes; the last three
+produce distinct `source_error:<identity>` results. Go receives the actual error
+through its production health-result handler. Rust publishes a new fenced
+observer result and its real reservation/health-count methods interpret the
+error. The previous topology, health metadata, version and established
+connections remain available, including lookup, rehydration, Finish and timeout
+closure. A successful health result clears the error; a config update does not.
+
+The 78-event `source-error-smoke.json` exercises initial failure, all six error
+identities with retained connections, Finish after failed observation, lookup
+and rehydration during failure, config rejection/acceptance without error
+clearance, timeout closure while the observer is failing, explicit recovery and
+an authoritative empty result. CI runs all three synthetic inputs through the
+same runner and uploads a third `routing-api-source-error` directory. The common
+eight comparator mutations remain a single round on the primary trace.
+
+Error publication is currently enabled by the test-only `api-replay` feature.
+The existing network discovery refresh still retains its last successful result
+on a failed poll; forwarding its qualified failure into the observer publisher
+belongs to the remaining producer integration. This slice does not claim that
+live-source error forwarding or arbitrary error identities are complete.

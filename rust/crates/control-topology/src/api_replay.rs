@@ -7,8 +7,8 @@
 
 use crate::health_overlay::{HealthOverlayPublisher, HealthPublishOutcome};
 use crate::{
-    BackendHealth, EpochResult, HealthOverlayHandle, MergedTopology, RoutingSnapshotHandle,
-    RoutingSnapshotPublisher,
+    BackendHealth, EpochResult, HealthOverlayHandle, MergedTopology, ObserverError,
+    RoutingSnapshotHandle, RoutingSnapshotPublisher,
 };
 use control_external::GenerationGate;
 use control_plane::OwnerToken;
@@ -24,6 +24,24 @@ pub struct HealthInput {
 }
 
 impl HealthInput {
+    /// Delivers a failed observer result without inventing a healthy/empty list.
+    /// # Errors
+    /// Rejects absent, superseded, withdrawn or retired source authority.
+    pub fn deliver_error(&self, error: ObserverError) -> Result<(), &'static str> {
+        if !self.owner.is_current() {
+            return Err("health input owner retired");
+        }
+        let source = self
+            .routing
+            .handle()
+            .current()
+            .ok_or("routing input retired")?;
+        if self.health.publish_error(&source, error) != HealthPublishOutcome::Published {
+            return Err("health input retired");
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(owner: OwnerToken) -> (Self, RoutingSnapshotHandle, HealthOverlayHandle) {
         let (routing, routing_handle) = RoutingSnapshotPublisher::new();
         let (health, health_handle) = HealthOverlayPublisher::new();
@@ -73,5 +91,59 @@ impl HealthInput {
             return Err("health input retired");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HealthInput;
+    use crate::{MergedTopology, ObserverError};
+    use control_plane::{OwnerScope, OwnershipRegistry};
+    use std::collections::HashMap;
+
+    #[test]
+    fn observer_error_recovery_and_owner_retirement_fence_retained_health() {
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "api-observer-error")
+            .unwrap_or_else(|error| unreachable!("claim: {error}"));
+        let (input, routing, health) = HealthInput::new(lease.token());
+        let publish = || {
+            input
+                .deliver(
+                    MergedTopology {
+                        backends: Vec::new(),
+                    },
+                    HashMap::new(),
+                    HashMap::new(),
+                )
+                .unwrap_or_else(|error| unreachable!("publish: {error}"));
+        };
+        publish();
+        let source = routing.current().unwrap_or_else(|| unreachable!("source"));
+        let good = health
+            .current_for(&source)
+            .unwrap_or_else(|| unreachable!("health"));
+        input
+            .deliver_error(ObserverError::TopologyUnavailable)
+            .unwrap_or_else(|error| unreachable!("error result: {error}"));
+        let failed = health
+            .current_for(&source)
+            .unwrap_or_else(|| unreachable!("failed"));
+        assert_eq!(
+            failed.observer_error(),
+            Some(ObserverError::TopologyUnavailable)
+        );
+        assert!(!health.still_current_for(&good, &source, &routing));
+        assert!(health.still_current_for(&failed, &source, &routing));
+        publish();
+        assert!(!health.still_current_for(&failed, &source, &routing));
+        let recovered = health
+            .current_for(&source)
+            .unwrap_or_else(|| unreachable!("recovered"));
+        assert_eq!(recovered.observer_error(), None);
+        drop(lease);
+        assert!(input.deliver_error(ObserverError::Cancelled).is_err());
+        assert!(health.current_for(&source).is_none());
     }
 }

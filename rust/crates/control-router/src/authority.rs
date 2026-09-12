@@ -55,6 +55,11 @@ pub enum RouteError {
     StaleCandidate,
     /// No eligible healthy backend remains in the client's group.
     NoBackend,
+    /// Wrapped no-backend identity; unlike the exact sentinel it does not retry.
+    WrappedNoBackend,
+    /// An external observer failed; the last backend data remains available for
+    /// existing connection callbacks, lookup, rehydration and migration.
+    Observer(control_topology::ObserverError),
     /// Multiple clusters claim the same listener port.
     PortConflict,
     /// A temporary unsupported capability is required, with no silent fallback.
@@ -96,6 +101,18 @@ impl From<LedgerError> for RouteError {
             LedgerError::ForceClosing => Self::ForceClosing,
             LedgerError::SameAccount => Self::SameBackend,
             LedgerError::CrossKeyspace => Self::CrossKeyspace,
+        }
+    }
+}
+
+impl From<control_topology::ObserverError> for RouteError {
+    fn from(error: control_topology::ObserverError) -> Self {
+        use control_topology::ObserverError;
+        match error {
+            ObserverError::NoBackend => Self::NoBackend,
+            ObserverError::WrappedNoBackend => Self::WrappedNoBackend,
+            ObserverError::PortConflict => Self::PortConflict,
+            other => Self::Observer(other),
         }
     }
 }
