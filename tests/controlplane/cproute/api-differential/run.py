@@ -103,7 +103,12 @@ def validate(trace):
         require(type(timestamp) is int and at <= timestamp <= 86_400_000_000_000,"INPUT","monotonic public clock")
         at = timestamp
         expect = event.get("expect")
-        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "exclude_previous", "exclude_history", "prefer_local", "prefer_idle_conn", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
+        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "force_close_due", "exclude_previous", "exclude_history", "prefer_local", "prefer_idle_conn", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
+        if "force_close_due" in expect:
+            due = expect["force_close_due"]
+            require(op == "tick" and expect["outcome"] == "ok" and "effects" not in expect
+                    and isinstance(due, list) and all(isinstance(b, str) and b for b in due)
+                    and len(due) == len(set(due)), "INPUT", "due failover backends")
         require("exclude_previous" not in expect or (op == "next" and type(expect["exclude_previous"]) is bool), "INPUT", "retry expectation")
         if "exclude_history" in expect:
             require(op == "next" and expect["outcome"] == "ok" and expect["exclude_history"] is True and "exclude_previous" not in expect,
@@ -199,6 +204,7 @@ class PublicConnections:
     """
     def __init__(self, config):
         self.pending, self.assigned, self.redirects = {}, {}, {}
+        self.closing, self.ordinals = set(), Counter()
         self.policy, self.selection = config["policy"], config["selection"]
         self.ratio, self.rate, self.label_name = 1.2, 0.0, ""
 
@@ -224,6 +230,20 @@ class PublicConnections:
             if rate <= 0.0001:
                 legal.add(backend)
         return legal
+
+    def force_close_effects(self, event, due):
+        """Resolve input-defined deadlines against this engine's public owners.
+
+        A refused close remains eligible; an accepted close stays suppressed even
+        across failover clear/reentry until the connection is actually closed.
+        In-flight redirects retain their public source assignment until success.
+        """
+        refused = set(event.get("refuse", []))
+        return [{"kind": "force_close", "session": sid,
+                 "operation": f"{sid}/{self.ordinals[sid] + 1}",
+                 "from": backend, "to": "", "accepted": sid not in refused}
+                for sid, backend in self.assigned.items()
+                if backend in due and sid not in self.closing]
 
     def apply(self, event, row):
         op, sid = event["op"], event.get("session", "")
@@ -256,8 +276,12 @@ class PublicConnections:
                 self.assigned[sid] = effect["to"]
         elif op == "close":
             self.assigned.pop(sid, None)
+            self.closing.discard(sid)
             self.redirects = {key: ef for key, ef in self.redirects.items() if ef["session"] != sid}
         for effect in row.get("effects", []):
+            self.ordinals[effect["session"]] += 1
+            if effect["kind"] == "force_close" and effect["accepted"]:
+                self.closing.add(effect["session"])
             if effect["kind"] == "redirect" and effect["accepted"]:
                 require(self.assigned.get(effect["session"]) == effect["from"]
                         and not any(ef["session"] == effect["session"] for ef in self.redirects.values()),
@@ -276,7 +300,9 @@ def observe(trace, rows, engine):
         fields = {"seq","op","session","outcome","backend","effects"} | ({"assignments","conn_count","healthy_backend_count","server_version"} if op == "checkpoint" else set())
         require(isinstance(row,dict) and set(row) == fields and type(row.get("seq")) is int and row.get("seq") == index and row.get("op") == op and row.get("session") == session, "RESULT_IDENTITY", f"{engine} event {index}")
         require(row.get("outcome") == expect["outcome"], "ERROR_OUTCOME", f"{engine} event {index}: {row.get('outcome')} != {expect['outcome']}")
-        require(causal(row["effects"]) == causal(expect.get("effects",[])), "EFFECTS", f"{engine} event {index}")
+        expected_effects = (connections.force_close_effects(event, expect["force_close_due"])
+                            if "force_close_due" in expect else expect.get("effects", []))
+        require(causal(row["effects"]) == causal(expected_effects), "EFFECTS", f"{engine} event {index}")
         for effect in row["effects"]:
             require(effect["from"] == ledger.get(effect["session"]) and effect["operation"] not in operations,"EFFECT_LEDGER",f"{engine} {index}")
             operations[effect["operation"]] = effect

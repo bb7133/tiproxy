@@ -171,8 +171,8 @@ artifacts are retained unchanged.
 The following dependencies withhold a slot from acceptance:
 
 - `effects-v2`: effects depend on each engine's own prior assignments, including which
-  session should move and whether an effect is due. Copying Go's effect list with
-  variable endpoints is insufficient.
+  session should migrate and whether a redirect is due. Non-migrating failover
+  closes now use the public-history predicate described below.
 - `policy-constraint:<policy>/prefer-idle`: not all factor advice can yet be derived
   from the available public inputs. An unrestricted candidate set is not qualification.
 - `metrics-input`: recorded query values still need paired publication adapters.
@@ -214,7 +214,20 @@ policy dependency. The common runner applies it independently to each engine's
 reservations, established connections and accepted redirects. Recorded Go is checked
 by that same predicate without exporting its ledger into the replay inputs. Empty
 ticks are proven from disabled redirection or absence of possible migration
-sessions/destinations, together with absence of due failover candidates;
-effect ownership/cadence remains unresolved when either can still depend on the
-engine's assignments. Original recordings and earlier derivations stay immutable;
+sessions/destinations. After a non-unique selection, `force_close_due` declares the
+backends whose failover deadline has arrived, derived from config, whole health
+inputs and event time. The common comparator resolves each engine's own established
+owners, effect ordinals and accepted-close history. Reservations are not established
+owners; refusal remains retryable and acceptance suppresses subsequent closes,
+including across clear/reentry, until the connection is closed. Independent session
+effects may commute. This predicate does not authorize redirects or clear the
+migration-cadence dependency.
+
+The 86-event force-close smoke covers random and connection/prefer-idle choices,
+before/equal/after deadlines, unchanged activation, repeated refusal, acceptance,
+clear/reentry, zero timeout and cleanup. CI runs the real adapters, derives the same
+expectations independently from each engine's public history and checks both outputs.
+Counterexamples also force different legal owners and reject missing, early,
+duplicated or misdirected effects. These tests do not qualify recorded slots.
+Original recordings and earlier derivations stay immutable;
 a new derivation must use a new output filename and does not alone qualify a slot.

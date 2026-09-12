@@ -434,6 +434,12 @@ def key_effects(effects):
     return sorted((e["kind"], e["session"], e["operation"], e["from"], e["to"], bool(e["accepted"])) for e in effects)
 
 
+def due_failover_backends(state):
+    timeout_ns = int(state.failover_timeout * 1_000_000_000)
+    return {bid for bid, b in state.backends.items() if b.failover_since is not None
+            and (timeout_ns == 0 or state.now >= b.failover_since + timeout_ns)}
+
+
 def derive_tick_effects(state, refused):
     """group.go:542-587 CloseTimedOutFailoverConnections at every rebalance: every listed
     connection on a backend whose failover has lasted >= failover-timeout (or immediately when
@@ -442,8 +448,7 @@ def derive_tick_effects(state, refused):
     owner, also while a redirect is in flight). A non-unique assignment cannot place the
     connection → the slot needs effects-v2 and nothing is emitted for it."""
     out = []
-    timeout_ns = int(state.failover_timeout * 1_000_000_000)
-    due = {bid for bid, b in state.backends.items() if b.failover_since is not None and (timeout_ns == 0 or state.now >= b.failover_since + timeout_ns)}
+    due = due_failover_backends(state)
     if not due:
         return out
     for s in sorted(state.sessions.values(), key=lambda x: (x.created, x.id)):
@@ -659,10 +664,19 @@ def derive(trace, rows, args):
                 # each engine's assignments. No session/destination means no
                 # migration for every engine, including empty-health ticks.
                 state.requires.add("effects-v2")
-            derived = derive_tick_effects(state, refused)
+            relative_close = not migration_possible and not state.unique_history
+            if relative_close:
+                # The due backend set is defined by public config/health/time.
+                # Each engine resolves its own owners and accepted-close history;
+                # only Go's own rows are used to validate this recording here.
+                due = sorted(due_failover_backends(state))
+                expect["force_close_due"] = due
+                derived = state.recorded_connections.force_close_effects(event, due)
+            else:
+                derived = derive_tick_effects(state, refused)
             if key_effects(leftover) != key_effects(derived):
                 raise Refuse(f"seq {seq}: recorded force_close effects {leftover} differ from the failover-timeout derivation {derived}")
-            if derived:
+            if derived and not relative_close:
                 expect["effects"] = derived
             if state.policy in METRIC_POLICIES and state.metrics_observed:
                 state.requires.add("metrics-input")  # migration advice consults metric factors
@@ -715,6 +729,8 @@ def compare_with_reference(derived, reference, requires):
                 diffs.append((seq, k, de.get(k), None))
         if "legal_server_versions" in re_ and sorted(re_["legal_server_versions"]) != sorted(de.get("legal_server_versions", [])):
             diffs.append((seq, "versions", de.get("legal_server_versions"), re_["legal_server_versions"]))
+        if de.get("force_close_due", []) != re_.get("force_close_due", []):
+            diffs.append((seq, "force_close_due", de.get("force_close_due"), re_.get("force_close_due")))
         if re_.get("effects", []) != de.get("effects", []):
             ref_effects, derived_effects = re_.get("effects", []), de.get("effects", [])
             if "effects-v2" in requires and not derived_effects:
@@ -924,7 +940,7 @@ def defect_checks():
             lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     # Disabled migration + no failover deadline proves an empty tick for every
     # engine, even after non-unique selection. Turning capability back on or
-    # marking a possibly-owned backend for failover retains the dependency.
+    # marking a possibly-owned backend for failover must check each engine's owner.
     no_effect = [{"op": "health", "backends": [dict(hb("a"), support_redirection=False), hb("b")]},
                  {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
                  {"op": "finish", "session": "s", "success": True}, {"op": "tick"}, {"op": "close", "session": "s"}]
@@ -932,8 +948,8 @@ def defect_checks():
             lambda d, r: "ok: empty effect set proven from disabled input" if d and not r else f"NOT CAUGHT ({r})")
     due = copy.deepcopy(no_effect)
     due.insert(4, {"op": "config", "toml": '[proxy]\nfail-backend-list = ["a"]\nfailover-timeout = 0\n'})
-    attempt("disabled_nonunique_due_still_requires_effects", cfg, due, rows_for(due, e2="default/a"),
-            lambda d, r: "ok: due force-close needs engine-relative ownership" if d and "effects-v2" in r else f"NOT CAUGHT ({r})")
+    attempt("disabled_nonunique_due_missing_close_refused", cfg, due, rows_for(due, e2="default/a"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     for mode in ("closed", "no_destination"):
         exhausted = copy.deepcopy(no_effect)
         exhausted[0]["backends"][0]["support_redirection"] = True
