@@ -626,7 +626,7 @@ impl Router {
         state
             .backends
             .values()
-            .filter(|backend| backend.healthy)
+            .filter(|backend| backend.healthy && backend.failover_since.is_none())
             .count()
     }
 

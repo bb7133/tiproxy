@@ -614,6 +614,13 @@
       }
     },
     {
+      "op": "config",
+      "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4010\"]\nfailover-timeout=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
       "op": "checkpoint",
       "expect": {
         "outcome": "ok",
@@ -673,163 +680,7 @@
     },
     {
       "op": "config",
-      "toml": "[balance]\npolicy=\"connection\"\nrouting-rule=\"port\"\n",
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "health",
-      "backends": [
-        {
-          "address": "127.0.0.1:4020",
-          "labels": {
-            "tiproxy-port": "6000"
-          },
-          "cluster": "east",
-          "keyspace": "tenant-a",
-          "ip": "127.0.0.1",
-          "status_port": 10080,
-          "healthy": true,
-          "local": true,
-          "server_version": "8.5.1",
-          "support_redirection": true
-        },
-        {
-          "address": "127.0.0.1:4020",
-          "labels": {
-            "tiproxy-port": "6000"
-          },
-          "cluster": "west",
-          "keyspace": "tenant-a",
-          "ip": "127.0.0.1",
-          "status_port": 10080,
-          "healthy": true,
-          "local": false,
-          "server_version": "8.5.2",
-          "support_redirection": true
-        }
-      ],
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "checkpoint",
-      "expect": {
-        "outcome": "ok",
-        "healthy_backend_count": 2,
-        "legal_server_versions": [
-          "8.5.1",
-          "8.5.2"
-        ]
-      }
-    },
-    {
-      "op": "open",
-      "session": "cluster-conflict",
-      "port": "6000",
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "next",
-      "session": "cluster-conflict",
-      "expect": {
-        "outcome": "port_conflict"
-      }
-    },
-    {
-      "op": "close",
-      "session": "cluster-conflict",
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "health",
-      "backends": [
-        {
-          "address": "127.0.0.1:4020",
-          "labels": {
-            "tiproxy-port": "6000"
-          },
-          "cluster": "east",
-          "keyspace": "tenant-a",
-          "ip": "127.0.0.1",
-          "status_port": 10080,
-          "healthy": true,
-          "local": true,
-          "server_version": "8.5.1",
-          "support_redirection": true
-        }
-      ],
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "open",
-      "session": "cluster-recovered",
-      "port": "6000",
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "next",
-      "session": "cluster-recovered",
-      "expect": {
-        "outcome": "ok",
-        "backend": "east/127.0.0.1:4020"
-      }
-    },
-    {
-      "op": "finish",
-      "session": "cluster-recovered",
-      "success": true,
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "checkpoint",
-      "expect": {
-        "outcome": "ok",
-        "healthy_backend_count": 1,
-        "legal_server_versions": [
-          "8.5.1"
-        ]
-      }
-    },
-    {
-      "op": "close",
-      "session": "cluster-recovered",
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "health",
-      "backends": [],
-      "expect": {
-        "outcome": "ok"
-      }
-    },
-    {
-      "op": "checkpoint",
-      "expect": {
-        "outcome": "ok",
-        "healthy_backend_count": 0,
-        "legal_server_versions": [
-          "8.5.1"
-        ]
-      }
-    },
-    {
-      "op": "config",
-      "toml": "[balance]\npolicy=\"location\"\nrouting-rule=\"\"\n",
+      "toml": "[balance]\npolicy=\"location\"\nrouting-rule=\"\"\nrouting-policy=\"prefer-idle\"\n",
       "expect": {
         "outcome": "ok"
       }

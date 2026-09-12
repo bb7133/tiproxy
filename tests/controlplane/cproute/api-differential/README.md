@@ -79,7 +79,7 @@ the acceptance contract or a recorded corpus trace. Rust's non-idle/closed
 rehydration rejection is also covered by a direct public-API unit test.
 
 
-The health-input increment adds 42 synthetic events (97 total): unhealthy and
+The health-input increment adds 43 synthetic events (84 primary + 14 Port = 98 total): unhealthy and
 nonlocal verdicts, version retention, a backend without redirection support
 that still receives a timed force-close, and two clusters sharing the same
 address/port with conflict and recovery, and a locality verdict reversal. They do not count as corpus recording
@@ -109,3 +109,24 @@ The real scheduler now honors the delivered redirection capability while still
 performing timeout closure. Existing network probe producers retain their
 previous enabled capability default; wiring their SQL capability detection is
 part of the later production composition, not claimed by this API replay.
+
+
+The first health-increment run at 77c33bd6 failed: the old composition fixture
+needed the new struct fields, and the combined synthetic incorrectly expected
+`routing-rule` to change at runtime. Go fixes that rule during Init. The Port
+14-event segment now starts a fresh router from `port-smoke.json`; the primary
+84-event trace retains its All startup rule. CI invokes the same runner for
+both and uploads both output directories. The original 97-event first-failure
+input/output and ZIP remain archived; no recorded trace was altered.
+
+A targeted Go-only diagnosis also caught a missing scenario input: becoming
+unhealthy alone does not activate the configured failover timeout. The
+capability/timeout scenario now explicitly delivers `fail-backend-list` before
+the boundary ticks. Its original no-effect output remains preserved. The Rust
+public healthy count excludes active failover backends, matching Go `Healthy`
+rather than only the observer's health bit.
+
+The locality reversal explicitly selects `prefer-idle`: the trace's initial
+`random` selection intentionally permits a remote backend and cannot justify
+a unique-local expectation. That invalid synthetic assumption and its raw Go
+result are preserved with the second diagnosis.
