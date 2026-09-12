@@ -143,6 +143,22 @@ which contains only locality verdicts from the public health input. These expect
 fields are removed from both replay inputs. Failover marking and its all-members guard are per group;
 force-close due time and acceptance come from inputs, logical time and public history.
 
+ClientCIDR and ProxyCIDR derive matching from the respective public address and
+the `cidr` labels. Members keep their existing group across label changes; the
+group's union refreshes after each complete health input. Invalid refreshes retain
+the last parsed networks, while an invalid new group cannot route. IPv4-mapped
+addresses and Go's default `/32` for bare labels are preserved. New admissions
+whose grouping depends on backend iteration order, a route matching multiple
+groups, simultaneous group removal/admission, and ambiguous retained membership
+are refused explicitly. No recorded group choice resolves those cases.
+
+Two synthetic 105-event cases exercise the actual adapters with opposite client
+and proxy addresses, match/no-match, retained membership, valid/invalid/empty label
+updates, IPv6, mapped IPv4, ungrouped Lookup/Rehydrate, and the per-group failover
+guard. CI also derives their expectations from inputs plus recorded Go public
+history, checks them against the hand-written scenarios, and validates both
+engines again. These are adapter/deriver checks, not qualifying recordings.
+
 The following dependencies withhold a slot from acceptance:
 
 - `effects-v2`: effects depend on each engine's own prior assignments, including which

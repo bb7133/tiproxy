@@ -36,6 +36,7 @@ Public semantics mirrored (file:line at the reviewed tree):
 import argparse
 import copy
 import importlib.util
+import ipaddress
 import json
 import sys
 import tomllib
@@ -56,6 +57,7 @@ SOURCE_ERROR_MAP = {
     "deadline_exceeded": "source_error:deadline_exceeded",
 }
 PORT_LABEL = "tiproxy-port"
+CIDR_RULES = {"client_cidr", "proxy_cidr"}
 METRIC_POLICIES = {"resource", "location"}  # factor lists include health/memory/cpu (factor_balance.go:117-120)
 UNSUPPORTED_CONFIG_KEYS = (("balance", "label-name"), ("labels",))  # label isolation: not specified for derivation
 
@@ -91,6 +93,51 @@ def toml_get(doc, *path):
             return None
         node = node[key]
     return node
+
+
+def cidr_values(backend):
+    return frozenset(v.strip() for v in backend.labels.get("cidr", "").split(",") if v.strip())
+
+
+def parse_cidrs(values):
+    """Public label parsing, including Go's /32 default for bare IPv6 addresses.
+
+    An invalid list rejects a new group. Refresh keeps the previously parsed list
+    on any error, even though the group's textual values have already changed.
+    """
+    networks = []
+    for value in values:
+        text = value if "/" in value else value + "/32"
+        prefix = text.rpartition("/")[2]
+        if not prefix.isascii() or not prefix.isdecimal() or "%" in text:
+            return None
+        try:
+            network = ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            return None
+        if network.version == 6 and network.network_address.ipv4_mapped is not None:
+            network = ipaddress.ip_network((network.network_address.ipv4_mapped, network.prefixlen - 96))
+        networks.append(network)
+    return networks
+
+
+def address_ip(value):
+    """Literal host from the public net.Addr string; no DNS or port validation."""
+    if value.startswith("["):
+        host, sep, port = value[1:].partition("]:")
+        if not sep or any(c in port for c in "[]:"):
+            return None
+    else:
+        host, sep, port = value.rpartition(":")
+        if not sep or any(c in host + port for c in "[]:"):
+            return None
+    if "%" in host:
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return (ip.ipv4_mapped or ip) if ip.version == 6 else ip
 
 
 class Backend:
@@ -161,6 +208,9 @@ class State:
         self.selection = config["selection"]
         self.backends = {}  # router.backends: id -> Backend
         self.groups = {}  # group value -> set(ids); MatchAll uses ""
+        self.cidr_values = {}
+        self.cidr_networks = {}
+        self.next_cidr_group = 0
         self.ignore_failover = {}  # group value -> bool
         self.failover = set()  # ids currently marked (Healthy() false)
         self.observer_error = None
@@ -173,7 +223,7 @@ class State:
         self.requires = set()
         self.retained_version = ""
         self.recorded_connections = _RUNNER.PublicConnections(config)
-        if self.rule not in ("", "port"):
+        if self.rule not in {"", "port"} | CIDR_RULES:
             self.requires.add(f"policy-constraint:{self.rule}")
 
     # --- helpers -------------------------------------------------------------------------
@@ -224,6 +274,7 @@ class State:
             self.retained_version = versions[-1]
 
     def update_groups(self):
+        old_groups = set(self.groups)
         for bid in list(self.backends):
             b = self.backends[bid]
             if not b.observed_healthy:
@@ -232,11 +283,56 @@ class State:
                     continue
                 if not self.held_sure(bid):
                     b.ambiguous = True  # retention depends on an engine-relative assignment
-            if b.group is None:
+            if b.group is None and self.rule not in CIDR_RULES:
                 value = self.group_value(b)
                 if value is not None:
                     b.group = value
                     self.groups.setdefault(value, set()).add(bid)
+        if self.rule in CIDR_RULES:
+            self.update_cidr_groups(old_groups - set(self.groups))
+
+    def update_cidr_groups(self, removed):
+        # Admission uses previous group values; RefreshCidr runs only after the
+        # complete update. Never use recorded Go group choices or map order.
+        fresh = [(bid, cidr_values(b)) for bid, b in self.backends.items() if b.group is None and cidr_values(b)]
+        if any(b.ambiguous for b in self.backends.values()):
+            raise Refuse("CIDR membership depends on engine-relative retention")
+        if removed and fresh:
+            raise Refuse("simultaneous CIDR group removal/admission needs an order-independent constraint")
+        destinations = {}
+        for bid, values in fresh:
+            matches = [g for g, prior in self.cidr_values.items() if prior & values]
+            if len(matches) > 1:
+                raise Refuse("CIDR admission intersects multiple retained groups")
+            destinations[bid] = matches[0] if matches else None
+        for i, (left, lv) in enumerate(fresh):
+            for right, rv in fresh[i + 1:]:
+                # A newly created group can win before a retained one or split
+                # a chain of intersecting labels, depending on map iteration.
+                if lv & rv and (destinations[left] is None or destinations[right] is None) and lv != rv:
+                    raise Refuse("CIDR admission depends on new-backend traversal order")
+        created = {}
+        for bid, values in fresh:
+            group = destinations[bid]
+            if group is None:
+                parsed = parse_cidrs(values)
+                if parsed is None:
+                    continue
+                group = created.get(values)
+                if group is None:
+                    self.next_cidr_group += 1
+                    group = f"cidr/{self.next_cidr_group}"
+                    created[values] = group
+                    self.groups[group] = set()
+                    self.cidr_networks[group] = parsed
+            self.backends[bid].group = group
+            self.groups[group].add(bid)
+        for group, members in self.groups.items():
+            values = frozenset(v for bid in members for v in cidr_values(self.backends[bid]))
+            self.cidr_values[group] = values
+            parsed = parse_cidrs(values)
+            if parsed is not None:
+                self.cidr_networks[group] = parsed
 
     def remove_backend(self, bid):
         b = self.backends.pop(bid)
@@ -247,6 +343,8 @@ class State:
                 if not members:
                     del self.groups[b.group]
                     self.ignore_failover.pop(b.group, None)
+                    self.cidr_values.pop(b.group, None)
+                    self.cidr_networks.pop(b.group, None)
 
     def apply_config(self, toml):
         doc = parse_toml(toml)
@@ -305,6 +403,12 @@ class State:
             if len(owners) > 1:
                 return None, "port_conflict"
             return (next(iter(owners.values())) if owners else None), None
+        if self.rule in CIDR_RULES:
+            ip = address_ip(session.client if self.rule == "client_cidr" else session.proxy)
+            matches = [g for g, networks in self.cidr_networks.items() if ip is not None and any(ip in net for net in networks)]
+            if len(matches) > 1:
+                raise Refuse("CIDR route matches multiple groups; traversal order is not an expectation")
+            return (self.groups[matches[0]] if matches else None), None
         raise Refuse(f"routing rule {self.rule!r} derivation not specified")
 
     def candidates(self, session):

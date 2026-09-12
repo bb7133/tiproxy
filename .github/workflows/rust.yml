@@ -401,6 +401,7 @@ jobs:
           (capture / "stored-validation.json").write_text(json.dumps({"status":"captured", "events":len(rows), "requires":requires, "paired":"pending", "qualification":"blocked"}) + "\n")
           PYTEST
           python3 tests/controlplane/cproute/api-differential/test_run.py
+          python3 tests/controlplane/cproute/api-differential/recorder/test_cidr.py
       - name: Compare the actual API adapters
         run: |
           python3 tests/controlplane/cproute/api-differential/run.py \
@@ -418,6 +419,34 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             tests/controlplane/cproute/api-differential/metrics-time-smoke.json \
             --output "${RUNNER_TEMP}/routing-api-metrics-time"
+          for rule in client proxy; do
+            python3 tests/controlplane/cproute/api-differential/run.py \
+              "tests/controlplane/cproute/api-differential/${rule}-cidr-smoke.json" \
+              --output "${RUNNER_TEMP}/routing-api-${rule}-cidr"
+          done
+          python3 - <<'PYCIDR'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          path = Path("tests/controlplane/cproute/api-differential/recorder/derive_expectations.py")
+          spec = importlib.util.spec_from_file_location("derive", path)
+          derive = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(derive)
+          for rule in ("client", "proxy"):
+              source = path.parents[1] / f"{rule}-cidr-smoke.json"
+              trace = json.loads(source.read_text())
+              output = Path(os.environ["RUNNER_TEMP"]) / f"routing-api-{rule}-cidr"
+              go = json.loads((output / "go.json").read_text())
+              rust = json.loads((output / "rust.json").read_text())
+              derived, requires = derive.derive(trace, go, None)
+              assert not requires, requires
+              assert derive.compare_with_reference(derived, trace, requires) == ([], [])
+              result = derive._RUNNER.compare(derived, go, rust)
+              (output / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
+              (output / "derived-validation.json").write_text(json.dumps(result, indent=2) + "\n")
+              print("CIDR-DERIVED", rule, result)
+          PYCIDR
           python3 tests/controlplane/cproute/api-differential/run.py \
             "${RUNNER_TEMP}/routing-api-recorded-source/derived.json" \
             --output "${RUNNER_TEMP}/routing-api-recorded-source-paired"
@@ -444,6 +473,8 @@ jobs:
             ${{ runner.temp }}/routing-api-source-error
             ${{ runner.temp }}/routing-api-retry
             ${{ runner.temp }}/routing-api-metrics-time
+            ${{ runner.temp }}/routing-api-client-cidr
+            ${{ runner.temp }}/routing-api-proxy-cidr
             ${{ runner.temp }}/routing-api-recorded-source
             ${{ runner.temp }}/routing-api-recorded-source-paired
             ${{ runner.temp }}/routing-api-recorded-metrics
