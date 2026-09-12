@@ -72,8 +72,13 @@ def validate(trace):
         require(type(timestamp) is int and at <= timestamp <= 86_400_000_000_000,"INPUT","monotonic public clock")
         at = timestamp
         expect = event.get("expect")
-        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "exclude_previous"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
+        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "exclude_previous", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
         require("exclude_previous" not in expect or (op == "next" and type(expect["exclude_previous"]) is bool), "INPUT", "retry expectation")
+        if "healthy_backend_count" in expect:
+            require(op == "checkpoint" and type(expect["healthy_backend_count"]) is int and expect["healthy_backend_count"] >= 0,"INPUT","healthy count expectation")
+        if "legal_server_versions" in expect:
+            versions = expect["legal_server_versions"]
+            require(op == "checkpoint" and isinstance(versions,list) and versions and all(isinstance(v,str) for v in versions) and len(versions) == len(set(versions)),"INPUT","version expectation")
         effects = expect.get("effects",[])
         require(isinstance(effects,list),"INPUT","effects")
         for effect in effects:
@@ -86,9 +91,15 @@ def validate(trace):
             require(isinstance(backends, list), "INPUT", "health inventory")
             addresses = []
             for backend in backends:
-                require(isinstance(backend, dict) and set(backend) == {"address", "labels"}, "INPUT", "backend fields")
+                require(isinstance(backend, dict) and {"address", "labels"} <= set(backend) <= {"address", "labels", "cluster", "keyspace", "ip", "status_port", "healthy", "local", "server_version", "support_redirection"}, "INPUT", "backend fields")
                 require(isinstance(backend["address"], str) and isinstance(backend["labels"], dict) and all(isinstance(k,str) and isinstance(v,str) for k,v in backend["labels"].items()), "INPUT", "backend types")
-                addresses.append(backend["address"])
+                for key in ("cluster","keyspace","ip","server_version"):
+                    require(key not in backend or isinstance(backend[key],str),"INPUT",f"backend {key}")
+                for key in ("healthy","local","support_redirection"):
+                    require(key not in backend or type(backend[key]) is bool,"INPUT",f"backend {key}")
+                require("status_port" not in backend or (type(backend["status_port"]) is int and 0 <= backend["status_port"] < 2**64),"INPUT","backend status port")
+                cluster = backend.get("cluster","default")
+                addresses.append(cluster+"/"+backend["address"] if cluster else backend["address"])
             require(len(set(addresses)) == len(addresses), "INPUT", "duplicate backend")
         elif op == "config":
             require(isinstance(event.get("toml"), str), "INPUT", "config update")
@@ -139,7 +150,7 @@ def observe(trace, rows, engine):
     pending, ledger, previous, operations, settled = {}, {}, {}, {}, set()
     for index, (event,row) in enumerate(zip(events,rows)):
         op, session, expect = event["op"], event.get("session",""), event["expect"]
-        fields = {"seq","op","session","outcome","backend","effects"} | ({"assignments","conn_count"} if op == "checkpoint" else set())
+        fields = {"seq","op","session","outcome","backend","effects"} | ({"assignments","conn_count","healthy_backend_count","server_version"} if op == "checkpoint" else set())
         require(isinstance(row,dict) and set(row) == fields and type(row.get("seq")) is int and row.get("seq") == index and row.get("op") == op and row.get("session") == session, "RESULT_IDENTITY", f"{engine} event {index}")
         require(row.get("outcome") == expect["outcome"], "ERROR_OUTCOME", f"{engine} event {index}: {row.get('outcome')} != {expect['outcome']}")
         require(causal(row["effects"]) == causal(expect.get("effects",[])), "EFFECTS", f"{engine} event {index}")
@@ -174,6 +185,11 @@ def observe(trace, rows, engine):
             ledger.pop(session,None)
             settled.update(key for key,effect in operations.items() if effect["session"] == session)
         elif op == "checkpoint":
+            require(type(row.get("healthy_backend_count")) is int and row["healthy_backend_count"] >= 0 and isinstance(row.get("server_version"),str),"OBSERVATION","public metadata types")
+            if "healthy_backend_count" in expect:
+                require(row["healthy_backend_count"] == expect["healthy_backend_count"],"OBSERVATION",f"{engine} healthy count {index}")
+            if "legal_server_versions" in expect:
+                require(row["server_version"] in expect["legal_server_versions"],"OBSERVATION",f"{engine} server version {index}")
             require(row.get("assignments") == ledger and type(row.get("conn_count")) is int and row["conn_count"] == len(ledger), "LEDGER", f"{engine} checkpoint {index}")
     require(not ledger and not pending and set(operations) <= settled, "LEDGER", f"{engine} final state")
 
@@ -182,6 +198,11 @@ def compare(trace, go, rust):
     validate(trace)
     observe(trace,go,"go")
     observe(trace,rust,"rust")
+    for event, left, right in zip(trace["events"],go,rust):
+        if event["op"] == "checkpoint":
+            require(left["healthy_backend_count"] == right["healthy_backend_count"],"OBSERVATION","healthy backend counts differ")
+            if "legal_server_versions" not in event["expect"]:
+                require(left["server_version"] == right["server_version"],"OBSERVATION","undeclared server version divergence")
     # Exact errors/effects agree by both satisfying the same public expectation.
     # Legal random backend divergence is retained in raw results; never feed
     # one engine's result into the other's input or compare private scores.

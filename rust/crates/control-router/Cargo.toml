@@ -21,6 +21,7 @@ control-routing.workspace = true
 workspace = true
 
 [dev-dependencies]
+control-topology = { workspace = true, features = ["api-replay"] }
 tokio = { workspace = true, features = ["test-util"] }
 etcd-client.workspace = true
 control-external.workspace = true

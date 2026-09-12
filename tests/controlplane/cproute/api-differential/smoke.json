@@ -507,6 +507,501 @@
       "expect": {
         "outcome": "ok"
       }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4010",
+          "labels": {},
+          "cluster": "east",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4011",
+          "labels": {},
+          "cluster": "east",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": false,
+          "local": false,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 1,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"location\"\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "health-boundary",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "health-boundary",
+      "expect": {
+        "outcome": "ok",
+        "backend": "east/127.0.0.1:4010"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "health-boundary",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4010",
+          "labels": {},
+          "cluster": "east",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": false,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        },
+        {
+          "address": "127.0.0.1:4011",
+          "labels": {},
+          "cluster": "east",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.2",
+          "support_redirection": true
+        }
+      ],
+      "at_nanos": 8000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 1,
+        "legal_server_versions": [
+          "8.5.2"
+        ]
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 8999999999,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 9000000000,
+      "expect": {
+        "outcome": "ok",
+        "effects": [
+          {
+            "kind": "force_close",
+            "session": "health-boundary",
+            "operation": "health-boundary/1",
+            "from": "east/127.0.0.1:4010",
+            "to": "",
+            "accepted": true
+          }
+        ]
+      }
+    },
+    {
+      "op": "close",
+      "session": "health-boundary",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.2"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"connection\"\nrouting-rule=\"port\"\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "tiproxy-port": "6000"
+          },
+          "cluster": "east",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "tiproxy-port": "6000"
+          },
+          "cluster": "west",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.2",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 2,
+        "legal_server_versions": [
+          "8.5.1",
+          "8.5.2"
+        ]
+      }
+    },
+    {
+      "op": "open",
+      "session": "cluster-conflict",
+      "port": "6000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "cluster-conflict",
+      "expect": {
+        "outcome": "port_conflict"
+      }
+    },
+    {
+      "op": "close",
+      "session": "cluster-conflict",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "tiproxy-port": "6000"
+          },
+          "cluster": "east",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "cluster-recovered",
+      "port": "6000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "cluster-recovered",
+      "expect": {
+        "outcome": "ok",
+        "backend": "east/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "cluster-recovered",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 1,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      }
+    },
+    {
+      "op": "close",
+      "session": "cluster-recovered",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"location\"\nrouting-rule=\"\"\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4030",
+          "labels": {
+            "zone": "east"
+          },
+          "cluster": "east",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.3",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4031",
+          "labels": {
+            "zone": "west"
+          },
+          "cluster": "west",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.3",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "locality-0",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "locality-0",
+      "expect": {
+        "outcome": "ok",
+        "backend": "east/127.0.0.1:4030"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "locality-0",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 2,
+        "legal_server_versions": [
+          "8.5.3"
+        ]
+      }
+    },
+    {
+      "op": "close",
+      "session": "locality-0",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4030",
+          "labels": {
+            "zone": "east"
+          },
+          "cluster": "east",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.3",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4031",
+          "labels": {
+            "zone": "west"
+          },
+          "cluster": "west",
+          "keyspace": "tenant-a",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.3",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "locality-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "locality-1",
+      "expect": {
+        "outcome": "ok",
+        "backend": "west/127.0.0.1:4031"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "locality-1",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 2,
+        "legal_server_versions": [
+          "8.5.3"
+        ]
+      }
+    },
+    {
+      "op": "close",
+      "session": "locality-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.3"
+        ]
+      }
     }
   ]
 }

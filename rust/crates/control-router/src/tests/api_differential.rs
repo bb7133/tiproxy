@@ -8,8 +8,9 @@ use super::{Harness, TestResult, must};
 use crate::scheduler::{CommandQueue, RoundClock};
 use crate::{Accounting, MigrationCommand, Reservation, RouteError, Router, Selector, Settlement};
 use control_routing::group::ClientInfo;
+use control_topology::{BackendHealth, BackendInfo, MergedBackend, MergedTopology};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -80,6 +81,16 @@ async fn replay() -> TestResult {
     h.patch(&initial, 3);
     h.source.deliver();
     h.applied().await;
+    let health_input = h
+        .topology
+        .replay_health_input(h.runtime.handle().module_context().owner().clone());
+    health_input.deliver(
+        MergedTopology {
+            backends: Vec::new(),
+        },
+        HashMap::new(),
+        HashMap::new(),
+    )?;
     h.router = Arc::new(
         Router::new_with_factors(
             Arc::new(h.source.clone()),
@@ -114,61 +125,48 @@ async fn replay() -> TestResult {
         match op {
             "health" => {
                 let backends = event["backends"].as_array().ok_or("health backends")?;
-                let labels: Vec<Vec<(&str, &str)>> = backends
-                    .iter()
-                    .map(|b| {
-                        b["labels"]
-                            .as_object()
-                            .into_iter()
-                            .flatten()
-                            .map(|(k, v)| (k.as_str(), v.as_str().unwrap_or_default()))
-                            .collect()
-                    })
-                    .collect();
-                let values: Vec<(&str, &[(&str, &str)])> = backends
-                    .iter()
-                    .zip(&labels)
-                    .map(|(b, l)| (text(b, "address"), l.as_slice()))
-                    .collect();
-                let wanted: BTreeSet<String> = values
-                    .iter()
-                    .map(|(addr, _)| format!("default/{addr}"))
-                    .collect();
-                known.extend(wanted.iter().cloned());
-                h.fixture.backends(&values);
-                // Wait on the public source handles; the adapter never reads
-                // the router's candidate or shortlist to derive expectations.
-                let routing = h.topology.routing_handle();
-                let health = h.topology.health_overlay_handle();
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        if let Some(source) = routing.current() {
-                            let seen: BTreeSet<String> = source
-                                .backends
-                                .backends
-                                .iter()
-                                .map(|b| b.backend_id.to_string())
-                                .collect();
-                            let labels_match = source.backends.backends.iter().all(|b| {
-                                backends.iter().any(|expected| {
-                                    b.backend_id.as_ref()
-                                        == format!("default/{}", text(expected, "address"))
-                                        && json!(&b.backend.labels) == expected["labels"]
-                                })
-                            });
-                            if seen == wanted
-                                && labels_match
-                                && let Some(verdicts) = health.current_for(&source)
-                                && wanted.iter().all(|id| verdicts.get(id).healthy)
-                                && health.still_current_for(&verdicts, &source, &routing)
-                            {
-                                break;
-                            }
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await?;
+                let mut topology = Vec::new();
+                let mut verdicts = HashMap::new();
+                let mut redirection = HashMap::new();
+                for b in backends {
+                    let cluster = b["cluster"].as_str().unwrap_or("default");
+                    let address = text(b, "address");
+                    let id: Arc<str> = if cluster.is_empty() {
+                        Arc::from(address)
+                    } else {
+                        Arc::from(format!("{cluster}/{address}"))
+                    };
+                    known.insert(id.to_string());
+                    topology.push(MergedBackend {
+                        backend_id: Arc::clone(&id),
+                        cluster_name: Arc::from(cluster),
+                        backend: BackendInfo {
+                            addr: address.into(),
+                            keyspace: text(b, "keyspace").into(),
+                            ip: b["ip"].as_str().unwrap_or("127.0.0.1").into(),
+                            status_port: b["status_port"].as_u64().unwrap_or(0),
+                            version: String::new(),
+                            git_hash: String::new(),
+                            deploy_path: String::new(),
+                            start_timestamp: 0,
+                            labels: serde_json::from_value(b["labels"].clone())?,
+                        },
+                    });
+                    verdicts.insert(
+                        Arc::clone(&id),
+                        BackendHealth {
+                            healthy: b["healthy"].as_bool().unwrap_or(true),
+                            local: b["local"].as_bool().unwrap_or(true),
+                            server_version: Some(text(b, "server_version").into()),
+                        },
+                    );
+                    redirection.insert(id, b["support_redirection"].as_bool().unwrap_or(true));
+                }
+                health_input.deliver(
+                    MergedTopology { backends: topology },
+                    verdicts,
+                    redirection,
+                )?;
                 let candidate = h
                     .router
                     .capture()
@@ -330,6 +328,8 @@ async fn replay() -> TestResult {
                     .sum();
                 row["assignments"] = json!(assignments);
                 row["conn_count"] = json!(count);
+                row["healthy_backend_count"] = json!(h.router.healthy_backend_count());
+                row["server_version"] = json!(h.router.server_version());
             }
             _ => return Err(format!("unsupported API input {op}").into()),
         }

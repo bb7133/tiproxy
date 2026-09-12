@@ -73,9 +73,18 @@ pub struct HealthSnapshot {
     /// The whole-map verdict, keyed by `backend_id`. A missing id is fail-closed
     /// unhealthy at [`Self::get`].
     health: HashMap<Arc<str>, BackendHealth>,
+    redirection: HashMap<Arc<str>, bool>,
 }
 
 impl HealthSnapshot {
+    /// Protocol migration capability delivered with this observer result.
+    /// Existing probe producers predate explicit capability publication and
+    /// retain their current enabled behavior when no value is supplied.
+    #[must_use]
+    pub fn supports_redirection(&self, backend_id: &str) -> bool {
+        self.redirection.get(backend_id).copied().unwrap_or(true)
+    }
+
     /// The health verdict for `backend_id`, **fail-closed** unhealthy when the id
     /// is absent from this round's map.
     ///
@@ -263,6 +272,17 @@ impl HealthOverlayPublisher {
         feed_gate: GenerationGate,
         owner: &OwnerToken,
     ) -> HealthPublishOutcome {
+        self.publish_result(source, health, HashMap::new(), feed_gate, owner)
+    }
+
+    pub(crate) fn publish_result(
+        &self,
+        source: &Arc<RoutingSnapshot>,
+        health: HashMap<Arc<str>, BackendHealth>,
+        redirection: HashMap<Arc<str>, bool>,
+        feed_gate: GenerationGate,
+        owner: &OwnerToken,
+    ) -> HealthPublishOutcome {
         let state = self.lock();
         if state.retired {
             return HealthPublishOutcome::Retired;
@@ -273,6 +293,7 @@ impl HealthOverlayPublisher {
             feed_gate,
             owner: owner.clone(),
             health,
+            redirection,
         });
         // Revoke the PREVIOUS published round's gate so a retained overlay loses
         // authority immediately, then swap the new snapshot in atomically.

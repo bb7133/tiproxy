@@ -81,7 +81,7 @@ impl Router {
             return Ok(());
         }
         let groups: Vec<_> = state.groups.keys().copied().collect();
-        if redirects_enabled {
+        if redirects_enabled && state.supports_redirection {
             for group in &groups {
                 if stopped(stop) {
                     return Ok(());

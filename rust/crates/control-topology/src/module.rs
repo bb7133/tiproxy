@@ -352,6 +352,17 @@ pub struct TopologyModuleHandle {
 }
 
 impl TopologyModuleHandle {
+    /// Replaces only this handle's dynamic observer inputs for API replay.
+    /// Config, namespace incarnation, mode and ownership fences remain real.
+    /// No production caller enables the `api-replay` feature.
+    #[cfg(feature = "api-replay")]
+    pub fn replay_health_input(&mut self, owner: OwnerToken) -> crate::api_replay::HealthInput {
+        let (input, routing, health) = crate::api_replay::HealthInput::new(owner);
+        self.routing = routing;
+        self.health = health;
+        input
+    }
+
     /// The staged applied metrics source; empty until explicitly enabled and a
     /// matching dynamic discovery/R generation exists. No collector is started.
     #[must_use]

@@ -34,6 +34,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "api-replay")]
+pub mod api_replay;
 mod backend_health;
 mod discovery;
 mod discovery_publish;

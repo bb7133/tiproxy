@@ -31,8 +31,29 @@ type apiTraceConfig struct {
 }
 
 type apiTraceBackend struct {
-	Address string            `json:"address"`
-	Labels  map[string]string `json:"labels"`
+	Address            string            `json:"address"`
+	Labels             map[string]string `json:"labels"`
+	Cluster            *string           `json:"cluster,omitempty"`
+	Keyspace           string            `json:"keyspace,omitempty"`
+	IP                 *string           `json:"ip,omitempty"`
+	StatusPort         uint              `json:"status_port,omitempty"`
+	Healthy            *bool             `json:"healthy,omitempty"`
+	Local              *bool             `json:"local,omitempty"`
+	ServerVersion      string            `json:"server_version,omitempty"`
+	SupportRedirection *bool             `json:"support_redirection,omitempty"`
+}
+
+func apiBool(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}
+func apiString(value *string, fallback string) string {
+	if value == nil {
+		return fallback
+	}
+	return *value
 }
 
 type apiTraceEvent struct {
@@ -200,9 +221,16 @@ func TestRouterAPIDifferential(t *testing.T) {
 		case "health":
 			backends := make(map[string]*observer.BackendHealth)
 			for _, b := range event.Backends {
-				backends["default/"+b.Address] = &observer.BackendHealth{BackendInfo: observer.BackendInfo{
-					Addr: b.Address, ClusterName: "default", IP: "127.0.0.1", Labels: b.Labels,
-				}, Healthy: true, Local: true, SupportRedirection: true}
+				cluster := apiString(b.Cluster, "default")
+				id := b.Address
+				if cluster != "" {
+					id = cluster + "/" + id
+				}
+				backends[id] = &observer.BackendHealth{BackendInfo: observer.BackendInfo{
+					Addr: b.Address, ClusterName: cluster, IP: apiString(b.IP, "127.0.0.1"), Labels: b.Labels,
+					Keyspace: b.Keyspace, StatusPort: b.StatusPort,
+				}, Healthy: apiBool(b.Healthy, true), Local: apiBool(b.Local, true),
+					ServerVersion: b.ServerVersion, SupportRedirection: apiBool(b.SupportRedirection, true)}
 			}
 			r.updateBackendHealth(observer.NewHealthResult(backends, nil))
 		case "config":
@@ -294,6 +322,8 @@ func TestRouterAPIDifferential(t *testing.T) {
 			}
 			row["assignments"] = assignments
 			row["conn_count"] = r.ConnCount()
+			row["healthy_backend_count"] = r.HealthyBackendCount()
+			row["server_version"] = r.ServerVersion()
 		default:
 			t.Fatalf("unsupported API input %q", event.Op)
 		}

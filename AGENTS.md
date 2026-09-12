@@ -84,6 +84,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/legacy-router-shadow/` - Temporary read-only routing observation codecs, native factor read-window decoding and bounded UDS consumption inside the existing Rust process. Domain mirror state stays in `control-router::shadow`; it has no production routing authority.
 - `rust/crates/control-proto/` - Versioned Go/Rust control-plane contracts; MySQL packet payloads must never cross this boundary.
 - `rust/crates/control-topology/src/metric_collector/` - Opt-in in-process metrics rounds, scoped owner tasks, qualified overlay and bounded real owner HTTP service; production composition remains off until the control-plane integration slice.
+- `rust/crates/control-topology/src/api_replay.rs` - Test-feature-only whole observer result input through existing publishers; never seeds router state or runs in the production binary.
 - `rust/crates/control-topology/src/metrics/` - Bounded query/history data core for staged backend resource metrics; runtime source/election authority is supplied separately by the collector.
 - `rust/crates/control-plane/` - Process-local Rust control-domain types, ownership fencing, config/TLS views, lifecycle/shutdown, and bounded observability; it must not depend on `control-proto`.
 - `rust/crates/control-external/` - Fenced, bounded Rust clients for control-plane external dependencies plus the minimal diagnostics gRPC binding; generated etcd protobuf types stay private to `etcd-client`.
