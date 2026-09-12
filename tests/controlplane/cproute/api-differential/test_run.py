@@ -89,16 +89,14 @@ class PublicMetricsTests(unittest.TestCase):
             with self.assertRaises(runner.Difference):
                 runner.validate_metrics(queries)
 
-    def test_dependency_cannot_be_removed_by_editing_provenance(self):
+    def test_zero_and_epoch_times_remain_distinct_inputs(self):
         trace = trace_for([])
-        trace["events"].insert(0, {"op":"metrics", "queries":self.packet(), "expect":{"outcome":"ok"}})
-        runner.validate(trace)
-        runner.require_replay_support(trace)
-        trace["events"][0]["queries"]["cpu"]["updated_nanos"] = None
-        for provenance in ({"kind":"synthetic"}, {"kind":"recorded","requires":[]}):
-            trace["provenance"] = provenance
-            with self.assertRaisesRegex(runner.Difference, "DEPENDENCY: metrics-zero-time"):
-                runner.require_replay_support(trace)
+        event = {"op":"metrics", "queries":self.packet(), "expect":{"outcome":"ok"}}
+        trace["events"].insert(0, event)
+        for stamp in (None, 0):
+            event["queries"]["cpu"]["updated_nanos"] = stamp
+            runner.validate(trace)
+            self.assertIs(event["queries"]["cpu"]["updated_nanos"], stamp)
 
 
 class RetryHistoryTests(unittest.TestCase):

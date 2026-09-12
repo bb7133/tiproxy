@@ -586,9 +586,6 @@ def derive(trace, rows, args):
     metric_inputs = [e for e in events if e["op"] == "metrics"]
     if metric_inputs:
         state.requires.discard("metrics-input")
-        if any(q is not None and q["updated_nanos"] is None
-               for e in metric_inputs for q in e["queries"].values()):
-            state.requires.add("metrics-zero-time")
     return result, sorted(state.requires)
 
 
@@ -741,6 +738,16 @@ def defect_checks():
         out["prefer_idle_recorded_metrics_input"] = "ok: requires " + str(req) if "metrics-input" in req else f"NOT CAUGHT ({req})"
     except Refuse as e:
         out["prefer_idle_recorded_metrics_input"] = f"NOT CAUGHT (refused: {e})"
+    # Actual whole publications close the input dependency even at Go zero time;
+    # they do not close the independent general policy constraint.
+    for stamp in [None, 0]:
+        packet = dict.fromkeys(_RUNNER.METRIC_KEYS)
+        packet["cpu"] = {"kind":"matrix", "updated_nanos":stamp, "series":[
+            {"labels":{"instance":"127.0.0.1:10080"}, "samples":[{"timestamp_ms":0, "value":"0.1"}]}]}
+        observed = ev[:1] + [{"op":"metrics", "queries":packet}] + ev[1:]
+        attempt(f"whole_metrics_time_{stamp}", {"policy":"resource", "selection":"prefer-idle", "rule":""}, observed,
+                rows_for(observed, e3="default/a"),
+                lambda d, r: "ok: policy remains, input supplied" if d and r == ["policy-constraint:resource/prefer-idle"] else f"NOT CAUGHT ({r})")
     # location/prefer-idle: one local and one remote → the local is unique; two locals → constraint
     ev = [{"op": "health", "backends": [hb("a", local=True), hb("b", local=False)]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
           {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}]

@@ -51,11 +51,7 @@ fn decode(value: serde_json::Value) -> Result<BTreeMap<QueryId, QueryResult>, &'
             "vector" => ValueKind::Vector,
             _ => return Err("metric result kind"),
         };
-        // The staged QueryResult represents Unix nanoseconds, not Go's year-one
-        // zero time. Refuse this distinction instead of aliasing it to epoch 0.
-        let updated_nanos = result
-            .updated_nanos
-            .ok_or("metrics-zero-time: native timestamp adapter pending")?;
+        let updated_nanos = result.updated_nanos;
         let mut series = Vec::new();
         for input in result.series {
             if kind == ValueKind::Vector && input.samples.len() != 1 {

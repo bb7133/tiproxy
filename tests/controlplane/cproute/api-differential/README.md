@@ -35,9 +35,10 @@ TiDB/PD/Prometheus sources, preserving values at these external boundaries.
 Whole external metric publications also enter both adapters. The test-only Rust
 publisher uses current routing/discovery/config/owner fences and keeps the merged
 series order; neither engine receives query-getter history or factor snapshots.
-The 17-event synthetic producer case exercises this boundary. Go year-one zero
-time is explicitly blocked as `metrics-zero-time`; generic resource-policy and
-migration-cadence qualification are still dependencies of real recordings.
+The 17-event synthetic producer case exercises this boundary. Both adapters keep
+Go year-one zero time (`null`) distinct from Unix epoch (`0`); a separate synthetic
+API case checks initial updates and exact expiry boundaries. Generic resource-policy
+and migration-cadence qualification remain dependencies of real recordings.
 
 Implementation is limited to three increments of the same replacement PR:
 

@@ -157,9 +157,10 @@ async fn current(
             if let Some(capture) = feed.capture()
                 && let Some(snapshot) = overlay.current_for(&capture)
                 && let Some(query) = snapshot.query_result(QueryId::Memory)?
-                && query.updated_nanos > after
+                && let Some(updated) = query.updated_nanos
+                && updated > after
             {
-                return Ok((snapshot, query.updated_nanos));
+                return Ok((snapshot, updated));
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

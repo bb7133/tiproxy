@@ -169,7 +169,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             owners: BTreeMap::new(),
-            history: window::History::new(0),
+            history: window::History::new(None),
         }
     }
 }

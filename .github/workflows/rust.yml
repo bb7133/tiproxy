@@ -397,7 +397,6 @@ jobs:
           assert trace["provenance"]["kind"] == "synthetic" and requires == ["policy-constraint:resource/prefer-idle"]
           module._RUNNER.validate(derived)
           module._RUNNER.observe(derived, rows, "recorded-go")
-          module._RUNNER.require_replay_support(derived)
           (capture / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
           (capture / "stored-validation.json").write_text(json.dumps({"status":"captured", "events":len(rows), "requires":requires, "paired":"pending", "qualification":"blocked"}) + "\n")
           PYTEST
@@ -416,6 +415,9 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             tests/controlplane/cproute/api-differential/retry-smoke.json \
             --output "${RUNNER_TEMP}/routing-api-retry"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            tests/controlplane/cproute/api-differential/metrics-time-smoke.json \
+            --output "${RUNNER_TEMP}/routing-api-metrics-time"
           python3 tests/controlplane/cproute/api-differential/run.py \
             "${RUNNER_TEMP}/routing-api-recorded-source/derived.json" \
             --output "${RUNNER_TEMP}/routing-api-recorded-source-paired"
@@ -441,6 +443,7 @@ jobs:
             ${{ runner.temp }}/routing-api-port
             ${{ runner.temp }}/routing-api-source-error
             ${{ runner.temp }}/routing-api-retry
+            ${{ runner.temp }}/routing-api-metrics-time
             ${{ runner.temp }}/routing-api-recorded-source
             ${{ runner.temp }}/routing-api-recorded-source-paired
             ${{ runner.temp }}/routing-api-recorded-metrics

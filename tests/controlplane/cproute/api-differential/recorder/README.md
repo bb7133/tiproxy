@@ -50,11 +50,13 @@ retimestamped. One merged input history preserves its cache lineage across data
 and health updates; an accepted Resource → Connection → Resource transition starts
 a new lineage, and replacement/Drop revoke old snapshots.
 
-Go zero time has no representation in the current native Unix-nanosecond value
-type. Any result with `updated_nanos: null` therefore retains `metrics-zero-time`
-and is rejected before output creation or either engine starts. Unix epoch 0 is
-supported and remains distinct. The raw recording preserves both forms. Existing
-recordings that claim metric observations but contain no metric events keep their
+The raw packet and both replay adapters preserve Go zero time as
+`updated_nanos: null`, distinct from Unix epoch `0`. Native factor history starts
+at the same zero key and uses strict expiry comparisons without narrowing that
+zero time into an i64 timestamp. The synthetic 170-event metric-time case covers
+CPU, memory and both health indicators, same-update cache retention, one-nanosecond
+updates, and the exact 60/120-second boundaries followed by one nanosecond.
+Recordings that claim metric observations but contain no metric events keep their
 `metrics-input` dependency. General resource-policy/effect/cadence qualification
 remains incomplete and separately blocked.
 

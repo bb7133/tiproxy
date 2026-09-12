@@ -459,7 +459,7 @@ async fn metric_input_preserves_values_and_fences_replacement_config_and_drop() 
     };
     let first = capture()?;
     let result = first.query_result(QueryId::Cpu)?.ok_or("cpu")?;
-    assert_eq!(result.updated_nanos, 0);
+    assert_eq!(result.updated_nanos, Some(0));
     assert!(result.series[0].samples[0].value.is_sign_negative());
     assert!(result.series[0].samples[1].value.is_nan());
     assert_eq!(result.series[0].samples[1].timestamp_ms, 2);
@@ -474,7 +474,7 @@ async fn metric_input_preserves_values_and_fences_replacement_config_and_drop() 
         first.still_current(),
         "malformed whole input cannot install its valid CPU prefix"
     );
-    packet["cpu"]["updated_nanos"] = json!(1);
+    packet["cpu"]["updated_nanos"] = serde_json::Value::Null;
     input.deliver(packet.clone())?;
     assert!(!first.still_current());
     assert_eq!(first.with_current(|| true), None);
@@ -491,7 +491,7 @@ async fn metric_input_preserves_values_and_fences_replacement_config_and_drop() 
             .query_result(QueryId::Cpu)?
             .ok_or("cpu")?
             .updated_nanos,
-        1
+        None
     );
     h.source.store.apply_toml(
         b"[balance]\npolicy='connection'",

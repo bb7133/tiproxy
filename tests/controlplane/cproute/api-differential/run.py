@@ -72,15 +72,6 @@ def validate_metrics(queries):
                     require(re.fullmatch(r"-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value) is not None and math.isfinite(float(value)), "INPUT", "metric value encoding")
 
 
-def require_replay_support(trace):
-    # Check actual values, not removable provenance/dependency tags. The native
-    # staged timestamp is Unix i64, which cannot represent Go's year-one zero.
-    require(not any(result is not None and result["updated_nanos"] is None
-                    for event in trace["events"] if event["op"] == "metrics"
-                    for result in event["queries"].values()),
-            "DEPENDENCY", "metrics-zero-time: native timestamp adapter pending")
-
-
 def validate(trace):
     require(isinstance(trace, dict) and set(trace) == {"version", "id", "config", "provenance", "events"}, "INPUT", "trace fields")
     require(type(trace["version"]) is int and trace["version"] == 1 and isinstance(trace["id"], str), "INPUT", "version/id")
@@ -472,7 +463,6 @@ def main():
     args = parser.parse_args()
     trace = load(args.trace)
     validate(trace)
-    require_replay_support(trace)
     destination = args.output.resolve()
     destination.mkdir(parents=True,exist_ok=False)
     # Deliberately omit oracle expectations and provenance from engine inputs.
