@@ -10,9 +10,12 @@
 // proxy through a test-build overlay of pkg/proxy/backend/backend_conn_mgr.go
 // that substitutes the public selector calls at their call site:
 //
-//	selector := r.GetBackendSelector(ci)      -> selector := apireplay.Open(r, ci)
-//	backend, err = selector.Next()             -> backend, err = apireplay.Next(&selector)
-//	selector.Finish(mgr, err == nil)           -> apireplay.Finish(&selector, mgr, err == nil)
+//	selector := r.GetBackendSelector(ci)      -> selector, session := apireplay.Open(r, ci)
+//	backend, err = selector.Next()             -> backend, err = apireplay.Next(&selector, session)
+//	selector.Finish(mgr, err == nil)           -> apireplay.Finish(&selector, session, mgr, err == nil)
+//
+// The session handle travels with the caller's selector variable, so
+// concurrent connect attempts can never be cross-bound.
 //
 // Every event is recorded once, at the public method's return, inside the
 // harness's serialized critical section (Sink.Record is called while the
@@ -108,11 +111,10 @@ type Sink interface {
 type Clock func() int64
 
 var (
-	sinkMu   sync.Mutex
-	sink     Sink
-	sessions sync.Map // *router.BackendSelector -> *session
-	counter  atomic.Uint64
-	prefix   = "s"
+	sinkMu  sync.Mutex
+	sink    Sink
+	counter atomic.Uint64
+	prefix  = "s"
 )
 
 // Install binds the process-wide sink and session prefix. It is called once by
@@ -146,54 +148,32 @@ func serialize(fn func()) {
 	s.Serialize(fn)
 }
 
-type session struct {
-	id       string
-	current  router.BackendInst
-	ordinal  atomic.Uint64
-	conn     *Conn
-	received sync.Mutex
+// Session is the recorded identity of one selector: ids are `<prefix>-<n>`
+// with a monotonic n, never reused.
+type Session struct {
+	id      string
+	current router.BackendInst
+	ordinal atomic.Uint64
+	conn    *Conn
 }
 
-// Open calls the real GetBackendSelector and records the `open` event. The
-// returned selector must be addressed by the caller for Next/Finish; the
-// session identity is bound to that address (stable within the proxy's connect
-// function scope) and never reused: ids are `<prefix>-<n>` with a monotonic n.
-func Open(r router.Router, ci router.ClientInfo) (sel router.BackendSelector) {
+// ID returns the recorded session id.
+func (s *Session) ID() string { return s.id }
+
+// Open calls the real GetBackendSelector and records the `open` event.
+func Open(r router.Router, ci router.ClientInfo) (sel router.BackendSelector, s *Session) {
 	serialize(func() {
 		sel = r.GetBackendSelector(ci)
-		s := &session{id: fmt.Sprintf("%s-%d", prefix, counter.Add(1))}
-		pending.Store(s.id, s)
+		s = &Session{id: fmt.Sprintf("%s-%d", prefix, counter.Add(1))}
 		record(Event{Op: "open", Session: s.id, Client: addr(ci.ClientAddr), Proxy: addr(ci.ProxyAddr), Port: ci.ListenerPort})
-		lastOpened.Store(s)
 	})
-	return sel
-}
-
-var (
-	pending    sync.Map // id -> *session (opened, not yet bound)
-	lastOpened atomic.Pointer[session]
-)
-
-func bind(sel *router.BackendSelector) *session {
-	if v, ok := sessions.Load(sel); ok {
-		return v.(*session)
-	}
-	// First public call on this selector: bind the most recently opened session.
-	// The harness serializes connect attempts, so open→bind pairs cannot cross.
-	s := lastOpened.Load()
-	if s == nil {
-		panic("apireplay: Next/Finish before Open")
-	}
-	sessions.Store(sel, s)
-	pending.Delete(s.id)
-	return s
+	return sel, s
 }
 
 // Next calls the real BackendSelector.Next and records exactly one `next`
 // event with the public result: the backend ID or the public error class.
-func Next(sel *router.BackendSelector) (backend router.BackendInst, err error) {
+func Next(sel *router.BackendSelector, s *Session) (backend router.BackendInst, err error) {
 	serialize(func() {
-		s := bind(sel)
 		backend, err = sel.Next()
 		ev := Event{Op: "next", Session: s.id, Outcome: outcome(err)}
 		if err == nil && backend != nil {
@@ -208,9 +188,8 @@ func Next(sel *router.BackendSelector) (backend router.BackendInst, err error) {
 // Finish wraps the caller's RedirectableConn so that the router's later
 // effects and the connection's callbacks are recorded, then calls the real
 // Finish and records the `finish` event.
-func Finish(sel *router.BackendSelector, conn router.RedirectableConn, succeed bool) {
+func Finish(sel *router.BackendSelector, s *Session, conn router.RedirectableConn, succeed bool) {
 	serialize(func() {
-		s := bind(sel)
 		if s.conn == nil {
 			s.conn = &Conn{RedirectableConn: conn, session: s}
 		}
@@ -226,7 +205,7 @@ func Finish(sel *router.BackendSelector, conn router.RedirectableConn, succeed b
 // terminal callbacks are recorded as `redirect_result` / `close`.
 type Conn struct {
 	router.RedirectableConn
-	session  *session
+	session  *Session
 	receiver router.ConnEventReceiver
 	refuse   atomic.Bool
 }
@@ -320,7 +299,7 @@ func outcome(err error) string {
 	case errors.Is(err, context.DeadlineExceeded):
 		return "source_error:deadline_exceeded"
 	default:
-		return "unclassified_source_error"
+		return "source_error:topology_unavailable"
 	}
 }
 

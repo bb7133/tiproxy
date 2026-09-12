@@ -28,6 +28,16 @@ Input format: trace v1 as accepted by `../run.py` `validate()` at PR #258 `a98be
   `provenance.metrics_observed`; synthetic traces never consumed metrics.
 - D3 external timer delivery: replay must deliver the recorded `tick` schedule itself; the
   runner already treats `tick` as an input (adapter calls the real rebalance). No change.
+- D4 `migration-cadence`: the **timing** of balance-driven redirects (which tick a
+  conn-count / location / metric migration is issued at) follows the factors' migration
+  cadence (`group.go:419-481`, `BalanceCount` per factor). The deriver does not reproduce
+  that cadence: recorded redirects are checked for legality only (from = the session's
+  listed backend, to in the declared destination set, acceptance = the scripted refusal)
+  and are **withheld** from `expect`; every slot with such a redirect is marked
+  `requires: ["migration-cadence"]` and does not count until bb7133 decides whether
+  cadence is in scope (then a rule is added here) or out of scope (then the runner compares
+  redirect legality only). Failover force-close timing is not cadence: it is derived exactly
+  (§3).
 
 ## 1. Time and ordering (review point 1)
 
@@ -126,9 +136,24 @@ evidence** only. `expect.effects` is derived as: kind, session, operation ordina
 `from: "@session"` (each engine's own current assignment), `legal_to` = the declared
 destination set derived from public inputs at that tick (healthy, not failover, in the
 group, ≠ from), `accepted` from the recorded client-side acceptance policy (refusals are
-scripted by the harness, not observed). This requires D1; until then the recorder
-emits the literal form only for slots where all prior choices were unique, and marks the
-rest `requires: ["effects-v2"]`.
+scripted by the harness, not observed). This requires D1; until then the recorder marks
+every slot with a non-unique choice `requires: ["effects-v2"]`.
+
+Effect **timing** is never copied from the recorded output:
+
+- `force_close` is derived from inputs and the logical clock
+  (`group.go:542-587`, run after `Balance` in every iteration, `router_score.go:471-483`):
+  a backend enters failover at the logical instant of the consuming health/config event and
+  keeps that instant while it stays marked (`router.go:178-190`); at every tick with
+  `now >= since + failover-timeout` (immediately when the timeout is 0) each connection
+  listed on that backend that has not yet accepted a force-close receives one
+  (`operation = <session>/<n>`, n continuing the session's effect ordinals after any
+  redirect issued earlier in the same iteration); an accepted one is not repeated, a refused
+  one is retried at the next tick. A recorded force-close set that differs from this
+  derivation (missing at the deadline, present before it) is refused. A session whose
+  assignment is non-unique cannot be placed on a backend: the slot needs `effects-v2`.
+- `redirect` timing is D4 (`migration-cadence`, §0): legality is checked, the effect is
+  withheld.
 
 ## 4. Required outcomes — how each is actually triggered (review point 4)
 

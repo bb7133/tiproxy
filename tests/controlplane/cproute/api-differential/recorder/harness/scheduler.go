@@ -39,7 +39,14 @@ type Scheduler struct {
 	seq     int
 	log     []Recorded
 	archive *os.File
+	observe func(apireplay.Event)
 }
+
+// Observe registers a hook invoked with every recorded event (lock held).
+func (s *Scheduler) Observe(fn func(apireplay.Event)) { s.observe = fn }
+
+// Seq returns the sequence number the next record will get (lock held by caller).
+func (s *Scheduler) Seq() int { return s.seq }
 
 func NewScheduler(archivePath string) (*Scheduler, error) {
 	f, err := os.Create(archivePath)
@@ -64,15 +71,19 @@ func (s *Scheduler) Record(ev apireplay.Event) {
 	r := Recorded{Seq: s.seq, AtNanos: s.nanos, Wall: time.Now(), Event: ev}
 	s.seq++
 	s.log = append(s.log, r)
+	if s.observe != nil {
+		s.observe(ev)
+	}
 	if s.archive != nil {
 		b, _ := json.Marshal(r)
 		s.archive.Write(append(b, '\n'))
 	}
 }
 
-// Run executes an input delivery or harness-driven public call at logical
-// time `at` (nanoseconds since trace start), under the critical section.
-// The logical clock only moves forward; the proxy's overlaid time.Now reads it.
+// Run executes a declared tick at logical time `at` (nanoseconds since trace
+// start) under the critical section. Only ticks move the logical clock (README
+// §1: the clock is the declared timer schedule; inputs and public calls are
+// stamped with the clock of the last tick that ran), and it only moves forward.
 func (s *Scheduler) Run(at int64, fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -82,6 +93,16 @@ func (s *Scheduler) Run(at int64, fn func()) {
 	}
 	fn()
 }
+
+// RunNow executes an input delivery at the current logical time.
+func (s *Scheduler) RunNow(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn()
+}
+
+// Elapsed is the wall clock since trace start (archived only, never asserted).
+func (s *Scheduler) Elapsed() time.Duration { return time.Since(s.start) }
 
 // Now returns the current logical time.
 func (s *Scheduler) Now() int64 {

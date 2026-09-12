@@ -86,12 +86,13 @@ def toml_get(doc, *path):
 
 
 class Backend:
-    __slots__ = ("id", "address", "cluster", "labels", "local", "observed_healthy", "version", "group", "ambiguous")
+    __slots__ = ("id", "address", "cluster", "labels", "local", "observed_healthy", "version", "group", "ambiguous", "failover_since")
 
     def __init__(self, bid, b):
         self.id = bid
         self.group = None
         self.ambiguous = False
+        self.failover_since = None  # logical instant the backend entered failover (kept while marked)
         self.update(b)
 
     def update(self, b):
@@ -100,11 +101,13 @@ class Backend:
         self.labels = dict(b.get("labels", {}) or {})
         self.local = bool(b.get("local", True))
         self.observed_healthy = bool(b.get("healthy", True))
+        if self.observed_healthy:
+            self.ambiguous = False  # consumed healthy: present in the router again, whatever the ledger said
         self.version = b.get("server_version", "")
 
 
 class Session:
-    __slots__ = ("id", "port", "client", "proxy", "cycle", "pending", "assigned", "inflight")
+    __slots__ = ("id", "port", "client", "proxy", "cycle", "pending", "assigned", "inflight", "force_closing", "ordinal", "created")
 
     def __init__(self, sid, event):
         self.id = sid
@@ -115,6 +118,9 @@ class Session:
         self.pending = None  # frozenset of possible reserved backends (Next ok, Finish not yet)
         self.assigned = None  # frozenset of possible current assignments
         self.inflight = None  # frozenset of possible redirect destinations holding the score
+        self.force_closing = False  # an accepted force_close was issued (group.go:566-569)
+        self.ordinal = 0  # effects issued on this session so far (operation = "<session>/<n>")
+        self.created = 0  # seq of the successful Finish (connList order)
 
     def possible(self):
         out = set()
@@ -147,6 +153,8 @@ class State:
         self.failover = set()  # ids currently marked (Healthy() false)
         self.observer_error = None
         self.fail_list = set()
+        self.failover_timeout = 60  # lib/config/proxy.go:171 default; seconds
+        self.now = 0  # logical clock of the event being consumed
         self.sessions = {}
         self.unique_history = True
         self.requires = set()
@@ -228,6 +236,11 @@ class State:
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise Refuse("proxy.fail-backend-list must be an array of strings")
             self.fail_list = set(v)
+        v = toml_get(doc, "proxy", "failover-timeout")
+        if v is not None:
+            if not isinstance(v, (int, float)) or v < 0:
+                raise Refuse("proxy.failover-timeout must be a non-negative number")
+            self.failover_timeout = v
         v = toml_get(doc, "balance", "policy")
         if v is not None:
             self.policy = v
@@ -238,8 +251,10 @@ class State:
         self.update_failover()
 
     def update_failover(self):
-        """group.go:286-341 per group; Healthy() = observed && not marked (router.go:160-165)."""
-        self.failover = set()
+        """group.go:286-341 per group; Healthy() = observed && not marked (router.go:160-165).
+        failoverSince is set when a backend enters failover and kept while it stays marked
+        (router.go:178-190); it is the logical clock of the consuming event."""
+        marked_now = set()
         for value, members in self.groups.items():
             routeable = [bid for bid in members if self.backends[bid].observed_healthy]
             marked = {bid for bid in members if self.backends[bid].address in self.fail_list}
@@ -248,7 +263,14 @@ class State:
                 self.ignore_failover[value] = True
                 continue
             self.ignore_failover[value] = False
-            self.failover |= marked
+            marked_now |= marked
+        for bid, b in self.backends.items():
+            if bid in marked_now:
+                if b.failover_since is None:
+                    b.failover_since = self.now
+            else:
+                b.failover_since = None
+        self.failover = marked_now
 
     # --- derived sets ---------------------------------------------------------------------
     def routed_group(self, session):
@@ -283,6 +305,40 @@ class State:
         if b is None or b.group is None:
             return set()
         return {m for m in self.groups.get(b.group, ()) if self.healthy(m)}
+
+
+def key_effects(effects):
+    return sorted((e["kind"], e["session"], e["operation"], e["from"], e["to"], bool(e["accepted"])) for e in effects)
+
+
+def derive_tick_effects(state, refused):
+    """group.go:542-587 CloseTimedOutFailoverConnections at every rebalance: every listed
+    connection on a backend whose failover has lasted >= failover-timeout (or immediately when
+    the timeout is 0) receives ForceClose; accepted ones are not repeated, refused ones are
+    retried on the next tick. Listed = the session's current assignment (its physical list
+    owner, also while a redirect is in flight). A non-unique assignment cannot place the
+    connection → the slot needs effects-v2 and nothing is emitted for it."""
+    out = []
+    timeout_ns = int(state.failover_timeout * 1_000_000_000)
+    due = {bid for bid, b in state.backends.items() if b.failover_since is not None and (timeout_ns == 0 or state.now >= b.failover_since + timeout_ns)}
+    if not due:
+        return out
+    for s in sorted(state.sessions.values(), key=lambda x: (x.created, x.id)):
+        if not s.assigned or s.force_closing:
+            continue
+        if len(s.assigned) != 1:
+            if s.assigned & due:
+                state.requires.add("effects-v2")
+            continue
+        (bid,) = tuple(s.assigned)
+        if bid not in due:
+            continue
+        s.ordinal += 1
+        accepted = s.id not in refused
+        out.append({"kind": "force_close", "session": s.id, "operation": f"{s.id}/{s.ordinal}", "from": bid, "to": "", "accepted": accepted})
+        if accepted:
+            s.force_closing = True
+    return out
 
 
 def route_once(state, session, excluded):
@@ -360,6 +416,7 @@ def derive(trace, rows, args):
     out_events = []
     for seq, (event, row) in enumerate(zip(events, rows)):
         op, sid = event["op"], event.get("session", "")
+        state.now = event.get("at_nanos", state.now)
         expect = {"outcome": "ok"}
         if op == "health":
             state.apply_health(event.get("backends", []))
@@ -396,7 +453,7 @@ def derive(trace, rows, args):
             if s.pending is None:
                 raise Refuse(f"seq {seq}: finish without a pending Next")
             if event["success"]:
-                s.assigned, s.cycle = s.pending, []
+                s.assigned, s.cycle, s.created = s.pending, [], seq
             s.pending = None
         elif op == "close":
             state.sessions.pop(sid, None)
@@ -424,29 +481,43 @@ def derive(trace, rows, args):
                 s.assigned = frozenset([name])
         elif op == "tick":
             refused = set(event.get("refuse", []) or [])
-            effects = row.get("effects", [])
-            if state.unique_history:
-                for ef in effects:
-                    s = state.sessions.get(ef["session"])
-                    if s is None or not s.assigned or ef["from"] not in s.assigned:
-                        raise Refuse(f"seq {seq}: effect {ef['operation']} from {ef['from']!r} contradicts the derived assignment")
-                    if ef["accepted"] == (ef["session"] in refused):
-                        raise Refuse(f"seq {seq}: effect {ef['operation']} acceptance contradicts the scripted refusal")
-                    if ef["kind"] == "redirect":
-                        legal_to = state.group_healthy(ef["from"]) - {ef["from"]}
-                        if ef["to"] not in legal_to:
-                            raise Refuse(f"seq {seq}: redirect destination {ef['to']!r} not in the legal set {sorted(legal_to)}")
-                        if ef["accepted"]:
-                            s.inflight = frozenset([ef["to"]])
-                if effects:
-                    expect["effects"] = effects  # literal form is exact while every prior choice was unique (README §0 D1)
-            else:
-                # Both presence and absence of effects depend on per-engine history (README §0 D1).
+            recorded = row.get("effects", [])
+            # Redirects (group.Balance) are issued before the failover close pass in the same
+            # iteration (router_score.go:471-483), so their ordinals come first.
+            # Redirects: legality is checked (from = the session's listed backend, to in the
+            # declared destination set); their timing follows the balance factors' migration
+            # cadence, which is not derived here → the slot needs the `migration-cadence`
+            # dependency and the redirect is withheld, never copied.
+            leftover = []
+            for ef in recorded:
+                if ef["kind"] == "force_close":
+                    leftover.append(ef)
+                    continue
+                s = state.sessions.get(ef["session"])
+                if s is None or not s.assigned:
+                    raise Refuse(f"seq {seq}: effect {ef['operation']} on an unknown or idle session")
+                if len(s.assigned) == 1 and ef["from"] not in s.assigned:
+                    raise Refuse(f"seq {seq}: effect {ef['operation']} from {ef['from']!r} contradicts the derived assignment {sorted(s.assigned)}")
+                if ef["accepted"] == (ef["session"] in refused):
+                    raise Refuse(f"seq {seq}: effect {ef['operation']} acceptance contradicts the scripted refusal")
+                legal_to = state.group_healthy(ef["from"]) - {ef["from"]}
+                if ef["to"] not in legal_to:
+                    raise Refuse(f"seq {seq}: redirect destination {ef['to']!r} not in the legal set {sorted(legal_to)}")
+                s.ordinal += 1
+                if ef["accepted"]:
+                    s.inflight = frozenset([ef["to"]]) if len(s.assigned) == 1 and state.unique_history else (frozenset(legal_to) or None)
+                state.requires.add("migration-cadence")
+                if not state.unique_history:
+                    state.requires.add("effects-v2")
+            if not state.unique_history:
+                # README §0 D1: after any non-unique choice the presence and absence of
+                # migrations depend on per-engine assignments; the slot needs effects-v2.
                 state.requires.add("effects-v2")
-                for ef in effects:
-                    s = state.sessions.get(ef["session"])
-                    if s is not None and ef["kind"] == "redirect" and ef["accepted"]:
-                        s.inflight = frozenset(state.group_healthy(ef["from"]) - {ef["from"]}) or None
+            derived = derive_tick_effects(state, refused)
+            if key_effects(leftover) != key_effects(derived):
+                raise Refuse(f"seq {seq}: recorded force_close effects {leftover} differ from the failover-timeout derivation {derived}")
+            if derived:
+                expect["effects"] = derived
             if state.policy in METRIC_POLICIES and state.metrics_observed:
                 state.requires.add("metrics-input")  # migration advice consults metric factors
         elif op == "redirect_result":
@@ -490,10 +561,13 @@ def compare_with_reference(derived, reference, requires):
         if "legal_server_versions" in re_ and sorted(re_["legal_server_versions"]) != sorted(de.get("legal_server_versions", [])):
             diffs.append((seq, "versions", de.get("legal_server_versions"), re_["legal_server_versions"]))
         if re_.get("effects", []) != de.get("effects", []):
-            if "effects-v2" in requires and not de.get("effects"):
-                withheld.append(seq)
+            ref_effects, derived_effects = re_.get("effects", []), de.get("effects", [])
+            if "effects-v2" in requires and not derived_effects:
+                withheld.append(seq)  # nothing can be placed without per-engine assignments
+            elif "migration-cadence" in requires and key_effects([e for e in ref_effects if e["kind"] != "redirect"]) == key_effects(derived_effects):
+                withheld.append(seq)  # redirects withheld; the derived force_close set matches
             else:
-                diffs.append((seq, "effects", de.get("effects"), re_.get("effects")))
+                diffs.append((seq, "effects", derived_effects, ref_effects))
     return diffs, withheld
 
 
@@ -515,9 +589,12 @@ def self_check(stripped, rows, reference, requires):
     try:
         j = next(i for i, e in enumerate(reference["events"]) if e["op"] == "tick" and e["expect"].get("effects"))
         bad = copy.deepcopy(rows); bad[j]["effects"] = []
-        derived, req = derive(copy.deepcopy(stripped), bad, None)
-        diffs, withheld = compare_with_reference(derived, reference, req)
-        results["dropped_effect"] = "caught by regression" if any(d[0] == j and d[1] == "effects" for d in diffs) else ("withheld (effects-v2 required)" if j in withheld else "NOT CAUGHT")
+        try:
+            derived, req = derive(copy.deepcopy(stripped), bad, None)
+            diffs, withheld = compare_with_reference(derived, reference, req)
+            results["dropped_effect"] = "caught by regression" if any(d[0] == j and d[1] == "effects" for d in diffs) else ("withheld (effects-v2 required)" if j in withheld else "NOT CAUGHT")
+        except Refuse as e:
+            results["dropped_effect"] = f"refused by derivation: {e}"
     except StopIteration:
         results["dropped_effect"] = "no required effects in this trace"
     results.update(defect_checks())
@@ -626,6 +703,26 @@ def defect_checks():
     ev2 = copy.deepcopy(ev); ev2[1]["toml"] = "[balance]\nlabel-name = 'zone'\n"
     attempt("toml_unsupported_key_refused", cfg, ev2, rows_for(ev2, e3="default/b"),
             lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    # failover-timeout force_close is derived from inputs and time: missing at the deadline
+    # tick → refused; injected before the deadline → refused; exact at the deadline → derived.
+    fc = {"kind": "force_close", "session": "s", "operation": "s/1", "from": "default/a", "to": "", "accepted": True}
+    ev = [{"op": "health", "backends": [hb("a"), hb("b", healthy=False)], "at_nanos": 0}, {"op": "open", "session": "s", "at_nanos": 0}, {"op": "next", "session": "s", "at_nanos": 0},
+          {"op": "finish", "session": "s", "success": True, "at_nanos": 0}, {"op": "health", "backends": [hb("a"), hb("b")], "at_nanos": 0},
+          {"op": "config", "toml": '[proxy]\nfail-backend-list = ["a"]\nfailover-timeout = 1\n', "at_nanos": 500},
+          {"op": "tick", "at_nanos": 1_000_000_499}, {"op": "tick", "at_nanos": 1_000_000_500}, {"op": "close", "session": "s", "at_nanos": 1_000_000_500}]
+    base = rows_for(ev, e2="default/a"); base[7]["effects"] = [fc]
+    attempt("forceclose_derived_at_deadline", cfg, ev, copy.deepcopy(base),
+            lambda d, r: "ok: force_close expected at the deadline tick" if d and d["events"][7]["expect"].get("effects") == [fc] and not d["events"][6]["expect"].get("effects") else f"NOT CAUGHT ({r})")
+    bad = copy.deepcopy(base); bad[7]["effects"] = []
+    attempt("forceclose_dropped_refused", cfg, ev, bad, lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    bad = copy.deepcopy(base); bad[6]["effects"] = [dict(fc, operation="s/injected")]
+    attempt("forceclose_early_refused", cfg, ev, bad, lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    # retention recovery: random A/B, A unhealthy then healthy again → Lookup A is known
+    ev = [{"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": True},
+          {"op": "health", "backends": [hb("a", healthy=False), hb("b")]}, {"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "lookup", "backend": "default/a"}, {"op": "close", "session": "s"}]
+    rows = rows_for(ev, e2="default/a"); rows[6]["backend"] = "default/a"
+    attempt("retention_recovery_lookup", cfg, ev, rows,
+            lambda d, r: "ok: lookup a known after recovery" if d and d["events"][6]["expect"].get("backend") == "default/a" else f"NOT CAUGHT ({r})")
     return out
 
 

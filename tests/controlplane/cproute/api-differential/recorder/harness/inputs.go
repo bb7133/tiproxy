@@ -7,6 +7,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/pingcap/tiproxy/lib/config"
@@ -33,8 +34,8 @@ func NewInputs(sched *Scheduler, driver *router.ReplayDriver) *Inputs {
 // Forward subscribes to the real observer and delivers every result in
 // arrival order at the current logical time. It returns when ctx ends.
 func (in *Inputs) Forward(ctx context.Context, bo observer.BackendObserver, name string) {
+	// The observer closes every subscription in Close; the forwarder only stops.
 	ch := bo.Subscribe(name)
-	defer bo.Unsubscribe(name)
 	for {
 		select {
 		case <-ctx.Done():
@@ -51,7 +52,7 @@ func (in *Inputs) Forward(ctx context.Context, bo observer.BackendObserver, name
 // Deliver applies one observer result through the production handler and
 // records it as `health` (explicit inventory) or `source_error` (identity).
 func (in *Inputs) Deliver(result observer.HealthResult) {
-	in.sched.Run(in.sched.Now(), func() {
+	in.sched.RunNow(func() {
 		in.mu.Lock()
 		in.raw = append(in.raw, result)
 		in.mu.Unlock()
@@ -75,7 +76,7 @@ func (in *Inputs) Deliver(result observer.HealthResult) {
 // DeliverConfig applies a validated config through the production handler and
 // records the `config` input with the validator's public outcome.
 func (in *Inputs) DeliverConfig(toml string, cfg *config.Config, validationErr error) {
-	in.sched.Run(in.sched.Now(), func() {
+	in.sched.RunNow(func() {
 		ev := apireplay.Event{Op: "config", TOML: toml, Outcome: "ok"}
 		if validationErr != nil {
 			ev.Outcome = "invalid_config"
@@ -104,6 +105,22 @@ func (in *Inputs) Raw() []observer.HealthResult {
 	out := make([]observer.HealthResult, len(in.raw))
 	copy(out, in.raw)
 	return out
+}
+
+// FaultError maps a declared source-error identity to the injected error; ""
+// clears the window. Only the three fetcher-boundary identities are injectable
+// (README §4); no-backend and port-conflict come from the router itself.
+func FaultError(identity string) error {
+	switch identity {
+	case "":
+		return nil
+	case "cancelled":
+		return context.Canceled
+	case "deadline_exceeded":
+		return context.DeadlineExceeded
+	default:
+		return errors.New("declared topology unavailable")
+	}
 }
 
 // FaultFetcher wraps the real BackendFetcher and, for a scripted window,

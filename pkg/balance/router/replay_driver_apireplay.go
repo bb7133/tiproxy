@@ -44,6 +44,11 @@ func NewReplayDriver(router *ScoreBasedRouter, bo observer.BackendObserver, bpCr
 	cancel()
 	router.Init(ctx, bo, bpCreator, cfgGetter, nil)
 	router.wg.Wait()
+	// The disabled loop would never drain the router's own subscription; the
+	// harness forwards every result itself (Inputs.Forward), so drop it here.
+	if bo != nil {
+		bo.Unsubscribe("score_based_router")
+	}
 	return &ReplayDriver{router: router}
 }
 
