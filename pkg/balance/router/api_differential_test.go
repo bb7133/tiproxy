@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,14 +19,16 @@ import (
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
 	configmgr "github.com/pingcap/tiproxy/pkg/manager/config"
+	replayclock "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/clock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
 type apiTraceConfig struct {
-	Policy    string `json:"policy"`
-	Selection string `json:"selection"`
-	Rule      string `json:"rule"`
+	ClockOriginNanos *int64 `json:"clock_origin_nanos,omitempty"`
+	Policy           string `json:"policy"`
+	Selection        string `json:"selection"`
+	Rule             string `json:"rule"`
 }
 
 type apiTraceBackend struct {
@@ -72,12 +73,10 @@ type apiTraceEvent struct {
 	Error     string            `json:"error,omitempty"`
 }
 
-// The runner's Go build overlay substitutes only clock calls in router/group.
-// One public event timestamp drives the clock; no internal read sequence is recorded.
-var apiReplayNanos atomic.Int64
-
-//nolint:unused // Called by the generated test build overlay, absent from ordinary builds.
-func apiReplayNow() time.Time { return time.Unix(1_700_000_000, apiReplayNanos.Load()) }
+// The test overlays route/group/factor clocks to one public event timestamp.
+//
+//nolint:unused // Called by the generated test build overlay.
+func apiReplayNow() time.Time { return replayclock.Now() }
 
 type apiEffect struct {
 	Kind      string `json:"kind"`
@@ -209,6 +208,11 @@ func TestRouterAPIDifferential(t *testing.T) {
 	decoder.DisallowUnknownFields()
 	require.NoError(t, decoder.Decode(&trace))
 	require.Equal(t, 1, trace.Version)
+	origin := replayclock.DefaultOrigin
+	if trace.Config.ClockOriginNanos != nil {
+		origin = *trace.Config.ClockOriginNanos
+	}
+	replayclock.Reset(origin)
 	manager := configmgr.NewConfigManager()
 	initial := fmt.Sprintf("[balance]\npolicy=%q\nrouting-policy=%q\nrouting-rule=%q\n", trace.Config.Policy, trace.Config.Selection, trace.Config.Rule)
 	require.NoError(t, manager.SetTOMLConfig([]byte(initial)))
@@ -240,7 +244,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 		require.NoError(t, os.WriteFile(os.Getenv("CPROUTE_API_OUTPUT"), encoded, 0o600))
 	})
 	for index, event := range trace.Events {
-		apiReplayNanos.Store(event.AtNanos)
+		replayclock.Advance(event.AtNanos)
 		effects = []apiEffect{}
 		row := map[string]any{"seq": index, "op": event.Op, "session": event.Session, "outcome": "ok", "backend": "", "effects": []any{}}
 		output = append(output, row)

@@ -2,6 +2,7 @@
   "version": 1,
   "id": "api-retry-and-connection-history",
   "config": {
+    "clock_origin_nanos": 1790000000123456789,
     "policy": "connection",
     "selection": "random",
     "rule": ""

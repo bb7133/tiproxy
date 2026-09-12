@@ -21,9 +21,10 @@ import (
 
 // TraceConfig is the trace v1 header config block.
 type TraceConfig struct {
-	Policy    string `json:"policy"`
-	Selection string `json:"selection"`
-	Rule      string `json:"rule"`
+	ClockOriginNanos *int64 `json:"clock_origin_nanos,omitempty"`
+	Policy           string `json:"policy"`
+	Selection        string `json:"selection"`
+	Rule             string `json:"rule"`
 }
 
 // Checkpoint is a public-state snapshot taken by the harness under the

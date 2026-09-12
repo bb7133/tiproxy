@@ -7,12 +7,12 @@ package router
 
 import (
 	"context"
-	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/balance/observer"
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
+	replayclock "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/clock"
 	"go.uber.org/zap"
 )
 
@@ -28,13 +28,8 @@ type ReplayDriver struct {
 	router *ScoreBasedRouter
 }
 
-// ReplayNanos is the harness logical clock (nanoseconds since trace start).
-// The recording build overlays time.Now() in group.go and router_score.go with
-// replayNow (the recording overlay names this symbol; run.py uses its own), so recorded timeouts and
-// replayed timeouts share one clock basis.
-var ReplayNanos atomic.Int64
-
-func replayNow() time.Time { return time.Unix(1_700_000_000, ReplayNanos.Load()) }
+// The test overlay shares its event clock with factor freshness checks.
+func replayNow() time.Time { return replayclock.Now() }
 
 // NewReplayDriver runs the real Init with an already-cancelled context so the
 // rebalance loop exits immediately, waits for it, and returns the driver.

@@ -53,7 +53,9 @@ def validate(trace):
     require(isinstance(trace, dict) and set(trace) == {"version", "id", "config", "provenance", "events"}, "INPUT", "trace fields")
     require(type(trace["version"]) is int and trace["version"] == 1 and isinstance(trace["id"], str), "INPUT", "version/id")
     config = trace["config"]
-    require(isinstance(config,dict) and set(config) == {"policy", "selection", "rule"}, "INPUT", "config fields")
+    require(isinstance(config,dict) and {"policy", "selection", "rule"} <= set(config) <= {"policy", "selection", "rule", "clock_origin_nanos"}, "INPUT", "config fields")
+    origin = config.get("clock_origin_nanos", 1_700_000_000_000_000_000)
+    require(type(origin) is int and 0 <= origin <= 2**63 - 1 - 86_400_000_000_000, "INPUT", "clock origin range")
     require(config["policy"] in {"connection", "resource", "location"}, "INPUT", "policy")
     require(config["selection"] in {"random", "prefer-idle"}, "INPUT", "selection")
     require(config["rule"] in {"", "client_cidr", "proxy_cidr", "port"}, "INPUT", "rule")
@@ -444,7 +446,7 @@ def main():
     for event in trace["events"]:
         timestamp = event.get("at_nanos",timestamp)
         inputs["events"].append({**{k:v for k,v in event.items() if k != "expect"},"at_nanos":timestamp})
-    # Test build only: every router/group time read sees the one public event
+    # Test build only: every router/group/factor time read sees the public event
     # clock. No caller/getter trace is introduced, and random tickets elsewhere
     # remain independent real wall-clock reads in both engines.
     replacements = {}
@@ -452,6 +454,14 @@ def main():
         original = ROOT / "pkg/balance/router" / name
         replacement = destination / name
         replacement.write_text(original.read_text().replace("time.Now()","apiReplayNow()"))
+        replacements[str(original)] = str(replacement)
+    for name in ("factor_cpu.go", "factor_memory.go", "factor_health.go"):
+        original = ROOT / "pkg/balance/factor" / name
+        data = original.read_text()
+        require('"time"' in data and "time.Now()" in data, "INPUT", "factor clock overlay anchor")
+        data = data.replace('"time"', '"time"\n\treplayclock "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/clock"')
+        replacement = destination / name
+        replacement.write_text(data.replace("time.Now()", "replayclock.Now()"))
         replacements[str(original)] = str(replacement)
     overlay = destination / "go-overlay.json"
     overlay.write_text(json.dumps({"Replace":replacements},sort_keys=True))

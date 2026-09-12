@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pingcap/tiproxy/pkg/balance/router"
+	replayclock "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/clock"
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
 )
 
@@ -49,6 +49,9 @@ type Scheduler struct {
 // Observe registers a hook invoked with every recorded event (lock held).
 func (s *Scheduler) Observe(fn func(apireplay.Event)) { s.observe = fn }
 
+// OriginNanos is the immutable Unix origin archived with the trace inputs.
+func (s *Scheduler) OriginNanos() int64 { return s.start.UnixNano() }
+
 // Seq returns the sequence number the next record will get (lock held by caller).
 func (s *Scheduler) Seq() int { return s.seq }
 
@@ -58,7 +61,7 @@ func NewScheduler(archivePath string) (*Scheduler, error) {
 		return nil, err
 	}
 	s := &Scheduler{start: time.Now(), archive: f}
-	router.ReplayNanos.Store(0)
+	replayclock.Reset(s.start.UnixNano())
 	return s, nil
 }
 
@@ -102,7 +105,7 @@ func (s *Scheduler) Run(at int64, fn func()) {
 	defer s.mu.Unlock()
 	if at > s.nanos {
 		s.nanos = at
-		router.ReplayNanos.Store(at)
+		replayclock.Advance(at)
 	}
 	fn()
 }

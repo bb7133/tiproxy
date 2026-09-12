@@ -92,6 +92,9 @@ async fn replay() -> TestResult {
     let trace: Value = serde_json::from_slice(&std::fs::read(input)?)?;
     assert_eq!(trace["version"], 1);
     let cfg = &trace["config"];
+    let origin = cfg["clock_origin_nanos"]
+        .as_i64()
+        .unwrap_or(1_700_000_000_000_000_000);
     let mut h = Harness::with_backends(text(cfg, "rule"), "connection", &[]).await?;
     let initial = format!(
         "[balance]\npolicy={:?}\nrouting-policy={:?}\n",
@@ -142,6 +145,10 @@ async fn replay() -> TestResult {
             json!({"seq":index,"op":op,"session":id,"outcome":"ok","backend":"","effects":[]});
         let elapsed = event["at_nanos"].as_u64().unwrap_or(0);
         let now = start + Duration::from_nanos(elapsed);
+        let wall = origin
+            .checked_add(i64::try_from(elapsed)?)
+            .ok_or("event clock overflow")?;
+        h.router.set_replay_wall(wall);
         match op {
             "source_error" => health_input.deliver_error(source_error(text(event, "error"))?)?,
             "health" => {
@@ -263,11 +270,7 @@ async fn replay() -> TestResult {
                     .capture()
                     .map_err(|e| format!("tick capture: {e:?}"))?;
                 let clock = RoundClock {
-                    fixed: Some((
-                        now,
-                        now,
-                        1_700_000_000_000_000_000 + i64::try_from(elapsed)?,
-                    )),
+                    fixed: Some((now, now, wall)),
                 };
                 h.router
                     .migration_round(&candidate, &queue, true, &stop, &clock)

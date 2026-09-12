@@ -4,11 +4,12 @@
 """Build and run the API-boundary recorder (recorder README §5).
 
 The recording build never edits the production tree: it uses `go build -overlay` with
-generated copies of three files:
+generated copies of these files:
 
   pkg/proxy/backend/backend_conn_mgr.go   selector call sites -> apireplay.Open/Next/Finish/EndSelection
   pkg/balance/router/group.go             time.Now() -> replayNow()  (harness logical clock)
   pkg/balance/router/router_score.go      time.Now() -> replayNow()
+  pkg/balance/factor/factor_{cpu,memory,health}.go  time.Now() -> replayclock.Now()
 
 Every substitution is anchored on the exact production text; a missing anchor aborts
 (the overlay is regenerated from the current tree on every run, never cached).
@@ -40,6 +41,12 @@ SUBSTITUTIONS = {
     "pkg/balance/router/group.go": [("time.Now()", "replayNow()", None)],
     "pkg/balance/router/router_score.go": [("time.Now()", "replayNow()", None)],
 }
+
+for name in ("factor_cpu.go", "factor_memory.go", "factor_health.go"):
+    SUBSTITUTIONS["pkg/balance/factor/" + name] = [
+        ('"time"', '"time"\n\treplayclock "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/clock"', 1),
+        ("time.Now()", "replayclock.Now()", None),
+    ]
 
 
 def substitute(rel, text):

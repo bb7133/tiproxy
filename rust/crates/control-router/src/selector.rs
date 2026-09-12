@@ -80,6 +80,8 @@ type RedirectOfferBarrier = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Recei
 /// Replacing/removing this router's namespace rejects new work; already minted
 /// reservations can still settle their original accounting owner.
 pub struct Router {
+    #[cfg(test)]
+    replay_wall: Mutex<Option<i64>>,
     factors_enabled: bool,
     metrics: Option<control_topology::MetricOverlayHandle>,
     sources: Sources,
@@ -108,6 +110,8 @@ impl Router {
         max_sessions: usize,
     ) -> Result<Self, RouteError> {
         Ok(Self {
+            #[cfg(test)]
+            replay_wall: Mutex::new(None),
             factors_enabled: false,
             metrics: None,
             sources: Sources::new(source, topology, context, namespace)?,
@@ -150,6 +154,28 @@ impl Router {
         router.factors_enabled = true;
         router.metrics = metrics;
         Ok(router)
+    }
+
+    /// Test-only public event time; it carries no query, factor or ledger state.
+    #[cfg(test)]
+    pub(crate) fn set_replay_wall(&self, now: i64) {
+        *self
+            .replay_wall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(now);
+    }
+
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn wall_now(&self) -> Result<i64, RouteError> {
+        #[cfg(test)]
+        if let Some(now) = *self
+            .replay_wall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return Ok(now);
+        }
+        now_nanos()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -358,7 +384,7 @@ impl Router {
             crate::authority::MetricInputs::StaticEmpty => None,
             crate::authority::MetricInputs::Dynamic(snapshot) => snapshot.as_deref(),
         };
-        let now = now_nanos()?;
+        let now = self.wall_now()?;
         let mut select = |metrics: Option<&control_topology::MetricSnapshot>,
                           queries: &crate::factors::Queries| {
             self.sources.validate(candidate)?;

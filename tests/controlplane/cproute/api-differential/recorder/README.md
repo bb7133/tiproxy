@@ -10,8 +10,21 @@ The four frozen acceptance/inventory files are unchanged.
 
 `record.py` generates exact-text overlays from the current source tree. The proxy's
 public `GetBackendSelector`, `Next` and `Finish` calls pass through `apireplay`;
-router clock reads use the declared logical timer schedule. Missing or duplicated
+router and factor clock reads use the declared logical timer schedule. Missing or duplicated
 anchors abort the build. Production files are never edited by the overlay.
+
+The optional `config.clock_origin_nanos` is the Unix-nanosecond origin of the
+recording scheduler. Real captures always include it; replay adds each event's
+`at_nanos` to that origin. Older traces without the field retain their original
+1700000000-second epoch. The single shared Go test clock covers router/group and
+CPU/memory/health-factor reads in both recording and replay. Rust's per-router
+test clock and migration round use that same public event time; production clocks
+and random selection tickets continue to use their existing clock sources. Original
+wall timings remain in each raw archive record. The 24-hour offset bound and the
+origin range are checked before invoking either engine.
+
+This clock connection does not provide missing query values: whole metrics input
+capture/replay and resource-policy qualification remain incomplete below.
 
 Every whole health/config input, timer iteration, public call and terminal callback
 executes with its record under one scheduler lock. Calls retain their public return

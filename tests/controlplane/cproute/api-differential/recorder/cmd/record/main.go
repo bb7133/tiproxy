@@ -343,7 +343,8 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	meta := harness.CaptureSummary{Head: sourceHead, Tree: sourceTree, SourceDirty: sourceDirty,
 		DurationNanos: sched.Elapsed().Nanoseconds(), PlannedDurationNanos: duration.Nanoseconds(),
 		Completed: wl.Completed(), Failed: wl.Failed(), Clients: clients, ScriptSHA256: scriptSHA}
-	status, err := harness.Write(dir, slot, attempt, harness.TraceConfig{Policy: policyName, Selection: selection, Rule: rule}, sched.Log(), checkpoints, incomplete,
+	origin := sched.OriginNanos()
+	status, err := harness.Write(dir, slot, attempt, harness.TraceConfig{Policy: policyName, Selection: selection, Rule: rule, ClockOriginNanos: &origin}, sched.Log(), checkpoints, incomplete,
 		clusterMgr.MetricsQuerier() != nil, meta)
 	if err != nil {
 		return err

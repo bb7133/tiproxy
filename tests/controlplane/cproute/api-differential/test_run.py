@@ -42,6 +42,20 @@ def cycle(*candidates, preferred=None):
     return result
 
 
+class PublicClockTests(unittest.TestCase):
+    def test_clock_origin_rejects_lossy_values_and_overflow(self):
+        trace = trace_for([])
+        for invalid in [True, 1.7e18, "1700000000000000000", -1, 2**63 - 86_400_000_000_000]:
+            trace["config"]["clock_origin_nanos"] = invalid
+            with self.assertRaisesRegex(runner.Difference, "clock origin"):
+                runner.validate(trace)
+        for valid in [0, 1_790_000_000_123_456_789, 2**63 - 1 - 86_400_000_000_000]:
+            trace["config"]["clock_origin_nanos"] = valid
+            runner.validate(trace)
+        del trace["config"]["clock_origin_nanos"]
+        runner.validate(trace)  # Older recorded inputs retain their original epoch.
+
+
 class RetryHistoryTests(unittest.TestCase):
     def test_two_engines_keep_their_own_complete_cycle(self):
         trace = trace_for([cycle("a", "b", "c")] * 4)

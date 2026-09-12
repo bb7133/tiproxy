@@ -154,7 +154,8 @@ func TestRecordedObserverSourceErrors(t *testing.T) {
 		sched.Record(apireplay.Event{Op: "checkpoint"})
 	})
 	require.NoError(t, sched.Close())
-	status, err := Write(dir, "observer-source-smoke", "a1", TraceConfig{Policy: "connection", Selection: "prefer-idle"}, sched.Log(), checkpoints, nil, false, CaptureSummary{Synthetic: true})
+	origin := sched.OriginNanos()
+	status, err := Write(dir, "observer-source-smoke", "a1", TraceConfig{Policy: "connection", Selection: "prefer-idle", ClockOriginNanos: &origin}, sched.Log(), checkpoints, nil, false, CaptureSummary{Synthetic: true})
 	require.NoError(t, err)
 	require.Equal(t, "recorded", status)
 	var trace struct{ Events []struct{ Op, Error string } }
