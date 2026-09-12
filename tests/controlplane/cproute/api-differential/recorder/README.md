@@ -1,6 +1,6 @@
-# Router API differential recorder (design, head 1 rev 2 — documentation only)
+# Router API differential recorder (design, head 1 rev 3 — documentation only)
 
-Status: revised design for review (addresses CodexM5 review of d623b6d4, msg dd0b295e);
+Status: revised design for review (addresses CodexM5 reviews dd0b295e and 8c02ac33);
 no code, no CI change, no frozen-file change. Owner: ClaudeHome (split C, bb7133
 2026-09-12). Reviewer: CodexM5. Baseline `a9c497c3` (`../contract.md` §1–§3).
 Input format: trace v1 as accepted by `../run.py` `validate()` at PR #258 `a98bee78`
@@ -15,9 +15,12 @@ Input format: trace v1 as accepted by `../run.py` `validate()` at PR #258 `a98be
   backends, so a literal `from`/`to` in `expect` would reject a correct engine. The recorder
   will emit `expect.effects` with `from: "@session"` (the engine's own current assignment
   for that session) and `to` as a declared destination **set** (`legal_to`), and the
-  runner needs to accept that form. Until D1 lands, recorded traces are replayable only
-  for slots whose prior selections are unique; the recorder marks such traces
-  `requires: ["effects-v2"]` in the manifest and they do not count toward N.
+  runner needs to accept that form. **This is an interface draft, not a settled rule**: when
+  a random earlier choice also changes *which* session should migrate or *whether* a
+  migration is due, swapping `from`/`to` while copying Go's effect list is still wrong; the
+  constraint is handled in CodexM5's runner extension. Until D1 lands, recorded traces are
+  replayable only for slots whose prior selections are all unique; every other slot is
+  marked `requires: ["effects-v2"]` in the manifest and does not count toward N.
 - D2 `metrics` inputs: Prometheus responses observed by the proxy are archived raw (§3) but
   cannot be replayed until the metrics input op exists in the runner (CodexM5's metrics/time
   extension). Slots whose family outcomes depend on metric-driven balance are recorded
@@ -34,8 +37,11 @@ Input format: trace v1 as accepted by `../run.py` `validate()` at PR #258 `a98be
   boundary instants for each configured timeout: `timeout − 1 ns` and `timeout`). Every
   scheduled iteration is recorded as a `tick` with its declared `at_nanos`, whether or not
   Go produced an effect. Nothing is filtered by Go's output; nothing is added after the fact.
-  If a declared boundary instant did not actually run (harness fault), the slot is discarded
-  and re-recorded; boundary events are never synthesized.
+  If a declared boundary instant did not actually run (harness fault), the recording is
+  **archived permanently as `incomplete`** together with the missing-boundary reason and all
+  raw inputs/outputs; it does not count toward N. A new capture gets a new attempt ID
+  (`<slot>-a<N>`) and never replaces or overwrites the first failure. Boundary events are
+  never synthesized.
 - **Consumption, not delivery.** `health` / `source_error` / `config` events carry the
   `at_nanos` at which the router **finished applying** the input (recorded inside the
   wrapper after the real handler returns), not the moment a channel tee saw the message.
@@ -60,16 +66,21 @@ seq, and the slot is not counted.
   candidate set is exhausted an **exact** `ErrNoBackend` resets the exclusions and retries
   once, a **wrapped** no-backend does not. The derivation therefore tracks the exclusion list
   per session and emits `exclude_previous` only on a retry within the same attempt cycle.
-  `|candidates| == 1` → `backend`; `> 1` → `legal_backends`; `== 0` → the recorded error
-  class must be one the inputs explain: `source_error:<identity>` if an observer error is
-  active (router `observeError`, `router_score.go:128-130,238`), `port_conflict` if the
-  listener port is claimed by two clusters, otherwise exact/wrapped no-backend **as
-  recorded and consistent with the exclusion state**; any other combination is refused.
-  Public balance policy constraints (e.g. `prefer-idle` never picking a busier backend when
-  an idle one is legal, `location` preferring local) are applied to the legal set only where
-  the policy's public rule is deterministic from inputs; otherwise the set is left as the
-  healthy-matching set and the slot's policy pair is noted as "unrestricted" in the
-  manifest (no relaxation is hidden).
+  `|candidates| == 1` → `backend`; `> 1` → `legal_backends`; `== 0` → the expected error
+  class is a **fixed mapping from inputs**, never "whatever was recorded": if an observer
+  error is active (router `observeError`, `router_score.go:128-130,238`) the identity maps
+  1:1 — `no_backend` → `no_backend`, `wrapped_no_backend` → `wrapped_no_backend`,
+  `port_conflict` → `port_conflict`, the other three → `source_error:<identity>`; if the
+  listener port is claimed by two clusters → `port_conflict`; ordinary exhaustion of the
+  candidate set (no observer error) can only be the **exact** `no_backend` (exclusion
+  exhaustion never produces the wrapped sentinel). Any recorded outcome outside this
+  mapping is a discrepancy candidate: the script refuses and keeps the raw record.
+  Public balance-policy constraints (`location` preferring local backends, etc.) restrict
+  the legal set only where the policy's public rule is deterministic from inputs; the real
+  `prefer-idle` chooses randomly within a threshold (`factor_balance.go:287-345`) and is
+  **not** a strict-idlest rule, so no such example is used. Where a constraint cannot be
+  proven, the slot is marked `requires: ["policy-constraint:<pair>"]` and **does not count
+  toward acceptance**; an "unrestricted" set is raw evidence only, never a qualified trace.
 - `lookup`: expectation is `ok` + the named backend iff that backend ID is **retained** by
   the router (`router.backends`, `router_score.go:172-181`), which includes unhealthy
   backends still holding connections and is unaffected by an observer error; otherwise
@@ -80,10 +91,11 @@ seq, and the slot is not counted.
 - `checkpoint`: `healthy_backend_count` = 0 if an observer error is active
   (`router_score.go:187`), else count of healthy backends **not** in active failover
   (fail-backend-list marking per `group.go` `updateFailoverLocked`, including its "ignore
-  the list when it would leave no routeable backend" guard); `legal_server_versions` =
-  versions of currently healthy backends ∪ the version retained from the last round that
-  had a healthy backend (Go keeps the last non-empty value) — **not** the union of all
-  history.
+  the list when it would leave no routeable backend" guard); `legal_server_versions` = the
+  versions of the **current round's** healthy backends when that set is non-empty (a
+  superseded version is no longer legal once a new round has a definite non-empty healthy
+  version); only when the current round has no healthy backend is the previously retained
+  version the sole legal value. Never the union of all history.
 - `finish` / `close` / `config` / `source_error`: outcomes as recorded; `invalid_config`
   is recorded at the **validation entry** (the config manager's `SetTOMLConfig` result),
   not by inspecting the applied config.
@@ -125,12 +137,25 @@ rest `requires: ["effects-v2"]`.
 and `router.Router.GetBackendSelector` returns it by value, so the recording seam must
 live **inside package `router`** and is compiled only under a build tag:
 
+- **`next` / `finish` are recorded at the public method return, never inside the
+  selector's closures.** Wrapping `routeOnce` would record calls the caller never sees: with
+  one backend, after a `Finish(false)`, the next public `Next()` first hits the exact
+  `ErrNoBackend`, clears the exclusions and retries successfully inside a single call
+  (`backend_selector.go:24-31`); only the single public result is a recordable event.
+  Wiring: a test-build **overlay** of the proxy call site (the same `go -overlay` mechanism
+  `run.py` uses for the clock) substitutes, in `pkg/proxy/backend/backend_conn_mgr.go`,
+  `selector.Next()` → `apireplay.Next(&selector, ...)` and `selector.Finish(mgr, ok)` →
+  `apireplay.Finish(&selector, mgr, ok, ...)`, where the `apireplay` test package calls the
+  real public `BackendSelector.Next` / `Finish` and records the returned value or error
+  once per public call. `CloseObservation` is **not** a connection close; it ends the
+  selection call. Connection `close` is recorded only from the real
+  `ConnEventReceiver.OnConnClosed` (`backend_conn_mgr.go:286,935`) through the
+  `RedirectableConn` wrapper.
 - `pkg/balance/router/recording_apireplay.go` (`//go:build apireplay`): `RecordingRouter`
-  wraps `*ScoreBasedRouter`, implements `Router` and `AssignmentRehydrator`, and its
-  `GetBackendSelector` calls the real one and returns a `BackendSelector` whose
-  `routeOnce` / `onCreate` / `closeObservation` closures call the real closures and record
-  `open` / `next` / `finish` / `close`. It adds no field to `ScoreBasedRouter` and no call
-  site in production files.
+  wraps `*ScoreBasedRouter`, implements `Router` and `AssignmentRehydrator`, records
+  `open` (ClientInfo) when `GetBackendSelector` is called, and records `lookup` /
+  `rehydrate` at their public returns. It adds no field to `ScoreBasedRouter`, no closure
+  wrapping and no call site in untagged production files.
 - `pkg/balance/observer` needs no tag: `BackendObserver` and `BackendFetcher` are
   interfaces; `RecordingObserver` (tees consumed results) and `FaultFetcher` (§4) live in
   the harness package.
@@ -158,7 +183,7 @@ filled after recording; the list is frozen before the first K run.
 
 ## 7. Deliverables
 
-1. This design + `recording-plan.tsv` (head 1, rev 2).
+1. This design + `recording-plan.tsv` (head 1, rev 3).
 2. `derive_expectations.py` + the tagged wrappers/composition + harness driver (head 2),
    validated by replaying a harness-recorded run of the existing `smoke.json` scenario shape
    through `run.py` on both engines.
