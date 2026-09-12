@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -179,6 +180,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	runCtx, stop := context.WithTimeout(ctx, duration)
 	defer stop()
 	var incomplete []string
+	var envMu sync.Mutex
 	checkpoints := map[int]harness.Checkpoint{}
 	go func() {
 		var k int64
@@ -208,11 +210,19 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 			}
 			switch a.Kind {
 			case "env":
-				cmd := exec.CommandContext(ctx, envSh, a.Args...)
-				cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-				if err := cmd.Run(); err != nil {
-					incomplete = append(incomplete, fmt.Sprintf("env %v: %v", a.Args, err))
-				}
+				// env.sh primitives block until their own readiness condition (e.g. topology
+				// key gone); run them detached so later declared actions keep their instants.
+				go func(a Action) {
+					cmd := exec.CommandContext(ctx, envSh, a.Args...)
+					cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+					fmt.Fprintf(os.Stderr, "[record] env %v at wall %s\n", a.Args, sched.Elapsed())
+					if err := cmd.Run(); err != nil {
+						envMu.Lock()
+						incomplete = append(incomplete, fmt.Sprintf("env %v: %v", a.Args, err))
+						envMu.Unlock()
+					}
+					fmt.Fprintf(os.Stderr, "[record] env %v done at wall %s\n", a.Args, sched.Elapsed())
+				}(a)
 			case "config":
 				err := cfgMgr.SetTOMLConfig([]byte(a.TOML))
 				inputs.DeliverConfig(a.TOML, cfgMgr.GetConfig(), err)

@@ -248,26 +248,37 @@ type receiverWrapper struct {
 	conn  *Conn
 }
 
-func (w *receiverWrapper) OnRedirectSucceed(from, to string, conn router.RedirectableConn) error {
-	err := w.inner.OnRedirectSucceed(from, to, w.conn)
-	if b, ok := w.conn.RedirectableConn.Value(backendKey{}).(router.BackendInst); ok {
-		w.conn.session.current = b
-	}
-	ok := true
-	record(Event{Op: "redirect_result", Session: w.conn.session.id, Success: &ok, Operation: w.lastOp(), Backend: to})
+// The three terminal callbacks arrive on connection goroutines; each real call
+// and its record run inside the serialized critical section so they cannot
+// interleave with a tick or an input delivery (review msg 4d63e069). The
+// router's Redirect/ForceClose on the wrapped connection only post a signal
+// (backend_conn_mgr.go), so a tick holding the section never waits on them.
+func (w *receiverWrapper) OnRedirectSucceed(from, to string, conn router.RedirectableConn) (err error) {
+	serialize(func() {
+		err = w.inner.OnRedirectSucceed(from, to, w.conn)
+		if b, ok := w.conn.RedirectableConn.Value(backendKey{}).(router.BackendInst); ok {
+			w.conn.session.current = b
+		}
+		ok := true
+		record(Event{Op: "redirect_result", Session: w.conn.session.id, Success: &ok, Operation: w.lastOp(), Backend: to})
+	})
 	return err
 }
 
-func (w *receiverWrapper) OnRedirectFail(from, to string, conn router.RedirectableConn) error {
-	err := w.inner.OnRedirectFail(from, to, w.conn)
-	ok := false
-	record(Event{Op: "redirect_result", Session: w.conn.session.id, Success: &ok, Operation: w.lastOp(), Backend: to})
+func (w *receiverWrapper) OnRedirectFail(from, to string, conn router.RedirectableConn) (err error) {
+	serialize(func() {
+		err = w.inner.OnRedirectFail(from, to, w.conn)
+		ok := false
+		record(Event{Op: "redirect_result", Session: w.conn.session.id, Success: &ok, Operation: w.lastOp(), Backend: to})
+	})
 	return err
 }
 
-func (w *receiverWrapper) OnConnClosed(backendID string, conn router.RedirectableConn) error {
-	err := w.inner.OnConnClosed(backendID, w.conn)
-	record(Event{Op: "close", Session: w.conn.session.id})
+func (w *receiverWrapper) OnConnClosed(backendID string, conn router.RedirectableConn) (err error) {
+	serialize(func() {
+		err = w.inner.OnConnClosed(backendID, w.conn)
+		record(Event{Op: "close", Session: w.conn.session.id})
+	})
 	return err
 }
 
