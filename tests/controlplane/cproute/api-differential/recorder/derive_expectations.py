@@ -152,9 +152,9 @@ class Session:
 class State:
     def __init__(self, config, provenance=None):
         provenance = provenance or {}
-        # Metric factors only matter when the recording actually consumed metric data. The
-        # synthetic runner has no metrics input, so synthetic traces never did; recorded traces
-        # did unless the harness archived `metrics_observed: false`.
+        # Preserve the conservative flag on older recorded traces. New whole
+        # publications below also mark actual data directly from public inputs;
+        # removable provenance cannot hide their replay dependency.
         self.metrics_observed = bool(provenance.get("metrics_observed", provenance.get("kind") == "recorded"))
         self.rule = config["rule"]  # fixed at Init (router_score.go:90)
         self.policy = config["policy"]
@@ -438,6 +438,15 @@ def derive(trace, rows, args):
         expect = {"outcome": "ok"}
         if op == "health":
             state.apply_health(event.get("backends", []))
+        elif op == "metrics":
+            try:
+                _RUNNER.validate_metrics(event.get("queries"))
+            except _RUNNER.Difference as error:
+                raise Refuse(f"seq {seq}: {error}") from error
+            if row["outcome"] != "ok" or row.get("backend", "") or row.get("effects", []):
+                raise Refuse(f"seq {seq}: metric publication cannot produce a routing result")
+            state.metrics_observed |= any(result is not None and result["series"] for result in event["queries"].values())
+            state.requires.add("metrics-input")
         elif op == "source_error":
             if event["error"] not in SOURCE_ERROR_MAP:
                 raise Refuse(f"seq {seq}: unknown source error identity {event['error']!r}")

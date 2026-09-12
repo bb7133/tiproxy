@@ -363,9 +363,10 @@ jobs:
             ~/.cargo/git/db
             rust/target
           key: rust-routing-api-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
-      - name: Check recorder lifecycle and source error regressions
+      - name: Check recorder lifecycle and external input regressions
         env:
           CPROUTE_RECORDED_SOURCE_ERRORS: ${{ runner.temp }}/routing-api-recorded-source
+          CPROUTE_RECORDED_METRICS: ${{ runner.temp }}/routing-api-recorded-metrics
         run: |
           go test -race -tags apireplay ./tests/controlplane/cproute/api-differential/recorder/... -count=1 -timeout=120s
           python3 - <<'PYTEST'
@@ -389,6 +390,21 @@ jobs:
           module._RUNNER.observe(derived, rows, "recorded-go")
           (capture / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
           (capture / "stored-validation.json").write_text(json.dumps({"status":"passed", "events":len(rows), "requires":requires}) + "\n")
+          capture = Path(os.environ["CPROUTE_RECORDED_METRICS"])
+          trace = json.loads((capture / "trace.json").read_text())
+          rows = json.loads((capture / "go.json").read_text())
+          derived, requires = module.derive(trace, rows, None)
+          assert trace["provenance"]["kind"] == "synthetic" and "metrics-input" in requires
+          module._RUNNER.validate(derived)
+          module._RUNNER.observe(derived, rows, "recorded-go")
+          try:
+              module._RUNNER.require_replay_support(derived)
+          except module._RUNNER.Difference as error:
+              assert "DEPENDENCY: metrics-input" in str(error)
+          else:
+              raise AssertionError("metrics producer must not qualify without its native input adapter")
+          (capture / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
+          (capture / "stored-validation.json").write_text(json.dumps({"status":"captured", "events":len(rows), "requires":requires, "paired":"blocked"}) + "\n")
           PYTEST
           python3 tests/controlplane/cproute/api-differential/test_run.py
       - name: Compare the actual API adapters
@@ -420,6 +436,7 @@ jobs:
             ${{ runner.temp }}/routing-api-retry
             ${{ runner.temp }}/routing-api-recorded-source
             ${{ runner.temp }}/routing-api-recorded-source-paired
+            ${{ runner.temp }}/routing-api-recorded-metrics
           if-no-files-found: error
 
   routing-shadow:

@@ -23,8 +23,29 @@ and random selection tickets continue to use their existing clock sources. Origi
 wall timings remain in each raw archive record. The 24-hour offset bound and the
 origin range are checked before invoking either engine.
 
-This clock connection does not provide missing query values: whole metrics input
-capture/replay and resource-policy qualification remain incomplete below.
+The recorder now publishes whole external metric query sets through
+`harness.MetricsInputs`. It forwards factor query registration to the real cluster
+reader, samples all six public queries (`cpu`, `memory`, `failure_pd`, `total_pd`,
+`failure_tikv`, `total_tikv`) at the declared default five-second metrics cadence,
+then installs the copied set and records its `metrics` event under the scheduler.
+Factor getters see only that publication; they neither poll nor append records.
+Unchanged sets are not repeated, and a later all-null set explicitly clears input
+data. An unsupported source result rejects the entire replacement and marks the
+capture incomplete while retaining the previous publication.
+
+Each `queries` object contains all six keys, with null for an unavailable result.
+A result preserves vector/matrix shape, series and sample order, every label,
+`updated_nanos` and each original `timestamp_ms`. Sample `value` is a round-trip
+decimal string, including `NaN`, `+Inf`, `-Inf` and negative zero. A null update time
+preserves Go's zero time separately from Unix epoch zero. No private provenance,
+factor cache, score or query-getter sequence is serialized.
+
+The recording producer is implemented; paired Go/Rust metric publication adapters
+and resource-policy qualification remain incomplete. Every trace containing a
+`metrics` event retains `metrics-input`, even for an empty set. The common entrypoint
+rejects such traces before creating an output directory or launching engines,
+regardless of removable provenance tags. CI preserves a synthetic real-router
+producer archive and its explicit dependencies, separately from paired smoke runs.
 
 Every whole health/config input, timer iteration, public call and terminal callback
 executes with its record under one scheduler lock. Calls retain their public return
@@ -110,9 +131,10 @@ The following dependencies withhold a slot from acceptance:
   variable endpoints is insufficient.
 - `policy-constraint:<policy>/prefer-idle`: not all factor advice can yet be derived
   from the available public inputs. An unrestricted candidate set is not qualification.
-- `metrics-input`: whole metrics inputs/history are not yet captured and replayed.
-  `metrics_observed` currently indicates a live metrics querier, not an archived
-  Prometheus response stream.
+- `metrics-input`: recorded query values still need paired publication adapters.
+  New captures set `metrics_observed` only after publishing actual nonempty data;
+  older captures' reader-presence flag is retained as historical evidence and does
+  not prove complete inputs. The producer archive alone does not clear this gate.
 - `migration-cadence`: explicitly required by contract §4. This dependency is derived
   from input capability and session/destination history even if every observed
   redirect is deleted. Whole-health support-redirection AND semantics disable the

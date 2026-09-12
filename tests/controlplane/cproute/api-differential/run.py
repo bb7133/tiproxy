@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -19,8 +20,9 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[4]
 MAX_BYTES = 32 * 1024 * 1024
-OPS = {"health", "source_error", "config", "open", "next", "finish", "close", "checkpoint", "tick", "redirect_result", "lookup", "rehydrate"}
+OPS = {"health", "source_error", "metrics", "config", "open", "next", "finish", "close", "checkpoint", "tick", "redirect_result", "lookup", "rehydrate"}
 SOURCE_ERRORS = {"no_backend", "wrapped_no_backend", "port_conflict", "topology_unavailable", "cancelled", "deadline_exceeded"}
+METRIC_KEYS = {"cpu", "memory", "failure_pd", "total_pd", "failure_tikv", "total_tikv"}
 
 
 class Difference(ValueError):
@@ -49,6 +51,33 @@ def load(path):
         raise Difference(f"INPUT: {error}") from error
 
 
+def validate_metrics(queries):
+    require(isinstance(queries, dict) and set(queries) == METRIC_KEYS, "INPUT", "whole metrics query set")
+    integer = lambda value: type(value) is int and -(2**63) <= value < 2**63
+    for result in queries.values():
+        if result is None:
+            continue
+        require(isinstance(result, dict) and set(result) == {"kind", "updated_nanos", "series"}, "INPUT", "metric result fields")
+        require(result["kind"] in {"vector", "matrix"} and (result["updated_nanos"] is None or integer(result["updated_nanos"])), "INPUT", "metric kind/update time")
+        require(isinstance(result["series"], list), "INPUT", "metric series")
+        for series in result["series"]:
+            require(isinstance(series, dict) and set(series) == {"labels", "samples"}, "INPUT", "metric series fields")
+            require(isinstance(series["labels"], dict) and all(isinstance(k,str) and isinstance(v,str) for k,v in series["labels"].items()), "INPUT", "metric labels")
+            require(isinstance(series["samples"], list) and (result["kind"] == "matrix" or len(series["samples"]) == 1), "INPUT", "metric sample count")
+            for sample in series["samples"]:
+                require(isinstance(sample, dict) and set(sample) == {"timestamp_ms", "value"} and integer(sample["timestamp_ms"]), "INPUT", "metric sample fields/time")
+                value = sample["value"]
+                require(isinstance(value,str) and len(value) <= 32, "INPUT", "metric value string")
+                if value not in {"NaN", "+Inf", "-Inf"}:
+                    require(re.fullmatch(r"-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value) is not None and math.isfinite(float(value)), "INPUT", "metric value encoding")
+
+
+def require_replay_support(trace):
+    # Check actual input operations, not removable provenance/dependency tags.
+    require(not any(event["op"] == "metrics" for event in trace["events"]),
+            "DEPENDENCY", "metrics-input: recorded values await the paired publication adapters")
+
+
 def validate(trace):
     require(isinstance(trace, dict) and set(trace) == {"version", "id", "config", "provenance", "events"}, "INPUT", "trace fields")
     require(type(trace["version"]) is int and trace["version"] == 1 and isinstance(trace["id"], str), "INPUT", "version/id")
@@ -68,6 +97,7 @@ def validate(trace):
         "tick":{"refuse"},"redirect_result":{"operation","success"},
         "lookup":{"backend"},"rehydrate":{"backend"},
         "source_error":{"error"},
+        "metrics":{"queries"},
     }
     sessions, pending, active, operations = set(), set(), set(), {}
     at = 0
@@ -104,7 +134,9 @@ def validate(trace):
             require(effect["kind"] in {"redirect","force_close"} and effect["session"] in active and type(effect["accepted"]) is bool,"INPUT","effect owner/acceptance")
             require(all(isinstance(effect[key],str) for key in ("session","operation","from","to")) and effect["operation"] not in operations,"INPUT","effect identity")
             operations[effect["operation"]] = effect
-        if op == "source_error":
+        if op == "metrics":
+            validate_metrics(event.get("queries"))
+        elif op == "source_error":
             require(isinstance(event.get("error"),str) and event["error"] in SOURCE_ERRORS,"INPUT","observer error identity")
         elif op == "health":
             backends = event.get("backends")
@@ -437,6 +469,7 @@ def main():
     args = parser.parse_args()
     trace = load(args.trace)
     validate(trace)
+    require_replay_support(trace)
     destination = args.output.resolve()
     destination.mkdir(parents=True,exist_ok=False)
     # Deliberately omit oracle expectations and provenance from engine inputs.

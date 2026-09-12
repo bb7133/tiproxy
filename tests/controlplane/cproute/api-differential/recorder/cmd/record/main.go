@@ -171,8 +171,9 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 
 	// Real router, background loop disabled, driven by the scheduler.
 	rt := router.NewScoreBasedRouter(lg.Named("router"))
+	metricInputs := harness.NewMetricsInputs(sched, clusterMgr.MetricsQuerier())
 	bpCreator := func(lg *zap.Logger) policy.BalancePolicy {
-		p := factor.NewFactorBasedBalance(lg, clusterMgr.MetricsQuerier())
+		p := factor.NewFactorBasedBalance(lg, metricInputs)
 		p.Init(cfgMgr.GetConfig())
 		return p
 	}
@@ -232,6 +233,19 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	}
 	var producerWG, envWG waitgroup.WaitGroup
 	checkpoints := map[int]harness.Checkpoint{}
+	producerWG.Run(func() {
+		for k := int64(0); runCtx.Err() == nil; k++ {
+			declared := k * hcCfg.MetricsInterval.Nanoseconds()
+			if wait := time.Duration(declared) - sched.Elapsed(); wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-runCtx.Done():
+					return
+				}
+			}
+			metricInputs.Publish(declared)
+		}
+	}, lg)
 	producerWG.Run(func() {
 		var k int64
 		for runCtx.Err() == nil {
@@ -345,7 +359,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		Completed: wl.Completed(), Failed: wl.Failed(), Clients: clients, ScriptSHA256: scriptSHA}
 	origin := sched.OriginNanos()
 	status, err := harness.Write(dir, slot, attempt, harness.TraceConfig{Policy: policyName, Selection: selection, Rule: rule, ClockOriginNanos: &origin}, sched.Log(), checkpoints, incomplete,
-		clusterMgr.MetricsQuerier() != nil, meta)
+		metricInputs.Observed(), meta)
 	if err != nil {
 		return err
 	}

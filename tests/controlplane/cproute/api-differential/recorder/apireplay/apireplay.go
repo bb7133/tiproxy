@@ -27,6 +27,7 @@ package apireplay
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,7 @@ type Effect struct {
 // `Outcome`/`Backend`/`Effects` fields are the recorded public results and are
 // kept apart from the trace input by the writer).
 type Event struct {
+	Metrics   json.RawMessage `json:"queries,omitempty"`
 	Op        string          `json:"op"`
 	TOML      string          `json:"toml,omitempty"`
 	Backends  []HealthBackend `json:"backends,omitempty"`

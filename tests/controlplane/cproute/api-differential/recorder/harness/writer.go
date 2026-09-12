@@ -63,6 +63,7 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	var inTick bool
 	var tickEffects []apireplay.Effect
 	var tickAt int64
+	requires := []string{}
 	push := func(ev map[string]any, row map[string]any, at int64) {
 		ev["at_nanos"] = at
 		row["seq"] = len(rows)
@@ -115,6 +116,11 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 					"status_port": b.StatusPort, "healthy": b.Healthy, "local": b.Local, "server_version": b.ServerVersion, "support_redirection": b.SupportRedirection})
 			}
 			push(map[string]any{"op": "health", "backends": backends}, map[string]any{"op": "health", "outcome": "ok"}, r.AtNanos)
+		case "metrics":
+			push(map[string]any{"op": "metrics", "queries": e.Metrics}, map[string]any{"op": "metrics", "outcome": "ok"}, r.AtNanos)
+			if len(requires) == 0 {
+				requires = append(requires, "metrics-input")
+			}
 		case "source_error":
 			if e.Outcome == "unclassified_source_error" {
 				incomplete = append(incomplete, fmt.Sprintf("seq %d: unclassified source error", r.Seq))
@@ -200,7 +206,7 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	}
 	manifest := map[string]any{
 		"slot": slot, "attempt": attempt, "status": status, "incomplete": incomplete,
-		"capture": summary, "qualified": false,
+		"capture": summary, "qualified": false, "requires": requires,
 		"events": len(events), "trace_sha256": hashes["trace"], "go_sha256": hashes["go"],
 		"archive_sha256": hashes["archive"],
 	}

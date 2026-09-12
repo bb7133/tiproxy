@@ -56,6 +56,49 @@ class PublicClockTests(unittest.TestCase):
         runner.validate(trace)  # Older recorded inputs retain their original epoch.
 
 
+class PublicMetricsTests(unittest.TestCase):
+    def packet(self):
+        queries = dict.fromkeys(runner.METRIC_KEYS)
+        queries["cpu"] = {"kind":"matrix", "updated_nanos":1_790_000_000_123_456_789,
+                          "series":[{"labels":{"instance":"b", "tiproxy_cluster":"second"},
+                                     "samples":[{"timestamp_ms":123-i, "value":v}
+                                                for i,v in enumerate(["-0","NaN","+Inf","-Inf","0.12345678901234566"])]}]}
+        return queries
+
+    def test_public_metric_values_keep_order_and_exact_clocks(self):
+        queries = self.packet()
+        before = copy.deepcopy(queries)
+        runner.validate_metrics(queries)
+        self.assertEqual(before, queries)
+        queries["memory"] = {"kind":"vector", "updated_nanos":None, "series":[]}
+        runner.validate_metrics(queries)
+        queries["memory"]["updated_nanos"] = 0
+        runner.validate_metrics(queries)
+
+    def test_partial_private_or_lossy_values_are_rejected(self):
+        changes = [lambda q:q.pop("total_pd"),
+                   lambda q:q["cpu"].update(provenance={"source":1}),
+                   lambda q:q["cpu"].update(updated_nanos=1.79e18),
+                   lambda q:q["cpu"]["series"][0]["samples"][0].update(timestamp_ms=True),
+                   lambda q:q["cpu"]["series"][0]["samples"][0].update(value=0.1),
+                   lambda q:q["cpu"]["series"][0]["samples"][0].update(value="1e999"),
+                   lambda q:q["cpu"].update(kind="vector")]
+        for change in changes:
+            queries = self.packet()
+            change(queries)
+            with self.assertRaises(runner.Difference):
+                runner.validate_metrics(queries)
+
+    def test_dependency_cannot_be_removed_by_editing_provenance(self):
+        trace = trace_for([])
+        trace["events"].insert(0, {"op":"metrics", "queries":self.packet(), "expect":{"outcome":"ok"}})
+        runner.validate(trace)
+        for provenance in ({"kind":"synthetic"}, {"kind":"recorded","requires":[]}):
+            trace["provenance"] = provenance
+            with self.assertRaisesRegex(runner.Difference, "DEPENDENCY: metrics-input"):
+                runner.require_replay_support(trace)
+
+
 class RetryHistoryTests(unittest.TestCase):
     def test_two_engines_keep_their_own_complete_cycle(self):
         trace = trace_for([cycle("a", "b", "c")] * 4)
