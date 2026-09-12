@@ -554,6 +554,49 @@
       "op": "tick",
       "at_nanos": 1000000000,
       "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {},
+          "cluster": "default",
+          "keyspace": "",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": false,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        }
+      ],
+      "at_nanos": 1000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "source_error",
+      "error": "deadline_exceeded",
+      "at_nanos": 1000000000,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1999999999,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 2000000000,
+      "expect": {
         "outcome": "ok",
         "effects": [
           {
@@ -570,7 +613,7 @@
     {
       "op": "close",
       "session": "held",
-      "at_nanos": 1000000000,
+      "at_nanos": 2000000000,
       "expect": {
         "outcome": "ok"
       }
@@ -584,12 +627,12 @@
           "8.5.1"
         ]
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "config",
       "toml": "[proxy]\nfail-backend-list=[]\n",
-      "at_nanos": 1000000000,
+      "at_nanos": 2000000000,
       "expect": {
         "outcome": "ok"
       }
@@ -610,7 +653,7 @@
           "support_redirection": false
         }
       ],
-      "at_nanos": 1000000000,
+      "at_nanos": 2000000000,
       "expect": {
         "outcome": "ok"
       }
@@ -624,7 +667,7 @@
           "8.5.1"
         ]
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "open",
@@ -632,7 +675,7 @@
       "expect": {
         "outcome": "ok"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "next",
@@ -641,7 +684,7 @@
         "outcome": "ok",
         "backend": "default/127.0.0.1:4020"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "finish",
@@ -650,7 +693,7 @@
       "expect": {
         "outcome": "ok"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "next",
@@ -659,7 +702,7 @@
         "outcome": "ok",
         "backend": "default/127.0.0.1:4020"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "finish",
@@ -668,7 +711,7 @@
       "expect": {
         "outcome": "ok"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "close",
@@ -676,7 +719,7 @@
       "expect": {
         "outcome": "ok"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "health",
@@ -684,7 +727,7 @@
       "expect": {
         "outcome": "ok"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "open",
@@ -692,7 +735,7 @@
       "expect": {
         "outcome": "ok"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "next",
@@ -700,7 +743,7 @@
       "expect": {
         "outcome": "no_backend"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "close",
@@ -708,7 +751,7 @@
       "expect": {
         "outcome": "ok"
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     },
     {
       "op": "checkpoint",
@@ -719,7 +762,7 @@
           "8.5.1"
         ]
       },
-      "at_nanos": 1000000000
+      "at_nanos": 2000000000
     }
   ]
 }

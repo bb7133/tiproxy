@@ -143,7 +143,7 @@ error. The previous topology, health metadata, version and established
 connections remain available, including lookup, rehydration, Finish and timeout
 closure. A successful health result clears the error; a config update does not.
 
-The 78-event `source-error-smoke.json` exercises initial failure, all six error
+The 82-event `source-error-smoke.json` exercises initial failure, all six error
 identities with retained connections, Finish after failed observation, lookup
 and rehydration during failure, config rejection/acceptance without error
 clearance, timeout closure while the observer is failing, explicit recovery and
@@ -156,3 +156,14 @@ The existing network discovery refresh still retains its last successful result
 on a failed poll; forwarding its qualified failure into the observer publisher
 belongs to the remaining producer integration. This slice does not claim that
 live-source error forwarding or arbitrary error identities are complete.
+
+
+The first source-error run at 1773e57f failed its synthetic expectation at
+seq 61: both engines correctly produced no force-close. The only backend was
+still healthy, so listing it in fail-backend-list would remove every routeable
+backend; both implementations ignore that list for the group. The first
+78-event input, identical raw engine outputs and failing CI artifact are retained.
+The corrected scenario first asserts no close in this protected state, then
+delivers an explicit unhealthy verdict and a new observer error. This activates
+failover at that health event and tests the before/equal timeout ticks while the
+observer is failing. No runtime algorithm changed to satisfy the scenario.
