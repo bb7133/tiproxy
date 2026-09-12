@@ -474,7 +474,7 @@ async fn metric_input_preserves_values_and_fences_replacement_config_and_drop() 
         first.still_current(),
         "malformed whole input cannot install its valid CPU prefix"
     );
-    packet["cpu"]["updated_nanos"] = serde_json::Value::Null;
+    packet["cpu"]["updated_nanos"] = Value::Null;
     input.deliver(packet.clone())?;
     assert!(!first.still_current());
     assert_eq!(first.with_current(|| true), None);
