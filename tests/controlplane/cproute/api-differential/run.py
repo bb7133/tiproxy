@@ -6,13 +6,16 @@
 import argparse
 import ast
 import copy
+from collections import Counter
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
 import subprocess
 import time
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[4]
 MAX_BYTES = 32 * 1024 * 1024
@@ -74,11 +77,14 @@ def validate(trace):
         require(type(timestamp) is int and at <= timestamp <= 86_400_000_000_000,"INPUT","monotonic public clock")
         at = timestamp
         expect = event.get("expect")
-        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "exclude_previous", "exclude_history", "prefer_local", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
+        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "exclude_previous", "exclude_history", "prefer_local", "prefer_idle_conn", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
         require("exclude_previous" not in expect or (op == "next" and type(expect["exclude_previous"]) is bool), "INPUT", "retry expectation")
         if "exclude_history" in expect:
             require(op == "next" and expect["outcome"] == "ok" and expect["exclude_history"] is True and "exclude_previous" not in expect,
                     "INPUT", "full exclusion expectation")
+        if "prefer_idle_conn" in expect:
+            require(expect["prefer_idle_conn"] is True and expect.get("exclude_history") is True and "prefer_local" not in expect,
+                    "INPUT", "connection preference after full exclusions")
         if "prefer_local" in expect:
             preferred = expect["prefer_local"]
             candidates = expect.get("legal_backends", [expect.get("backend")])
@@ -156,11 +162,87 @@ def causal(effects):
     return per_session
 
 
+class PublicConnections:
+    """One engine's public reservations and connections, never a getter/score tape.
+
+    A successful Next reserves one connection. An accepted redirect transfers that
+    reservation immediately, while the public assignment moves only on success.
+    This separation matters for new selections during delayed callbacks.
+    """
+    def __init__(self, config):
+        self.pending, self.assigned, self.redirects = {}, {}, {}
+        self.policy, self.selection = config["policy"], config["selection"]
+        self.ratio, self.rate, self.label_name = 1.2, 0.0, ""
+
+    def prefer_idle(self, candidates):
+        require(self.policy == "connection" and self.selection == "prefer-idle" and not self.label_name,
+                "INPUT", "connection preference requires connection/prefer-idle without label isolation")
+        counts = Counter(self.pending.values()) + Counter(self.assigned.values())
+        for effect in self.redirects.values():
+            counts[effect["from"]] -= 1
+            counts[effect["to"]] += 1
+        require(all(n >= 0 for n in counts.values()), "EFFECT_LEDGER", "negative public connection count")
+        best = min(counts[b] for b in candidates)
+        best_bits = min(best, 65535)
+        legal = set()
+        for backend in candidates:
+            count = counts[backend]
+            # Go compares the clamped 16-bit factor first, then calls advice
+            # with the original counts. Equal saturated factors are not evicted.
+            if min(count, 65535) <= best_bits or float(count) <= float(best + 1) * self.ratio:
+                legal.add(backend)
+                continue
+            rate = self.rate if self.rate > 0 else max(0.0, (float(count + best + 1) / (1 + self.ratio) - float(best + 1)) / 120)
+            if rate <= 0.0001:
+                legal.add(backend)
+        return legal
+
+    def apply(self, event, row):
+        op, sid = event["op"], event.get("session", "")
+        if op == "config" and row["outcome"] == "ok":
+            try:
+                balance = tomllib.loads(event["toml"]).get("balance", {})
+            except tomllib.TOMLDecodeError as error:
+                raise Difference(f"INPUT: accepted config cannot be parsed: {error}") from error
+            self.policy = balance.get("policy", self.policy) or "resource"
+            self.selection = balance.get("routing-policy", self.selection) or "prefer-idle"
+            self.label_name = balance.get("label-name", self.label_name)
+            conn = balance.get("conn-count", {})
+            ratio = conn.get("count-ratio-threshold", self.ratio)
+            rate = conn.get("migrations-per-second", self.rate)
+            require(type(ratio) in (int, float) and math.isfinite(ratio) and (ratio == 0 or ratio > 1)
+                    and type(rate) in (int, float) and math.isfinite(rate) and rate >= 0,
+                    "INPUT", "finite connection policy configuration")
+            self.ratio, self.rate = float(ratio or 1.2), float(rate)
+        elif op == "next" and row["outcome"] == "ok":
+            self.pending[sid] = row["backend"]
+        elif op == "finish":
+            backend = self.pending.pop(sid)
+            if event["success"]:
+                self.assigned[sid] = backend
+        elif op == "rehydrate" and row["outcome"] == "ok":
+            self.assigned[sid] = row["backend"]
+        elif op == "redirect_result":
+            effect = self.redirects.pop(event["operation"], None)
+            if effect is not None and sid in self.assigned and event["success"]:
+                self.assigned[sid] = effect["to"]
+        elif op == "close":
+            self.assigned.pop(sid, None)
+            self.redirects = {key: ef for key, ef in self.redirects.items() if ef["session"] != sid}
+        for effect in row.get("effects", []):
+            if effect["kind"] == "redirect" and effect["accepted"]:
+                require(self.assigned.get(effect["session"]) == effect["from"]
+                        and not any(ef["session"] == effect["session"] for ef in self.redirects.values()),
+                        "EFFECT_LEDGER", "redirect requires one established owner and no pending redirect")
+                self.redirects[effect["operation"]] = effect
+
+
 def observe(trace, rows, engine):
     events = trace["events"]
     require(isinstance(rows,list) and len(rows) == len(events), "MISSING_RESULT", engine)
     pending, ledger, previous, operations, settled = {}, {}, {}, {}, set()
     excluded = {}
+    connections = PublicConnections(trace["config"])
     for index, (event,row) in enumerate(zip(events,rows)):
         op, session, expect = event["op"], event.get("session",""), event["expect"]
         fields = {"seq","op","session","outcome","backend","effects"} | ({"assignments","conn_count","healthy_backend_count","server_version"} if op == "checkpoint" else set())
@@ -187,6 +269,8 @@ def observe(trace, rows, engine):
                     history.clear()
                     remaining = candidates
                 require(backend in remaining, "RETRY_RESULT", f"{engine} event {index} repeated a member of its exclusion cycle")
+                if expect.get("prefer_idle_conn"):
+                    require(backend in connections.prefer_idle(remaining), "POLICY_RESULT", f"{engine} event {index} chose an evicted busy backend")
                 if "prefer_local" in expect:
                     preferred = remaining.intersection(expect["prefer_local"])
                     require(backend in (preferred or remaining), "POLICY_RESULT", f"{engine} event {index} bypassed an unexcluded local backend")
@@ -224,6 +308,7 @@ def observe(trace, rows, engine):
             if "legal_server_versions" in expect:
                 require(row["server_version"] in expect["legal_server_versions"],"OBSERVATION",f"{engine} server version {index}")
             require(row.get("assignments") == ledger and type(row.get("conn_count")) is int and row["conn_count"] == len(ledger), "LEDGER", f"{engine} checkpoint {index}")
+        connections.apply(event, row)
     require(not ledger and not pending and set(operations) <= settled, "LEDGER", f"{engine} final state")
 
 

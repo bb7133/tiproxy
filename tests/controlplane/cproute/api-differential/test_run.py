@@ -83,5 +83,101 @@ class RetryHistoryTests(unittest.TestCase):
                 runner.validate(trace)
 
 
+class ConnectionPreferenceTests(unittest.TestCase):
+    def history(self):
+        return runner.PublicConnections({"policy": "connection", "selection": "prefer-idle"})
+
+    def reserve(self, history, sid, backend, finish=None):
+        history.apply({"op": "next", "session": sid}, {"outcome": "ok", "backend": backend})
+        if finish is not None:
+            history.apply({"op": "finish", "session": sid, "success": finish}, {})
+
+    def config(self, history, toml, outcome="ok"):
+        history.apply({"op": "config", "toml": toml}, {"outcome": outcome})
+
+    def test_pending_failed_finish_and_close_change_eligibility(self):
+        h = self.history()
+        self.reserve(h, "a1", "a", True)
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"a", "b"})  # small skew is legal
+        self.reserve(h, "a2", "a")
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"b"})  # pending Next already counts
+        self.reserve(h, "b1", "b")
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"a", "b"})
+        h.apply({"op": "finish", "session": "b1", "success": False}, {})
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"b"})
+        h.apply({"op": "finish", "session": "a2", "success": True}, {})
+        h.apply({"op": "close", "session": "a1"}, {})
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"a", "b"})
+
+    def test_config_rate_cutoff_ratio_reset_and_rejected_update(self):
+        h = self.history()
+        for sid in ("a1", "a2"):
+            self.reserve(h, sid, "a", True)
+        for rate, expected in ((0.0001, {"a", "b"}), (0.0001001, {"b"})):
+            self.config(h, f"[balance.conn-count]\nmigrations-per-second = {rate}\n")
+            self.assertEqual(h.prefer_idle({"a", "b"}), expected)
+        self.config(h, "[balance.conn-count]\ncount-ratio-threshold = 3.0\n")
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"a", "b"})
+        self.config(h, "[balance.conn-count]\ncount-ratio-threshold = 0\n")
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"b"})
+        self.config(h, "invalid TOML", "invalid_config")
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"b"})
+        for value in ("nan", "inf", "-1"):
+            with self.assertRaisesRegex(runner.Difference, "INPUT"):
+                self.config(h, f"[balance.conn-count]\nmigrations-per-second = {value}\n")
+
+    def test_saturated_factor_ties_use_clamped_ordering(self):
+        h = self.history()
+        h.pending = {f"a{i}": "a" for i in range(65535)} | {f"b{i}": "b" for i in range(65537)}
+        self.config(h, "[balance.conn-count]\ncount-ratio-threshold = 1.000001\nmigrations-per-second = 1\n")
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"a", "b"})
+        del h.pending["a0"]
+        self.assertEqual(h.prefer_idle({"a", "b"}), {"a"})
+
+    def test_redirect_transfers_reservation_until_callback_or_close(self):
+        for result in (False, True, "close"):
+            h = self.history()
+            for sid in ("s", "keep"):
+                self.reserve(h, sid, "a", True)
+            ef = {"kind": "redirect", "session": "s", "operation": "s/1", "from": "a", "to": "b", "accepted": True}
+            h.apply({"op": "tick"}, {"effects": [dict(ef, accepted=False)]})
+            self.assertEqual(h.prefer_idle({"a", "b"}), {"b"})
+            h.apply({"op": "tick"}, {"effects": [ef]})
+            self.assertEqual(h.prefer_idle({"a", "b"}), {"a", "b"})
+            h.apply({"op": "tick"}, {"effects": [dict(ef, kind="force_close", operation="s/2", to="")]})
+            if result == "close":
+                h.apply({"op": "close", "session": "s"}, {})
+            callback = {"op": "redirect_result", "session": "s", "operation": "s/1", "success": result is not False}
+            h.apply(callback, {})
+            h.apply(callback, {})  # duplicate/late delivery cannot resurrect or double-transfer
+            self.assertEqual(h.prefer_idle({"a", "b"}), {"b"} if result is False else {"a", "b"})
+            self.assertEqual(h.assigned.get("s"), "a" if result is False else "b" if result is True else None)
+
+    def test_common_comparator_rejects_busy_choice_using_each_engine_history(self):
+        # Both engines' first two legal choices differ. A third choice must use
+        # their respective idle backend; it cannot be frozen from the Go rows.
+        events = []
+        for sid in ("s1", "s2", "s3"):
+            events += [{"op": "open", "session": sid, "expect": {"outcome": "ok"}},
+                       {"op": "next", "session": sid, "expect": {**cycle("a", "b"), "prefer_idle_conn": True}},
+                       {"op": "finish", "session": sid, "success": True, "expect": {"outcome": "ok"}}]
+        events += [{"op": "close", "session": sid, "expect": {"outcome": "ok"}} for sid in ("s1", "s2", "s3")]
+        events += [{"op": "checkpoint", "expect": {"outcome": "ok"}}]
+        trace = trace_for([]); trace["config"]["selection"] = "prefer-idle"; trace["events"] = events
+        runner.compare(trace, rows_for(trace, ["a", "a", "b"]), rows_for(trace, ["b", "b", "a"]))
+        with self.assertRaisesRegex(runner.Difference, "POLICY_RESULT"):
+            runner.observe(trace, rows_for(trace, ["b", "b", "b"]), "bad")
+        trace["events"][1]["expect"]["prefer_idle_conn"] = False
+        with self.assertRaisesRegex(runner.Difference, "INPUT"):
+            runner.validate(trace)
+
+    def test_exhaustion_precedes_connection_preference(self):
+        trace = trace_for([{**cycle("a", "b"), "prefer_idle_conn": True}] * 3)
+        trace["config"]["selection"] = "prefer-idle"
+        runner.observe(trace, rows_for(trace, ["a", "b", "a"]), "valid")
+        with self.assertRaisesRegex(runner.Difference, "RETRY_RESULT"):
+            runner.observe(trace, rows_for(trace, ["a", "a", "b"]), "bad")
+
+
 if __name__ == "__main__":
     unittest.main()

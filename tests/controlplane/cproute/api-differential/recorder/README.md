@@ -113,3 +113,12 @@ go test -race -tags apireplay ./tests/controlplane/cproute/api-differential/reco
 
 Run `run.py.validate()` on a derived trace before any replay claim. A nonempty
 `requires` list remains a blocker even when that structural validation passes.
+
+Connection/prefer-idle now emits a public-history predicate rather than an unresolved
+policy dependency. The common runner applies it independently to each engine's
+reservations, established connections and accepted redirects. Recorded Go is checked
+by that same predicate without exporting its ledger into the replay inputs. Empty
+ticks are proven from disabled redirection and absence of due failover candidates;
+effect ownership/cadence remains unresolved when either can still depend on the
+engine's assignments. Original recordings and earlier derivations stay immutable;
+a new derivation must use a new output filename and does not alone qualify a slot.

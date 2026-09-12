@@ -186,8 +186,26 @@ The deriver keeps uncertainty across a reset that happened only in Go, so it can
 mistakenly reuse Go's reset for Rust. Policy/effect and metrics dependencies remain
 explicit; this does not qualify the recorded corpus.
 
-`retry-smoke.json` contains 52 synthetic events for complete cycles, topology removal
+`retry-smoke.json` contains 115 synthetic events for complete cycles, topology removal
 and restoration, exact/wrapped observer errors and local-to-remote fallback. CI uses
 the same replay/comparison entrypoint and uploads `routing-api-retry` with the other
 three smoke artifacts. Six direct comparator regressions reject invalid histories;
 the common comparator mutation table remains the same eight faults.
+
+Connection/prefer-idle expectations use `expect.prefer_idle_conn: true` together
+with full exclusion history. The common comparator derives each engine's outstanding
+reservations from successful Next, Finish, Rehydrate, accepted Redirect, callback
+and Close events. It applies the configured ratio and migration-rate cutoff to that
+engine's remaining candidates, including the 16-bit factor saturation. No recorded
+Go count or choice is passed to Rust. Config updates come from the original TOML;
+invalid updates preserve the last accepted configuration.
+
+The recorder deriver uses the same predicate to reject unexplained recorded Go
+choices. A non-unique choice does not by itself make every later tick ambiguous:
+a whole health input that disables redirection and no possibly-owned backend with
+a due failover deadline prove an empty effect set. Enabled redirection and ambiguous
+failover ownership still retain their effect/cadence dependencies. The retry fixture
+also exercises busy-backend exclusion, full-cycle exhaustion before preference,
+rate-cutoff equality, ratio updates and closing retained sessions. Twelve direct
+regressions and 27 derivation counterexamples cover these rules; recorded corpus
+qualification and the eight common comparator faults remain separate gates.

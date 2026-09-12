@@ -21,8 +21,9 @@ Public semantics mirrored (file:line at the reviewed tree):
   (backend_selector.go:24-37, router_score.go:127-130).
 - routing: observed-healthy, not in active failover, member of the routed group, not
   excluded (group.go:352-386); the `random` selection may return any of them
-  (factor_balance.go:255-279); `prefer-idle` evicts by factor advice and is not derivable
-  from public inputs, so |candidates| > 1 under prefer-idle is a policy-constraint.
+  (factor_balance.go:255-279); `prefer-idle` evicts by factor advice and is derivable
+  from public inputs plus each engine's own public connection history for `connection`.
+  Resource/Location metric advice remains a policy-constraint.
 - failover guard is evaluated per group: the list is ignored for a group only when it would
   leave that group without a routeable backend (group.go:286-341); the timeout does not
   gate the marking (router.go:160-165, Healthy = observed && not in failover).
@@ -34,10 +35,17 @@ Public semantics mirrored (file:line at the reviewed tree):
 
 import argparse
 import copy
+import importlib.util
 import json
 import sys
 import tomllib
 from pathlib import Path
+
+# Use the common comparator's public-history constraint for recorded Go validation.
+# It consumes Go's own outputs only; emitted expectations never contain that ledger.
+_RUNNER_SPEC = importlib.util.spec_from_file_location("api_runner", Path(__file__).resolve().parents[1] / "run.py")
+_RUNNER = importlib.util.module_from_spec(_RUNNER_SPEC)
+_RUNNER_SPEC.loader.exec_module(_RUNNER)
 
 SOURCE_ERROR_MAP = {
     "no_backend": "no_backend",
@@ -164,6 +172,7 @@ class State:
         self.unique_history = True
         self.requires = set()
         self.retained_version = ""
+        self.recorded_connections = _RUNNER.PublicConnections(config)
         if self.rule not in ("", "port"):
             self.requires.add(f"policy-constraint:{self.rule}")
 
@@ -399,7 +408,14 @@ def derive_next(state, session, expect):
             else:
                 legal = prefer_local(state, legal)
             legal_go = prefer_local(state, legal_go)
-        if len(legal) > 1:
+        if state.policy == "connection":
+            # All candidates remain input-derived. Each engine applies its own
+            # public reservation/assignment history after its own exclusions.
+            legal, _ = state.candidates(session)
+            expect["exclude_history"] = True
+            expect["prefer_idle_conn"] = True
+            legal_go = sorted(state.recorded_connections.prefer_idle(legal_go))
+        elif len(legal) > 1:
             state.requires.add(f"policy-constraint:{state.policy}/prefer-idle")
             if state.policy in METRIC_POLICIES and state.metrics_observed:
                 state.requires.add("metrics-input")
@@ -524,7 +540,7 @@ def derive(trace, rows, args):
                 state.requires.add("migration-cadence")
                 if not state.unique_history:
                     state.requires.add("effects-v2")
-            if not state.unique_history:
+            if not state.unique_history and state.support_redirection:
                 # README §0 D1: after any non-unique choice the presence and absence of
                 # migrations depend on per-engine assignments; the slot needs effects-v2.
                 state.requires.add("effects-v2")
@@ -547,6 +563,10 @@ def derive(trace, rows, args):
             expect["legal_server_versions"] = current if current else [state.retained_version]
         else:
             raise Refuse(f"seq {seq}: unsupported op {op!r}")
+        try:
+            state.recorded_connections.apply(event, row)
+        except _RUNNER.Difference as error:
+            raise Refuse(f"seq {seq}: {error}") from error
         e = dict(event)
         e["expect"] = expect
         out_events.append(e)
@@ -773,6 +793,31 @@ def defect_checks():
             lambda d, r: "ok: disabled by whole health input" if d and "migration-cadence" not in r else f"NOT CAUGHT ({r})")
     injected = copy.deepcopy(base); injected[5]["effects"] = [effect]
     attempt("redirect_while_disabled_refused", cfg, disabled, injected,
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    # Disabled migration + no failover deadline proves an empty tick for every
+    # engine, even after non-unique selection. Turning capability back on or
+    # marking a possibly-owned backend for failover retains the dependency.
+    no_effect = [{"op": "health", "backends": [dict(hb("a"), support_redirection=False), hb("b")]},
+                 {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
+                 {"op": "finish", "session": "s", "success": True}, {"op": "tick"}, {"op": "close", "session": "s"}]
+    attempt("disabled_nonunique_empty_tick", cfg, no_effect, rows_for(no_effect, e2="default/a"),
+            lambda d, r: "ok: empty effect set proven from disabled input" if d and not r else f"NOT CAUGHT ({r})")
+    due = copy.deepcopy(no_effect)
+    due.insert(4, {"op": "config", "toml": '[proxy]\nfail-backend-list = ["a"]\nfailover-timeout = 0\n'})
+    attempt("disabled_nonunique_due_still_requires_effects", cfg, due, rows_for(due, e2="default/a"),
+            lambda d, r: "ok: due force-close needs engine-relative ownership" if d and "effects-v2" in r else f"NOT CAUGHT ({r})")
+    # Recorded preference must reject a busy result, not merely emit a flag.
+    pref = [{"op": "health", "backends": [hb("a"), hb("b")]}]
+    choices = {}
+    for sid in ("s1", "s2", "s3"):
+        pref += [{"op": "open", "session": sid}, {"op": "next", "session": sid}, {"op": "finish", "session": sid, "success": True}]
+        choices[f"e{len(pref)-2}"] = "default/b" if sid == "s3" else "default/a"
+    pref += [{"op": "close", "session": sid} for sid in ("s1", "s2", "s3")]
+    pref_cfg = dict(cfg, selection="prefer-idle")
+    attempt("connection_preference_from_own_public_history", pref_cfg, pref, rows_for(pref, **choices),
+            lambda d, r: "ok: per-engine connection predicate" if d and not r and d["events"][8]["expect"].get("prefer_idle_conn") else f"NOT CAUGHT ({r})")
+    choices["e8"] = "default/a"
+    attempt("connection_busy_recorded_choice_refused", pref_cfg, pref, rows_for(pref, **choices),
             lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     return out
 
