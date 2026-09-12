@@ -145,7 +145,10 @@ func apiClientAddress(value string) net.Addr {
 	if value == "" {
 		return nil
 	}
-	return apiAddress(value)
+	// Like real connection addresses, this must be nil-capable for NetAddr2IP.
+	// Keep the literal string so malformed-address cases still reach the parser.
+	address := apiAddress(value)
+	return &address
 }
 
 func apiError(err error) string {
