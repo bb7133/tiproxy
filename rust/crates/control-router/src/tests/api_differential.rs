@@ -7,6 +7,7 @@
 use super::{Harness, TestResult, must};
 use crate::scheduler::{CommandQueue, RoundClock};
 use crate::{Accounting, MigrationCommand, Reservation, RouteError, Router, Selector, Settlement};
+use control_config::ConfigNamespaceSource;
 use control_routing::group::ClientInfo;
 use control_topology::{BackendHealth, BackendInfo, MergedBackend, MergedTopology, ObserverError};
 use serde_json::{Value, json};

@@ -115,7 +115,7 @@ impl MetricInput {
         routing: RoutingSnapshotHandle,
         discovery: DiscoveryHandle,
         mode: watch::Receiver<Arc<ModeEpoch>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (mut publication, handle) =
             MetricPublication::new(source, HealthCheckConfig::default());
         publication.enable()?;

@@ -372,7 +372,7 @@ impl TopologyModuleHandle {
     pub async fn replay_metric_input(
         &self,
         owner: OwnerToken,
-    ) -> Result<crate::api_replay::MetricInput, Box<dyn std::error::Error>> {
+    ) -> Result<crate::api_replay::MetricInput, Box<dyn std::error::Error + Send + Sync>> {
         crate::api_replay::MetricInput::new(
             Arc::clone(&self.source),
             owner,
