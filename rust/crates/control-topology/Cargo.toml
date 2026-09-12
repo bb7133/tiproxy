@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = []
-# External health-result delivery for the API differential test adapter only.
+# External health/merged-query delivery for the API differential test adapter only.
 api-replay = []
 
 [dependencies]

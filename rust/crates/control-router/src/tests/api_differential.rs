@@ -114,6 +114,11 @@ async fn replay() -> TestResult {
         HashMap::new(),
         HashMap::new(),
     )?;
+    let mut metric_input = h
+        .topology
+        .replay_metric_input(h.runtime.handle().module_context().owner().clone())
+        .await?;
+    metric_input.sync()?;
     h.router = Arc::new(
         Router::new_with_factors(
             Arc::new(h.source.clone()),
@@ -121,7 +126,7 @@ async fn replay() -> TestResult {
             &h.runtime.handle().module_context(),
             "default",
             100_000,
-            None,
+            Some(metric_input.handle()),
         )
         .map_err(|e| format!("router init: {e:?}"))?,
     );
@@ -150,6 +155,7 @@ async fn replay() -> TestResult {
             .ok_or("event clock overflow")?;
         h.router.set_replay_wall(wall);
         match op {
+            "metrics" => metric_input.deliver(event["queries"].clone())?,
             "source_error" => health_input.deliver_error(source_error(text(event, "error"))?)?,
             "health" => {
                 let backends = event["backends"].as_array().ok_or("health backends")?;
@@ -195,6 +201,7 @@ async fn replay() -> TestResult {
                     verdicts,
                     redirection,
                 )?;
+                metric_input.sync()?;
                 let candidate = h
                     .router
                     .capture()
@@ -218,6 +225,7 @@ async fn replay() -> TestResult {
                 } else {
                     h.source.deliver();
                     h.applied().await;
+                    metric_input.sync()?;
                     let candidate = h.ready().await;
                     h.router
                         .refresh_failover(&candidate, now)
@@ -415,5 +423,109 @@ async fn rehydration_rejects_non_idle_or_closed_sessions_without_extra_charge() 
         h.router.accounting(backend).map(Accounting::active),
         Some(0)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // One ordered source lifetime, including retained old snapshots.
+async fn metric_input_preserves_values_and_fences_replacement_config_and_drop() -> TestResult {
+    use control_topology::metrics::QueryId;
+    let mut h = Harness::new("", "resource").await?;
+    let health = h
+        .topology
+        .replay_health_input(h.runtime.handle().module_context().owner().clone());
+    health.deliver(MergedTopology::default(), HashMap::new(), HashMap::new())?;
+    let mut input = h
+        .topology
+        .replay_metric_input(h.runtime.handle().module_context().owner().clone())
+        .await?;
+    let overlay = input.handle();
+    let mut packet = json!({"cpu":{"kind":"matrix","updated_nanos":0,"series":[
+        {"labels":{"instance":"a"},"samples":[{"timestamp_ms":3,"value":"-0"},{"timestamp_ms":2,"value":"NaN"}]},
+        {"labels":{"instance":"a","duplicate":"second"},"samples":[]}]},
+        "memory":null,"failure_pd":null,"total_pd":null,"failure_tikv":null,"total_tikv":null});
+    input.deliver(packet.clone())?;
+    let capture = || {
+        overlay
+            .routing_current_for(
+                &h.topology
+                    .routing_handle()
+                    .current()
+                    .unwrap_or_else(|| unreachable!("routing")),
+                &h.source.store.current().resource_incarnation(),
+            )
+            .ok_or("metric snapshot")
+    };
+    let first = capture()?;
+    let result = first.query_result(QueryId::Cpu)?.ok_or("cpu")?;
+    assert_eq!(result.updated_nanos, 0);
+    assert!(result.series[0].samples[0].value.is_sign_negative());
+    assert!(result.series[0].samples[1].value.is_nan());
+    assert_eq!(result.series[0].samples[1].timestamp_ms, 2);
+    assert_eq!(result.series[1].labels["duplicate"], "second");
+    let lineage = first
+        .cache_lineage("any-recorded-cluster")
+        .ok_or("lineage")?;
+    let mut invalid = packet.clone();
+    invalid["memory"] = json!({"kind":"scalar","updated_nanos":1,"series":[]});
+    assert!(input.deliver(invalid).is_err());
+    assert!(
+        first.still_current(),
+        "malformed whole input cannot install its valid CPU prefix"
+    );
+    packet["cpu"]["updated_nanos"] = json!(1);
+    input.deliver(packet.clone())?;
+    assert!(!first.still_current());
+    assert_eq!(first.with_current(|| true), None);
+    let second = capture()?;
+    assert!(
+        lineage.same_history(
+            &second
+                .cache_lineage("any-recorded-cluster")
+                .ok_or("lineage")?
+        )
+    );
+    assert_eq!(
+        second
+            .query_result(QueryId::Cpu)?
+            .ok_or("cpu")?
+            .updated_nanos,
+        1
+    );
+    h.source.store.apply_toml(
+        b"[balance]\npolicy='connection'",
+        None,
+        100,
+        Path::new("/tmp"),
+    )?;
+    assert!(
+        !second.still_current(),
+        "accepted policy transition revokes before watcher polling"
+    );
+    input.sync()?;
+    h.source.store.apply_toml(
+        b"[balance]\npolicy='resource'",
+        None,
+        101,
+        Path::new("/tmp"),
+    )?;
+    input.sync()?;
+    let resumed = capture()?;
+    assert!(
+        !lineage.same_history(
+            &resumed
+                .cache_lineage("any-recorded-cluster")
+                .ok_or("lineage")?
+        )
+    );
+    input.deliver(json!({"cpu":null,"memory":null,"failure_pd":null,"total_pd":null,"failure_tikv":null,"total_tikv":null}))?;
+    assert!(!resumed.still_current());
+    let cleared = capture()?;
+    assert!(cleared.query_result(QueryId::Cpu)?.is_none());
+    assert_eq!(cleared.with_current(|| 7), Some(7));
+    drop(input);
+    assert!(!cleared.still_current());
+    assert_eq!(cleared.with_current(|| 7), None);
+    assert!(capture().is_err());
     Ok(())
 }

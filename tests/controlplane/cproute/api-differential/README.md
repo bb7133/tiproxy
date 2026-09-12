@@ -32,6 +32,13 @@ scheduling in a test adapter, not a duplicate routing implementation. No interna
 caller capture is attached. Recording will use the live Go loop and actual
 TiDB/PD/Prometheus sources, preserving values at these external boundaries.
 
+Whole external metric publications also enter both adapters. The test-only Rust
+publisher uses current routing/discovery/config/owner fences and keeps the merged
+series order; neither engine receives query-getter history or factor snapshots.
+The 17-event synthetic producer case exercises this boundary. Go year-one zero
+time is explicitly blocked as `metrics-zero-time`; generic resource-policy and
+migration-cadence qualification are still dependencies of real recordings.
+
 Implementation is limited to three increments of the same replacement PR:
 
 1. Common input validation, Go/Rust API adapters and basic selection/retry/

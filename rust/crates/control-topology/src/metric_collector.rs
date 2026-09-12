@@ -28,6 +28,8 @@ use tokio::task::JoinSet;
 use crate::metrics::{MetricError, QueryId, QueryResult, ReaderState, Source};
 use crate::{MetricCapture, MetricSourceHandle};
 
+#[cfg(feature = "api-replay")]
+pub(crate) mod api_replay;
 mod collect;
 mod owner;
 mod service;
@@ -84,11 +86,17 @@ impl ClusterResult {
 
 #[derive(Default)]
 struct Published {
+    #[cfg(feature = "api-replay")]
+    external: Option<Arc<api_replay::ExternalResult>>,
     capture: Option<MetricCapture>,
     clusters: BTreeMap<String, Arc<ClusterResult>>,
 }
 impl Published {
     fn clear(&mut self) {
+        #[cfg(feature = "api-replay")]
+        if let Some(external) = self.external.take() {
+            external.gate.revoke();
+        }
         for result in self.clusters.values() {
             result.gate.revoke();
         }
@@ -199,6 +207,8 @@ impl MetricCacheLineage {
 /// Query values remain data; retain this snapshot and use `with_current` at the
 /// routing publication boundary after reading a value.
 pub struct MetricSnapshot {
+    #[cfg(feature = "api-replay")]
+    external: Option<Arc<api_replay::ExternalResult>>,
     capture: MetricCapture,
     serving: Arc<service::Binding>,
     clusters: BTreeMap<String, Arc<ClusterResult>>,
@@ -208,6 +218,10 @@ impl MetricSnapshot {
     /// only alongside ledger-owned factor state; final use requires `with_current`.
     #[must_use]
     pub fn cache_lineage(&self, cluster: &str) -> Option<MetricCacheLineage> {
+        #[cfg(feature = "api-replay")]
+        if let Some(external) = &self.external {
+            return Some(MetricCacheLineage(Arc::clone(&external.lineage)));
+        }
         self.clusters
             .get(cluster)
             .map(|result| MetricCacheLineage(Arc::clone(&result.lineage)))
@@ -216,13 +230,25 @@ impl MetricSnapshot {
     /// Checks source, serving lifetime, result replacement and selected owners.
     #[must_use]
     pub fn still_current(&self) -> bool {
-        self.capture.still_current()
+        self.input_current()
+            && self.capture.still_current()
             && self.serving.is_live()
             && self.clusters.values().all(|result| {
                 result.queries_current()
                     && result.gate.is_live()
                     && result.selected_proofs().iter().all(owner::Proof::is_live)
             })
+    }
+    fn input_current(&self) -> bool {
+        #[cfg(feature = "api-replay")]
+        if self
+            .external
+            .as_ref()
+            .is_some_and(|result| !result.current())
+        {
+            return false;
+        }
+        true
     }
     /// The original topology capture for final pairing with a routing decision.
     #[must_use]
@@ -235,6 +261,13 @@ impl MetricSnapshot {
     pub fn query_result(&self, rule: QueryId) -> Result<Option<QueryResult>, MetricError> {
         if !self.still_current() {
             return Ok(None);
+        }
+        #[cfg(feature = "api-replay")]
+        if let Some(external) = &self.external {
+            // This input is already merged. A second merge would reorder first
+            // matches and rewrite timestamps from an unrelated cluster.
+            let result = external.queries.get(&rule).cloned();
+            return Ok(self.still_current().then_some(result).flatten());
         }
         let result = QueryResult::merge(
             self.clusters
@@ -262,6 +295,7 @@ impl MetricSnapshot {
                         owner::with_retained(&proofs, || {
                             if self.serving.is_live()
                                 && self.capture.still_current()
+                                && self.input_current()
                                 && self
                                     .clusters
                                     .values()
@@ -339,6 +373,8 @@ impl MetricOverlayHandle {
             return None;
         }
         let snapshot = MetricSnapshot {
+            #[cfg(feature = "api-replay")]
+            external: published.external.clone(),
             capture: capture.clone(),
             serving: Arc::clone(&self.shared.serving),
             clusters: published.clusters.clone(),

@@ -20,6 +20,7 @@ import (
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
 	configmgr "github.com/pingcap/tiproxy/pkg/manager/config"
 	replayclock "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/clock"
+	replaymetrics "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/metrics"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
@@ -58,19 +59,20 @@ func apiString(value *string, fallback string) string {
 }
 
 type apiTraceEvent struct {
-	Op        string            `json:"op"`
-	Session   string            `json:"session,omitempty"`
-	Client    string            `json:"client,omitempty"`
-	Proxy     string            `json:"proxy,omitempty"`
-	Port      string            `json:"port,omitempty"`
-	Backends  []apiTraceBackend `json:"backends,omitempty"`
-	Success   bool              `json:"success,omitempty"`
-	TOML      string            `json:"toml,omitempty"`
-	AtNanos   int64             `json:"at_nanos,omitempty"`
-	Backend   string            `json:"backend,omitempty"`
-	Operation string            `json:"operation,omitempty"`
-	Refuse    []string          `json:"refuse,omitempty"`
-	Error     string            `json:"error,omitempty"`
+	Queries   map[string]*replaymetrics.Result `json:"queries,omitempty"`
+	Op        string                           `json:"op"`
+	Session   string                           `json:"session,omitempty"`
+	Client    string                           `json:"client,omitempty"`
+	Proxy     string                           `json:"proxy,omitempty"`
+	Port      string                           `json:"port,omitempty"`
+	Backends  []apiTraceBackend                `json:"backends,omitempty"`
+	Success   bool                             `json:"success,omitempty"`
+	TOML      string                           `json:"toml,omitempty"`
+	AtNanos   int64                            `json:"at_nanos,omitempty"`
+	Backend   string                           `json:"backend,omitempty"`
+	Operation string                           `json:"operation,omitempty"`
+	Refuse    []string                         `json:"refuse,omitempty"`
+	Error     string                           `json:"error,omitempty"`
 }
 
 // The test overlays route/group/factor clocks to one public event timestamp.
@@ -123,14 +125,16 @@ func (c *apiConn) ForceClose() bool {
 	return accepted
 }
 
-type apiEmptyMetrics struct{}
-
-func (apiEmptyMetrics) AddQueryExpr(string, metricsreader.QueryExpr, metricsreader.QueryRule) {}
-func (apiEmptyMetrics) RemoveQueryExpr(string)                                                {}
-func (apiEmptyMetrics) GetQueryResult(string) metricsreader.QueryResult {
-	return metricsreader.QueryResult{}
+type apiMetrics struct {
+	current map[string]metricsreader.QueryResult
 }
-func (apiEmptyMetrics) GetBackendMetrics() []byte { return nil }
+
+func (*apiMetrics) AddQueryExpr(string, metricsreader.QueryExpr, metricsreader.QueryRule) {}
+func (*apiMetrics) RemoveQueryExpr(string)                                                {}
+func (m *apiMetrics) GetQueryResult(key string) metricsreader.QueryResult {
+	return m.current[key]
+}
+func (*apiMetrics) GetBackendMetrics() []byte { return nil }
 
 type apiAddress string
 
@@ -216,12 +220,13 @@ func TestRouterAPIDifferential(t *testing.T) {
 	manager := configmgr.NewConfigManager()
 	initial := fmt.Sprintf("[balance]\npolicy=%q\nrouting-policy=%q\nrouting-rule=%q\n", trace.Config.Policy, trace.Config.Selection, trace.Config.Rule)
 	require.NoError(t, manager.SetTOMLConfig([]byte(initial)))
+	metricInputs := &apiMetrics{}
 	r := NewScoreBasedRouter(zap.NewNop())
 	ob := newMockBackendObserver()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r.Init(ctx, ob, func(lg *zap.Logger) policy.BalancePolicy {
-		return factor.NewFactorBasedBalance(lg, apiEmptyMetrics{})
+		return factor.NewFactorBasedBalance(lg, metricInputs)
 	}, manager, nil)
 	r.wg.Wait()
 	t.Cleanup(r.Close)
@@ -250,6 +255,10 @@ func TestRouterAPIDifferential(t *testing.T) {
 		output = append(output, row)
 		s := sessions[event.Session]
 		switch event.Op {
+		case "metrics":
+			next, err := replaymetrics.Decode(event.Queries)
+			require.NoError(t, err)
+			metricInputs.current = next
 		case "source_error":
 			r.updateBackendHealth(observer.NewHealthResult(nil, apiSourceError(event.Error)))
 		case "health":

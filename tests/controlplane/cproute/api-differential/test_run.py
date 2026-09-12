@@ -93,9 +93,11 @@ class PublicMetricsTests(unittest.TestCase):
         trace = trace_for([])
         trace["events"].insert(0, {"op":"metrics", "queries":self.packet(), "expect":{"outcome":"ok"}})
         runner.validate(trace)
+        runner.require_replay_support(trace)
+        trace["events"][0]["queries"]["cpu"]["updated_nanos"] = None
         for provenance in ({"kind":"synthetic"}, {"kind":"recorded","requires":[]}):
             trace["provenance"] = provenance
-            with self.assertRaisesRegex(runner.Difference, "DEPENDENCY: metrics-input"):
+            with self.assertRaisesRegex(runner.Difference, "DEPENDENCY: metrics-zero-time"):
                 runner.require_replay_support(trace)
 
 

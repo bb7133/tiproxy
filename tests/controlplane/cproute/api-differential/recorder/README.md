@@ -40,12 +40,29 @@ decimal string, including `NaN`, `+Inf`, `-Inf` and negative zero. A null update
 preserves Go's zero time separately from Unix epoch zero. No private provenance,
 factor cache, score or query-getter sequence is serialized.
 
-The recording producer is implemented; paired Go/Rust metric publication adapters
-and resource-policy qualification remain incomplete. Every trace containing a
-`metrics` event retains `metrics-input`, even for an empty set. The common entrypoint
-rejects such traces before creating an output directory or launching engines,
-regardless of removable provenance tags. CI preserves a synthetic real-router
-producer archive and its explicit dependencies, separately from paired smoke runs.
+Both API replay adapters now consume whole publications. Go uses the shared
+`metrics/` value decoder and swaps the complete result map before the next public
+call. Rust's test-only input owns a real bound collector lifetime, pairs with the
+actual routing/discovery/mode/config/owner capabilities, and publishes an immutable
+merged result through the metric snapshot path. No network collector runs during
+replay. The query packet is already merged: it is not split/re-merged, relabeled or
+retimestamped. One merged input history preserves its cache lineage across data
+and health updates; an accepted Resource → Connection → Resource transition starts
+a new lineage, and replacement/Drop revoke old snapshots.
+
+Go zero time has no representation in the current native Unix-nanosecond value
+type. Any result with `updated_nanos: null` therefore retains `metrics-zero-time`
+and is rejected before output creation or either engine starts. Unix epoch 0 is
+supported and remains distinct. The raw recording preserves both forms. Existing
+recordings that claim metric observations but contain no metric events keep their
+`metrics-input` dependency. General resource-policy/effect/cadence qualification
+remains incomplete and separately blocked.
+
+CI pairs the synthetic real-router producer's 17 events/three publications and
+checks its input-defined A, A, B selection sequence in both engines. This small
+scenario is adapter evidence, not general resource parity or a qualifying trace.
+The raw archive, dependency-bearing derivation, stored Go result, paired engine
+outputs and this scenario assertion are preserved together.
 
 Every whole health/config input, timer iteration, public call and terminal callback
 executes with its record under one scheduler lock. Calls retain their public return

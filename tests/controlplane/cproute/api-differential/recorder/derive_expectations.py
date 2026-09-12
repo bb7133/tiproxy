@@ -583,6 +583,12 @@ def derive(trace, rows, args):
         out_events.append(e)
     result = copy.deepcopy(trace)
     result["events"] = out_events
+    metric_inputs = [e for e in events if e["op"] == "metrics"]
+    if metric_inputs:
+        state.requires.discard("metrics-input")
+        if any(q is not None and q["updated_nanos"] is None
+               for e in metric_inputs for q in e["queries"].values()):
+            state.requires.add("metrics-zero-time")
     return result, sorted(state.requires)
 
 

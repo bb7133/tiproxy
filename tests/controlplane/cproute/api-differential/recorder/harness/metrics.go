@@ -13,34 +13,19 @@ import (
 	"time"
 
 	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
+	replaymetrics "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/metrics"
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
 	"github.com/prometheus/common/model"
 )
 
 // These are the external query names registered by the three resource factors.
 // The recorder samples the entire fixed set, independently of getter calls.
-var metricKeys = [...]string{"cpu", "memory", "failure_pd", "total_pd", "failure_tikv", "total_tikv"}
+var metricKeys = replaymetrics.Keys
 
-// MetricSample retains the original millisecond timestamp and IEEE value.
-// Values use decimal strings so NaN, infinities and negative zero survive JSON.
-type MetricSample struct {
-	TimestampMillis int64  `json:"timestamp_ms"`
-	Value           string `json:"value"`
-}
-
-// MetricSeries preserves first-match series ordering and every original label.
-type MetricSeries struct {
-	Labels  map[string]string `json:"labels"`
-	Samples []MetricSample    `json:"samples"`
-}
-
-// MetricResult contains only external values, never reader/factor provenance.
-// A null update time means Go's zero time; Unix epoch zero remains distinct.
-type MetricResult struct {
-	Kind         string         `json:"kind"`
-	UpdatedNanos *int64         `json:"updated_nanos"`
-	Series       []MetricSeries `json:"series"`
-}
+// Wire types are shared with the replay decoder; no private provenance crosses them.
+type MetricSample = replaymetrics.Sample
+type MetricSeries = replaymetrics.Series
+type MetricResult = replaymetrics.Result
 
 func copyMetricResult(q metricsreader.QueryResult) (*MetricResult, metricsreader.QueryResult, error) {
 	if q.Value == nil {

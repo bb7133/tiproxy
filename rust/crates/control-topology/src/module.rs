@@ -357,10 +357,30 @@ impl TopologyModuleHandle {
     /// No production caller enables the `api-replay` feature.
     #[cfg(feature = "api-replay")]
     pub fn replay_health_input(&mut self, owner: OwnerToken) -> crate::api_replay::HealthInput {
-        let (input, routing, health) = crate::api_replay::HealthInput::new(owner);
+        let (mut input, routing, health) = crate::api_replay::HealthInput::new(owner);
+        input.bind_discovery(self.discovery.clone());
         self.routing = routing;
         self.health = health;
         input
+    }
+
+    /// Creates a test-only whole-query publisher paired with this handle's
+    /// actual routing/config/discovery lifetimes. It starts no collector loops.
+    /// # Errors
+    /// Returns a bind/material failure without enabling production collection.
+    #[cfg(feature = "api-replay")]
+    pub async fn replay_metric_input(
+        &self,
+        owner: OwnerToken,
+    ) -> Result<crate::api_replay::MetricInput, Box<dyn std::error::Error>> {
+        crate::api_replay::MetricInput::new(
+            Arc::clone(&self.source),
+            owner,
+            self.routing.clone(),
+            self.discovery.clone(),
+            self.mode.clone(),
+        )
+        .await
     }
 
     /// The staged applied metrics source; empty until explicitly enabled and a

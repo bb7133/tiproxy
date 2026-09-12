@@ -20,6 +20,7 @@ import (
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 	configmgr "github.com/pingcap/tiproxy/pkg/manager/config"
+	replaymetrics "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/metrics"
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
@@ -53,6 +54,18 @@ func TestMetricWirePreservesSpecialValuesOrderAndTimes(t *testing.T) {
 	encoded, err := json.Marshal(wire)
 	require.NoError(t, err)
 	require.NotContains(t, string(encoded), "Provenance")
+	packet := map[string]*replaymetrics.Result{}
+	for _, key := range replaymetrics.Keys {
+		packet[key] = nil
+	}
+	packet["cpu"] = wire
+	replayed, err := replaymetrics.Decode(packet)
+	require.NoError(t, err)
+	roundtrip, _, err := copyMetricResult(replayed["cpu"])
+	require.NoError(t, err)
+	encodedAgain, err := json.Marshal(roundtrip)
+	require.NoError(t, err)
+	require.JSONEq(t, string(encoded), string(encodedAgain))
 	source[0].Metric["instance"] = "changed"
 	source[0].Values[0].Value = 1
 	require.Equal(t, "b", wire.Series[0].Labels["instance"])

@@ -5,6 +5,9 @@
 //! publishers and their authority checks; it cannot seed router groups, scores,
 //! reservations, or decisions. Network discovery/probing belongs to recording.
 
+mod metrics;
+pub use metrics::MetricInput;
+
 use crate::health_overlay::{HealthOverlayPublisher, HealthPublishOutcome};
 use crate::{
     BackendHealth, EpochResult, HealthOverlayHandle, MergedTopology, ObserverError,
@@ -21,6 +24,7 @@ pub struct HealthInput {
     routing: RoutingSnapshotPublisher,
     health: HealthOverlayPublisher,
     owner: OwnerToken,
+    discovery: Option<crate::DiscoveryHandle>,
 }
 
 impl HealthInput {
@@ -50,10 +54,15 @@ impl HealthInput {
                 routing,
                 health,
                 owner,
+                discovery: None,
             },
             routing_handle,
             health_handle,
         )
+    }
+
+    pub(crate) fn bind_discovery(&mut self, discovery: crate::DiscoveryHandle) {
+        self.discovery = Some(discovery);
     }
 
     /// Publishes a completed health result, including unhealthy entries and an
@@ -71,7 +80,13 @@ impl HealthInput {
         }
         self.routing
             .publish(EpochResult {
-                client_epoch: 1,
+                client_epoch: match &self.discovery {
+                    Some(discovery) => discovery
+                        .capture()
+                        .map_err(|_| "discovery retired")?
+                        .client_epoch(),
+                    None => 1,
+                },
                 value: topology,
             })
             .map_err(|_| "routing generation exhausted")?;

@@ -73,9 +73,12 @@ def validate_metrics(queries):
 
 
 def require_replay_support(trace):
-    # Check actual input operations, not removable provenance/dependency tags.
-    require(not any(event["op"] == "metrics" for event in trace["events"]),
-            "DEPENDENCY", "metrics-input: recorded values await the paired publication adapters")
+    # Check actual values, not removable provenance/dependency tags. The native
+    # staged timestamp is Unix i64, which cannot represent Go's year-one zero.
+    require(not any(result is not None and result["updated_nanos"] is None
+                    for event in trace["events"] if event["op"] == "metrics"
+                    for result in event["queries"].values()),
+            "DEPENDENCY", "metrics-zero-time: native timestamp adapter pending")
 
 
 def validate(trace):

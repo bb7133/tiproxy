@@ -394,17 +394,12 @@ jobs:
           trace = json.loads((capture / "trace.json").read_text())
           rows = json.loads((capture / "go.json").read_text())
           derived, requires = module.derive(trace, rows, None)
-          assert trace["provenance"]["kind"] == "synthetic" and "metrics-input" in requires
+          assert trace["provenance"]["kind"] == "synthetic" and requires == ["policy-constraint:resource/prefer-idle"]
           module._RUNNER.validate(derived)
           module._RUNNER.observe(derived, rows, "recorded-go")
-          try:
-              module._RUNNER.require_replay_support(derived)
-          except module._RUNNER.Difference as error:
-              assert "DEPENDENCY: metrics-input" in str(error)
-          else:
-              raise AssertionError("metrics producer must not qualify without its native input adapter")
+          module._RUNNER.require_replay_support(derived)
           (capture / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
-          (capture / "stored-validation.json").write_text(json.dumps({"status":"captured", "events":len(rows), "requires":requires, "paired":"blocked"}) + "\n")
+          (capture / "stored-validation.json").write_text(json.dumps({"status":"captured", "events":len(rows), "requires":requires, "paired":"pending", "qualification":"blocked"}) + "\n")
           PYTEST
           python3 tests/controlplane/cproute/api-differential/test_run.py
       - name: Compare the actual API adapters
@@ -424,6 +419,18 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             "${RUNNER_TEMP}/routing-api-recorded-source/derived.json" \
             --output "${RUNNER_TEMP}/routing-api-recorded-source-paired"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            "${RUNNER_TEMP}/routing-api-recorded-metrics/derived.json" \
+            --output "${RUNNER_TEMP}/routing-api-recorded-metrics-paired"
+          python3 - <<'PYMETRICS'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "routing-api-recorded-metrics-paired"
+          for engine in ("go", "rust"):
+              rows = json.loads((root / f"{engine}.json").read_text())
+              assert [row["backend"] for row in rows if row["op"] == "next"] == ["127.0.0.1:4000", "127.0.0.1:4000", "127.0.0.1:4001"]
+          (root / "input-scenario-validation.json").write_text(json.dumps({"status":"passed", "events":17, "publications":3, "qualification":"blocked: general resource policy/cadence"}) + "\n")
+          PYMETRICS
       - name: Preserve API inputs, outputs and first failure
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -437,6 +444,7 @@ jobs:
             ${{ runner.temp }}/routing-api-recorded-source
             ${{ runner.temp }}/routing-api-recorded-source-paired
             ${{ runner.temp }}/routing-api-recorded-metrics
+            ${{ runner.temp }}/routing-api-recorded-metrics-paired
           if-no-files-found: error
 
   routing-shadow:
