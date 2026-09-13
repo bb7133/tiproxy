@@ -87,12 +87,18 @@ def main():
             ("selector-settles-other-session", "retry.rs", [
                 ('if !reservation.belongs_to(&self.session)', 'if false')]),
             ("assignment-locality-always-true", "selector.rs", [
-                ('let local = candidate.health.get(&backend.source.backend_id).local;', 'let local = true;')]),
+                ('let local = candidate.health.get(&backend.source.backend_id).local;', 'let local = true;'),
+                ('let assignment = assignment(&backend.source, candidate.health.get(id).local);',
+                 'let assignment = assignment(&backend.source, true);')]),
             ("assignment-locality-always-false", "selector.rs", [
-                ('let local = candidate.health.get(&backend.source.backend_id).local;', 'let local = false;')]),
+                ('let local = candidate.health.get(&backend.source.backend_id).local;', 'let local = false;'),
+                ('let assignment = assignment(&backend.source, candidate.health.get(id).local);',
+                 'let assignment = assignment(&backend.source, false);')]),
             ("assignment-locality-from-current-config", "selector.rs", [
                 ('let local = candidate.health.get(&backend.source.backend_id).local;',
-                 'let local = candidate.policy.proxy_labels.iter().find(|(name, _)| name.as_ref() == "zone").is_none_or(|(_, zone)| zone.is_empty() || backend.source.backend.labels.get("zone").is_some_and(|value| value == zone.as_ref()));')]),
+                 'let local = candidate.policy.proxy_labels.iter().find(|(name, _)| name.as_ref() == "zone").is_none_or(|(_, zone)| zone.is_empty() || backend.source.backend.labels.get("zone").is_some_and(|value| value == zone.as_ref()));'),
+                ('let assignment = assignment(&backend.source, candidate.health.get(id).local);',
+                 'let assignment = assignment(&backend.source, candidate.policy.proxy_labels.iter().find(|(name, _)| name.as_ref() == "zone").is_none_or(|(_, zone)| zone.is_empty() || backend.source.backend.labels.get("zone").is_some_and(|value| value == zone.as_ref())));')]),
         ]
         for name, filename, replacements in cases:
             changed = originals[filename]
@@ -111,6 +117,10 @@ def main():
                 required = "tests::sources::revoked_mode_inside_real_registration_shutdown_prevents_locked_reservation ... FAILED"
                 if required not in tested.stdout:
                     raise RuntimeError(f"mutation missed the real commit-window row: {name}\n{tested.stdout}")
+            if name.startswith("assignment-locality-"):
+                required = "tests::locality::assignment_locality_uses_the_exact_health_round_not_current_config ... FAILED"
+                if required not in tested.stdout:
+                    raise RuntimeError(f"mutation missed the exact-health locality row: {name}\n{tested.stdout}")
             (base / filename).write_text(originals[filename])
             print(f"CP-ROUTE selector mutation killed: {name}", flush=True)
         baseline()
