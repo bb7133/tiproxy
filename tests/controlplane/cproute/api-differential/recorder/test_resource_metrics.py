@@ -134,7 +134,7 @@ class ResourceMetricTests(unittest.TestCase):
         _, requires = derive.derive(trace, self.rows, None)
         self.assertIn("policy-constraint:resource/prefer-idle", requires)
 
-    def test_intervening_health_scoring_keeps_unmodeled_history_explicit(self):
+    def test_stable_health_scoring_is_modeled_but_identity_change_is_explicit(self):
         trace = copy.deepcopy(self.trace)
         index = next(i for i, event in enumerate(trace["events"]) if event["op"] == "open")
         trace["events"].insert(index, {"op": "health", "at_nanos": 0, "backends": health()})
@@ -142,6 +142,9 @@ class ResourceMetricTests(unittest.TestCase):
         rows.insert(index, {"seq": index, "op": "health", "session": "", "outcome": "ok", "backend": "", "effects": []})
         for seq, row in enumerate(rows):
             row["seq"] = seq
+        _, requires = derive.derive(trace, rows, None)
+        self.assertEqual(requires, [])
+        trace["events"][index]["backends"][1]["status_port"] = 10082
         _, requires = derive.derive(trace, rows, None)
         self.assertIn("policy-constraint:resource/prefer-idle", requires)
 

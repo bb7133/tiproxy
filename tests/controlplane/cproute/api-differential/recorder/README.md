@@ -59,8 +59,9 @@ updates, and the exact 60/120-second boundaries followed by one nanosecond.
 Recordings that claim metric observations but contain no metric events keep their
 `metrics-input` dependency. The same 170-event input is now independently derived
 from each engine's public rows with no residual policy dependency. A separate
-bounded two-backend case also derives Resource redirect cadence from the same
-public packets and connection history. General multi-group and ambiguous Resource
+bounded two-backend case also derives Resource redirect cadence, stable health
+refresh scoring and same-update retention from the same public packets and
+connection history. General multi-group and ambiguous Resource
 effect/cadence qualification remains incomplete and separately blocked.
 
 CI pairs the synthetic real-router producer's 17 events/three publications and
@@ -281,8 +282,11 @@ connection count. It distinguishes Go's year-one zero time from Unix epoch zero,
 retains same-update snapshots, handles one-nanosecond changes and uses the strict
 60/120-second expiry boundaries. Policy transitions reset factor lifetimes, and
 the bounded model includes the config-time scoring call that can seed a recreated
-factor from the retained whole packet. Incomplete rows, unsupported group shapes,
-retries and intervening health or unsupported tick scoring keep the explicit
+factor from the retained whole packet. A whole health refresh can likewise seed
+or retain that cache when the same two healthy members, metric identities and
+factor inputs remain unchanged; its observed and proposed-failover scoring views
+are then equal. Incomplete rows, topology/failover changes, unsupported group
+shapes, retries and unsupported tick scoring keep the explicit
 `policy-constraint:resource/prefer-idle` dependency. The 170-event metric-time
 fixture and existing 17-event metrics-producer trace now derive their choices
 independently from both engines with no dependency; both remain synthetic and do
@@ -290,12 +294,14 @@ not count toward the frozen 18-slot corpus.
 
 `resource_cadence_smoke.py` fixes six public connections to the high-CPU backend,
 then derives the production Resource factor pair and 10/s migration cadence. It
-checks the exact 100 ms boundary, a refused request that does not consume the
-one-acceptance budget, successful callback ownership, and the CPU negative-advice
-guard after current estimates cross. A complete supported tick preserves factor
-cache lineage for later routing; incomplete metric ownership or any unsupported
-shape keeps `migration-cadence` instead of copying observed effects. The scenario
-is synthetic adapter evidence and does not qualify a recording slot.
+checks the stable health refresh's two scoring views. When a later changed packet
+has the same update time, the prior factor snapshot remains. It also covers the
+exact 100 ms boundary, a refused request that does not consume the one-acceptance
+budget, successful callback ownership, and the CPU negative-advice guard after
+current estimates cross. A complete supported tick preserves factor cache lineage;
+incomplete metric ownership or any unsupported shape keeps `migration-cadence`
+instead of copying observed effects. The scenario is synthetic adapter evidence
+and does not qualify a recording slot.
 
 `status_cadence_smoke.py` extends constrained Connection histories to unhealthy
 status migration. The first unhealthy scoring call captures its input-derived

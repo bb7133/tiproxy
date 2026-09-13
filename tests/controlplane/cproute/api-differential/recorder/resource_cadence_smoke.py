@@ -1,6 +1,7 @@
 # Copyright 2026 PingCAP, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Written Resource migration cadence from public metric and connection inputs."""
+import copy
 import json
 from pathlib import Path
 import sys
@@ -40,6 +41,19 @@ def make_trace():
          "samples":[{"timestamp_ms":ORIGIN // 1_000_000, "value":"0.1"}]},
     ]}
     add("metrics", 0, queries=packet)
+    # A whole health refresh invokes both observed and proposed-failover factor
+    # scoring. With stable membership and no fail list both public views are the
+    # same; the metric packet is consumed before the following Balance call.
+    add("health", 0, backends=copy.deepcopy(backends))
+    same_update = copy.deepcopy(packet)
+    left, right = same_update["cpu"]["series"]
+    left["samples"], right["samples"] = right["samples"], left["samples"]
+    for series in (left, right):
+        series["samples"][0]["timestamp_ms"] += 1
+    # The payload changes, but the QueryResult update time does not. If health
+    # scoring really consumed the prior packet, Balance must retain A as the
+    # high-CPU source instead of treating this payload as a fresh snapshot.
+    add("metrics", 0, queries=same_update)
     add("tick", 0, {"effects":[{"kind":"redirect", "session":"resource-0",
         "operation":"resource-0/1", "from":A, "to":B, "accepted":True}]})
     add("redirect_result", 1, session="resource-0", operation="resource-0/1", success=True)

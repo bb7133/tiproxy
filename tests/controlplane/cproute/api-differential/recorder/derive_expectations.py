@@ -274,11 +274,13 @@ class State:
 
     # --- inputs (router_score.go updateBackendHealth / updateGroups / group.UpdateFailover) ---
     def apply_health(self, backends):
+        prime_resource = False
         if self.metric_queries is not None and self.policy in METRIC_POLICIES:
-            # Health delivery scores observed and proposed failover views. The
-            # bounded metric model below deliberately covers selection and
-            # config calls only.
-            self.resource_metric_history_trusted = False
+            # Health delivery scores observed and proposed failover views. A
+            # stable bounded Resource group can consume those public calls;
+            # topology/failover changes remain explicit dependencies.
+            prime_resource = _stable_resource_health_update(self, backends)
+            self.resource_metric_history_trusted &= prime_resource
         self.observer_error = None
         seen = {}
         for raw in backends:
@@ -299,6 +301,11 @@ class State:
         )
         self.update_groups()
         self.update_failover()
+        if prime_resource and self.resource_metric_history_trusted:
+            # With no fail list both routeable views contain the same members.
+            # The second real scoring call sees the same metric timestamps, so
+            # the first complete factor update determines the retained state.
+            self.resource_metric_history_trusted &= _prime_resource_scoring(self)
         versions = [b.version for b in self.backends.values() if b.observed_healthy and b.version]
         if versions:
             self.retained_version = versions[-1]
@@ -442,7 +449,7 @@ class State:
             # Group.SetConfig scores the observed view while refreshing its
             # failover mask. Mirror that factor call when the group shape is in
             # the same bounded model; otherwise keep later routing explicit.
-            self.resource_metric_history_trusted &= _prime_resource_config(self)
+            self.resource_metric_history_trusted &= _prime_resource_scoring(self)
         # balance.routing-rule at runtime is ignored by the router (matchType fixed at Init).
         self.update_failover()
 
@@ -1008,8 +1015,8 @@ def _resource_advice(state, name, values, cpu_usage, source, target, counts):
     raise AssertionError(name)
 
 
-def _prime_resource_config(state):
-    """Consume the factor call made by Group.SetConfig's failover refresh."""
+def _prime_resource_scoring(state):
+    """Consume a bounded factor call made by a failover-view refresh."""
     if (state.policy != "resource" or state.fail_list or not state.unique_history
             or any(len(owners) != 1 for session in state.sessions.values()
                    for owners in (session.pending, session.assigned, session.inflight) if owners)
@@ -1023,6 +1030,40 @@ def _prime_resource_config(state):
             or any(state.backends[bid].cluster for bid in legal)):
         return False
     return _resource_factor_scores(state, legal) is not None
+
+
+def _stable_resource_health_update(state, backends):
+    """Whether a health delivery preserves the bounded Resource factor instance.
+
+    Restrict this increment to an unchanged, fully healthy two-backend group.
+    Identity, metric lookup and factor-order inputs must all remain public and
+    stable; otherwise the existing dependency is safer than reconstructing a
+    private group lifecycle or failover view.
+    """
+    if (state.policy != "resource" or not state.resource_metric_history_trusted
+            or state.fail_list or not state.unique_history or len(state.groups) != 1
+            or len(state.backends) != 2
+            or any(not backend.observed_healthy for backend in state.backends.values())):
+        return False
+    members = next(iter(state.groups.values()))
+    incoming = {}
+    for raw in backends:
+        bid = backend_id(raw)
+        if bid in incoming:
+            return False
+        incoming[bid] = raw
+    if set(incoming) != set(members) or set(members) != set(state.backends):
+        return False
+    for bid, raw in incoming.items():
+        old = state.backends[bid]
+        if (not raw.get("healthy", True)
+                or raw.get("ip", "") != old.ip
+                or raw.get("status_port", 0) != old.status_port
+                or raw.get("keyspace", "") != old.keyspace
+                or dict(raw.get("labels", {}) or {}) != old.labels
+                or bool(raw.get("local", True)) != old.local):
+            return False
+    return True
 
 
 def resource_metrics_preferred(state, session, legal):

@@ -64,7 +64,26 @@ class ResourceCadenceTests(unittest.TestCase):
         self.assertEqual(requires, [])
         self.assertEqual(derive.compare_with_reference(derived, self.trace, requires), ([], []))
         result = derive._RUNNER.compare(derived, self.rows, self.rows)
-        self.assertEqual(result, {"events":34, "violations":0, "provenance":"synthetic"})
+        self.assertEqual(result, {"events":36, "violations":0, "provenance":"synthetic"})
+
+    def test_stable_health_refresh_is_modeled_but_metric_identity_change_is_not(self):
+        health = [event for event in self.trace["events"] if event["op"] == "health"]
+        self.assertEqual(len(health), 3)
+        trace = copy.deepcopy(self.trace)
+        refresh = [event for event in trace["events"] if event["op"] == "health"][1]
+        refresh["backends"][1]["status_port"] = 10082
+        _, requires = derive.derive(trace, self.rows, None)
+        self.assertIn("migration-cadence", requires)
+        self.assertIn("policy-constraint:resource/prefer-idle", requires)
+
+    def test_same_update_retains_the_health_scored_packet(self):
+        trace = copy.deepcopy(self.trace)
+        packets = [event["queries"] for event in trace["events"]
+                   if event["op"] == "metrics"]
+        self.assertEqual(len(packets), 2)
+        packets[1]["cpu"]["updated_nanos"] += 1
+        with self.assertRaises(derive.Refuse):
+            derive.derive(trace, self.rows, None)
 
     def test_missing_early_and_wrong_resource_effects_are_rejected(self):
         rows = copy.deepcopy(self.rows)
