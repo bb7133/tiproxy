@@ -40,16 +40,17 @@ type Checkpoint struct {
 // CaptureSummary identifies the recording build and workload; qualification
 // additionally requires schema validation and replay of the derived inputs.
 type CaptureSummary struct {
-	Synthetic            bool   `json:"synthetic,omitempty"`
-	Head                 string `json:"head"`
-	Tree                 string `json:"tree"`
-	SourceDirty          string `json:"source_dirty"`
-	DurationNanos        int64  `json:"duration_nanos"`
-	PlannedDurationNanos int64  `json:"planned_duration_nanos"`
-	Completed            int64  `json:"completed_connections"`
-	Failed               int64  `json:"failed_connections"`
-	Clients              int    `json:"clients"`
-	ScriptSHA256         string `json:"script_sha256"`
+	Synthetic                 bool   `json:"synthetic,omitempty"`
+	Head                      string `json:"head"`
+	Tree                      string `json:"tree"`
+	SourceDirty               string `json:"source_dirty"`
+	DurationNanos             int64  `json:"duration_nanos"`
+	PlannedDurationNanos      int64  `json:"planned_duration_nanos"`
+	Completed                 int64  `json:"completed_connections"`
+	Failed                    int64  `json:"failed_connections"`
+	Clients                   int    `json:"clients"`
+	ScriptSHA256              string `json:"script_sha256"`
+	EnvironmentManifestSHA256 string `json:"environment_manifest_sha256,omitempty"`
 }
 
 // Write converts the recorded log into the trace v1 input file (no expect
@@ -204,11 +205,24 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 		}
 		hashes[name] = sum
 	}
+	if summary.EnvironmentManifestSHA256 != "" {
+		sum, err := fileSHA(filepath.Join(dir, "environment-manifest.json"))
+		if err != nil {
+			return "", fmt.Errorf("hash environment manifest: %w", err)
+		}
+		if sum != summary.EnvironmentManifestSHA256 {
+			return "", fmt.Errorf("environment manifest changed after preflight: got %s, want %s", sum, summary.EnvironmentManifestSHA256)
+		}
+	}
 	manifest := map[string]any{
 		"slot": slot, "attempt": attempt, "status": status, "incomplete": incomplete,
 		"capture": summary, "qualified": false, "requires": requires,
 		"events": len(events), "trace_sha256": hashes["trace"], "go_sha256": hashes["go"],
 		"archive_sha256": hashes["archive"],
+	}
+	if summary.EnvironmentManifestSHA256 != "" {
+		manifest["environment_manifest_file"] = "environment-manifest.json"
+		manifest["environment_manifest_sha256"] = summary.EnvironmentManifestSHA256
 	}
 	if err := writeJSON(filepath.Join(dir, "manifest.json"), manifest); err != nil {
 		return "", err

@@ -121,7 +121,12 @@ closed and its immutable snapshot converted and hashed. Archive write/sync/close
 errors and unsettled sessions make the capture incomplete.
 
 Files are `archive.jsonl`, `trace.json` (inputs without expectations), `go.json`,
-`manifest.json`, `proxy.toml`, and the exact `actions.json` when supplied. The manifest
+`manifest.json`, `environment-manifest.json`, `proxy.toml`, and the exact
+`actions.json` when supplied. Before it opens an attempt or starts live services,
+the recorder requires a JSON environment snapshot with the host identity, TiDB/PD/
+TiKV/Prometheus component versions and artifact hashes, binary identities, and live
+endpoints. It copies the exact source bytes exclusively into the attempt and binds
+their SHA-256 to both the capture summary and top-level manifest. The manifest also
 records source head/tree/dirty status, workload duration, completed and failed
 connection counts, script hash, event count and all three data hashes. `record.py`
 embeds the build source identity; a dirty or unidentified build is incomplete.
@@ -212,7 +217,8 @@ Run from the repository root, with build/output directories outside the source t
 ```sh
 python3 tests/controlplane/cproute/api-differential/recorder/record.py build --out /tmp/api-record-build
 /tmp/api-record-build/record -slot N01 -attempt a3 -duration 150s -clients 8 \
-  -out /path/to/new-recordings -script /path/to/actions.json -env /path/to/env.sh
+  -out /path/to/new-recordings -script /path/to/actions.json -env /path/to/env.sh \
+  -environment-manifest /path/to/environment-manifest.json
 python3 tests/controlplane/cproute/api-differential/recorder/derive_expectations.py \
   /path/to/new-recordings/N01-a3/trace.json /path/to/new-recordings/N01-a3/go.json \
   --output /path/to/new-recordings/N01-a3/derived.json

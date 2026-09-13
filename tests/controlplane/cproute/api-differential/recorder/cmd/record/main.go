@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -62,36 +63,69 @@ type Action struct {
 	Error    string   `json:"error,omitempty"` // source_error identity; "" clears the fault window
 }
 
+type environmentComponent struct {
+	Version string `json:"version"`
+	SHA256  string `json:"sha256"`
+	Length  int64  `json:"length"`
+}
+
+type environmentManifest struct {
+	GeneratedAt string `json:"generated_at"`
+	Host        struct {
+		Hostname string `json:"hostname"`
+		OS       string `json:"os"`
+		Arch     string `json:"arch"`
+	} `json:"host"`
+	Components map[string]environmentComponent `json:"components"`
+	Binaries   map[string]string               `json:"binaries"`
+	PD         struct {
+		ClientURL string `json:"client_url"`
+	} `json:"pd"`
+	TiKV struct {
+		Addr   string `json:"addr"`
+		Status string `json:"status"`
+	} `json:"tikv"`
+	Prometheus struct {
+		BaseURL string `json:"base_url"`
+	} `json:"prometheus"`
+	TiDB []struct {
+		Name   string `json:"name"`
+		SQL    string `json:"sql"`
+		Status string `json:"status"`
+	} `json:"tidb"`
+}
+
 func main() {
 	var (
-		slot      = flag.String("slot", "smoke", "trace slot id (recording-plan.tsv)")
-		attempt   = flag.String("attempt", "a1", "attempt id; a new capture never overwrites a previous one")
-		policyF   = flag.String("policy", "connection", "[balance] policy")
-		selection = flag.String("selection", "prefer-idle", "[balance] routing-policy")
-		rule      = flag.String("rule", "", "[balance] routing-rule (fixed at Init)")
-		listen    = flag.String("listen", "127.0.0.1:6000", "proxy listener(s), comma separated")
-		pd        = flag.String("pd", "127.0.0.1:2379", "PD address")
-		duration  = flag.Duration("duration", 60*time.Second, "recording duration")
-		clients   = flag.Int("clients", 8, "concurrent mysql clients")
-		pause     = flag.Duration("pause", 200*time.Millisecond, "pause between lifecycles per client")
-		sources   = flag.String("sources", "", "comma separated loopback source IPs for clients")
-		out       = flag.String("out", "", "output directory (required)")
-		script    = flag.String("script", "", "JSON file with scripted actions")
-		envSh     = flag.String("env", "", "path to slice3 env.sh for env actions")
-		tick      = flag.Duration("tick", 10*time.Millisecond, "declared rebalance tick interval")
+		slot        = flag.String("slot", "smoke", "trace slot id (recording-plan.tsv)")
+		attempt     = flag.String("attempt", "a1", "attempt id; a new capture never overwrites a previous one")
+		policyF     = flag.String("policy", "connection", "[balance] policy")
+		selection   = flag.String("selection", "prefer-idle", "[balance] routing-policy")
+		rule        = flag.String("rule", "", "[balance] routing-rule (fixed at Init)")
+		listen      = flag.String("listen", "127.0.0.1:6000", "proxy listener(s), comma separated")
+		pd          = flag.String("pd", "127.0.0.1:2379", "PD address")
+		duration    = flag.Duration("duration", 60*time.Second, "recording duration")
+		clients     = flag.Int("clients", 8, "concurrent mysql clients")
+		pause       = flag.Duration("pause", 200*time.Millisecond, "pause between lifecycles per client")
+		sources     = flag.String("sources", "", "comma separated loopback source IPs for clients")
+		out         = flag.String("out", "", "output directory (required)")
+		script      = flag.String("script", "", "JSON file with scripted actions")
+		envSh       = flag.String("env", "", "path to slice3 env.sh for env actions")
+		envManifest = flag.String("environment-manifest", "", "immutable JSON snapshot from the live environment (required)")
+		tick        = flag.Duration("tick", 10*time.Millisecond, "declared rebalance tick interval")
 	)
 	flag.Parse()
 	if *out == "" {
 		fmt.Fprintln(os.Stderr, "-out is required")
 		os.Exit(2)
 	}
-	if err := run(*slot, *attempt, *policyF, *selection, *rule, *listen, *pd, *duration, *clients, *pause, *sources, *out, *script, *envSh, *tick); err != nil {
+	if err := run(*slot, *attempt, *policyF, *selection, *rule, *listen, *pd, *duration, *clients, *pause, *sources, *out, *script, *envSh, *envManifest, *tick); err != nil {
 		fmt.Fprintln(os.Stderr, "record:", err)
 		os.Exit(1)
 	}
 }
 
-func run(slot, attempt, policyName, selection, rule, listen, pd string, duration time.Duration, clients int, pause time.Duration, sources, out, script, envSh string, tickEvery time.Duration) (runErr error) {
+func run(slot, attempt, policyName, selection, rule, listen, pd string, duration time.Duration, clients int, pause time.Duration, sources, out, script, envSh, envManifestPath string, tickEvery time.Duration) (runErr error) {
 	if duration <= 0 || tickEvery <= 0 || clients <= 0 || pause < 0 {
 		return fmt.Errorf("duration, tick and clients must be positive; pause must be nonnegative")
 	}
@@ -119,12 +153,19 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		scriptSHA = fmt.Sprintf("%x", sha256.Sum256(scriptData))
 		sort.SliceStable(actions, func(i, j int) bool { return actions[i].AtMillis < actions[j].AtMillis })
 	}
+	envManifestData, envManifestSHA, err := loadEnvironmentManifest(envManifestPath)
+	if err != nil {
+		return err
+	}
 	dir := filepath.Join(out, slot+"-"+attempt)
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
 	}
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		return err
+	}
+	if err := writeExclusiveFile(filepath.Join(dir, "environment-manifest.json"), envManifestData, 0o600); err != nil {
+		return fmt.Errorf("preserve environment manifest: %w", err)
 	}
 	lg, err := zap.NewDevelopment(zap.IncreaseLevel(zap.WarnLevel))
 	if err != nil {
@@ -356,7 +397,8 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	}
 	meta := harness.CaptureSummary{Head: sourceHead, Tree: sourceTree, SourceDirty: sourceDirty,
 		DurationNanos: sched.Elapsed().Nanoseconds(), PlannedDurationNanos: duration.Nanoseconds(),
-		Completed: wl.Completed(), Failed: wl.Failed(), Clients: clients, ScriptSHA256: scriptSHA}
+		Completed: wl.Completed(), Failed: wl.Failed(), Clients: clients, ScriptSHA256: scriptSHA,
+		EnvironmentManifestSHA256: envManifestSHA}
 	origin := sched.OriginNanos()
 	status, err := harness.Write(dir, slot, attempt, harness.TraceConfig{Policy: policyName, Selection: selection, Rule: rule, ClockOriginNanos: &origin}, sched.Log(), checkpoints, incomplete,
 		metricInputs.Observed(), meta)
@@ -383,6 +425,70 @@ func validateActions(actions []Action) error {
 		}
 	}
 	return nil
+}
+
+func loadEnvironmentManifest(path string) ([]byte, string, error) {
+	if path == "" {
+		return nil, "", errors.New("-environment-manifest is required")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("read environment manifest: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var manifest environmentManifest
+	if err := decoder.Decode(&manifest); err != nil {
+		return nil, "", fmt.Errorf("decode environment manifest: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, "", errors.New("environment manifest must contain exactly one JSON object")
+	}
+	if _, err := time.Parse(time.RFC3339, manifest.GeneratedAt); err != nil {
+		return nil, "", fmt.Errorf("environment manifest generated_at must be RFC3339: %w", err)
+	}
+	if manifest.Host.Hostname == "" || manifest.Host.OS == "" || manifest.Host.Arch == "" {
+		return nil, "", errors.New("environment manifest requires host hostname, os and arch")
+	}
+	for _, name := range []string{"pd", "tikv", "tidb", "prometheus"} {
+		component, ok := manifest.Components[name]
+		if !ok || component.Version == "" || component.Length <= 0 {
+			return nil, "", fmt.Errorf("environment manifest requires version and positive length for component %q", name)
+		}
+		decoded, err := hex.DecodeString(component.SHA256)
+		if err != nil || len(decoded) != sha256.Size {
+			return nil, "", fmt.Errorf("environment manifest component %q requires a SHA-256 digest", name)
+		}
+	}
+	for _, name := range []string{"pd", "tikv", "tidb"} {
+		if manifest.Binaries[name] == "" {
+			return nil, "", fmt.Errorf("environment manifest requires binary identity for %q", name)
+		}
+	}
+	if manifest.PD.ClientURL == "" || manifest.TiKV.Addr == "" || manifest.TiKV.Status == "" || manifest.Prometheus.BaseURL == "" {
+		return nil, "", errors.New("environment manifest requires PD, TiKV and Prometheus endpoints")
+	}
+	if len(manifest.TiDB) == 0 {
+		return nil, "", errors.New("environment manifest requires at least one TiDB instance")
+	}
+	for i, instance := range manifest.TiDB {
+		if instance.Name == "" || instance.SQL == "" || instance.Status == "" {
+			return nil, "", fmt.Errorf("environment manifest TiDB instance %d requires name, sql and status", i)
+		}
+	}
+	sum := sha256.Sum256(data)
+	return data, hex.EncodeToString(sum[:]), nil
+}
+
+func writeExclusiveFile(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	n, writeErr := f.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	return errors.Join(writeErr, f.Sync(), f.Close())
 }
 
 // ledger mirrors run.py's public assignment ledger from the recorded events so
