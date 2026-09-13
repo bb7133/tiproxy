@@ -416,6 +416,8 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/recorder/test_resource_cadence.py
           python3 tests/controlplane/cproute/api-differential/recorder/scripts/test_validate_normal.py
           python3 tests/controlplane/cproute/api-differential/recorder/scripts/test_validate_failover.py
+          python3 tests/controlplane/cproute/api-differential/recorder/scripts/test_validate_config.py
+          python3 tests/controlplane/cproute/api-differential/recorder/scripts/gen_config_scripts.py --check
       - name: Compare the actual API adapters
         run: |
           python3 tests/controlplane/cproute/api-differential/run.py \

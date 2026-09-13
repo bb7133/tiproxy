@@ -1,0 +1,116 @@
+[
+ {
+  "at_ms": 10000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 15000,
+  "kind": "config",
+  "toml": "[balance]\npolicy = \"resource\"\nrouting-policy = \"prefer-idle\"\n"
+ },
+ {
+  "at_ms": 20000,
+  "kind": "config",
+  "toml": "[balance]\npolicy = \"invalid-policy\"\n"
+ },
+ {
+  "at_ms": 25000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 30000,
+  "kind": "source_error",
+  "error": "topology_unavailable"
+ },
+ {
+  "at_ms": 40000,
+  "kind": "source_error",
+  "error": ""
+ },
+ {
+  "at_ms": 50000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 55000,
+  "kind": "env",
+  "args": [
+   "tidb-set-labels",
+   "3",
+   "cidr=127.0.0.1/32"
+  ]
+ },
+ {
+  "at_ms": 55001,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 100000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 105000,
+  "kind": "env",
+  "args": [
+   "tidb-add"
+  ]
+ },
+ {
+  "at_ms": 105001,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 150000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 155000,
+  "kind": "env",
+  "args": [
+   "tidb-set-labels",
+   "4",
+   "cidr=127.0.0.2/32"
+  ]
+ },
+ {
+  "at_ms": 155001,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 190000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 205000,
+  "kind": "env",
+  "args": [
+   "tidb-remove",
+   "4"
+  ]
+ },
+ {
+  "at_ms": 205001,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 280000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 285000,
+  "kind": "env",
+  "args": [
+   "tidb-set-labels",
+   "3",
+   "cidr=127.0.0.2/32"
+  ]
+ },
+ {
+  "at_ms": 285001,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 310000,
+  "kind": "checkpoint"
+ }
+]

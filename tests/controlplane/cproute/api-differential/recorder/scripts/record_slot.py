@@ -1,30 +1,43 @@
 #!/usr/bin/env python3
 # Copyright 2026 PingCAP, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Prepare the slice-3 environment for one normal-family slot, record one attempt, qualify it.
+"""Prepare the slice-3 environment for one normal (N0x) or config/source-change (C0x) slot, record
+one attempt, qualify it.
 
-1. Preflight: normal-slots.tsv must match the frozen recording plan row for row (policy, selection,
-   Go rule spelling, minimum duration, zero held sessions, parseable script); the attempt directory
-   and the external manifest snapshot must not exist yet.
+1. Preflight: the family table (normal-slots.tsv / config-slots.tsv) must match the frozen recording
+   plan row for row (policy, selection, Go rule spelling, minimum duration, zero held sessions,
+   parseable script; C scripts must equal gen_config_scripts.py output); the attempt directory and
+   the external manifest snapshot must not exist yet. A C row whose router close/recreate/rehydrate
+   lifecycle is still `pending:` is refused unless --trial is given (trial captures cannot qualify).
 2. Set TiDB session-token redirection and per-instance labels through env.sh (only instances whose
    labels differ are restarted).
-3. Parse the post-mutation `env.sh manifest` output and assert redirection mode, the exact label map,
-   running instances and config identity; write exactly that output as the exclusive snapshot.
-4. Run the built recorder, then validate_normal.py: the raw capture gate (manifest status, clean
-   build, slot/attempt, plan minimums, snapshot hash) AND the event-level gate. The verdict is
-   written exclusively to <attempt>/normal-validation.json; a failed or missing verdict exits non-zero
-   and the attempt must not be counted.
-Labels are restored to empty in a finally block when --clear-labels is given.
+3. Parse the post-mutation `env.sh manifest` output and assert redirection mode, the exact label map
+   (config, runtime /info and PD topology labels when reported), running instances and config
+   identity; write exactly that output as the exclusive snapshot.
+4. Run the built recorder, then the family validator (validate_normal.py / validate_config.py): the
+   raw capture gate (manifest status, clean build, slot/attempt, plan minimums, snapshot hash) AND the
+   event-level gate. The verdict is written exclusively to <attempt>/<family>-validation.json; a
+   failed or missing verdict exits non-zero and the attempt must not be counted.
+In a finally block: an added tidb-4 is removed, an instance whose runtime labels differ from its
+config labels is restarted (TiDB cannot delete runtime labels), and with --clear-labels configured
+labels are cleared.
 """
 import argparse, csv, json, os, subprocess, sys
 from pathlib import Path
 
+import gen_config_scripts
+import validate_config
 import validate_normal
 
 HERE = Path(__file__).resolve().parent
 PLAN = HERE.parent / "recording-plan.tsv"
 PLAN_RULES = {"all": "", "client-cidr": "client_cidr", "proxy-cidr": "proxy_cidr", "port": "port"}
 INSTANCES = [f"tidb-{i}" for i in range(4)]
+SOURCE_ERRORS = {"cancelled", "deadline_exceeded", "topology_unavailable"}
+FAMILIES = {  # slot prefix -> plan family, validator, verdict file, frozen redirection layer
+    "N": ("normal", validate_normal, "normal-validation.json", "off"),
+    "C": ("config-source", validate_config, "config-validation.json", "on"),
+}
 
 
 def sh(*cmd):
@@ -32,12 +45,13 @@ def sh(*cmd):
     subprocess.run(cmd, check=True)
 
 
-def preflight(rows):
+def preflight(rows, family="normal", allow_pending=False):
     problems = []
+    redirection = next(v[3] for v in FAMILIES.values() if v[0] == family)
     with open(PLAN) as f:
-        plan = {r["trace_id"]: r for r in csv.DictReader(f, delimiter="\t") if r["family"] == "normal"}
+        plan = {r["trace_id"]: r for r in csv.DictReader(f, delimiter="\t") if r["family"] == family}
     if sorted(plan) != sorted(rows):
-        problems.append(f"slots {sorted(rows)} differ from the plan's normal rows {sorted(plan)}")
+        problems.append(f"slots {sorted(rows)} differ from the plan's {family} rows {sorted(plan)}")
     for slot, r in sorted(rows.items()):
         p = plan.get(slot)
         if p is None:
@@ -49,8 +63,10 @@ def preflight(rows):
                 problems.append(f"{slot}: {k}={r[k]!r}, plan requires {v!r}")
         if not r["duration"].endswith("s") or int(r["duration"][:-1]) < int(p["min_seconds"]):
             problems.append(f"{slot}: duration {r['duration']} below plan minimum {p['min_seconds']}s")
-        if r["redirection"] != "off":
-            problems.append(f"{slot}: normal family is recorded with redirection off (frozen N(off) -> F/C(on) layering)")
+        if r["redirection"] != redirection:
+            problems.append(f"{slot}: {family} family is recorded with redirection {redirection} (frozen N(off) -> F/C(on) layering)")
+        if family == "config-source":
+            problems += config_row_problems(slot, r, allow_pending)
         if sorted(validate_normal.parse_labels(r["labels"])) != INSTANCES:
             problems.append(f"{slot}: labels must declare exactly {INSTANCES}")
         try:
@@ -64,6 +80,30 @@ def preflight(rows):
             problems.append(f"{slot}: rule {r['go_rule']!r} needs {want_listeners} listener(s)")
         if r["go_rule"] == "client_cidr" and len(r["sources"].split(",")) != 2:
             problems.append(f"{slot}: client_cidr needs two client source addresses")
+    return problems
+
+
+def config_row_problems(slot, r, allow_pending):
+    problems = []
+    labels = validate_normal.parse_labels(r["labels"])
+    if r["source_error"] not in SOURCE_ERRORS:
+        problems.append(f"{slot}: source_error must be one of {sorted(SOURCE_ERRORS)}")
+    change = ("retain_labels", "join_labels", "restore_labels")
+    if r["go_rule"] == "":
+        if any(r[k] for k in change):
+            problems.append(f"{slot}: MatchAll uses a routing-rule config change, not label changes")
+    else:
+        parsed = {k: dict(p.split("=", 1) for p in r[k].split(",") if p) for k in change}
+        if not all(parsed.values()):
+            problems.append(f"{slot}: CIDR/Port slots need retain, join and restore labels")
+        elif parsed["restore_labels"] != labels["tidb-3"]:
+            problems.append(f"{slot}: restore_labels must equal tidb-3's declared labels {labels['tidb-3']}")
+        elif parsed["join_labels"] != labels["tidb-2"] or parsed["retain_labels"] == labels["tidb-3"]:
+            problems.append(f"{slot}: join must use tidb-2's group labels and retain must change tidb-3's value")
+    if r["lifecycle"].startswith("pending:") and not allow_pending:
+        problems.append(f"{slot}: router close/recreate/rehydrate lifecycle is a pending placeholder; C freeze refused")
+    if (HERE / r["script"]).exists() and (HERE / r["script"]).read_text() != gen_config_scripts.render(r):
+        problems.append(f"{slot}: {r['script']} differs from gen_config_scripts.py output")
     return problems
 
 
@@ -81,11 +121,22 @@ def check_manifest(manifest, row):
             problems.append(f"{name} is not running")
         if not t.get("config_sha256"):
             problems.append(f"{name} has no config identity")
-        if t.get("labels") != labels[name]:
-            problems.append(f"{name} labels {t.get('labels')} differ from declared {labels[name]}")
+        for key in ("labels", "runtime_labels", "topology_labels"):
+            if key in t and t[key] != labels[name]:
+                problems.append(f"{name} {key} {t[key]} differ from declared {labels[name]}")
         if t.get("session_token_signing") is not (row["redirection"] == "on"):
             problems.append(f"{name} session_token_signing={t.get('session_token_signing')} but redirection={row['redirection']}")
     return problems
+
+
+def restore_environment(env):
+    """Undo in-trace topology/label mutations even when the capture was interrupted."""
+    tidb = json.loads(subprocess.run([env, "manifest"], check=True, capture_output=True, text=True).stdout)["tidb"]
+    for t in tidb:
+        if t["name"] not in INSTANCES:
+            sh(env, "tidb-remove", t["name"].removeprefix("tidb-"))
+        elif t.get("runtime_labels") is not None and t["runtime_labels"] != t.get("labels"):
+            sh(env, "tidb-restart", t["name"].removeprefix("tidb-"))
 
 
 def write_exclusive(path, data):
@@ -102,9 +153,13 @@ def main():
     ap.add_argument("--env", required=True, help="slice3 env.sh")
     ap.add_argument("--out", required=True)
     ap.add_argument("--clear-labels", action="store_true")
+    ap.add_argument("--trial", action="store_true", help="allow a pending C lifecycle placeholder (capture cannot qualify)")
     args = ap.parse_args()
-    rows = validate_normal.slot_rows()
-    problems = preflight(rows)
+    if args.slot[:1] not in FAMILIES:
+        sys.exit(f"unknown slot family {args.slot}")
+    family, validator, verdict_name, _ = FAMILIES[args.slot[:1]]
+    rows = validator.slot_rows()
+    problems = preflight(rows, family, allow_pending=args.trial)
     if args.slot not in rows:
         problems.append(f"unknown slot {args.slot}")
     out = Path(args.out)
@@ -140,15 +195,16 @@ def main():
         rc = subprocess.run(cmd).returncode
         if not (attempt_dir / "trace.json").exists():
             sys.exit(f"recorder exited {rc} without a trace")
-        problems, contexts = validate_normal.validate_dir(args.slot, args.attempt, attempt_dir, snapshot)
-        verdict = {"slot": args.slot, "attempt": args.attempt, "validator": "validate_normal.py",
-                   "passed": not problems, "problems": problems, "contexts": contexts}
-        write_exclusive(attempt_dir / "normal-validation.json", (json.dumps(verdict, indent=2) + "\n").encode())
+        problems, contexts = validator.validate_dir(args.slot, args.attempt, attempt_dir, snapshot)
+        verdict = {"slot": args.slot, "attempt": args.attempt, "validator": Path(validator.__file__).name,
+                   "trial": args.trial, "passed": not problems and not args.trial, "problems": problems, "contexts": contexts}
+        write_exclusive(attempt_dir / verdict_name, (json.dumps(verdict, indent=2) + "\n").encode())
         for p in problems:
             print("FAIL:", p)
-        print("normal validation", "PASS" if not problems else "FAILED", flush=True)
-        sys.exit(rc or (1 if problems else 0))
+        print(family, "validation", "PASS" if verdict["passed"] else "FAILED", flush=True)
+        sys.exit(rc or (0 if verdict["passed"] else 1))
     finally:
+        restore_environment(args.env)
         if args.clear_labels:
             for name in INSTANCES:
                 if labels[name]:
