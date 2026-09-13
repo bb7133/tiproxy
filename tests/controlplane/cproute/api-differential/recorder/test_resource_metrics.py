@@ -127,6 +127,13 @@ class ResourceMetricTests(unittest.TestCase):
             _, requires = derive.derive(trace, rows, None)
             self.assertIn("policy-constraint:resource/prefer-idle", requires)
 
+    def test_shared_public_metric_owner_keeps_the_policy_dependency(self):
+        trace = copy.deepcopy(self.trace)
+        health_event = next(event for event in trace["events"] if event["op"] == "health")
+        health_event["backends"][1]["status_port"] = health_event["backends"][0]["status_port"]
+        _, requires = derive.derive(trace, self.rows, None)
+        self.assertIn("policy-constraint:resource/prefer-idle", requires)
+
     def test_intervening_health_scoring_keeps_unmodeled_history_explicit(self):
         trace = copy.deepcopy(self.trace)
         index = next(i for i, event in enumerate(trace["events"]) if event["op"] == "open")

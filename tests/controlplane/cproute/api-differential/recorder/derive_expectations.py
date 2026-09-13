@@ -23,9 +23,9 @@ Public semantics mirrored (file:line at the reviewed tree):
   excluded (group.go:352-386); the `random` selection may return any of them
   (factor_balance.go:255-279); `prefer-idle` evicts by factor advice and is derivable
   from public inputs plus each engine's own public connection history for `connection`.
-  Bounded two-backend Resource/prefer-idle cases are derived from whole public
-  CPU, memory and health metric packets; other Resource/Location advice remains
-  a policy-constraint.
+  Bounded two-backend Resource/prefer-idle choices and migration ticks are
+  derived from whole public CPU, memory and health metric packets; other
+  Resource/Location advice remains a policy-constraint.
 - failover guard is evaluated per group: the list is ignored for a group only when it would
   leave that group without a routeable backend (group.go:286-341); the timeout does not
   gate the marking (router.go:160-165, Healthy = observed && not in failover).
@@ -36,6 +36,8 @@ Public semantics mirrored (file:line at the reviewed tree):
 - Connection migration: shared constrained assignments determine the pair,
   rate, physical insertion order, accepted-request cadence and failure cooldown.
   Non-unique histories and distinguishable tied pairs remain migration dependencies.
+- Resource migration: the same rules are derived for a complete two-backend,
+  single-group public metric history; unsupported factor calls remain dependencies.
 """
 
 import argparse
@@ -243,7 +245,7 @@ class State:
         self.status_history_trusted = self.policy == "connection"
         self.clock_origin = config.get("clock_origin_nanos", 1_700_000_000_000_000_000)
         self.metric_queries = None  # latest whole public metrics publication
-        self.resource_rates = {"health": 0.0, "memory": 0.0, "cpu": 0.0}
+        self.resource_rates = {"health": 0.0, "memory": 0.0, "cpu": 0.0, "location": 0.0}
         self.reset_resource_metrics()
         self.resource_metric_history_trusted = True
         if self.rule not in {"", "port"} | CIDR_RULES:
@@ -426,7 +428,7 @@ class State:
             if type(v) not in (int, float) or not math.isfinite(v) or v < 0:
                 raise Refuse("balance.status.migrations-per-second must be finite and non-negative")
             self.status_rate = float(v)
-        for factor in ("health", "memory", "cpu"):
+        for factor in ("health", "memory", "cpu", "location"):
             v = toml_get(doc, "balance", factor, "migrations-per-second")
             if v is not None:
                 if type(v) not in (int, float) or not math.isfinite(v) or v < 0:
@@ -731,13 +733,17 @@ def _metric_rows(state, result, legal, kind):
         if set(labels) != {"instance"} or labels["instance"] in by_instance:
             return None
         by_instance[labels["instance"]] = series["samples"]
-    rows = {}
+    rows, claimed = {}, set()
     for bid in legal:
         backend = state.backends[bid]
         if (not backend.ip or type(backend.status_port) is not int
                 or backend.status_port <= 0):
             return None
-        samples = by_instance.get(f"{backend.ip}:{backend.status_port}")
+        instance = f"{backend.ip}:{backend.status_port}"
+        if instance in claimed:
+            return None  # one public metric row cannot prove two backend identities
+        claimed.add(instance)
+        samples = by_instance.get(instance)
         if not samples:
             return None
         rows[bid] = samples
@@ -957,6 +963,51 @@ def _resource_factor_scores(state, legal):
     return counts, health, memory, cpu, cpu_usage
 
 
+def _resource_advice(state, name, values, cpu_usage, source, target, counts):
+    """Mirror one Resource factor's BalanceCount result as (advice, rate)."""
+    if name == "health":
+        snapshot = state.health_snapshots.get(source, (0, 0, 0))
+        if values[source] - values[target] <= 1:
+            return "neutral", 0.0
+        rate = state.resource_rates["health"] or snapshot[2]
+        return "positive", rate
+    if name == "memory":
+        snapshot = state.memory_snapshots.get(source, (0, 0, 0, 0, 0))
+        if values[source] - values[target] <= 1:
+            return "neutral", 0.0
+        rate = state.resource_rates["memory"] or snapshot[4]
+        return "positive", rate
+    if name == "cpu":
+        if source not in cpu_usage or target not in cpu_usage:
+            return "neutral", 0.0
+        from_average, from_latest = cpu_usage[source]
+        to_average, to_latest = cpu_usage[target]
+        per_connection = state.cpu_usage_per_conn
+        negative = ((1.3 - (to_average + per_connection)) * 1.1
+                    < 1.3 - (from_average - per_connection)
+                    or (1.3 - (to_latest + per_connection)) * 1.1
+                    < 1.3 - (from_latest - per_connection))
+        if negative:
+            return "negative", 0.0
+        neutral = (1.3 - to_average < (1.3 - from_average) * 1.2
+                   or 1.3 - to_latest < (1.3 - from_latest) * 1.2)
+        if neutral:
+            return "neutral", 0.0
+        rate = state.resource_rates["cpu"] if state.resource_rates["cpu"] > 0 else 1 / per_connection / 600
+        return "positive", rate
+    if name == "location":
+        return "positive", state.resource_rates["location"] or 1.0
+    if name == "conn":
+        ratio, rate = state.recorded_connections.ratio, state.recorded_connections.rate
+        if float(counts[source]) <= float(counts[target] + 1) * ratio:
+            return "neutral", 0.0
+        if rate <= 0:
+            rate = max(0.0, (float(counts[source] + counts[target] + 1) / (1 + ratio)
+                             - float(counts[target] + 1)) / 120)
+        return "positive", rate
+    raise AssertionError(name)
+
+
 def _prime_resource_config(state):
     """Consume the factor call made by Group.SetConfig's failover refresh."""
     if (state.policy != "resource" or state.fail_list or not state.unique_history
@@ -1002,47 +1053,96 @@ def resource_metrics_preferred(state, session, legal):
     if factors is None:
         return None
     counts, health, memory, cpu, cpu_usage = factors
-    scores = {bid: (health[bid], memory[bid], cpu[bid], 0, min(counts[bid], 65535)) for bid in legal}
+    conn_scores = {bid: min(counts[bid], 65535) for bid in legal}
+    scores = {bid: (health[bid], memory[bid], cpu[bid], 0, conn_scores[bid]) for bid in legal}
     target = min(legal, key=lambda bid: scores[bid])
     source = next(bid for bid in legal if bid != target)
     if scores[source] == scores[target]:
         return sorted(legal)
     factors = (("health", health), ("memory", memory), ("cpu", cpu),
-               ("location", {bid: 0 for bid in legal}), ("conn", counts))
+               ("location", {bid: int(not state.backends[bid].local) for bid in legal}),
+               ("conn", conn_scores))
     for name, values in factors:
         if values[source] < values[target]:
             return sorted(legal)
         if values[source] == values[target]:
             continue
-        positive = False
-        if name == "health":
-            snapshot = state.health_snapshots.get(source, (0, 0, 0))
-            positive = values[source] - values[target] > 1 and (
-                state.resource_rates["health"] > 0 or snapshot[2] > 0.0001)
-        elif name == "memory":
-            snapshot = state.memory_snapshots.get(source, (0, 0, 0, 0, 0))
-            positive = values[source] - values[target] > 1 and (
-                state.resource_rates["memory"] > 0 or snapshot[4] > 0.0001)
-        elif name == "cpu":
-            from_average, from_latest = cpu_usage[source]
-            to_average, to_latest = cpu_usage[target]
-            per_connection = state.cpu_usage_per_conn
-            negative = ((1.3 - (to_average + per_connection)) * 1.1 < 1.3 - (from_average - per_connection)
-                        or (1.3 - (to_latest + per_connection)) * 1.1 < 1.3 - (from_latest - per_connection))
-            neutral = (1.3 - to_average < (1.3 - from_average) * 1.2
-                       or 1.3 - to_latest < (1.3 - from_latest) * 1.2)
-            rate = state.resource_rates["cpu"] if state.resource_rates["cpu"] > 0 else 1 / per_connection / 600
-            positive = not negative and not neutral and rate > 0.0001
-        elif name == "conn":
-            ratio, rate = state.recorded_connections.ratio, state.recorded_connections.rate
-            if float(counts[source]) > float(counts[target] + 1) * ratio:
-                if rate <= 0:
-                    rate = max(0.0, (float(counts[source] + counts[target] + 1) / (1 + ratio)
-                                     - float(counts[target] + 1)) / 120)
-                positive = rate > 0.0001
-        if positive:
+        advice, rate = _resource_advice(state, name, values, cpu_usage, source, target, counts)
+        if advice == "positive" and rate > 0.0001:
             return [target]
     return sorted(legal)
+
+
+def derive_resource_redirects(state, refused):
+    """Predict one bounded two-backend Resource balance tick from public inputs."""
+    if (state.policy != "resource" or not state.resource_metric_history_trusted
+            or state.metric_queries is None or state.recorded_connections.label_name
+            or not state.unique_history or "migration-cadence" in state.requires
+            or state.ambiguous_group_clocks or state.fail_list or len(state.groups) != 1
+            or any(b.ambiguous for b in state.backends.values())
+            or any(len(owners) != 1 for session in state.sessions.values()
+                   for owners in (session.pending, session.assigned, session.inflight) if owners)):
+        return None
+    group, members = next(iter(state.groups.items()))
+    legal = sorted(members)
+    if (len(legal) != 2 or any(not state.healthy(bid) for bid in legal)
+            or any(state.backends[bid].cluster for bid in legal)):
+        return None
+    factors = _resource_factor_scores(state, legal)
+    if factors is None:
+        return None
+    counts, health, memory, cpu, cpu_usage = factors
+    location = {bid: int(not state.backends[bid].local) for bid in legal}
+    conn_scores = {bid: min(counts[bid], 65535) for bid in legal}
+    values = (("health", health), ("memory", memory), ("cpu", cpu),
+              ("location", location), ("conn", conn_scores))
+    scores = {bid: tuple(factor[bid] for _, factor in values) for bid in legal}
+    target = min(legal, key=lambda bid: scores[bid])
+    source = next(bid for bid in legal if bid != target)
+    if scores[source] == scores[target]:
+        return []
+    _, physical = state.connection_counts()
+    if counts[source] <= 0 or physical[source] <= 0:
+        return []
+    rate = 0.0
+    for name, factor in values:
+        if factor[source] < factor[target]:
+            break
+        advice, candidate_rate = _resource_advice(
+            state, name, factor, cpu_usage, source, target, counts)
+        if advice == "negative":
+            break
+        if factor[source] > factor[target] and advice == "positive" and candidate_rate > 0.0001:
+            rate = candidate_rate
+            break
+    if rate <= 0.0001 or state.backends[source].keyspace != state.backends[target].keyspace:
+        return []
+    interval = int(1_000_000_000.0 / rate)
+    if interval <= 0:
+        return None
+    last = state.group_last_redirect.get(group)
+    if interval < 20_000_000:
+        budget = (10_000_000 - 1) // interval + 1
+    elif last is None or state.now - last >= interval:
+        budget = 1
+    else:
+        return []
+    effects = []
+    for session in sorted(state.sessions.values(), key=lambda item: item.created):
+        if budget == 0:
+            break
+        if (session.assigned != frozenset([source]) or session.force_closing
+                or session.inflight):
+            continue
+        if (session.redirect_failed and session.last_redirect is not None
+                and state.now < session.last_redirect + 3_000_000_000):
+            continue
+        accepted = session.id not in refused
+        effects.append({"kind":"redirect", "session":session.id,
+                        "operation":f"{session.id}/{session.ordinal + 1}",
+                        "from":source, "to":target, "accepted":accepted})
+        budget -= int(accepted)
+    return effects
 
 
 def derive_next(state, session, expect):
@@ -1189,12 +1289,19 @@ def derive(trace, rows, args):
                 s.assigned = frozenset([name])
                 s.created = seq
         elif op == "tick":
-            if state.metric_queries is not None and state.policy in METRIC_POLICIES:
-                # BackendsToBalance is another factor scoring call. Resource
-                # migration/cadence remains outside the bounded selection model.
-                state.resource_metric_history_trusted = False
             refused = set(event.get("refuse", []) or [])
             recorded = row.get("effects", [])
+            resource_predicted = None
+            if (state.support_redirection and state.metric_queries is not None
+                    and state.policy in METRIC_POLICIES):
+                # Every enabled tick calls BackendsToBalance even when there is
+                # no physical source connection. Preserve the factor cache only
+                # when the complete bounded Resource call is independently
+                # modeled; other metric-policy histories stay explicit.
+                if state.policy == "resource":
+                    resource_predicted = derive_resource_redirects(state, refused)
+                if resource_predicted is None:
+                    state.resource_metric_history_trusted = False
             if state.support_redirection:
                 for group, members in state.groups.items():
                     if len(members) > 1:
@@ -1208,7 +1315,14 @@ def derive(trace, rows, args):
                 and any(state.migration_targets(bid) for bid in s.assigned)
                 for s in state.sessions.values()
             )
-            predicted = derive_connection_redirects(state, refused) if migration_possible else []
+            if not migration_possible:
+                predicted = []
+            elif state.policy == "connection":
+                predicted = derive_connection_redirects(state, refused)
+            elif state.policy == "resource":
+                predicted = resource_predicted
+            else:
+                predicted = None
             modeled = predicted is not None
             if migration_possible and not modeled:
                 state.requires.add("migration-cadence")
@@ -1240,7 +1354,8 @@ def derive(trace, rows, args):
                 if not state.unique_history and not modeled:
                     state.requires.add("effects-v2")
             if modeled and _RUNNER.causal([ef for ef in recorded if ef["kind"] == "redirect"]) != _RUNNER.causal(predicted):
-                raise Refuse(f"seq {seq}: redirect effects contradict the input-derived connection cadence: expected {predicted}")
+                cadence = "resource" if state.policy == "resource" else "connection"
+                raise Refuse(f"seq {seq}: redirect effects contradict the input-derived {cadence} cadence: expected {predicted}")
             if not state.unique_history and migration_possible and not modeled:
                 # A possible migration after non-unique routing depends on
                 # each engine's assignments. No session/destination means no

@@ -406,6 +406,7 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/recorder/test_cadence.py
           python3 tests/controlplane/cproute/api-differential/recorder/test_status_cadence.py
           python3 tests/controlplane/cproute/api-differential/recorder/test_resource_metrics.py
+          python3 tests/controlplane/cproute/api-differential/recorder/test_resource_cadence.py
       - name: Compare the actual API adapters
         run: |
           python3 tests/controlplane/cproute/api-differential/run.py \
@@ -503,6 +504,11 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             "${RUNNER_TEMP}/status-cadence-smoke.json" \
             --output "${RUNNER_TEMP}/routing-api-status-cadence"
+          python3 tests/controlplane/cproute/api-differential/recorder/resource_cadence_smoke.py \
+            "${RUNNER_TEMP}/resource-cadence-smoke.json"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            "${RUNNER_TEMP}/resource-cadence-smoke.json" \
+            --output "${RUNNER_TEMP}/routing-api-resource-cadence"
           python3 - <<'PYCLOSE'
           import importlib.util
           import json
@@ -515,7 +521,8 @@ jobs:
           cases = [(path.parents[1] / "force-close-smoke.json", "routing-api-force-close"),
                    (Path(os.environ["RUNNER_TEMP"]) / "keyspace-smoke.json", "routing-api-keyspace"),
                    (Path(os.environ["RUNNER_TEMP"]) / "connection-cadence-smoke.json", "routing-api-cadence"),
-                   (Path(os.environ["RUNNER_TEMP"]) / "status-cadence-smoke.json", "routing-api-status-cadence")]
+                   (Path(os.environ["RUNNER_TEMP"]) / "status-cadence-smoke.json", "routing-api-status-cadence"),
+                   (Path(os.environ["RUNNER_TEMP"]) / "resource-cadence-smoke.json", "routing-api-resource-cadence")]
           for source, folder in cases:
               trace = json.loads(source.read_text())
               output = Path(os.environ["RUNNER_TEMP"]) / folder
@@ -583,6 +590,8 @@ jobs:
             ${{ runner.temp }}/connection-cadence-smoke.json
             ${{ runner.temp }}/routing-api-status-cadence
             ${{ runner.temp }}/status-cadence-smoke.json
+            ${{ runner.temp }}/routing-api-resource-cadence
+            ${{ runner.temp }}/resource-cadence-smoke.json
             ${{ runner.temp }}/routing-api-recorded-source
             ${{ runner.temp }}/routing-api-recorded-source-paired
             ${{ runner.temp }}/routing-api-recorded-metrics

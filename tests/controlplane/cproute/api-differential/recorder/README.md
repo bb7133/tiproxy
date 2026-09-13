@@ -58,8 +58,10 @@ CPU, memory and both health indicators, same-update cache retention, one-nanosec
 updates, and the exact 60/120-second boundaries followed by one nanosecond.
 Recordings that claim metric observations but contain no metric events keep their
 `metrics-input` dependency. The same 170-event input is now independently derived
-from each engine's public rows with no residual policy dependency. General
-resource effect/cadence qualification remains incomplete and separately blocked.
+from each engine's public rows with no residual policy dependency. A separate
+bounded two-backend case also derives Resource redirect cadence from the same
+public packets and connection history. General multi-group and ambiguous Resource
+effect/cadence qualification remains incomplete and separately blocked.
 
 CI pairs the synthetic real-router producer's 17 events/three publications and
 checks its input-defined A, A, B selection sequence in both engines. This small
@@ -190,8 +192,10 @@ The following dependencies withhold a slot from acceptance:
   choose a different pair and the router does not retry another destination.
   Whole health updates replace keyspaces; missing retained sources keep their last
   delivered value. Healthy Connection balance with an already constrained shared
-  assignment history now derives exact effects as described below. Other legal
-  redirects remain withheld. No further scope approval is needed to implement
+  assignment history now derives exact effects as described below. A bounded
+  two-backend Resource history also derives the factor-selected pair, advice,
+  rate, exact cadence and refusal budget from complete public metric packets.
+  Other legal redirects remain withheld. No further scope approval is needed to implement
   the remaining cadence/effect eligibility requirement.
 
 Additional planned work includes timer boundary expansion, scripted refusal/delayed
@@ -263,7 +267,7 @@ the real adapters and derives identical expectations independently from each out
 Python counterexample rows are written test data and are not engine evidence.
 
 This increment deliberately retains the existing migration dependency for
-non-unique assignment histories, resource/location migration factors,
+non-unique assignment histories, unmodeled resource/location migration factors,
 or tied pairs with different legal effects. It also refuses to seed a cadence
 clock from an earlier unverified migration. A synthetic timing scenario is not a
 qualifying recording and does not freeze the remaining 18-slot manifest.
@@ -278,11 +282,20 @@ retains same-update snapshots, handles one-nanosecond changes and uses the stric
 60/120-second expiry boundaries. Policy transitions reset factor lifetimes, and
 the bounded model includes the config-time scoring call that can seed a recreated
 factor from the retained whole packet. Incomplete rows, unsupported group shapes,
-retries and intervening health/tick scoring keep the explicit
+retries and intervening health or unsupported tick scoring keep the explicit
 `policy-constraint:resource/prefer-idle` dependency. The 170-event metric-time
 fixture and existing 17-event metrics-producer trace now derive their choices
 independently from both engines with no dependency; both remain synthetic and do
 not count toward the frozen 18-slot corpus.
+
+`resource_cadence_smoke.py` fixes six public connections to the high-CPU backend,
+then derives the production Resource factor pair and 10/s migration cadence. It
+checks the exact 100 ms boundary, a refused request that does not consume the
+one-acceptance budget, successful callback ownership, and the CPU negative-advice
+guard after current estimates cross. A complete supported tick preserves factor
+cache lineage for later routing; incomplete metric ownership or any unsupported
+shape keeps `migration-cadence` instead of copying observed effects. The scenario
+is synthetic adapter evidence and does not qualify a recording slot.
 
 `status_cadence_smoke.py` extends constrained Connection histories to unhealthy
 status migration. The first unhealthy scoring call captures its input-derived
