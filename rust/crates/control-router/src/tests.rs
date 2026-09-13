@@ -54,6 +54,7 @@ mod locality;
 mod migration;
 mod registration;
 mod resource;
+mod resource_release;
 mod sources;
 mod worker;
 

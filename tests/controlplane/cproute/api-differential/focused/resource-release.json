@@ -1,0 +1,7 @@
+{
+  "suite": "resource-release",
+  "contract": "a9c497c3 section 4",
+  "cycles": 100,
+  "drain_millis": 2000,
+  "cases": ["failed_creation", "refused_effect_cleanup", "shutdown_outstanding", "repeated_create_close"]
+}
