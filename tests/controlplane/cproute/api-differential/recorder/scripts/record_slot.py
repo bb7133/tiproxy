@@ -10,7 +10,8 @@
    labels differ are restarted).
 3. Parse the post-mutation `env.sh manifest` output and assert redirection mode, the exact label map,
    running instances and config identity; write exactly that output as the exclusive snapshot.
-4. Run the built recorder, then the event-level validator (validate_normal.py). The verdict is
+4. Run the built recorder, then validate_normal.py: the raw capture gate (manifest status, clean
+   build, slot/attempt, plan minimums, snapshot hash) AND the event-level gate. The verdict is
    written exclusively to <attempt>/normal-validation.json; a failed or missing verdict exits non-zero
    and the attempt must not be counted.
 Labels are restored to empty in a finally block when --clear-labels is given.
@@ -48,8 +49,8 @@ def preflight(rows):
                 problems.append(f"{slot}: {k}={r[k]!r}, plan requires {v!r}")
         if not r["duration"].endswith("s") or int(r["duration"][:-1]) < int(p["min_seconds"]):
             problems.append(f"{slot}: duration {r['duration']} below plan minimum {p['min_seconds']}s")
-        if r["redirection"] not in ("on", "off"):
-            problems.append(f"{slot}: redirection must be on or off")
+        if r["redirection"] != "off":
+            problems.append(f"{slot}: normal family is recorded with redirection off (frozen N(off) -> F/C(on) layering)")
         if sorted(validate_normal.parse_labels(r["labels"])) != INSTANCES:
             problems.append(f"{slot}: labels must declare exactly {INSTANCES}")
         try:
@@ -139,7 +140,7 @@ def main():
         rc = subprocess.run(cmd).returncode
         if not (attempt_dir / "trace.json").exists():
             sys.exit(f"recorder exited {rc} without a trace")
-        problems, contexts = validate_normal.validate_dir(args.slot, attempt_dir)
+        problems, contexts = validate_normal.validate_dir(args.slot, args.attempt, attempt_dir, snapshot)
         verdict = {"slot": args.slot, "attempt": args.attempt, "validator": "validate_normal.py",
                    "passed": not problems, "problems": problems, "contexts": contexts}
         write_exclusive(attempt_dir / "normal-validation.json", (json.dumps(verdict, indent=2) + "\n").encode())
