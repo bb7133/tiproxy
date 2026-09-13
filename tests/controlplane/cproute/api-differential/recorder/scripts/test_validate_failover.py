@@ -170,6 +170,19 @@ def drop(t, predicate):
     return t
 
 
+def move_after(t, predicate, anchor, anchor_ordinal=1):
+    t = copy.deepcopy(t)
+    moving = [(event, result) for event, result in zip(t.events, t.go) if predicate(event, result)]
+    remaining = [(event, result) for event, result in zip(t.events, t.go) if not predicate(event, result)]
+    anchors = [i for i, (event, result) in enumerate(remaining) if anchor(event, result)]
+    insert = anchors[anchor_ordinal - 1] + 1
+    pairs = remaining[:insert] + moving + remaining[insert:]
+    t.events = [event for event, _ in pairs]
+    t.go = [result for _, result in pairs]
+    t.resequence()
+    return t
+
+
 class FailoverValidatorTests(unittest.TestCase):
     def assertFails(self, trace, needle):
         problems = trace.result()
@@ -250,6 +263,30 @@ class FailoverValidatorTests(unittest.TestCase):
                 if effect.get("operation") == "held-2/1":
                     effect["from"] = "default/127.0.0.1:4000"
         self.assertFails(trace, "no accepted redirect completed after its session closed")
+
+        def clear(event, _):
+            return event.get("op") == "config" and event.get("toml") == "[proxy]\nfail-backend-list = []\n"
+
+        for slot in ("F02", "F04"):
+            with self.subTest(slot=slot, mutation="accepted_after_first_clear"):
+                trace = move_after(
+                    positive(slot),
+                    lambda event, result: event.get("operation") == "held-1/2"
+                    or any(effect.get("operation") == "held-1/2" for effect in result.get("effects", [])),
+                    clear,
+                )
+                self.assertFails(trace, "no later accepted redirect for the refused session")
+
+            with self.subTest(slot=slot, mutation="late_issuance_after_reentry_clear"):
+                trace = move_after(
+                    positive(slot),
+                    lambda event, result: event.get("operation") == "held-2/1"
+                    or (event.get("op") == "close" and event.get("session") == "held-2")
+                    or any(effect.get("operation") == "held-2/1" for effect in result.get("effects", [])),
+                    clear,
+                    anchor_ordinal=2,
+                )
+                self.assertFails(trace, "no accepted redirect completed after its session closed")
 
     def test_health_guard_and_final_ledger_are_required(self):
         trace = positive("F02")

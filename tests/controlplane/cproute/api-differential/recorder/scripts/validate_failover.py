@@ -158,9 +158,13 @@ def validate(row, trace, go):
             problems.append("unchanged activation did not repeat the same target and timeout")
         if any(first[0] < i < repeat[0] and not targets for i, targets, _ in config_rows):
             problems.append("failover was cleared before the unchanged activation")
-        if not any(repeat[0] < i < reentry[0] and not targets for i, targets, _ in config_rows):
+        first_clear = next(((i, targets, timeout) for i, targets, timeout in config_rows
+                            if repeat[0] < i < reentry[0]), None)
+        if first_clear is None or first_clear[1]:
             problems.append("no clear between unchanged activation and reentry")
-        if not any(i > reentry[0] and not targets for i, targets, _ in config_rows):
+        reentry_clear = next(((i, targets, timeout) for i, targets, timeout in config_rows
+                              if i > reentry[0]), None)
+        if reentry_clear is None or reentry_clear[1]:
             problems.append("reentered failover was not cleared")
         for name, current in (("initial activation", first), ("reentry", reentry)):
             i, targets, _ = current
@@ -172,12 +176,15 @@ def validate(row, trace, go):
                 problems.append(f"{name} target {sorted(targets)} was not assigned at the preceding checkpoint {sorted(assigned)}")
 
         first_target = next(iter(first[1]))
+        first_window_end = first_clear[0] if first_clear is not None else len(events)
         refused = [(i, effect) for i, effect in operations.values()
-                   if i > first[0] and effect.get("kind") == "redirect" and not effect.get("accepted")
+                   if first[0] < i < first_window_end
+                   and effect.get("kind") == "redirect" and not effect.get("accepted")
                    and backend_address(effect.get("from", "")) == first_target]
         accepted_after_refusal = False
         for refused_i, effect in refused:
-            if any(i > refused_i and later.get("kind") == "redirect" and later.get("accepted")
+            if any(refused_i < i < first_window_end
+                   and later.get("kind") == "redirect" and later.get("accepted")
                    and later.get("session") == effect.get("session")
                    and backend_address(later.get("from", "")) == first_target
                    for i, later in operations.values()):
@@ -189,9 +196,12 @@ def validate(row, trace, go):
             problems.append("no later accepted redirect for the refused session")
 
         reentry_target = next(iter(reentry[1]))
+        reentry_window_end = reentry_clear[0] if reentry_clear is not None else len(events)
         late = []
         for operation, (issued_i, effect) in operations.items():
-            if issued_i <= reentry[0] or effect.get("kind") != "redirect" or not effect.get("accepted"):
+            if not reentry[0] < issued_i < reentry_window_end:
+                continue
+            if effect.get("kind") != "redirect" or not effect.get("accepted"):
                 continue
             if backend_address(effect.get("from", "")) != reentry_target:
                 continue
