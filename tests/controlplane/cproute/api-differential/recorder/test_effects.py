@@ -87,6 +87,12 @@ class RelativeCloseTests(unittest.TestCase):
         with self.assertRaises(derive.Refuse):
             derive.derive(trace,rows,None)
 
+    def test_one_shot_refusal_without_an_eligible_effect_is_refused(self):
+        trace, rows = example(B)
+        trace["events"][5]["refuse_next"] = 1
+        with self.assertRaisesRegex(derive.Refuse, "one-shot refusal"):
+            derive.derive(trace, rows, None)
+
     def test_accepted_close_survives_clear_and_reentry(self):
         trace, rows = example(A)
         ledger = runner.PublicConnections(trace["config"])
@@ -107,13 +113,12 @@ class RelativeCloseTests(unittest.TestCase):
         c.apply({"op":"redirect_result","session":"s","operation":"s/1","success":True},{})
         self.assertEqual(c.force_close_effects({"op":"tick"},[B]),[effect(B,2,True)])
 
-    def test_due_constraint_cannot_replace_redirect_cadence(self):
+    def test_due_constraint_composes_with_engine_relative_redirect_cadence(self):
         trace, rows = example(A)
         for b in trace["events"][0]["backends"]: b["support_redirection"] = True
-        # All ticks can migrate to B, so the deriver must retain that dependency.
-        _, requires = derive.derive(trace,example(B)[1],None)
-        self.assertIn("migration-cadence",requires)
-        self.assertIn("effects-v2",requires)
+        derived, requires = derive.derive(trace,example(B)[1],None)
+        self.assertEqual(requires, [])
+        self.assertTrue(any("redirect_cadence" in e["expect"] for e in derived["events"] if e["op"] == "tick"))
 
     def test_closed_random_history_does_not_poison_exact_active_effects(self):
         def backend(name, port):
@@ -199,7 +204,7 @@ class RelativeCloseTests(unittest.TestCase):
                 self.assertEqual(derive.compare_with_reference(d1,trace,r1), ([],[]))
                 runner.compare(d1,left,right)
 
-    def test_same_keyspace_and_legacy_empty_keep_the_cadence_dependency(self):
+    def test_same_keyspace_and_legacy_empty_use_relative_cadence(self):
         for keyspace in (None, "", "tenant-A"):
             with self.subTest(keyspace=keyspace):
                 trace, rows = example(B)
@@ -207,9 +212,9 @@ class RelativeCloseTests(unittest.TestCase):
                     backend["support_redirection"] = True
                     if keyspace is not None:
                         backend["keyspace"] = keyspace
-                _, requires = derive.derive(trace,rows,None)
-                self.assertIn("migration-cadence",requires)
-                self.assertIn("effects-v2",requires)
+                derived, requires = derive.derive(trace,rows,None)
+                self.assertEqual(requires, [])
+                self.assertTrue(any("redirect_cadence" in e["expect"] for e in derived["events"] if e["op"] == "tick"))
 
     def test_cross_keyspace_redirect_is_refused_even_when_the_script_refuses_it(self):
         for accepted in (True, False):
@@ -257,8 +262,148 @@ class RelativeCloseTests(unittest.TestCase):
         for backend,keyspace in zip(trace["events"][0]["backends"], ("red","blue")):
             backend.update(support_redirection=True, keyspace=keyspace)
         trace["events"][0]["backends"].append({"address":"c", "labels":{}, "keyspace":"red"})
-        _, requires = derive.derive(trace,rows,None)
-        self.assertIn("migration-cadence",requires)
+        derived, requires = derive.derive(trace,rows,None)
+        self.assertEqual(requires, [])
+        self.assertTrue(any("redirect_cadence" in e["expect"] for e in derived["events"] if e["op"] == "tick"))
+
+    def test_relative_refusal_alias_and_delayed_close_follow_each_engine(self):
+        sessions = list("abcde")
+        events = [{"op":"health", "backends":[
+            {"address":"a", "labels":{}, "support_redirection":True},
+            {"address":"b", "labels":{}, "support_redirection":True},
+        ]}]
+        for sid in sessions:
+            events += [{"op":"open", "session":sid}, {"op":"next", "session":sid},
+                       {"op":"finish", "session":sid, "success":True}]
+        tick = len(events)
+        events.append({"op":"tick", "at_nanos":1, "refuse_next":1})
+        events.append({"op":"close", "at_nanos":2, "session":"b",
+                       "effect_ref":"redirect/1"})
+        events.append({"op":"redirect_result", "at_nanos":2, "session":"b",
+                       "effect_ref":"redirect/1", "success":True})
+        for sid in "acde":
+            events.append({"op":"close", "at_nanos":3, "session":sid})
+        events += [{"op":"health", "at_nanos":4, "backends":[]},
+                   {"op":"checkpoint", "at_nanos":4}]
+        trace = {"version":1, "id":"relative-effect-alias",
+                 "config":{"policy":"connection", "selection":"random", "rule":""},
+                 "provenance":{"kind":"synthetic"}, "events":events}
+
+        def rows(assignments, rejected, accepted, mapped_close):
+            result=[]
+            for seq,event in enumerate(events):
+                sid=event.get("session", "")
+                row={"seq":seq,"op":event["op"],"session":sid,"outcome":"ok","backend":"","effects":[]}
+                if event["op"]=="next":
+                    row["backend"]=assignments[sid]
+                result.append(row)
+            result[tick]["effects"]=[
+                {"kind":"redirect","session":rejected,"operation":f"{rejected}/1",
+                 "from":A,"to":B,"accepted":False},
+                {"kind":"redirect","session":accepted,"operation":f"{accepted}/1",
+                 "from":A,"to":B,"accepted":True},
+            ]
+            result[tick+1]["session"]=accepted
+            result[tick+2]["session"]=accepted
+            for logical,actual in mapped_close.items():
+                index=next(i for i,e in enumerate(events) if e["op"]=="close" and e.get("session")==logical and i>tick+2)
+                result[index]["session"]=actual
+            result[-1].update(assignments={},conn_count=0,healthy_backend_count=0,server_version="")
+            return result
+
+        left=rows(dict(a=A,b=A,c=A,d=A,e=B),"a","b",{})
+        right=rows(dict(a=B,b=A,c=A,d=A,e=A),"b","c",{"c":"b"})
+        derived, requires = derive.derive(trace,left,None)
+        self.assertEqual(requires, [])
+        self.assertIn("redirect_cadence",derived["events"][tick]["expect"])
+        runner.compare(derived,left,right)
+        bad=copy.deepcopy(right)
+        bad[tick]["effects"][1]["to"]=A
+        with self.assertRaisesRegex(runner.Difference,"EFFECTS"):
+            runner.observe(derived,bad,"corrupt")
+        bad=copy.deepcopy(right)
+        bad[tick]["effects"]=[]
+        with self.assertRaisesRegex(runner.Difference,"EFFECTS"):
+            runner.observe(derived,bad,"corrupt")
+
+    def test_optional_callback_handles_engine_relative_cadence_time(self):
+        sessions = list("abcde")
+        events = [{"op":"health", "backends":[
+            {"address":"a", "labels":{}, "support_redirection":True},
+            {"address":"b", "labels":{}, "support_redirection":True},
+        ]}]
+        for sid in sessions:
+            events += [{"op":"open", "session":sid}, {"op":"next", "session":sid},
+                       {"op":"finish", "session":sid, "success":True}]
+        tick=len(events)
+        events += [{"op":"tick", "at_nanos":1},
+                   {"op":"redirect_result", "at_nanos":2, "session":"a",
+                    "operation":"a/1", "success":True},
+                   {"op":"tick", "at_nanos":200_000_000_000}]
+        events += [{"op":"close", "at_nanos":200_000_000_001, "session":sid}
+                   for sid in sessions]
+        events += [{"op":"health", "at_nanos":200_000_000_002, "backends":[]},
+                   {"op":"checkpoint", "at_nanos":200_000_000_002}]
+        trace={"version":1,"id":"optional-relative-callback",
+               "config":{"policy":"connection","selection":"random","rule":""},
+               "provenance":{"kind":"synthetic"},"events":events}
+
+        def rows(assignments, migrated):
+            result=[]
+            for seq,event in enumerate(events):
+                sid=event.get("session","")
+                row={"seq":seq,"op":event["op"],"session":sid,
+                     "outcome":"ok","backend":"","effects":[]}
+                if event["op"]=="next": row["backend"]=assignments[sid]
+                result.append(row)
+            if migrated:
+                result[tick]["effects"]=[{"kind":"redirect","session":"a","operation":"a/1",
+                                           "from":A,"to":B,"accepted":True}]
+                result[tick+2]["effects"]=[{"kind":"redirect","session":"b","operation":"b/1",
+                                             "from":A,"to":B,"accepted":True}]
+            else:
+                result[tick+1].update(session="",outcome="no_effect")
+            result[-1].update(assignments={},conn_count=0,healthy_backend_count=0,server_version="")
+            return result
+
+        left=rows({sid:A for sid in sessions},True)
+        right=rows(dict(a=A,b=A,c=A,d=B,e=B),False)
+        derived,requires=derive.derive(trace,left,None)
+        self.assertEqual(requires,[])
+        self.assertTrue(derived["events"][tick+1]["optional_effect"])
+        self.assertEqual(derived["events"][tick+1]["effect_ref"],"redirect/1")
+        self.assertIn("redirect_cadence",derived["events"][tick+2]["expect"])
+        self.assertNotIn("effects",derived["events"][tick+2]["expect"])
+        result = runner.compare(derived,left,right)
+        self.assertEqual(result["effect_ledger"]["go"], {
+            "accepted_effects": 2, "accepted_redirects": 2,
+            "accepted_force_closes": 0, "callback_events": 1,
+            "completed_callbacks": 1, "no_effect_callbacks": 0,
+            "callback_settled_redirects": 1, "close_settled_redirects": 1,
+            "other_settled_redirects": 0,
+            "close_settled_force_closes": 0, "unsettled_accepted_effects": 0,
+            "all_accepted_settled": True,
+            "accepted_operations": [
+                {"operation":"a/1", "kind":"redirect", "session":"a",
+                 "settled_by":"callback"},
+                {"operation":"b/1", "kind":"redirect", "session":"b",
+                 "settled_by":"close"},
+            ],
+        })
+        self.assertEqual(result["effect_ledger"]["rust"], {
+            "accepted_effects": 0, "accepted_redirects": 0,
+            "accepted_force_closes": 0, "callback_events": 1,
+            "completed_callbacks": 0, "no_effect_callbacks": 1,
+            "callback_settled_redirects": 0, "close_settled_redirects": 0,
+            "other_settled_redirects": 0,
+            "close_settled_force_closes": 0, "unsettled_accepted_effects": 0,
+            "all_accepted_settled": True,
+            "accepted_operations": [],
+        })
+        bad=copy.deepcopy(left)
+        bad[tick+1].update(session="",outcome="no_effect")
+        with self.assertRaisesRegex(runner.Difference,"RESULT_IDENTITY"):
+            runner.observe(derived,bad,"same-session-missing")
 
     def test_keyspace_fixture_preserves_the_existing_session_and_deadline_scenario(self):
         spec = importlib.util.spec_from_file_location("keyspace_smoke", ROOT / "keyspace_smoke.py")

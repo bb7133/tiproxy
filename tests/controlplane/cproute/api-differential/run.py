@@ -8,6 +8,7 @@ import ast
 import copy
 from collections import Counter
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -87,8 +88,8 @@ def validate(trace):
     require(isinstance(events, list) and 0 < len(events) <= 100_000, "INPUT", "event count")
     allowed = {
         "health":{"backends"},"config":{"toml"},"open":{"client","proxy","port"},
-        "next":set(),"finish":{"success"},"close":set(),"checkpoint":set(),
-        "tick":{"refuse"},"redirect_result":{"operation","success"},
+        "next":set(),"finish":{"success"},"close":{"effect_ref"},"checkpoint":set(),
+        "tick":{"refuse","refuse_next"},"redirect_result":{"operation","effect_ref","optional_effect","success"},
         "lookup":{"backend"},"rehydrate":{"backend"},
         "source_error":{"error"},
         "metrics":{"queries"},
@@ -103,12 +104,40 @@ def validate(trace):
         require(type(timestamp) is int and at <= timestamp <= 86_400_000_000_000,"INPUT","monotonic public clock")
         at = timestamp
         expect = event.get("expect")
-        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "force_close_due", "exclude_previous", "exclude_history", "prefer_local", "prefer_idle_conn", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
+        require(isinstance(expect, dict) and set(expect) <= {"outcome", "backend", "legal_backends", "effects", "force_close_due", "redirect_cadence", "status_scoring", "exclude_previous", "exclude_history", "prefer_local", "prefer_idle_conn", "healthy_backend_count", "legal_server_versions"} and isinstance(expect.get("outcome"), str), "INPUT", f"expectation {index}")
         if "force_close_due" in expect:
             due = expect["force_close_due"]
             require(op == "tick" and expect["outcome"] == "ok" and "effects" not in expect
                     and isinstance(due, list) and all(isinstance(b, str) and b for b in due)
                     and len(due) == len(set(due)), "INPUT", "due failover backends")
+        if "status_scoring" in expect:
+            scoring = expect["status_scoring"]
+            require(isinstance(scoring, list), "INPUT", "status scoring calls")
+            for call in scoring:
+                require(isinstance(call, dict) and set(call) == {"group", "health"}
+                        and isinstance(call["group"], str) and call["group"]
+                        and isinstance(call["health"], dict) and call["health"]
+                        and all(isinstance(b, str) and b and type(v) is bool
+                                for b, v in call["health"].items()), "INPUT", "status scoring call")
+        if "redirect_cadence" in expect:
+            model = expect["redirect_cadence"]
+            require(op == "tick" and expect["outcome"] == "ok" and "effects" not in expect
+                    and isinstance(model, dict) and set(model) == {"kind", "groups"}
+                    and model["kind"] == "connection" and isinstance(model["groups"], list),
+                    "INPUT", "redirect cadence model")
+            group_ids, members = set(), set()
+            for group in model["groups"]:
+                require(isinstance(group, dict) and set(group) == {"group", "members"}
+                        and isinstance(group["group"], str) and group["group"] not in group_ids
+                        and isinstance(group["members"], list) and group["members"],
+                        "INPUT", "redirect cadence group")
+                group_ids.add(group["group"])
+                for member in group["members"]:
+                    require(isinstance(member, dict) and set(member) == {"backend", "healthy", "keyspace"}
+                            and isinstance(member["backend"], str) and member["backend"] not in members
+                            and type(member["healthy"]) is bool and isinstance(member["keyspace"], str),
+                            "INPUT", "redirect cadence member")
+                    members.add(member["backend"])
         require("exclude_previous" not in expect or (op == "next" and type(expect["exclude_previous"]) is bool), "INPUT", "retry expectation")
         if "exclude_history" in expect:
             require(op == "next" and expect["outcome"] == "ok" and expect["exclude_history"] is True and "exclude_previous" not in expect,
@@ -156,10 +185,21 @@ def validate(trace):
             require(isinstance(event.get("toml"), str), "INPUT", "config update")
         elif op == "tick":
             require(isinstance(event.get("refuse",[]),list) and all(id in active for id in event.get("refuse",[])),"INPUT","effect refusal inputs")
+            require(type(event.get("refuse_next", 0)) is int and 0 <= event.get("refuse_next", 0) <= 1,
+                    "INPUT", "one-shot effect refusal")
         elif op == "redirect_result":
-            effect = operations.get(event.get("operation"))
-            require(effect is not None and effect["kind"] == "redirect" and effect["accepted"] and type(event.get("success")) is bool,"INPUT","callback authority")
-            require(session == effect["session"],"INPUT","callback owner")
+            operation, effect_ref = event.get("operation"), event.get("effect_ref")
+            match = (re.fullmatch(r"redirect/([1-9][0-9]*)", effect_ref)
+                     if isinstance(effect_ref, str) else None)
+            optional = event.get("optional_effect", False)
+            require(type(event.get("success")) is bool and ((isinstance(operation, str) and operation and effect_ref is None)
+                    or (operation is None and match is not None))
+                    and type(optional) is bool and (not optional or match is not None),
+                    "INPUT", "callback authority")
+            if operation is not None:
+                effect = operations.get(operation)
+                require(effect is not None and effect["kind"] == "redirect" and effect["accepted"],"INPUT","callback operation")
+                require(session == effect["session"],"INPUT","callback owner")
         elif op == "open":
             require(session and session not in sessions, "INPUT", "open identity")
             require(all(isinstance(event.get(key,""), str) for key in ("client","proxy","port")), "INPUT", "client addresses")
@@ -178,6 +218,9 @@ def validate(trace):
                 if event["success"]: active.add(session)
             else:
                 require(session not in pending, "INPUT", "close requires creation completion")
+                if "effect_ref" in event:
+                    require(re.fullmatch(r"redirect/[1-9][0-9]*", event["effect_ref"]) is not None,
+                            "INPUT", "relative close authority")
                 sessions.remove(session)
                 active.discard(session)
         if op in {"lookup","rehydrate"}:
@@ -205,18 +248,27 @@ class PublicConnections:
     def __init__(self, config):
         self.pending, self.assigned, self.redirects = {}, {}, {}
         self.closing, self.ordinals = set(), Counter()
+        self.created, self.last_redirect, self.redirect_failed = {}, {}, {}
+        self.group_last_redirect, self.status_snapshots = {}, {}
+        self.backend_groups = {}
+        self.logical_to_actual, self.effect_refs, self.effect_ref_sessions = {}, {}, {}
+        self.unbound_redirects, self.skipped_effect_refs = [], set()
         self.policy, self.selection = config["policy"], config["selection"]
-        self.ratio, self.rate, self.label_name = 1.2, 0.0, ""
+        self.ratio, self.rate, self.status_rate, self.label_name = 1.2, 0.0, 0.0, ""
 
-    def prefer_idle(self, candidates):
-        require(self.policy in {"connection", "resource", "location"}
-                and self.selection == "prefer-idle" and not self.label_name,
-                "INPUT", "connection-factor preference requires prefer-idle without label isolation")
+    def counts(self):
         counts = Counter(self.pending.values()) + Counter(self.assigned.values())
         for effect in self.redirects.values():
             counts[effect["from"]] -= 1
             counts[effect["to"]] += 1
         require(all(n >= 0 for n in counts.values()), "EFFECT_LEDGER", "negative public connection count")
+        return counts
+
+    def prefer_idle(self, candidates):
+        require(self.policy in {"connection", "resource", "location"}
+                and self.selection == "prefer-idle" and not self.label_name,
+                "INPUT", "connection-factor preference requires prefer-idle without label isolation")
+        counts = self.counts()
         best = min(counts[b] for b in candidates)
         best_bits = min(best, 65535)
         legal = set()
@@ -232,23 +284,32 @@ class PublicConnections:
                 legal.add(backend)
         return legal
 
-    def force_close_effects(self, event, due):
+    def _force_close_effects(self, event, due, refuse_next):
         """Resolve input-defined deadlines against this engine's public owners.
 
         A refused close remains eligible; an accepted close stays suppressed even
         across failover clear/reentry until the connection is actually closed.
         In-flight redirects retain their public source assignment until success.
         """
-        refused = set(event.get("refuse", []))
-        return [{"kind": "force_close", "session": sid,
-                 "operation": f"{sid}/{self.ordinals[sid] + 1}",
-                 "from": backend, "to": "", "accepted": sid not in refused}
-                for sid, backend in self.assigned.items()
-                if backend in due and sid not in self.closing]
+        refused = {self.logical_to_actual.get(sid, sid) for sid in event.get("refuse", [])}
+        effects = []
+        for sid, backend in self.assigned.items():
+            if backend not in due or sid in self.closing:
+                continue
+            scripted = sid in refused
+            if not scripted and refuse_next:
+                scripted, refuse_next = True, refuse_next - 1
+            effects.append({"kind": "force_close", "session": sid,
+                            "operation": f"{sid}/{self.ordinals[sid] + 1}",
+                            "from": backend, "to": "", "accepted": not scripted})
+        return effects, refuse_next
 
-    def apply(self, event, row):
-        op, sid = event["op"], event.get("session", "")
-        if op == "config" and row["outcome"] == "ok":
+    def force_close_effects(self, event, due):
+        return self._force_close_effects(event, due, event.get("refuse_next", 0))[0]
+
+    def prepare(self, event, expect, row, now):
+        """Apply input-derived configuration/scoring before this public call."""
+        if event["op"] == "config" and row["outcome"] == "ok":
             try:
                 balance = tomllib.loads(event["toml"]).get("balance", {})
             except tomllib.TOMLDecodeError as error:
@@ -259,55 +320,305 @@ class PublicConnections:
             conn = balance.get("conn-count", {})
             ratio = conn.get("count-ratio-threshold", self.ratio)
             rate = conn.get("migrations-per-second", self.rate)
+            status = balance.get("status", {})
+            status_rate = status.get("migrations-per-second", self.status_rate)
             require(type(ratio) in (int, float) and math.isfinite(ratio) and (ratio == 0 or ratio > 1)
-                    and type(rate) in (int, float) and math.isfinite(rate) and rate >= 0,
+                    and type(rate) in (int, float) and math.isfinite(rate) and rate >= 0
+                    and type(status_rate) in (int, float) and math.isfinite(status_rate) and status_rate >= 0,
                     "INPUT", "finite connection policy configuration")
             self.ratio, self.rate = float(ratio or 1.2), float(rate)
+            self.status_rate = float(status_rate)
+        for call in expect.get("status_scoring", []):
+            snapshots = self.status_snapshots.setdefault(call["group"], {})
+            for backend in call["health"]:
+                self.backend_groups[backend] = call["group"]
+            counts = self.counts()
+            for backend, healthy in call["health"].items():
+                if healthy:
+                    snapshots.pop(backend, None)
+                    continue
+                prior = snapshots.get(backend, (0.0, 0))[0]
+                rate = prior if prior > 0.0001 else float(counts[backend]) / 5.0
+                snapshots[backend] = (rate, now)
+            for backend, (_, accessed) in list(snapshots.items()):
+                if accessed + 60_000_000_000 < now:
+                    del snapshots[backend]
+
+    def resolve_effect(self, event):
+        effect_ref = event.get("effect_ref")
+        if effect_ref is None:
+            return None
+        actual = self.logical_to_actual.get(event.get("session", ""), event.get("session", ""))
+        if effect_ref in self.effect_refs:
+            effect = self.effect_refs[effect_ref]
+            require(self.effect_ref_sessions[effect_ref] == event.get("session", ""),
+                    "EFFECT_LEDGER", f"relative effect {effect_ref} crossed sessions")
+            return effect
+        if effect_ref in self.skipped_effect_refs:
+            require(self.effect_ref_sessions[effect_ref] == event.get("session", ""),
+                    "EFFECT_LEDGER", f"relative callback {effect_ref} crossed sessions")
+            require(not any(effect["session"] == actual for effect in self.redirects.values()),
+                    "EFFECT_LEDGER",
+                    f"relative callback {effect_ref} skipped a same-session redirect")
+            return None
+        position = next((i for i, effect in enumerate(self.unbound_redirects)
+                         if effect["session"] == actual), None)
+        if position is None and event["op"] == "close" and self.unbound_redirects:
+            # The strict delayed close establishes which engine-local session
+            # the recording's logical close handle denotes.
+            position = 0
+        if position is not None:
+            effect = self.unbound_redirects.pop(position)
+            self.effect_refs[effect_ref] = effect
+            self.effect_ref_sessions[effect_ref] = event.get("session", "")
+            return effect
+        require(not any(effect["session"] == actual for effect in self.redirects.values()),
+                "EFFECT_LEDGER",
+                f"relative callback {effect_ref} skipped a same-session redirect")
+        require(event.get("optional_effect") is True, "EFFECT_LEDGER",
+                f"unknown relative effect {effect_ref}")
+        self.skipped_effect_refs.add(effect_ref)
+        self.effect_ref_sessions[effect_ref] = event.get("session", "")
+        return None
+
+    def resolve_event(self, event):
+        """Resolve a logical trace handle to this engine's concrete session.
+
+        A scripted close of the connection carrying a delayed accepted redirect
+        swaps logical handles. Later ordinary close events therefore still close
+        every remaining concrete connection exactly once.
+        """
+        logical = event.get("session", "")
+        if "effect_ref" not in event:
+            return self.logical_to_actual.get(logical, logical)
+        effect = self.resolve_effect(event)
+        if effect is None:
+            return ""
+        actual = effect["session"]
+        if event["op"] == "close":
+            require(logical in self.logical_to_actual and actual in self.logical_to_actual.values(),
+                    "EFFECT_LEDGER", "relative close requires two live handles")
+            other = next(name for name, value in self.logical_to_actual.items() if value == actual)
+            displaced = self.logical_to_actual[logical]
+            self.logical_to_actual[logical], self.logical_to_actual[other] = actual, displaced
+        return actual
+
+    def resolve_operation(self, event):
+        if "effect_ref" in event:
+            effect = self.resolve_effect(event)
+            return effect["operation"] if effect is not None else ""
+        return event.get("operation", "")
+
+    def _group_redirect_options(self, event, group, now, refuse_next):
+        members = {item["backend"]: item for item in group["members"]}
+        if len(members) <= 1:
+            return [([], refuse_next)]
+        counts = self.counts()
+        physical = Counter(self.assigned.values())
+        bits = {backend: (int(not item["healthy"]), min(counts[backend], 65535))
+                for backend, item in members.items()}
+        minimum = min(bits.values())
+        if minimum[0]:
+            return [([], refuse_next)]
+        refused = {self.logical_to_actual.get(sid, sid) for sid in event.get("refuse", [])}
+        options = []
+        for target in sorted(backend for backend in members if bits[backend] == minimum):
+            sources = []
+            for source in members:
+                if bits[source] <= minimum or physical[source] == 0 or counts[source] <= 0:
+                    continue
+                if not members[source]["healthy"]:
+                    snapshot = self.status_snapshots.get(group["group"], {}).get(source)
+                    require(snapshot is not None, "EFFECT_LEDGER", f"missing status cadence for {source}")
+                    rate = self.status_rate if self.status_rate > 0 else snapshot[0]
+                else:
+                    if float(counts[source]) <= float(counts[target] + 1) * self.ratio:
+                        continue
+                    rate = self.rate if self.rate > 0 else max(
+                        0.0,
+                        (float(counts[source] + counts[target] + 1) / (1 + self.ratio)
+                         - float(counts[target] + 1)) / 120,
+                    )
+                if rate > 0.0001:
+                    sources.append((source, rate))
+            if not sources:
+                options.append(([], refuse_next))
+                continue
+            busiest = max(bits[source] for source, _ in sources)
+            for source, rate in sorted(sources):
+                if bits[source] != busiest:
+                    continue
+                if members[source]["keyspace"] != members[target]["keyspace"]:
+                    options.append(([], refuse_next))
+                    continue
+                interval = int(1_000_000_000.0 / rate)
+                require(interval > 0, "EFFECT_LEDGER", "unsupported migration interval")
+                last = self.group_last_redirect.get(group["group"])
+                if interval < 20_000_000:
+                    budget = (10_000_000 - 1) // interval + 1
+                elif last is None or now - last >= interval:
+                    budget = 1
+                else:
+                    options.append(([], refuse_next))
+                    continue
+                remaining_refusal = refuse_next
+                effects = []
+                for sid in sorted(self.assigned, key=lambda item: self.created[item]):
+                    if budget == 0:
+                        break
+                    if (self.assigned[sid] != source or sid in self.closing
+                            or any(effect["session"] == sid for effect in self.redirects.values())):
+                        continue
+                    if (self.redirect_failed.get(sid, False) and sid in self.last_redirect
+                            and now < self.last_redirect[sid] + 3_000_000_000):
+                        continue
+                    scripted = sid in refused
+                    if not scripted and remaining_refusal:
+                        scripted, remaining_refusal = True, remaining_refusal - 1
+                    effects.append({"kind": "redirect", "session": sid,
+                                    "operation": f"{sid}/{self.ordinals[sid] + 1}",
+                                    "from": source, "to": target, "accepted": not scripted})
+                    budget -= int(not scripted)
+                options.append((effects, remaining_refusal))
+        unique = {}
+        for effects, remaining in options:
+            key = (json.dumps(causal(effects), sort_keys=True), remaining)
+            unique[key] = (effects, remaining)
+        return list(unique.values())
+
+    def redirect_effect_alternatives(self, event, model, now):
+        groups = model["groups"]
+        orders = itertools.permutations(groups) if event.get("refuse_next", 0) and len(groups) > 1 else [groups]
+        alternatives = []
+        for order in orders:
+            partial = [([], event.get("refuse_next", 0))]
+            for group in order:
+                expanded = []
+                for effects, refusal in partial:
+                    for more, remaining in self._group_redirect_options(event, group, now, refusal):
+                        expanded.append((effects + more, remaining))
+                        require(len(expanded) <= 256, "INPUT", "redirect cadence alternatives")
+                partial = expanded
+            alternatives.extend(partial)
+        unique = {}
+        for effects, remaining in alternatives:
+            key = (json.dumps(causal(effects), sort_keys=True), remaining)
+            unique[key] = (effects, remaining)
+        return list(unique.values())
+
+    def expected_effect_alternatives(self, event, expect, now):
+        if "redirect_cadence" not in expect:
+            if "force_close_due" in expect:
+                effects, refusal = self._force_close_effects(event, expect["force_close_due"], event.get("refuse_next", 0))
+                return [effects] if refusal == 0 else []
+            effects = expect.get("effects", [])
+            refusal = event.get("refuse_next", 0)
+            refused = {self.logical_to_actual.get(sid, sid) for sid in event.get("refuse", [])}
+            for effect in effects:
+                if effect["session"] not in refused and refusal:
+                    if effect["accepted"]:
+                        return []
+                    refusal -= 1
+            return [effects] if refusal == 0 else []
+        alternatives = []
+        for redirects, refusal in self.redirect_effect_alternatives(event, expect["redirect_cadence"], now):
+            closes, refusal = self._force_close_effects(event, expect.get("force_close_due", []), refusal)
+            if refusal == 0:
+                alternatives.append(redirects + closes)
+        return alternatives
+
+    def apply(self, event, row, sid=None, operation=None, index=0, prepared=False):
+        op = event["op"]
+        if not prepared:
+            self.prepare(event, event.get("expect", {}), row, event.get("at_nanos", 0))
+        sid = event.get("session", "") if sid is None else sid
+        operation = event.get("operation", "") if operation is None else operation
+        if op == "open":
+            self.logical_to_actual[event["session"]] = sid
         elif op == "next" and row["outcome"] == "ok":
             self.pending[sid] = row["backend"]
         elif op == "finish":
             backend = self.pending.pop(sid)
             if event["success"]:
                 self.assigned[sid] = backend
+                self.created[sid] = index
         elif op == "rehydrate" and row["outcome"] == "ok":
             self.assigned[sid] = row["backend"]
+            self.created[sid] = index
         elif op == "redirect_result":
-            effect = self.redirects.pop(event["operation"], None)
-            if effect is not None and sid in self.assigned and event["success"]:
-                self.assigned[sid] = effect["to"]
+            effect = self.redirects.pop(operation, None)
+            self.unbound_redirects = [item for item in self.unbound_redirects
+                                      if item["operation"] != operation]
+            if effect is not None:
+                self.redirect_failed[sid] = not event["success"]
+                if sid in self.assigned and event["success"]:
+                    self.assigned[sid] = effect["to"]
+                    self.created[sid] = index
         elif op == "close":
             self.assigned.pop(sid, None)
+            self.pending.pop(sid, None)
+            self.created.pop(sid, None)
+            self.last_redirect.pop(sid, None)
+            self.redirect_failed.pop(sid, None)
             self.closing.discard(sid)
             self.redirects = {key: ef for key, ef in self.redirects.items() if ef["session"] != sid}
+            self.unbound_redirects = [effect for effect in self.unbound_redirects
+                                      if effect["session"] != sid]
+            self.logical_to_actual.pop(event["session"], None)
+        model = event.get("expect", {}).get("redirect_cadence", {})
+        group_for = {member["backend"]: group["group"]
+                     for group in model.get("groups", []) for member in group["members"]}
         for effect in row.get("effects", []):
             self.ordinals[effect["session"]] += 1
+            require(effect["operation"] == f"{effect['session']}/{self.ordinals[effect['session']]}",
+                    "EFFECT_LEDGER", "non-monotonic effect operation")
             if effect["kind"] == "force_close" and effect["accepted"]:
                 self.closing.add(effect["session"])
+            if effect["kind"] == "redirect":
+                self.last_redirect[effect["session"]] = event.get("at_nanos", 0)
+                self.redirect_failed[effect["session"]] = not effect["accepted"]
             if effect["kind"] == "redirect" and effect["accepted"]:
                 require(self.assigned.get(effect["session"]) == effect["from"]
                         and not any(ef["session"] == effect["session"] for ef in self.redirects.values()),
                         "EFFECT_LEDGER", "redirect requires one established owner and no pending redirect")
                 self.redirects[effect["operation"]] = effect
+                group = group_for.get(effect["from"], self.backend_groups.get(effect["from"]))
+                if group is not None:
+                    self.group_last_redirect[group] = event.get("at_nanos", 0)
+                self.unbound_redirects.append(effect)
 
 
 def observe(trace, rows, engine):
     events = trace["events"]
     require(isinstance(rows,list) and len(rows) == len(events), "MISSING_RESULT", engine)
     pending, ledger, previous, operations, settled = {}, {}, {}, {}, set()
+    settled_by = {}
     excluded = {}
     connections = PublicConnections(trace["config"])
     for index, (event,row) in enumerate(zip(events,rows)):
-        op, session, expect = event["op"], event.get("session",""), event["expect"]
+        op, expect = event["op"], event["expect"]
+        now = event.get("at_nanos", 0)
         fields = {"seq","op","session","outcome","backend","effects"} | ({"assignments","conn_count","healthy_backend_count","server_version"} if op == "checkpoint" else set())
-        require(isinstance(row,dict) and set(row) == fields and type(row.get("seq")) is int and row.get("seq") == index and row.get("op") == op and row.get("session") == session, "RESULT_IDENTITY", f"{engine} event {index}")
-        require(row.get("outcome") == expect["outcome"], "ERROR_OUTCOME", f"{engine} event {index}: {row.get('outcome')} != {expect['outcome']}")
-        expected_effects = (connections.force_close_effects(event, expect["force_close_due"])
-                            if "force_close_due" in expect else expect.get("effects", []))
-        require(causal(row["effects"]) == causal(expected_effects), "EFFECTS", f"{engine} event {index}")
+        require(isinstance(row,dict) and set(row) == fields and type(row.get("seq")) is int
+                and row.get("seq") == index and row.get("op") == op,
+                "RESULT_IDENTITY", f"{engine} event {index}")
+        connections.prepare(event, expect, row, now)
+        session = connections.resolve_event(event)
+        operation = connections.resolve_operation(event)
+        require(row.get("session") == session, "RESULT_IDENTITY", f"{engine} event {index}")
+        expected_outcome = ("no_effect" if event.get("optional_effect") and not operation
+                            else expect["outcome"])
+        require(row.get("outcome") == expected_outcome, "ERROR_OUTCOME",
+                f"{engine} event {index}: {row.get('outcome')} != {expected_outcome}")
+        expected_effects = connections.expected_effect_alternatives(event, expect, now)
+        require(any(causal(row["effects"]) == causal(alternative) for alternative in expected_effects),
+                "EFFECTS", f"{engine} event {index}")
         for effect in row["effects"]:
             require(effect["from"] == ledger.get(effect["session"]) and effect["operation"] not in operations,"EFFECT_LEDGER",f"{engine} {index}")
             operations[effect["operation"]] = effect
-            if not effect["accepted"]: settled.add(effect["operation"])
+            if not effect["accepted"]:
+                settled.add(effect["operation"])
+                settled_by[effect["operation"]] = "refused"
         if op in {"next","lookup","rehydrate"} and row["outcome"] == "ok":
             backend = row.get("backend")
             if "backend" in expect:
@@ -347,15 +658,25 @@ def observe(trace, rows, engine):
             backend = pending.pop(session)
             if event["success"]: ledger[session] = backend
         elif op == "redirect_result":
-            key = event["operation"]
-            require(key in operations,"EFFECT_LEDGER",f"{engine} missing accepted effect")
-            if key not in settled and session in ledger and event["success"]: ledger[session] = operations[key]["to"]
-            settled.add(key)
+            key = operation
+            if key:
+                require(key in operations,"EFFECT_LEDGER",f"{engine} missing accepted effect")
+                if key not in settled:
+                    settled_by[key] = "callback"
+                    if session in ledger and event["success"]:
+                        ledger[session] = operations[key]["to"]
+                settled.add(key)
+            else:
+                require(event.get("optional_effect") is True, "EFFECT_LEDGER",
+                        f"{engine} missing required accepted effect")
         elif op == "close":
             excluded.pop(session, None)
             previous.pop(session, None)
             ledger.pop(session,None)
-            settled.update(key for key,effect in operations.items() if effect["session"] == session)
+            closing = {key for key,effect in operations.items()
+                       if effect["session"] == session and key not in settled}
+            settled.update(closing)
+            settled_by.update((key, "close") for key in closing)
         elif op == "checkpoint":
             require(type(row.get("healthy_backend_count")) is int and row["healthy_backend_count"] >= 0 and isinstance(row.get("server_version"),str),"OBSERVATION","public metadata types")
             if "healthy_backend_count" in expect:
@@ -363,14 +684,49 @@ def observe(trace, rows, engine):
             if "legal_server_versions" in expect:
                 require(row["server_version"] in expect["legal_server_versions"],"OBSERVATION",f"{engine} server version {index}")
             require(row.get("assignments") == ledger and type(row.get("conn_count")) is int and row["conn_count"] == len(ledger), "LEDGER", f"{engine} checkpoint {index}")
-        connections.apply(event, row)
-    require(not ledger and not pending and set(operations) <= settled, "LEDGER", f"{engine} final state")
+        connections.apply(event, row, session, operation, index, prepared=True)
+    unsettled = [key for key,effect in operations.items()
+                 if effect["accepted"] and key not in settled]
+    require(not ledger and not pending and not unsettled
+            and not connections.pending and not connections.assigned
+            and not connections.redirects and not connections.unbound_redirects
+            and not connections.logical_to_actual,
+            "LEDGER", f"{engine} final state")
+    accepted_redirects = [(key, effect) for key,effect in operations.items()
+                          if effect["accepted"] and effect["kind"] == "redirect"]
+    accepted_force_closes = [(key, effect) for key,effect in operations.items()
+                             if effect["accepted"] and effect["kind"] == "force_close"]
+    callback_rows = [row for event,row in zip(events,rows)
+                     if event["op"] == "redirect_result"]
+    return {
+        "accepted_effects": len(accepted_redirects) + len(accepted_force_closes),
+        "accepted_redirects": len(accepted_redirects),
+        "accepted_force_closes": len(accepted_force_closes),
+        "callback_events": len(callback_rows),
+        "completed_callbacks": sum(row["outcome"] == "ok" for row in callback_rows),
+        "no_effect_callbacks": sum(row["outcome"] == "no_effect" for row in callback_rows),
+        "callback_settled_redirects": sum(settled_by.get(key) == "callback"
+                                          for key,_ in accepted_redirects),
+        "close_settled_redirects": sum(settled_by.get(key) == "close"
+                                       for key,_ in accepted_redirects),
+        "other_settled_redirects": sum(settled_by.get(key) not in {"callback", "close"}
+                                       for key,_ in accepted_redirects),
+        "close_settled_force_closes": sum(settled_by.get(key) == "close"
+                                          for key,_ in accepted_force_closes),
+        "unsettled_accepted_effects": len(unsettled),
+        "all_accepted_settled": not unsettled,
+        "accepted_operations": [
+            {"operation": key, "kind": effect["kind"], "session": effect["session"],
+             "settled_by": settled_by.get(key, "unsettled")}
+            for key,effect in operations.items() if effect["accepted"]
+        ],
+    }
 
 
 def compare(trace, go, rust):
     validate(trace)
-    observe(trace,go,"go")
-    observe(trace,rust,"rust")
+    go_effect_ledger = observe(trace,go,"go")
+    rust_effect_ledger = observe(trace,rust,"rust")
     for event, left, right in zip(trace["events"],go,rust):
         if event["op"] == "checkpoint":
             require(left["healthy_backend_count"] == right["healthy_backend_count"],"OBSERVATION","healthy backend counts differ")
@@ -379,7 +735,9 @@ def compare(trace, go, rust):
     # Exact errors/effects agree by both satisfying the same public expectation.
     # Legal random backend divergence is retained in raw results; never feed
     # one engine's result into the other's input or compare private scores.
-    return {"events":len(trace["events"]),"violations":0,"provenance":trace["provenance"]["kind"]}
+    return {"events":len(trace["events"]),"violations":0,
+            "provenance":trace["provenance"]["kind"],
+            "effect_ledger":{"go":go_effect_ledger,"rust":rust_effect_ledger}}
 
 
 def comparator_checks(trace, reference, destination):

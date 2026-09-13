@@ -193,6 +193,27 @@ class FailoverValidatorTests(unittest.TestCase):
             with self.subTest(slot=slot):
                 self.assertEqual(positive(slot).result(), [])
 
+    def test_writer_effect_references_and_delayed_close_are_accepted(self):
+        trace = positive("F02")
+        references = {}
+        ordinal = 0
+        for result in trace.go:
+            for effect in result.get("effects", []):
+                if effect.get("kind") == "redirect" and effect.get("accepted") is True:
+                    ordinal += 1
+                    references[effect["operation"]] = f"redirect/{ordinal}"
+        for event in trace.events:
+            operation = event.pop("operation", None)
+            if event["op"] == "redirect_result":
+                event["effect_ref"] = references[operation]
+            elif event["op"] == "close" and event.get("session") == "held-2":
+                event["effect_ref"] = references["held-2/1"]
+        self.assertEqual(trace.result(), [])
+        delayed = next(event for event in trace.events
+                       if event["op"] == "close" and event.get("session") == "held-2")
+        delayed["effect_ref"] = "redirect/999"
+        self.assertFails(trace, "invalid accepted-effect reference")
+
     def test_activation_checkpoint_timeout_and_sequence_are_required(self):
         trace = positive("F02")
         first_config = next(i for i, event in enumerate(trace.events) if event["op"] == "config" and "4002" in event["toml"])

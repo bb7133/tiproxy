@@ -11,7 +11,7 @@ use control_config::ConfigNamespaceSource;
 use control_routing::group::ClientInfo;
 use control_topology::{BackendHealth, BackendInfo, MergedBackend, MergedTopology, ObserverError};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,6 +30,7 @@ struct ClientEffects {
     names: BTreeMap<u64, String>,
     ordinals: BTreeMap<String, u64>,
     refused: BTreeSet<String>,
+    refuse_next: u64,
     offered: Vec<(Value, MigrationCommand)>,
 }
 impl ClientEffects {
@@ -41,7 +42,12 @@ impl ClientEffects {
         let id = &self.names[&from.connection_id];
         let ordinal = self.ordinals.entry(id.clone()).or_default();
         *ordinal += 1;
-        let accepted = !self.refused.contains(id);
+        let mut refused = self.refused.contains(id);
+        if !refused && self.refuse_next > 0 {
+            self.refuse_next -= 1;
+            refused = true;
+        }
+        let accepted = !refused;
         let effect = json!({"kind":kind,"session":id,"operation":format!("{id}/{ordinal}"),
             "from":from.backend_id,"to":to,"accepted":accepted});
         self.offered.push((effect, command.clone()));
@@ -83,6 +89,10 @@ fn source_error(name: &str) -> Result<ObserverError, &'static str> {
     })
 }
 
+fn is_cluster_replacement_metric_gap(error: &str, backend_clusters_replaced: bool) -> bool {
+    backend_clusters_replaced && error == "metric input source unavailable"
+}
+
 // One finite external event dispatcher keeps the lifecycle readable in order.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -119,7 +129,9 @@ async fn replay() -> TestResult {
         .topology
         .replay_metric_input(h.runtime.handle().module_context().owner().clone())
         .await?;
-    metric_input.sync()?;
+    metric_input
+        .sync()
+        .map_err(|error| format!("initial metric input sync: {error}"))?;
     h.router = Arc::new(
         Router::new_with_factors(
             Arc::new(h.source.clone()),
@@ -132,6 +144,7 @@ async fn replay() -> TestResult {
         .map_err(|e| format!("router init: {e:?}"))?,
     );
     let mut sessions: BTreeMap<String, Slot> = BTreeMap::new();
+    let mut logical_sessions: BTreeMap<String, String> = BTreeMap::new();
     let mut known = BTreeSet::new();
     let mut output = Vec::new();
     let start = Instant::now();
@@ -142,11 +155,84 @@ async fn replay() -> TestResult {
         Box::new(move |command| must(sink.lock()).accept(command)),
     );
     let mut operations: BTreeMap<String, (String, MigrationCommand, bool)> = BTreeMap::new();
+    let mut effect_refs: BTreeMap<String, String> = BTreeMap::new();
+    let mut effect_ref_sessions: BTreeMap<String, String> = BTreeMap::new();
+    let mut skipped_effect_refs: BTreeSet<String> = BTreeSet::new();
+    let mut unbound_redirects = VecDeque::new();
     let (_stop, stop) = tokio::sync::watch::channel(false);
     let events = trace["events"].as_array().ok_or("missing events")?;
     for (index, event) in events.iter().enumerate() {
-        let id = text(event, "session");
+        let logical_id = text(event, "session");
         let op = text(event, "op");
+        let mut id = logical_sessions
+            .get(logical_id)
+            .map_or(logical_id, String::as_str)
+            .to_string();
+        let logical_actual = id.clone();
+        let mut resolved_operation = text(event, "operation").to_string();
+        let effect_ref = text(event, "effect_ref");
+        let mut skipped_effect = false;
+        if !effect_ref.is_empty() {
+            if let Some(operation) = effect_refs.get(effect_ref) {
+                resolved_operation = operation.clone();
+                if effect_ref_sessions.get(effect_ref).map(String::as_str) != Some(logical_id) {
+                    return Err("relative callback crossed sessions".into());
+                }
+            } else if !skipped_effect_refs.contains(effect_ref) {
+                let position = unbound_redirects
+                    .iter()
+                    .position(|operation| {
+                        operations
+                            .get(operation)
+                            .is_some_and(|(session, _, _)| session == &logical_actual)
+                    })
+                    .or_else(|| (op == "close" && !unbound_redirects.is_empty()).then_some(0));
+                if let Some(position) = position {
+                    resolved_operation = unbound_redirects
+                        .remove(position)
+                        .ok_or("relative effect queue")?;
+                    effect_refs.insert(effect_ref.into(), resolved_operation.clone());
+                    effect_ref_sessions.insert(effect_ref.into(), logical_id.into());
+                }
+            } else if effect_ref_sessions.get(effect_ref).map(String::as_str) != Some(logical_id) {
+                return Err("relative callback crossed sessions".into());
+            }
+            if resolved_operation.is_empty() {
+                if operations.iter().any(|(_, (session, command, completed))| {
+                    matches!(command, MigrationCommand::Redirect(_))
+                        && session == &logical_actual
+                        && !completed
+                        && sessions.contains_key(session)
+                }) {
+                    return Err("relative callback skipped a same-session redirect".into());
+                }
+                if event["optional_effect"].as_bool() != Some(true) {
+                    return Err("unknown relative effect".into());
+                }
+                id.clear();
+                skipped_effect = true;
+                skipped_effect_refs.insert(effect_ref.into());
+                effect_ref_sessions.insert(effect_ref.into(), logical_id.into());
+            } else {
+                id = operations
+                    .get(&resolved_operation)
+                    .ok_or("relative effect operation")?
+                    .0
+                    .clone();
+            }
+            if op == "close" && !skipped_effect {
+                let other = logical_sessions
+                    .iter()
+                    .find_map(|(logical, actual)| (actual == &id).then(|| logical.clone()))
+                    .ok_or("relative close target")?;
+                let displaced = logical_sessions
+                    .get(logical_id)
+                    .ok_or("relative close logical handle")?
+                    .clone();
+                logical_sessions.insert(logical_id.into(), id.clone());
+                logical_sessions.insert(other, displaced);
+            }
+        }
         let mut row =
             json!({"seq":index,"op":op,"session":id,"outcome":"ok","backend":"","effects":[]});
         let elapsed = event["at_nanos"].as_u64().unwrap_or(0);
@@ -156,7 +242,9 @@ async fn replay() -> TestResult {
             .ok_or("event clock overflow")?;
         h.router.set_replay_wall(wall);
         match op {
-            "metrics" => metric_input.deliver(event["queries"].clone())?,
+            "metrics" => metric_input
+                .deliver(event["queries"].clone())
+                .map_err(|error| format!("metric input at event {index}: {error}"))?,
             "source_error" => health_input.deliver_error(source_error(text(event, "error"))?)?,
             "health" => {
                 let backends = event["backends"].as_array().ok_or("health backends")?;
@@ -202,7 +290,9 @@ async fn replay() -> TestResult {
                     verdicts,
                     redirection,
                 )?;
-                metric_input.sync()?;
+                metric_input.sync().map_err(|error| {
+                    format!("metric input health sync at event {index}: {error}")
+                })?;
                 let candidate = h
                     .router
                     .capture()
@@ -212,6 +302,7 @@ async fn replay() -> TestResult {
                     .map_err(|e| format!("failover: {e:?}"))?;
             }
             "config" => {
+                let prior_backend_clusters = h.source.store.current().topology()?.backend_clusters;
                 if h.source
                     .store
                     .apply_toml(
@@ -224,9 +315,30 @@ async fn replay() -> TestResult {
                 {
                     row["outcome"] = json!("invalid_config");
                 } else {
+                    let backend_clusters_replaced =
+                        h.source.store.current().topology()?.backend_clusters
+                            != prior_backend_clusters;
                     h.source.deliver();
                     h.applied().await;
-                    metric_input.sync()?;
+                    // A backend-cluster replacement retires the old routing
+                    // source before the following recorded health event
+                    // publishes its replacement. That public transient has no
+                    // metric snapshot; the next health/metrics input must bind
+                    // it, while every other replay-input failure stays fatal.
+                    match metric_input.sync() {
+                        Ok(()) => {}
+                        Err(error)
+                            if is_cluster_replacement_metric_gap(
+                                error,
+                                backend_clusters_replaced,
+                            ) => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "metric input config sync at event {index}: {error}"
+                            )
+                            .into());
+                        }
+                    }
                     let candidate = h.ready().await;
                     h.router
                         .refresh_failover(&candidate, now)
@@ -235,8 +347,9 @@ async fn replay() -> TestResult {
             }
             "open" => {
                 let selector = h.router.selector().map_err(|e| format!("open: {e:?}"))?;
+                logical_sessions.insert(logical_id.into(), logical_id.into());
                 let prior = sessions.insert(
-                    id.into(),
+                    logical_id.into(),
                     Slot {
                         selector,
                         pending: None,
@@ -254,26 +367,36 @@ async fn replay() -> TestResult {
                 Err(error) => row["outcome"] = json!(outcome(error)),
             },
             "rehydrate" => {
-                let s = sessions.get_mut(id).ok_or("missing session")?;
+                let s = sessions.get_mut(&id).ok_or("missing session")?;
                 match s.selector.rehydrate(text(event, "backend")) {
                     Ok(assignment) => {
                         row["backend"] = json!(assignment.backend_id);
                         s.active = Some(assignment.backend_id);
                         must(effects.lock())
                             .names
-                            .insert(assignment.connection_id, id.into());
+                            .insert(assignment.connection_id, id.clone());
                     }
                     Err(RouteError::NoBackend) => row["outcome"] = json!("unknown_backend"),
                     Err(error) => row["outcome"] = json!(outcome(error)),
                 }
             }
             "tick" => {
-                must(effects.lock()).refused = event["refuse"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|v| v.as_str().unwrap_or_default().to_string())
-                    .collect();
+                {
+                    let mut client = must(effects.lock());
+                    client.refused = event["refuse"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|v| {
+                            let logical = v.as_str().unwrap_or_default();
+                            logical_sessions
+                                .get(logical)
+                                .map_or(logical, String::as_str)
+                                .to_string()
+                        })
+                        .collect();
+                    client.refuse_next = event["refuse_next"].as_u64().unwrap_or(0);
+                }
                 let candidate = h
                     .router
                     .capture()
@@ -288,6 +411,9 @@ async fn replay() -> TestResult {
                 for (effect, command) in must(effects.lock()).offered.drain(..) {
                     if effect["accepted"] == true {
                         assert!(queue.take().is_some());
+                        if effect["kind"] == "redirect" {
+                            unbound_redirects.push_back(text(&effect, "operation").into());
+                        }
                         operations.insert(
                             text(&effect, "operation").into(),
                             (text(&effect, "session").into(), command, false),
@@ -295,12 +421,23 @@ async fn replay() -> TestResult {
                     }
                     rows.push(effect);
                 }
+                assert_eq!(
+                    must(effects.lock()).refuse_next,
+                    0,
+                    "one-shot refusal not consumed"
+                );
                 assert!(queue.take().is_none());
                 row["effects"] = json!(rows);
             }
             "redirect_result" => {
+                if skipped_effect {
+                    row["outcome"] = json!("no_effect");
+                    output.push(row);
+                    continue;
+                }
+                unbound_redirects.retain(|operation| operation != &resolved_operation);
                 let (session, command, completed) = operations
-                    .get_mut(text(event, "operation"))
+                    .get_mut(&resolved_operation)
                     .ok_or("unknown operation")?;
                 let MigrationCommand::Redirect(redirect) = command else {
                     return Err("not a redirect".into());
@@ -318,7 +455,7 @@ async fn replay() -> TestResult {
                 *completed = true;
             }
             "next" => {
-                let s = sessions.get_mut(id).ok_or("missing session")?;
+                let s = sessions.get_mut(&id).ok_or("missing session")?;
                 let client = ClientInfo {
                     client_address: (!s.client.is_empty()).then_some(s.client.as_str()),
                     proxy_address: (!s.proxy.is_empty()).then_some(s.proxy.as_str()),
@@ -328,26 +465,32 @@ async fn replay() -> TestResult {
                         row["backend"] = json!(reservation.assignment().backend_id);
                         must(effects.lock())
                             .names
-                            .insert(reservation.assignment().connection_id, id.into());
+                            .insert(reservation.assignment().connection_id, id.clone());
                         s.pending = Some(reservation);
                     }
                     Err(error) => row["outcome"] = json!(outcome(error)),
                 }
             }
             "finish" => {
-                let s = sessions.get_mut(id).ok_or("missing session")?;
+                let s = sessions.get_mut(&id).ok_or("missing session")?;
                 let pending = s.pending.take().ok_or("missing reservation")?;
                 let connected = event["success"].as_bool().unwrap_or(false);
                 assert_eq!(s.selector.finish(&pending, connected), Settlement::Applied);
                 s.active = connected.then(|| pending.assignment().backend_id.clone());
             }
             "close" => {
-                let s = sessions.remove(id).ok_or("missing session")?;
+                let s = sessions.remove(&id).ok_or("missing session")?;
                 assert!(
                     s.pending.is_none(),
                     "pending creation requires its Finish callback"
                 );
                 drop(s);
+                unbound_redirects.retain(|operation| {
+                    operations
+                        .get(operation)
+                        .is_none_or(|(session, _, _)| session != &id)
+                });
+                logical_sessions.remove(logical_id);
             }
             "checkpoint" => {
                 let assignments: BTreeMap<&str, &str> = sessions
@@ -372,6 +515,14 @@ async fn replay() -> TestResult {
         sessions.is_empty(),
         "trace must settle and close all logical sessions"
     );
+    assert!(
+        logical_sessions.is_empty(),
+        "trace must close every logical handle"
+    );
+    assert!(
+        unbound_redirects.is_empty(),
+        "trace must close or bind every accepted redirect"
+    );
     assert_eq!(
         known
             .iter()
@@ -387,6 +538,22 @@ async fn replay() -> TestResult {
     h.runtime
         .begin_shutdown(control_plane::ShutdownReason::Requested)?;
     Ok(())
+}
+
+#[test]
+fn replay_metric_gap_is_bounded_to_backend_cluster_replacement() {
+    assert!(is_cluster_replacement_metric_gap(
+        "metric input source unavailable",
+        true
+    ));
+    assert!(!is_cluster_replacement_metric_gap(
+        "metric input source unavailable",
+        false
+    ));
+    assert!(!is_cluster_replacement_metric_gap(
+        "metric input publication retired",
+        true
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -46,6 +46,9 @@ type Effect struct {
 	From      string `json:"from"`
 	To        string `json:"to"`
 	Accepted  bool   `json:"accepted"`
+	// RefuseNext records which rejected request consumed the external one-shot
+	// control. The writer moves it into the tick input; adapter output omits it.
+	RefuseNext bool `json:"refuse_next,omitempty"`
 }
 
 // Event is one trace v1 event as recorded (inputs carry their own fields; the
@@ -138,12 +141,13 @@ type controlState struct {
 	refuse       uint64
 	delay        uint64
 	delayed      map[*Conn]delayedRedirect
+	closing      map[*Conn]string
 	delayedReady chan struct{}
 	errors       []string
 }
 
 func newControls() *controlState {
-	return &controlState{delayed: make(map[*Conn]delayedRedirect), delayedReady: make(chan struct{}, 1)}
+	return &controlState{delayed: make(map[*Conn]delayedRedirect), closing: make(map[*Conn]string), delayedReady: make(chan struct{}, 1)}
 }
 
 // MarkOverlayInstalled is called by a generated source file that record.py
@@ -196,11 +200,17 @@ func CloseDelayedRedirect(ctx context.Context) error {
 		for candidate, delayed := range controls.delayed {
 			conn = candidate
 			result = delayed
+			if conn.redirect != nil {
+				controls.closing[conn] = conn.redirect.id
+			}
 			break
 		}
 		controls.mu.Unlock()
 		if conn != nil {
 			if !conn.RedirectableConn.ForceClose() {
+				controls.mu.Lock()
+				delete(controls.closing, conn)
+				controls.mu.Unlock()
 				return errors.New("delayed redirect connection refused scripted close")
 			}
 			select {
@@ -233,6 +243,9 @@ func PendingControls() []string {
 	}
 	if len(controls.delayed) != 0 {
 		pending = append(pending, fmt.Sprintf("unsettled delayed redirect callbacks=%d", len(controls.delayed)))
+	}
+	if len(controls.closing) != 0 {
+		pending = append(pending, fmt.Sprintf("unsettled delayed redirect closes=%d", len(controls.closing)))
 	}
 	pending = append(pending, controls.errors...)
 	return pending
@@ -276,6 +289,14 @@ func takeDelayedRedirect(conn *Conn) (delayedRedirect, bool) {
 		delete(controls.delayed, conn)
 	}
 	return result, ok
+}
+
+func takeDelayedClose(conn *Conn) string {
+	controls.mu.Lock()
+	defer controls.mu.Unlock()
+	operation := controls.closing[conn]
+	delete(controls.closing, conn)
+	return operation
 }
 
 func record(ev Event) {
@@ -391,9 +412,9 @@ type redirectOperation struct {
 // (a scripted, declared refusal — recorder README §4).
 func (c *Conn) Refuse(v bool) { c.refuse.Store(v) }
 
-func (c *Conn) effect(kind string, to router.BackendInst, accepted bool) string {
+func (c *Conn) effect(kind string, to router.BackendInst, accepted, refuseNext bool) string {
 	n := c.session.ordinal.Add(1)
-	e := Effect{Kind: kind, Session: c.session.id, Operation: fmt.Sprintf("%s/%d", c.session.id, n), Accepted: accepted}
+	e := Effect{Kind: kind, Session: c.session.id, Operation: fmt.Sprintf("%s/%d", c.session.id, n), Accepted: accepted, RefuseNext: refuseNext}
 	if c.session.current != nil {
 		e.From = c.session.current.ID()
 	}
@@ -405,8 +426,10 @@ func (c *Conn) effect(kind string, to router.BackendInst, accepted bool) string 
 }
 
 func (c *Conn) Redirect(to router.BackendInst) bool {
-	accepted := !c.refuse.Load() && !consumeRefusal() && c.RedirectableConn.Redirect(to)
-	op := c.effect("redirect", to, accepted)
+	refused := c.refuse.Load()
+	refuseNext := !refused && consumeRefusal()
+	accepted := !refused && !refuseNext && c.RedirectableConn.Redirect(to)
+	op := c.effect("redirect", to, accepted, refuseNext)
 	if accepted {
 		c.redirect = &redirectOperation{id: op, from: c.session.current, to: to}
 	}
@@ -414,8 +437,10 @@ func (c *Conn) Redirect(to router.BackendInst) bool {
 }
 
 func (c *Conn) ForceClose() bool {
-	accepted := !c.refuse.Load() && !consumeRefusal() && c.RedirectableConn.ForceClose()
-	c.effect("force_close", nil, accepted)
+	refused := c.refuse.Load()
+	refuseNext := !refused && consumeRefusal()
+	accepted := !refused && !refuseNext && c.RedirectableConn.ForceClose()
+	c.effect("force_close", nil, accepted, refuseNext)
 	return accepted
 }
 
@@ -458,7 +483,7 @@ func (w *receiverWrapper) OnConnClosed(backendID string, conn router.Redirectabl
 	serialize(func() {
 		err = w.inner.OnConnClosed(backendID, w.conn)
 		w.conn.session.closed = true
-		record(Event{Op: "close", Session: w.conn.session.id})
+		record(Event{Op: "close", Session: w.conn.session.id, Operation: takeDelayedClose(w.conn)})
 		if delayed, ok := takeDelayedRedirect(w.conn); ok {
 			lateErr := w.deliverRedirectResult(delayed.from, delayed.to, delayed.success)
 			close(delayed.settled)

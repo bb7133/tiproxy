@@ -100,11 +100,13 @@ resurrect a session. An unmatched callback is preserved as a recorder error.
 The harness composes a real proxy, factor policy, PD-backed observer and cluster
 manager. Scripted actions support environment commands, an explicit `await_env`
 barrier, config changes, fetcher-boundary source-error windows, checkpoints, a
-one-shot refusal, and one delayed real redirect callback followed by a scripted
-client close. Failover scripts use `failover_select` to take a public checkpoint,
-choose one backend currently assigned to a held client, arm an optional `refuse`
-or `delay` control, and apply a positive-timeout drain inside the same serialized
-boundary. `failover_repeat` reapplies that exact target/timeout, while
+global one-shot refusal, and one delayed real redirect callback followed by a
+scripted client close. Failover scripts use `failover_select` to take a public
+checkpoint, choose one backend currently assigned to a held client, arm an optional
+global `refuse` or per-connection `delay` control, and apply a positive-timeout drain
+inside the same serialized boundary. The global refusal is consumed by the next
+effect request regardless of its session. `failover_repeat` reapplies the exact
+target/timeout, while
 `failover_clear` exits it. This avoids hard-coding a randomly assigned held
 session or allowing an ordinary tick to consume a one-shot control first.
 Environment commands in one batch may run concurrently, but every
@@ -213,9 +215,11 @@ artifacts are retained unchanged.
 
 The following dependencies withhold a slot from acceptance:
 
-- `effects-v2`: effects depend on each engine's own prior assignments, including which
-  session should migrate and whether a redirect is due. Non-migrating failover
-  closes now use the public-history predicate described below.
+- `effects-v2`: an unsupported history still cannot express every engine's legal
+  effect set. Bounded Connection and connection-equivalent histories instead emit
+  an input-derived relative cadence descriptor; the runner resolves owners and
+  operations from each engine's own public assignment ledger. Non-migrating
+  failover closes use the same public-history predicate.
 - `policy-constraint:<policy>/prefer-idle`: not all factor advice can yet be derived
   from the available public inputs. An unrestricted candidate set is not qualification.
 - `metrics-input`: an older recorded history claims that metric data was observed
@@ -223,21 +227,22 @@ The following dependencies withhold a slot from acceptance:
   set `metrics_observed` only after recording actual nonempty data and fail closed
   if that state lacks a publication. Both paired adapters consume every recorded
   publication; only the independent history deriver may add or clear this gate.
-- `migration-cadence`: explicitly required by contract §4. This dependency is derived
+- `migration-cadence`: required by contract §4 for unsupported histories and derived
   from input capability and session/destination history even if every observed
   redirect is deleted. Whole-health support-redirection AND semantics disable the
-  balance pass; independent failover closes still run. Destinations must also have
+  balance pass; independent failover closes still run. Destinations must have
   exactly the source's current public keyspace, including empty == empty for legacy
-  inputs. When every possible pair crosses keyspaces, migration is impossible;
-  compatible alternatives retain the cadence dependency because the factors may
-  choose a different pair and the router does not retry another destination.
+  inputs. When every possible pair crosses keyspaces, migration is impossible.
   Whole health updates replace keyspaces; missing retained sources keep their last
-  delivered value. Healthy Connection balance with an already constrained shared
-  assignment history now derives exact effects as described below. A bounded
-  two-backend Resource history also derives the factor-selected pair, advice,
-  rate, exact cadence and refusal budget from complete public metric packets.
-  Other legal redirects remain withheld. No further scope approval is needed to implement
-  the remaining cadence/effect eligibility requirement.
+  delivered value. Bounded Connection histories now describe every current group,
+  member health/keyspace and input-derived Status scoring call without choosing an
+  owner. The runner applies Connection/Status priority, ratio/rate, physical FIFO,
+  slow/fast cadence, cooldown, keyspace and one-shot refusal independently to each
+  engine's ledger. Resource/Location histories use this same relative model only
+  when all higher-priority public factors are proven neutral. The existing bounded
+  Resource model may also derive an exact pair from complete metric packets.
+  Ambiguous group lifetimes, unmodeled factor advice and histories whose legal
+  alternatives exceed the bounded model retain this dependency.
 
 Additional planned work includes timer boundary expansion and
 router Close/recreate/rehydrate for the config/source family. The
@@ -287,26 +292,56 @@ final ledger. CIDR match/no-match and Port conflict/recovery are checked in ever
 applicable slot. These scripts and synthetic validator tests are candidate
 infrastructure; they do not count as recorded corpus evidence by themselves.
 
-The writer preserves a refused client effect as that tick's `refuse` input. If one
-session both accepts and refuses effects in the same tick, the session-level replay
-protocol cannot express the input and the attempt is marked incomplete.
+The writer distinguishes the existing per-session `refuse` input from the scripted
+global one-shot control. The latter is archived on the concrete rejected effect,
+then projected into the public trace as `refuse_next: 1`; the internal marker never
+appears in Go output rows. This lets each adapter consume the refusal on its own
+first eligible effect instead of importing Go's chosen owner. More than one global
+refusal in a tick is invalid. If one session both accepts and rejects effects for
+reasons that cannot be represented by these inputs, the attempt is incomplete.
+
+Each recorded accepted redirect receives a stable logical reference
+`redirect/<ordinal>`. For an ordinary callback, the input's logical session is first
+mapped to that engine's session and the reference can bind only that session's oldest
+outstanding accepted redirect, never an operation from another session. Legal
+assignment differences may move the corresponding effect to another tick. The
+callback reports `no_effect` when that session has no outstanding redirect; it is an
+error to do so while the session has one. The tick-level cadence predicate still
+independently rejects any missing or extra effect that its ledger requires, and the
+final ledger rejects accepted effects left without a same-session callback or close.
+Every paired manifest reports accepted redirects, callback and close settlement
+counts, no-effect callbacks, zero unsettled accepted effects and the per-operation
+settlement path separately for Go and Rust.
+
+The scripted close used by the delayed-callback probe is strict and carries the
+same reference as its following callback. It must bind an outstanding effect;
+closing that concrete connection swaps logical close handles, so the remaining
+scripted closes still settle every engine's live connection exactly once. A stale
+strict reference fails the common ledger.
 
 Run `run.py.validate()` on a derived trace before any replay claim. A nonempty
 `requires` list remains a blocker even when that structural validation passes.
 
-Connection/prefer-idle now emits a public-history predicate rather than an unresolved
-policy dependency. The common runner applies it independently to each engine's
+Connection/prefer-idle emits public-history predicates rather than an unresolved
+policy dependency. The common runner applies them independently to each engine's
 reservations, established connections and accepted redirects. Recorded Go is checked
-by that same predicate without exporting its ledger into the replay inputs. Empty
-ticks are proven from disabled redirection or absence of possible migration
-sessions/destinations. After a non-unique selection, `force_close_due` declares the
-backends whose failover deadline has arrived, derived from config, whole health
-inputs and event time. The common comparator resolves each engine's own established
-owners, effect ordinals and accepted-close history. Reservations are not established
-owners; refusal remains retryable and acceptance suppresses subsequent closes,
-including across clear/reentry, until the connection is closed. Independent session
-effects may commute. This predicate does not authorize redirects or clear the
-migration-cadence dependency.
+by the same predicates without exporting its ledger into replay inputs. Empty ticks
+are proven from disabled redirection or absence of possible migration
+sessions/destinations. A supported active balance tick carries `redirect_cadence`:
+input-derived group epochs, member health/keyspace and any Status scoring calls.
+The runner combines that descriptor with each engine's connection counts, physical
+insertion order, retained unhealthy rate, cooldown and cadence clock to enumerate
+its legal effect sequence. A global one-shot refusal may expose more than one legal
+group order; the bounded alternatives are explicit and no observed Go choice is
+used as Rust input.
+
+After a non-unique selection, `force_close_due` declares the backends whose failover
+deadline has arrived, derived from config, whole health inputs and event time. The
+common comparator resolves each engine's own established owners, effect ordinals
+and accepted-close history, and composes closes after redirects in production order.
+Reservations are not established owners; refusal remains retryable and acceptance
+suppresses subsequent closes, including across clear/reentry, until the connection
+is closed. Independent session effects may commute.
 
 The 86-event force-close smoke covers random and connection/prefer-idle choices,
 before/equal/after deadlines, unchanged activation, repeated refusal, acceptance,
@@ -342,12 +377,15 @@ FIFO, stale/late callbacks, close before completion and group recreation. CI run
 the real adapters and derives identical expectations independently from each output.
 Python counterexample rows are written test data and are not engine evidence.
 
-This increment deliberately retains the existing migration dependency for
-active non-unique assignments, unmodeled resource/location migration factors,
-unknown retained Status rates, or tied pairs with different legal effects. It
-also refuses to seed a cadence clock from an earlier unverified migration. A
-synthetic timing scenario is not a qualifying recording and does not freeze the
-remaining 18-slot manifest.
+This increment retains the migration dependency for ambiguous group lifetimes,
+unmodeled Resource/Location migration factors, incomplete public Status scoring,
+or an alternative set outside the bounded relative model. It also refuses to seed
+a cadence clock from an earlier unverified migration. The Python relative-effects
+counterexample lets two engine rows choose different legal owners and callback counts.
+The generated relative-effects smoke consumes a global refusal and resolves
+a strict delayed close plus late callback through the accepted-effect alias in both
+real adapters. Both are synthetic evidence, not a qualifying recording, and neither
+freezes the 18-slot manifest.
 
 Resource `prefer-idle` selection now has a bounded input-derived case: two
 healthy, equally local backends in one group, unique public ownership, no label
@@ -405,3 +443,10 @@ Next now uses the factor path, retaining valid scoring history even when factors
 reject every candidate. Failover refresh performs both observed-healthy and
 proposed-mask scoring passes for Connection. The unchanged public scenario checks
 these changes against the preserved first Go/Rust outputs.
+
+The Rust replay-only adapter tolerates `metric input source unavailable` solely on
+the immediate sync after an accepted config changes the normalized backend-cluster
+set. That set replacement retires the old source before the next recorded health
+publication binds the new one. Initial sync, health sync, non-cluster config sync,
+and every other error remain fatal; a focused Rust counterexample checks both the
+non-cluster and wrong-error boundaries. Production Rust routing code is unchanged.

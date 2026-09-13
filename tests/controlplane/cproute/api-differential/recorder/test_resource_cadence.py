@@ -64,7 +64,27 @@ class ResourceCadenceTests(unittest.TestCase):
         self.assertEqual(requires, [])
         self.assertEqual(derive.compare_with_reference(derived, self.trace, requires), ([], []))
         result = derive._RUNNER.compare(derived, self.rows, self.rows)
-        self.assertEqual(result, {"events":36, "violations":0, "provenance":"synthetic"})
+        self.assertEqual(result, {
+            "events":36, "violations":0, "provenance":"synthetic",
+            "effect_ledger": {
+                engine: {"accepted_effects":2, "accepted_redirects":2,
+                         "accepted_force_closes":0, "callback_events":2,
+                         "completed_callbacks":2, "no_effect_callbacks":0,
+                         "callback_settled_redirects":2,
+                         "close_settled_redirects":0,
+                         "other_settled_redirects":0,
+                         "close_settled_force_closes":0,
+                         "unsettled_accepted_effects":0,
+                         "all_accepted_settled":True,
+                         "accepted_operations":[
+                             {"operation":"resource-0/1", "kind":"redirect",
+                              "session":"resource-0", "settled_by":"callback"},
+                             {"operation":"resource-2/1", "kind":"redirect",
+                              "session":"resource-2", "settled_by":"callback"},
+                         ]}
+                for engine in ("go", "rust")
+            },
+        })
 
     def test_stable_health_refresh_is_modeled_but_metric_identity_change_is_not(self):
         health = [event for event in self.trace["events"] if event["op"] == "health"]

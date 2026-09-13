@@ -37,8 +37,11 @@ publisher uses current routing/discovery/config/owner fences and keeps the merge
 series order; neither engine receives query-getter history or factor snapshots.
 The 17-event synthetic producer case exercises this boundary. Both adapters keep
 Go year-one zero time (`null`) distinct from Unix epoch (`0`); a separate synthetic
-API case checks initial updates and exact expiry boundaries. Generic resource-policy
-and migration-cadence qualification remain dependencies of real recordings.
+API case checks initial updates and exact expiry boundaries. Unsupported
+Resource/Location factor shapes and ambiguous topology histories remain explicit
+dependencies of real recordings. Bounded Connection and connection-equivalent
+Resource/Location cadence is resolved independently from each engine's public
+assignment history.
 
 Implementation is limited to three increments of the same replacement PR:
 
@@ -211,9 +214,13 @@ invalid updates preserve the last accepted configuration.
 The recorder deriver uses the same predicate to reject unexplained recorded Go
 choices. A non-unique choice does not by itself make every later tick ambiguous:
 a disabled migration pass or absence of any possible session/destination, together
-with no possibly-owned backend at a due failover deadline, prove an empty effect set. Enabled redirection and ambiguous
-failover ownership still retain their effect/cadence dependencies. The retry fixture
-also exercises busy-backend exclusion, full-cycle exhaustion before preference,
-rate-cutoff equality, ratio updates and closing retained sessions. Twelve direct
-regressions and 29 derivation counterexamples cover these rules; recorded corpus
+with no possibly-owned backend at a due failover deadline, proves an empty effect
+set. For bounded Connection or connection-equivalent factor histories, a
+`redirect_cadence` expectation supplies only input-derived groups, health and
+keyspace. The runner then calculates the legal redirects, refusal, cooldown,
+cadence and failover closes separately from each engine's own public assignments.
+Unsupported factors or ambiguous group histories retain their dependencies. The
+retry fixture also exercises busy-backend exclusion, full-cycle exhaustion before
+preference, rate-cutoff equality, ratio updates and closing retained sessions.
+Direct regressions and derivation counterexamples cover these rules; recorded corpus
 qualification and the eight common comparator faults remain separate gates.

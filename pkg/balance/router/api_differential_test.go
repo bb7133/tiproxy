@@ -59,20 +59,23 @@ func apiString(value *string, fallback string) string {
 }
 
 type apiTraceEvent struct {
-	Queries   map[string]*replaymetrics.Result `json:"queries,omitempty"`
-	Op        string                           `json:"op"`
-	Session   string                           `json:"session,omitempty"`
-	Client    string                           `json:"client,omitempty"`
-	Proxy     string                           `json:"proxy,omitempty"`
-	Port      string                           `json:"port,omitempty"`
-	Backends  []apiTraceBackend                `json:"backends,omitempty"`
-	Success   bool                             `json:"success,omitempty"`
-	TOML      string                           `json:"toml,omitempty"`
-	AtNanos   int64                            `json:"at_nanos,omitempty"`
-	Backend   string                           `json:"backend,omitempty"`
-	Operation string                           `json:"operation,omitempty"`
-	Refuse    []string                         `json:"refuse,omitempty"`
-	Error     string                           `json:"error,omitempty"`
+	Queries    map[string]*replaymetrics.Result `json:"queries,omitempty"`
+	Op         string                           `json:"op"`
+	Session    string                           `json:"session,omitempty"`
+	Client     string                           `json:"client,omitempty"`
+	Proxy      string                           `json:"proxy,omitempty"`
+	Port       string                           `json:"port,omitempty"`
+	Backends   []apiTraceBackend                `json:"backends,omitempty"`
+	Success    bool                             `json:"success,omitempty"`
+	TOML       string                           `json:"toml,omitempty"`
+	AtNanos    int64                            `json:"at_nanos,omitempty"`
+	Backend    string                           `json:"backend,omitempty"`
+	Operation  string                           `json:"operation,omitempty"`
+	EffectRef  string                           `json:"effect_ref,omitempty"`
+	Optional   bool                             `json:"optional_effect,omitempty"`
+	Refuse     []string                         `json:"refuse,omitempty"`
+	RefuseNext int                              `json:"refuse_next,omitempty"`
+	Error      string                           `json:"error,omitempty"`
 }
 
 // The test overlays route/group/factor clocks to one public event timestamp.
@@ -99,6 +102,7 @@ type apiConn struct {
 	id         string
 	ordinal    int
 	refuse     bool
+	refuseNext *int
 	effects    *[]apiEffect
 	operations map[string]*apiOperation
 }
@@ -115,12 +119,22 @@ func (c *apiConn) record(kind string, to BackendInst, accepted bool) {
 	}
 }
 func (c *apiConn) Redirect(to BackendInst) bool {
-	accepted := !c.refuse && c.mockRedirectableConn.Redirect(to)
+	refused := c.refuse
+	if !refused && *c.refuseNext > 0 {
+		(*c.refuseNext)--
+		refused = true
+	}
+	accepted := !refused && c.mockRedirectableConn.Redirect(to)
 	c.record("redirect", to, accepted)
 	return accepted
 }
 func (c *apiConn) ForceClose() bool {
-	accepted := !c.refuse && c.mockRedirectableConn.ForceClose()
+	refused := c.refuse
+	if !refused && *c.refuseNext > 0 {
+		(*c.refuseNext)--
+		refused = true
+	}
+	accepted := !refused && c.mockRedirectableConn.ForceClose()
 	c.record("force_close", nil, accepted)
 	return accepted
 }
@@ -240,9 +254,15 @@ func TestRouterAPIDifferential(t *testing.T) {
 		active   bool
 	}
 	sessions := make(map[string]*slot)
+	logicalSessions := make(map[string]string)
 	output := make([]map[string]any, 0, len(trace.Events))
 	effects := []apiEffect{}
 	operations := make(map[string]*apiOperation)
+	effectRefs := make(map[string]*apiOperation)
+	effectRefSessions := make(map[string]string)
+	skippedEffectRefs := make(map[string]struct{})
+	unboundRedirects := []*apiOperation{}
+	refuseNext := 0
 	t.Cleanup(func() {
 		if len(output) > 0 {
 			output[len(output)-1]["effects"] = effects
@@ -254,9 +274,68 @@ func TestRouterAPIDifferential(t *testing.T) {
 	for index, event := range trace.Events {
 		replayclock.Advance(event.AtNanos)
 		effects = []apiEffect{}
-		row := map[string]any{"seq": index, "op": event.Op, "session": event.Session, "outcome": "ok", "backend": "", "effects": []any{}}
+		actualSession := logicalSessions[event.Session]
+		if actualSession == "" {
+			actualSession = event.Session
+		}
+		logicalActual := actualSession
+		var referenced *apiOperation
+		skippedEffect := false
+		if event.EffectRef != "" {
+			referenced = effectRefs[event.EffectRef]
+			_, alreadySkipped := skippedEffectRefs[event.EffectRef]
+			if referenced != nil || alreadySkipped {
+				require.Equal(t, effectRefSessions[event.EffectRef], event.Session,
+					"relative callback crossed sessions")
+			}
+			position := -1
+			for i, candidate := range unboundRedirects {
+				if candidate.effect.Session == logicalActual {
+					position = i
+					break
+				}
+			}
+			if position < 0 && event.Op == "close" && len(unboundRedirects) > 0 {
+				position = 0
+			}
+			if referenced == nil && !alreadySkipped && position >= 0 {
+				referenced = unboundRedirects[position]
+				unboundRedirects = append(unboundRedirects[:position], unboundRedirects[position+1:]...)
+				effectRefs[event.EffectRef] = referenced
+				effectRefSessions[event.EffectRef] = event.Session
+			}
+			if referenced == nil {
+				for _, candidate := range operations {
+					if candidate.effect.Kind == "redirect" && candidate.effect.Session == logicalActual &&
+						!candidate.completed && sessions[candidate.effect.Session] != nil {
+						require.Failf(t, "same-session redirect", "seq=%d effect_ref=%s", index, event.EffectRef)
+					}
+				}
+				require.True(t, event.Optional, "seq=%d effect_ref=%s", index, event.EffectRef)
+				skippedEffectRefs[event.EffectRef] = struct{}{}
+				effectRefSessions[event.EffectRef] = event.Session
+				actualSession = ""
+				skippedEffect = true
+			} else if event.Op == "close" {
+				actualSession = referenced.effect.Session
+				var other string
+				for logical, actual := range logicalSessions {
+					if actual == actualSession {
+						other = logical
+						break
+					}
+				}
+				require.NotEmpty(t, other, "relative close target")
+				displaced := logicalSessions[event.Session]
+				require.NotEmpty(t, displaced, "relative close logical handle")
+				logicalSessions[event.Session], logicalSessions[other] = actualSession, displaced
+			} else {
+				actualSession = referenced.effect.Session
+			}
+		}
+		row := map[string]any{"seq": index, "op": event.Op, "session": actualSession, "outcome": "ok", "backend": "", "effects": []any{}}
 		output = append(output, row)
-		s := sessions[event.Session]
+		s := sessions[actualSession]
 		switch event.Op {
 		case "metrics":
 			next, err := replaymetrics.Decode(event.Queries)
@@ -287,9 +366,10 @@ func TestRouterAPIDifferential(t *testing.T) {
 			}
 		case "open":
 			require.Nil(t, s, "duplicate logical session")
+			logicalSessions[event.Session] = event.Session
 			sessions[event.Session] = &slot{selector: r.GetBackendSelector(ClientInfo{
 				ClientAddr: apiClientAddress(event.Client), ProxyAddr: apiClientAddress(event.Proxy), ListenerPort: event.Port,
-			}), conn: &apiConn{mockRedirectableConn: newMockRedirectableConn(t, uint64(index+1)), id: event.Session, effects: &effects, operations: operations}}
+			}), conn: &apiConn{mockRedirectableConn: newMockRedirectableConn(t, uint64(index+1)), id: event.Session, refuseNext: &refuseNext, effects: &effects, operations: operations}}
 		case "lookup":
 			backend, ok := r.LookupBackend(event.Backend)
 			if !ok {
@@ -309,18 +389,38 @@ func TestRouterAPIDifferential(t *testing.T) {
 				s.active = true
 			}
 		case "tick":
+			refuseNext = event.RefuseNext
 			for id, live := range sessions {
 				live.conn.refuse = false
 				for _, refused := range event.Refuse {
-					if id == refused {
+					if id == logicalSessions[refused] {
 						live.conn.refuse = true
 					}
 				}
 			}
 			r.rebalance(context.Background())
+			require.Zero(t, refuseNext, "one-shot refusal was not consumed at seq=%d", index)
+			for i := range effects {
+				if effects[i].Kind == "redirect" && effects[i].Accepted {
+					unboundRedirects = append(unboundRedirects, operations[effects[i].Operation])
+				}
+			}
 		case "redirect_result":
-			operation := operations[event.Operation]
+			if skippedEffect {
+				row["outcome"] = "no_effect"
+				break
+			}
+			operation := referenced
+			if operation == nil {
+				operation = operations[event.Operation]
+			}
 			require.NotNil(t, operation, "seq=%d operation=%s", index, event.Operation)
+			for i, candidate := range unboundRedirects {
+				if candidate == operation {
+					unboundRedirects = append(unboundRedirects[:i], unboundRedirects[i+1:]...)
+					break
+				}
+			}
 			require.Equal(t, "redirect", operation.effect.Kind)
 			if event.Success {
 				require.NoError(t, operation.conn.receiver.OnRedirectSucceed(operation.from.ID(), operation.to.ID(), operation.conn))
@@ -358,7 +458,15 @@ func TestRouterAPIDifferential(t *testing.T) {
 				require.NoError(t, s.conn.receiver.OnConnClosed(s.conn.from.ID(), s.conn))
 			}
 			s.selector.CloseObservation()
-			delete(sessions, event.Session)
+			kept := unboundRedirects[:0]
+			for _, operation := range unboundRedirects {
+				if operation.effect.Session != actualSession {
+					kept = append(kept, operation)
+				}
+			}
+			unboundRedirects = kept
+			delete(sessions, actualSession)
+			delete(logicalSessions, event.Session)
 		case "checkpoint":
 			assignments := make(map[string]string)
 			for id, live := range sessions {
@@ -376,5 +484,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 		row["effects"] = effects
 	}
 	require.Empty(t, sessions, "trace must settle and close all logical sessions")
+	require.Empty(t, logicalSessions, "trace must close every logical handle")
+	require.Empty(t, unboundRedirects, "trace must close or bind every accepted redirect")
 	require.Zero(t, r.ConnCount())
 }

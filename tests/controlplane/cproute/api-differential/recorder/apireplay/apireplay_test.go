@@ -151,6 +151,9 @@ func TestScriptedEffectRefusalIsOneShot(t *testing.T) {
 	if len(out.events) != 2 || out.events[0].Effects[0].Accepted || !out.events[1].Effects[0].Accepted {
 		t.Fatalf("recorded effects=%+v", out.events)
 	}
+	if !out.events[0].Effects[0].RefuseNext || out.events[1].Effects[0].RefuseNext {
+		t.Fatalf("global-refusal provenance=%+v", out.events)
+	}
 	if pending := PendingControls(); len(pending) != 0 {
 		t.Fatalf("pending controls=%v", pending)
 	}
@@ -195,6 +198,9 @@ func TestDelayedRedirectResultIsReleasedAfterRealClose(t *testing.T) {
 	}
 	if len(out.events) != 3 || out.events[1].Op != "close" || out.events[2].Op != "redirect_result" {
 		t.Fatalf("recorded events=%+v", out.events)
+	}
+	if out.events[1].Operation != "s/1" || out.events[2].Operation != "s/1" {
+		t.Fatalf("delayed close/result references=%+v", out.events)
 	}
 	if c.session.current.ID() != "A" {
 		t.Fatalf("late callback resurrected closed session on %s", c.session.current.ID())

@@ -196,19 +196,112 @@ class ConnectionPreferenceTests(unittest.TestCase):
             h = self.history()
             for sid in ("s", "keep"):
                 self.reserve(h, sid, "a", True)
-            ef = {"kind": "redirect", "session": "s", "operation": "s/1", "from": "a", "to": "b", "accepted": True}
-            h.apply({"op": "tick"}, {"effects": [dict(ef, accepted=False)]})
+            ef = {"kind": "redirect", "session": "s", "operation": "s/2", "from": "a", "to": "b", "accepted": True}
+            h.apply({"op": "tick"}, {"effects": [dict(ef, operation="s/1", accepted=False)]})
             self.assertEqual(h.prefer_idle({"a", "b"}), {"b"})
             h.apply({"op": "tick"}, {"effects": [ef]})
             self.assertEqual(h.prefer_idle({"a", "b"}), {"a", "b"})
-            h.apply({"op": "tick"}, {"effects": [dict(ef, kind="force_close", operation="s/2", to="")]})
+            h.apply({"op": "tick"}, {"effects": [dict(ef, kind="force_close", operation="s/3", to="")]})
             if result == "close":
                 h.apply({"op": "close", "session": "s"}, {})
-            callback = {"op": "redirect_result", "session": "s", "operation": "s/1", "success": result is not False}
+            callback = {"op": "redirect_result", "session": "s", "operation": "s/2", "success": result is not False}
             h.apply(callback, {})
             h.apply(callback, {})  # duplicate/late delivery cannot resurrect or double-transfer
             self.assertEqual(h.prefer_idle({"a", "b"}), {"b"} if result is False else {"a", "b"})
             self.assertEqual(h.assigned.get("s"), "a" if result is False else "b" if result is True else None)
+
+    def test_global_refusal_must_be_consumed_by_an_eligible_effect(self):
+        h = self.history()
+        event = {"op": "tick", "refuse_next": 1}
+        singleton = {"redirect_cadence": {"kind": "connection", "groups": [
+            {"group": "group/1", "members": [{"backend": "a", "healthy": True, "keyspace": ""}]},
+        ]}}
+        self.assertEqual(h.expected_effect_alternatives(event, singleton, 0), [])
+        rejected = {"kind": "force_close", "session": "s", "operation": "s/1",
+                    "from": "a", "to": "", "accepted": False}
+        self.assertEqual(h.expected_effect_alternatives(event, {"effects": [rejected]}, 0), [[rejected]])
+        self.assertEqual(h.expected_effect_alternatives(
+            event, {"effects": [dict(rejected, accepted=True)]}, 0), [])
+
+    def test_relative_redirect_ordinal_does_not_embed_a_tick(self):
+        for tick in (4, 17):
+            with self.subTest(tick=tick):
+                h = self.history()
+                self.reserve(h, "actual", "a", True)
+                redirect = {"kind": "redirect", "session": "actual", "operation": "actual/1",
+                            "from": "a", "to": "b", "accepted": True}
+                h.apply({"op": "tick", "at_nanos": tick}, {"effects": [redirect]}, index=tick)
+                callback = {"op": "redirect_result", "session": "actual",
+                            "effect_ref": "redirect/1", "success": True}
+                self.assertEqual(h.resolve_event(callback), "actual")
+                self.assertEqual(h.resolve_operation(callback), "actual/1")
+
+    def test_relative_effect_binding_is_session_scoped_and_stable(self):
+        h = self.history()
+        for sid in ("a", "b"):
+            self.reserve(h, sid, "source", True)
+        for sid in ("a", "b"):
+            redirect = {"kind": "redirect", "session": sid, "operation": f"{sid}/1",
+                        "from": "source", "to": "target", "accepted": True}
+            h.apply({"op": "tick"}, {"effects": [redirect]})
+
+        first = {"op": "redirect_result", "session": "a",
+                 "effect_ref": "redirect/1", "success": True}
+        self.assertEqual(h.resolve_operation(first), "a/1")
+        with self.assertRaisesRegex(runner.Difference, "same-session redirect"):
+            h.resolve_operation({"op": "redirect_result", "session": "a",
+                                 "effect_ref": "redirect/2", "optional_effect": True,
+                                 "success": True})
+        # Reusing a bound handle cannot consume the next accepted redirect.
+        self.assertEqual(h.resolve_operation(first), "a/1")
+        self.assertEqual([effect["operation"] for effect in h.unbound_redirects], ["b/1"])
+        with self.assertRaisesRegex(runner.Difference, "crossed sessions"):
+            h.resolve_operation({**first, "session": "b"})
+
+    def test_optional_relative_callback_cannot_borrow_another_session(self):
+        h = self.history()
+        self.reserve(h, "a", "source", True)
+        redirect = {"kind": "redirect", "session": "a", "operation": "a/1",
+                    "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [redirect]})
+        callback = {"op": "redirect_result", "session": "b",
+                    "effect_ref": "redirect/1", "optional_effect": True,
+                    "success": True}
+        self.assertEqual(h.resolve_event(callback), "")
+        self.assertEqual(h.resolve_operation(callback), "")
+        self.assertEqual([effect["operation"] for effect in h.unbound_redirects], ["a/1"])
+        self.reserve(h, "b", "source", True)
+        other = {"kind": "redirect", "session": "b", "operation": "b/1",
+                 "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [other]})
+        with self.assertRaisesRegex(runner.Difference, "same-session redirect"):
+            h.resolve_operation(callback)
+        h.apply({"op": "close", "session": "a"}, {})
+        h.apply({"op": "close", "session": "b"}, {})
+        self.assertEqual(h.unbound_redirects, [])
+
+    def test_failed_relative_callback_keeps_per_session_cooldown(self):
+        h = self.history()
+        self.reserve(h, "active", "a", True)
+        for sid in ("pending-1", "pending-2", "pending-3"):
+            self.reserve(h, sid, "a")
+        expect = {"redirect_cadence": {"kind": "connection", "groups": [{
+            "group": "group/1",
+            "members": [
+                {"backend": "a", "healthy": True, "keyspace": ""},
+                {"backend": "b", "healthy": True, "keyspace": ""},
+            ],
+        }]}}
+        tick = {"op": "tick", "at_nanos": 0}
+        redirect = h.expected_effect_alternatives(tick, expect, 0)[0][0]
+        self.assertEqual(redirect["session"], "active")
+        h.apply(tick, {"effects": [redirect]})
+        h.apply({"op": "redirect_result", "session": "active",
+                 "operation": "active/1", "success": False}, {})
+        self.assertEqual(h.expected_effect_alternatives(tick, expect, 2_999_999_999), [[]])
+        retry = h.expected_effect_alternatives(tick, expect, 3_000_000_000)[0]
+        self.assertEqual([(effect["session"], effect["operation"]) for effect in retry],
+                         [("active", "active/2")])
 
     def test_common_comparator_rejects_busy_choice_using_each_engine_history(self):
         # Both engines' first two legal choices differ. A third choice must use

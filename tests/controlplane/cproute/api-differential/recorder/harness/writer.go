@@ -127,7 +127,7 @@ func summarizeLifecycles(log []Recorded, heldSessions map[string]struct{}) Lifec
 	return summary
 }
 
-func tickRefusals(effects []apireplay.Effect) (refused []string, mixed []string) {
+func tickRefusals(effects []apireplay.Effect) (refused []string, mixed []string, refuseNext int) {
 	type acceptance uint8
 	const (
 		rejected acceptance = 1 << iota
@@ -135,6 +135,10 @@ func tickRefusals(effects []apireplay.Effect) (refused []string, mixed []string)
 	)
 	states := make(map[string]acceptance)
 	for _, effect := range effects {
+		if effect.RefuseNext {
+			refuseNext++
+			continue
+		}
 		if effect.Accepted {
 			states[effect.Session] |= accepted
 		} else {
@@ -154,6 +158,15 @@ func tickRefusals(effects []apireplay.Effect) (refused []string, mixed []string)
 	return
 }
 
+func publicEffects(effects []apireplay.Effect) []apireplay.Effect {
+	public := make([]apireplay.Effect, len(effects))
+	copy(public, effects)
+	for i := range public {
+		public[i].RefuseNext = false
+	}
+	return public
+}
+
 // Write converts the recorded log into the trace v1 input file (no expect
 // blocks), the Go rows file and a manifest with hashes. Ticks are folded:
 // `tick_begin` … effects … `tick_end` become one `tick` event whose row carries
@@ -166,6 +179,8 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	var tickEffects []apireplay.Effect
 	var tickAt int64
 	var metricPublications int
+	operationRefs := make(map[string]string)
+	acceptedRedirects := 0
 	push := func(ev map[string]any, row map[string]any, at int64) {
 		ev["at_nanos"] = at
 		row["seq"] = len(rows)
@@ -194,13 +209,25 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 				incomplete = append(incomplete, fmt.Sprintf("seq %d: tick end without begin", r.Seq))
 			}
 			ev := map[string]any{"op": "tick"}
-			effects := tickEffects
+			effects := publicEffects(tickEffects)
 			if effects == nil {
 				effects = []apireplay.Effect{}
 			}
-			refused, mixed := tickRefusals(effects)
+			refused, mixed, refuseNext := tickRefusals(tickEffects)
 			if len(refused) > 0 {
 				ev["refuse"] = refused
+			}
+			if refuseNext > 0 {
+				ev["refuse_next"] = refuseNext
+			}
+			if refuseNext > 1 {
+				incomplete = append(incomplete, fmt.Sprintf("tick at %d: global refusal consumed %d effects", tickAt, refuseNext))
+			}
+			for _, effect := range effects {
+				if effect.Kind == "redirect" && effect.Accepted {
+					acceptedRedirects++
+					operationRefs[effect.Operation] = fmt.Sprintf("redirect/%d", acceptedRedirects)
+				}
 			}
 			for _, session := range mixed {
 				incomplete = append(incomplete, fmt.Sprintf("tick at %d: session %s has both accepted and refused effects", tickAt, session))
@@ -243,9 +270,22 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 		case "finish":
 			push(map[string]any{"op": "finish", "session": e.Session, "success": *e.Success}, map[string]any{"op": "finish", "session": e.Session, "outcome": "ok"}, r.AtNanos)
 		case "close":
-			push(map[string]any{"op": "close", "session": e.Session}, map[string]any{"op": "close", "session": e.Session, "outcome": "ok"}, r.AtNanos)
+			ev := map[string]any{"op": "close", "session": e.Session}
+			if e.Operation != "" {
+				ref, ok := operationRefs[e.Operation]
+				if !ok {
+					incomplete = append(incomplete, fmt.Sprintf("seq %d: delayed close operation %s has no accepted redirect", r.Seq, e.Operation))
+				} else {
+					ev["effect_ref"] = ref
+				}
+			}
+			push(ev, map[string]any{"op": "close", "session": e.Session, "outcome": "ok"}, r.AtNanos)
 		case "redirect_result":
-			push(map[string]any{"op": "redirect_result", "session": e.Session, "operation": e.Operation, "success": *e.Success},
+			ref, ok := operationRefs[e.Operation]
+			if !ok {
+				incomplete = append(incomplete, fmt.Sprintf("seq %d: redirect result operation %s has no accepted effect", r.Seq, e.Operation))
+			}
+			push(map[string]any{"op": "redirect_result", "session": e.Session, "effect_ref": ref, "success": *e.Success},
 				map[string]any{"op": "redirect_result", "session": e.Session, "outcome": "ok"}, r.AtNanos)
 		case "lookup", "rehydrate":
 			ev := map[string]any{"op": e.Op, "backend": e.Backend}

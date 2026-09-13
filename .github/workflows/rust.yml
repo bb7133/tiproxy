@@ -518,6 +518,11 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             "${RUNNER_TEMP}/resource-cadence-smoke.json" \
             --output "${RUNNER_TEMP}/routing-api-resource-cadence"
+          python3 tests/controlplane/cproute/api-differential/recorder/relative_effects_smoke.py \
+            "${RUNNER_TEMP}/relative-effects-smoke.json"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            "${RUNNER_TEMP}/relative-effects-smoke.json" \
+            --output "${RUNNER_TEMP}/routing-api-relative-effects"
           python3 - <<'PYCLOSE'
           import importlib.util
           import json
@@ -531,7 +536,8 @@ jobs:
                    (Path(os.environ["RUNNER_TEMP"]) / "keyspace-smoke.json", "routing-api-keyspace"),
                    (Path(os.environ["RUNNER_TEMP"]) / "connection-cadence-smoke.json", "routing-api-cadence"),
                    (Path(os.environ["RUNNER_TEMP"]) / "status-cadence-smoke.json", "routing-api-status-cadence"),
-                   (Path(os.environ["RUNNER_TEMP"]) / "resource-cadence-smoke.json", "routing-api-resource-cadence")]
+                   (Path(os.environ["RUNNER_TEMP"]) / "resource-cadence-smoke.json", "routing-api-resource-cadence"),
+                   (Path(os.environ["RUNNER_TEMP"]) / "relative-effects-smoke.json", "routing-api-relative-effects")]
           for source, folder in cases:
               trace = json.loads(source.read_text())
               output = Path(os.environ["RUNNER_TEMP"]) / folder
@@ -605,6 +611,8 @@ jobs:
             ${{ runner.temp }}/status-cadence-smoke.json
             ${{ runner.temp }}/routing-api-resource-cadence
             ${{ runner.temp }}/resource-cadence-smoke.json
+            ${{ runner.temp }}/routing-api-relative-effects
+            ${{ runner.temp }}/relative-effects-smoke.json
             ${{ runner.temp }}/routing-api-recorded-source
             ${{ runner.temp }}/routing-api-recorded-source-paired
             ${{ runner.temp }}/routing-api-recorded-metrics

@@ -64,6 +64,8 @@ def validate(row, trace, go):
     config_rows = []
     config_on = config_off = conflict_end = None
     operations = {}
+    effect_refs = {}
+    accepted_redirects = 0
     results = Counter()
     closes = defaultdict(list)
 
@@ -138,10 +140,21 @@ def validate(row, trace, go):
                     problems.append(f"duplicate effect operation {operation}")
                 else:
                     operations[operation] = (i, effect)
+                    if effect.get("kind") == "redirect" and effect.get("accepted") is True:
+                        accepted_redirects += 1
+                        effect_refs[f"redirect/{accepted_redirects}"] = operation
         elif op == "close":
             closes[event["session"]].append(i)
+            effect_ref = event.get("effect_ref")
+            if effect_ref:
+                operation = effect_refs.get(effect_ref)
+                issued = operations.get(operation)
+                if (issued is None or issued[1].get("kind") != "redirect"
+                        or issued[1].get("accepted") is not True
+                        or issued[1].get("session") != event.get("session")):
+                    problems.append(f"close at {i} has invalid accepted-effect reference {effect_ref!r}")
         elif op == "redirect_result":
-            operation = event.get("operation", "")
+            operation = event.get("operation") or effect_refs.get(event.get("effect_ref"), "")
             results[operation] += 1
             issued = operations.get(operation)
             if issued is None or not issued[1].get("accepted") or issued[1].get("kind") != "redirect":
@@ -207,7 +220,9 @@ def validate(row, trace, go):
                 continue
             session = effect.get("session")
             result_i = next((i for i, (event, _) in enumerate(zip(events, go))
-                             if event.get("op") == "redirect_result" and event.get("operation") == operation), None)
+                             if event.get("op") == "redirect_result"
+                             and (event.get("operation")
+                                  or effect_refs.get(event.get("effect_ref"), "")) == operation), None)
             if result_i is not None and any(issued_i < close_i < result_i for close_i in closes[session]):
                 late.append(operation)
         if not late:

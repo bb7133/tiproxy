@@ -6,8 +6,9 @@
 Input : a recorded trace (events without `expect`) and the recorded Go rows for the same
         events (output evidence: per-event outcome/backend/effects).
 Output: the trace with `expect` per event, plus a `requires` list naming every runner
-        dependency the slot needs before it can count (effects-v2, metrics-input,
-        policy-constraint:<pair>). Dependencies are decided from the
+        dependency the slot needs before it can count (effects-v2,
+        migration-cadence, metrics-input, policy-constraint:<pair>).
+        Dependencies are decided from the
         public inputs and their history, never from what the recorded output happened to be.
 
 Rules (README §2, rev 3): Next / Lookup / Rehydrate are derived separately; error classes map
@@ -35,12 +36,14 @@ Public semantics mirrored (file:line at the reviewed tree):
   consumed unhealthy/absent and idle — no listed connection, no pending reservation, no
   in-flight redirect score (router_score.go:264, 340-356, group.go:222-238). Rehydrate
   additionally needs group ownership (group.go:514-520).
-- Connection-factor migration: exact active assignments determine the pair,
-  rate, physical insertion order, accepted-request cadence and failure cooldown.
-  Closed random histories do not poison later exact ownership, but an ambiguous
-  active owner or retained status rate and distinguishable tied pairs remain
-  migration dependencies. Resource/Location reduce to this path only when their
-  complete metric-factor lifetime proves all higher-priority scores equal.
+- Connection-factor migration: a relative expectation carries only input-derived
+  groups, health, keyspace and Status scoring calls. The common runner combines it
+  with each engine's own active assignments to determine the pair, rate, physical
+  insertion order, accepted-request cadence, one-shot refusal and failure cooldown.
+  Closed random histories do not poison later ownership. Ambiguous group lifetimes,
+  incomplete Status scoring and alternatives outside the bounded model remain
+  dependencies. Resource/Location reduce to this path only when their complete
+  metric-factor lifetime proves all higher-priority scores equal.
 - Resource migration: the same rules are derived for a complete two-backend,
   single-group public metric history; unsupported factor calls remain dependencies.
 """
@@ -227,6 +230,8 @@ class State:
         self.selection = config["selection"]
         self.backends = {}  # router.backends: id -> Backend
         self.groups = {}  # group value -> set(ids); MatchAll uses ""
+        self.group_epochs = {}  # public-model identity; changes when a group is destroyed/recreated
+        self.next_group_epoch = 0
         self.cidr_values = {}
         self.cidr_networks = {}
         self.next_cidr_group = 0
@@ -245,9 +250,13 @@ class State:
         self.group_last_redirect = {}  # only accepted requests advance a group's cadence
         self.ambiguous_group_clocks = set()
         self.redirect_operations = {}  # public accepted operation handles and their settlement
+        self.operation_refs = {}  # recorded operation -> engine-relative accepted-effect reference
+        self.ref_operations = {}  # inverse map for already-relative recorder inputs
+        self.accepted_redirects = 0
         # group -> backend -> (input-derived rate or None when an engine-relative
         # owner made the retained rate unknowable, last scoring time)
         self.status_snapshots = {}
+        self.status_calls = []  # input-derived scoring calls made while consuming one event
         self.status_rate = 0.0
         self.clock_origin = config.get("clock_origin_nanos", 1_700_000_000_000_000_000)
         self.metric_queries = None  # latest whole public metrics publication
@@ -260,6 +269,9 @@ class State:
     # --- helpers -------------------------------------------------------------------------
     def held_possible(self, bid):
         return any(bid in s.possible() for s in self.sessions.values())
+
+    def relative_history_active(self):
+        return any(session.relative_history for session in self.sessions.values())
 
     def held_sure(self, bid):
         return any(bid in s.sure() for s in self.sessions.values())
@@ -277,6 +289,13 @@ class State:
     def healthy(self, bid):
         b = self.backends[bid]
         return b.observed_healthy and bid not in self.failover
+
+    def ensure_group(self, value):
+        if value not in self.groups:
+            self.groups[value] = set()
+            self.next_group_epoch += 1
+            self.group_epochs[value] = f"group/{self.next_group_epoch}"
+        return self.groups[value]
 
     # --- inputs (router_score.go updateBackendHealth / updateGroups / group.UpdateFailover) ---
     def apply_health(self, backends):
@@ -342,7 +361,7 @@ class State:
                 value = self.group_value(b)
                 if value is not None:
                     b.group = value
-                    self.groups.setdefault(value, set()).add(bid)
+                    self.ensure_group(value).add(bid)
         if self.rule in CIDR_RULES:
             self.update_cidr_groups(old_groups - set(self.groups))
         self.ambiguous_group_clocks = ambiguous_clocks & set(self.groups)
@@ -379,7 +398,7 @@ class State:
                     self.next_cidr_group += 1
                     group = f"cidr/{self.next_cidr_group}"
                     created[values] = group
-                    self.groups[group] = set()
+                    self.ensure_group(group)
                     self.cidr_networks[group] = parsed
             self.backends[bid].group = group
             self.groups[group].add(bid)
@@ -403,6 +422,7 @@ class State:
                     self.cidr_networks.pop(b.group, None)
                     self.group_last_redirect.pop(b.group, None)
                     self.status_snapshots.pop(b.group, None)
+                    self.group_epochs.pop(b.group, None)
 
     def reset_resource_metrics(self):
         """Mirror destruction/recreation of Resource factors on policy transitions."""
@@ -521,6 +541,8 @@ class State:
         """Public scoring calls determine status rate retention and strict expiry."""
         if not health or self.policy not in {"connection"} | METRIC_POLICIES:
             return
+        self.status_calls.append({"group": self.group_epochs[group],
+                                  "health": dict(sorted(health.items()))})
         snapshots = self.status_snapshots.setdefault(group, {})
         counts, _ = self.connection_counts()
         uncertain = set()
@@ -700,6 +722,31 @@ def derive_connection_redirects(state, refused):
     return out
 
 
+def connection_cadence_model(state):
+    """Describe the bounded migration model without choosing engine owners.
+
+    The common runner supplies each engine's public Next/Finish/callback ledger.
+    This descriptor contributes only input-derived group membership, health,
+    keyspace and the proof that every higher-priority factor is neutral.
+    """
+    if (state.policy not in {"connection"} | METRIC_POLICIES
+            or state.ambiguous_group_clocks or state.recorded_connections.label_name
+            or any(backend.ambiguous for backend in state.backends.values())):
+        return None
+    groups = []
+    for group, members in sorted(state.groups.items()):
+        members = sorted(members)
+        if (state.policy in METRIC_POLICIES and len(members) > 1
+                and not metric_factors_are_connection_only(state, members)):
+            return None
+        groups.append({
+            "group": state.group_epochs[group],
+            "members": [{"backend": bid, "healthy": state.healthy(bid),
+                         "keyspace": state.backends[bid].keyspace} for bid in members],
+        })
+    return {"kind": "connection", "groups": groups}
+
+
 def remember_redirect(state, effect, modeled):
     session = state.sessions[effect["session"]]
     session.ordinal += 1
@@ -725,7 +772,7 @@ def due_failover_backends(state):
             and (timeout_ns == 0 or state.now >= b.failover_since + timeout_ns)}
 
 
-def derive_tick_effects(state, refused):
+def derive_tick_effects(state, refused, refuse_next=0):
     """group.go:542-587 CloseTimedOutFailoverConnections at every rebalance: every listed
     connection on a backend whose failover has lasted >= failover-timeout (or immediately when
     the timeout is 0) receives ForceClose; accepted ones are not repeated, refused ones are
@@ -735,7 +782,7 @@ def derive_tick_effects(state, refused):
     out = []
     due = due_failover_backends(state)
     if not due:
-        return out
+        return out, refuse_next
     for s in sorted(state.sessions.values(), key=lambda x: (x.created, x.id)):
         if not s.assigned or s.force_closing:
             continue
@@ -747,11 +794,14 @@ def derive_tick_effects(state, refused):
         if bid not in due:
             continue
         s.ordinal += 1
-        accepted = s.id not in refused
+        scripted = s.id in refused
+        if not scripted and refuse_next:
+            scripted, refuse_next = True, refuse_next - 1
+        accepted = not scripted
         out.append({"kind": "force_close", "session": s.id, "operation": f"{s.id}/{s.ordinal}", "from": bid, "to": "", "accepted": accepted})
         if accepted:
             s.force_closing = True
-    return out
+    return out, refuse_next
 
 
 def route_once(state, session, excluded):
@@ -1376,6 +1426,8 @@ def derive(trace, rows, args):
     for seq, (event, row) in enumerate(zip(events, rows)):
         op, sid = event["op"], event.get("session", "")
         state.now = event.get("at_nanos", state.now)
+        state.status_calls = []
+        connections_prepared = False
         expect = {"outcome": "ok"}
         if op == "health":
             state.apply_health(event.get("backends", []))
@@ -1462,6 +1514,13 @@ def derive(trace, rows, args):
                 for group, members in state.groups.items():
                     if len(members) > 1:
                         state.update_connection_status(group, {bid: state.healthy(bid) for bid in members})
+            if state.status_calls:
+                expect["status_scoring"] = copy.deepcopy(state.status_calls)
+            try:
+                state.recorded_connections.prepare(event, expect, row, state.now)
+            except _RUNNER.Difference as error:
+                raise Refuse(f"seq {seq}: {error}") from error
+            connections_prepared = True
             metric_predicted = None
             if (state.support_redirection and state.metric_queries is not None
                     and state.policy in METRIC_POLICIES):
@@ -1473,8 +1532,6 @@ def derive(trace, rows, args):
                 metric_predicted = derive_connection_redirects(state, refused)
                 if metric_predicted is None and state.policy == "resource":
                     metric_predicted = derive_resource_redirects(state, refused)
-                if metric_predicted is None:
-                    state.resource_metric_history_trusted = False
             # Whether a migration could be due is a property of inputs and
             # session history. Deleting its observed output must not remove
             # this dependency. A whole health result can disable Balance,
@@ -1484,6 +1541,17 @@ def derive(trace, rows, args):
                 and any(state.migration_targets(bid) for bid in s.assigned)
                 for s in state.sessions.values()
             )
+            relative_history = state.relative_history_active()
+            # Recorded in-flight/close/callback state may differ after legal
+            # engine-specific routing. A bounded relative model is therefore
+            # needed even when Go has no eligible source on this exact tick.
+            relative_migration_possible = relative_history and any(
+                state.migration_targets(bid) for bid in state.backends
+            )
+            migration_may_differ = (
+                migration_possible
+                or (state.support_redirection and relative_migration_possible)
+            )
             if not migration_possible:
                 predicted = []
             elif state.policy == "connection":
@@ -1492,15 +1560,33 @@ def derive(trace, rows, args):
                 predicted = metric_predicted
             else:
                 predicted = None
-            modeled = predicted is not None
-            if migration_possible and not modeled:
+            if relative_history:
+                # Once ordinary routing has made a legal engine-specific
+                # choice, even a later exact recorded ledger cannot name the
+                # other engine's session selected for migration. Keep using
+                # the public engine-relative cadence model for the rest of
+                # that history rather than turning Go's owner into an oracle.
+                predicted = None
+            if event.get("refuse_next", 0):
+                # A one-shot refusal belongs to the external client boundary,
+                # so the concrete refused owner is resolved per engine.
+                predicted = None
+            relative_model = (
+                connection_cadence_model(state)
+                if migration_may_differ and predicted is None else None
+            )
+            modeled = predicted is not None or relative_model is not None
+            if migration_may_differ and not modeled:
                 state.requires.add("migration-cadence")
+                if state.policy in METRIC_POLICIES:
+                    state.resource_metric_history_trusted = False
             # Redirects (group.Balance) are issued before the failover close pass in the same
             # iteration (router_score.go:471-483), so their ordinals come first.
             # Check public ownership/destination/acceptance for all redirects.
             # Modeled timing is compared against its independent prediction;
             # other factor/history cases remain withheld, never copied.
             leftover = []
+            refusal_budget = event.get("refuse_next", 0)
             for ef in recorded:
                 if ef["kind"] == "force_close":
                     leftover.append(ef)
@@ -1512,43 +1598,66 @@ def derive(trace, rows, args):
                     raise Refuse(f"seq {seq}: effect {ef['operation']} on an unknown or idle session")
                 if len(s.assigned) == 1 and ef["from"] not in s.assigned:
                     raise Refuse(f"seq {seq}: effect {ef['operation']} from {ef['from']!r} contradicts the derived assignment {sorted(s.assigned)}")
-                if ef["accepted"] == (ef["session"] in refused):
+                scripted = ef["session"] in refused
+                if not scripted and refusal_budget:
+                    scripted, refusal_budget = True, refusal_budget - 1
+                if ef["accepted"] == scripted:
                     raise Refuse(f"seq {seq}: effect {ef['operation']} acceptance contradicts the scripted refusal")
                 legal_to = state.migration_targets(ef["from"])
                 if ef["to"] not in legal_to:
                     raise Refuse(f"seq {seq}: redirect destination {ef['to']!r} not in the legal set {sorted(legal_to)}")
-                remember_redirect(state, ef, modeled)
+                remember_redirect(state, ef, predicted is not None)
                 if not modeled:
                     state.requires.add("migration-cadence")
-                if not state.unique_history and not modeled:
+                if relative_history and not modeled:
                     state.requires.add("effects-v2")
-            if modeled and _RUNNER.causal([ef for ef in recorded if ef["kind"] == "redirect"]) != _RUNNER.causal(predicted):
+            if (predicted is not None
+                    and _RUNNER.causal([ef for ef in recorded if ef["kind"] == "redirect"])
+                    != _RUNNER.causal(predicted)):
                 raise Refuse(f"seq {seq}: redirect effects contradict the input-derived {state.policy} cadence: expected {predicted}")
-            if not state.unique_history and migration_possible and not modeled:
+            if relative_model is not None:
+                expect["redirect_cadence"] = relative_model
+            if relative_history and migration_may_differ and not modeled:
                 # A possible migration after non-unique routing depends on
                 # each engine's assignments. No session/destination means no
                 # migration for every engine, including empty-health ticks.
                 state.requires.add("effects-v2")
-            relative_close = not migration_possible and not state.unique_history
+            relative_close = (relative_history
+                              and (not migration_possible or relative_model is not None))
             if relative_close:
                 # The due backend set is defined by public config/health/time.
                 # Each engine resolves its own owners and accepted-close history;
                 # only Go's own rows are used to validate this recording here.
                 due = sorted(due_failover_backends(state))
                 expect["force_close_due"] = due
-                derived = state.recorded_connections.force_close_effects(event, due)
+                derived, remaining_refusal = state.recorded_connections._force_close_effects(
+                    event, due, refusal_budget)
             else:
-                derived = derive_tick_effects(state, refused)
-            if key_effects(leftover) != key_effects(derived):
+                derived, remaining_refusal = derive_tick_effects(state, refused, refusal_budget)
+            if relative_model is not None:
+                alternatives = state.recorded_connections.expected_effect_alternatives(event, expect, state.now)
+                if not any(_RUNNER.causal(recorded) == _RUNNER.causal(candidate) for candidate in alternatives):
+                    raise Refuse(f"seq {seq}: effects contradict the engine-relative connection cadence: recorded {recorded}, expected one of {alternatives[:4]}, counts {state.recorded_connections.counts()}, last {state.recorded_connections.group_last_redirect}")
+            elif key_effects(leftover) != key_effects(derived):
                 raise Refuse(f"seq {seq}: recorded force_close effects {leftover} differ from the failover-timeout derivation {derived}")
+            if relative_model is None and remaining_refusal:
+                raise Refuse(f"seq {seq}: one-shot refusal was not consumed by an eligible effect")
             if derived and not relative_close:
                 expect["effects"] = derived
             if modeled and predicted:
                 expect["effects"] = predicted + derived
+            for effect in recorded:
+                if effect["kind"] == "redirect" and effect["accepted"]:
+                    state.accepted_redirects += 1
+                    effect_ref = f"redirect/{state.accepted_redirects}"
+                    state.operation_refs[effect["operation"]] = effect_ref
+                    state.ref_operations[effect_ref] = effect["operation"]
             if state.policy in METRIC_POLICIES and state.metrics_observed:
                 state.requires.add("metrics-input")  # migration advice consults metric factors
         elif op == "redirect_result":
-            operation = event["operation"]
+            operation = event.get("operation") or state.ref_operations.get(event.get("effect_ref"))
+            if operation is None:
+                raise Refuse(f"seq {seq}: callback has no known engine-relative operation")
             accepted = state.redirect_operations.get(operation)
             if accepted is None or accepted[0] != sid:
                 raise Refuse(f"seq {seq}: callback lacks a matching accepted redirect {operation!r}")
@@ -1567,12 +1676,42 @@ def derive(trace, rows, args):
             expect["legal_server_versions"] = current if current else [state.retained_version]
         else:
             raise Refuse(f"seq {seq}: unsupported op {op!r}")
+        if state.status_calls and "status_scoring" not in expect:
+            expect["status_scoring"] = copy.deepcopy(state.status_calls)
+        e = dict(event)
+        if op == "close" and "effect_ref" not in e and seq + 1 < len(events):
+            following = events[seq + 1]
+            if (following.get("op") == "redirect_result"
+                    and following.get("session") == sid):
+                operation = (following.get("operation")
+                             or state.ref_operations.get(following.get("effect_ref")))
+                effect_ref = state.operation_refs.get(operation)
+                if effect_ref is not None:
+                    # Older traces recorded the close/result adjacency but not
+                    # the close's operation. Preserve that public ordering as
+                    # the same strict delayed-close reference new writers emit.
+                    e["effect_ref"] = effect_ref
+        if op == "redirect_result" and "operation" in e:
+            effect_ref = state.operation_refs.get(e["operation"])
+            if effect_ref is not None:
+                e.pop("operation")
+                e["effect_ref"] = effect_ref
+        if (op == "redirect_result" and "effect_ref" in e
+                and not (out_events and out_events[-1]["op"] == "close"
+                         and out_events[-1].get("effect_ref") == e["effect_ref"])):
+            # Ordinary asynchronous callbacks are engine-relative completion
+            # opportunities. An engine with no outstanding accepted redirect
+            # at this input emits no_effect; a delayed-close callback is strict.
+            e["optional_effect"] = True
+        e["expect"] = expect
         try:
-            state.recorded_connections.apply(event, row)
+            if not connections_prepared:
+                state.recorded_connections.prepare(e, expect, row, state.now)
+            public_sid = state.recorded_connections.resolve_event(e)
+            public_operation = state.recorded_connections.resolve_operation(e)
+            state.recorded_connections.apply(e, row, public_sid, public_operation, seq, prepared=True)
         except _RUNNER.Difference as error:
             raise Refuse(f"seq {seq}: {error}") from error
-        e = dict(event)
-        e["expect"] = expect
         out_events.append(e)
     result = copy.deepcopy(trace)
     result["events"] = out_events
@@ -1718,11 +1857,12 @@ def defect_checks():
     rows = rows_for(ev, e2="default/a"); rows[4]["backend"] = "default/a"; rows[7]["outcome"] = "unknown_backend"
     attempt("pending_reservation_retains", cfg, ev, rows,
             lambda d, r: "ok: retained while pending, removed once idle" if d and d["events"][4]["expect"]["outcome"] == "ok" and d["events"][7]["expect"]["outcome"] == "unknown_backend" else f"NOT CAUGHT ({r})")
-    # random history + tick without effects still requires effects-v2 (input/history decides)
+    # Random history + an effectless tick is now closed by the bounded
+    # engine-relative Connection cadence predicate, without recorded ownership.
     ev = [{"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
           {"op": "finish", "session": "s", "success": True}, {"op": "tick"}, {"op": "close", "session": "s"}]
-    attempt("effects_v2_without_effect", cfg, ev, rows_for(ev, e2="default/a"),
-            lambda d, r: "ok: requires effects-v2" if d and "effects-v2" in r else f"NOT CAUGHT ({r})")
+    attempt("relative_effectless_tick_derived", cfg, ev, rows_for(ev, e2="default/a"),
+            lambda d, r: "ok: engine-relative empty tick" if d and not r and "redirect_cadence" in d["events"][4]["expect"] else f"NOT CAUGHT ({r})")
     # Prefer-idle with two candidates is a policy constraint. An older recorded
     # trace that claims metric observations without whole publications also
     # needs metrics-input; raw writer manifests never make this policy decision.
@@ -1912,7 +2052,13 @@ def main():
     if requires:
         derived["provenance"]["requires"] = requires
     if args.output:
-        args.output.write_text(json.dumps(derived, indent=2) + "\n")
+        encoded = json.dumps(derived, indent=2) + "\n"
+        if len(encoded.encode()) > _RUNNER.MAX_BYTES:
+            encoded = json.dumps(derived, separators=(",", ":")) + "\n"
+        if len(encoded.encode()) > _RUNNER.MAX_BYTES:
+            print(f"REFUSED: derived trace exceeds {_RUNNER.MAX_BYTES} bytes", file=sys.stderr)
+            sys.exit(2)
+        args.output.write_text(encoded)
     print(json.dumps({"events": len(derived["events"]), "requires": requires}))
     if args.check_against:
         reference = json.loads(args.check_against.read_text())
