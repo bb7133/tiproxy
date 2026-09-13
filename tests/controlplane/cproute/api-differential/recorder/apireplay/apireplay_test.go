@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 )
@@ -34,17 +35,46 @@ type reviewBackend struct {
 
 func (b reviewBackend) ID() string { return b.id }
 
-type reviewConn struct{ router.RedirectableConn }
+type reviewConn struct {
+	router.RedirectableConn
+	forced      *int
+	forcedReady chan<- struct{}
+}
 
 func (c reviewConn) Value(any) any                    { return nil }
 func (c reviewConn) Redirect(router.BackendInst) bool { return true }
-func (c reviewConn) ForceClose() bool                 { return true }
+func (c reviewConn) ForceClose() bool {
+	if c.forced != nil {
+		(*c.forced)++
+	}
+	if c.forcedReady != nil {
+		c.forcedReady <- struct{}{}
+	}
+	return true
+}
 
-type reviewReceiver struct{ router.ConnEventReceiver }
+type reviewReceiver struct {
+	router.ConnEventReceiver
+	order *[]string
+}
 
-func (r reviewReceiver) OnRedirectSucceed(string, string, router.RedirectableConn) error { return nil }
-func (r reviewReceiver) OnRedirectFail(string, string, router.RedirectableConn) error    { return nil }
-func (r reviewReceiver) OnConnClosed(string, router.RedirectableConn) error              { return nil }
+func (r reviewReceiver) append(event string) {
+	if r.order != nil {
+		*r.order = append(*r.order, event)
+	}
+}
+func (r reviewReceiver) OnRedirectSucceed(string, string, router.RedirectableConn) error {
+	r.append("redirect_success")
+	return nil
+}
+func (r reviewReceiver) OnRedirectFail(string, string, router.RedirectableConn) error {
+	r.append("redirect_fail")
+	return nil
+}
+func (r reviewReceiver) OnConnClosed(string, router.RedirectableConn) error {
+	r.append("close")
+	return nil
+}
 
 func TestReviewCallbackMustSerialize(t *testing.T) {
 	out := &reviewSink{}
@@ -102,6 +132,89 @@ func TestLateRedirectDoesNotResurrectClosedSession(t *testing.T) {
 	}
 	if c.session.current.ID() != "A" || out.events[len(out.events)-1].Operation != "s/1" {
 		t.Fatalf("late callback: %+v", out.events)
+	}
+}
+
+func TestScriptedEffectRefusalIsOneShot(t *testing.T) {
+	out := &reviewSink{}
+	Install(out, "refusal")
+	c := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "s", current: reviewBackend{id: "A"}}}
+	RefuseNextEffect()
+	var first, second bool
+	out.Serialize(func() {
+		first = c.Redirect(reviewBackend{id: "B"})
+		second = c.Redirect(reviewBackend{id: "B"})
+	})
+	if first || !second {
+		t.Fatalf("one-shot results: first=%v second=%v", first, second)
+	}
+	if len(out.events) != 2 || out.events[0].Effects[0].Accepted || !out.events[1].Effects[0].Accepted {
+		t.Fatalf("recorded effects=%+v", out.events)
+	}
+	if pending := PendingControls(); len(pending) != 0 {
+		t.Fatalf("pending controls=%v", pending)
+	}
+}
+
+func TestDelayedRedirectResultIsReleasedAfterRealClose(t *testing.T) {
+	out := &reviewSink{}
+	Install(out, "delayed")
+	forced := 0
+	forcedReady := make(chan struct{}, 1)
+	c := &Conn{RedirectableConn: reviewConn{forced: &forced, forcedReady: forcedReady}, session: &Session{id: "s", current: reviewBackend{id: "A"}}}
+	order := []string{}
+	w := &receiverWrapper{inner: reviewReceiver{order: &order}, conn: c}
+	out.Serialize(func() {
+		if !c.Redirect(reviewBackend{id: "B"}) {
+			t.Fatal("redirect refused")
+		}
+	})
+	DelayNextRedirectResult()
+	if err := w.OnRedirectSucceed("A", "B", c); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 0 || len(out.events) != 1 {
+		t.Fatalf("callback was delivered before close: order=%v events=%+v", order, out.events)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- CloseDelayedRedirect(ctx) }()
+	<-forcedReady
+	if forced != 1 {
+		t.Fatalf("underlying ForceClose calls=%d", forced)
+	}
+	if err := w.OnConnClosed("A", c); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeResult; err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(order); got != "[close redirect_success]" {
+		t.Fatalf("callback order=%s", got)
+	}
+	if len(out.events) != 3 || out.events[1].Op != "close" || out.events[2].Op != "redirect_result" {
+		t.Fatalf("recorded events=%+v", out.events)
+	}
+	if c.session.current.ID() != "A" {
+		t.Fatalf("late callback resurrected closed session on %s", c.session.current.ID())
+	}
+	if pending := PendingControls(); len(pending) != 0 {
+		t.Fatalf("pending controls=%v", pending)
+	}
+}
+
+func TestDelayedRedirectControlTimesOutAndRemainsPending(t *testing.T) {
+	Install(&reviewSink{}, "timeout")
+	DelayNextRedirectResult()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := CloseDelayedRedirect(ctx); err == nil {
+		t.Fatal("missing delayed callback did not time out")
+	}
+	pending := PendingControls()
+	if len(pending) != 1 || pending[0] != "unconsumed delay_next_redirect_result=1" {
+		t.Fatalf("pending controls=%v", pending)
 	}
 }
 

@@ -124,7 +124,27 @@ var (
 	counter          atomic.Uint64
 	overlayInstalled atomic.Bool
 	prefix           = "s"
+	controls         = newControls()
 )
+
+type delayedRedirect struct {
+	from, to string
+	success  bool
+	settled  chan struct{}
+}
+
+type controlState struct {
+	mu           sync.Mutex
+	refuse       uint64
+	delay        uint64
+	delayed      map[*Conn]delayedRedirect
+	delayedReady chan struct{}
+	errors       []string
+}
+
+func newControls() *controlState {
+	return &controlState{delayed: make(map[*Conn]delayedRedirect), delayedReady: make(chan struct{}, 1)}
+}
 
 // MarkOverlayInstalled is called by a generated source file that record.py
 // adds to the overlaid backend package. A recorder binary without the complete
@@ -140,9 +160,122 @@ func Install(s Sink, sessionPrefix string) {
 	sinkMu.Lock()
 	defer sinkMu.Unlock()
 	sink = s
+	controls = newControls()
 	if sessionPrefix != "" {
 		prefix = sessionPrefix
 	}
+}
+
+// RefuseNextEffect makes exactly one subsequently issued Redirect or ForceClose
+// return false at the client boundary. It is test-build control input, not a
+// router decision or an engine oracle.
+func RefuseNextEffect() {
+	controls.mu.Lock()
+	controls.refuse++
+	controls.mu.Unlock()
+}
+
+// DelayNextRedirectResult holds exactly one real redirect callback. The
+// callback is delivered to the router only after that connection's real close
+// callback, allowing the recorder to preserve the required late-completion
+// history without fabricating a terminal result.
+func DelayNextRedirectResult() {
+	controls.mu.Lock()
+	controls.delay++
+	controls.mu.Unlock()
+}
+
+// CloseDelayedRedirect waits until a real redirect callback has been held and
+// asks the underlying client connection to close. The real close callback
+// releases the held redirect result after the close has reached the router.
+func CloseDelayedRedirect(ctx context.Context) error {
+	for {
+		controls.mu.Lock()
+		var conn *Conn
+		var result delayedRedirect
+		for candidate, delayed := range controls.delayed {
+			conn = candidate
+			result = delayed
+			break
+		}
+		controls.mu.Unlock()
+		if conn != nil {
+			if !conn.RedirectableConn.ForceClose() {
+				return errors.New("delayed redirect connection refused scripted close")
+			}
+			select {
+			case <-result.settled:
+				return nil
+			case <-ctx.Done():
+				return fmt.Errorf("wait for delayed redirect settlement: %w", ctx.Err())
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for delayed redirect callback: %w", ctx.Err())
+		case <-controls.delayedReady:
+		}
+	}
+}
+
+// PendingControls reports unconsumed script controls. Any row here makes the
+// capture incomplete: the script tried to exercise an outcome that never
+// reached the actual client boundary.
+func PendingControls() []string {
+	controls.mu.Lock()
+	defer controls.mu.Unlock()
+	var pending []string
+	if controls.refuse != 0 {
+		pending = append(pending, fmt.Sprintf("unconsumed refuse_next_effect=%d", controls.refuse))
+	}
+	if controls.delay != 0 {
+		pending = append(pending, fmt.Sprintf("unconsumed delay_next_redirect_result=%d", controls.delay))
+	}
+	if len(controls.delayed) != 0 {
+		pending = append(pending, fmt.Sprintf("unsettled delayed redirect callbacks=%d", len(controls.delayed)))
+	}
+	pending = append(pending, controls.errors...)
+	return pending
+}
+
+func consumeRefusal() bool {
+	controls.mu.Lock()
+	defer controls.mu.Unlock()
+	if controls.refuse == 0 {
+		return false
+	}
+	controls.refuse--
+	return true
+}
+
+func holdRedirectResult(conn *Conn, result delayedRedirect) bool {
+	controls.mu.Lock()
+	defer controls.mu.Unlock()
+	if controls.delay == 0 {
+		return false
+	}
+	controls.delay--
+	if _, exists := controls.delayed[conn]; exists {
+		controls.errors = append(controls.errors, "multiple delayed redirect callbacks for one connection")
+		return false
+	}
+	result.settled = make(chan struct{})
+	controls.delayed[conn] = result
+	select {
+	case controls.delayedReady <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func takeDelayedRedirect(conn *Conn) (delayedRedirect, bool) {
+	controls.mu.Lock()
+	defer controls.mu.Unlock()
+	result, ok := controls.delayed[conn]
+	if ok {
+		delete(controls.delayed, conn)
+	}
+	return result, ok
 }
 
 func record(ev Event) {
@@ -272,7 +405,7 @@ func (c *Conn) effect(kind string, to router.BackendInst, accepted bool) string 
 }
 
 func (c *Conn) Redirect(to router.BackendInst) bool {
-	accepted := !c.refuse.Load() && c.RedirectableConn.Redirect(to)
+	accepted := !c.refuse.Load() && !consumeRefusal() && c.RedirectableConn.Redirect(to)
 	op := c.effect("redirect", to, accepted)
 	if accepted {
 		c.redirect = &redirectOperation{id: op, from: c.session.current, to: to}
@@ -281,7 +414,7 @@ func (c *Conn) Redirect(to router.BackendInst) bool {
 }
 
 func (c *Conn) ForceClose() bool {
-	accepted := !c.refuse.Load() && c.RedirectableConn.ForceClose()
+	accepted := !c.refuse.Load() && !consumeRefusal() && c.RedirectableConn.ForceClose()
 	c.effect("force_close", nil, accepted)
 	return accepted
 }
@@ -303,16 +436,20 @@ type receiverWrapper struct {
 // (backend_conn_mgr.go), so a tick holding the section never waits on them.
 func (w *receiverWrapper) OnRedirectSucceed(from, to string, conn router.RedirectableConn) (err error) {
 	serialize(func() {
-		err = w.inner.OnRedirectSucceed(from, to, w.conn)
-		w.recordRedirectResult(from, to, true)
+		if holdRedirectResult(w.conn, delayedRedirect{from: from, to: to, success: true}) {
+			return
+		}
+		err = w.deliverRedirectResult(from, to, true)
 	})
 	return err
 }
 
 func (w *receiverWrapper) OnRedirectFail(from, to string, conn router.RedirectableConn) (err error) {
 	serialize(func() {
-		err = w.inner.OnRedirectFail(from, to, w.conn)
-		w.recordRedirectResult(from, to, false)
+		if holdRedirectResult(w.conn, delayedRedirect{from: from, to: to}) {
+			return
+		}
+		err = w.deliverRedirectResult(from, to, false)
 	})
 	return err
 }
@@ -322,7 +459,25 @@ func (w *receiverWrapper) OnConnClosed(backendID string, conn router.Redirectabl
 		err = w.inner.OnConnClosed(backendID, w.conn)
 		w.conn.session.closed = true
 		record(Event{Op: "close", Session: w.conn.session.id})
+		if delayed, ok := takeDelayedRedirect(w.conn); ok {
+			lateErr := w.deliverRedirectResult(delayed.from, delayed.to, delayed.success)
+			close(delayed.settled)
+			if err == nil {
+				err = lateErr
+			}
+		}
 	})
+	return err
+}
+
+func (w *receiverWrapper) deliverRedirectResult(from, to string, success bool) error {
+	var err error
+	if success {
+		err = w.inner.OnRedirectSucceed(from, to, w.conn)
+	} else {
+		err = w.inner.OnRedirectFail(from, to, w.conn)
+	}
+	w.recordRedirectResult(from, to, success)
 	return err
 }
 

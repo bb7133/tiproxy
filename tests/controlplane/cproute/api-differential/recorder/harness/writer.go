@@ -51,6 +51,9 @@ type CaptureSummary struct {
 	WorkloadCompleted         int64  `json:"workload_completed_queries"`
 	WorkloadFailed            int64  `json:"workload_failed_queries"`
 	Clients                   int    `json:"clients"`
+	HeldClients               int    `json:"held_clients"`
+	HeldQueries               int64  `json:"held_queries"`
+	HeldFailed                int64  `json:"held_failed_queries"`
 	ScriptSHA256              string `json:"script_sha256"`
 	EnvironmentManifestSHA256 string `json:"environment_manifest_sha256,omitempty"`
 }

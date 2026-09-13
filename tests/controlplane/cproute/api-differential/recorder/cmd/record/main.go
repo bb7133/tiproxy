@@ -56,11 +56,12 @@ var sourceHead, sourceTree, sourceDirty string
 
 // Action is one scripted, declared operation at a wall offset from trace start.
 type Action struct {
-	AtMillis int64    `json:"at_ms"`
-	Kind     string   `json:"kind"` // env | config | source_error | checkpoint
-	Args     []string `json:"args,omitempty"`
-	TOML     string   `json:"toml,omitempty"`
-	Error    string   `json:"error,omitempty"` // source_error identity; "" clears the fault window
+	AtMillis      int64    `json:"at_ms"`
+	Kind          string   `json:"kind"` // env | await_env | config | source_error | checkpoint | scripted client controls
+	Args          []string `json:"args,omitempty"`
+	TOML          string   `json:"toml,omitempty"`
+	Error         string   `json:"error,omitempty"` // source_error identity; "" clears the fault window
+	TimeoutMillis int64    `json:"timeout_ms,omitempty"`
 }
 
 type environmentComponent struct {
@@ -106,6 +107,7 @@ func main() {
 		pd           = flag.String("pd", "127.0.0.1:2379", "PD address")
 		duration     = flag.Duration("duration", 60*time.Second, "recording duration")
 		clients      = flag.Int("clients", 8, "concurrent mysql clients")
+		heldClients  = flag.Int("held-clients", 0, "supplemental long-lived mysql clients for migration controls")
 		pause        = flag.Duration("pause", 200*time.Millisecond, "pause between lifecycles per client")
 		sources      = flag.String("sources", "", "comma separated loopback source IPs for clients")
 		out          = flag.String("out", "", "output directory (required)")
@@ -128,15 +130,19 @@ func main() {
 		fmt.Fprintln(os.Stderr, "-out is required")
 		os.Exit(2)
 	}
-	if err := run(*slot, *attempt, *policyF, *selection, *rule, *listen, *pd, *duration, *clients, *pause, *sources, *out, *script, *envSh, *envManifest, *tick); err != nil {
+	if err := run(*slot, *attempt, *policyF, *selection, *rule, *listen, *pd, *duration, *clients, *heldClients, *pause, *sources, *out, *script, *envSh, *envManifest, *tick); err != nil {
 		fmt.Fprintln(os.Stderr, "record:", err)
 		os.Exit(1)
 	}
 }
 
-func run(slot, attempt, policyName, selection, rule, listen, pd string, duration time.Duration, clients int, pause time.Duration, sources, out, script, envSh, envManifestPath string, tickEvery time.Duration) (runErr error) {
-	if duration <= 0 || tickEvery <= 0 || clients <= 0 || pause < 0 {
-		return fmt.Errorf("duration, tick and clients must be positive; pause must be nonnegative")
+func run(slot, attempt, policyName, selection, rule, listen, pd string, duration time.Duration, clients, heldClients int, pause time.Duration, sources, out, script, envSh, envManifestPath string, tickEvery time.Duration) (runErr error) {
+	if duration <= 0 || tickEvery <= 0 || clients <= 0 || heldClients < 0 || pause < 0 {
+		return fmt.Errorf("duration, tick and clients must be positive; held-clients and pause must be nonnegative")
+	}
+	listeners := config.SplitAddrList(listen)
+	if len(listeners) == 0 {
+		return errors.New("-listen requires at least one address")
 	}
 	// Validate the complete script before opening an attempt or starting live services.
 	var actions []Action
@@ -156,11 +162,14 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		if err = decoder.Decode(new(any)); err != io.EOF {
 			return fmt.Errorf("action script must contain exactly one JSON array")
 		}
+		sort.SliceStable(actions, func(i, j int) bool { return actions[i].AtMillis < actions[j].AtMillis })
 		if err = validateActions(actions); err != nil {
 			return err
 		}
+		if requiresEnvironmentDriver(actions) && envSh == "" {
+			return errors.New("-env is required by env actions")
+		}
 		scriptSHA = fmt.Sprintf("%x", sha256.Sum256(scriptData))
-		sort.SliceStable(actions, func(i, j int) bool { return actions[i].AtMillis < actions[j].AtMillis })
 	}
 	envManifestData, envManifestSHA, err := loadEnvironmentManifest(envManifestPath)
 	if err != nil {
@@ -183,9 +192,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	if err != nil {
 		return err
 	}
-	listeners := strings.Split(listen, ",")
-	toml := fmt.Sprintf("[proxy]\naddr = %q\npd-addrs = %q\n[balance]\npolicy = %q\nrouting-policy = %q\nrouting-rule = %q\n[log]\nlevel = \"warn\"\n",
-		listeners[0], pd, policyName, selection, rule)
+	toml := recordingConfig(listeners, pd, policyName, selection, rule)
 	cfgFile := filepath.Join(dir, "proxy.toml")
 	if err := os.WriteFile(cfgFile, []byte(toml), 0o600); err != nil {
 		return err
@@ -344,6 +351,8 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					}
 					fmt.Fprintf(os.Stderr, "[record] env %v done at wall %s\n", a.Args, sched.Elapsed())
 				}, lg)
+			case "await_env":
+				envWG.Wait()
 			case "config":
 				err := cfgMgr.SetTOMLConfig([]byte(a.TOML))
 				inputs.DeliverConfig(a.TOML, cfgMgr.GetConfig(), err)
@@ -354,6 +363,18 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					return
 				}
 				fetcher.Set(fault)
+			case "refuse_next_effect":
+				sched.RunNow(apireplay.RefuseNextEffect)
+			case "delay_next_redirect_result":
+				sched.RunNow(apireplay.DelayNextRedirectResult)
+			case "close_delayed_redirect":
+				controlCtx, cancelControl := context.WithTimeout(runCtx, actionTimeout(a))
+				err := apireplay.CloseDelayedRedirect(controlCtx)
+				cancelControl()
+				if err != nil {
+					markIncomplete(fmt.Sprintf("close delayed redirect: %v", err))
+					return
+				}
 			case "checkpoint":
 				sched.RunNow(func() {
 					seq := sched.Seq()
@@ -367,9 +388,9 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		}
 	}, lg)
 
-	wl := &harness.Workload{Listener: listeners[0], Clients: clients, Pause: pause, User: "root"}
+	wl := &harness.Workload{Listeners: listeners, Clients: clients, HeldClients: heldClients, Pause: pause, User: "root"}
 	if sources != "" {
-		wl.Sources = strings.Split(sources, ",")
+		wl.Sources = config.SplitAddrList(sources)
 	}
 	wl.Run(runCtx)
 	// No producer may race the final checkpoint or the archive hash. The real
@@ -384,6 +405,9 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	sqlClosed = true
 	if closeErr != nil {
 		markIncomplete(fmt.Sprintf("close SQL server: %v", closeErr))
+	}
+	for _, reason := range apireplay.PendingControls() {
+		markIncomplete(reason)
 	}
 	if ctx.Err() != nil {
 		markIncomplete("recording interrupted before normal duration elapsed")
@@ -415,7 +439,8 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	meta := harness.CaptureSummary{Head: sourceHead, Tree: sourceTree, SourceDirty: sourceDirty,
 		DurationNanos: sched.Elapsed().Nanoseconds(), PlannedDurationNanos: duration.Nanoseconds(),
 		Completed: lifecycles.Completed, Failed: lifecycles.Opened - lifecycles.Completed,
-		WorkloadCompleted: wl.Completed(), WorkloadFailed: wl.Failed(), Clients: clients, ScriptSHA256: scriptSHA,
+		WorkloadCompleted: wl.Completed(), WorkloadFailed: wl.Failed(), Clients: clients,
+		HeldClients: heldClients, HeldQueries: wl.HeldQueries(), HeldFailed: wl.HeldFailed(), ScriptSHA256: scriptSHA,
 		EnvironmentManifestSHA256: envManifestSHA}
 	origin := sched.OriginNanos()
 	status, err := harness.Write(dir, slot, attempt, harness.TraceConfig{Policy: policyName, Selection: selection, Rule: rule, ClockOriginNanos: &origin}, records, checkpoints, incomplete,
@@ -429,21 +454,89 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 }
 
 func validateActions(actions []Action) error {
+	const maxDurationMillis = int64((time.Duration(1<<63 - 1)) / time.Millisecond)
+	pendingEnvironment := false
+	pendingDelayedRedirect := false
 	for i, a := range actions {
-		if a.AtMillis < 0 {
-			return fmt.Errorf("action %d: negative at_ms", i)
+		if a.AtMillis < 0 || a.AtMillis > maxDurationMillis {
+			return fmt.Errorf("action %d: at_ms is outside time.Duration range", i)
+		}
+		if a.TimeoutMillis < 0 || a.TimeoutMillis > maxDurationMillis {
+			return fmt.Errorf("action %d: timeout_ms is outside time.Duration range", i)
+		}
+		if len(a.Args) != 0 && a.Kind != "env" {
+			return fmt.Errorf("action %d: args is only valid for env", i)
+		}
+		if a.TOML != "" && a.Kind != "config" {
+			return fmt.Errorf("action %d: toml is only valid for config", i)
+		}
+		if a.Error != "" && a.Kind != "source_error" {
+			return fmt.Errorf("action %d: error is only valid for source_error", i)
+		}
+		if pendingEnvironment && a.Kind != "env" && a.Kind != "await_env" {
+			return fmt.Errorf("action %d: env batch requires await_env before %q", i, a.Kind)
 		}
 		switch a.Kind {
-		case "env", "config", "checkpoint":
+		case "env":
+			if len(a.Args) == 0 {
+				return fmt.Errorf("action %d: env requires a nonempty args vector", i)
+			}
+			pendingEnvironment = true
+		case "await_env":
+			if !pendingEnvironment {
+				return fmt.Errorf("action %d: await_env has no pending env batch", i)
+			}
+			pendingEnvironment = false
+		case "config", "checkpoint", "refuse_next_effect":
 		case "source_error":
 			if _, err := harness.FaultError(a.Error); err != nil {
 				return fmt.Errorf("action %d: %w", i, err)
 			}
+		case "delay_next_redirect_result":
+			if pendingDelayedRedirect {
+				return fmt.Errorf("action %d: a delayed redirect control is already pending", i)
+			}
+			pendingDelayedRedirect = true
+		case "close_delayed_redirect":
+			if !pendingDelayedRedirect {
+				return fmt.Errorf("action %d: close_delayed_redirect has no preceding delay control", i)
+			}
+			pendingDelayedRedirect = false
 		default:
 			return fmt.Errorf("action %d: unsupported kind %q", i, a.Kind)
 		}
+		if a.TimeoutMillis != 0 && a.Kind != "close_delayed_redirect" {
+			return fmt.Errorf("action %d: timeout_ms is only valid for close_delayed_redirect", i)
+		}
+	}
+	if pendingEnvironment {
+		return errors.New("action script ends with an env batch that has no await_env")
+	}
+	if pendingDelayedRedirect {
+		return errors.New("action script ends with an unclosed delayed redirect control")
 	}
 	return nil
+}
+
+func requiresEnvironmentDriver(actions []Action) bool {
+	for _, action := range actions {
+		if action.Kind == "env" {
+			return true
+		}
+	}
+	return false
+}
+
+func actionTimeout(action Action) time.Duration {
+	if action.TimeoutMillis == 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(action.TimeoutMillis) * time.Millisecond
+}
+
+func recordingConfig(listeners []string, pd, policyName, selection, rule string) string {
+	return fmt.Sprintf("[proxy]\naddr = %q\npd-addrs = %q\n[balance]\npolicy = %q\nrouting-policy = %q\nrouting-rule = %q\n[log]\nlevel = \"warn\"\n",
+		strings.Join(listeners, ","), pd, policyName, selection, rule)
 }
 
 func validateRecordedLifecycles(lifecycles harness.LifecycleSummary, workloadCompleted int64) error {

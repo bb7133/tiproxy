@@ -98,10 +98,22 @@ callback updates the public assignment; duplicates and callbacks after close do 
 resurrect a session. An unmatched callback is preserved as a recorder error.
 
 The harness composes a real proxy, factor policy, PD-backed observer and cluster
-manager. Scripted actions currently support environment commands, config changes,
-fetcher-boundary source-error windows and checkpoints. A fault wraps the real
-`BackendFetcher`; the real observer then publishes the error. Stopping PD alone is
-not guaranteed to publish an error because the production fetcher retries.
+manager. Scripted actions support environment commands, an explicit `await_env`
+barrier, config changes, fetcher-boundary source-error windows, checkpoints, a
+one-shot refusal, and one delayed real redirect callback followed by a scripted
+client close. Environment commands in one batch may run concurrently, but every
+batch must end with `await_env`; a script that overlaps a later phase or ends with
+an unjoined command is rejected before capture. Unconsumed refusal/delay controls
+and an unsettled delayed callback make the attempt incomplete. A fault wraps the
+real `BackendFetcher`; the real observer then publishes the error. Stopping PD alone
+is not guaranteed to publish an error because the production fetcher retries.
+
+`-listen` accepts the same comma-separated address list as the real proxy and the
+workload covers listeners and optional source addresses as a product. The regular
+clients still drive complete connect/query/close lifecycles. `-held-clients` adds
+supplemental long-lived query sessions for real redirect/force-close callbacks;
+their query counts are reported separately and never inflate the completed-lifecycle
+qualification count.
 
 Source-error scripts accept only `cancelled`, `deadline_exceeded`,
 `topology_unavailable`, or the empty string to clear a fault. Invalid names, unknown
@@ -219,11 +231,11 @@ The following dependencies withhold a slot from acceptance:
   Other legal redirects remain withheld. No further scope approval is needed to implement
   the remaining cadence/effect eligibility requirement.
 
-Additional planned work includes timer boundary expansion, scripted refusal/delayed
-callbacks, router Close/recreate/rehydrate, CIDR/no-match and multiple-listener/cluster
-scenarios. The presence of a row in `recording-plan.tsv` does not mean its driver is
-implemented. Captures with unresolved dependencies remain raw evidence and do not
-count toward the 18 slots, three rounds or focused acceptance groups.
+Additional planned work includes timer boundary expansion,
+router Close/recreate/rehydrate, and the complete frozen CIDR/Port scripts. The
+presence of a row in `recording-plan.tsv` does not mean its driver is implemented.
+Captures with unresolved dependencies remain raw evidence and do not count toward
+the 18 slots, three rounds or focused acceptance groups.
 
 ## Commands
 
@@ -238,6 +250,24 @@ python3 tests/controlplane/cproute/api-differential/recorder/derive_expectations
   /path/to/new-recordings/N01-a3/trace.json /path/to/new-recordings/N01-a3/go.json \
   --output /path/to/new-recordings/N01-a3/derived.json
 go test -race -tags apireplay ./tests/controlplane/cproute/api-differential/recorder/...
+```
+
+Failover attempts additionally pass `-held-clients` and may use these action
+shapes (the real script arms them immediately before the input that can issue the
+effect):
+
+```json
+[
+  {"at_ms": 10000, "kind": "refuse_next_effect"},
+  {"at_ms": 10001, "kind": "config", "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=20\n"},
+  {"at_ms": 20000, "kind": "config", "toml": "[proxy]\nfail-backend-list=[]\n"},
+  {"at_ms": 21000, "kind": "delay_next_redirect_result"},
+  {"at_ms": 21001, "kind": "config", "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=20\n"},
+  {"at_ms": 30000, "kind": "close_delayed_redirect", "timeout_ms": 10000},
+  {"at_ms": 40000, "kind": "env", "args": ["tidb-stop", "0"]},
+  {"at_ms": 40000, "kind": "env", "args": ["tidb-stop", "1"]},
+  {"at_ms": 40000, "kind": "await_env"}
+]
 ```
 
 Run `run.py.validate()` on a derived trace before any replay claim. A nonempty

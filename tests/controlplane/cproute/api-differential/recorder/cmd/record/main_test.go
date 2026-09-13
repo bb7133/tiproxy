@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	mgrcfg "github.com/pingcap/tiproxy/pkg/manager/config"
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/harness"
 	"github.com/stretchr/testify/require"
@@ -55,13 +56,73 @@ func TestInvalidActionsFailBeforeCapture(t *testing.T) {
 		path := filepath.Join(dir, "actions.json")
 		require.NoError(t, os.WriteFile(path, []byte(script), 0o600))
 		out := filepath.Join(dir, "recordings")
-		err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, "", out, path, "", "", time.Millisecond)
+		err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, 0, "", out, path, "", "", time.Millisecond)
 		require.Error(t, err)
 		require.NoDirExists(t, out)
 	}
 	for _, identity := range []string{"", "cancelled", "deadline_exceeded", "topology_unavailable"} {
 		require.NoError(t, validateActions([]Action{{Kind: "source_error", Error: identity}}))
 	}
+}
+
+func TestScriptControlValidation(t *testing.T) {
+	valid := []Action{
+		{Kind: "env", Args: []string{"tidb-stop", "0"}},
+		{Kind: "env", Args: []string{"tidb-stop", "1"}},
+		{Kind: "await_env"},
+		{Kind: "env", Args: []string{"tidb-start", "0"}},
+		{Kind: "env", Args: []string{"tidb-start", "1"}},
+		{Kind: "await_env"},
+		{Kind: "refuse_next_effect"},
+		{Kind: "delay_next_redirect_result"},
+		{Kind: "close_delayed_redirect", TimeoutMillis: 5000},
+	}
+	require.NoError(t, validateActions(valid))
+	require.True(t, requiresEnvironmentDriver(valid))
+	require.Equal(t, 5*time.Second, actionTimeout(valid[len(valid)-1]))
+	require.Equal(t, 10*time.Second, actionTimeout(Action{}))
+
+	for name, actions := range map[string][]Action{
+		"env missing args":         {{Kind: "env"}, {Kind: "await_env"}},
+		"env missing barrier":      {{Kind: "env", Args: []string{"tidb-stop", "0"}}},
+		"env overlaps config":      {{Kind: "env", Args: []string{"tidb-stop", "0"}}, {Kind: "config"}},
+		"barrier without batch":    {{Kind: "await_env"}},
+		"delay not closed":         {{Kind: "delay_next_redirect_result"}},
+		"close without delay":      {{Kind: "close_delayed_redirect"}},
+		"two pending delays":       {{Kind: "delay_next_redirect_result"}, {Kind: "delay_next_redirect_result"}},
+		"timeout on wrong action":  {{Kind: "checkpoint", TimeoutMillis: 1}},
+		"negative control timeout": {{Kind: "close_delayed_redirect", TimeoutMillis: -1}},
+		"overflowing timeout":      {{Kind: "delay_next_redirect_result"}, {Kind: "close_delayed_redirect", TimeoutMillis: 1<<63 - 1}},
+		"args on control":          {{Kind: "refuse_next_effect", Args: []string{"unexpected"}}},
+		"toml on checkpoint":       {{Kind: "checkpoint", TOML: "[proxy]"}},
+		"error on config":          {{Kind: "config", Error: "cancelled"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, validateActions(actions))
+		})
+	}
+}
+
+func TestActionsSortBeforeBarrierValidation(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "actions.json")
+	require.NoError(t, os.WriteFile(script, []byte(`[
+  {"at_ms":10,"kind":"await_env"},
+  {"at_ms":0,"kind":"env","args":["tidb-stop","0"]}
+]`), 0o600))
+	out := filepath.Join(dir, "recordings")
+	err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, 0, "", out, script, "", "", time.Millisecond)
+	require.EqualError(t, err, "-env is required by env actions")
+	require.NoDirExists(t, out)
+}
+
+func TestRecordingConfigPreservesMultipleListeners(t *testing.T) {
+	listeners := []string{"127.0.0.1:6000", "127.0.0.1:6001"}
+	manager := mgrcfg.NewConfigManager()
+	require.NoError(t, manager.SetTOMLConfig([]byte(recordingConfig(listeners, "127.0.0.1:2379", "resource", "random", "port"))))
+	got, err := manager.GetConfig().Proxy.GetSQLAddrs()
+	require.NoError(t, err)
+	require.Equal(t, listeners, got)
 }
 
 func TestEnvironmentManifestPreflight(t *testing.T) {
@@ -118,7 +179,7 @@ func environmentManifestFixture() string {
 
 func TestEnvironmentManifestIsRequiredBeforeCapture(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "recordings")
-	err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, "", out, "", "", "", time.Millisecond)
+	err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, 0, "", out, "", "", "", time.Millisecond)
 	require.EqualError(t, err, "-environment-manifest is required")
 	require.NoDirExists(t, out)
 }
@@ -133,7 +194,7 @@ func TestRecorderWithoutOverlayFailsBeforeCapture(t *testing.T) {
 	environment := filepath.Join(dir, "environment.json")
 	require.NoError(t, os.WriteFile(environment, []byte(environmentManifestFixture()), 0o600))
 	out := filepath.Join(dir, "recordings")
-	err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, "", out, "", "", environment, time.Millisecond)
+	err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, 0, "", out, "", "", environment, time.Millisecond)
 	require.EqualError(t, err, "recorder build is missing the API replay overlay; use record.py build or run")
 	require.NoDirExists(t, out)
 }

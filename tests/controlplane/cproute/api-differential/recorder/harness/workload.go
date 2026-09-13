@@ -19,27 +19,35 @@ import (
 )
 
 // Workload drives real MySQL connection lifecycles through the recorded proxy
-// listener: connect → SELECT 1 → close, from `clients` concurrent clients, each
-// optionally bound to a loopback source address (CIDR families). Every
-// lifecycle is one recorded open/next/finish/close sequence.
+// listeners: connect → SELECT 1 → close, from `clients` concurrent clients,
+// each optionally bound to a loopback source address (CIDR families). Every
+// lifecycle is one recorded open/next/finish/close sequence. HeldClients adds
+// supplemental long-lived sessions so failover scripts can exercise real
+// redirect and force-close callbacks while the lifecycle workload continues.
 type Workload struct {
-	Listener  string   // proxy listener host:port
-	Sources   []string // loopback source IPs to bind (round-robin); empty = default
-	Clients   int
-	Pause     time.Duration
-	User      string
-	completed atomic.Int64
-	failed    atomic.Int64
+	Listener    string   // legacy single listener; ignored when Listeners is nonempty
+	Listeners   []string // proxy listener host:ports
+	Sources     []string // loopback source IPs; empty = default
+	Clients     int
+	HeldClients int
+	Pause       time.Duration
+	User        string
+	completed   atomic.Int64
+	failed      atomic.Int64
+	heldQueries atomic.Int64
+	heldFailed  atomic.Int64
 }
 
-func (w *Workload) Completed() int64 { return w.completed.Load() }
-func (w *Workload) Failed() int64    { return w.failed.Load() }
+func (w *Workload) Completed() int64   { return w.completed.Load() }
+func (w *Workload) Failed() int64      { return w.failed.Load() }
+func (w *Workload) HeldQueries() int64 { return w.heldQueries.Load() }
+func (w *Workload) HeldFailed() int64  { return w.heldFailed.Load() }
 
-func (w *Workload) connector(source string) (driver.Connector, error) {
+func (w *Workload) connector(listener, source string) (driver.Connector, error) {
 	cfg := mysql.NewConfig()
 	cfg.User = w.User
 	cfg.Net = "tcp"
-	cfg.Addr = w.Listener
+	cfg.Addr = listener
 	cfg.Timeout = 5 * time.Second
 	cfg.ReadTimeout = 5 * time.Second
 	cfg.WriteTimeout = 5 * time.Second
@@ -55,13 +63,15 @@ func (w *Workload) connector(source string) (driver.Connector, error) {
 func (w *Workload) Run(ctx context.Context) {
 	var wg waitgroup.WaitGroup
 	for i := 0; i < w.Clients; i++ {
-		source := ""
-		if len(w.Sources) > 0 {
-			source = w.Sources[i%len(w.Sources)]
-		}
+		listener, source := w.target(i)
 		wg.Run(func() {
+			connector, err := w.connector(listener, source)
+			if err != nil {
+				w.failed.Add(1)
+				return
+			}
 			for ctx.Err() == nil {
-				if err := w.once(ctx, source); err != nil {
+				if err := w.once(ctx, connector); err != nil {
 					w.failed.Add(1)
 				} else {
 					w.completed.Add(1)
@@ -73,15 +83,38 @@ func (w *Workload) Run(ctx context.Context) {
 			}
 		})
 	}
+	for i := 0; i < w.HeldClients; i++ {
+		listener, source := w.target(i)
+		wg.Run(func() {
+			connector, err := w.connector(listener, source)
+			if err != nil {
+				w.heldFailed.Add(1)
+				return
+			}
+			w.hold(ctx, connector)
+		})
+	}
 	wg.Wait()
 }
 
-func (w *Workload) once(ctx context.Context, source string) error {
-	c, err := w.connector(source)
-	if err != nil {
-		return err
+func (w *Workload) target(i int) (listener, source string) {
+	listeners := w.Listeners
+	if len(listeners) == 0 && w.Listener != "" {
+		listeners = []string{w.Listener}
 	}
-	db := sql.OpenDB(c)
+	if len(listeners) == 0 {
+		return "", ""
+	}
+	listenerIndex := i
+	if len(w.Sources) > 0 {
+		source = w.Sources[i%len(w.Sources)]
+		listenerIndex = i / len(w.Sources)
+	}
+	return listeners[listenerIndex%len(listeners)], source
+}
+
+func (w *Workload) once(ctx context.Context, connector driver.Connector) error {
+	db := sql.OpenDB(connector)
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	var one int
@@ -92,4 +125,28 @@ func (w *Workload) once(ctx context.Context, source string) error {
 		return fmt.Errorf("unexpected SELECT 1 result %d", one)
 	}
 	return nil
+}
+
+func (w *Workload) hold(ctx context.Context, connector driver.Connector) {
+	db := sql.OpenDB(connector)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	pause := w.Pause
+	if pause < 200*time.Millisecond {
+		pause = 200 * time.Millisecond
+	}
+	for ctx.Err() == nil {
+		var one int
+		err := db.QueryRowContext(ctx, "SELECT 1").Scan(&one)
+		if err == nil && one == 1 {
+			w.heldQueries.Add(1)
+		} else if ctx.Err() == nil {
+			w.heldFailed.Add(1)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(pause):
+		}
+	}
 }
