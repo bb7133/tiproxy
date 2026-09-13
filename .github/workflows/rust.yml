@@ -472,6 +472,9 @@ jobs:
               "tests/controlplane/cproute/api-differential/${rule}-cidr-smoke.json" \
               --output "${RUNNER_TEMP}/routing-api-${rule}-cidr"
           done
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            tests/controlplane/cproute/api-differential/cidr-retention-smoke.json \
+            --output "${RUNNER_TEMP}/routing-api-cidr-retention"
           python3 - <<'PYCIDR'
           import importlib.util
           import json
@@ -481,14 +484,18 @@ jobs:
           spec = importlib.util.spec_from_file_location("derive", path)
           derive = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(derive)
-          for rule in ("client", "proxy"):
-              source = path.parents[1] / f"{rule}-cidr-smoke.json"
+          cases = [("client", path.parents[1] / "client-cidr-smoke.json", "routing-api-client-cidr"),
+                   ("proxy", path.parents[1] / "proxy-cidr-smoke.json", "routing-api-proxy-cidr"),
+                   ("retention", path.parents[1] / "cidr-retention-smoke.json", "routing-api-cidr-retention")]
+          for rule, source, folder in cases:
               trace = json.loads(source.read_text())
-              output = Path(os.environ["RUNNER_TEMP"]) / f"routing-api-{rule}-cidr"
+              output = Path(os.environ["RUNNER_TEMP"]) / folder
               go = json.loads((output / "go.json").read_text())
               rust = json.loads((output / "rust.json").read_text())
               derived, requires = derive.derive(trace, go, None)
-              assert not requires, requires
+              other, other_requires = derive.derive(trace, rust, None)
+              assert not requires and not other_requires, (requires, other_requires)
+              assert derived == other
               assert derive.compare_with_reference(derived, trace, requires) == ([], [])
               result = derive._RUNNER.compare(derived, go, rust)
               (output / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
@@ -602,6 +609,7 @@ jobs:
             ${{ runner.temp }}/routing-api-metrics-time
             ${{ runner.temp }}/routing-api-client-cidr
             ${{ runner.temp }}/routing-api-proxy-cidr
+            ${{ runner.temp }}/routing-api-cidr-retention
             ${{ runner.temp }}/routing-api-force-close
             ${{ runner.temp }}/routing-api-keyspace
             ${{ runner.temp }}/keyspace-smoke.json

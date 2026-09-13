@@ -76,14 +76,44 @@ class CIDRTests(unittest.TestCase):
         with self.assertRaisesRegex(derive.Refuse, "removal/admission"):
             state.apply_health([backend("b", "127.0.0.0/24")])
 
-    def test_engine_relative_retention_cannot_choose_group_members(self):
+    @staticmethod
+    def make_retention_ambiguous(state, *backends):
+        session = derive.Session("s", {})
+        session.assigned = frozenset(f"default/{name}" for name in backends)
+        state.sessions["s"] = session
+
+    def test_redundant_engine_relative_retention_preserves_cidr_decisions(self):
         state = self.state()
         state.apply_health([backend("a", "127.0.0.0/24"), backend("b", "127.0.0.0/24")])
-        session = derive.Session("s", {})
-        session.assigned = frozenset(["default/a", "default/b"])
-        state.sessions["s"] = session
+        self.make_retention_ambiguous(state, "a", "b")
+        state.apply_health([backend("b", "127.0.0.0/24")])
+        self.assertTrue(state.backends["default/a"].ambiguous)
+        self.assertEqual(self.candidates(state, "127.0.0.8:1"), ["default/b"])
+
+    def test_fresh_admission_with_engine_relative_retention_is_refused(self):
+        state = self.state()
+        state.apply_health([backend("a", "127.0.0.0/24"), backend("b", "127.0.0.0/24")])
+        self.make_retention_ambiguous(state, "a", "b")
+        with self.assertRaisesRegex(derive.Refuse, "fresh CIDR admission.*engine-relative retention"):
+            state.apply_health([backend("b", "127.0.0.0/24"), backend("c", "127.0.0.0/24")])
+
+    def test_engine_relative_retention_cannot_decide_group_existence(self):
+        state = self.state()
+        state.apply_health([backend("a", "127.0.0.0/24")])
+        self.make_retention_ambiguous(state, "a", "not-present")
+        with self.assertRaisesRegex(derive.Refuse, "group existence.*engine-relative retention"):
+            state.apply_health([])
+
+    def test_engine_relative_retention_cannot_change_group_values(self):
+        state = self.state()
+        state.apply_health([backend("a", "127.0.0.0/24")])
+        state.apply_health([
+            backend("a", "127.0.0.0/24"),
+            backend("b", "127.0.0.0/24,192.0.2.0/24"),
+        ])
+        self.make_retention_ambiguous(state, "a", "b")
         with self.assertRaisesRegex(derive.Refuse, "engine-relative retention"):
-            state.apply_health([backend("b", "127.0.0.0/24")])
+            state.apply_health([backend("a", "127.0.0.0/24")])
 
     def test_fixtures_and_wrong_address_result_rejection(self):
         for rule in ("client", "proxy"):

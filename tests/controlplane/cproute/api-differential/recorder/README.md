@@ -195,14 +195,21 @@ the last parsed networks, while an invalid new group cannot route. IPv4-mapped
 addresses and Go's default `/32` for bare labels are preserved. New admissions
 whose grouping depends on backend iteration order, a route matching multiple
 groups, simultaneous group removal/admission, and ambiguous retained membership
-are refused explicitly. No recorded group choice resolves those cases.
+are refused explicitly. The one bounded retention exception is an update with no
+fresh admission where every affected group has a certain surviving member and
+the ambiguous members add no CIDR value beyond those certain survivors; then
+both group existence and the refreshed CIDR union are identical in every engine.
+No recorded group choice resolves cases outside that invariant.
 
 Two synthetic 105-event cases exercise the actual adapters with opposite client
 and proxy addresses, match/no-match, retained membership, valid/invalid/empty label
 updates, IPv6, mapped IPv4, ungrouped Lookup/Rehydrate, and the per-group failover
-guard. CI also derives their expectations from inputs plus recorded Go public
-history, checks them against the hand-written scenarios, and validates both
-engines again. These are adapter/deriver checks, not qualifying recordings.
+guard. A 14-event case separately makes one same-CIDR member's retention
+engine-relative, proves routing remains fixed by the certain survivor, and then
+converges after the ambiguous connection closes. CI independently derives all
+three traces from each engine's public rows, checks them against the hand-written
+scenarios, and validates the pair again. These are adapter/deriver checks, not
+qualifying recordings.
 
 The first paired CIDR run after the Go address fix exposed two Rust differences:
 rejection of a valid routing-rule write and restoration onto an ungrouped backend.

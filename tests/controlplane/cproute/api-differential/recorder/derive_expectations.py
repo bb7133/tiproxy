@@ -372,8 +372,34 @@ class State:
         # Admission uses previous group values; RefreshCidr runs only after the
         # complete update. Never use recorded Go group choices or map order.
         fresh = [(bid, cidr_values(b)) for bid, b in self.backends.items() if b.group is None and cidr_values(b)]
-        if any(b.ambiguous for b in self.backends.values()):
-            raise Refuse("CIDR membership depends on engine-relative retention")
+        ambiguous = {bid for bid, b in self.backends.items() if b.ambiguous}
+        if ambiguous:
+            # The model retains every possibly owned unhealthy backend. That
+            # superset is safe for an otherwise stable CIDR group only when
+            # removing any ambiguous members cannot destroy the group or
+            # change its refreshed CIDR union. Keep fresh admission separate:
+            # it consults the retained groups while Go is walking a map, so do
+            # not silently choose one engine-relative membership history.
+            if fresh:
+                raise Refuse("fresh CIDR admission depends on engine-relative retention")
+            for group, members in self.groups.items():
+                uncertain = members & ambiguous
+                if not uncertain:
+                    continue
+                certain = members - uncertain
+                if not certain:
+                    raise Refuse("CIDR group existence depends on engine-relative retention")
+                certain_values = frozenset(
+                    value for bid in certain for value in cidr_values(self.backends[bid])
+                )
+                uncertain_values = frozenset(
+                    value for bid in uncertain for value in cidr_values(self.backends[bid])
+                )
+                if not uncertain_values <= certain_values:
+                    raise Refuse("CIDR group values depend on engine-relative retention")
+            if any(b.group is None or b.group not in self.groups
+                   for bid, b in self.backends.items() if bid in ambiguous):
+                raise Refuse("CIDR membership depends on engine-relative retention")
         if removed and fresh:
             raise Refuse("simultaneous CIDR group removal/admission needs an order-independent constraint")
         destinations = {}
@@ -1837,6 +1863,10 @@ def defect_checks():
             out[name] = want(d, req)
         except Refuse as e:
             out[name] = want(None, str(e))
+    def cidr_hb(addr, values, healthy=True):
+        item = hb(addr, healthy=healthy)
+        item["labels"] = {"cidr": values}
+        return item
     # A fails, B fails, third Next returns the still-excluded A (C alive) -> refused
     ev = [{"op": "health", "backends": [hb("a"), hb("b"), hb("c")]}, {"op": "open", "session": "s"},
           {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": False},
@@ -1856,6 +1886,31 @@ def defect_checks():
     # expressed as {b,c} minus the engine's complete history; Go's row is also validated
     attempt("reset_only_when_exhausted", cfg, ev, rows_for(ev, e2="default/a", e4="default/b", e7="default/c"),
             lambda d, r: ("ok: full engine-relative cycle over {b,c}") if d and d["events"][7]["expect"].get("legal_backends") == ["default/b", "default/c"] and d["events"][7]["expect"].get("exclude_history") and "exclusion-history" not in r else f"NOT CAUGHT ({r})")
+    # B5: an unhealthy possibly-owned CIDR member is safe only when its
+    # retention cannot change group existence or the refreshed CIDR union and
+    # no fresh admission consults that engine-relative membership.
+    cidr_cfg = {"policy": "connection", "selection": "random", "rule": "client_cidr"}
+    ev = [{"op":"health", "backends":[cidr_hb("a", "127.0.0.0/24"), cidr_hb("b", "127.0.0.0/24")]},
+          {"op":"open", "session":"s", "client":"127.0.0.8:1"}, {"op":"next", "session":"s"},
+          {"op":"finish", "session":"s", "success":True},
+          {"op":"health", "backends":[cidr_hb("b", "127.0.0.0/24")]}, {"op":"close", "session":"s"}]
+    attempt("cidr_redundant_ambiguous_retention", cidr_cfg, ev, rows_for(ev, e2="default/a"),
+            lambda d, r: "ok: group and CIDR union are invariant" if d and not r else f"NOT CAUGHT ({r})")
+    fresh = copy.deepcopy(ev)
+    fresh[4]["backends"].append(cidr_hb("c", "127.0.0.0/24"))
+    attempt("cidr_ambiguous_retention_with_admission", cidr_cfg, fresh, rows_for(fresh, e2="default/a"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    gone = copy.deepcopy(ev)
+    gone[4]["backends"] = []
+    attempt("cidr_ambiguous_retention_group_existence", cidr_cfg, gone, rows_for(gone, e2="default/a"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
+    values = [{"op":"health", "backends":[cidr_hb("a", "127.0.0.0/24")]},
+              {"op":"health", "backends":[cidr_hb("a", "127.0.0.0/24"), cidr_hb("b", "127.0.0.0/24,192.0.2.0/24")]},
+              {"op":"open", "session":"s", "client":"127.0.0.8:1"}, {"op":"next", "session":"s"},
+              {"op":"finish", "session":"s", "success":True},
+              {"op":"health", "backends":[cidr_hb("a", "127.0.0.0/24")]}, {"op":"close", "session":"s"}]
+    attempt("cidr_ambiguous_retention_changes_union", cidr_cfg, values, rows_for(values, e3="default/a"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     # per-group failover guard: list hits only the 6000 group's single backend -> ignored there
     ev = [{"op": "health", "backends": [hb("127.0.0.1:4001", port="6000"), hb("127.0.0.1:4002", port="6001")]},
           {"op": "config", "toml": '[proxy]\nfail-backend-list = ["127.0.0.1:4001"]\nfailover-timeout = 1\n'},

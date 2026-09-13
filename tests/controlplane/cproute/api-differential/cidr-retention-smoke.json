@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "id": "api-cidr-engine-relative-retention",
+  "config": {
+    "policy": "connection",
+    "selection": "random",
+    "rule": "client_cidr"
+  },
+  "provenance": {
+    "kind": "synthetic"
+  },
+  "events": [
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {"cidr": "127.0.0.0/24"},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4021",
+          "labels": {"cidr": "127.0.0.0/24"},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "open",
+      "session": "ambiguous-owner",
+      "client": "127.0.0.8:8000",
+      "proxy": "198.51.100.8:8000",
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "next",
+      "session": "ambiguous-owner",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4020",
+          "default/127.0.0.1:4021"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "ambiguous-owner",
+      "success": true,
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4021",
+          "labels": {"cidr": "127.0.0.0/24"},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "open",
+      "session": "certain-owner",
+      "client": "127.0.0.9:8001",
+      "proxy": "198.51.100.9:8001",
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "next",
+      "session": "certain-owner",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4021"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "certain-owner",
+      "success": true,
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "close",
+      "session": "ambiguous-owner",
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4021",
+          "labels": {"cidr": "127.0.0.0/24"},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {"outcome": "unknown_backend"}
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4021",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4021"
+      }
+    },
+    {
+      "op": "close",
+      "session": "certain-owner",
+      "expect": {"outcome": "ok"}
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 1,
+        "legal_server_versions": ["8.5.1"]
+      }
+    }
+  ]
+}
