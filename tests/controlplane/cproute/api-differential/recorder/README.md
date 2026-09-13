@@ -262,10 +262,22 @@ the real adapters and derives identical expectations independently from each out
 Python counterexample rows are written test data and are not engine evidence.
 
 This increment deliberately retains the existing migration dependency for
-non-unique assignment histories, resource/location factors,
+non-unique assignment histories, resource/location migration factors,
 or tied pairs with different legal effects. It also refuses to seed a cadence
 clock from an earlier unverified migration. A synthetic timing scenario is not a
 qualifying recording and does not freeze the remaining 18-slot manifest.
+
+Resource `prefer-idle` selection now has one bounded input-derived case: two
+healthy, idle, equally local backends; no label, memory, or error-rate factor;
+and a complete CPU matrix keyed by the public health `ip:status_port` fields.
+The derivation mirrors CPU EWMA, score buckets, positive/neutral/negative advice,
+unchanged query-update retention, and the strict two-minute expiry boundary.
+Incomplete packets, zero/unknown update times, competing factor inputs,
+connection load, retries, and intervening health/config/tick scoring keep the
+explicit `policy-constraint:resource/prefer-idle` dependency. The existing
+17-event metrics-producer trace now derives all three choices from its public
+packets for both engines with no dependency; it remains synthetic and therefore
+does not count toward the frozen 18-slot corpus.
 
 `status_cadence_smoke.py` extends constrained Connection histories to unhealthy
 status migration. The first unhealthy scoring call captures its input-derived

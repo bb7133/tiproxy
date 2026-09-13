@@ -394,17 +394,18 @@ jobs:
           trace = json.loads((capture / "trace.json").read_text())
           rows = json.loads((capture / "go.json").read_text())
           derived, requires = module.derive(trace, rows, None)
-          assert trace["provenance"]["kind"] == "synthetic" and requires == ["policy-constraint:resource/prefer-idle"]
+          assert trace["provenance"]["kind"] == "synthetic" and not requires
           module._RUNNER.validate(derived)
           module._RUNNER.observe(derived, rows, "recorded-go")
           (capture / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
-          (capture / "stored-validation.json").write_text(json.dumps({"status":"captured", "events":len(rows), "requires":requires, "paired":"pending", "qualification":"blocked"}) + "\n")
+          (capture / "stored-validation.json").write_text(json.dumps({"status":"passed", "events":len(rows), "requires":requires, "paired":"pending", "qualification":"synthetic"}) + "\n")
           PYTEST
           python3 tests/controlplane/cproute/api-differential/test_run.py
           python3 tests/controlplane/cproute/api-differential/recorder/test_cidr.py
           python3 tests/controlplane/cproute/api-differential/recorder/test_effects.py
           python3 tests/controlplane/cproute/api-differential/recorder/test_cadence.py
           python3 tests/controlplane/cproute/api-differential/recorder/test_status_cadence.py
+          python3 tests/controlplane/cproute/api-differential/recorder/test_resource_metrics.py
       - name: Compare the actual API adapters
         run: |
           python3 tests/controlplane/cproute/api-differential/run.py \
@@ -503,13 +504,30 @@ jobs:
             "${RUNNER_TEMP}/routing-api-recorded-metrics/derived.json" \
             --output "${RUNNER_TEMP}/routing-api-recorded-metrics-paired"
           python3 - <<'PYMETRICS'
-          import json, os
+          import importlib.util, json, os
           from pathlib import Path
           root = Path(os.environ["RUNNER_TEMP"]) / "routing-api-recorded-metrics-paired"
+          source = root.parent / "routing-api-recorded-metrics"
+          path = Path("tests/controlplane/cproute/api-differential/recorder/derive_expectations.py")
+          spec = importlib.util.spec_from_file_location("derive", path)
+          derive = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(derive)
+          trace = json.loads((source / "trace.json").read_text())
+          derivations = []
           for engine in ("go", "rust"):
               rows = json.loads((root / f"{engine}.json").read_text())
               assert [row["backend"] for row in rows if row["op"] == "next"] == ["127.0.0.1:4000", "127.0.0.1:4000", "127.0.0.1:4001"]
-          (root / "input-scenario-validation.json").write_text(json.dumps({"status":"passed", "events":17, "publications":3, "qualification":"blocked: general resource policy/cadence"}) + "\n")
+              derived, requires = derive.derive(trace, rows, None)
+              assert not requires
+              derive._RUNNER.validate(derived)
+              derive._RUNNER.observe(derived, rows, engine)
+              derivations.append(derived)
+          assert derivations[0] == derivations[1]
+          result = derive._RUNNER.compare(derivations[0],
+              json.loads((root / "go.json").read_text()),
+              json.loads((root / "rust.json").read_text()))
+          assert result["events"] == 17 and result["violations"] == 0
+          (root / "input-scenario-validation.json").write_text(json.dumps({"status":"passed", "events":17, "publications":3, "requires":[], "independent_derivations_equal":True, "qualification":"synthetic: not a qualifying recording"}) + "\n")
           PYMETRICS
       - name: Preserve API inputs, outputs and first failure
         if: always()

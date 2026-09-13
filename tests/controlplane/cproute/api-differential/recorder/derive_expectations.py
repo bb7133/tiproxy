@@ -23,7 +23,9 @@ Public semantics mirrored (file:line at the reviewed tree):
   excluded (group.go:352-386); the `random` selection may return any of them
   (factor_balance.go:255-279); `prefer-idle` evicts by factor advice and is derivable
   from public inputs plus each engine's own public connection history for `connection`.
-  Resource/Location metric advice remains a policy-constraint.
+  A bounded two-backend, CPU-only Resource/prefer-idle case is derived from
+  whole public metric packets; other Resource/Location advice remains a
+  policy-constraint.
 - failover guard is evaluated per group: the list is ignored for a group only when it would
   leave that group without a routeable backend (group.go:286-341); the timeout does not
   gate the marking (router.go:160-165, Healthy = observed && not in failover).
@@ -146,7 +148,7 @@ def address_ip(value):
 
 
 class Backend:
-    __slots__ = ("id", "address", "cluster", "keyspace", "labels", "local", "observed_healthy", "version", "group", "ambiguous", "failover_since", "support_redirection")
+    __slots__ = ("id", "address", "ip", "status_port", "cluster", "keyspace", "labels", "local", "observed_healthy", "version", "group", "ambiguous", "failover_since", "support_redirection")
 
     def __init__(self, bid, b):
         self.id = bid
@@ -157,6 +159,8 @@ class Backend:
 
     def update(self, b):
         self.address = b["address"]
+        self.ip = b.get("ip", "")
+        self.status_port = b.get("status_port", 0)
         self.cluster = b.get("cluster", "default")
         self.keyspace = b.get("keyspace", "")
         self.labels = dict(b.get("labels", {}) or {})
@@ -237,6 +241,12 @@ class State:
         self.status_snapshots = {}  # group -> backend -> (input-derived rate, last scoring time)
         self.status_rate = 0.0
         self.status_history_trusted = self.policy == "connection"
+        self.clock_origin = config.get("clock_origin_nanos", 1_700_000_000_000_000_000)
+        self.metric_queries = None  # latest whole public metrics publication
+        self.cpu_last_metric = None  # QueryResult.UpdateTime consumed by a factor call
+        self.cpu_snapshots = {}  # backend -> (sample ms, average, latest, physical count)
+        self.cpu_usage_per_conn = 0.0
+        self.resource_metric_history_trusted = True
         if self.rule not in {"", "port"} | CIDR_RULES:
             self.requires.add(f"policy-constraint:{self.rule}")
 
@@ -263,6 +273,10 @@ class State:
 
     # --- inputs (router_score.go updateBackendHealth / updateGroups / group.UpdateFailover) ---
     def apply_health(self, backends):
+        if self.metric_queries is not None and self.policy in METRIC_POLICIES:
+            # Health delivery scores observed and proposed failover views. The
+            # bounded CPU model below deliberately covers selection calls only.
+            self.resource_metric_history_trusted = False
         self.observer_error = None
         seen = {}
         for raw in backends:
@@ -376,6 +390,8 @@ class State:
                     self.status_snapshots.pop(b.group, None)
 
     def apply_config(self, toml):
+        if self.metric_queries is not None and self.policy in METRIC_POLICIES:
+            self.resource_metric_history_trusted = False
         doc = parse_toml(toml)
         v = toml_get(doc, "proxy", "fail-backend-list")
         if v is not None:
@@ -402,6 +418,10 @@ class State:
             self.status_rate = float(v)
         # balance.routing-rule at runtime is ignored by the router (matchType fixed at Init).
         self.update_failover()
+
+    def apply_metrics(self, queries):
+        self.metric_queries = copy.deepcopy(queries)
+        self.metrics_observed |= any(result is not None and result["series"] for result in queries.values())
 
     def update_failover(self):
         """group.go:286-341 per group; Healthy() = observed && not marked (router.go:160-165).
@@ -676,6 +696,115 @@ def prefer_local(state, legal):
     return local if local else legal
 
 
+def resource_cpu_preferred(state, session, legal):
+    """Return the Resource/prefer-idle candidates for a bounded CPU-only case.
+
+    This is intentionally narrower than the production factor implementation:
+    it accepts only one group of two fully specified, equally local, idle
+    backends and a whole public metrics publication whose only non-empty factor
+    is a complete CPU matrix. Unsupported factor histories return ``None`` so
+    the caller retains the explicit policy dependency.
+    """
+    if (state.policy != "resource" or state.selection != "prefer-idle"
+            or not state.resource_metric_history_trusted or state.metric_queries is None
+            or state.recorded_connections.label_name or session.relative_history or session.cycle
+            or len(legal) != 2 or any(not state.healthy(bid) for bid in legal)
+            or len({state.backends[bid].local for bid in legal}) != 1
+            or any(state.backends[bid].cluster for bid in legal)):
+        return None
+    group = state.backends[legal[0]].group
+    if group is None or any(state.backends[bid].group != group for bid in legal):
+        return None
+    members = state.groups.get(group, set())
+    if set(legal) != set(members):
+        return None
+    counts, physical = state.connection_counts()
+    if any(counts[bid] or physical[bid] for bid in legal):
+        return None
+    queries = state.metric_queries
+    for key in _RUNNER.METRIC_KEYS - {"cpu"}:
+        result = queries[key]
+        if result is not None and result["series"]:
+            return None
+    cpu = queries["cpu"]
+    if cpu is None or not cpu["series"]:
+        # QueryResult.Empty short-circuits CPU scoring; every remaining factor
+        # is equal under the constraints above.
+        return sorted(legal)
+    updated = cpu["updated_nanos"]
+    if cpu["kind"] != "matrix" or type(updated) is not int or updated == 0:
+        return None
+    if state.cpu_last_metric != updated:
+        if state.cpu_last_metric is not None and updated <= state.cpu_last_metric:
+            return None
+        series_by_instance = {}
+        for series in cpu["series"]:
+            labels = series["labels"]
+            if set(labels) != {"instance"} or labels["instance"] in series_by_instance:
+                return None
+            series_by_instance[labels["instance"]] = series["samples"]
+        snapshots = dict(state.cpu_snapshots)
+        for bid in legal:
+            backend = state.backends[bid]
+            if not backend.ip or type(backend.status_port) is not int or backend.status_port <= 0:
+                return None
+            samples = series_by_instance.get(f"{backend.ip}:{backend.status_port}")
+            if not samples:
+                return None
+            values = []
+            for sample in samples:
+                try:
+                    value = float(sample["value"])
+                except ValueError:
+                    return None
+                if not math.isfinite(value) or value < 0:
+                    return None
+                values.append(value)
+            sample_ms = samples[-1]["timestamp_ms"]
+            previous = snapshots.get(bid)
+            if previous is not None and sample_ms <= previous[0]:
+                return None
+            average = values[0]
+            for value in values[1:]:
+                average = average * 0.5 + value * 0.5
+            snapshots[bid] = (sample_ms, min(average, 1.0), values[-1], 0)
+        state.cpu_snapshots = snapshots
+        state.cpu_last_metric = updated
+        # With no physical connections at the snapshot, Go preserves the old
+        # estimate or installs its documented 0.001 floor. A prior nonzero
+        # estimate would require an earlier supported scoring call.
+        if state.cpu_usage_per_conn <= 0:
+            state.cpu_usage_per_conn = 0.001
+    if state.clock_origin + state.now - state.cpu_last_metric > 120_000_000_000:
+        return sorted(legal)
+    if any(bid not in state.cpu_snapshots for bid in legal):
+        return None
+    usage = {}
+    for bid in legal:
+        _, average, latest, snapshot_count = state.cpu_snapshots[bid]
+        current = max(0.0, min(1.0, latest + (counts[bid] - snapshot_count) * state.cpu_usage_per_conn))
+        usage[bid] = (average, current, int(current * 100) // 5)
+    best_score = min(value[2] for value in usage.values())
+    best = [bid for bid in legal if usage[bid][2] == best_score]
+    if len(best) != 1:
+        return sorted(legal) if len(best) == len(legal) else None
+    target = best[0]
+    preferred = [target]
+    to_average, to_latest, _ = usage[target]
+    per_conn = state.cpu_usage_per_conn
+    for source in legal:
+        if source == target:
+            continue
+        from_average, from_latest, _ = usage[source]
+        negative = ((1.3 - (to_average + per_conn)) * 1.1 < 1.3 - (from_average - per_conn)
+                    or (1.3 - (to_latest + per_conn)) * 1.1 < 1.3 - (from_latest - per_conn))
+        neutral = (1.3 - to_average < (1.3 - from_average) * 1.2
+                   or 1.3 - to_latest < (1.3 - from_latest) * 1.2)
+        if negative or neutral:
+            preferred.append(source)
+    return sorted(preferred)
+
+
 def derive_next(state, session, expect):
     """Engine-independent expectation for one Next, plus Go's own legal set for validation."""
     go_excluded = [b for b, _ in session.cycle]
@@ -714,6 +843,15 @@ def derive_next(state, session, expect):
             expect["exclude_history"] = True
             expect["prefer_idle_conn"] = True
             legal_go = sorted(state.recorded_connections.prefer_idle(legal_go))
+        elif state.policy == "resource":
+            modeled = resource_cpu_preferred(state, session, legal_go)
+            if modeled is None:
+                if len(legal) > 1:
+                    state.requires.add("policy-constraint:resource/prefer-idle")
+                    if state.metrics_observed:
+                        state.requires.add("metrics-input")
+            else:
+                legal = legal_go = modeled
         elif len(legal) > 1:
             state.requires.add(f"policy-constraint:{state.policy}/prefer-idle")
             if state.policy in METRIC_POLICIES and state.metrics_observed:
@@ -744,7 +882,7 @@ def derive(trace, rows, args):
                 raise Refuse(f"seq {seq}: {error}") from error
             if row["outcome"] != "ok" or row.get("backend", "") or row.get("effects", []):
                 raise Refuse(f"seq {seq}: metric publication cannot produce a routing result")
-            state.metrics_observed |= any(result is not None and result["series"] for result in event["queries"].values())
+            state.apply_metrics(event["queries"])
             state.requires.add("metrics-input")
         elif op == "source_error":
             if event["error"] not in SOURCE_ERROR_MAP:
@@ -811,6 +949,10 @@ def derive(trace, rows, args):
                 s.assigned = frozenset([name])
                 s.created = seq
         elif op == "tick":
+            if state.metric_queries is not None and state.policy in METRIC_POLICIES:
+                # BackendsToBalance is another factor scoring call. Resource
+                # migration/cadence remains outside the bounded selection model.
+                state.resource_metric_history_trusted = False
             refused = set(event.get("refuse", []) or [])
             recorded = row.get("effects", [])
             if state.support_redirection:
@@ -1078,6 +1220,23 @@ def defect_checks():
         attempt(f"whole_metrics_time_{stamp}", {"policy":"resource", "selection":"prefer-idle", "rule":""}, observed,
                 rows_for(observed, e3="default/a"),
                 lambda d, r: "ok: policy remains, input supplied" if d and r == ["policy-constraint:resource/prefer-idle"] else f"NOT CAUGHT ({r})")
+    # A complete fresh CPU-only packet determines Resource/prefer-idle without
+    # consulting the recorded result: both backends are otherwise identical.
+    resource_backends = [dict(hb("127.0.0.1:4000", cluster=""), status_port=10080),
+                         dict(hb("127.0.0.1:4001", cluster=""), status_port=10081)]
+    packet = dict.fromkeys(_RUNNER.METRIC_KEYS)
+    packet["cpu"] = {"kind":"matrix", "updated_nanos":1_800_000_000_000_000_000, "series":[
+        {"labels":{"instance":"127.0.0.1:10080"}, "samples":[{"timestamp_ms":1_800_000_000_000, "value":"0.1"}]},
+        {"labels":{"instance":"127.0.0.1:10081"}, "samples":[{"timestamp_ms":1_800_000_000_000, "value":"0.9"}]}]}
+    ev = [{"op":"health", "backends":resource_backends}, {"op":"metrics", "queries":packet},
+          {"op":"open", "session":"s"}, {"op":"next", "session":"s"},
+          {"op":"finish", "session":"s", "success":False}, {"op":"close", "session":"s"}]
+    resource_cfg = {"policy":"resource", "selection":"prefer-idle", "rule":"",
+                    "clock_origin_nanos":1_800_000_000_000_000_000}
+    attempt("resource_cpu_public_packet", resource_cfg, ev, rows_for(ev, e3="127.0.0.1:4000"),
+            lambda d, r: "ok: CPU selects 4000" if d and not r and d["events"][3]["expect"].get("backend") == "127.0.0.1:4000" else f"NOT CAUGHT ({r})")
+    attempt("resource_cpu_wrong_result", resource_cfg, ev, rows_for(ev, e3="127.0.0.1:4001"),
+            lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     # location/prefer-idle: one local and one remote → the local is unique; two locals → constraint
     ev = [{"op": "health", "backends": [hb("a", local=True), hb("b", local=False)]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
           {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}]
