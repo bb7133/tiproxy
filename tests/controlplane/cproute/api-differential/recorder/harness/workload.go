@@ -11,12 +11,15 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
 )
+
+var heldDialCounter atomic.Uint64
 
 // Workload drives real MySQL connection lifecycles through the recorded proxy
 // listeners: connect → SELECT 1 → close, from `clients` concurrent clients,
@@ -36,6 +39,8 @@ type Workload struct {
 	failed      atomic.Int64
 	heldQueries atomic.Int64
 	heldFailed  atomic.Int64
+	heldMu      sync.Mutex
+	heldAddrs   map[string]struct{}
 }
 
 func (w *Workload) Completed() int64   { return w.completed.Load() }
@@ -43,7 +48,26 @@ func (w *Workload) Failed() int64      { return w.failed.Load() }
 func (w *Workload) HeldQueries() int64 { return w.heldQueries.Load() }
 func (w *Workload) HeldFailed() int64  { return w.heldFailed.Load() }
 
-func (w *Workload) connector(listener, source string) (driver.Connector, error) {
+func (w *Workload) HeldClientAddresses() map[string]struct{} {
+	w.heldMu.Lock()
+	defer w.heldMu.Unlock()
+	result := make(map[string]struct{}, len(w.heldAddrs))
+	for address := range w.heldAddrs {
+		result[address] = struct{}{}
+	}
+	return result
+}
+
+func (w *Workload) noteHeldAddress(address string) {
+	w.heldMu.Lock()
+	defer w.heldMu.Unlock()
+	if w.heldAddrs == nil {
+		w.heldAddrs = make(map[string]struct{})
+	}
+	w.heldAddrs[address] = struct{}{}
+}
+
+func (w *Workload) connector(listener, source string, held bool) (driver.Connector, error) {
 	cfg := mysql.NewConfig()
 	cfg.User = w.User
 	cfg.Net = "tcp"
@@ -51,8 +75,21 @@ func (w *Workload) connector(listener, source string) (driver.Connector, error) 
 	cfg.Timeout = 5 * time.Second
 	cfg.ReadTimeout = 5 * time.Second
 	cfg.WriteTimeout = 5 * time.Second
+	d := &net.Dialer{Timeout: 5 * time.Second}
 	if source != "" {
-		d := &net.Dialer{Timeout: 5 * time.Second, LocalAddr: &net.TCPAddr{IP: net.ParseIP(source)}}
+		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(source)}
+	}
+	if held {
+		network := fmt.Sprintf("rec-held-%d", heldDialCounter.Add(1))
+		mysql.RegisterDialContext(network, func(ctx context.Context, addr string) (net.Conn, error) {
+			conn, err := d.DialContext(ctx, "tcp", addr)
+			if err == nil {
+				w.noteHeldAddress(conn.LocalAddr().String())
+			}
+			return conn, err
+		})
+		cfg.Net = network
+	} else if source != "" {
 		mysql.RegisterDialContext("rec-"+source, func(ctx context.Context, addr string) (net.Conn, error) { return d.DialContext(ctx, "tcp", addr) })
 		cfg.Net = "rec-" + source
 	}
@@ -65,7 +102,7 @@ func (w *Workload) Run(ctx context.Context) {
 	for i := 0; i < w.Clients; i++ {
 		listener, source := w.target(i)
 		wg.Run(func() {
-			connector, err := w.connector(listener, source)
+			connector, err := w.connector(listener, source, false)
 			if err != nil {
 				w.failed.Add(1)
 				return
@@ -86,7 +123,7 @@ func (w *Workload) Run(ctx context.Context) {
 	for i := 0; i < w.HeldClients; i++ {
 		listener, source := w.target(i)
 		wg.Run(func() {
-			connector, err := w.connector(listener, source)
+			connector, err := w.connector(listener, source, true)
 			if err != nil {
 				w.heldFailed.Add(1)
 				return

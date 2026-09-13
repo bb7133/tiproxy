@@ -125,6 +125,15 @@ func TestRecordingConfigPreservesMultipleListeners(t *testing.T) {
 	require.Equal(t, listeners, got)
 }
 
+func TestClientCountMustCoverListenerSourceProduct(t *testing.T) {
+	listeners := []string{"127.0.0.1:6000", "127.0.0.2:6001"}
+	sources := []string{"127.0.0.1", "127.0.0.2"}
+	require.EqualError(t, validateClientCoverage(3, listeners, sources),
+		"clients 3 cannot cover all 4 listener/source combinations")
+	require.NoError(t, validateClientCoverage(4, listeners, sources))
+	require.NoError(t, validateClientCoverage(2, listeners, nil))
+}
+
 func TestEnvironmentManifestPreflight(t *testing.T) {
 	valid := environmentManifestFixture()
 	dir := t.TempDir()

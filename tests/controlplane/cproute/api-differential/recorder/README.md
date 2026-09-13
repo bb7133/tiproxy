@@ -110,10 +110,12 @@ is not guaranteed to publish an error because the production fetcher retries.
 
 `-listen` accepts the same comma-separated address list as the real proxy and the
 workload covers listeners and optional source addresses as a product. The regular
-clients still drive complete connect/query/close lifecycles. `-held-clients` adds
+client count must cover every listener/source combination or the attempt is rejected
+before capture. The clients still drive complete connect/query/close lifecycles. `-held-clients` adds
 supplemental long-lived query sessions for real redirect/force-close callbacks;
-their query counts are reported separately and never inflate the completed-lifecycle
-qualification count.
+their public client addresses identify their API sessions during finalization, so
+their query counts are reported separately and they never inflate the completed-
+lifecycle qualification count.
 
 Source-error scripts accept only `cancelled`, `deadline_exceeded`,
 `topology_unavailable`, or the empty string to clear a fault. Invalid names, unknown
@@ -269,6 +271,10 @@ effect):
   {"at_ms": 40000, "kind": "await_env"}
 ]
 ```
+
+The writer preserves a refused client effect as that tick's `refuse` input. If one
+session both accepts and refuses effects in the same tick, the session-level replay
+protocol cannot express the input and the attempt is marked incomplete.
 
 Run `run.py.validate()` on a derived trace before any replay claim. A nonempty
 `requires` list remains a blocker even when that structural validation passes.

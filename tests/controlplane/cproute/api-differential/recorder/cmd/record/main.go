@@ -144,6 +144,10 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	if len(listeners) == 0 {
 		return errors.New("-listen requires at least one address")
 	}
+	sourceList := config.SplitAddrList(sources)
+	if err := validateClientCoverage(clients, listeners, sourceList); err != nil {
+		return err
+	}
 	// Validate the complete script before opening an attempt or starting live services.
 	var actions []Action
 	var scriptData []byte
@@ -389,9 +393,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	}, lg)
 
 	wl := &harness.Workload{Listeners: listeners, Clients: clients, HeldClients: heldClients, Pause: pause, User: "root"}
-	if sources != "" {
-		wl.Sources = config.SplitAddrList(sources)
-	}
+	wl.Sources = sourceList
 	wl.Run(runCtx)
 	// No producer may race the final checkpoint or the archive hash. The real
 	// SQL server's Close joins connection goroutines and their terminal callbacks.
@@ -429,7 +431,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		markIncomplete(reason)
 	}
 	records := sched.Log()
-	lifecycles := harness.SummarizeLifecycles(records)
+	lifecycles := harness.SummarizeQualifyingLifecycles(records, wl.HeldClientAddresses())
 	if err := validateRecordedLifecycles(lifecycles, wl.Completed()); err != nil {
 		markIncomplete(err.Error())
 	}
@@ -450,6 +452,17 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	}
 	fmt.Printf("%s: status=%s completed=%d workload_completed=%d workload_failed=%d events=%d dir=%s\n",
 		slot, status, lifecycles.Completed, wl.Completed(), wl.Failed(), len(records), dir)
+	return nil
+}
+
+func validateClientCoverage(clients int, listeners, sources []string) error {
+	combinations := len(listeners)
+	if len(sources) > 0 {
+		combinations *= len(sources)
+	}
+	if clients < combinations {
+		return fmt.Errorf("clients %d cannot cover all %d listener/source combinations", clients, combinations)
+	}
 	return nil
 }
 

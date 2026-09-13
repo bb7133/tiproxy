@@ -60,6 +60,56 @@ func TestSummarizeLifecyclesUsesAPIEvents(t *testing.T) {
 	require.Equal(t, LifecycleSummary{Opened: 3, Next: 2, SuccessfulFinishes: 2, Closed: 3, Completed: 1}, SummarizeLifecycles(log))
 }
 
+func TestQualifyingLifecyclesExcludeHeldClientAddresses(t *testing.T) {
+	yes := true
+	log := []Recorded{
+		{Event: apireplay.Event{Op: "open", Session: "work", Client: "127.0.0.1:5000"}},
+		{Event: apireplay.Event{Op: "next", Session: "work"}},
+		{Event: apireplay.Event{Op: "finish", Session: "work", Success: &yes}},
+		{Event: apireplay.Event{Op: "close", Session: "work"}},
+		{Event: apireplay.Event{Op: "open", Session: "held", Client: "127.0.0.1:5001"}},
+		{Event: apireplay.Event{Op: "next", Session: "held"}},
+		{Event: apireplay.Event{Op: "finish", Session: "held", Success: &yes}},
+		{Event: apireplay.Event{Op: "close", Session: "held"}},
+	}
+	require.Equal(t, LifecycleSummary{Opened: 1, Next: 1, SuccessfulFinishes: 1, Closed: 1, Completed: 1},
+		SummarizeQualifyingLifecycles(log, map[string]struct{}{"127.0.0.1:5001": {}}))
+}
+
+func TestTickRefusalsArePublicInputsAndMixedAcceptanceFailsClosed(t *testing.T) {
+	refused, mixed := tickRefusals([]apireplay.Effect{
+		{Session: "b", Accepted: false},
+		{Session: "a", Accepted: false},
+		{Session: "a", Accepted: false},
+		{Session: "mixed", Accepted: false},
+		{Session: "mixed", Accepted: true},
+		{Session: "accepted", Accepted: true},
+	})
+	require.Equal(t, []string{"a", "b"}, refused)
+	require.Equal(t, []string{"mixed"}, mixed)
+}
+
+func TestWriteCarriesRefusedEffectIntoTickInput(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
+	log := []Recorded{
+		{Seq: 0, AtNanos: 10, Event: apireplay.Event{Op: "tick_begin"}},
+		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "effect", Effects: []apireplay.Effect{
+			{Kind: "force_close", Session: "s", Operation: "s/1", From: "a", Accepted: false},
+		}}},
+		{Seq: 2, AtNanos: 10, Event: apireplay.Event{Op: "tick_end"}},
+	}
+	_, err := Write(dir, "F01", "t1", TraceConfig{}, log, nil, nil, false, CaptureSummary{Synthetic: true})
+	require.NoError(t, err)
+	data, err := os.ReadFile(filepath.Join(dir, "trace.json"))
+	require.NoError(t, err)
+	var trace struct {
+		Events []map[string]any `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(data, &trace))
+	require.Equal(t, []any{"s"}, trace.Events[0]["refuse"])
+}
+
 func TestWriteFailsClosedWhenObservedMetricsLackPublication(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))

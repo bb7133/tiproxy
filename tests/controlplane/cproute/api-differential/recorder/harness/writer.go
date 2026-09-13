@@ -69,11 +69,22 @@ type LifecycleSummary struct {
 	Completed          int64
 }
 
-// SummarizeLifecycles reconstructs the finite public lifecycle from the raw
-// archive without consulting the workload driver or router internals.
+// SummarizeLifecycles reconstructs every finite public lifecycle from the raw
+// archive without consulting router internals.
 func SummarizeLifecycles(log []Recorded) LifecycleSummary {
+	return summarizeLifecycles(log, nil)
+}
+
+// SummarizeQualifyingLifecycles excludes supplemental held-client connections
+// identified by their public client addresses. Their API events remain in the
+// trace for effect coverage, but cannot inflate the short-lifecycle threshold.
+func SummarizeQualifyingLifecycles(log []Recorded, heldClients map[string]struct{}) LifecycleSummary {
+	return summarizeLifecycles(log, heldClients)
+}
+
+func summarizeLifecycles(log []Recorded, heldClients map[string]struct{}) LifecycleSummary {
 	type state struct {
-		opened, established, closed bool
+		opened, established, closed, held bool
 	}
 	states := make(map[string]*state)
 	var summary LifecycleSummary
@@ -83,6 +94,12 @@ func SummarizeLifecycles(log []Recorded) LifecycleSummary {
 		if s == nil && event.Session != "" {
 			s = &state{}
 			states[event.Session] = s
+		}
+		if event.Op == "open" && s != nil {
+			_, s.held = heldClients[event.Client]
+		}
+		if s != nil && s.held {
+			continue
 		}
 		switch event.Op {
 		case "open":
@@ -110,6 +127,33 @@ func SummarizeLifecycles(log []Recorded) LifecycleSummary {
 		}
 	}
 	return summary
+}
+
+func tickRefusals(effects []apireplay.Effect) (refused []string, mixed []string) {
+	type acceptance uint8
+	const (
+		rejected acceptance = 1 << iota
+		accepted
+	)
+	states := make(map[string]acceptance)
+	for _, effect := range effects {
+		if effect.Accepted {
+			states[effect.Session] |= accepted
+		} else {
+			states[effect.Session] |= rejected
+		}
+	}
+	for session, state := range states {
+		switch state {
+		case rejected:
+			refused = append(refused, session)
+		case rejected | accepted:
+			mixed = append(mixed, session)
+		}
+	}
+	sort.Strings(refused)
+	sort.Strings(mixed)
+	return
 }
 
 // Write converts the recorded log into the trace v1 input file (no expect
@@ -155,6 +199,13 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			effects := tickEffects
 			if effects == nil {
 				effects = []apireplay.Effect{}
+			}
+			refused, mixed := tickRefusals(effects)
+			if len(refused) > 0 {
+				ev["refuse"] = refused
+			}
+			for _, session := range mixed {
+				incomplete = append(incomplete, fmt.Sprintf("tick at %d: session %s has both accepted and refused effects", tickAt, session))
 			}
 			push(ev, map[string]any{"op": "tick", "outcome": "ok", "effects": effects}, tickAt)
 			inTick = false
