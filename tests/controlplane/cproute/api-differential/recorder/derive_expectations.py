@@ -141,7 +141,7 @@ def address_ip(value):
 
 
 class Backend:
-    __slots__ = ("id", "address", "cluster", "labels", "local", "observed_healthy", "version", "group", "ambiguous", "failover_since", "support_redirection")
+    __slots__ = ("id", "address", "cluster", "keyspace", "labels", "local", "observed_healthy", "version", "group", "ambiguous", "failover_since", "support_redirection")
 
     def __init__(self, bid, b):
         self.id = bid
@@ -153,6 +153,7 @@ class Backend:
     def update(self, b):
         self.address = b["address"]
         self.cluster = b.get("cluster", "default")
+        self.keyspace = b.get("keyspace", "")
         self.labels = dict(b.get("labels", {}) or {})
         self.local = bool(b.get("local", True))
         self.support_redirection = bool(b.get("support_redirection", True))
@@ -429,6 +430,18 @@ class State:
             return set()
         return {m for m in self.groups.get(b.group, ()) if self.healthy(m)}
 
+    def migration_targets(self, bid):
+        """Necessary destinations, not the factor's chosen pair or advice."""
+        source = self.backends.get(bid)
+        if source is None:
+            return set()
+        # Balance refuses its whole chosen pair when the current public
+        # keyspaces differ, including legacy empty versus a named keyspace.
+        # A compatible alternative does not guarantee that Balance selects
+        # it: retain migration-cadence whenever any legal pair is possible.
+        return {target for target in self.group_healthy(bid) - {bid}
+                if self.backends[target].keyspace == source.keyspace}
+
 
 def key_effects(effects):
     return sorted((e["kind"], e["session"], e["operation"], e["from"], e["to"], bool(e["accepted"])) for e in effects)
@@ -625,7 +638,7 @@ def derive(trace, rows, args):
             # while the independent failover-close pass still runs.
             migration_possible = state.support_redirection and any(
                 s.assigned and not s.force_closing and not s.inflight
-                and any(state.group_healthy(bid) - {bid} for bid in s.assigned)
+                and any(state.migration_targets(bid) for bid in s.assigned)
                 for s in state.sessions.values()
             )
             if migration_possible:
@@ -650,7 +663,7 @@ def derive(trace, rows, args):
                     raise Refuse(f"seq {seq}: effect {ef['operation']} from {ef['from']!r} contradicts the derived assignment {sorted(s.assigned)}")
                 if ef["accepted"] == (ef["session"] in refused):
                     raise Refuse(f"seq {seq}: effect {ef['operation']} acceptance contradicts the scripted refusal")
-                legal_to = state.group_healthy(ef["from"]) - {ef["from"]}
+                legal_to = state.migration_targets(ef["from"])
                 if ef["to"] not in legal_to:
                     raise Refuse(f"seq {seq}: redirect destination {ef['to']!r} not in the legal set {sorted(legal_to)}")
                 s.ordinal += 1

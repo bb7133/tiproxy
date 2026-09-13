@@ -182,7 +182,13 @@ The following dependencies withhold a slot from acceptance:
 - `migration-cadence`: explicitly required by contract §4. This dependency is derived
   from input capability and session/destination history even if every observed
   redirect is deleted. Whole-health support-redirection AND semantics disable the
-  balance pass; independent failover closes still run. Legal observed redirects are
+  balance pass; independent failover closes still run. Destinations must also have
+  exactly the source's current public keyspace, including empty == empty for legacy
+  inputs. When every possible pair crosses keyspaces, migration is impossible;
+  compatible alternatives retain the cadence dependency because the factors may
+  choose a different pair and the router does not retry another destination.
+  Whole health updates replace keyspaces; missing retained sources keep their last
+  delivered value. Legal observed redirects are
   withheld until exact cadence/effect eligibility is implemented. No further scope
   approval is needed to implement this requirement.
 
@@ -227,6 +233,11 @@ The 86-event force-close smoke covers random and connection/prefer-idle choices,
 before/equal/after deadlines, unchanged activation, repeated refusal, acceptance,
 clear/reentry, zero timeout and cleanup. CI runs the real adapters, derives the same
 expectations independently from each engine's public history and checks both outputs.
+The 87-event keyspace variant enables redirection and changes only public whole
+health inputs: named versus legacy empty, then two distinct named keyspaces on
+refresh. Both real engines must still issue only the input-derived failover closes.
+The original 86-event scenario stays unchanged. Both variants require identical
+independently derived expectations and no unresolved dependencies.
 Counterexamples also force different legal owners and reject missing, early,
 duplicated or misdirected effects. These tests do not qualify recorded slots.
 Original recordings and earlier derivations stay immutable;

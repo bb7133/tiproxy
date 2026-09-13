@@ -451,6 +451,11 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             tests/controlplane/cproute/api-differential/force-close-smoke.json \
             --output "${RUNNER_TEMP}/routing-api-force-close"
+          python3 tests/controlplane/cproute/api-differential/recorder/keyspace_smoke.py \
+            "${RUNNER_TEMP}/keyspace-smoke.json"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            "${RUNNER_TEMP}/keyspace-smoke.json" \
+            --output "${RUNNER_TEMP}/routing-api-keyspace"
           python3 - <<'PYCLOSE'
           import importlib.util
           import json
@@ -460,19 +465,22 @@ jobs:
           spec = importlib.util.spec_from_file_location("derive", path)
           derive = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(derive)
-          trace = json.loads((path.parents[1] / "force-close-smoke.json").read_text())
-          output = Path(os.environ["RUNNER_TEMP"]) / "routing-api-force-close"
-          go = json.loads((output / "go.json").read_text())
-          rust = json.loads((output / "rust.json").read_text())
-          derived, requires = derive.derive(trace, go, None)
-          other, other_requires = derive.derive(trace, rust, None)
-          assert not requires and not other_requires, (requires, other_requires)
-          assert derived == other
-          assert derive.compare_with_reference(derived, trace, requires) == ([], [])
-          result = derive._RUNNER.compare(derived, go, rust)
-          (output / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
-          (output / "derived-validation.json").write_text(json.dumps(result, indent=2) + "\n")
-          print("FORCE-CLOSE-DERIVED", result)
+          cases = [(path.parents[1] / "force-close-smoke.json", "routing-api-force-close"),
+                   (Path(os.environ["RUNNER_TEMP"]) / "keyspace-smoke.json", "routing-api-keyspace")]
+          for source, folder in cases:
+              trace = json.loads(source.read_text())
+              output = Path(os.environ["RUNNER_TEMP"]) / folder
+              go = json.loads((output / "go.json").read_text())
+              rust = json.loads((output / "rust.json").read_text())
+              derived, requires = derive.derive(trace, go, None)
+              other, other_requires = derive.derive(trace, rust, None)
+              assert not requires and not other_requires, (requires, other_requires)
+              assert derived == other
+              assert derive.compare_with_reference(derived, trace, requires) == ([], [])
+              result = derive._RUNNER.compare(derived, go, rust)
+              (output / "derived.json").write_text(json.dumps(derived, indent=2) + "\n")
+              (output / "derived-validation.json").write_text(json.dumps(result, indent=2) + "\n")
+              print("FORCE-CLOSE-DERIVED", folder, result)
           PYCLOSE
           python3 tests/controlplane/cproute/api-differential/run.py \
             "${RUNNER_TEMP}/routing-api-recorded-source/derived.json" \
@@ -503,6 +511,8 @@ jobs:
             ${{ runner.temp }}/routing-api-client-cidr
             ${{ runner.temp }}/routing-api-proxy-cidr
             ${{ runner.temp }}/routing-api-force-close
+            ${{ runner.temp }}/routing-api-keyspace
+            ${{ runner.temp }}/keyspace-smoke.json
             ${{ runner.temp }}/routing-api-recorded-source
             ${{ runner.temp }}/routing-api-recorded-source-paired
             ${{ runner.temp }}/routing-api-recorded-metrics

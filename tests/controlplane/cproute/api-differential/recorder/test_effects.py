@@ -115,6 +115,98 @@ class RelativeCloseTests(unittest.TestCase):
         self.assertIn("migration-cadence",requires)
         self.assertIn("effects-v2",requires)
 
+    def test_cross_keyspace_only_targets_do_not_require_migration_cadence(self):
+        for keyspaces in (("tenant-A", "tenant-B"), ("", "tenant-A"),
+                          ("tenant-A", ""), ("Tenant", "tenant")):
+            with self.subTest(keyspaces=keyspaces):
+                trace, left = example(A)
+                _, right = example(B)
+                for backend, keyspace in zip(trace["events"][0]["backends"], keyspaces):
+                    backend.update(support_redirection=True, keyspace=keyspace)
+                d1, r1 = derive.derive(trace, left, None)
+                d2, r2 = derive.derive(trace, right, None)
+                self.assertEqual((r1,r2), ([],[]))
+                self.assertEqual(d1,d2)
+                self.assertEqual(derive.compare_with_reference(d1,trace,r1), ([],[]))
+                runner.compare(d1,left,right)
+
+    def test_same_keyspace_and_legacy_empty_keep_the_cadence_dependency(self):
+        for keyspace in (None, "", "tenant-A"):
+            with self.subTest(keyspace=keyspace):
+                trace, rows = example(B)
+                for backend in trace["events"][0]["backends"]:
+                    backend["support_redirection"] = True
+                    if keyspace is not None:
+                        backend["keyspace"] = keyspace
+                _, requires = derive.derive(trace,rows,None)
+                self.assertIn("migration-cadence",requires)
+                self.assertIn("effects-v2",requires)
+
+    def test_cross_keyspace_redirect_is_refused_even_when_the_script_refuses_it(self):
+        for accepted in (True, False):
+            trace, rows = example(A)
+            for backend, keyspace in zip(trace["events"][0]["backends"], ("red", "blue")):
+                backend.update(support_redirection=True, keyspace=keyspace)
+            if not accepted:
+                trace["events"][5]["refuse"] = ["s"]
+            rows[5]["effects"] = [{"kind":"redirect", "session":"s", "operation":"s/1",
+                                    "from":A, "to":B, "accepted":accepted}]
+            with self.assertRaisesRegex(derive.Refuse, "redirect destination"):
+                derive.derive(trace,rows,None)
+
+    def test_keyspaces_follow_whole_health_updates_and_retained_missing_sources(self):
+        state = derive.State({"policy":"connection", "selection":"random", "rule":""})
+        a = {"address":"a", "labels":{}, "keyspace":"red"}
+        b = {"address":"b", "labels":{}, "keyspace":"blue"}
+        state.apply_health([a,b])
+        session = derive.Session("s", {})
+        session.assigned = frozenset([A])
+        state.sessions["s"] = session
+        self.assertEqual(state.migration_targets(A), set())
+        state.apply_health([b])  # retained source keeps its last delivered keyspace
+        self.assertIn(A,state.backends)
+        self.assertEqual(state.backends[A].keyspace,"red")
+        b["keyspace"] = "red"
+        state.apply_health([b])
+        self.assertEqual(state.migration_targets(A), {B})
+        state.apply_health([{"address":"a", "labels":{}},b])
+        self.assertEqual(state.backends[A].keyspace, "")  # omitted on refresh resets to legacy
+        self.assertEqual(state.migration_targets(A), set())
+        self.assertEqual(state.migration_targets("unknown"), set())
+
+    def test_compatible_alternative_keeps_cadence_but_not_across_groups(self):
+        for rule in ("", "port"):
+            state = derive.State({"policy":"connection", "selection":"random", "rule":rule})
+            state.apply_health([
+                {"address":"a", "keyspace":"red", "labels":{derive.PORT_LABEL:"4000"}},
+                {"address":"b", "keyspace":"blue", "labels":{derive.PORT_LABEL:"4000"}},
+                {"address":"c", "keyspace":"red", "labels":{derive.PORT_LABEL:"4001"}},
+            ])
+            self.assertEqual(state.migration_targets(A), {"default/c"} if rule == "" else set())
+            self.assertEqual(state.migration_targets(B), set())
+        trace, rows = example(B)
+        for backend,keyspace in zip(trace["events"][0]["backends"], ("red","blue")):
+            backend.update(support_redirection=True, keyspace=keyspace)
+        trace["events"][0]["backends"].append({"address":"c", "labels":{}, "keyspace":"red"})
+        _, requires = derive.derive(trace,rows,None)
+        self.assertIn("migration-cadence",requires)
+
+    def test_keyspace_fixture_preserves_the_existing_session_and_deadline_scenario(self):
+        spec = importlib.util.spec_from_file_location("keyspace_smoke", ROOT / "keyspace_smoke.py")
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        original = json.loads((ROOT.parent / "force-close-smoke.json").read_text())
+        trace = fixture.make_trace()
+        self.assertEqual(len(trace["events"]), len(original["events"]) + 1)
+        self.assertEqual([e for e in trace["events"] if e["op"] != "health"],
+                         [e for e in original["events"] if e["op"] != "health"])
+        for event in trace["events"]:
+            if event["op"] == "health" and event["backends"]:
+                a,b = event["backends"]
+                self.assertTrue(a["support_redirection"] and b["support_redirection"])
+                self.assertNotEqual(a.get("keyspace",""),b.get("keyspace",""))
+        runner.validate(trace)
+
     def test_constraint_schema_and_written_deadline_are_checked(self):
         trace, rows = example(A)
         for value in (True,[A,A],[""],[1]):
