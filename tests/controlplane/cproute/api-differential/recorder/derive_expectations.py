@@ -1096,17 +1096,20 @@ def defect_checks():
             lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     # failover-timeout force_close is derived from inputs and time: missing at the deadline
     # tick → refused; injected before the deadline → refused; exact at the deadline → derived.
-    fc = {"kind": "force_close", "session": "s", "operation": "s/1", "from": "default/a", "to": "", "accepted": True}
+    redirect = {"kind": "redirect", "session": "s", "operation": "s/1", "from": "default/a", "to": "default/b", "accepted": True}
+    fc = {"kind": "force_close", "session": "s", "operation": "s/2", "from": "default/a", "to": "", "accepted": True}
     ev = [{"op": "health", "backends": [hb("a"), hb("b", healthy=False)], "at_nanos": 0}, {"op": "open", "session": "s", "at_nanos": 0}, {"op": "next", "session": "s", "at_nanos": 0},
           {"op": "finish", "session": "s", "success": True, "at_nanos": 0}, {"op": "health", "backends": [hb("a"), hb("b")], "at_nanos": 0},
           {"op": "config", "toml": '[proxy]\nfail-backend-list = ["a"]\nfailover-timeout = 1\n', "at_nanos": 500},
           {"op": "tick", "at_nanos": 1_000_000_499}, {"op": "tick", "at_nanos": 1_000_000_500}, {"op": "close", "session": "s", "at_nanos": 1_000_000_500}]
-    base = rows_for(ev, e2="default/a"); base[7]["effects"] = [fc]
+    # The pre-deadline tick already migrates this unhealthy source. The later
+    # close still targets its physical source while that request is in flight.
+    base = rows_for(ev, e2="default/a"); base[6]["effects"] = [redirect]; base[7]["effects"] = [fc]
     attempt("forceclose_derived_at_deadline", cfg, ev, copy.deepcopy(base),
-            lambda d, r: "ok: force_close expected at the deadline tick" if d and d["events"][7]["expect"].get("effects") == [fc] and not d["events"][6]["expect"].get("effects") else f"NOT CAUGHT ({r})")
+            lambda d, r: "ok: redirect before deadline, force_close at deadline" if d and not r and d["events"][7]["expect"].get("effects") == [fc] and d["events"][6]["expect"].get("effects") == [redirect] else f"NOT CAUGHT ({r})")
     bad = copy.deepcopy(base); bad[7]["effects"] = []
     attempt("forceclose_dropped_refused", cfg, ev, bad, lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
-    bad = copy.deepcopy(base); bad[6]["effects"] = [dict(fc, operation="s/injected")]
+    bad = copy.deepcopy(base); bad[6]["effects"] = [redirect, fc]
     attempt("forceclose_early_refused", cfg, ev, bad, lambda d, r: "NOT CAUGHT" if d else f"refused: {r}")
     # retention recovery: random A/B, A unhealthy then healthy again → Lookup A is known
     ev = [{"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"}, {"op": "finish", "session": "s", "success": True},

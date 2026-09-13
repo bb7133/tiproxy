@@ -105,6 +105,18 @@ def make_trace():
     close(start+4_300_000_000,"masked-3","masked-4","masked-5","destination-0","destination-1")
     health(start+4_300_000_000,empty=True)
     add("checkpoint",start+4_300_000_000,{"healthy_backend_count":0,"legal_server_versions":[""]})
+    # A drain deadline still closes the physical source of an accepted redirect
+    # whose completion is delayed. The close consumes the next public ordinal.
+    start=250_000_000_000
+    health(start);restore(start,"deadline",1)
+    config(start,'[proxy]\nfail-backend-list=["127.0.0.1:4000"]\nfailover-timeout=1\n')
+    tick(start+999_999_999,"deadline-0")
+    add("tick",start+1_000_000_000,{"effects":[{"kind":"force_close","session":"deadline-0",
+        "operation":"deadline-0/2","from":A,"to":"","accepted":True}]})
+    close(start+1_000_000_001,"deadline-0")
+    add("redirect_result",start+1_000_000_002,session="deadline-0",operation="deadline-0/1",success=True)
+    health(start+1_000_000_003,empty=True)
+    add("checkpoint",start+1_000_000_003,{"healthy_backend_count":0,"legal_server_versions":[""]})
     return {"version":1,"id":"connection-status-cadence",
             "config":{"policy":"connection","selection":"random","rule":"","clock_origin_nanos":0},
             "provenance":{"kind":"synthetic","description":"Status migration and expiry inputs; not a qualifying recording"},

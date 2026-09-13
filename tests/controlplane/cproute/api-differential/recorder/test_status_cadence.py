@@ -34,7 +34,7 @@ class StatusCadenceTests(unittest.TestCase):
 
     def test_missing_status_moves_and_early_deadlines_are_refused(self):
         for index,event in enumerate(self.trace['events']):
-            if event['op']!='tick' or not event['expect']['effects']:
+            if event['op']!='tick' or not event['expect']['effects'] or event['expect']['effects'][0]['kind']!='redirect':
                 continue
             rows=copy.deepcopy(self.rows);rows[index]['effects']=[]
             with self.subTest(seq=index),self.assertRaisesRegex(deriver.Refuse,'connection cadence'):
@@ -43,6 +43,22 @@ class StatusCadenceTests(unittest.TestCase):
                 rows=copy.deepcopy(self.rows);rows[index-1]['effects']=copy.deepcopy(self.rows[index]['effects'])
                 with self.subTest(early=index-1),self.assertRaises(deriver.Refuse):
                     deriver.derive(self.trace,rows,None)
+
+    def test_drain_after_redirect_keeps_physical_owner_and_next_ordinal(self):
+        index=next(i for i,e in enumerate(self.trace['events'])
+                   if e['op']=='tick' and any(ef['kind']=='force_close' for ef in e['expect']['effects']))
+        for mode in ('missing','ordinal','target','early'):
+            rows=copy.deepcopy(self.rows)
+            if mode=='missing':
+                rows[index]['effects']=[]
+            elif mode=='ordinal':
+                rows[index]['effects'][0]['operation']='deadline-0/1'
+            elif mode=='target':
+                rows[index]['effects'][0]['from']=fixture.B
+            else:
+                rows[index-1]['effects']+=rows[index]['effects']
+            with self.subTest(mode=mode),self.assertRaisesRegex(deriver.Refuse,'force_close effects'):
+                deriver.derive(self.trace,rows,None)
 
     def test_status_expiry_changes_rate_without_copying_outputs(self):
         trace=copy.deepcopy(self.trace)
