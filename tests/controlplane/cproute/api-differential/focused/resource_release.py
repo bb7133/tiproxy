@@ -36,7 +36,7 @@ def main():
     engines = {
         "go": (["go", "test", "-race", "-count=1", "-run", "^TestAPIResourceRelease$", "./pkg/balance/router"], ROOT),
         "rust": (["cargo", "test", "--locked", "-p", "control-router", "--lib", "--",
-                  "tests::resource_release::api_resource_release", "--exact"], ROOT / "rust"),
+                  "tests::resource_release::api_resource_release", "--exact", "--ignored"], ROOT / "rust"),
     }
     summary = {"suite": spec["suite"], "spec_sha256": hashlib.sha256(spec_path.read_bytes()).hexdigest(),
                "cycles": spec["cycles"], "cases": spec["cases"], "engines": {}}

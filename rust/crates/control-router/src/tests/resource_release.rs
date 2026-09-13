@@ -442,6 +442,7 @@ async fn negative_control(h: &Harness) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires CPROUTE_RESOURCE_OUTPUT; run by dedicated resource-release evidence"]
 async fn api_resource_release() -> TestResult {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../tests/controlplane/cproute/api-differential/focused/resource-release.json");
