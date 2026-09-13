@@ -11,7 +11,11 @@ The four frozen acceptance/inventory files are unchanged.
 `record.py` generates exact-text overlays from the current source tree. The proxy's
 public `GetBackendSelector`, `Next` and `Finish` calls pass through `apireplay`;
 router and factor clock reads use the declared logical timer schedule. Missing or duplicated
-anchors abort the build. Production files are never edited by the overlay.
+anchors abort the build. Every Go/Git subprocess receives the same canonical `PWD`
+used by the overlay keys, so a logical symlink cannot change source lookup. A generated
+backend init marker attests that Go applied the overlay; `record.py` executes the built
+binary's marker check and refuses an uninstrumented build. Production files are never
+edited by the overlay.
 
 The optional `config.clock_origin_nanos` is the Unix-nanosecond origin of the
 recording scheduler. Real captures always include it; replay adds each event's
@@ -130,6 +134,11 @@ their SHA-256 to both the capture summary and top-level manifest. The manifest a
 records source head/tree/dirty status, workload duration, completed and failed
 connection counts, script hash, event count and all three data hashes. `record.py`
 embeds the build source identity; a dirty or unidentified build is incomplete.
+The `completed_connections` qualification count is reconstructed only from distinct
+recorded `open` → successful `finish` → `close` lifecycles. Independent workload query
+counters remain separately reported; if the recorder sees fewer complete API lifecycles
+than successful queries, the capture is incomplete. This catches missing or partially
+applied call-site instrumentation even after the build attestation.
 `qualified` is always false here: derivation, common schema validation, same-tree
 paired replay and the frozen corpus gates remain separate requirements.
 

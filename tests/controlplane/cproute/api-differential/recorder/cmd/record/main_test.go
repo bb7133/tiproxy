@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
+	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/harness"
 	"github.com/stretchr/testify/require"
 )
 
@@ -64,22 +65,7 @@ func TestInvalidActionsFailBeforeCapture(t *testing.T) {
 }
 
 func TestEnvironmentManifestPreflight(t *testing.T) {
-	digest := strings.Repeat("a", sha256.Size*2)
-	valid := fmt.Sprintf(`{
-  "generated_at": "2026-09-13T08:00:00Z",
-  "host": {"hostname": "recorder", "os": "darwin", "arch": "arm64"},
-  "components": {
-    "pd": {"version": "v1", "sha256": %q, "length": 1},
-    "tikv": {"version": "v1", "sha256": %q, "length": 2},
-    "tidb": {"version": "v1", "sha256": %q, "length": 3},
-    "prometheus": {"version": "v1", "sha256": %q, "length": 4}
-  },
-  "binaries": {"pd": "pd-build", "tikv": "tikv-build", "tidb": "tidb-build"},
-  "pd": {"client_url": "http://127.0.0.1:2379"},
-  "tikv": {"addr": "127.0.0.1:20160", "status": "127.0.0.1:20180"},
-  "prometheus": {"base_url": "http://127.0.0.1:9090"},
-  "tidb": [{"name": "tidb-0", "sql": "127.0.0.1:4000", "status": "127.0.0.1:10080"}]
-}`, digest, digest, digest, digest)
+	valid := environmentManifestFixture()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "environment.json")
 	require.NoError(t, os.WriteFile(path, []byte(valid), 0o600))
@@ -95,6 +81,7 @@ func TestEnvironmentManifestPreflight(t *testing.T) {
 	require.Equal(t, data, preservedData)
 	require.Error(t, writeExclusiveFile(preserved, []byte("replacement"), 0o600), "a capture must never replace its bound snapshot")
 
+	digest := strings.Repeat("a", sha256.Size*2)
 	for name, contents := range map[string]string{
 		"trailing value":    valid + `{}`,
 		"missing component": strings.Replace(valid, `"prometheus": {"version": "v1", "sha256": `+fmt.Sprintf("%q", digest)+`, "length": 4}`, `"other": {"version": "v1", "sha256": `+fmt.Sprintf("%q", digest)+`, "length": 4}`, 1),
@@ -110,9 +97,43 @@ func TestEnvironmentManifestPreflight(t *testing.T) {
 	}
 }
 
+func environmentManifestFixture() string {
+	digest := strings.Repeat("a", sha256.Size*2)
+	return fmt.Sprintf(`{
+  "generated_at": "2026-09-13T08:00:00Z",
+  "host": {"hostname": "recorder", "os": "darwin", "arch": "arm64"},
+  "components": {
+    "pd": {"version": "v1", "sha256": %q, "length": 1},
+    "tikv": {"version": "v1", "sha256": %q, "length": 2},
+    "tidb": {"version": "v1", "sha256": %q, "length": 3},
+    "prometheus": {"version": "v1", "sha256": %q, "length": 4}
+  },
+  "binaries": {"pd": "pd-build", "tikv": "tikv-build", "tidb": "tidb-build"},
+  "pd": {"client_url": "http://127.0.0.1:2379"},
+  "tikv": {"addr": "127.0.0.1:20160", "status": "127.0.0.1:20180"},
+  "prometheus": {"base_url": "http://127.0.0.1:9090"},
+  "tidb": [{"name": "tidb-0", "sql": "127.0.0.1:4000", "status": "127.0.0.1:10080"}]
+}`, digest, digest, digest, digest)
+}
+
 func TestEnvironmentManifestIsRequiredBeforeCapture(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "recordings")
 	err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, "", out, "", "", "", time.Millisecond)
 	require.EqualError(t, err, "-environment-manifest is required")
+	require.NoDirExists(t, out)
+}
+
+func TestRecordedLifecycleGateFailsClosed(t *testing.T) {
+	require.ErrorContains(t, validateRecordedLifecycles(harness.LifecycleSummary{}, 1), "completed=0 workload=1 open=0")
+	require.NoError(t, validateRecordedLifecycles(harness.LifecycleSummary{Opened: 2, SuccessfulFinishes: 1, Closed: 2, Completed: 1}, 1))
+}
+
+func TestRecorderWithoutOverlayFailsBeforeCapture(t *testing.T) {
+	dir := t.TempDir()
+	environment := filepath.Join(dir, "environment.json")
+	require.NoError(t, os.WriteFile(environment, []byte(environmentManifestFixture()), 0o600))
+	out := filepath.Join(dir, "recordings")
+	err := run("test", "a1", "connection", "prefer-idle", "", "127.0.0.1:0", "", time.Second, 1, 0, "", out, "", "", environment, time.Millisecond)
+	require.EqualError(t, err, "recorder build is missing the API replay overlay; use record.py build or run")
 	require.NoDirExists(t, out)
 }

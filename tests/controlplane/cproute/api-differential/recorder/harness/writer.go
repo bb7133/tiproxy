@@ -48,9 +48,65 @@ type CaptureSummary struct {
 	PlannedDurationNanos      int64  `json:"planned_duration_nanos"`
 	Completed                 int64  `json:"completed_connections"`
 	Failed                    int64  `json:"failed_connections"`
+	WorkloadCompleted         int64  `json:"workload_completed_queries"`
+	WorkloadFailed            int64  `json:"workload_failed_queries"`
 	Clients                   int    `json:"clients"`
 	ScriptSHA256              string `json:"script_sha256"`
 	EnvironmentManifestSHA256 string `json:"environment_manifest_sha256,omitempty"`
+}
+
+// LifecycleSummary counts only recorder API events. Completed is the number of
+// distinct opened sessions that established a backend and later closed; this,
+// rather than the independent workload counter, is the qualification count.
+type LifecycleSummary struct {
+	Opened             int64
+	Next               int64
+	SuccessfulFinishes int64
+	Closed             int64
+	Completed          int64
+}
+
+// SummarizeLifecycles reconstructs the finite public lifecycle from the raw
+// archive without consulting the workload driver or router internals.
+func SummarizeLifecycles(log []Recorded) LifecycleSummary {
+	type state struct {
+		opened, established, closed bool
+	}
+	states := make(map[string]*state)
+	var summary LifecycleSummary
+	for _, record := range log {
+		event := record.Event
+		s := states[event.Session]
+		if s == nil && event.Session != "" {
+			s = &state{}
+			states[event.Session] = s
+		}
+		switch event.Op {
+		case "open":
+			summary.Opened++
+			if s != nil {
+				s.opened = true
+			}
+		case "next":
+			summary.Next++
+		case "finish":
+			if event.Success != nil && *event.Success {
+				summary.SuccessfulFinishes++
+				if s != nil {
+					s.established = true
+				}
+			}
+		case "close":
+			summary.Closed++
+			if s != nil && s.opened && s.established && !s.closed {
+				summary.Completed++
+			}
+			if s != nil {
+				s.closed = true
+			}
+		}
+	}
+	return summary
 }
 
 // Write converts the recorded log into the trace v1 input file (no expect

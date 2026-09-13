@@ -119,11 +119,20 @@ type Sink interface {
 type Clock func() int64
 
 var (
-	sinkMu  sync.Mutex
-	sink    Sink
-	counter atomic.Uint64
-	prefix  = "s"
+	sinkMu           sync.Mutex
+	sink             Sink
+	counter          atomic.Uint64
+	overlayInstalled atomic.Bool
+	prefix           = "s"
 )
+
+// MarkOverlayInstalled is called by a generated source file that record.py
+// adds to the overlaid backend package. A recorder binary without the complete
+// overlay never calls it and must fail before starting a capture.
+func MarkOverlayInstalled() { overlayInstalled.Store(true) }
+
+// OverlayInstalled reports whether the generated build attestation ran.
+func OverlayInstalled() bool { return overlayInstalled.Load() }
 
 // Install binds the process-wide sink and session prefix. It is called once by
 // the harness before the proxy accepts its first connection.

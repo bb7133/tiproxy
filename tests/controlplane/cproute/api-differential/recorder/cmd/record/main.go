@@ -97,24 +97,33 @@ type environmentManifest struct {
 
 func main() {
 	var (
-		slot        = flag.String("slot", "smoke", "trace slot id (recording-plan.tsv)")
-		attempt     = flag.String("attempt", "a1", "attempt id; a new capture never overwrites a previous one")
-		policyF     = flag.String("policy", "connection", "[balance] policy")
-		selection   = flag.String("selection", "prefer-idle", "[balance] routing-policy")
-		rule        = flag.String("rule", "", "[balance] routing-rule (fixed at Init)")
-		listen      = flag.String("listen", "127.0.0.1:6000", "proxy listener(s), comma separated")
-		pd          = flag.String("pd", "127.0.0.1:2379", "PD address")
-		duration    = flag.Duration("duration", 60*time.Second, "recording duration")
-		clients     = flag.Int("clients", 8, "concurrent mysql clients")
-		pause       = flag.Duration("pause", 200*time.Millisecond, "pause between lifecycles per client")
-		sources     = flag.String("sources", "", "comma separated loopback source IPs for clients")
-		out         = flag.String("out", "", "output directory (required)")
-		script      = flag.String("script", "", "JSON file with scripted actions")
-		envSh       = flag.String("env", "", "path to slice3 env.sh for env actions")
-		envManifest = flag.String("environment-manifest", "", "immutable JSON snapshot from the live environment (required)")
-		tick        = flag.Duration("tick", 10*time.Millisecond, "declared rebalance tick interval")
+		slot         = flag.String("slot", "smoke", "trace slot id (recording-plan.tsv)")
+		attempt      = flag.String("attempt", "a1", "attempt id; a new capture never overwrites a previous one")
+		policyF      = flag.String("policy", "connection", "[balance] policy")
+		selection    = flag.String("selection", "prefer-idle", "[balance] routing-policy")
+		rule         = flag.String("rule", "", "[balance] routing-rule (fixed at Init)")
+		listen       = flag.String("listen", "127.0.0.1:6000", "proxy listener(s), comma separated")
+		pd           = flag.String("pd", "127.0.0.1:2379", "PD address")
+		duration     = flag.Duration("duration", 60*time.Second, "recording duration")
+		clients      = flag.Int("clients", 8, "concurrent mysql clients")
+		pause        = flag.Duration("pause", 200*time.Millisecond, "pause between lifecycles per client")
+		sources      = flag.String("sources", "", "comma separated loopback source IPs for clients")
+		out          = flag.String("out", "", "output directory (required)")
+		script       = flag.String("script", "", "JSON file with scripted actions")
+		envSh        = flag.String("env", "", "path to slice3 env.sh for env actions")
+		envManifest  = flag.String("environment-manifest", "", "immutable JSON snapshot from the live environment (required)")
+		tick         = flag.Duration("tick", 10*time.Millisecond, "declared rebalance tick interval")
+		checkOverlay = flag.Bool("check-overlay", false, "verify that record.py's build overlay is installed, then exit")
 	)
 	flag.Parse()
+	if *checkOverlay {
+		if !apireplay.OverlayInstalled() {
+			fmt.Fprintln(os.Stderr, "API replay overlay is not installed")
+			os.Exit(1)
+		}
+		fmt.Println("API replay overlay: installed")
+		return
+	}
 	if *out == "" {
 		fmt.Fprintln(os.Stderr, "-out is required")
 		os.Exit(2)
@@ -156,6 +165,9 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	envManifestData, envManifestSHA, err := loadEnvironmentManifest(envManifestPath)
 	if err != nil {
 		return err
+	}
+	if !apireplay.OverlayInstalled() {
+		return errors.New("recorder build is missing the API replay overlay; use record.py build or run")
 	}
 	dir := filepath.Join(out, slot+"-"+attempt)
 	if err := os.MkdirAll(out, 0o755); err != nil {
@@ -392,20 +404,27 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	for _, reason := range ledger.violations {
 		markIncomplete(reason)
 	}
+	records := sched.Log()
+	lifecycles := harness.SummarizeLifecycles(records)
+	if err := validateRecordedLifecycles(lifecycles, wl.Completed()); err != nil {
+		markIncomplete(err.Error())
+	}
 	if sourceHead == "" || sourceTree == "" || sourceDirty != "false" {
 		markIncomplete("capture requires a clean, identified source tree built by record.py")
 	}
 	meta := harness.CaptureSummary{Head: sourceHead, Tree: sourceTree, SourceDirty: sourceDirty,
 		DurationNanos: sched.Elapsed().Nanoseconds(), PlannedDurationNanos: duration.Nanoseconds(),
-		Completed: wl.Completed(), Failed: wl.Failed(), Clients: clients, ScriptSHA256: scriptSHA,
+		Completed: lifecycles.Completed, Failed: lifecycles.Opened - lifecycles.Completed,
+		WorkloadCompleted: wl.Completed(), WorkloadFailed: wl.Failed(), Clients: clients, ScriptSHA256: scriptSHA,
 		EnvironmentManifestSHA256: envManifestSHA}
 	origin := sched.OriginNanos()
-	status, err := harness.Write(dir, slot, attempt, harness.TraceConfig{Policy: policyName, Selection: selection, Rule: rule, ClockOriginNanos: &origin}, sched.Log(), checkpoints, incomplete,
+	status, err := harness.Write(dir, slot, attempt, harness.TraceConfig{Policy: policyName, Selection: selection, Rule: rule, ClockOriginNanos: &origin}, records, checkpoints, incomplete,
 		metricInputs.Observed(), meta)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s: status=%s completed=%d failed=%d events=%d dir=%s\n", slot, status, wl.Completed(), wl.Failed(), len(sched.Log()), dir)
+	fmt.Printf("%s: status=%s completed=%d workload_completed=%d workload_failed=%d events=%d dir=%s\n",
+		slot, status, lifecycles.Completed, wl.Completed(), wl.Failed(), len(records), dir)
 	return nil
 }
 
@@ -423,6 +442,14 @@ func validateActions(actions []Action) error {
 		default:
 			return fmt.Errorf("action %d: unsupported kind %q", i, a.Kind)
 		}
+	}
+	return nil
+}
+
+func validateRecordedLifecycles(lifecycles harness.LifecycleSummary, workloadCompleted int64) error {
+	if lifecycles.Completed < workloadCompleted {
+		return fmt.Errorf("recorded API lifecycles below successful workload queries: completed=%d workload=%d open=%d finish_success=%d close=%d",
+			lifecycles.Completed, workloadCompleted, lifecycles.Opened, lifecycles.SuccessfulFinishes, lifecycles.Closed)
 	}
 	return nil
 }

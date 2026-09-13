@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,4 +40,22 @@ func TestWriteBindsEnvironmentManifest(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(changedDir, "environment-manifest.json"), environment, 0o600))
 	_, err = Write(changedDir, "N01", "a2", TraceConfig{}, nil, nil, nil, false, CaptureSummary{EnvironmentManifestSHA256: fmt.Sprintf("%064d", 0)})
 	require.ErrorContains(t, err, "environment manifest changed after preflight")
+}
+
+func TestSummarizeLifecyclesUsesAPIEvents(t *testing.T) {
+	yes, no := true, false
+	log := []Recorded{
+		{Event: apireplay.Event{Op: "open", Session: "complete"}},
+		{Event: apireplay.Event{Op: "next", Session: "complete"}},
+		{Event: apireplay.Event{Op: "finish", Session: "complete", Success: &yes}},
+		{Event: apireplay.Event{Op: "close", Session: "complete"}},
+		{Event: apireplay.Event{Op: "close", Session: "complete"}}, // duplicate is not another completion
+		{Event: apireplay.Event{Op: "open", Session: "failed"}},
+		{Event: apireplay.Event{Op: "next", Session: "failed"}},
+		{Event: apireplay.Event{Op: "finish", Session: "failed", Success: &no}},
+		{Event: apireplay.Event{Op: "close", Session: "failed"}},
+		{Event: apireplay.Event{Op: "open", Session: "unclosed"}},
+		{Event: apireplay.Event{Op: "finish", Session: "unclosed", Success: &yes}},
+	}
+	require.Equal(t, LifecycleSummary{Opened: 3, Next: 2, SuccessfulFinishes: 2, Closed: 3, Completed: 1}, SummarizeLifecycles(log))
 }

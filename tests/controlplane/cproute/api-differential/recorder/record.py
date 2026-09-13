@@ -10,6 +10,7 @@ generated copies of these files:
   pkg/balance/router/group.go             time.Now() -> replayNow()  (harness logical clock)
   pkg/balance/router/router_score.go      time.Now() -> replayNow()
   pkg/balance/factor/factor_{cpu,memory,health}.go  time.Now() -> replayclock.Now()
+  pkg/proxy/backend/api_replay_overlay_marker.go    build attestation (new overlaid file)
 
 Every substitution is anchored on the exact production text; a missing anchor aborts
 (the overlay is regenerated from the current tree on every run, never cached).
@@ -29,6 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[5]
 PKG = "./tests/controlplane/cproute/api-differential/recorder/cmd/record"
 APIREPLAY = "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
+OVERLAY_MARKER = "pkg/proxy/backend/api_replay_overlay_marker.go"
 
 SUBSTITUTIONS = {
     "pkg/proxy/backend/backend_conn_mgr.go": [
@@ -67,6 +69,19 @@ def overlay(out):
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(substitute(rel, src.read_text()))
         replace[str(src)] = str(dst)
+    marker = ROOT / OVERLAY_MARKER
+    if marker.exists():
+        raise SystemExit(f"overlay marker target unexpectedly exists: {marker}")
+    marker_copy = out / "overlay" / OVERLAY_MARKER
+    marker_copy.parent.mkdir(parents=True, exist_ok=True)
+    marker_copy.write_text(
+        "// Copyright 2026 PingCAP, Inc.\n"
+        "// SPDX-License-Identifier: Apache-2.0\n\n"
+        "package backend\n\n"
+        f'import "{APIREPLAY}"\n\n'
+        "func init() { apireplay.MarkOverlayInstalled() }\n"
+    )
+    replace[str(marker)] = str(marker_copy)
     path = out / "overlay.json"
     path.write_text(json.dumps({"Replace": replace}, indent=2) + "\n")
     return path
@@ -75,13 +90,22 @@ def overlay(out):
 def build(out):
     path = overlay(out)
     binary = out / "record"
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip()
-    dirty = bool(subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=ROOT, text=True).strip())
+    env = os.environ.copy()
+    # os.Getwd (and therefore the Go command) trusts a matching inherited PWD.
+    # Keep it identical to the realpath used by every overlay key so a logical
+    # symlink such as macOS /tmp cannot silently bypass all replacements.
+    env["PWD"] = str(ROOT)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, env=env, text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, env=env, text=True).strip()
+    dirty = bool(subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=ROOT, env=env, text=True).strip())
     ldflags = f"-X main.sourceHead={head} -X main.sourceTree={tree} -X main.sourceDirty={str(dirty).lower()}"
     cmd = ["go", "build", "-ldflags", ldflags, "-tags", "apireplay", "-overlay", str(path), "-o", str(binary), PKG]
     print("+", " ".join(cmd), file=sys.stderr)
-    subprocess.run(cmd, cwd=ROOT, check=True)
+    subprocess.run(cmd, cwd=ROOT, env=env, check=True)
+    # The generated backend init marker is linked only when Go honored the
+    # overlay. Execute it so a nominally successful but uninstrumented build
+    # cannot reach a live environment.
+    subprocess.run([str(binary), "-check-overlay"], cwd=ROOT, env=env, check=True)
     return binary
 
 
@@ -98,7 +122,9 @@ def main():
         print(binary)
         return
     rest = [a for a in rest if a != "--"]
-    os.execv(str(binary), [str(binary), *rest])
+    env = os.environ.copy()
+    env["PWD"] = str(ROOT)
+    os.execve(str(binary), [str(binary), *rest], env)
 
 
 if __name__ == "__main__":
