@@ -56,12 +56,14 @@ var sourceHead, sourceTree, sourceDirty string
 
 // Action is one scripted, declared operation at a wall offset from trace start.
 type Action struct {
-	AtMillis      int64    `json:"at_ms"`
-	Kind          string   `json:"kind"` // env | await_env | config | source_error | checkpoint | scripted client controls
-	Args          []string `json:"args,omitempty"`
-	TOML          string   `json:"toml,omitempty"`
-	Error         string   `json:"error,omitempty"` // source_error identity; "" clears the fault window
-	TimeoutMillis int64    `json:"timeout_ms,omitempty"`
+	AtMillis               int64    `json:"at_ms"`
+	Kind                   string   `json:"kind"` // env | await_env | config | source_error | checkpoint | scripted client controls
+	Args                   []string `json:"args,omitempty"`
+	TOML                   string   `json:"toml,omitempty"`
+	Error                  string   `json:"error,omitempty"` // source_error identity; "" clears the fault window
+	TimeoutMillis          int64    `json:"timeout_ms,omitempty"`
+	FailoverTimeoutSeconds int64    `json:"failover_timeout_seconds,omitempty"`
+	EffectControl          string   `json:"effect_control,omitempty"` // refuse | delay; armed atomically with failover_select
 }
 
 type environmentComponent struct {
@@ -295,8 +297,12 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		defer incompleteMu.Unlock()
 		incomplete = append(incomplete, reason)
 	}
+	wl := &harness.Workload{Listeners: listeners, Clients: clients, HeldClients: heldClients, Pause: pause, User: "root"}
+	wl.Sources = sourceList
 	var producerWG, envWG waitgroup.WaitGroup
 	checkpoints := map[int]harness.Checkpoint{}
+	selectedFailoverBackend := ""
+	selectedFailoverTimeout := int64(0)
 	producerWG.Run(func() {
 		for k := int64(0); runCtx.Err() == nil; k++ {
 			declared := k * hcCfg.MetricsInterval.Nanoseconds()
@@ -360,6 +366,33 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 			case "config":
 				err := cfgMgr.SetTOMLConfig([]byte(a.TOML))
 				inputs.DeliverConfig(a.TOML, cfgMgr.GetConfig(), err)
+			case "failover_select":
+				sched.RunNow(func() {
+					seq := sched.Seq()
+					assignments := ledger.assignments()
+					checkpoints[seq] = harness.Checkpoint{Seq: seq, Assignments: assignments, ConnCount: rt.ConnCount(),
+						HealthyBackendCount: rt.HealthyBackendCount(), ServerVersion: rt.ServerVersion()}
+					sched.Record(apireplay.Event{Op: "checkpoint"})
+					selectedFailoverBackend = ledger.chooseHeldBackend(wl.HeldClientAddresses())
+					selectedFailoverTimeout = a.FailoverTimeoutSeconds
+					if selectedFailoverBackend == "" {
+						markIncomplete("failover_select found no established held-client assignment")
+						sched.Record(apireplay.Event{Op: "recorder_error", Outcome: "failover_select_without_held_assignment"})
+						return
+					}
+					toml := failoverConfig(selectedFailoverBackend, selectedFailoverTimeout)
+					err := cfgMgr.SetTOMLConfig([]byte(toml))
+					armEffectControl(a.EffectControl)
+					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err)
+				})
+			case "failover_repeat":
+				toml := failoverConfig(selectedFailoverBackend, selectedFailoverTimeout)
+				err := cfgMgr.SetTOMLConfig([]byte(toml))
+				inputs.DeliverConfig(toml, cfgMgr.GetConfig(), err)
+			case "failover_clear":
+				toml := failoverConfig("", 0)
+				err := cfgMgr.SetTOMLConfig([]byte(toml))
+				inputs.DeliverConfig(toml, cfgMgr.GetConfig(), err)
 			case "source_error":
 				fault, err := harness.FaultError(a.Error)
 				if err != nil {
@@ -392,8 +425,6 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		}
 	}, lg)
 
-	wl := &harness.Workload{Listeners: listeners, Clients: clients, HeldClients: heldClients, Pause: pause, User: "root"}
-	wl.Sources = sourceList
 	wl.Run(runCtx)
 	// No producer may race the final checkpoint or the archive hash. The real
 	// SQL server's Close joins connection goroutines and their terminal callbacks.
@@ -470,6 +501,8 @@ func validateActions(actions []Action) error {
 	const maxDurationMillis = int64((time.Duration(1<<63 - 1)) / time.Millisecond)
 	pendingEnvironment := false
 	pendingDelayedRedirect := false
+	selectedFailover := false
+	activeFailover := false
 	for i, a := range actions {
 		if a.AtMillis < 0 || a.AtMillis > maxDurationMillis {
 			return fmt.Errorf("action %d: at_ms is outside time.Duration range", i)
@@ -485,6 +518,12 @@ func validateActions(actions []Action) error {
 		}
 		if a.Error != "" && a.Kind != "source_error" {
 			return fmt.Errorf("action %d: error is only valid for source_error", i)
+		}
+		if a.FailoverTimeoutSeconds != 0 && a.Kind != "failover_select" {
+			return fmt.Errorf("action %d: failover_timeout_seconds is only valid for failover_select", i)
+		}
+		if a.EffectControl != "" && a.Kind != "failover_select" {
+			return fmt.Errorf("action %d: effect_control is only valid for failover_select", i)
 		}
 		if pendingEnvironment && a.Kind != "env" && a.Kind != "await_env" {
 			return fmt.Errorf("action %d: env batch requires await_env before %q", i, a.Kind)
@@ -510,6 +549,33 @@ func validateActions(actions []Action) error {
 				return fmt.Errorf("action %d: a delayed redirect control is already pending", i)
 			}
 			pendingDelayedRedirect = true
+		case "failover_select":
+			if a.FailoverTimeoutSeconds <= 0 {
+				return fmt.Errorf("action %d: failover_select requires a positive failover_timeout_seconds", i)
+			}
+			if activeFailover {
+				return fmt.Errorf("action %d: failover_select requires a preceding failover_clear", i)
+			}
+			if a.EffectControl != "" && a.EffectControl != "refuse" && a.EffectControl != "delay" {
+				return fmt.Errorf("action %d: unsupported effect_control %q", i, a.EffectControl)
+			}
+			if a.EffectControl == "delay" {
+				if pendingDelayedRedirect {
+					return fmt.Errorf("action %d: a delayed redirect control is already pending", i)
+				}
+				pendingDelayedRedirect = true
+			}
+			selectedFailover = true
+			activeFailover = true
+		case "failover_repeat":
+			if !selectedFailover || !activeFailover {
+				return fmt.Errorf("action %d: failover_repeat requires an active failover_select", i)
+			}
+		case "failover_clear":
+			if !activeFailover {
+				return fmt.Errorf("action %d: failover_clear requires an active failover_select", i)
+			}
+			activeFailover = false
 		case "close_delayed_redirect":
 			if !pendingDelayedRedirect {
 				return fmt.Errorf("action %d: close_delayed_redirect has no preceding delay control", i)
@@ -528,6 +594,9 @@ func validateActions(actions []Action) error {
 	if pendingDelayedRedirect {
 		return errors.New("action script ends with an unclosed delayed redirect control")
 	}
+	if activeFailover {
+		return errors.New("action script ends with an active selected failover")
+	}
 	return nil
 }
 
@@ -545,6 +614,29 @@ func actionTimeout(action Action) time.Duration {
 		return 10 * time.Second
 	}
 	return time.Duration(action.TimeoutMillis) * time.Millisecond
+}
+
+func armEffectControl(control string) {
+	switch control {
+	case "refuse":
+		apireplay.RefuseNextEffect()
+	case "delay":
+		apireplay.DelayNextRedirectResult()
+	}
+}
+
+func failoverConfig(backend string, timeoutSeconds int64) string {
+	if backend == "" {
+		return "[proxy]\nfail-backend-list = []\n"
+	}
+	return fmt.Sprintf("[proxy]\nfail-backend-list = [%q]\nfailover-timeout = %d\n", backendAddress(backend), timeoutSeconds)
+}
+
+func backendAddress(backend string) string {
+	if i := strings.LastIndexByte(backend, '/'); i >= 0 {
+		return backend[i+1:]
+	}
+	return backend
 }
 
 func recordingConfig(listeners []string, pd, policyName, selection, rule string) string {
@@ -628,6 +720,7 @@ func writeExclusiveFile(path string, data []byte, perm os.FileMode) error {
 // checkpoints carry `assignments` the way the adapter reports them.
 type ledger struct {
 	open       map[string]bool
+	client     map[string]string
 	settled    map[string]bool
 	violations []string
 	pending    map[string]string
@@ -635,13 +728,14 @@ type ledger struct {
 }
 
 func newLedger() *ledger {
-	return &ledger{open: map[string]bool{}, settled: map[string]bool{}, pending: map[string]string{}, active: map[string]string{}}
+	return &ledger{open: map[string]bool{}, client: map[string]string{}, settled: map[string]bool{}, pending: map[string]string{}, active: map[string]string{}}
 }
 
 func (l *ledger) observe(ev apireplay.Event) {
 	switch ev.Op {
 	case "open":
 		l.open[ev.Session] = true
+		l.client[ev.Session] = ev.Client
 	case "next":
 		if ev.Outcome == "ok" {
 			l.pending[ev.Session] = ev.Backend
@@ -665,9 +759,29 @@ func (l *ledger) observe(ev apireplay.Event) {
 			l.violations = append(l.violations, "close without open selector: "+ev.Session)
 		}
 		delete(l.open, ev.Session)
+		delete(l.client, ev.Session)
 		delete(l.active, ev.Session)
 		delete(l.pending, ev.Session)
 	}
+}
+
+func (l *ledger) chooseHeldBackend(heldClients map[string]struct{}) string {
+	choices := make([]string, 0)
+	seen := make(map[string]struct{})
+	for session, backend := range l.active {
+		if _, held := heldClients[l.client[session]]; !held || backend == "" {
+			continue
+		}
+		if _, exists := seen[backend]; !exists {
+			seen[backend] = struct{}{}
+			choices = append(choices, backend)
+		}
+	}
+	sort.Strings(choices)
+	if len(choices) == 0 {
+		return ""
+	}
+	return choices[0]
 }
 
 func (l *ledger) assignments() map[string]string {

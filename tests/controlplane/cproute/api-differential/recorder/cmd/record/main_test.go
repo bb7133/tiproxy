@@ -7,6 +7,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,6 +41,34 @@ func TestLedgerTracksAbandonedAndClosedSessions(t *testing.T) {
 	if len(l.open)+len(l.active)+len(l.pending) != 0 {
 		t.Fatal("late callback resurrected session")
 	}
+}
+
+func TestLedgerSelectsOnlyAnEstablishedHeldClient(t *testing.T) {
+	l := newLedger()
+	yes := true
+	for _, tc := range []struct{ session, client, backend string }{
+		{"regular", "127.0.0.1:1000", "default/127.0.0.1:4000"},
+		{"held-b", "127.0.0.1:2000", "default/127.0.0.1:4002"},
+		{"held-a", "127.0.0.1:2001", "default/127.0.0.1:4001"},
+	} {
+		l.observe(apireplay.Event{Op: "open", Session: tc.session, Client: tc.client})
+		l.observe(apireplay.Event{Op: "next", Session: tc.session, Outcome: "ok", Backend: tc.backend})
+		l.observe(apireplay.Event{Op: "finish", Session: tc.session, Success: &yes})
+	}
+	require.Equal(t, "default/127.0.0.1:4001", l.chooseHeldBackend(map[string]struct{}{
+		"127.0.0.1:2000": {}, "127.0.0.1:2001": {},
+	}))
+	require.Empty(t, l.chooseHeldBackend(map[string]struct{}{"127.0.0.1:9999": {}}))
+	l.observe(apireplay.Event{Op: "close", Session: "held-a"})
+	require.Equal(t, "default/127.0.0.1:4002", l.chooseHeldBackend(map[string]struct{}{
+		"127.0.0.1:2000": {}, "127.0.0.1:2001": {},
+	}))
+}
+
+func TestFailoverConfigUsesAddressAndPositiveTimeout(t *testing.T) {
+	require.Equal(t, "[proxy]\nfail-backend-list = [\"127.0.0.1:4001\"]\nfailover-timeout = 60\n",
+		failoverConfig("default/127.0.0.1:4001", 60))
+	require.Equal(t, "[proxy]\nfail-backend-list = []\n", failoverConfig("", 0))
 }
 
 func TestInvalidActionsFailBeforeCapture(t *testing.T) {
@@ -76,29 +105,59 @@ func TestScriptControlValidation(t *testing.T) {
 		{Kind: "refuse_next_effect"},
 		{Kind: "delay_next_redirect_result"},
 		{Kind: "close_delayed_redirect", TimeoutMillis: 5000},
+		{Kind: "failover_select", FailoverTimeoutSeconds: 60, EffectControl: "refuse"},
+		{Kind: "failover_repeat"},
+		{Kind: "failover_clear"},
+		{Kind: "failover_select", FailoverTimeoutSeconds: 60, EffectControl: "delay"},
+		{Kind: "close_delayed_redirect", TimeoutMillis: 5000},
+		{Kind: "failover_clear"},
 	}
 	require.NoError(t, validateActions(valid))
 	require.True(t, requiresEnvironmentDriver(valid))
-	require.Equal(t, 5*time.Second, actionTimeout(valid[len(valid)-1]))
+	require.Equal(t, 5*time.Second, actionTimeout(Action{TimeoutMillis: 5000}))
 	require.Equal(t, 10*time.Second, actionTimeout(Action{}))
 
 	for name, actions := range map[string][]Action{
-		"env missing args":         {{Kind: "env"}, {Kind: "await_env"}},
-		"env missing barrier":      {{Kind: "env", Args: []string{"tidb-stop", "0"}}},
-		"env overlaps config":      {{Kind: "env", Args: []string{"tidb-stop", "0"}}, {Kind: "config"}},
-		"barrier without batch":    {{Kind: "await_env"}},
-		"delay not closed":         {{Kind: "delay_next_redirect_result"}},
-		"close without delay":      {{Kind: "close_delayed_redirect"}},
-		"two pending delays":       {{Kind: "delay_next_redirect_result"}, {Kind: "delay_next_redirect_result"}},
-		"timeout on wrong action":  {{Kind: "checkpoint", TimeoutMillis: 1}},
-		"negative control timeout": {{Kind: "close_delayed_redirect", TimeoutMillis: -1}},
-		"overflowing timeout":      {{Kind: "delay_next_redirect_result"}, {Kind: "close_delayed_redirect", TimeoutMillis: 1<<63 - 1}},
-		"args on control":          {{Kind: "refuse_next_effect", Args: []string{"unexpected"}}},
-		"toml on checkpoint":       {{Kind: "checkpoint", TOML: "[proxy]"}},
-		"error on config":          {{Kind: "config", Error: "cancelled"}},
+		"env missing args":           {{Kind: "env"}, {Kind: "await_env"}},
+		"env missing barrier":        {{Kind: "env", Args: []string{"tidb-stop", "0"}}},
+		"env overlaps config":        {{Kind: "env", Args: []string{"tidb-stop", "0"}}, {Kind: "config"}},
+		"barrier without batch":      {{Kind: "await_env"}},
+		"delay not closed":           {{Kind: "delay_next_redirect_result"}},
+		"close without delay":        {{Kind: "close_delayed_redirect"}},
+		"two pending delays":         {{Kind: "delay_next_redirect_result"}, {Kind: "delay_next_redirect_result"}},
+		"timeout on wrong action":    {{Kind: "checkpoint", TimeoutMillis: 1}},
+		"negative control timeout":   {{Kind: "close_delayed_redirect", TimeoutMillis: -1}},
+		"overflowing timeout":        {{Kind: "delay_next_redirect_result"}, {Kind: "close_delayed_redirect", TimeoutMillis: 1<<63 - 1}},
+		"args on control":            {{Kind: "refuse_next_effect", Args: []string{"unexpected"}}},
+		"toml on checkpoint":         {{Kind: "checkpoint", TOML: "[proxy]"}},
+		"error on config":            {{Kind: "config", Error: "cancelled"}},
+		"zero failover timeout":      {{Kind: "failover_select"}},
+		"negative failover timeout":  {{Kind: "failover_select", FailoverTimeoutSeconds: -1}},
+		"repeat without select":      {{Kind: "failover_repeat"}},
+		"clear without select":       {{Kind: "failover_clear"}},
+		"select without clear":       {{Kind: "failover_select", FailoverTimeoutSeconds: 1}, {Kind: "failover_select", FailoverTimeoutSeconds: 1}},
+		"bad effect control":         {{Kind: "failover_select", FailoverTimeoutSeconds: 1, EffectControl: "drop"}},
+		"effect control elsewhere":   {{Kind: "checkpoint", EffectControl: "refuse"}},
+		"failover timeout elsewhere": {{Kind: "checkpoint", FailoverTimeoutSeconds: 1}},
+		"active failover at end":     {{Kind: "failover_select", FailoverTimeoutSeconds: 1}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			require.Error(t, validateActions(actions))
+		})
+	}
+}
+
+func TestCheckedInFailoverScriptsValidate(t *testing.T) {
+	paths, err := filepath.Glob("../../scripts/F*.json")
+	require.NoError(t, err)
+	require.Len(t, paths, 6)
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+			var actions []Action
+			require.NoError(t, json.Unmarshal(data, &actions))
+			require.NoError(t, validateActions(actions))
 		})
 	}
 }

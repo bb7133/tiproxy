@@ -76,14 +76,22 @@ func (in *Inputs) Deliver(result observer.HealthResult) {
 // records the `config` input with the validator's public outcome.
 func (in *Inputs) DeliverConfig(toml string, cfg *config.Config, validationErr error) {
 	in.sched.RunNow(func() {
-		ev := apireplay.Event{Op: "config", TOML: toml, Outcome: "ok"}
-		if validationErr != nil {
-			ev.Outcome = "invalid_config"
-		} else {
-			in.driver.DeliverConfig(cfg)
-		}
-		in.sched.Record(ev)
+		in.DeliverConfigLocked(toml, cfg, validationErr)
 	})
+}
+
+// DeliverConfigLocked is DeliverConfig for a caller that already owns the
+// Scheduler critical section. Dynamic recording actions use it to snapshot a
+// public assignment, arm a client control and apply the resulting config as one
+// indivisible input boundary. Other callers should use DeliverConfig.
+func (in *Inputs) DeliverConfigLocked(toml string, cfg *config.Config, validationErr error) {
+	ev := apireplay.Event{Op: "config", TOML: toml, Outcome: "ok"}
+	if validationErr != nil {
+		ev.Outcome = "invalid_config"
+	} else {
+		in.driver.DeliverConfig(cfg)
+	}
+	in.sched.Record(ev)
 }
 
 // Tick runs one real rebalance iteration at the declared logical instant and

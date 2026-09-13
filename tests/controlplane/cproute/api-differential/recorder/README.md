@@ -101,7 +101,13 @@ The harness composes a real proxy, factor policy, PD-backed observer and cluster
 manager. Scripted actions support environment commands, an explicit `await_env`
 barrier, config changes, fetcher-boundary source-error windows, checkpoints, a
 one-shot refusal, and one delayed real redirect callback followed by a scripted
-client close. Environment commands in one batch may run concurrently, but every
+client close. Failover scripts use `failover_select` to take a public checkpoint,
+choose one backend currently assigned to a held client, arm an optional `refuse`
+or `delay` control, and apply a positive-timeout drain inside the same serialized
+boundary. `failover_repeat` reapplies that exact target/timeout, while
+`failover_clear` exits it. This avoids hard-coding a randomly assigned held
+session or allowing an ordinary tick to consume a one-shot control first.
+Environment commands in one batch may run concurrently, but every
 batch must end with `await_env`; a script that overlaps a later phase or ends with
 an unjoined command is rejected before capture. Unconsumed refusal/delay controls
 and an unsettled delayed callback make the attempt incomplete. A fault wraps the
@@ -233,8 +239,8 @@ The following dependencies withhold a slot from acceptance:
   Other legal redirects remain withheld. No further scope approval is needed to implement
   the remaining cadence/effect eligibility requirement.
 
-Additional planned work includes timer boundary expansion,
-router Close/recreate/rehydrate, and the complete frozen CIDR/Port scripts. The
+Additional planned work includes timer boundary expansion and
+router Close/recreate/rehydrate for the config/source family. The
 presence of a row in `recording-plan.tsv` does not mean its driver is implemented.
 Captures with unresolved dependencies remain raw evidence and do not count toward
 the 18 slots, three rounds or focused acceptance groups.
@@ -254,23 +260,32 @@ python3 tests/controlplane/cproute/api-differential/recorder/derive_expectations
 go test -race -tags apireplay ./tests/controlplane/cproute/api-differential/recorder/...
 ```
 
-Failover attempts additionally pass `-held-clients` and may use these action
-shapes (the real script arms them immediately before the input that can issue the
-effect):
+Failover attempts additionally pass `-held-clients`. The checked-in F01--F06
+scripts use the following atomic action shapes; every nonempty drain has a
+strictly positive timeout:
 
 ```json
 [
-  {"at_ms": 10000, "kind": "refuse_next_effect"},
-  {"at_ms": 10001, "kind": "config", "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=20\n"},
-  {"at_ms": 20000, "kind": "config", "toml": "[proxy]\nfail-backend-list=[]\n"},
-  {"at_ms": 21000, "kind": "delay_next_redirect_result"},
-  {"at_ms": 21001, "kind": "config", "toml": "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=20\n"},
-  {"at_ms": 30000, "kind": "close_delayed_redirect", "timeout_ms": 10000},
-  {"at_ms": 40000, "kind": "env", "args": ["tidb-stop", "0"]},
-  {"at_ms": 40000, "kind": "env", "args": ["tidb-stop", "1"]},
-  {"at_ms": 40000, "kind": "await_env"}
+  {"at_ms": 10000, "kind": "failover_select", "failover_timeout_seconds": 60, "effect_control": "refuse"},
+  {"at_ms": 20000, "kind": "failover_repeat"},
+  {"at_ms": 30000, "kind": "failover_clear"},
+  {"at_ms": 40000, "kind": "failover_select", "failover_timeout_seconds": 60, "effect_control": "delay"},
+  {"at_ms": 50000, "kind": "close_delayed_redirect", "timeout_ms": 20000},
+  {"at_ms": 55000, "kind": "failover_clear"},
+  {"at_ms": 70000, "kind": "env", "args": ["tidb-stop", "0"]},
+  {"at_ms": 70001, "kind": "await_env"}
 ]
 ```
+
+`scripts/record_failover.py` binds F01--F06 to `failover-slots.tsv`, requires
+redirection on and held sessions, snapshots the post-label environment, and
+combines raw qualification with `validate_failover.py`. The event gate requires
+checkpoint-derived activation, unchanged activation, clear/reentry, a refused
+then accepted redirect, a redirect completion after close, health loss/recovery,
+the all-members failover guard, zero duplicate/unsettled operations and an empty
+final ledger. CIDR match/no-match and Port conflict/recovery are checked in every
+applicable slot. These scripts and synthetic validator tests are candidate
+infrastructure; they do not count as recorded corpus evidence by themselves.
 
 The writer preserves a refused client effect as that tick's `refuse` input. If one
 session both accepts and refuses effects in the same tick, the session-level replay
