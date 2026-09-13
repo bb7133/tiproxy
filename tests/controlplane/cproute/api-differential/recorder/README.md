@@ -188,9 +188,10 @@ The following dependencies withhold a slot from acceptance:
   compatible alternatives retain the cadence dependency because the factors may
   choose a different pair and the router does not retry another destination.
   Whole health updates replace keyspaces; missing retained sources keep their last
-  delivered value. Legal observed redirects are
-  withheld until exact cadence/effect eligibility is implemented. No further scope
-  approval is needed to implement this requirement.
+  delivered value. Healthy Connection balance with an already constrained shared
+  assignment history now derives exact effects as described below. Other legal
+  redirects remain withheld. No further scope approval is needed to implement
+  the remaining cadence/effect eligibility requirement.
 
 Additional planned work includes timer boundary expansion, scripted refusal/delayed
 callbacks, router Close/recreate/rehydrate, CIDR/no-match and multiple-listener/cluster
@@ -242,3 +243,26 @@ Counterexamples also force different legal owners and reject missing, early,
 duplicated or misdirected effects. These tests do not qualify recorded slots.
 Original recordings and earlier derivations stay immutable;
 a new derivation must use a new output filename and does not alone qualify a slot.
+
+Healthy Connection migration now derives the selected pair, connection ratio and
+rate from public inputs and a shared, already constrained connection history.
+It accounts for pending reservations and accepted redirects, uses physical insertion
+order from Finish/Rehydrate/successful completion, and checks the slow/fast cadence
+boundary at 20ms. The fast budget uses `(10ms - 1ns) / interval + 1`; refusals neither
+consume that budget nor advance the group clock. Refused requests and failed
+completions retry only at or after three seconds from request issuance. Successful
+completions append physical ownership at the destination, and a new group starts
+with a new cadence clock. Previously completed or closed operation handles cannot
+settle a later request on the same logical session in expectation derivation.
+
+`cadence_smoke.py` generates written scenarios for explicit/default rate, exact
+ratio and interval boundaries, refusals, delayed failures, re-enabling redirection,
+FIFO, stale/late callbacks, close before completion and group recreation. CI runs
+the real adapters and derives identical expectations independently from each output.
+Python counterexample rows are written test data and are not engine evidence.
+
+This increment deliberately retains the existing migration dependency for
+non-unique assignment histories, unhealthy status advice, resource/location factors,
+or tied pairs with different legal effects. It also refuses to seed a cadence
+clock from an earlier unverified migration. A synthetic timing scenario is not a
+qualifying recording and does not freeze the remaining 18-slot manifest.

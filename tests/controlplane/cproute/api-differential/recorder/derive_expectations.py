@@ -31,10 +31,14 @@ Public semantics mirrored (file:line at the reviewed tree):
   consumed unhealthy/absent and idle — no listed connection, no pending reservation, no
   in-flight redirect score (router_score.go:264, 340-356, group.go:222-238). Rehydrate
   additionally needs group ownership (group.go:514-520).
+- healthy Connection migration: shared constrained assignments determine the pair,
+  rate, physical insertion order, accepted-request cadence and failure cooldown.
+  Non-unique histories and distinguishable tied pairs remain migration dependencies.
 """
 
 import argparse
 import copy
+from collections import Counter
 import importlib.util
 import ipaddress
 import json
@@ -164,7 +168,7 @@ class Backend:
 
 
 class Session:
-    __slots__ = ("id", "port", "client", "proxy", "cycle", "relative_history", "pending", "assigned", "inflight", "force_closing", "ordinal", "created")
+    __slots__ = ("id", "port", "client", "proxy", "cycle", "relative_history", "pending", "assigned", "inflight", "force_closing", "ordinal", "created", "last_redirect", "redirect_failed")
 
     def __init__(self, sid, event):
         self.id = sid
@@ -181,6 +185,8 @@ class Session:
         self.force_closing = False  # an accepted force_close was issued (group.go:566-569)
         self.ordinal = 0  # effects issued on this session so far (operation = "<session>/<n>")
         self.created = 0  # seq of the successful Finish (connList order)
+        self.last_redirect = None  # public request time, not callback time
+        self.redirect_failed = False
 
     def possible(self):
         out = set()
@@ -224,6 +230,9 @@ class State:
         self.requires = set()
         self.retained_version = ""
         self.recorded_connections = _RUNNER.PublicConnections(config)
+        self.group_last_redirect = {}  # only accepted requests advance a group's cadence
+        self.ambiguous_group_clocks = set()
+        self.redirect_operations = {}  # public accepted operation handles and their settlement
         if self.rule not in {"", "port"} | CIDR_RULES:
             self.requires.add(f"policy-constraint:{self.rule}")
 
@@ -276,6 +285,18 @@ class State:
 
     def update_groups(self):
         old_groups = set(self.groups)
+        ambiguous_clocks = set(self.ambiguous_group_clocks)
+        if self.rule not in CIDR_RULES:
+            # Go walks a map: admitting a replacement before removing the last
+            # old member preserves the group clock; reversing that order resets
+            # it. A whole input must not silently choose either private order.
+            fresh_values = {self.group_value(b) for b in self.backends.values()
+                            if b.group is None and b.observed_healthy}
+            for group, members in self.groups.items():
+                if (group in fresh_values and group in self.group_last_redirect
+                        and all(not self.backends[bid].observed_healthy
+                                and not self.held_possible(bid) for bid in members)):
+                    ambiguous_clocks.add(group)
         for bid in list(self.backends):
             b = self.backends[bid]
             if not b.observed_healthy:
@@ -291,6 +312,7 @@ class State:
                     self.groups.setdefault(value, set()).add(bid)
         if self.rule in CIDR_RULES:
             self.update_cidr_groups(old_groups - set(self.groups))
+        self.ambiguous_group_clocks = ambiguous_clocks & set(self.groups)
 
     def update_cidr_groups(self, removed):
         # Admission uses previous group values; RefreshCidr runs only after the
@@ -346,6 +368,7 @@ class State:
                     self.ignore_failover.pop(b.group, None)
                     self.cidr_values.pop(b.group, None)
                     self.cidr_networks.pop(b.group, None)
+                    self.group_last_redirect.pop(b.group, None)
 
     def apply_config(self, toml):
         doc = parse_toml(toml)
@@ -445,6 +468,113 @@ class State:
 
 def key_effects(effects):
     return sorted((e["kind"], e["session"], e["operation"], e["from"], e["to"], bool(e["accepted"])) for e in effects)
+
+
+def derive_connection_redirects(state, refused):
+    """Predict healthy Connection balance from an already constrained public history.
+
+    None means the existing migration dependency is still required. In particular,
+    a recorded choice or an unverified earlier migration must not select a pair or
+    seed this clock. Tied pairs are resolved only if every choice has the same
+    observable effects; otherwise no observed Go effect is turned into an oracle.
+    """
+    if (state.policy != "connection" or not state.unique_history
+            or "migration-cadence" in state.requires
+            or state.ambiguous_group_clocks
+            or state.recorded_connections.label_name
+            or any(not state.healthy(bid) or b.ambiguous for bid,b in state.backends.items())):
+        return None
+    if any(len(owners) != 1 for s in state.sessions.values()
+           for owners in (s.pending,s.assigned,s.inflight) if owners):
+        return None
+    counts, physical = Counter(), Counter()
+    for session in state.sessions.values():
+        if session.pending:
+            counts[next(iter(session.pending))] += 1
+        if session.assigned:
+            owner = next(iter(session.assigned))
+            physical[owner] += 1
+            counts[owner] += 1
+            if session.inflight:
+                counts[owner] -= 1
+                counts[next(iter(session.inflight))] += 1
+    out = []
+    ratio, override = state.recorded_connections.ratio, state.recorded_connections.rate
+    for group,members in sorted(state.groups.items()):
+        if len(members) <= 1:
+            continue
+        bits = {bid:min(counts[bid],65535) for bid in members}
+        minimum = min(bits.values())
+        alternatives = []
+        for target in sorted(bid for bid in members if bits[bid] == minimum):
+            sources = []
+            for source in members:
+                if bits[source] <= minimum or physical[source] == 0 or counts[source] <= 0:
+                    continue
+                if float(counts[source]) <= float(counts[target] + 1) * ratio:
+                    continue
+                rate = override if override > 0 else max(
+                    0.0, (float(counts[source] + counts[target] + 1) / (1 + ratio) - float(counts[target] + 1)) / 120)
+                if rate > 0.0001:
+                    sources.append((source,rate))
+            if not sources:
+                alternatives.append([])
+                continue
+            busiest = max(bits[source] for source,_ in sources)
+            for source,rate in sorted(sources):
+                if bits[source] != busiest:
+                    continue
+                effects = []
+                if state.backends[source].keyspace != state.backends[target].keyspace:
+                    alternatives.append(effects)  # the whole pair is skipped, with no fallback
+                    continue
+                interval = int(1_000_000_000.0 / rate)  # Go float64 -> Duration truncation
+                if interval <= 0:
+                    return None  # the existing dependency covers unsupported arithmetic
+                last = state.group_last_redirect.get(group)
+                if interval < 20_000_000:
+                    budget = (10_000_000 - 1) // interval + 1
+                elif last is None or state.now - last >= interval:
+                    budget = 1
+                else:
+                    alternatives.append(effects)
+                    continue
+                # Physical insertion order is observable through Finish,
+                # Rehydrate and the successful completion of a redirect.
+                for session in sorted(state.sessions.values(), key=lambda s:s.created):
+                    if budget == 0:
+                        break
+                    if session.assigned != frozenset([source]) or session.force_closing or session.inflight:
+                        continue
+                    if (session.redirect_failed and session.last_redirect is not None
+                            and state.now < session.last_redirect + 3_000_000_000):
+                        continue
+                    accepted = session.id not in refused
+                    effects.append({"kind":"redirect", "session":session.id,
+                                    "operation":f"{session.id}/{session.ordinal + 1}",
+                                    "from":source, "to":target, "accepted":accepted})
+                    budget -= int(accepted)
+                alternatives.append(effects)
+        if any(_RUNNER.causal(effects) != _RUNNER.causal(alternatives[0]) for effects in alternatives[1:]):
+            return None
+        out.extend(alternatives[0])
+    return out
+
+
+def remember_redirect(state, effect):
+    session = state.sessions[effect["session"]]
+    session.ordinal += 1
+    session.last_redirect = state.now
+    session.redirect_failed = not effect["accepted"]
+    if effect["accepted"]:
+        legal = state.migration_targets(effect["from"])
+        session.inflight = (frozenset([effect["to"]]) if len(session.assigned) == 1 and state.unique_history
+                            else frozenset(legal) or None)
+        operation = effect["operation"]
+        if operation in state.redirect_operations:
+            raise Refuse(f"duplicate redirect operation {operation!r}")
+        state.redirect_operations[operation] = (session.id, session.inflight, False)
+        state.group_last_redirect[state.backends[effect["from"]].group] = state.now
 
 
 def due_failover_backends(state):
@@ -607,6 +737,9 @@ def derive(trace, rows, args):
             s.pending = None
         elif op == "close":
             state.sessions.pop(sid, None)
+            for operation,(owner,targets,completed) in list(state.redirect_operations.items()):
+                if owner == sid:
+                    state.redirect_operations[operation] = (owner,targets,True)
         elif op == "lookup":
             name = event["backend"]
             b = state.backends.get(name)
@@ -629,6 +762,7 @@ def derive(trace, rows, args):
             if ok:
                 expect["backend"] = name
                 s.assigned = frozenset([name])
+                s.created = seq
         elif op == "tick":
             refused = set(event.get("refuse", []) or [])
             recorded = row.get("effects", [])
@@ -641,14 +775,15 @@ def derive(trace, rows, args):
                 and any(state.migration_targets(bid) for bid in s.assigned)
                 for s in state.sessions.values()
             )
-            if migration_possible:
+            predicted = derive_connection_redirects(state, refused) if migration_possible else []
+            modeled = predicted is not None
+            if migration_possible and not modeled:
                 state.requires.add("migration-cadence")
             # Redirects (group.Balance) are issued before the failover close pass in the same
             # iteration (router_score.go:471-483), so their ordinals come first.
-            # Redirects: legality is checked (from = the session's listed backend, to in the
-            # declared destination set); their timing follows the balance factors' migration
-            # cadence, which is not derived here → the slot needs the `migration-cadence`
-            # dependency and the redirect is withheld, never copied.
+            # Check public ownership/destination/acceptance for all redirects.
+            # Modeled timing is compared against its independent prediction;
+            # other factor/history cases remain withheld, never copied.
             leftover = []
             for ef in recorded:
                 if ef["kind"] == "force_close":
@@ -666,13 +801,14 @@ def derive(trace, rows, args):
                 legal_to = state.migration_targets(ef["from"])
                 if ef["to"] not in legal_to:
                     raise Refuse(f"seq {seq}: redirect destination {ef['to']!r} not in the legal set {sorted(legal_to)}")
-                s.ordinal += 1
-                if ef["accepted"]:
-                    s.inflight = frozenset([ef["to"]]) if len(s.assigned) == 1 and state.unique_history else (frozenset(legal_to) or None)
-                state.requires.add("migration-cadence")
-                if not state.unique_history:
+                remember_redirect(state, ef)
+                if not modeled:
+                    state.requires.add("migration-cadence")
+                if not state.unique_history and not modeled:
                     state.requires.add("effects-v2")
-            if not state.unique_history and migration_possible:
+            if modeled and _RUNNER.causal([ef for ef in recorded if ef["kind"] == "redirect"]) != _RUNNER.causal(predicted):
+                raise Refuse(f"seq {seq}: redirect effects contradict the input-derived connection cadence: expected {predicted}")
+            if not state.unique_history and migration_possible and not modeled:
                 # A possible migration after non-unique routing depends on
                 # each engine's assignments. No session/destination means no
                 # migration for every engine, including empty-health ticks.
@@ -691,14 +827,24 @@ def derive(trace, rows, args):
                 raise Refuse(f"seq {seq}: recorded force_close effects {leftover} differ from the failover-timeout derivation {derived}")
             if derived and not relative_close:
                 expect["effects"] = derived
+            if modeled and predicted:
+                expect["effects"] = predicted + derived
             if state.policy in METRIC_POLICIES and state.metrics_observed:
                 state.requires.add("metrics-input")  # migration advice consults metric factors
         elif op == "redirect_result":
+            operation = event["operation"]
+            accepted = state.redirect_operations.get(operation)
+            if accepted is None or accepted[0] != sid:
+                raise Refuse(f"seq {seq}: callback lacks a matching accepted redirect {operation!r}")
+            owner, targets, completed = accepted
             s = state.sessions.get(sid)
-            if s is not None and s.inflight:
-                if event["success"]:
-                    s.assigned = s.inflight
-                s.inflight = None
+            if not completed:
+                if s is not None and s.inflight:
+                    if event["success"]:
+                        s.assigned, s.created = targets, seq
+                    s.redirect_failed = not event["success"]
+                    s.inflight = None
+                state.redirect_operations[operation] = (owner, targets, True)
         elif op == "checkpoint":
             expect["healthy_backend_count"] = 0 if state.observer_error is not None else len(state.routable_ids())
             current = sorted({b.version for b in state.backends.values() if b.observed_healthy and b.version})
@@ -929,8 +1075,15 @@ def defect_checks():
         rows = copy.deepcopy(base)
         if present:
             rows[5]["effects"] = [effect]
-        attempt("migration_dependency_" + ("refused" if present else "deleted"), cfg, ev, rows,
-                lambda d, r: "ok: input-derived migration dependency" if d and "migration-cadence" in r else f"NOT CAUGHT ({r})")
+        # A shared 1/0 connection count is neutral at ratio 1.2. The new
+        # input-derived cadence rejects the fabricated redirect itself and
+        # proves the empty tick instead of leaving either result withheld.
+        if present:
+            attempt("neutral_connection_redirect_refused", cfg, ev, rows,
+                    lambda d, r: f"refused: {r}" if d is None else "NOT CAUGHT")
+        else:
+            attempt("neutral_connection_empty_tick_derived", cfg, ev, rows,
+                    lambda d, r: "ok: neutral pair has no effect" if d and not r else f"NOT CAUGHT ({r})")
     # Go resets at the singleton-A update, while an engine that first chose B
     # need not reset. Keep the later A/B/C constraint relative for both histories.
     relative_ev = [{"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "open", "session": "s"},
