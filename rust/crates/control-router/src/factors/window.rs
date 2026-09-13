@@ -182,7 +182,7 @@ impl<T> Default for Snapshot<T> {
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct History<Q: Query> {
     pub cache: BTreeMap<Arc<str>, Snapshot<Q::Time>>,
     pub cpu_time: Option<Q::Time>,

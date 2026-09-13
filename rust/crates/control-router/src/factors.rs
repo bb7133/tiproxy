@@ -203,6 +203,26 @@ pub(crate) fn order(policy: &RoutingConfig) -> Vec<Factor> {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(crate) fn same_state_for_test(&self, other: &Self) -> bool {
+        self.history == other.history
+            && self.owners.len() == other.owners.len()
+            && self.owners.iter().all(|(id, owner)| {
+                other.owners.get(id).is_some_and(|other| {
+                    owner.cluster == other.cluster && Arc::ptr_eq(&owner.identity, &other.identity)
+                })
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resource_entries_for_test(&self) -> usize {
+        self.history
+            .cache
+            .values()
+            .filter(|entry| entry.cpu.is_some() || entry.memory.is_some() || entry.health.is_some())
+            .count()
+    }
+
     // Accounts outlive a temporary omission from the group, but never a retired
     // ledger owner. A same-text backend replacement must get an empty cache.
     pub(crate) fn retain_owners(&mut self, owners: &BTreeMap<Arc<str>, Arc<AccountIdentity>>) {

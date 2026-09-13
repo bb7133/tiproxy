@@ -15,6 +15,7 @@ COLLECT = "crates/control-topology/src/metric_collector/collect.rs"
 SERVICE = "crates/control-topology/src/metric_collector/service.rs"
 SOURCE = "crates/control-router/src/authority.rs"
 SELECTOR = "crates/control-router/src/selector.rs"
+SCHEDULER = "crates/control-router/src/selector/scheduler.rs"
 
 
 def main():
@@ -43,6 +44,8 @@ def main():
     add("reserve-final-metric-fence-bypassed", SELECTOR, "metrics.with_current(|| select(Some(metrics), &queries))", "Some(select(Some(metrics), &queries))", "live", "COMPOSE_FINAL_INPUT_FENCE_RESERVES_EMPTY")
     add("label-prefilter-changes-CPU-pool", SELECTOR, "input.healthy\n                    && !excluded.contains(&input.id.as_ref())", "input.healthy && input.label_matches\n                    && !excluded.contains(&input.id.as_ref())", "live", "COMPOSE_LABEL_REMAINS_IN_FACTOR_POOL")
     add("retry-exclusion-ignored", SELECTOR, "&& !excluded.contains(&input.id.as_ref())", "&& (true || !excluded.contains(&input.id.as_ref()))", "missing", "COMPOSE_RETRY_EXCLUSION")
+    add("missing-metrics-clear-resource-history", SCHEDULER, "if factor_metrics.is_none()\n                    && candidate.policy.balance_policy", "if false && factor_metrics.is_none()\n                    && candidate.policy.balance_policy", "failover-resource", "RESOURCE_REFRESH_MISSING_METRICS_RETAINS_HISTORY")
+    add("stale-failover-update-committed", SCHEDULER, "self.sources.validate(candidate)?;\n        state.apply_failover(update, now);\n        Ok(())", "state.apply_failover(update, now);\n        self.sources.validate(candidate)", "failover-stale", "STALE_FAILOVER_REFRESH_HAS_NO_PARTIAL_COMMIT")
     # Policy and metric lineage both retire caches. Disable both deliberately
     # to test the actual cold-start outcome rather than a redundant guard.
     cases.append(("resource-cache-survives-both-retirement-signals", [
@@ -94,6 +97,8 @@ def main():
                         "service": ("control_topology", "routing_query_retirement_"),
                         "static": ("control_router", "composed_static_"),
                         "missing": ("control_router", "composed_missing_"),
+                        "failover-resource": ("control_router", "resource_failover_refresh_"),
+                        "failover-stale": ("control_router", "stale_failover_refresh_"),
                     }[family]
                     result = live.run(binaries[binary], selection, environment)
                 if result.returncode != 101 or "test result: FAILED" not in result.stdout or marker not in result.stdout:

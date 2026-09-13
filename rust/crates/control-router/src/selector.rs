@@ -74,6 +74,48 @@ type MetricUseBarrier = (
 #[cfg(test)]
 type RedirectOfferBarrier = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
+#[cfg(test)]
+type FailoverCommitBarrier = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+pub(crate) struct SchedulerStateSnapshot {
+    failover_since: BTreeMap<Arc<str>, Option<Instant>>,
+    factors: BTreeMap<u64, GroupFactors>,
+}
+
+#[cfg(test)]
+impl SchedulerStateSnapshot {
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.failover_since == other.failover_since
+            && self.factors.len() == other.factors.len()
+            && self.factors.iter().all(|(group, factors)| {
+                other.factors.get(group).is_some_and(|other| {
+                    let same_incarnation = match (&factors.incarnation, &other.incarnation) {
+                        (None, None) => true,
+                        (Some(left), Some(right)) => left.same_as(right),
+                        _ => false,
+                    };
+                    same_incarnation
+                        && factors.core.same_state_for_test(&other.core)
+                        && factors.lineages.len() == other.lineages.len()
+                        && factors.lineages.iter().all(|(cluster, lineage)| {
+                            other
+                                .lineages
+                                .get(cluster)
+                                .is_some_and(|other| lineage.same_history(other))
+                        })
+                })
+            })
+    }
+
+    pub(crate) fn resource_entries(&self) -> usize {
+        self.factors
+            .values()
+            .map(|factors| factors.core.resource_entries_for_test())
+            .sum()
+    }
+}
+
 /// One namespace router incarnation, with a single lock for selection/accounting.
 ///
 /// This staged API is intentionally not wired to the production dataplane.
@@ -94,6 +136,8 @@ pub struct Router {
     next_metric_use: Mutex<Option<MetricUseBarrier>>,
     #[cfg(test)]
     next_redirect_offer: Mutex<Option<RedirectOfferBarrier>>,
+    #[cfg(test)]
+    next_failover_commit: Mutex<Option<FailoverCommitBarrier>>,
 }
 
 impl Router {
@@ -123,6 +167,8 @@ impl Router {
             next_metric_use: Mutex::new(None),
             #[cfg(test)]
             next_redirect_offer: Mutex::new(None),
+            #[cfg(test)]
+            next_failover_commit: Mutex::new(None),
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
                 factors: BTreeMap::new(),
@@ -237,6 +283,32 @@ impl Router {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some((signal, wait));
         (observed, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_failover_commit_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (signal, prepared) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        *self
+            .next_failover_commit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((signal, wait));
+        (prepared, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduler_state_for_test(&self) -> SchedulerStateSnapshot {
+        let state = self.lock();
+        SchedulerStateSnapshot {
+            failover_since: state
+                .backends
+                .iter()
+                .map(|(id, backend)| (Arc::clone(id), backend.failover_since))
+                .collect(),
+            factors: state.factors.clone(),
+        }
     }
 
     /// Admits a new session under the current namespace incarnation.
@@ -845,11 +917,9 @@ impl State {
             .collect()
     }
 
-    fn prepare_factors(
+    fn prepare_retained_factors(
         &self,
         group: u64,
-        metrics: Option<&control_topology::MetricSnapshot>,
-        inputs: &[crate::factors::Input],
         incarnation: &control_config::ResourceIncarnation,
     ) -> GroupFactors {
         let owners = self
@@ -868,6 +938,17 @@ impl State {
         }
         factors.incarnation = Some(incarnation.clone());
         factors.core.retain_owners(&owners);
+        factors
+    }
+
+    fn prepare_factors(
+        &self,
+        group: u64,
+        metrics: Option<&control_topology::MetricSnapshot>,
+        inputs: &[crate::factors::Input],
+        incarnation: &control_config::ResourceIncarnation,
+    ) -> GroupFactors {
+        let mut factors = self.prepare_retained_factors(group, incarnation);
         let clusters: BTreeSet<String> = inputs
             .iter()
             .map(|input| input.cluster.clone())

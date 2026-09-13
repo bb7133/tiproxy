@@ -13,11 +13,16 @@
 // limitations under the License.
 
 //! The complete per-round selection/scan/admission boundary uses one router lock.
-use super::{Arc, Candidate, RouteError, Router, State, read_queries};
+use super::{Arc, Candidate, GroupFactors, RouteError, Router, State, read_queries};
 use crate::scheduler::{CommandQueue, MigrationProgress};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+
+struct FailoverUpdate {
+    factors: BTreeMap<u64, GroupFactors>,
+    effective: BTreeSet<Arc<str>>,
+}
 
 pub(crate) fn stopped(stop: &watch::Receiver<bool>) -> bool {
     *stop.borrow() || stop.has_changed().is_err()
@@ -72,16 +77,38 @@ impl Router {
                 && let Ok(queries) = read_queries(metrics)
                 && let Some(result) = metrics.with_current(|| {
                     self.sources.validate(candidate)?;
-                    state.update_failover(candidate, now, wall, Some(metrics), &queries);
-                    self.sources.validate(candidate)
+                    let update = state.prepare_failover(candidate, wall, Some(metrics), &queries);
+                    self.commit_failover(&mut state, candidate, update, now)
                 })
             {
                 return result;
             }
         }
         self.sources.validate(candidate)?;
-        state.update_failover(candidate, now, wall, None, &crate::factors::Queries::new());
-        self.sources.validate(candidate)
+        let update = state.prepare_failover(candidate, wall, None, &crate::factors::Queries::new());
+        self.commit_failover(&mut state, candidate, update, now)
+    }
+
+    fn commit_failover(
+        &self,
+        state: &mut State,
+        candidate: &Candidate,
+        update: FailoverUpdate,
+        now: Instant,
+    ) -> Result<(), RouteError> {
+        #[cfg(test)]
+        if let Some((signal, wait)) = self
+            .next_failover_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = signal.send(());
+            let _ = wait.recv();
+        }
+        self.sources.validate(candidate)?;
+        state.apply_failover(update, now);
+        Ok(())
     }
 
     pub(crate) fn migration_round(
@@ -244,15 +271,15 @@ impl State {
             .refuse_keyspace(now, record);
     }
 
-    fn update_failover(
-        &mut self,
+    fn prepare_failover(
+        &self,
         candidate: &Candidate,
-        now: Instant,
         wall: i64,
         metrics: Option<&control_topology::MetricSnapshot>,
         queries: &crate::factors::Queries,
-    ) {
+    ) -> FailoverUpdate {
         let mut effective = BTreeSet::new();
+        let mut factor_updates = BTreeMap::new();
         let groups: Vec<_> = self.groups.keys().copied().collect();
         for group in groups {
             let inputs = self.factor_inputs(group, candidate);
@@ -284,12 +311,21 @@ impl State {
                 } else {
                     (metrics, queries)
                 };
-                let mut factors = self.prepare_factors(
-                    group,
-                    factor_metrics,
-                    &observed,
-                    &candidate.config.resource_incarnation(),
-                );
+                // Go keeps the last CPU/memory/health observations when a
+                // Resource/Location refresh has no current metric publication.
+                let mut factors = if factor_metrics.is_none()
+                    && candidate.policy.balance_policy
+                        != control_config::RoutingBalancePolicy::Connection
+                {
+                    self.prepare_retained_factors(group, &candidate.config.resource_incarnation())
+                } else {
+                    self.prepare_factors(
+                        group,
+                        factor_metrics,
+                        &observed,
+                        &candidate.config.resource_incarnation(),
+                    )
+                };
                 factors
                     .core
                     .evaluate(&observed, &candidate.policy, factor_queries, wall);
@@ -303,7 +339,7 @@ impl State {
                         .core
                         .evaluate(&observed, &candidate.policy, factor_queries, wall);
                 }
-                self.factors.insert(group, factors);
+                factor_updates.insert(group, factors);
             }
             if !ignore {
                 effective.extend(
@@ -318,8 +354,16 @@ impl State {
                 );
             }
         }
+        FailoverUpdate {
+            factors: factor_updates,
+            effective,
+        }
+    }
+
+    fn apply_failover(&mut self, update: FailoverUpdate, now: Instant) {
+        self.factors.extend(update.factors);
         for (id, backend) in &mut self.backends {
-            if effective.contains(id) {
+            if update.effective.contains(id) {
                 backend.failover_since.get_or_insert(now);
             } else {
                 backend.failover_since = None;
