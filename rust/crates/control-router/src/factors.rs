@@ -142,6 +142,7 @@ impl FactorReport {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Input {
     pub id: Arc<str>,
     pub owner: Arc<AccountIdentity>,
