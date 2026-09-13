@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The complete per-round selection/scan/admission boundary uses one router lock.
-use super::{Arc, Candidate, RouteError, Router, State};
+use super::{Arc, Candidate, RouteError, Router, State, read_queries};
 use crate::scheduler::{CommandQueue, MigrationProgress};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -61,8 +61,27 @@ impl Router {
         self.sources.validate(candidate)?;
         state.refresh(candidate)?;
         self.sources.validate(candidate)?;
-        state.update_failover(candidate, now, self.wall_now()?);
-        Ok(())
+        let wall = self.wall_now()?;
+        if candidate.policy.balance_policy != control_config::RoutingBalancePolicy::Connection {
+            let metrics = match &candidate.metrics {
+                crate::authority::MetricInputs::StaticEmpty => None,
+                crate::authority::MetricInputs::Dynamic(snapshot) => snapshot.as_deref(),
+            };
+            if let Some(metrics) = metrics
+                .filter(|metrics| Arc::ptr_eq(&candidate.routing, metrics.source().routing()))
+                && let Ok(queries) = read_queries(metrics)
+                && let Some(result) = metrics.with_current(|| {
+                    self.sources.validate(candidate)?;
+                    state.update_failover(candidate, now, wall, Some(metrics), &queries);
+                    self.sources.validate(candidate)
+                })
+            {
+                return result;
+            }
+        }
+        self.sources.validate(candidate)?;
+        state.update_failover(candidate, now, wall, None, &crate::factors::Queries::new());
+        self.sources.validate(candidate)
     }
 
     pub(crate) fn migration_round(
@@ -225,7 +244,14 @@ impl State {
             .refuse_keyspace(now, record);
     }
 
-    fn update_failover(&mut self, candidate: &Candidate, now: Instant, wall: i64) {
+    fn update_failover(
+        &mut self,
+        candidate: &Candidate,
+        now: Instant,
+        wall: i64,
+        metrics: Option<&control_topology::MetricSnapshot>,
+        queries: &crate::factors::Queries,
+    ) {
         let mut effective = BTreeSet::new();
         let groups: Vec<_> = self.groups.keys().copied().collect();
         for group in groups {
@@ -240,38 +266,44 @@ impl State {
                         .routing_identity
                         .failed(&candidate.policy)
                 });
-            if candidate.policy.balance_policy == control_config::RoutingBalancePolicy::Connection {
-                // Group.UpdateFailover scores all observed healthy members,
-                // then the proposed mask, even when that mask is unchanged.
-                // These passes reset/refresh Status history before Balance.
-                let mut observed: Vec<_> = inputs
-                    .iter()
-                    .filter(|input| input.healthy)
-                    .cloned()
-                    .collect();
-                if !observed.is_empty() {
-                    let mut factors = self.prepare_factors(
-                        group,
-                        None,
-                        &observed,
-                        &candidate.config.resource_incarnation(),
-                    );
-                    let queries = crate::factors::Queries::new();
+            // Group.UpdateFailover scores all observed healthy members, then
+            // the proposed mask, even when that mask is unchanged. Resource
+            // factors consume the same fenced query snapshot on both passes;
+            // Connection uses only Status and therefore needs no metric input.
+            let mut observed: Vec<_> = inputs
+                .iter()
+                .filter(|input| input.healthy)
+                .cloned()
+                .collect();
+            if !observed.is_empty() {
+                let empty = crate::factors::Queries::new();
+                let (factor_metrics, factor_queries) = if candidate.policy.balance_policy
+                    == control_config::RoutingBalancePolicy::Connection
+                {
+                    (None, &empty)
+                } else {
+                    (metrics, queries)
+                };
+                let mut factors = self.prepare_factors(
+                    group,
+                    factor_metrics,
+                    &observed,
+                    &candidate.config.resource_incarnation(),
+                );
+                factors
+                    .core
+                    .evaluate(&observed, &candidate.policy, factor_queries, wall);
+                if !routeable.is_empty() {
+                    for input in &mut observed {
+                        input.healthy = !self.backends[&input.id]
+                            .routing_identity
+                            .failed(&candidate.policy);
+                    }
                     factors
                         .core
-                        .evaluate(&observed, &candidate.policy, &queries, wall);
-                    if !routeable.is_empty() {
-                        for input in &mut observed {
-                            input.healthy = !self.backends[&input.id]
-                                .routing_identity
-                                .failed(&candidate.policy);
-                        }
-                        factors
-                            .core
-                            .evaluate(&observed, &candidate.policy, &queries, wall);
-                    }
-                    self.factors.insert(group, factors);
+                        .evaluate(&observed, &candidate.policy, factor_queries, wall);
                 }
+                self.factors.insert(group, factors);
             }
             if !ignore {
                 effective.extend(
