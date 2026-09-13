@@ -282,3 +282,11 @@ all-unhealthy groups, exact expiry through intervening Next calls, unchanged
 failover masks, the all-members guard and explicit override. Both engines and
 both derivations run in CI. A previous resource/location history still withholds
 status migration because its factor-call history is not yet derived.
+
+The first paired status run found that Rust skipped Status scoring on the
+Connection routing path and during failover refresh. A recovered or expired
+source therefore kept an old migration rate and issued requests early. Connection
+Next now uses the factor path, retaining valid scoring history even when factors
+reject every candidate. Failover refresh performs both observed-healthy and
+proposed-mask scoring passes for Connection. The unchanged public scenario checks
+these changes against the preserved first Go/Rust outputs.

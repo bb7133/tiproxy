@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use control_config::{ConfigNamespaceSource, RoutingConfig, RoutingRule, RoutingSelectionPolicy};
+use control_config::{
+    ConfigNamespaceSource, RoutingBalancePolicy, RoutingConfig, RoutingRule, RoutingSelectionPolicy,
+};
 use control_plane::ModuleContext;
 use control_routing::group::{ClientInfo, GroupMatcher, MatchType, PortRoutes};
 use control_routing::{RouteAssignment, RouteCode};
@@ -349,7 +351,11 @@ impl Router {
         }
         state.refresh(candidate)?;
         let group = state.factor_group(candidate, client, listener_port)?;
-        if self.factors_enabled && candidate.config.resource_incarnation().enabled() {
+        // Connection routing must also update Status history. A healthy-only
+        // Route call can clear/prune a rate later consumed by migration.
+        if candidate.policy.balance_policy == RoutingBalancePolicy::Connection
+            || (self.factors_enabled && candidate.config.resource_incarnation().enabled())
+        {
             return self.reserve_factors(&mut state, session, candidate, group, excluded, ticket);
         }
         let mut choices = state.routeable(group, &candidate.policy, excluded);
@@ -392,6 +398,9 @@ impl Router {
                           queries: &crate::factors::Queries| {
             self.sources.validate(candidate)?;
             let inputs = state.resource_inputs(group, candidate, excluded);
+            if inputs.is_empty() {
+                return Err(RouteError::NoBackend);
+            }
             let mut factors = state.prepare_factors(
                 group,
                 metrics,
@@ -401,6 +410,10 @@ impl Router {
             let report = factors
                 .core
                 .evaluate(&inputs, &candidate.policy, queries, now);
+            self.sources.validate(candidate)?;
+            // Scoring happens even when every scored backend is rejected by
+            // a factor. Persist only after the source and metric fences hold.
+            state.factors.insert(group, factors);
             let id = report
                 .choice(candidate.policy.selection_policy, ticket)
                 .ok_or(RouteError::NoBackend)?;
@@ -411,7 +424,6 @@ impl Router {
             // the effect, under this same lock and (when present) metric fence.
             self.sources.validate(candidate)?;
             let reserved = state.ledger.reserve(session, &identity, assignment)?;
-            state.factors.insert(group, factors);
             Ok(reserved)
         };
         // Keep the test barrier after reading data and before its final fence.
