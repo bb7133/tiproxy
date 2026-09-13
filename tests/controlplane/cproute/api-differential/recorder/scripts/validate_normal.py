@@ -14,17 +14,29 @@ outcome is present, correlated with the routing context of each session:
 - a whole routed-group outage during which every routed next is exactly no_backend, then recovery;
 - CIDR slots: the matching address succeeds and the non-matching address only gets no_backend;
 - port slots: both listener ports succeed before the duplicate-cluster interval, both report
-  port_conflict inside it, none before it, and both recover after its removal.
+  port_conflict inside it, none before it or after the duplicate cluster has left the health
+  snapshot, and both recover after that point.
+
+The raw capture must also qualify on its own (raw_gate): recorded status from a clean identified
+build, exact slot/attempt, completed connections and duration at or above the frozen plan minimum,
+the planned duration of the slot, and the environment hash bound to the exclusive snapshot. The
+verdict passes only when both gates pass.
 
 Routing groups come from normal-slots.tsv (single table), using the Go rule semantics: no rule
 routes to every backend, client_cidr/proxy_cidr match the `cidr` label against the client/proxy
 IP, and port matches the `tiproxy-port` label against the listener port.
 """
-import argparse, csv, ipaddress, json, sys
+import argparse, csv, hashlib, ipaddress, json, sys
 from collections import defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+PLAN = HERE.parent / "recording-plan.tsv"
+
+
+def plan_rows():
+    with open(PLAN) as f:
+        return {r["trace_id"]: r for r in csv.DictReader(f, delimiter="\t")}
 
 
 def slot_rows():
@@ -84,8 +96,7 @@ def validate(row, trace, go):
     outage = defaultdict(bool)          # context currently in a whole-group outage after being usable
     stats = defaultdict(lambda: defaultdict(int))
     label_mismatch = set()
-    config_on = config_off = None
-    last_conflict = None
+    config_on = config_off = conflict_end = None
     per_session = defaultdict(list)
 
     def group(ctx):
@@ -97,10 +108,13 @@ def validate(row, trace, go):
         op = e["op"]
         if op == "health":
             healthy = set()
-            for b in e.get("backends") or []:
+            backends = e.get("backends") or []
+            if config_off is not None and conflict_end is None and all(b.get("cluster", "default") == "default" for b in backends):
+                conflict_end = i
+            for b in backends:
                 if b.get("cluster", "default") == "default" and b["address"] in declared and b.get("labels", {}) != declared[b["address"]]:
                     label_mismatch.add((b["address"], json.dumps(b.get("labels", {}), sort_keys=True)))
-                if b.get("healthy"):
+                if b.get("healthy", True):
                     healthy.add(b["address"])
             for ctx, members in groups.items():
                 if members & healthy:
@@ -136,19 +150,22 @@ def validate(row, trace, go):
             if not seen_usable[ctx]:
                 st["initial_" + out] += 1
             if outage[ctx]:
+                st["outage_next"] += 1
                 st["outage_" + out] += 1
             if out == "port_conflict":
-                last_conflict = i
                 if config_on is None:
                     st["conflict_before_config"] += 1
                 elif config_off is None:
                     st["conflict_inside"] += 1
+                elif conflict_end is not None:
+                    st["conflict_after_removal"] += 1
             if out == "ok":
                 if config_on is None:
                     st["ok_before_config"] += 1
                 if not outage[ctx] and st["outages"]:
                     st["ok_after_outage"] += 1
-                st["last_ok"] = i
+                if conflict_end is not None:
+                    st["ok_after_conflict"] += 1
 
     for addr, labels in sorted(label_mismatch):
         problems.append(f"recorded labels of {addr} are {labels}, slot declares {json.dumps(declared[addr], sort_keys=True)}")
@@ -188,9 +205,10 @@ def validate(row, trace, go):
     if not outage_ctx:
         problems.append("no whole routed-group outage observed with a no_backend next inside it")
     for c in routed_ctx:
-        if stats[c]["outage_ok"] or stats[c]["outage_port_conflict"]:
-            problems.append(f"{c}: non-no_backend next during a whole routed-group outage "
-                            f"(ok={stats[c]['outage_ok']}, port_conflict={stats[c]['outage_port_conflict']})")
+        if stats[c]["outage_next"] != stats[c]["outage_no_backend"]:
+            other = {k[len("outage_"):]: v for k, v in stats[c].items()
+                     if k.startswith("outage_") and k not in ("outage_next", "outage_no_backend") and v}
+            problems.append(f"{c}: non-no_backend next during a whole routed-group outage {other}")
     for c in outage_ctx:
         if not stats[c]["ok_after_outage"]:
             problems.append(f"{c}: no recovery success after the routed-group outage")
@@ -216,6 +234,8 @@ def validate(row, trace, go):
             problems.append(f"port contexts {sorted(groups)} differ from listeners {sorted(listeners)}")
         if config_on is None or config_off is None:
             problems.append("port slot lacks the duplicate-cluster config interval")
+        elif conflict_end is None:
+            problems.append("duplicate cluster never left the health snapshot after its removal")
         for c in sorted(listeners):
             st = stats[c]
             if not st["ok_before_config"]:
@@ -224,27 +244,74 @@ def validate(row, trace, go):
                 problems.append(f"{c}: no port_conflict inside the duplicate-cluster interval")
             if st["conflict_before_config"]:
                 problems.append(f"{c}: port_conflict before the duplicate-cluster interval")
-            if last_conflict is None or st.get("last_ok", -1) < last_conflict:
-                problems.append(f"{c}: no recovery success after the last port_conflict")
+            if st["conflict_after_removal"]:
+                problems.append(f"{c}: {st['conflict_after_removal']} port_conflict after the duplicate cluster left health")
+            if not st["ok_after_conflict"]:
+                problems.append(f"{c}: no recovery success after the duplicate cluster left health")
     summary = {c: {k: v for k, v in sorted(stats[c].items())} | {"group": sorted(groups[c])} for c in sorted(groups)}
     return problems, summary
 
 
-def validate_dir(slot, out_dir):
+def duration_nanos(text):
+    if not text.endswith("s") or not text[:-1].isdigit():
+        raise ValueError(f"duration {text!r} must be whole seconds")
+    return int(text[:-1]) * 10**9
+
+
+def raw_gate(row, plan, attempt, manifest, snapshot_sha):
+    """Qualification of the raw capture itself, independent of scenario outcomes."""
+    problems = []
+    cap = manifest.get("capture") or {}
+    if manifest.get("status") != "recorded" or manifest.get("incomplete"):
+        problems.append(f"raw: status={manifest.get('status')!r} incomplete={manifest.get('incomplete')}")
+    if cap.get("source_dirty") != "false" or not cap.get("head") or not cap.get("tree"):
+        problems.append(f"raw: build not clean and identified (source_dirty={cap.get('source_dirty')!r}, head={cap.get('head')!r}, tree={cap.get('tree')!r})")
+    if manifest.get("slot") != row["slot"] or manifest.get("attempt") != attempt:
+        problems.append(f"raw: manifest slot/attempt {manifest.get('slot')}/{manifest.get('attempt')} != {row['slot']}/{attempt}")
+    if (cap.get("completed_connections") or 0) < int(plan["min_completed_connections"]):
+        problems.append(f"raw: completed_connections {cap.get('completed_connections')} < plan minimum {plan['min_completed_connections']}")
+    if (cap.get("duration_nanos") or 0) < int(plan["min_seconds"]) * 10**9:
+        problems.append(f"raw: duration_nanos {cap.get('duration_nanos')} < plan minimum {plan['min_seconds']} s")
+    if cap.get("planned_duration_nanos") != duration_nanos(row["duration"]):
+        problems.append(f"raw: planned_duration_nanos {cap.get('planned_duration_nanos')} != slot duration {row['duration']}")
+    if cap.get("clients") != int(row["clients"]) or cap.get("held_clients") != int(row["held_clients"]):
+        problems.append(f"raw: clients/held {cap.get('clients')}/{cap.get('held_clients')} != slot {row['clients']}/{row['held_clients']}")
+    for key, value in (("environment_manifest_sha256", manifest.get("environment_manifest_sha256")),
+                       ("capture.environment_manifest_sha256", cap.get("environment_manifest_sha256"))):
+        if value != snapshot_sha:
+            problems.append(f"raw: {key} {value} != snapshot sha256 {snapshot_sha}")
+    return problems
+
+
+def sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def validate_dir(slot, attempt, out_dir, snapshot=None):
+    """Both gates for one attempt directory; snapshot defaults to the recorder's preserved copy."""
     row = slot_rows()[slot]
     out_dir = Path(out_dir)
+    manifest = json.load(open(out_dir / "manifest.json"))
+    snapshot = Path(snapshot) if snapshot else out_dir / "environment-manifest.json"
+    problems = raw_gate(row, plan_rows()[slot], attempt, manifest, sha256_file(snapshot))
+    if sha256_file(out_dir / "environment-manifest.json") != sha256_file(snapshot):
+        problems.append("raw: preserved environment-manifest.json differs from the snapshot")
     trace = json.load(open(out_dir / "trace.json"))
     go = json.load(open(out_dir / "go.json"))
-    return validate(row, trace, go)
+    event_problems, summary = validate(row, trace, go)
+    return problems + event_problems, summary
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("slot")
-    ap.add_argument("capture", help="recorder output directory containing trace.json and go.json")
+    ap.add_argument("capture", help="recorder attempt directory <out>/<slot>-<attempt>")
+    ap.add_argument("--attempt", help="defaults to the directory name suffix")
+    ap.add_argument("--snapshot", help="exclusive environment snapshot passed to the recorder")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    problems, summary = validate_dir(args.slot, args.capture)
+    attempt = args.attempt or Path(args.capture).resolve().name.removeprefix(args.slot + "-")
+    problems, summary = validate_dir(args.slot, attempt, args.capture, args.snapshot)
     if args.json:
         print(json.dumps({"slot": args.slot, "passed": not problems, "problems": problems, "contexts": summary}, indent=2))
     else:

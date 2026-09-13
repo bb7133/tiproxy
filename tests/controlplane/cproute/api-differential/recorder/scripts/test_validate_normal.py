@@ -70,6 +70,7 @@ def port_trace():
     t.session("p4", "127.0.0.1", "6000", ("port_conflict", "", None))
     t.session("q4", "127.0.0.1", "6001", ("port_conflict", "", None))
     t.add({"op": "config", "toml": ONE_CLUSTER})
+    t.session("q4b", "127.0.0.1", "6001", ("port_conflict", "", None))  # removal not yet in health
     t.health()
     t.session("p5", "127.0.0.1", "6000", ("ok", "127.0.0.1:4001", True))
     t.session("q5", "127.0.0.1", "6001", ("ok", "127.0.0.1:4003", True))
@@ -122,9 +123,48 @@ class NormalValidatorTests(unittest.TestCase):
     def test_port_mutations_are_detected(self):
         row = ROWS["N04"]
         self.assertFails(drop(port_trace(), "q4"), row, "port=6001: no port_conflict inside")
-        self.assertFails(drop(port_trace(), "q5"), row, "port=6001: no recovery success after the last port_conflict")
+        self.assertFails(drop(port_trace(), "q5"), row, "port=6001: no recovery success after the duplicate cluster left health")
         self.assertFails(drop(drop(port_trace(), "q1"), "q2"), row, "port=6001: no success before the duplicate-cluster interval")
         self.assertFails(mutate(port_trace(), "p2", "next", outcome="port_conflict"), row, "port_conflict before the duplicate-cluster interval")
+
+    def test_exact_outage_and_conflict_removal(self):
+        extra = cidr_trace()
+        extra.events.insert(len(extra.events) - 5, {"op": "next", "session": "a2"})
+        extra.go.insert(len(extra.go) - 5, {"seq": 0, "op": "next", "session": "a2", "outcome": "source_error", "backend": "", "effects": []})
+        for i, g in enumerate(extra.go):
+            g["seq"] = i
+        self.assertFails(extra, ROWS["N02"], "non-no_backend next during a whole routed-group outage {'source_error': 1}")
+        late = port_trace()
+        late.session("q6", "127.0.0.1", "6001", ("port_conflict", "", None))
+        self.assertFails(late, ROWS["N04"], "port=6001: 1 port_conflict after the duplicate cluster left health")
+        self.assertFails(drop(port_trace(), "p5"), ROWS["N04"],
+                         "port=6000: no recovery success after the duplicate cluster left health")
+
+    def test_raw_gate(self):
+        row, plan = ROWS["N01"], v.plan_rows()["N01"]
+        good = {"slot": "N01", "attempt": "f1", "status": "recorded", "incomplete": None, "environment_manifest_sha256": "e",
+                "capture": {"head": "h", "tree": "t", "source_dirty": "false", "completed_connections": 100,
+                            "duration_nanos": 60 * 10**9, "planned_duration_nanos": 240 * 10**9, "clients": 8,
+                            "held_clients": 0, "environment_manifest_sha256": "e"}}
+        self.assertEqual(v.raw_gate(row, plan, "f1", good, "e"), [])
+        cases = [
+            ({"status": "incomplete", "incomplete": ["capture requires a clean, identified source tree built by record.py"]}, {}, "raw: status='incomplete'"),
+            ({}, {"source_dirty": "true"}, "raw: build not clean"),
+            ({}, {"head": ""}, "raw: build not clean"),
+            ({}, {"completed_connections": 99}, "raw: completed_connections 99 < plan minimum 100"),
+            ({}, {"duration_nanos": 60 * 10**9 - 1}, "raw: duration_nanos 59999999999 < plan minimum 60 s"),
+            ({}, {"planned_duration_nanos": 239 * 10**9}, "raw: planned_duration_nanos"),
+            ({"slot": "N02"}, {}, "raw: manifest slot/attempt"),
+            ({}, {"environment_manifest_sha256": "other"}, "raw: capture.environment_manifest_sha256 other != snapshot"),
+        ]
+        for top, cap, needle in cases:
+            m = copy.deepcopy(good)
+            m.update(top)
+            m["capture"].update(cap)
+            problems = v.raw_gate(row, plan, "f1", m, "e")
+            self.assertTrue(any(needle in p for p in problems), (needle, problems))
+        self.assertTrue(v.raw_gate(row, plan, "f2", good, "e"))
+        self.assertTrue(v.raw_gate(row, plan, "f1", good, "snapshot-differs"))
 
     def test_misalignment_is_rejected(self):
         t = port_trace()
@@ -137,9 +177,10 @@ class NormalValidatorTests(unittest.TestCase):
         bad["N01"]["duration"] = "30s"
         bad["N03"]["go_rule"] = "proxy-cidr"
         bad["N05"]["held_clients"] = "2"
+        bad["N02"]["redirection"] = "on"
         del bad["N06"]
         problems = record_slot.preflight(bad)
-        for needle in ("N01: duration 30s below plan minimum", "N03: go_rule='proxy-cidr'", "N05: held_clients='2'", "differ from the plan's normal rows"):
+        for needle in ("N01: duration 30s below plan minimum", "N03: go_rule='proxy-cidr'", "N05: held_clients='2'", "N02: normal family is recorded with redirection off", "differ from the plan's normal rows"):
             self.assertTrue(any(needle in p for p in problems), (needle, problems))
 
     def test_manifest_assertions(self):
