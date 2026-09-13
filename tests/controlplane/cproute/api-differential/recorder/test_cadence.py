@@ -107,7 +107,7 @@ class CadenceTests(unittest.TestCase):
             with self.assertRaisesRegex(derive.Refuse,"callback lacks"):
                 derive.derive(trace,self.rows,None)
 
-    def test_tied_pairs_and_untrusted_histories_stay_unqualified(self):
+    def test_tied_pairs_and_active_uncertainty_stay_unqualified(self):
         state = derive.State(self.trace["config"])
         state.apply_health([{"address":"a","labels":{}},{"address":"b","labels":{}},{"address":"c","labels":{}}])
         for i in range(3):
@@ -117,8 +117,13 @@ class CadenceTests(unittest.TestCase):
         self.assertIsNone(derive.derive_connection_redirects(state,set()))
         state.apply_health([{"address":"a","labels":{}},{"address":"b","labels":{}}])
         self.assertTrue(derive.derive_connection_redirects(state,set()))
+        # An earlier random selection is harmless after its owner is exact or
+        # closed; only uncertainty still present in the active ledger matters.
         state.unique_history=False
+        self.assertTrue(derive.derive_connection_redirects(state,set()))
+        state.sessions["s0"].assigned=frozenset(["default/a","default/b"])
         self.assertIsNone(derive.derive_connection_redirects(state,set()))
+        state.sessions["s0"].assigned=frozenset(["default/a"])
         state.unique_history=True;state.requires.add("migration-cadence")
         self.assertIsNone(derive.derive_connection_redirects(state,set()))
 

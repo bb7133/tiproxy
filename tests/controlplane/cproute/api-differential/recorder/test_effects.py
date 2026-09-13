@@ -115,6 +115,75 @@ class RelativeCloseTests(unittest.TestCase):
         self.assertIn("migration-cadence",requires)
         self.assertIn("effects-v2",requires)
 
+    def test_closed_random_history_does_not_poison_exact_active_effects(self):
+        def backend(name, port):
+            return {"address":name, "labels":{}, "cluster":"default", "ip":"127.0.0.1",
+                    "status_port":port, "healthy":True, "local":True,
+                    "server_version":"", "support_redirection":True}
+
+        def neutral_metrics():
+            packet=dict.fromkeys(runner.METRIC_KEYS)
+            for failure,total in (("failure_pd","total_pd"),("failure_tikv","total_tikv")):
+                packet[failure]={"kind":"vector","updated_nanos":0,"series":[]}
+                packet[total]={"kind":"vector","updated_nanos":0,"series":[]}
+                for name,port in (("a",10080),("b",10081)):
+                    labels={"instance":f"127.0.0.1:{port}","tiproxy_cluster":"default"}
+                    packet[failure]["series"].append(
+                        {"labels":labels,"samples":[{"timestamp_ms":0,"value":"0"}]})
+                    packet[total]["series"].append(
+                        {"labels":labels,"samples":[{"timestamp_ms":0,"value":"1"}]})
+            return packet
+
+        for policy in ("connection","resource","location"):
+            with self.subTest(policy=policy):
+                both=[backend("a",10080),backend("b",10081)]
+                events=[{"op":"health","at_nanos":0,"backends":both}]
+                if policy != "connection":
+                    events.append({"op":"metrics","at_nanos":0,"queries":neutral_metrics()})
+                events += [
+                    {"op":"open","at_nanos":1,"session":"closed"},
+                    {"op":"next","at_nanos":1,"session":"closed"},
+                    {"op":"finish","at_nanos":1,"session":"closed","success":True},
+                    {"op":"close","at_nanos":2,"session":"closed"},
+                    {"op":"health","at_nanos":3,"backends":[backend("a",10080)]},
+                    {"op":"open","at_nanos":4,"session":"held"},
+                    {"op":"next","at_nanos":4,"session":"held"},
+                    {"op":"finish","at_nanos":4,"session":"held","success":True},
+                    {"op":"health","at_nanos":5,"backends":both},
+                    {"op":"config","at_nanos":6,"toml":
+                     '[proxy]\nfail-backend-list=["a"]\nfailover-timeout=60\n'},
+                    {"op":"tick","at_nanos":7,"refuse":["held"]},
+                    {"op":"close","at_nanos":8,"session":"held"},
+                    {"op":"health","at_nanos":9,"backends":[]},
+                    {"op":"checkpoint","at_nanos":9},
+                ]
+                trace={"version":1,"id":f"{policy}-closed-history-exact-effect",
+                       "config":{"policy":policy,"selection":"random","rule":""},
+                       "provenance":{"kind":"synthetic"},"events":events}
+                rows=[]
+                for seq,event in enumerate(events):
+                    row={"seq":seq,"op":event["op"],"session":event.get("session",""),
+                         "outcome":"ok","backend":"","effects":[]}
+                    if event["op"]=="next":
+                        row["backend"]=A
+                    if event["op"]=="tick":
+                        row["effects"]=[{"kind":"redirect","session":"held","operation":"held/1",
+                                         "from":A,"to":B,"accepted":False}]
+                    if event["op"]=="checkpoint":
+                        row.update(assignments={},conn_count=0,healthy_backend_count=0,server_version="")
+                    rows.append(row)
+                derived,requires=derive.derive(trace,rows,None)
+                self.assertEqual(requires,[])
+                self.assertEqual(next(e["expect"]["effects"] for e in derived["events"] if e["op"]=="tick"),
+                                 rows[next(i for i,e in enumerate(events) if e["op"]=="tick")]["effects"])
+                runner.compare(derived,rows,rows)
+
+                missing=copy.deepcopy(rows)
+                tick=next(i for i,e in enumerate(events) if e["op"]=="tick")
+                missing[tick]["effects"]=[]
+                with self.assertRaisesRegex(derive.Refuse,f"input-derived {policy} cadence"):
+                    derive.derive(trace,missing,None)
+
     def test_cross_keyspace_only_targets_do_not_require_migration_cadence(self):
         for keyspaces in (("tenant-A", "tenant-B"), ("", "tenant-A"),
                           ("tenant-A", ""), ("Tenant", "tenant")):

@@ -37,7 +37,7 @@ class StatusCadenceTests(unittest.TestCase):
             if event['op']!='tick' or not event['expect']['effects'] or event['expect']['effects'][0]['kind']!='redirect':
                 continue
             rows=copy.deepcopy(self.rows);rows[index]['effects']=[]
-            with self.subTest(seq=index),self.assertRaisesRegex(deriver.Refuse,'connection cadence'):
+            with self.subTest(seq=index),self.assertRaisesRegex(deriver.Refuse,'input-derived .* cadence'):
                 deriver.derive(self.trace,rows,None)
             if index>0 and self.trace['events'][index-1]['op']=='tick' and not self.rows[index-1]['effects']:
                 rows=copy.deepcopy(self.rows);rows[index-1]['effects']=copy.deepcopy(self.rows[index]['effects'])
@@ -72,13 +72,38 @@ class StatusCadenceTests(unittest.TestCase):
         with self.assertRaisesRegex(deriver.Refuse,'connection cadence'):
             deriver.derive(trace,self.rows,None)
 
-    def test_unsupported_factor_history_remains_unqualified(self):
+    def test_status_history_is_preserved_across_metric_policy_transition(self):
         state=deriver.State({'policy':'resource','selection':'random','rule':''})
-        state.apply_config('[balance]\npolicy="connection"\n')
         state.apply_health([{'address':'a'},{'address':'b'}])
         s=deriver.Session('s',{});s.assigned=frozenset(['default/a']);state.sessions['s']=s
         state.apply_health([{'address':'a','healthy':False},{'address':'b'}])
+        state.update_connection_status('', {'default/a':False, 'default/b':True})
+        state.apply_config('[balance]\npolicy="connection"\n')
+        self.assertEqual(deriver.derive_connection_redirects(state,set()), [{
+            'kind':'redirect','session':'s','operation':'s/1','from':'default/a',
+            'to':'default/b','accepted':True,
+        }])
+
+    def test_ambiguous_owner_poisons_only_the_status_snapshot_it_can_seed(self):
+        state=deriver.State({'policy':'connection','selection':'random','rule':''})
+        state.apply_health([{'address':'a'},{'address':'b'}])
+        state.failover={'default/a'}
+        s=deriver.Session('s',{});s.assigned=frozenset(['default/a','default/b'])
+        state.sessions['s']=s
+        state.update_connection_status('', {'default/a':False, 'default/b':True})
+        state.sessions.clear()
+        exact=deriver.Session('exact',{});exact.assigned=frozenset(['default/a'])
+        state.sessions['exact']=exact
         self.assertIsNone(deriver.derive_connection_redirects(state,set()))
+
+        # A healthy scoring call deletes FactorStatus's retained snapshot. A
+        # later exact unhealthy call can therefore seed a new public rate.
+        state.update_connection_status('', {'default/a':True, 'default/b':True})
+        state.update_connection_status('', {'default/a':False, 'default/b':True})
+        self.assertEqual(deriver.derive_connection_redirects(state,set()), [{
+            'kind':'redirect','session':'exact','operation':'exact/1','from':'default/a',
+            'to':'default/b','accepted':True,
+        }])
 
 
 if __name__=='__main__':

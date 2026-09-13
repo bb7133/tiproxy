@@ -35,9 +35,12 @@ Public semantics mirrored (file:line at the reviewed tree):
   consumed unhealthy/absent and idle — no listed connection, no pending reservation, no
   in-flight redirect score (router_score.go:264, 340-356, group.go:222-238). Rehydrate
   additionally needs group ownership (group.go:514-520).
-- Connection migration: shared constrained assignments determine the pair,
+- Connection-factor migration: exact active assignments determine the pair,
   rate, physical insertion order, accepted-request cadence and failure cooldown.
-  Non-unique histories and distinguishable tied pairs remain migration dependencies.
+  Closed random histories do not poison later exact ownership, but an ambiguous
+  active owner or retained status rate and distinguishable tied pairs remain
+  migration dependencies. Resource/Location reduce to this path only when their
+  complete metric-factor lifetime proves all higher-priority scores equal.
 - Resource migration: the same rules are derived for a complete two-backend,
   single-group public metric history; unsupported factor calls remain dependencies.
 """
@@ -242,9 +245,10 @@ class State:
         self.group_last_redirect = {}  # only accepted requests advance a group's cadence
         self.ambiguous_group_clocks = set()
         self.redirect_operations = {}  # public accepted operation handles and their settlement
-        self.status_snapshots = {}  # group -> backend -> (input-derived rate, last scoring time)
+        # group -> backend -> (input-derived rate or None when an engine-relative
+        # owner made the retained rate unknowable, last scoring time)
+        self.status_snapshots = {}
         self.status_rate = 0.0
-        self.status_history_trusted = self.policy == "connection"
         self.clock_origin = config.get("clock_origin_nanos", 1_700_000_000_000_000_000)
         self.metric_queries = None  # latest whole public metrics publication
         self.resource_rates = {"health": 0.0, "memory": 0.0, "cpu": 0.0, "location": 0.0}
@@ -438,8 +442,6 @@ class State:
         v = toml_get(doc, "balance", "policy")
         if v is not None:
             self.policy = v
-            if v != "connection":
-                self.status_history_trusted = False
         v = toml_get(doc, "balance", "routing-policy")
         if v is not None:
             self.selection = v
@@ -517,16 +519,31 @@ class State:
 
     def update_connection_status(self, group, health):
         """Public scoring calls determine status rate retention and strict expiry."""
-        if not health or self.policy != "connection" or not self.unique_history:
+        if not health or self.policy not in {"connection"} | METRIC_POLICIES:
             return
         snapshots = self.status_snapshots.setdefault(group, {})
         counts, _ = self.connection_counts()
+        uncertain = set()
+        for session in self.sessions.values():
+            for owners in (session.pending, session.assigned, session.inflight):
+                if owners and len(owners) != 1:
+                    uncertain.update(owners)
         for bid, healthy in health.items():
             if healthy:
                 snapshots.pop(bid, None)
                 continue
             rate, _ = snapshots.get(bid, (0.0, 0))
-            snapshots[bid] = (rate if rate > 0.0001 else float(counts[bid]) / 5.0, self.now)
+            # FactorStatus retains a positive balance count. If the retained
+            # value is zero it is recomputed from the current ConnScore; an
+            # engine-relative owner therefore makes this snapshot unknowable
+            # even after that session later closes.
+            if rate is None or rate > 0.0001:
+                next_rate = rate
+            elif bid in uncertain:
+                next_rate = None
+            else:
+                next_rate = float(counts[bid]) / 5.0
+            snapshots[bid] = (next_rate, self.now)
         for bid, (_, accessed) in list(snapshots.items()):
             if accessed + 60_000_000_000 < self.now:
                 del snapshots[bid]
@@ -589,19 +606,21 @@ def key_effects(effects):
 
 
 def derive_connection_redirects(state, refused):
-    """Predict Connection balance from an already constrained public history.
+    """Predict connection-factor balance from exact active public ownership.
 
     None means the existing migration dependency is still required. In particular,
     a recorded choice or an unverified earlier migration must not select a pair or
-    seed this clock. Tied pairs are resolved only if every choice has the same
-    observable effects; otherwise no observed Go effect is turned into an oracle.
+    seed this clock. Closed ambiguous sessions do not poison a later exact active
+    ledger. Resource/Location enter this path only when their complete metric-factor
+    lifetime proves every higher-priority factor equal. Tied pairs are resolved only
+    if every choice has the same observable effects; otherwise no observed Go effect
+    is turned into an oracle.
     """
-    if (state.policy != "connection" or not state.unique_history
+    if (state.policy not in {"connection"} | METRIC_POLICIES
             or "migration-cadence" in state.requires
             or state.ambiguous_group_clocks
             or state.recorded_connections.label_name
-            or any(b.ambiguous for b in state.backends.values())
-            or (not state.status_history_trusted and any(not state.healthy(bid) for bid in state.backends))):
+            or any(b.ambiguous for b in state.backends.values())):
         return None
     if any(len(owners) != 1 for s in state.sessions.values()
            for owners in (s.pending,s.assigned,s.inflight) if owners):
@@ -612,6 +631,9 @@ def derive_connection_redirects(state, refused):
     for group,members in sorted(state.groups.items()):
         if len(members) <= 1:
             continue
+        if (state.policy in METRIC_POLICIES
+                and not metric_factors_are_connection_only(state, sorted(members))):
+            return None
         bits = {bid:(int(not state.healthy(bid)), min(counts[bid],65535)) for bid in members}
         minimum = min(bits.values())
         if minimum[0]:
@@ -624,7 +646,7 @@ def derive_connection_redirects(state, refused):
                     continue
                 if not state.healthy(source):
                     snapshot = state.status_snapshots.get(group, {}).get(source)
-                    if snapshot is None:
+                    if snapshot is None or snapshot[0] is None:
                         return None
                     rate = state.status_rate if state.status_rate > 0 else snapshot[0]
                 else:
@@ -678,14 +700,17 @@ def derive_connection_redirects(state, refused):
     return out
 
 
-def remember_redirect(state, effect):
+def remember_redirect(state, effect, modeled):
     session = state.sessions[effect["session"]]
     session.ordinal += 1
     session.last_redirect = state.now
     session.redirect_failed = not effect["accepted"]
     if effect["accepted"]:
         legal = state.migration_targets(effect["from"])
-        session.inflight = (frozenset([effect["to"]]) if len(session.assigned) == 1 and state.unique_history
+        # Only an independently modeled redirect may turn the recorded target
+        # into future state. Otherwise retain every input-legal destination;
+        # the output being validated is evidence, not an oracle.
+        session.inflight = (frozenset([effect["to"]]) if modeled and len(session.assigned) == 1
                             else frozenset(legal) or None)
         operation = effect["operation"]
         if operation in state.redirect_operations:
@@ -805,16 +830,15 @@ def _public_health_packet_neutral(state):
     return True
 
 
-def metric_prefer_idle_is_connection_only(state, legal):
-    """Prove a bounded metric-policy route reduces to locality + ConnCount.
+def metric_factors_are_connection_only(state, legal):
+    """Prove a bounded metric-policy factor call reduces to ConnCount.
 
     The recording environment intentionally discloses CPU/memory no-data. If
     every health value throughout the current factor lifetime is also normal
-    and every candidate has the same locality, status/location/health/memory/
-    CPU scores are equal. Prefer-idle therefore applies exactly the public
-    connection factor, including each engine's own retry exclusions.
+    and every candidate has the same locality, location/health/memory/CPU scores
+    are equal. Status is modeled separately from public health/failover inputs.
     """
-    if (state.policy not in METRIC_POLICIES or state.selection != "prefer-idle"
+    if (state.policy not in METRIC_POLICIES or not legal
             or state.metric_queries is None or state.recorded_connections.label_name):
         return False
     group = state.backends[legal[0]].group
@@ -1296,7 +1320,7 @@ def derive_next(state, session, expect):
         legal = legal_go
     if state.selection == "prefer-idle":
         connection_only = (state.policy in METRIC_POLICIES
-                           and metric_prefer_idle_is_connection_only(state, legal_go))
+                           and metric_factors_are_connection_only(state, legal_go))
         if connection_only:
             # The higher-priority metric factors are publicly proven equal.
             # Keep the full candidate set in the expectation so each engine
@@ -1431,21 +1455,26 @@ def derive(trace, rows, args):
         elif op == "tick":
             refused = set(event.get("refuse", []) or [])
             recorded = row.get("effects", [])
-            resource_predicted = None
-            if (state.support_redirection and state.metric_queries is not None
-                    and state.policy in METRIC_POLICIES):
-                # Every enabled tick calls BackendsToBalance even when there is
-                # no physical source connection. Preserve the factor cache only
-                # when the complete bounded Resource call is independently
-                # modeled; other metric-policy histories stay explicit.
-                if state.policy == "resource":
-                    resource_predicted = derive_resource_redirects(state, refused)
-                if resource_predicted is None:
-                    state.resource_metric_history_trusted = False
+            # BackendsToBalance scores Status first on this tick. Its retained
+            # unhealthy rate must therefore be available to every policy's
+            # prediction below, including a first tick after health loss.
             if state.support_redirection:
                 for group, members in state.groups.items():
                     if len(members) > 1:
                         state.update_connection_status(group, {bid: state.healthy(bid) for bid in members})
+            metric_predicted = None
+            if (state.support_redirection and state.metric_queries is not None
+                    and state.policy in METRIC_POLICIES):
+                # Every enabled tick calls BackendsToBalance even when there is
+                # no physical source connection. A lifetime with no CPU/memory,
+                # normal health and equal locality reduces both metric policies
+                # to the exact active connection ledger. Otherwise retain the
+                # complete bounded Resource model or keep the history explicit.
+                metric_predicted = derive_connection_redirects(state, refused)
+                if metric_predicted is None and state.policy == "resource":
+                    metric_predicted = derive_resource_redirects(state, refused)
+                if metric_predicted is None:
+                    state.resource_metric_history_trusted = False
             # Whether a migration could be due is a property of inputs and
             # session history. Deleting its observed output must not remove
             # this dependency. A whole health result can disable Balance,
@@ -1459,8 +1488,8 @@ def derive(trace, rows, args):
                 predicted = []
             elif state.policy == "connection":
                 predicted = derive_connection_redirects(state, refused)
-            elif state.policy == "resource":
-                predicted = resource_predicted
+            elif state.policy in METRIC_POLICIES:
+                predicted = metric_predicted
             else:
                 predicted = None
             modeled = predicted is not None
@@ -1488,14 +1517,13 @@ def derive(trace, rows, args):
                 legal_to = state.migration_targets(ef["from"])
                 if ef["to"] not in legal_to:
                     raise Refuse(f"seq {seq}: redirect destination {ef['to']!r} not in the legal set {sorted(legal_to)}")
-                remember_redirect(state, ef)
+                remember_redirect(state, ef, modeled)
                 if not modeled:
                     state.requires.add("migration-cadence")
                 if not state.unique_history and not modeled:
                     state.requires.add("effects-v2")
             if modeled and _RUNNER.causal([ef for ef in recorded if ef["kind"] == "redirect"]) != _RUNNER.causal(predicted):
-                cadence = "resource" if state.policy == "resource" else "connection"
-                raise Refuse(f"seq {seq}: redirect effects contradict the input-derived {cadence} cadence: expected {predicted}")
+                raise Refuse(f"seq {seq}: redirect effects contradict the input-derived {state.policy} cadence: expected {predicted}")
             if not state.unique_history and migration_possible and not modeled:
                 # A possible migration after non-unique routing depends on
                 # each engine's assignments. No session/destination means no

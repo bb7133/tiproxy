@@ -307,8 +307,11 @@ duplicated or misdirected effects. These tests do not qualify recorded slots.
 Original recordings and earlier derivations stay immutable;
 a new derivation must use a new output filename and does not alone qualify a slot.
 
-Connection migration now derives the selected pair, connection ratio and
-rate from public inputs and a shared, already constrained connection history.
+Connection-factor migration now derives the selected pair, connection ratio and
+rate from public inputs and exact current ownership. An earlier random choice no
+longer poisons the remainder of a trace after that session has closed; uncertainty
+that is still active, or that seeded a retained unhealthy Status rate, remains a
+dependency.
 It accounts for pending reservations and accepted redirects, uses physical insertion
 order from Finish/Rehydrate/successful completion, and checks the slow/fast cadence
 boundary at 20ms. The fast budget uses `(10ms - 1ns) / interval + 1`; refusals neither
@@ -325,10 +328,11 @@ the real adapters and derives identical expectations independently from each out
 Python counterexample rows are written test data and are not engine evidence.
 
 This increment deliberately retains the existing migration dependency for
-non-unique assignment histories, unmodeled resource/location migration factors,
-or tied pairs with different legal effects. It also refuses to seed a cadence
-clock from an earlier unverified migration. A synthetic timing scenario is not a
-qualifying recording and does not freeze the remaining 18-slot manifest.
+active non-unique assignments, unmodeled resource/location migration factors,
+unknown retained Status rates, or tied pairs with different legal effects. It
+also refuses to seed a cadence clock from an earlier unverified migration. A
+synthetic timing scenario is not a qualifying recording and does not freeze the
+remaining 18-slot manifest.
 
 Resource `prefer-idle` selection now has a bounded input-derived case: two
 healthy, equally local backends in one group, unique public ownership, no label
@@ -373,8 +377,11 @@ The Go replay now also routes the status factor's clock through the declared
 public event time. The scenario checks rate retention, support pauses, recovery,
 all-unhealthy groups, exact expiry through intervening Next calls, unchanged
 failover masks, the all-members guard and explicit override. Both engines and
-both derivations run in CI. A previous resource/location history still withholds
-status migration because its factor-call history is not yet derived.
+both derivations run in CI. Status is present and retained across all three public
+balance policies. A Resource/Location tick can therefore use the same exact
+status/connection cadence when the complete lifetime proves its metric factors
+neutral; an engine-relative owner that could seed an unhealthy snapshot still
+withholds that history until a healthy scoring call clears it.
 
 The first paired status run found that Rust skipped Status scoring on the
 Connection routing path and during failover refresh. A recovered or expired

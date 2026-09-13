@@ -37,6 +37,10 @@ def make_trace():
     def config(at, value):
         add("config",at,toml=value)
 
+    def empty_metrics(at):
+        add("metrics",at,queries={key:None for key in
+            ("cpu","memory","failure_pd","total_pd","failure_tikv","total_tikv")})
+
     # Status outranks connection count. Its initial rate is retained while the
     # source stays unhealthy, including count decreases and support pauses.
     health(0);restore(0,"retained",6);health(0,a=False)
@@ -117,6 +121,18 @@ def make_trace():
     add("redirect_result",start+1_000_000_002,session="deadline-0",operation="deadline-0/1",success=True)
     health(start+1_000_000_003,empty=True)
     add("checkpoint",start+1_000_000_003,{"healthy_backend_count":0,"legal_server_versions":[""]})
+
+    # FactorStatus is retained when an existing group changes from Connection
+    # to a metric policy. On the first Resource tick after health loss, Status
+    # still outranks the newly created neutral metric factors.
+    start=300_000_000_000
+    health(start);restore(start,"metric-status",1);health(start,a=False)
+    config(start+1,'[balance]\npolicy="resource"\n')
+    empty_metrics(start+2)
+    tick(start+2,"metric-status-0")
+    add("redirect_result",start+3,session="metric-status-0",operation="metric-status-0/1",success=True)
+    close(start+4,"metric-status-0");health(start+4,empty=True)
+    add("checkpoint",start+4,{"healthy_backend_count":0,"legal_server_versions":[""]})
     return {"version":1,"id":"connection-status-cadence",
             "config":{"policy":"connection","selection":"random","rule":"","clock_origin_nanos":0},
             "provenance":{"kind":"synthetic","description":"Status migration and expiry inputs; not a qualifying recording"},
