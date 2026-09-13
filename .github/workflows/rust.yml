@@ -404,6 +404,7 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/recorder/test_cidr.py
           python3 tests/controlplane/cproute/api-differential/recorder/test_effects.py
           python3 tests/controlplane/cproute/api-differential/recorder/test_cadence.py
+          python3 tests/controlplane/cproute/api-differential/recorder/test_status_cadence.py
       - name: Compare the actual API adapters
         run: |
           python3 tests/controlplane/cproute/api-differential/run.py \
@@ -462,6 +463,11 @@ jobs:
           python3 tests/controlplane/cproute/api-differential/run.py \
             "${RUNNER_TEMP}/connection-cadence-smoke.json" \
             --output "${RUNNER_TEMP}/routing-api-cadence"
+          python3 tests/controlplane/cproute/api-differential/recorder/status_cadence_smoke.py \
+            "${RUNNER_TEMP}/status-cadence-smoke.json"
+          python3 tests/controlplane/cproute/api-differential/run.py \
+            "${RUNNER_TEMP}/status-cadence-smoke.json" \
+            --output "${RUNNER_TEMP}/routing-api-status-cadence"
           python3 - <<'PYCLOSE'
           import importlib.util
           import json
@@ -473,7 +479,8 @@ jobs:
           spec.loader.exec_module(derive)
           cases = [(path.parents[1] / "force-close-smoke.json", "routing-api-force-close"),
                    (Path(os.environ["RUNNER_TEMP"]) / "keyspace-smoke.json", "routing-api-keyspace"),
-                   (Path(os.environ["RUNNER_TEMP"]) / "connection-cadence-smoke.json", "routing-api-cadence")]
+                   (Path(os.environ["RUNNER_TEMP"]) / "connection-cadence-smoke.json", "routing-api-cadence"),
+                   (Path(os.environ["RUNNER_TEMP"]) / "status-cadence-smoke.json", "routing-api-status-cadence")]
           for source, folder in cases:
               trace = json.loads(source.read_text())
               output = Path(os.environ["RUNNER_TEMP"]) / folder
@@ -522,6 +529,8 @@ jobs:
             ${{ runner.temp }}/keyspace-smoke.json
             ${{ runner.temp }}/routing-api-cadence
             ${{ runner.temp }}/connection-cadence-smoke.json
+            ${{ runner.temp }}/routing-api-status-cadence
+            ${{ runner.temp }}/status-cadence-smoke.json
             ${{ runner.temp }}/routing-api-recorded-source
             ${{ runner.temp }}/routing-api-recorded-source-paired
             ${{ runner.temp }}/routing-api-recorded-metrics

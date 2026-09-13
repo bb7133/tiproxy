@@ -42,7 +42,7 @@ SUBSTITUTIONS = {
     "pkg/balance/router/router_score.go": [("time.Now()", "replayNow()", None)],
 }
 
-for name in ("factor_cpu.go", "factor_memory.go", "factor_health.go"):
+for name in ("factor_cpu.go", "factor_memory.go", "factor_health.go", "factor_status.go"):
     SUBSTITUTIONS["pkg/balance/factor/" + name] = [
         ('"time"', '"time"\n\treplayclock "github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/clock"', 1),
         ("time.Now()", "replayclock.Now()", None),

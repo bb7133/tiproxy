@@ -31,7 +31,7 @@ Public semantics mirrored (file:line at the reviewed tree):
   consumed unhealthy/absent and idle — no listed connection, no pending reservation, no
   in-flight redirect score (router_score.go:264, 340-356, group.go:222-238). Rehydrate
   additionally needs group ownership (group.go:514-520).
-- healthy Connection migration: shared constrained assignments determine the pair,
+- Connection migration: shared constrained assignments determine the pair,
   rate, physical insertion order, accepted-request cadence and failure cooldown.
   Non-unique histories and distinguishable tied pairs remain migration dependencies.
 """
@@ -42,6 +42,7 @@ from collections import Counter
 import importlib.util
 import ipaddress
 import json
+import math
 import sys
 import tomllib
 from pathlib import Path
@@ -233,6 +234,9 @@ class State:
         self.group_last_redirect = {}  # only accepted requests advance a group's cadence
         self.ambiguous_group_clocks = set()
         self.redirect_operations = {}  # public accepted operation handles and their settlement
+        self.status_snapshots = {}  # group -> backend -> (input-derived rate, last scoring time)
+        self.status_rate = 0.0
+        self.status_history_trusted = self.policy == "connection"
         if self.rule not in {"", "port"} | CIDR_RULES:
             self.requires.add(f"policy-constraint:{self.rule}")
 
@@ -369,6 +373,7 @@ class State:
                     self.cidr_values.pop(b.group, None)
                     self.cidr_networks.pop(b.group, None)
                     self.group_last_redirect.pop(b.group, None)
+                    self.status_snapshots.pop(b.group, None)
 
     def apply_config(self, toml):
         doc = parse_toml(toml)
@@ -385,9 +390,16 @@ class State:
         v = toml_get(doc, "balance", "policy")
         if v is not None:
             self.policy = v
+            if v != "connection":
+                self.status_history_trusted = False
         v = toml_get(doc, "balance", "routing-policy")
         if v is not None:
             self.selection = v
+        v = toml_get(doc, "balance", "status", "migrations-per-second")
+        if v is not None:
+            if type(v) not in (int, float) or not math.isfinite(v) or v < 0:
+                raise Refuse("balance.status.migrations-per-second must be finite and non-negative")
+            self.status_rate = float(v)
         # balance.routing-rule at runtime is ignored by the router (matchType fixed at Init).
         self.update_failover()
 
@@ -399,6 +411,11 @@ class State:
         for value, members in self.groups.items():
             routeable = [bid for bid in members if self.backends[bid].observed_healthy]
             marked = {bid for bid in members if self.backends[bid].address in self.fail_list}
+            # The real guard scores observed members once as healthy, then
+            # with the proposed failover mask, before committing that mask.
+            self.update_connection_status(value, {bid: True for bid in routeable})
+            if routeable:
+                self.update_connection_status(value, {bid: bid not in marked for bid in routeable})
             remaining = [bid for bid in routeable if bid not in marked]
             if routeable and not remaining:
                 self.ignore_failover[value] = True
@@ -412,6 +429,36 @@ class State:
             else:
                 b.failover_since = None
         self.failover = marked_now
+
+    def connection_counts(self):
+        counts, physical = Counter(), Counter()
+        for session in self.sessions.values():
+            if session.pending and len(session.pending) == 1:
+                counts[next(iter(session.pending))] += 1
+            if session.assigned and len(session.assigned) == 1:
+                owner = next(iter(session.assigned))
+                physical[owner] += 1
+                counts[owner] += 1
+                if session.inflight and len(session.inflight) == 1:
+                    counts[owner] -= 1
+                    counts[next(iter(session.inflight))] += 1
+        return counts, physical
+
+    def update_connection_status(self, group, health):
+        """Public scoring calls determine status rate retention and strict expiry."""
+        if not health or self.policy != "connection" or not self.unique_history:
+            return
+        snapshots = self.status_snapshots.setdefault(group, {})
+        counts, _ = self.connection_counts()
+        for bid, healthy in health.items():
+            if healthy:
+                snapshots.pop(bid, None)
+                continue
+            rate, _ = snapshots.get(bid, (0.0, 0))
+            snapshots[bid] = (rate if rate > 0.0001 else float(counts[bid]) / 5.0, self.now)
+        for bid, (_, accessed) in list(snapshots.items()):
+            if accessed + 60_000_000_000 < self.now:
+                del snapshots[bid]
 
     # --- derived sets ---------------------------------------------------------------------
     def routed_group(self, session):
@@ -471,7 +518,7 @@ def key_effects(effects):
 
 
 def derive_connection_redirects(state, refused):
-    """Predict healthy Connection balance from an already constrained public history.
+    """Predict Connection balance from an already constrained public history.
 
     None means the existing migration dependency is still required. In particular,
     a recorded choice or an unverified earlier migration must not select a pair or
@@ -482,39 +529,38 @@ def derive_connection_redirects(state, refused):
             or "migration-cadence" in state.requires
             or state.ambiguous_group_clocks
             or state.recorded_connections.label_name
-            or any(not state.healthy(bid) or b.ambiguous for bid,b in state.backends.items())):
+            or any(b.ambiguous for b in state.backends.values())
+            or (not state.status_history_trusted and any(not state.healthy(bid) for bid in state.backends))):
         return None
     if any(len(owners) != 1 for s in state.sessions.values()
            for owners in (s.pending,s.assigned,s.inflight) if owners):
         return None
-    counts, physical = Counter(), Counter()
-    for session in state.sessions.values():
-        if session.pending:
-            counts[next(iter(session.pending))] += 1
-        if session.assigned:
-            owner = next(iter(session.assigned))
-            physical[owner] += 1
-            counts[owner] += 1
-            if session.inflight:
-                counts[owner] -= 1
-                counts[next(iter(session.inflight))] += 1
+    counts, physical = state.connection_counts()
     out = []
     ratio, override = state.recorded_connections.ratio, state.recorded_connections.rate
     for group,members in sorted(state.groups.items()):
         if len(members) <= 1:
             continue
-        bits = {bid:min(counts[bid],65535) for bid in members}
+        bits = {bid:(int(not state.healthy(bid)), min(counts[bid],65535)) for bid in members}
         minimum = min(bits.values())
+        if minimum[0]:
+            continue  # status forbids migration to an unhealthy target
         alternatives = []
         for target in sorted(bid for bid in members if bits[bid] == minimum):
             sources = []
             for source in members:
                 if bits[source] <= minimum or physical[source] == 0 or counts[source] <= 0:
                     continue
-                if float(counts[source]) <= float(counts[target] + 1) * ratio:
-                    continue
-                rate = override if override > 0 else max(
-                    0.0, (float(counts[source] + counts[target] + 1) / (1 + ratio) - float(counts[target] + 1)) / 120)
+                if not state.healthy(source):
+                    snapshot = state.status_snapshots.get(group, {}).get(source)
+                    if snapshot is None:
+                        return None
+                    rate = state.status_rate if state.status_rate > 0 else snapshot[0]
+                else:
+                    if float(counts[source]) <= float(counts[target] + 1) * ratio:
+                        continue
+                    rate = override if override > 0 else max(
+                        0.0, (float(counts[source] + counts[target] + 1) / (1 + ratio) - float(counts[target] + 1)) / 120)
                 if rate > 0.0001:
                     sources.append((source,rate))
             if not sources:
@@ -642,6 +688,7 @@ def derive_next(state, session, expect):
         if err == "no_backend":
             session.relative_history = False
         return None
+    state.update_connection_status(state.backends[legal_go[0]].group, {bid: True for bid in legal_go})
     if session.relative_history:
         # Publish candidates before exclusions; the comparator subtracts each
         # engine's complete cycle and resets only when its own set is exhausted.
@@ -766,6 +813,10 @@ def derive(trace, rows, args):
         elif op == "tick":
             refused = set(event.get("refuse", []) or [])
             recorded = row.get("effects", [])
+            if state.support_redirection:
+                for group, members in state.groups.items():
+                    if len(members) > 1:
+                        state.update_connection_status(group, {bid: state.healthy(bid) for bid in members})
             # Whether a migration could be due is a property of inputs and
             # session history. Deleting its observed output must not remove
             # this dependency. A whole health result can disable Balance,

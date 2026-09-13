@@ -17,7 +17,7 @@ The optional `config.clock_origin_nanos` is the Unix-nanosecond origin of the
 recording scheduler. Real captures always include it; replay adds each event's
 `at_nanos` to that origin. Older traces without the field retain their original
 1700000000-second epoch. The single shared Go test clock covers router/group and
-CPU/memory/health-factor reads in both recording and replay. Rust's per-router
+CPU/memory/health/status-factor reads in both recording and replay. Rust's per-router
 test clock and migration round use that same public event time; production clocks
 and random selection tickets continue to use their existing clock sources. Original
 wall timings remain in each raw archive record. The 24-hour offset bound and the
@@ -244,7 +244,7 @@ duplicated or misdirected effects. These tests do not qualify recorded slots.
 Original recordings and earlier derivations stay immutable;
 a new derivation must use a new output filename and does not alone qualify a slot.
 
-Healthy Connection migration now derives the selected pair, connection ratio and
+Connection migration now derives the selected pair, connection ratio and
 rate from public inputs and a shared, already constrained connection history.
 It accounts for pending reservations and accepted redirects, uses physical insertion
 order from Finish/Rehydrate/successful completion, and checks the slow/fast cadence
@@ -262,7 +262,23 @@ the real adapters and derives identical expectations independently from each out
 Python counterexample rows are written test data and are not engine evidence.
 
 This increment deliberately retains the existing migration dependency for
-non-unique assignment histories, unhealthy status advice, resource/location factors,
+non-unique assignment histories, resource/location factors,
 or tied pairs with different legal effects. It also refuses to seed a cadence
 clock from an earlier unverified migration. A synthetic timing scenario is not a
 qualifying recording and does not freeze the remaining 18-slot manifest.
+
+`status_cadence_smoke.py` extends constrained Connection histories to unhealthy
+status migration. The first unhealthy scoring call captures its input-derived
+connection rate; later count decreases keep that rate. A healthy scoring call
+clears it, while a different member's scoring call prunes an unaccessed entry
+strictly after 60 seconds. The failover guard's two public-input scoring passes
+are included, so even an unchanged failover-list update can refresh the rate.
+Explicit status rates override it. Status precedes connection count and no
+migration targets an unhealthy backend.
+
+The Go replay now also routes the status factor's clock through the declared
+public event time. The scenario checks rate retention, support pauses, recovery,
+all-unhealthy groups, exact expiry through intervening Next calls, unchanged
+failover masks, the all-members guard and explicit override. Both engines and
+both derivations run in CI. A previous resource/location history still withholds
+status migration because its factor-call history is not yet derived.

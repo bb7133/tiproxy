@@ -507,7 +507,7 @@ def main():
         replacement = destination / name
         replacement.write_text(original.read_text().replace("time.Now()","apiReplayNow()"))
         replacements[str(original)] = str(replacement)
-    for name in ("factor_cpu.go", "factor_memory.go", "factor_health.go"):
+    for name in ("factor_cpu.go", "factor_memory.go", "factor_health.go", "factor_status.go"):
         original = ROOT / "pkg/balance/factor" / name
         data = original.read_text()
         require('"time"' in data and "time.Now()" in data, "INPUT", "factor clock overlay anchor")
