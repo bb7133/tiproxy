@@ -120,7 +120,7 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	var inTick bool
 	var tickEffects []apireplay.Effect
 	var tickAt int64
-	requires := []string{}
+	var metricPublications int
 	push := func(ev map[string]any, row map[string]any, at int64) {
 		ev["at_nanos"] = at
 		row["seq"] = len(rows)
@@ -175,9 +175,7 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			push(map[string]any{"op": "health", "backends": backends}, map[string]any{"op": "health", "outcome": "ok"}, r.AtNanos)
 		case "metrics":
 			push(map[string]any{"op": "metrics", "queries": e.Metrics}, map[string]any{"op": "metrics", "outcome": "ok"}, r.AtNanos)
-			if len(requires) == 0 {
-				requires = append(requires, "metrics-input")
-			}
+			metricPublications++
 		case "source_error":
 			if e.Outcome == "unclassified_source_error" {
 				incomplete = append(incomplete, fmt.Sprintf("seq %d: unclassified source error", r.Seq))
@@ -219,6 +217,13 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	}
 	if inTick {
 		incomplete = append(incomplete, "trace ended inside a tick")
+	}
+	// MetricsInputs can observe nonempty source data only while recording the
+	// corresponding whole publication under this scheduler. Treat disagreement
+	// as capture loss, not as a policy dependency. The independent deriver is
+	// the sole authority for `requires` after it consumes the complete history.
+	if metricsObserved && metricPublications == 0 {
+		incomplete = append(incomplete, "nonempty metrics observed without a recorded whole publication")
 	}
 	kind := "recorded"
 	if summary.Synthetic {
@@ -272,7 +277,7 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	}
 	manifest := map[string]any{
 		"slot": slot, "attempt": attempt, "status": status, "incomplete": incomplete,
-		"capture": summary, "qualified": false, "requires": requires,
+		"capture": summary, "qualified": false, "qualification": "pending-derivation",
 		"events": len(events), "trace_sha256": hashes["trace"], "go_sha256": hashes["go"],
 		"archive_sha256": hashes["archive"],
 	}

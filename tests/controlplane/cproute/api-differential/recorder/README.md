@@ -60,9 +60,14 @@ at the same zero key and uses strict expiry comparisons without narrowing that
 zero time into an i64 timestamp. The synthetic 170-event metric-time case covers
 CPU, memory and both health indicators, same-update cache retention, one-nanosecond
 updates, and the exact 60/120-second boundaries followed by one nanosecond.
-Recordings that claim metric observations but contain no metric events keep their
-`metrics-input` dependency. The same 170-event input is now independently derived
-from each engine's public rows with no residual policy dependency. A separate
+Raw capture manifests are always unqualified and explicitly pending derivation;
+they do not guess policy dependencies. The independent deriver is the sole source
+of `requires`: a recorded history that claims metric observations but contains no
+whole-publication event keeps `metrics-input`, while any recorded publication is
+replayed by both adapters and supplies that input. The writer also marks the
+otherwise impossible observed-without-publication state incomplete. The same
+170-event input is now independently derived from each engine's public rows with
+no residual policy dependency. A separate
 bounded two-backend case also derives Resource redirect cadence, stable health
 refresh scoring and same-update retention from the same public packets and
 connection history. General multi-group and ambiguous Resource
@@ -193,10 +198,11 @@ The following dependencies withhold a slot from acceptance:
   closes now use the public-history predicate described below.
 - `policy-constraint:<policy>/prefer-idle`: not all factor advice can yet be derived
   from the available public inputs. An unrestricted candidate set is not qualification.
-- `metrics-input`: recorded query values still need paired publication adapters.
-  New captures set `metrics_observed` only after publishing actual nonempty data;
-  older captures' reader-presence flag is retained as historical evidence and does
-  not prove complete inputs. The producer archive alone does not clear this gate.
+- `metrics-input`: an older recorded history claims that metric data was observed
+  but provides no whole-publication event before the policy needs it. New captures
+  set `metrics_observed` only after recording actual nonempty data and fail closed
+  if that state lacks a publication. Both paired adapters consume every recorded
+  publication; only the independent history deriver may add or clear this gate.
 - `migration-cadence`: explicitly required by contract §4. This dependency is derived
   from input capability and session/destination history even if every observed
   redirect is deleted. Whole-health support-redirection AND semantics disable the

@@ -178,6 +178,7 @@ func TestRecordedWholeMetricsDriveRealRouter(t *testing.T) {
 	require.NoError(t, err)
 	var manifest map[string]any
 	require.NoError(t, json.Unmarshal(data, &manifest))
-	require.Equal(t, []any{"metrics-input"}, manifest["requires"])
+	require.NotContains(t, manifest, "requires", "raw capture cannot decide policy dependencies")
 	require.Equal(t, false, manifest["qualified"])
+	require.Equal(t, "pending-derivation", manifest["qualification"])
 }

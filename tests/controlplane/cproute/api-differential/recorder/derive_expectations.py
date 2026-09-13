@@ -1596,7 +1596,9 @@ def defect_checks():
           {"op": "finish", "session": "s", "success": True}, {"op": "tick"}, {"op": "close", "session": "s"}]
     attempt("effects_v2_without_effect", cfg, ev, rows_for(ev, e2="default/a"),
             lambda d, r: "ok: requires effects-v2" if d and "effects-v2" in r else f"NOT CAUGHT ({r})")
-    # prefer-idle with two candidates is a policy constraint; resource adds metrics-input
+    # Prefer-idle with two candidates is a policy constraint. An older recorded
+    # trace that claims metric observations without whole publications also
+    # needs metrics-input; raw writer manifests never make this policy decision.
     ev = [{"op": "health", "backends": [hb("a"), hb("b")]}, {"op": "open", "session": "s"}, {"op": "next", "session": "s"},
           {"op": "finish", "session": "s", "success": True}, {"op": "close", "session": "s"}]
     attempt("prefer_idle_policy_constraint", {"policy": "resource", "selection": "prefer-idle", "rule": ""}, ev, rows_for(ev, e2="default/a"),
@@ -1606,6 +1608,15 @@ def defect_checks():
         out["prefer_idle_recorded_metrics_input"] = "ok: requires " + str(req) if "metrics-input" in req else f"NOT CAUGHT ({req})"
     except Refuse as e:
         out["prefer_idle_recorded_metrics_input"] = f"NOT CAUGHT (refused: {e})"
+    packet = dict.fromkeys(_RUNNER.METRIC_KEYS)
+    observed = ev[:1] + [{"op":"metrics", "queries":packet}] + ev[1:]
+    try:
+        _, req = derive({"config":{"policy":"connection", "selection":"random", "rule":""},
+                         "provenance":{"kind":"recorded", "metrics_observed":True},
+                         "events":observed}, rows_for(observed, e3="default/a"), None)
+        out["connection_recorded_metrics_not_required"] = "ok: whole input supplied and policy does not consume it" if not req else f"NOT CAUGHT ({req})"
+    except Refuse as e:
+        out["connection_recorded_metrics_not_required"] = f"NOT CAUGHT (refused: {e})"
     # Actual whole publications close the input dependency even at Go zero time;
     # they do not close the independent general policy constraint.
     for stamp in [None, 0]:

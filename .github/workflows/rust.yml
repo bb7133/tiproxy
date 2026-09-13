@@ -397,6 +397,9 @@ jobs:
           capture = Path(os.environ["CPROUTE_RECORDED_METRICS"])
           trace = json.loads((capture / "trace.json").read_text())
           rows = json.loads((capture / "go.json").read_text())
+          manifest = json.loads((capture / "manifest.json").read_text())
+          assert manifest["qualification"] == "pending-derivation"
+          assert manifest["qualified"] is False and "requires" not in manifest
           derived, requires = module.derive(trace, rows, None)
           assert trace["provenance"]["kind"] == "synthetic" and not requires
           module._RUNNER.validate(derived)

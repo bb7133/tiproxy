@@ -59,3 +59,18 @@ func TestSummarizeLifecyclesUsesAPIEvents(t *testing.T) {
 	}
 	require.Equal(t, LifecycleSummary{Opened: 3, Next: 2, SuccessfulFinishes: 2, Closed: 3, Completed: 1}, SummarizeLifecycles(log))
 }
+
+func TestWriteFailsClosedWhenObservedMetricsLackPublication(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
+	status, err := Write(dir, "N01", "a1", TraceConfig{}, nil, nil, nil, true, CaptureSummary{Synthetic: true})
+	require.NoError(t, err)
+	require.Equal(t, "incomplete", status)
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	require.NoError(t, err)
+	var manifest map[string]any
+	require.NoError(t, json.Unmarshal(data, &manifest))
+	require.Equal(t, []any{"nonempty metrics observed without a recorded whole publication"}, manifest["incomplete"])
+	require.NotContains(t, manifest, "requires")
+	require.Equal(t, "pending-derivation", manifest["qualification"])
+}
