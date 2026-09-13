@@ -787,8 +787,17 @@ def comparator_checks(trace, reference, destination):
                 if row["op"] == "checkpoint" and session in row["assignments"]: row["assignments"][session] = old
                 if row["op"] == "close" and row["session"] == session: break
         elif name == "drop_effect":
-            index = next(i for i,r in enumerate(bad) if r["effects"] and not r["effects"][0]["accepted"])
-            bad[index]["effects"] = []
+            # Drop a terminal accepted close request. It is the last operation
+            # for its session and the following close still empties the public
+            # connection ledger, so EFFECTS is the sole intended assertion. A
+            # refused redirect would leave a later ordinal gap and be rejected
+            # first by the stronger operation ledger instead.
+            index = next(i for i in range(len(bad)-1, -1, -1)
+                         if any(e["kind"] == "force_close" and e["accepted"]
+                                for e in bad[i]["effects"]))
+            position = next(i for i,e in enumerate(bad[index]["effects"])
+                            if e["kind"] == "force_close" and e["accepted"])
+            del bad[index]["effects"][position]
         elif name == "duplicate_terminal_result":
             bad.append(copy.deepcopy(bad[-1]))
         elif name == "ignore_final_ledger":
