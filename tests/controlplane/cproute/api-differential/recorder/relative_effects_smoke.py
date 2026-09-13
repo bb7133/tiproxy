@@ -23,23 +23,32 @@ def make_case():
             {"op": "next", "session": session},
             {"op": "finish", "session": session, "success": True},
         ]
-    events.append({"op": "health", "backends": [
+    events += [
+        {"op": "config", "refuse_next": 1,
+         "toml": "[proxy]\nfail-backend-list=[\"a\"]\nfailover-timeout=60\n"},
+        # The input control belongs to the whole failover window, not to the
+        # recording engine's concrete effect tick. This empty round proves that
+        # each adapter retains it until its own first eligible attempt.
+        {"op": "tick", "at_nanos": 1},
+        {"op": "health", "at_nanos": 2, "backends": [
         {"address": "a", "labels": {}, "support_redirection": True},
         {"address": "b", "labels": {}, "support_redirection": True},
-    ]})
+        ]},
+    ]
     tick = len(events)
     effect_ref = "redirect/1"
     events += [
-        {"op": "tick", "at_nanos": 1, "refuse_next": 1},
-        {"op": "close", "at_nanos": 2, "session": "b", "effect_ref": effect_ref},
-        {"op": "redirect_result", "at_nanos": 2, "session": "b",
+        {"op": "tick", "at_nanos": 3},
+        {"op": "config", "at_nanos": 4, "toml": "[proxy]\nfail-backend-list=[]\n"},
+        {"op": "close", "at_nanos": 5, "session": "b", "effect_ref": effect_ref},
+        {"op": "redirect_result", "at_nanos": 5, "session": "b",
          "effect_ref": effect_ref, "success": True},
     ]
-    events += [{"op": "close", "at_nanos": 3, "session": session}
+    events += [{"op": "close", "at_nanos": 6, "session": session}
                for session in "acde"]
     events += [
-        {"op": "health", "at_nanos": 4, "backends": []},
-        {"op": "checkpoint", "at_nanos": 4},
+        {"op": "health", "at_nanos": 7, "backends": []},
+        {"op": "checkpoint", "at_nanos": 7},
     ]
     trace = {
         "version": 1,

@@ -149,6 +149,70 @@ func TestWriteCarriesRelativeRefusalCallbackAndDelayedClose(t *testing.T) {
 	require.NotContains(t, effects[0].(map[string]any), "refuse_next")
 }
 
+func TestWriteArmsGlobalRefusalAtConfigAndConsumesItOnALaterTick(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
+	log := []Recorded{
+		{Seq: 0, AtNanos: 5, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", RefuseNext: true}},
+		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "tick_begin"}},
+		{Seq: 2, AtNanos: 10, Event: apireplay.Event{Op: "tick_end"}},
+		{Seq: 3, AtNanos: 20, Event: apireplay.Event{Op: "tick_begin"}},
+		{Seq: 4, AtNanos: 20, Event: apireplay.Event{Op: "effect", Effects: []apireplay.Effect{
+			{Kind: "redirect", Session: "s", Operation: "s/1", From: "a", To: "b", RefuseNext: true},
+		}}},
+		{Seq: 5, AtNanos: 20, Event: apireplay.Event{Op: "tick_end"}},
+		{Seq: 6, AtNanos: 30, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[]\n", Outcome: "ok"}},
+	}
+	status, err := Write(dir, "F01", "t1", TraceConfig{}, log, nil, nil, false, CaptureSummary{Synthetic: true})
+	require.NoError(t, err)
+	require.Equal(t, "recorded", status)
+	data, err := os.ReadFile(filepath.Join(dir, "trace.json"))
+	require.NoError(t, err)
+	var trace struct {
+		Events []map[string]any `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(data, &trace))
+	require.Equal(t, float64(1), trace.Events[0]["refuse_next"])
+	require.NotContains(t, trace.Events[1], "refuse_next")
+	require.NotContains(t, trace.Events[2], "refuse_next")
+}
+
+func TestWriteFailsClosedWhenGlobalRefusalReachesFailoverClear(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
+	log := []Recorded{
+		{Seq: 0, AtNanos: 5, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", RefuseNext: true}},
+		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "tick_begin"}},
+		{Seq: 2, AtNanos: 10, Event: apireplay.Event{Op: "tick_end"}},
+		{Seq: 3, AtNanos: 20, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[]\n", Outcome: "ok"}},
+	}
+	status, err := Write(dir, "F01", "t1", TraceConfig{}, log, nil, nil, false, CaptureSummary{Synthetic: true})
+	require.NoError(t, err)
+	require.Equal(t, "incomplete", status)
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	require.NoError(t, err)
+	var manifest map[string]any
+	require.NoError(t, json.Unmarshal(data, &manifest))
+	require.Contains(t, manifest["incomplete"], "seq 3: global refusal was not consumed before failover clear")
+}
+
+func TestWriteFailsClosedWhenGlobalRefusalIsArmedTwice(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
+	log := []Recorded{
+		{Seq: 0, AtNanos: 5, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", RefuseNext: true}},
+		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", RefuseNext: true}},
+	}
+	status, err := Write(dir, "F01", "t1", TraceConfig{}, log, nil, nil, false, CaptureSummary{Synthetic: true})
+	require.NoError(t, err)
+	require.Equal(t, "incomplete", status)
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	require.NoError(t, err)
+	var manifest map[string]any
+	require.NoError(t, json.Unmarshal(data, &manifest))
+	require.Contains(t, manifest["incomplete"], "seq 1: global refusal armed while one is pending")
+}
+
 func TestWriteFailsClosedWhenGlobalRefusalIsConsumedTwice(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))

@@ -305,6 +305,16 @@ async fn replay() -> TestResult {
                     .map_err(|e| format!("failover: {e:?}"))?;
             }
             "config" => {
+                let refusal = event["refuse_next"].as_u64().unwrap_or(0);
+                if refusal > 0 {
+                    assert_eq!(refusal, 1, "one-shot refusal input at event {index}");
+                    let mut client = must(effects.lock());
+                    assert_eq!(
+                        client.refuse_next, 0,
+                        "one-shot refusal armed while one is pending at event {index}"
+                    );
+                    client.refuse_next = refusal;
+                }
                 let prior_backend_clusters = h.source.store.current().topology()?.backend_clusters;
                 if h.source
                     .store
@@ -346,6 +356,20 @@ async fn replay() -> TestResult {
                     h.router
                         .refresh_failover(&candidate, now)
                         .map_err(|e| format!("failover config: {e:?}"))?;
+                    if h.source
+                        .store
+                        .current()
+                        .effective()
+                        .routing()?
+                        .failed_backends
+                        .is_empty()
+                    {
+                        assert_eq!(
+                            must(effects.lock()).refuse_next,
+                            0,
+                            "one-shot refusal was not consumed before failover clear at event {index}"
+                        );
+                    }
                 }
             }
             "open" => {
@@ -398,7 +422,15 @@ async fn replay() -> TestResult {
                                 .to_string()
                         })
                         .collect();
-                    client.refuse_next = event["refuse_next"].as_u64().unwrap_or(0);
+                    let refusal = event["refuse_next"].as_u64().unwrap_or(0);
+                    if refusal > 0 {
+                        assert_eq!(refusal, 1, "one-shot refusal input at event {index}");
+                        assert_eq!(
+                            client.refuse_next, 0,
+                            "one-shot refusal armed while one is pending at event {index}"
+                        );
+                        client.refuse_next = refusal;
+                    }
                 }
                 let candidate = h
                     .router
@@ -424,11 +456,6 @@ async fn replay() -> TestResult {
                     }
                     rows.push(effect);
                 }
-                assert_eq!(
-                    must(effects.lock()).refuse_next,
-                    0,
-                    "one-shot refusal not consumed"
-                );
                 assert!(queue.take().is_none());
                 row["effects"] = json!(rows);
             }
@@ -525,6 +552,11 @@ async fn replay() -> TestResult {
     assert!(
         unbound_redirects.is_empty(),
         "trace must close or bind every accepted redirect"
+    );
+    assert_eq!(
+        must(effects.lock()).refuse_next,
+        0,
+        "trace ended with an unconsumed one-shot refusal"
     );
     assert_eq!(
         known

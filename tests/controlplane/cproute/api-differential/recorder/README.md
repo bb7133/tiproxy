@@ -293,12 +293,21 @@ applicable slot. These scripts and synthetic validator tests are candidate
 infrastructure; they do not count as recorded corpus evidence by themselves.
 
 The writer distinguishes the existing per-session `refuse` input from the scripted
-global one-shot control. The latter is archived on the concrete rejected effect,
-then projected into the public trace as `refuse_next: 1`; the internal marker never
-appears in Go output rows. This lets each adapter consume the refusal on its own
-first eligible effect instead of importing Go's chosen owner. More than one global
-refusal in a tick is invalid. If one session both accepts and rejects effects for
-reasons that cannot be represented by these inputs, the attempt is incomplete.
+global one-shot control. For `failover_select`, the latter is projected as
+`refuse_next: 1` on the same serialized config input that arms the real client
+control, rather than on the later tick where Go happened to consume it. Each adapter
+therefore rejects its own first non-session-refused Redirect or ForceClose attempt
+in that failover window, even when legal engine-relative cadence moves the attempt
+to another tick or session. Empty ticks retain the control; a second arm, a failover
+clear, or trace end while it remains pending fails closed. The concrete consuming
+effect is archived only to prove unique consumption and its internal marker never
+appears in Go output rows. Older tick-level `refuse_next` inputs remain replayable,
+but a config arm and legacy tick arm cannot overlap. More than one consumption in a
+tick is invalid. If one session both accepts and rejects effects for reasons that
+cannot be represented by these inputs, the attempt is incomplete. The failover
+validator still requires the recorded rejected redirect to originate from the
+checkpoint-selected failed backend; an unrelated earlier migration makes that
+attempt incomplete rather than weakening the intended outcome.
 
 Each recorded accepted redirect receives a stable logical reference
 `redirect/<ordinal>`. For an ordinary callback, the input's logical session is first
@@ -334,9 +343,9 @@ sessions/destinations. A supported active balance tick carries `redirect_cadence
 input-derived group epochs, member health/keyspace and any Status scoring calls.
 The runner combines that descriptor with each engine's connection counts, physical
 insertion order, retained unhealthy rate, cooldown and cadence clock to enumerate
-its legal effect sequence. A global one-shot refusal may expose more than one legal
-group order; the bounded alternatives are explicit and no observed Go choice is
-used as Rust input.
+its legal effect sequence. A pending global one-shot refusal may expose more than
+one legal group order; the bounded alternatives are explicit and no observed Go
+choice is used as Rust input.
 
 After a non-unique selection, `force_close_due` declares the backends whose failover
 deadline has arrived, derived from config, whole health inputs and event time. The

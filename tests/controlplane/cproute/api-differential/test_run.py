@@ -210,18 +210,44 @@ class ConnectionPreferenceTests(unittest.TestCase):
             self.assertEqual(h.prefer_idle({"a", "b"}), {"b"} if result is False else {"a", "b"})
             self.assertEqual(h.assigned.get("s"), "a" if result is False else "b" if result is True else None)
 
-    def test_global_refusal_must_be_consumed_by_an_eligible_effect(self):
+    def test_global_refusal_survives_empty_tick_but_not_failover_clear(self):
         h = self.history()
         event = {"op": "tick", "refuse_next": 1}
         singleton = {"redirect_cadence": {"kind": "connection", "groups": [
             {"group": "group/1", "members": [{"backend": "a", "healthy": True, "keyspace": ""}]},
         ]}}
-        self.assertEqual(h.expected_effect_alternatives(event, singleton, 0), [])
+        h.prepare(event, singleton, {"outcome": "ok"}, 0)
+        self.assertEqual(h.expected_effect_alternatives(event, singleton, 0), [[]])
+        h.apply(event, {"outcome": "ok", "effects": []}, prepared=True)
+        self.assertEqual(h.refuse_next, 1)
+        clear = {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"}
+        with self.assertRaisesRegex(runner.Difference, "not consumed before failover clear"):
+            h.prepare(clear, {}, {"outcome": "ok"}, 1)
+
+    def test_global_refusal_is_consumed_by_first_eligible_attempt(self):
+        h = self.history()
+        event = {"op": "tick", "refuse_next": 1}
         rejected = {"kind": "force_close", "session": "s", "operation": "s/1",
                     "from": "a", "to": "", "accepted": False}
+        h.prepare(event, {}, {"outcome": "ok"}, 0)
         self.assertEqual(h.expected_effect_alternatives(event, {"effects": [rejected]}, 0), [[rejected]])
-        self.assertEqual(h.expected_effect_alternatives(
+        h.apply(event, {"outcome": "ok", "effects": [rejected]}, prepared=True)
+        self.assertEqual(h.refuse_next, 0)
+        second = self.history()
+        second.prepare(event, {}, {"outcome": "ok"}, 0)
+        self.assertEqual(second.expected_effect_alternatives(
             event, {"effects": [dict(rejected, accepted=True)]}, 0), [])
+
+    def test_config_and_legacy_tick_refusal_cannot_overlap(self):
+        h = self.history()
+        arm = {"op": "config", "refuse_next": 1,
+               "toml": "[proxy]\nfail-backend-list=[\"a\"]\n"}
+        h.prepare(arm, {}, {"outcome": "ok"}, 0)
+        repeat = {"op": "config", "toml": "[proxy]\nfail-backend-list=[\"a\"]\n"}
+        h.prepare(repeat, {}, {"outcome": "ok"}, 1)
+        self.assertEqual(h.refuse_next, 1)
+        with self.assertRaisesRegex(runner.Difference, "armed while one is pending"):
+            h.prepare({"op": "tick", "refuse_next": 1}, {}, {"outcome": "ok"}, 2)
 
     def test_relative_redirect_ordinal_does_not_embed_a_tick(self):
         for tick in (4, 17):

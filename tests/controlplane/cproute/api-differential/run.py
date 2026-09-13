@@ -87,7 +87,7 @@ def validate(trace):
     events = trace["events"]
     require(isinstance(events, list) and 0 < len(events) <= 100_000, "INPUT", "event count")
     allowed = {
-        "health":{"backends"},"config":{"toml"},"open":{"client","proxy","port"},
+        "health":{"backends"},"config":{"toml","refuse_next"},"open":{"client","proxy","port"},
         "next":set(),"finish":{"success"},"close":{"effect_ref"},"checkpoint":set(),
         "tick":{"refuse","refuse_next"},"redirect_result":{"operation","effect_ref","optional_effect","success"},
         "lookup":{"backend"},"rehydrate":{"backend"},
@@ -183,6 +183,9 @@ def validate(trace):
             require(len(set(addresses)) == len(addresses), "INPUT", "duplicate backend")
         elif op == "config":
             require(isinstance(event.get("toml"), str), "INPUT", "config update")
+            require(type(event.get("refuse_next", 0)) is int and 0 <= event.get("refuse_next", 0) <= 1
+                    and (not event.get("refuse_next", 0) or expect["outcome"] == "ok"),
+                    "INPUT", "config one-shot effect refusal")
         elif op == "tick":
             require(isinstance(event.get("refuse",[]),list) and all(id in active for id in event.get("refuse",[])),"INPUT","effect refusal inputs")
             require(type(event.get("refuse_next", 0)) is int and 0 <= event.get("refuse_next", 0) <= 1,
@@ -253,6 +256,7 @@ class PublicConnections:
         self.backend_groups = {}
         self.logical_to_actual, self.effect_refs, self.effect_ref_sessions = {}, {}, {}
         self.unbound_redirects, self.skipped_effect_refs = [], set()
+        self.refuse_next, self.fail_backend_list = 0, set()
         self.policy, self.selection = config["policy"], config["selection"]
         self.ratio, self.rate, self.status_rate, self.label_name = 1.2, 0.0, 0.0, ""
 
@@ -309,11 +313,20 @@ class PublicConnections:
 
     def prepare(self, event, expect, row, now):
         """Apply input-derived configuration/scoring before this public call."""
+        if event.get("refuse_next", 0):
+            require(self.refuse_next == 0, "EFFECT_LEDGER", "one-shot refusal armed while one is pending")
+            self.refuse_next = event["refuse_next"]
         if event["op"] == "config" and row["outcome"] == "ok":
             try:
-                balance = tomllib.loads(event["toml"]).get("balance", {})
+                document = tomllib.loads(event["toml"])
             except tomllib.TOMLDecodeError as error:
                 raise Difference(f"INPUT: accepted config cannot be parsed: {error}") from error
+            proxy = document.get("proxy", {})
+            if "fail-backend-list" in proxy:
+                self.fail_backend_list = set(proxy["fail-backend-list"])
+                require(self.fail_backend_list or self.refuse_next == 0, "EFFECT_LEDGER",
+                        "one-shot refusal was not consumed before failover clear")
+            balance = document.get("balance", {})
             self.policy = balance.get("policy", self.policy) or "resource"
             self.selection = balance.get("routing-policy", self.selection) or "prefer-idle"
             self.label_name = balance.get("label-name", self.label_name)
@@ -494,10 +507,10 @@ class PublicConnections:
 
     def redirect_effect_alternatives(self, event, model, now):
         groups = model["groups"]
-        orders = itertools.permutations(groups) if event.get("refuse_next", 0) and len(groups) > 1 else [groups]
+        orders = itertools.permutations(groups) if self.refuse_next and len(groups) > 1 else [groups]
         alternatives = []
         for order in orders:
-            partial = [([], event.get("refuse_next", 0))]
+            partial = [([], self.refuse_next)]
             for group in order:
                 expanded = []
                 for effects, refusal in partial:
@@ -515,22 +528,21 @@ class PublicConnections:
     def expected_effect_alternatives(self, event, expect, now):
         if "redirect_cadence" not in expect:
             if "force_close_due" in expect:
-                effects, refusal = self._force_close_effects(event, expect["force_close_due"], event.get("refuse_next", 0))
-                return [effects] if refusal == 0 else []
+                effects, _ = self._force_close_effects(event, expect["force_close_due"], self.refuse_next)
+                return [effects]
             effects = expect.get("effects", [])
-            refusal = event.get("refuse_next", 0)
+            refusal = self.refuse_next
             refused = {self.logical_to_actual.get(sid, sid) for sid in event.get("refuse", [])}
             for effect in effects:
                 if effect["session"] not in refused and refusal:
                     if effect["accepted"]:
                         return []
                     refusal -= 1
-            return [effects] if refusal == 0 else []
+            return [effects]
         alternatives = []
         for redirects, refusal in self.redirect_effect_alternatives(event, expect["redirect_cadence"], now):
             closes, refusal = self._force_close_effects(event, expect.get("force_close_due", []), refusal)
-            if refusal == 0:
-                alternatives.append(redirects + closes)
+            alternatives.append(redirects + closes)
         return alternatives
 
     def apply(self, event, row, sid=None, operation=None, index=0, prepared=False):
@@ -571,6 +583,13 @@ class PublicConnections:
             self.unbound_redirects = [effect for effect in self.unbound_redirects
                                       if effect["session"] != sid]
             self.logical_to_actual.pop(event["session"], None)
+        elif op == "tick" and self.refuse_next:
+            refused = {self.logical_to_actual.get(item, item) for item in event.get("refuse", [])}
+            consumed = [effect for effect in row.get("effects", [])
+                        if effect["session"] not in refused and not effect["accepted"]]
+            require(len(consumed) <= 1, "EFFECT_LEDGER", "one-shot refusal was consumed more than once")
+            if consumed:
+                self.refuse_next = 0
         model = event.get("expect", {}).get("redirect_cadence", {})
         group_for = {member["backend"]: group["group"]
                      for group in model.get("groups", []) for member in group["members"]}
@@ -696,7 +715,7 @@ def observe(trace, rows, engine):
     require(not ledger and not pending and not unsettled
             and not connections.pending and not connections.assigned
             and not connections.redirects and not connections.unbound_redirects
-            and not connections.logical_to_actual,
+            and not connections.logical_to_actual and connections.refuse_next == 0,
             "LEDGER", f"{engine} final state")
     accepted_redirects = [(key, effect) for key,effect in operations.items()
                           if effect["accepted"] and effect["kind"] == "redirect"]

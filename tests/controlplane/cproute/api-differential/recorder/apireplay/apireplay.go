@@ -55,19 +55,23 @@ type Effect struct {
 // `Outcome`/`Backend`/`Effects` fields are the recorded public results and are
 // kept apart from the trace input by the writer).
 type Event struct {
-	Metrics   json.RawMessage `json:"queries,omitempty"`
-	Op        string          `json:"op"`
-	TOML      string          `json:"toml,omitempty"`
-	Backends  []HealthBackend `json:"backends,omitempty"`
-	Session   string          `json:"session,omitempty"`
-	Client    string          `json:"client,omitempty"`
-	Proxy     string          `json:"proxy,omitempty"`
-	Port      string          `json:"port,omitempty"`
-	Backend   string          `json:"backend,omitempty"`
-	Success   *bool           `json:"success,omitempty"`
-	Operation string          `json:"operation,omitempty"`
-	Outcome   string          `json:"outcome,omitempty"`
-	Effects   []Effect        `json:"effects,omitempty"`
+	Metrics json.RawMessage `json:"queries,omitempty"`
+	Op      string          `json:"op"`
+	TOML    string          `json:"toml,omitempty"`
+	// RefuseNext marks the serialized input boundary that arms the global
+	// one-shot client refusal. The consuming Effect carries the same bit only
+	// so the writer can prove that the control was consumed exactly once.
+	RefuseNext bool            `json:"refuse_next,omitempty"`
+	Backends   []HealthBackend `json:"backends,omitempty"`
+	Session    string          `json:"session,omitempty"`
+	Client     string          `json:"client,omitempty"`
+	Proxy      string          `json:"proxy,omitempty"`
+	Port       string          `json:"port,omitempty"`
+	Backend    string          `json:"backend,omitempty"`
+	Success    *bool           `json:"success,omitempty"`
+	Operation  string          `json:"operation,omitempty"`
+	Outcome    string          `json:"outcome,omitempty"`
+	Effects    []Effect        `json:"effects,omitempty"`
 }
 
 // HealthBackend is one explicit health inventory entry (every field written).

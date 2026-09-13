@@ -253,6 +253,7 @@ class State:
         self.operation_refs = {}  # recorded operation -> engine-relative accepted-effect reference
         self.ref_operations = {}  # inverse map for already-relative recorder inputs
         self.accepted_redirects = 0
+        self.refuse_next = 0  # global input control, carried until the next eligible effect attempt
         # group -> backend -> (input-derived rate or None when an engine-relative
         # owner made the retained rate unknowable, last scoring time)
         self.status_snapshots = {}
@@ -1429,6 +1430,10 @@ def derive(trace, rows, args):
         state.status_calls = []
         connections_prepared = False
         expect = {"outcome": "ok"}
+        if event.get("refuse_next", 0):
+            if state.refuse_next:
+                raise Refuse(f"seq {seq}: one-shot refusal armed while one is pending")
+            state.refuse_next = event["refuse_next"]
         if op == "health":
             state.apply_health(event.get("backends", []))
         elif op == "metrics":
@@ -1450,6 +1455,8 @@ def derive(trace, rows, args):
             expect["outcome"] = row["outcome"]  # validator result at the validation entry (README §2)
             if row["outcome"] == "ok":
                 state.apply_config(event.get("toml", ""))
+                if not state.fail_list and state.refuse_next:
+                    raise Refuse(f"seq {seq}: one-shot refusal was not consumed before failover clear")
         elif op == "open":
             state.sessions[sid] = Session(sid, event)
         elif op == "next":
@@ -1567,7 +1574,7 @@ def derive(trace, rows, args):
                 # the public engine-relative cadence model for the rest of
                 # that history rather than turning Go's owner into an oracle.
                 predicted = None
-            if event.get("refuse_next", 0):
+            if state.refuse_next:
                 # A one-shot refusal belongs to the external client boundary,
                 # so the concrete refused owner is resolved per engine.
                 predicted = None
@@ -1586,7 +1593,7 @@ def derive(trace, rows, args):
             # Modeled timing is compared against its independent prediction;
             # other factor/history cases remain withheld, never copied.
             leftover = []
-            refusal_budget = event.get("refuse_next", 0)
+            refusal_budget = state.refuse_next
             for ef in recorded:
                 if ef["kind"] == "force_close":
                     leftover.append(ef)
@@ -1640,8 +1647,7 @@ def derive(trace, rows, args):
                     raise Refuse(f"seq {seq}: effects contradict the engine-relative connection cadence: recorded {recorded}, expected one of {alternatives[:4]}, counts {state.recorded_connections.counts()}, last {state.recorded_connections.group_last_redirect}")
             elif key_effects(leftover) != key_effects(derived):
                 raise Refuse(f"seq {seq}: recorded force_close effects {leftover} differ from the failover-timeout derivation {derived}")
-            if relative_model is None and remaining_refusal:
-                raise Refuse(f"seq {seq}: one-shot refusal was not consumed by an eligible effect")
+            state.refuse_next = remaining_refusal
             if derived and not relative_close:
                 expect["effects"] = derived
             if modeled and predicted:
@@ -1713,6 +1719,8 @@ def derive(trace, rows, args):
         except _RUNNER.Difference as error:
             raise Refuse(f"seq {seq}: {error}") from error
         out_events.append(e)
+    if state.refuse_next:
+        raise Refuse("one-shot refusal was not consumed before the end of the trace")
     result = copy.deepcopy(trace)
     result["events"] = out_events
     metric_inputs = [e for e in events if e["op"] == "metrics"]

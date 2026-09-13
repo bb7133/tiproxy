@@ -360,10 +360,19 @@ func TestRouterAPIDifferential(t *testing.T) {
 			}
 			r.updateBackendHealth(observer.NewHealthResult(backends, nil))
 		case "config":
+			if event.RefuseNext > 0 {
+				require.Equal(t, 1, event.RefuseNext, "one-shot refusal input at seq=%d", index)
+				require.Zero(t, refuseNext, "one-shot refusal armed while one is pending at seq=%d", index)
+				refuseNext = event.RefuseNext
+			}
 			if err := manager.SetTOMLConfig([]byte(event.TOML)); err != nil {
 				row["outcome"] = "invalid_config"
 			} else {
-				r.setConfig(manager.GetConfig())
+				cfg := manager.GetConfig()
+				r.setConfig(cfg)
+				if len(cfg.Proxy.FailBackendList) == 0 {
+					require.Zero(t, refuseNext, "one-shot refusal was not consumed before failover clear at seq=%d", index)
+				}
 			}
 		case "open":
 			require.Nil(t, s, "duplicate logical session")
@@ -390,7 +399,11 @@ func TestRouterAPIDifferential(t *testing.T) {
 				s.active = true
 			}
 		case "tick":
-			refuseNext = event.RefuseNext
+			if event.RefuseNext > 0 {
+				require.Equal(t, 1, event.RefuseNext, "one-shot refusal input at seq=%d", index)
+				require.Zero(t, refuseNext, "one-shot refusal armed while one is pending at seq=%d", index)
+				refuseNext = event.RefuseNext
+			}
 			for id, live := range sessions {
 				live.conn.refuse = false
 				for _, refused := range event.Refuse {
@@ -400,7 +413,6 @@ func TestRouterAPIDifferential(t *testing.T) {
 				}
 			}
 			r.rebalance(context.Background())
-			require.Zero(t, refuseNext, "one-shot refusal was not consumed at seq=%d", index)
 			for i := range effects {
 				if effects[i].Kind == "redirect" && effects[i].Accepted {
 					unboundRedirects = append(unboundRedirects, operations[effects[i].Operation])
@@ -487,5 +499,6 @@ func TestRouterAPIDifferential(t *testing.T) {
 	require.Empty(t, sessions, "trace must settle and close all logical sessions")
 	require.Empty(t, logicalSessions, "trace must close every logical handle")
 	require.Empty(t, unboundRedirects, "trace must close or bind every accepted redirect")
+	require.Zero(t, refuseNext, "trace ended with an unconsumed one-shot refusal")
 	require.Zero(t, r.ConnCount())
 }

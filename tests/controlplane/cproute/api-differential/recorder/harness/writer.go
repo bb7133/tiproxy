@@ -16,6 +16,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/pingcap/tiproxy/tests/controlplane/cproute/api-differential/recorder/apireplay"
 )
 
@@ -167,6 +168,16 @@ func publicEffects(effects []apireplay.Effect) []apireplay.Effect {
 	return public
 }
 
+func clearsFailover(input string) bool {
+	var patch struct {
+		Proxy struct {
+			FailBackendList []string `toml:"fail-backend-list"`
+		} `toml:"proxy"`
+	}
+	metadata, err := toml.Decode(input, &patch)
+	return err == nil && metadata.IsDefined("proxy", "fail-backend-list") && len(patch.Proxy.FailBackendList) == 0
+}
+
 // Write converts the recorded log into the trace v1 input file (no expect
 // blocks), the Go rows file and a manifest with hashes. Ticks are folded:
 // `tick_begin` … effects … `tick_end` become one `tick` event whose row carries
@@ -179,6 +190,7 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	var tickEffects []apireplay.Effect
 	var tickAt int64
 	var metricPublications int
+	var pendingGlobalRefusal bool
 	operationRefs := make(map[string]string)
 	acceptedRedirects := 0
 	push := func(ev map[string]any, row map[string]any, at int64) {
@@ -217,7 +229,11 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			if len(refused) > 0 {
 				ev["refuse"] = refused
 			}
-			if refuseNext > 0 {
+			if refuseNext > 0 && pendingGlobalRefusal {
+				pendingGlobalRefusal = false
+			} else if refuseNext > 0 {
+				// Backward-compatible standalone controls cannot be attached to a
+				// config boundary, so their consumed effect still carries the arm.
 				ev["refuse_next"] = refuseNext
 			}
 			if refuseNext > 1 {
@@ -261,7 +277,18 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			}
 			push(map[string]any{"op": "source_error", "error": e.Outcome}, map[string]any{"op": "source_error", "outcome": "ok"}, r.AtNanos)
 		case "config":
-			push(map[string]any{"op": "config", "toml": e.TOML}, map[string]any{"op": "config", "outcome": e.Outcome}, r.AtNanos)
+			ev := map[string]any{"op": "config", "toml": e.TOML}
+			if e.RefuseNext {
+				if pendingGlobalRefusal {
+					incomplete = append(incomplete, fmt.Sprintf("seq %d: global refusal armed while one is pending", r.Seq))
+				}
+				pendingGlobalRefusal = true
+				ev["refuse_next"] = 1
+			}
+			if e.Outcome == "ok" && clearsFailover(e.TOML) && pendingGlobalRefusal {
+				incomplete = append(incomplete, fmt.Sprintf("seq %d: global refusal was not consumed before failover clear", r.Seq))
+			}
+			push(ev, map[string]any{"op": "config", "outcome": e.Outcome}, r.AtNanos)
 		case "open":
 			push(map[string]any{"op": "open", "session": e.Session, "client": e.Client, "proxy": e.Proxy, "port": e.Port},
 				map[string]any{"op": "open", "session": e.Session, "outcome": "ok"}, r.AtNanos)
@@ -309,6 +336,9 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	}
 	if inTick {
 		incomplete = append(incomplete, "trace ended inside a tick")
+	}
+	if pendingGlobalRefusal {
+		incomplete = append(incomplete, "global refusal input was never consumed")
 	}
 	// MetricsInputs can observe nonempty source data only while recording the
 	// corresponding whole publication under this scheduler. Treat disagreement

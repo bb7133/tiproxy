@@ -76,7 +76,7 @@ func (in *Inputs) Deliver(result observer.HealthResult) {
 // records the `config` input with the validator's public outcome.
 func (in *Inputs) DeliverConfig(toml string, cfg *config.Config, validationErr error) {
 	in.sched.RunNow(func() {
-		in.DeliverConfigLocked(toml, cfg, validationErr)
+		in.DeliverConfigLocked(toml, cfg, validationErr, false)
 	})
 }
 
@@ -84,8 +84,8 @@ func (in *Inputs) DeliverConfig(toml string, cfg *config.Config, validationErr e
 // Scheduler critical section. Dynamic recording actions use it to snapshot a
 // public assignment, arm a client control and apply the resulting config as one
 // indivisible input boundary. Other callers should use DeliverConfig.
-func (in *Inputs) DeliverConfigLocked(toml string, cfg *config.Config, validationErr error) {
-	ev := apireplay.Event{Op: "config", TOML: toml, Outcome: "ok"}
+func (in *Inputs) DeliverConfigLocked(toml string, cfg *config.Config, validationErr error, refuseNext bool) {
+	ev := apireplay.Event{Op: "config", TOML: toml, Outcome: "ok", RefuseNext: refuseNext}
 	if validationErr != nil {
 		ev.Outcome = "invalid_config"
 	} else {
