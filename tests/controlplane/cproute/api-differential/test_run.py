@@ -210,7 +210,7 @@ class ConnectionPreferenceTests(unittest.TestCase):
             self.assertEqual(h.prefer_idle({"a", "b"}), {"b"} if result is False else {"a", "b"})
             self.assertEqual(h.assigned.get("s"), "a" if result is False else "b" if result is True else None)
 
-    def test_global_refusal_survives_empty_tick_but_not_failover_clear(self):
+    def test_global_refusal_with_zero_attempts_expires_at_failover_clear(self):
         h = self.history()
         event = {"op": "tick", "refuse_next": 1}
         singleton = {"redirect_cadence": {"kind": "connection", "groups": [
@@ -221,8 +221,33 @@ class ConnectionPreferenceTests(unittest.TestCase):
         h.apply(event, {"outcome": "ok", "effects": []}, prepared=True)
         self.assertEqual(h.refuse_next, 1)
         clear = {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"}
-        with self.assertRaisesRegex(runner.Difference, "not consumed before failover clear"):
-            h.prepare(clear, {}, {"outcome": "ok"}, 1)
+        h.prepare(clear, {}, {"outcome": "ok"}, 1)
+        self.assertEqual(h.refuse_next, 0)
+
+    def test_global_refusal_with_an_eligible_attempt_cannot_expire(self):
+        h = self.history()
+        h.refuse_next = 1
+        h.refusal_attempts = 1
+        with self.assertRaisesRegex(runner.Difference, "survived 1 eligible attempts"):
+            h.expire_refusal("failover clear")
+
+    def test_config_refusal_arm_requires_nonempty_failover(self):
+        h = self.history()
+        clear_arm = {"op": "config", "refuse_next": 1,
+                     "toml": "[proxy]\nfail-backend-list=[]\n"}
+        with self.assertRaisesRegex(runner.Difference, "requires a nonempty failover list"):
+            h.prepare(clear_arm, {}, {"outcome": "ok"}, 0)
+
+    def test_session_refused_attempt_does_not_consume_global_refusal(self):
+        h = self.history()
+        event = {"op": "tick", "refuse_next": 1, "refuse": ["s"]}
+        rejected = {"kind": "force_close", "session": "s", "operation": "s/1",
+                    "from": "a", "to": "", "accepted": False}
+        h.prepare(event, {}, {"outcome": "ok"}, 0)
+        h.apply(event, {"outcome": "ok", "effects": [rejected]}, prepared=True)
+        self.assertEqual((h.refuse_next, h.refusal_attempts), (1, 0))
+        h.expire_refusal("trace end")
+        self.assertEqual(h.refuse_next, 0)
 
     def test_global_refusal_is_consumed_by_first_eligible_attempt(self):
         h = self.history()

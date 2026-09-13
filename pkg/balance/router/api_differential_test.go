@@ -99,12 +99,13 @@ type apiOperation struct {
 }
 type apiConn struct {
 	*mockRedirectableConn
-	id         string
-	ordinal    int
-	refuse     bool
-	refuseNext *int
-	effects    *[]apiEffect
-	operations map[string]*apiOperation
+	id              string
+	ordinal         int
+	refuse          bool
+	refuseNext      *int
+	refusalAttempts *int
+	effects         *[]apiEffect
+	operations      map[string]*apiOperation
 }
 
 func (c *apiConn) record(kind string, to BackendInst, accepted bool) {
@@ -121,6 +122,7 @@ func (c *apiConn) record(kind string, to BackendInst, accepted bool) {
 func (c *apiConn) Redirect(to BackendInst) bool {
 	refused := c.refuse
 	if !refused && *c.refuseNext > 0 {
+		(*c.refusalAttempts)++
 		(*c.refuseNext)--
 		refused = true
 	}
@@ -131,6 +133,7 @@ func (c *apiConn) Redirect(to BackendInst) bool {
 func (c *apiConn) ForceClose() bool {
 	refused := c.refuse
 	if !refused && *c.refuseNext > 0 {
+		(*c.refusalAttempts)++
 		(*c.refuseNext)--
 		refused = true
 	}
@@ -263,6 +266,21 @@ func TestRouterAPIDifferential(t *testing.T) {
 	skippedEffectRefs := make(map[string]struct{})
 	unboundRedirects := []*apiOperation{}
 	refuseNext := 0
+	refusalAttempts := 0
+	armRefusal := func(value, index int) {
+		require.Equal(t, 1, value, "one-shot refusal input at seq=%d", index)
+		require.Zero(t, refuseNext, "one-shot refusal armed while one is pending at seq=%d", index)
+		refuseNext = value
+		refusalAttempts = 0
+	}
+	expireRefusal := func(boundary string, index int) {
+		if refuseNext == 0 {
+			return
+		}
+		require.Zero(t, refusalAttempts,
+			"one-shot refusal survived %d eligible attempts before %s at seq=%d", refusalAttempts, boundary, index)
+		refuseNext = 0
+	}
 	t.Cleanup(func() {
 		if len(output) > 0 {
 			output[len(output)-1]["effects"] = effects
@@ -361,17 +379,19 @@ func TestRouterAPIDifferential(t *testing.T) {
 			r.updateBackendHealth(observer.NewHealthResult(backends, nil))
 		case "config":
 			if event.RefuseNext > 0 {
-				require.Equal(t, 1, event.RefuseNext, "one-shot refusal input at seq=%d", index)
-				require.Zero(t, refuseNext, "one-shot refusal armed while one is pending at seq=%d", index)
-				refuseNext = event.RefuseNext
+				armRefusal(event.RefuseNext, index)
 			}
 			if err := manager.SetTOMLConfig([]byte(event.TOML)); err != nil {
 				row["outcome"] = "invalid_config"
 			} else {
 				cfg := manager.GetConfig()
 				r.setConfig(cfg)
+				if event.RefuseNext > 0 {
+					require.NotEmpty(t, cfg.Proxy.FailBackendList,
+						"config refusal arm requires a nonempty failover list at seq=%d", index)
+				}
 				if len(cfg.Proxy.FailBackendList) == 0 {
-					require.Zero(t, refuseNext, "one-shot refusal was not consumed before failover clear at seq=%d", index)
+					expireRefusal("failover clear", index)
 				}
 			}
 		case "open":
@@ -379,7 +399,8 @@ func TestRouterAPIDifferential(t *testing.T) {
 			logicalSessions[event.Session] = event.Session
 			sessions[event.Session] = &slot{selector: r.GetBackendSelector(ClientInfo{
 				ClientAddr: apiClientAddress(event.Client), ProxyAddr: apiClientAddress(event.Proxy), ListenerPort: event.Port,
-			}), conn: &apiConn{mockRedirectableConn: newMockRedirectableConn(t, uint64(index+1)), id: event.Session, refuseNext: &refuseNext, effects: &effects, operations: operations}}
+			}), conn: &apiConn{mockRedirectableConn: newMockRedirectableConn(t, uint64(index+1)), id: event.Session,
+				refuseNext: &refuseNext, refusalAttempts: &refusalAttempts, effects: &effects, operations: operations}}
 		case "lookup":
 			backend, ok := r.LookupBackend(event.Backend)
 			if !ok {
@@ -400,9 +421,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 			}
 		case "tick":
 			if event.RefuseNext > 0 {
-				require.Equal(t, 1, event.RefuseNext, "one-shot refusal input at seq=%d", index)
-				require.Zero(t, refuseNext, "one-shot refusal armed while one is pending at seq=%d", index)
-				refuseNext = event.RefuseNext
+				armRefusal(event.RefuseNext, index)
 			}
 			for id, live := range sessions {
 				live.conn.refuse = false
@@ -499,6 +518,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 	require.Empty(t, sessions, "trace must settle and close all logical sessions")
 	require.Empty(t, logicalSessions, "trace must close every logical handle")
 	require.Empty(t, unboundRedirects, "trace must close or bind every accepted redirect")
+	expireRefusal("trace end", len(trace.Events))
 	require.Zero(t, refuseNext, "trace ended with an unconsumed one-shot refusal")
 	require.Zero(t, r.ConnCount())
 }

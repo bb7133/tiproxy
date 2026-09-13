@@ -256,7 +256,7 @@ class PublicConnections:
         self.backend_groups = {}
         self.logical_to_actual, self.effect_refs, self.effect_ref_sessions = {}, {}, {}
         self.unbound_redirects, self.skipped_effect_refs = [], set()
-        self.refuse_next, self.fail_backend_list = 0, set()
+        self.refuse_next, self.refusal_attempts, self.fail_backend_list = 0, 0, set()
         self.policy, self.selection = config["policy"], config["selection"]
         self.ratio, self.rate, self.status_rate, self.label_name = 1.2, 0.0, 0.0, ""
 
@@ -288,6 +288,14 @@ class PublicConnections:
                 legal.add(backend)
         return legal
 
+    def expire_refusal(self, boundary):
+        """Drop an engine-relative arm only when this engine had no eligible attempt."""
+        if not self.refuse_next:
+            return
+        require(self.refusal_attempts == 0, "EFFECT_LEDGER",
+                f"one-shot refusal survived {self.refusal_attempts} eligible attempts before {boundary}")
+        self.refuse_next = 0
+
     def _force_close_effects(self, event, due, refuse_next):
         """Resolve input-defined deadlines against this engine's public owners.
 
@@ -316,16 +324,21 @@ class PublicConnections:
         if event.get("refuse_next", 0):
             require(self.refuse_next == 0, "EFFECT_LEDGER", "one-shot refusal armed while one is pending")
             self.refuse_next = event["refuse_next"]
+            self.refusal_attempts = 0
         if event["op"] == "config" and row["outcome"] == "ok":
             try:
                 document = tomllib.loads(event["toml"])
             except tomllib.TOMLDecodeError as error:
                 raise Difference(f"INPUT: accepted config cannot be parsed: {error}") from error
             proxy = document.get("proxy", {})
+            if event.get("refuse_next", 0):
+                require(isinstance(proxy.get("fail-backend-list"), list)
+                        and bool(proxy["fail-backend-list"]), "INPUT",
+                        "config refusal arm requires a nonempty failover list")
             if "fail-backend-list" in proxy:
                 self.fail_backend_list = set(proxy["fail-backend-list"])
-                require(self.fail_backend_list or self.refuse_next == 0, "EFFECT_LEDGER",
-                        "one-shot refusal was not consumed before failover clear")
+                if not self.fail_backend_list:
+                    self.expire_refusal("failover clear")
             balance = document.get("balance", {})
             self.policy = balance.get("policy", self.policy) or "resource"
             self.selection = balance.get("routing-policy", self.selection) or "prefer-idle"
@@ -585,8 +598,9 @@ class PublicConnections:
             self.logical_to_actual.pop(event["session"], None)
         elif op == "tick" and self.refuse_next:
             refused = {self.logical_to_actual.get(item, item) for item in event.get("refuse", [])}
-            consumed = [effect for effect in row.get("effects", [])
-                        if effect["session"] not in refused and not effect["accepted"]]
+            eligible = [effect for effect in row.get("effects", []) if effect["session"] not in refused]
+            self.refusal_attempts += len(eligible)
+            consumed = [effect for effect in eligible if not effect["accepted"]]
             require(len(consumed) <= 1, "EFFECT_LEDGER", "one-shot refusal was consumed more than once")
             if consumed:
                 self.refuse_next = 0
@@ -712,6 +726,7 @@ def observe(trace, rows, engine):
         connections.apply(event, row, session, operation, index, prepared=True)
     unsettled = [key for key,effect in operations.items()
                  if effect["accepted"] and key not in settled]
+    connections.expire_refusal("trace end")
     require(not ledger and not pending and not unsettled
             and not connections.pending and not connections.assigned
             and not connections.redirects and not connections.unbound_redirects

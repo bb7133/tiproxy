@@ -298,16 +298,21 @@ global one-shot control. For `failover_select`, the latter is projected as
 control, rather than on the later tick where Go happened to consume it. Each adapter
 therefore rejects its own first non-session-refused Redirect or ForceClose attempt
 in that failover window, even when legal engine-relative cadence moves the attempt
-to another tick or session. Empty ticks retain the control; a second arm, a failover
-clear, or trace end while it remains pending fails closed. The concrete consuming
-effect is archived only to prove unique consumption and its internal marker never
-appears in Go output rows. Older tick-level `refuse_next` inputs remain replayable,
-but a config arm and legacy tick arm cannot overlap. More than one consumption in a
-tick is invalid. If one session both accepts and rejects effects for reasons that
-cannot be represented by these inputs, the attempt is incomplete. The failover
-validator still requires the recorded rejected redirect to originate from the
-checkpoint-selected failed backend; an unrelated earlier migration makes that
-attempt incomplete rather than weakening the intended outcome.
+to another tick or session. Empty ticks retain the control and a second arm fails
+closed. The recorder is strict: its selected Go window must consume the arm before
+clear/end or the attempt is incomplete. A replay engine can legitimately own no
+connection on the recording-selected backend; at clear/end it may expire a pending
+arm only after explicitly proving that it issued zero non-session-refused attempts
+since the arm. Any such attempt necessarily consumes the arm, so a positive attempt
+count with a pending arm fails closed. The concrete consuming effect is archived
+only to prove unique consumption and its internal marker never appears in Go output
+rows. Older tick-level `refuse_next` inputs remain replayable, but a config arm and
+legacy tick arm cannot overlap. More than one consumption in a tick is invalid. If
+one session both accepts and rejects effects for reasons that cannot be represented
+by these inputs, the attempt is incomplete. The failover validator still requires
+the recorded rejected redirect to originate from the checkpoint-selected failed
+backend; an unrelated earlier migration makes that attempt incomplete rather than
+weakening the intended outcome.
 
 Each recorded accepted redirect receives a stable logical reference
 `redirect/<ordinal>`. For an ordinary callback, the input's logical session is first

@@ -31,9 +31,32 @@ struct ClientEffects {
     ordinals: BTreeMap<String, u64>,
     refused: BTreeSet<String>,
     refuse_next: u64,
+    refusal_attempts: u64,
     offered: Vec<(Value, MigrationCommand)>,
 }
 impl ClientEffects {
+    fn arm_refusal(&mut self, refusal: u64, index: usize) {
+        assert_eq!(refusal, 1, "one-shot refusal input at event {index}");
+        assert_eq!(
+            self.refuse_next, 0,
+            "one-shot refusal armed while one is pending at event {index}"
+        );
+        self.refuse_next = refusal;
+        self.refusal_attempts = 0;
+    }
+
+    fn expire_refusal(&mut self, boundary: &str, index: usize) {
+        if self.refuse_next == 0 {
+            return;
+        }
+        assert_eq!(
+            self.refusal_attempts, 0,
+            "one-shot refusal survived {} eligible attempts before {boundary} at event {index}",
+            self.refusal_attempts
+        );
+        self.refuse_next = 0;
+    }
+
     fn accept(&mut self, command: &MigrationCommand) -> bool {
         let (kind, from, to) = match command {
             MigrationCommand::Redirect(r) => ("redirect", r.from(), r.to().backend_id.as_str()),
@@ -44,6 +67,7 @@ impl ClientEffects {
         *ordinal += 1;
         let mut refused = self.refused.contains(id);
         if !refused && self.refuse_next > 0 {
+            self.refusal_attempts += 1;
             self.refuse_next -= 1;
             refused = true;
         }
@@ -307,13 +331,7 @@ async fn replay() -> TestResult {
             "config" => {
                 let refusal = event["refuse_next"].as_u64().unwrap_or(0);
                 if refusal > 0 {
-                    assert_eq!(refusal, 1, "one-shot refusal input at event {index}");
-                    let mut client = must(effects.lock());
-                    assert_eq!(
-                        client.refuse_next, 0,
-                        "one-shot refusal armed while one is pending at event {index}"
-                    );
-                    client.refuse_next = refusal;
+                    must(effects.lock()).arm_refusal(refusal, index);
                 }
                 let prior_backend_clusters = h.source.store.current().topology()?.backend_clusters;
                 if h.source
@@ -356,19 +374,22 @@ async fn replay() -> TestResult {
                     h.router
                         .refresh_failover(&candidate, now)
                         .map_err(|e| format!("failover config: {e:?}"))?;
-                    if h.source
+                    let failover_empty = h
+                        .source
                         .store
                         .current()
                         .effective()
                         .routing()?
                         .failed_backends
-                        .is_empty()
-                    {
-                        assert_eq!(
-                            must(effects.lock()).refuse_next,
-                            0,
-                            "one-shot refusal was not consumed before failover clear at event {index}"
+                        .is_empty();
+                    if refusal > 0 {
+                        assert!(
+                            !failover_empty,
+                            "config refusal arm requires a nonempty failover list at event {index}"
                         );
+                    }
+                    if failover_empty {
+                        must(effects.lock()).expire_refusal("failover clear", index);
                     }
                 }
             }
@@ -424,12 +445,7 @@ async fn replay() -> TestResult {
                         .collect();
                     let refusal = event["refuse_next"].as_u64().unwrap_or(0);
                     if refusal > 0 {
-                        assert_eq!(refusal, 1, "one-shot refusal input at event {index}");
-                        assert_eq!(
-                            client.refuse_next, 0,
-                            "one-shot refusal armed while one is pending at event {index}"
-                        );
-                        client.refuse_next = refusal;
+                        client.arm_refusal(refusal, index);
                     }
                 }
                 let candidate = h
@@ -553,10 +569,9 @@ async fn replay() -> TestResult {
         unbound_redirects.is_empty(),
         "trace must close or bind every accepted redirect"
     );
-    assert_eq!(
-        must(effects.lock()).refuse_next,
-        0,
-        "trace ended with an unconsumed one-shot refusal"
+    must(effects.lock()).expire_refusal(
+        "trace end",
+        trace["events"].as_array().ok_or("events")?.len(),
     );
     assert_eq!(
         known

@@ -24,6 +24,21 @@ def make_case():
             {"op": "finish", "session": session, "success": True},
         ]
     events += [
+        {"op": "health", "backends": [
+            {"address": "a", "labels": {}, "support_redirection": True},
+            {"address": "b", "labels": {}, "support_redirection": True},
+        ]},
+        # Every session is on A, so selecting B proves that a replay engine can
+        # have other live owners but zero attempts from the failed backend. Its
+        # explicit zero-attempt window expires at clear; the real recorder
+        # remains stricter and must consume its armed control.
+        {"op": "config", "refuse_next": 1,
+         "toml": "[proxy]\nfail-backend-list=[\"b\"]\nfailover-timeout=60\n"},
+        {"op": "tick"},
+        {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"},
+        {"op": "health", "backends": [
+            {"address": "a", "labels": {}, "support_redirection": True},
+        ]},
         {"op": "config", "refuse_next": 1,
          "toml": "[proxy]\nfail-backend-list=[\"a\"]\nfailover-timeout=60\n"},
         # The input control belongs to the whole failover window, not to the
@@ -48,6 +63,9 @@ def make_case():
                for session in "acde"]
     events += [
         {"op": "health", "at_nanos": 7, "backends": []},
+        {"op": "config", "at_nanos": 7, "refuse_next": 1,
+         "toml": "[proxy]\nfail-backend-list=[\"a\"]\nfailover-timeout=60\n"},
+        {"op": "tick", "at_nanos": 7},
         {"op": "checkpoint", "at_nanos": 7},
     ]
     trace = {

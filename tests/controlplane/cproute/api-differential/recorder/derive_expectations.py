@@ -254,6 +254,7 @@ class State:
         self.ref_operations = {}  # inverse map for already-relative recorder inputs
         self.accepted_redirects = 0
         self.refuse_next = 0  # global input control, carried until the next eligible effect attempt
+        self.refusal_attempts = 0  # non-session-refused attempts while that control is pending
         # group -> backend -> (input-derived rate or None when an engine-relative
         # owner made the retained rate unknowable, last scoring time)
         self.status_snapshots = {}
@@ -1434,6 +1435,7 @@ def derive(trace, rows, args):
             if state.refuse_next:
                 raise Refuse(f"seq {seq}: one-shot refusal armed while one is pending")
             state.refuse_next = event["refuse_next"]
+            state.refusal_attempts = 0
         if op == "health":
             state.apply_health(event.get("backends", []))
         elif op == "metrics":
@@ -1456,7 +1458,9 @@ def derive(trace, rows, args):
             if row["outcome"] == "ok":
                 state.apply_config(event.get("toml", ""))
                 if not state.fail_list and state.refuse_next:
-                    raise Refuse(f"seq {seq}: one-shot refusal was not consumed before failover clear")
+                    if state.refusal_attempts:
+                        raise Refuse(f"seq {seq}: one-shot refusal survived {state.refusal_attempts} eligible attempts before failover clear")
+                    state.refuse_next = 0
         elif op == "open":
             state.sessions[sid] = Session(sid, event)
         elif op == "next":
@@ -1528,6 +1532,14 @@ def derive(trace, rows, args):
             except _RUNNER.Difference as error:
                 raise Refuse(f"seq {seq}: {error}") from error
             connections_prepared = True
+            if state.refuse_next:
+                actual_refused = {
+                    state.recorded_connections.logical_to_actual.get(item, item)
+                    for item in refused
+                }
+                state.refusal_attempts += sum(
+                    effect["session"] not in actual_refused for effect in recorded
+                )
             metric_predicted = None
             if (state.support_redirection and state.metric_queries is not None
                     and state.policy in METRIC_POLICIES):
@@ -1720,7 +1732,13 @@ def derive(trace, rows, args):
             raise Refuse(f"seq {seq}: {error}") from error
         out_events.append(e)
     if state.refuse_next:
-        raise Refuse("one-shot refusal was not consumed before the end of the trace")
+        if state.refusal_attempts:
+            raise Refuse(f"one-shot refusal survived {state.refusal_attempts} eligible attempts before the end of the trace")
+        state.refuse_next = 0
+    try:
+        state.recorded_connections.expire_refusal("trace end")
+    except _RUNNER.Difference as error:
+        raise Refuse(str(error)) from error
     result = copy.deepcopy(trace)
     result["events"] = out_events
     metric_inputs = [e for e in events if e["op"] == "metrics"]

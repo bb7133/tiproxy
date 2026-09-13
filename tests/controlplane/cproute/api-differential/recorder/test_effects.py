@@ -87,10 +87,19 @@ class RelativeCloseTests(unittest.TestCase):
         with self.assertRaises(derive.Refuse):
             derive.derive(trace,rows,None)
 
-    def test_one_shot_refusal_without_an_eligible_effect_is_refused(self):
+    def test_one_shot_refusal_without_an_eligible_effect_expires_at_trace_end(self):
         trace, rows = example(B)
         trace["events"][5]["refuse_next"] = 1
-        with self.assertRaisesRegex(derive.Refuse, "one-shot refusal"):
+        derived, requires = derive.derive(trace, rows, None)
+        self.assertEqual(requires, [])
+        runner.observe(derived, rows, "zero-attempt")
+
+    def test_pending_one_shot_cannot_accept_the_first_eligible_attempt(self):
+        trace, rows = example(A)
+        trace["events"][5]["refuse_next"] = 1
+        with self.assertRaisesRegex(runner.Difference, "EFFECTS"):
+            runner.observe(trace, rows, "unconsumed-attempt")
+        with self.assertRaisesRegex(derive.Refuse, "force_close effects"):
             derive.derive(trace, rows, None)
 
     def test_accepted_close_survives_clear_and_reentry(self):
