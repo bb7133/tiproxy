@@ -413,9 +413,7 @@
       "at_nanos": 3300000002,
       "expect": {
         "outcome": "ok",
-        "force_close_due": [
-          "default/127.0.0.1:4001"
-        ]
+        "force_close_due": []
       }
     },
     {
@@ -821,9 +819,7 @@
       "at_nanos": 13300000002,
       "expect": {
         "outcome": "ok",
-        "force_close_due": [
-          "default/127.0.0.1:4001"
-        ]
+        "force_close_due": []
       }
     },
     {

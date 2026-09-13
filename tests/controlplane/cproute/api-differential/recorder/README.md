@@ -344,7 +344,10 @@ common comparator resolves each engine's own established owners, effect ordinals
 and accepted-close history, and composes closes after redirects in production order.
 Reservations are not established owners; refusal remains retryable and acceptance
 suppresses subsequent closes, including across clear/reentry, until the connection
-is closed. Independent session effects may commute.
+is closed. A backend can remain past its failover deadline without being due when
+its last established owner has already closed: Go removes the connection from the
+backend list in `OnConnClosed`, and the timeout worker can only act on connections
+still present in that list. Independent session effects may commute.
 
 The 86-event force-close smoke covers random and connection/prefer-idle choices,
 before/equal/after deadlines, unchanged activation, repeated refusal, acceptance,
@@ -353,7 +356,9 @@ expectations independently from each engine's public history and checks both out
 The 87-event keyspace variant enables redirection and changes only public whole
 health inputs: named versus legacy empty, then two distinct named keyspaces on
 refresh. Both real engines must still issue only the input-derived failover closes.
-The original 86-event scenario stays unchanged. Both variants require identical
+The original 86-event event sequence stays unchanged. Its reference predicates say
+that the cleanup tick after the final close has no due backend, while the immediately
+preceding tick with live owners remains due. Both variants require identical
 independently derived expectations and no unresolved dependencies.
 Counterexamples also force different legal owners and reject missing, early,
 duplicated or misdirected effects. These tests do not qualify recorded slots.

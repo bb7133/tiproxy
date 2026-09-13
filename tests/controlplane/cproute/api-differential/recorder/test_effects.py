@@ -94,6 +94,15 @@ class RelativeCloseTests(unittest.TestCase):
             derive.derive(trace, rows, None)
 
     def test_accepted_close_survives_clear_and_reentry(self):
+        live = runner.PublicConnections({"policy":"connection","selection":"random"})
+        live.apply({"op":"rehydrate","session":"s"},
+                   {"outcome":"ok","backend":A,"effects":[]})
+        accepted = [effect(A,1,True)]
+        self.assertEqual(live.force_close_effects({"op":"tick"}, [A]), accepted)
+        live.apply({"op":"tick"}, {"effects":accepted})
+        live.apply({"op":"close","session":"s"}, {"effects":[]})
+        self.assertEqual(live.force_close_effects({"op":"tick"}, [A]), [])
+
         trace, rows = example(A)
         ledger = runner.PublicConnections(trace["config"])
         for e,r in zip(trace["events"][:8], rows[:8]):
@@ -420,6 +429,20 @@ class RelativeCloseTests(unittest.TestCase):
                 self.assertTrue(a["support_redirection"] and b["support_redirection"])
                 self.assertNotEqual(a.get("keyspace",""),b.get("keyspace",""))
         runner.validate(trace)
+
+    def test_force_close_fixture_clears_due_after_the_last_owner_closes(self):
+        original = json.loads((ROOT.parent / "force-close-smoke.json").read_text())
+        for start, cleanup in ((33, 40), (75, 82)):
+            with self.subTest(start=start):
+                events = original["events"]
+                self.assertEqual(events[start]["expect"]["force_close_due"],
+                                 ["default/127.0.0.1:4001"])
+                self.assertEqual(events[start + 1]["op"], "checkpoint")
+                self.assertTrue(all(event["op"] == "close"
+                                    for event in events[start + 2:cleanup]))
+                self.assertEqual(len(events[start + 2:cleanup]), 5)
+                self.assertEqual(events[cleanup]["op"], "tick")
+                self.assertEqual(events[cleanup]["expect"]["force_close_due"], [])
 
     def test_constraint_schema_and_written_deadline_are_checked(self):
         trace, rows = example(A)
