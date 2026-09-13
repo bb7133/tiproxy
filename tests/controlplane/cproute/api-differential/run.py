@@ -209,8 +209,9 @@ class PublicConnections:
         self.ratio, self.rate, self.label_name = 1.2, 0.0, ""
 
     def prefer_idle(self, candidates):
-        require(self.policy == "connection" and self.selection == "prefer-idle" and not self.label_name,
-                "INPUT", "connection preference requires connection/prefer-idle without label isolation")
+        require(self.policy in {"connection", "resource", "location"}
+                and self.selection == "prefer-idle" and not self.label_name,
+                "INPUT", "connection-factor preference requires prefer-idle without label isolation")
         counts = Counter(self.pending.values()) + Counter(self.assigned.values())
         for effect in self.redirects.values():
             counts[effect["from"]] -= 1

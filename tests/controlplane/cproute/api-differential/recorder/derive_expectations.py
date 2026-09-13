@@ -24,8 +24,10 @@ Public semantics mirrored (file:line at the reviewed tree):
   (factor_balance.go:255-279); `prefer-idle` evicts by factor advice and is derivable
   from public inputs plus each engine's own public connection history for `connection`.
   Bounded two-backend Resource/prefer-idle choices and migration ticks are
-  derived from whole public CPU, memory and health metric packets; other
-  Resource/Location advice remains a policy-constraint.
+  derived from whole public CPU, memory and health metric packets. Resource/
+  Location prefer-idle also reduces to the public connection ledger when the
+  complete factor lifetime proves no CPU/memory data, only normal health, and
+  equal locality within the routed group; other advice remains a constraint.
 - failover guard is evaluated per group: the list is ignored for a group only when it would
   leave that group without a routeable backend (group.go:286-341); the timeout does not
   gate the marking (router.go:160-165, Healthy = observed && not in failover).
@@ -408,6 +410,17 @@ class State:
         self.health_query_updates = {key: None for key in ("failure_pd", "total_pd", "failure_tikv", "total_tikv")}
         self.health_query_results = {}
         self.health_snapshots = {}  # backend -> (updated ns, range, retained rate)
+        # Empty current CPU/memory results do not clear the real factor caches.
+        # Only qualify the no-data reduction when the complete lifetime since
+        # factor creation has been empty for both inputs.
+        self.metric_cpu_memory_history_empty = True
+        # A deliberately narrower invariant than the complete Resource model:
+        # when every health sample ever visible to the current metric-policy
+        # factors was normal, health cannot outrank the connection factor even
+        # after engine-relative retry exclusions. Once disproved, keep it
+        # false until the factors are recreated; a later packet may have first
+        # been consumed by a different candidate subset in each engine.
+        self.metric_health_history_neutral = True
 
     def apply_config(self, toml):
         old_policy = self.policy
@@ -456,6 +469,10 @@ class State:
     def apply_metrics(self, queries):
         self.metric_queries = copy.deepcopy(queries)
         self.metrics_observed |= any(result is not None and result["series"] for result in queries.values())
+        if self.policy in METRIC_POLICIES:
+            self.metric_cpu_memory_history_empty &= all(
+                queries[key] is None or not queries[key]["series"] for key in ("cpu", "memory"))
+            self.metric_health_history_neutral &= _public_health_packet_neutral(self)
 
     def update_failover(self):
         """group.go:286-341 per group; Healthy() = observed && not marked (router.go:160-165).
@@ -730,29 +747,100 @@ def prefer_local(state, legal):
     return local if local else legal
 
 
+def _metric_samples_for_backend(result, backend):
+    """Mirror QueryResult's first instance/optional-cluster match."""
+    if not backend.ip or type(backend.status_port) is not int or backend.status_port <= 0:
+        return None, None
+    instance = f"{backend.ip}:{backend.status_port}"
+    cluster = backend.cluster.strip() or "default"
+    for index, series in enumerate(result["series"]):
+        labels = series["labels"]
+        if labels.get("instance") != instance:
+            continue
+        if "tiproxy_cluster" in labels and labels["tiproxy_cluster"] != cluster:
+            continue
+        return index, series["samples"]
+    return None, None
+
+
+def _public_health_packet_neutral(state):
+    """Whether the current public packet can only produce health score zero.
+
+    Missing rows are normal in FactorHealth. Duplicate instance ownership or
+    malformed samples are not used to qualify a trace: those cases keep the
+    policy constraint. This function is folded into a lifetime invariant by
+    State so an earlier non-zero snapshot cannot be forgotten merely because a
+    later routing call sees a different retry subset.
+    """
+    if state.metric_queries is None:
+        return False
+    pairs = (("failure_pd", "total_pd", 0.5),
+             ("failure_tikv", "total_tikv", 0.3))
+    for failure_key, total_key, threshold in pairs:
+        failure = state.metric_queries[failure_key]
+        total = state.metric_queries[total_key]
+        if failure is None or not failure["series"] or total is None or not total["series"]:
+            continue
+        if failure["kind"] != "vector" or total["kind"] != "vector":
+            return False
+        claimed_failure, claimed_total = set(), set()
+        for backend in state.backends.values():
+            if not backend.observed_healthy:
+                continue
+            failure_index, failure_samples = _metric_samples_for_backend(failure, backend)
+            total_index, total_samples = _metric_samples_for_backend(total, backend)
+            # FactorHealth treats either missing sample as the normal range.
+            if not failure_samples or not total_samples:
+                continue
+            if failure_index in claimed_failure or total_index in claimed_total:
+                return False
+            claimed_failure.add(failure_index)
+            claimed_total.add(total_index)
+            failure_values = _samples(failure_samples, True)
+            total_values = _samples(total_samples, True)
+            if (failure_values is None or total_values is None
+                    or failure_values[0][1] < 0 or total_values[0][1] < 0
+                    or _health_range(failure_values[0][1], total_values[0][1], threshold) != 0):
+                return False
+    return True
+
+
+def metric_prefer_idle_is_connection_only(state, legal):
+    """Prove a bounded metric-policy route reduces to locality + ConnCount.
+
+    The recording environment intentionally discloses CPU/memory no-data. If
+    every health value throughout the current factor lifetime is also normal
+    and every candidate has the same locality, status/location/health/memory/
+    CPU scores are equal. Prefer-idle therefore applies exactly the public
+    connection factor, including each engine's own retry exclusions.
+    """
+    if (state.policy not in METRIC_POLICIES or state.selection != "prefer-idle"
+            or state.metric_queries is None or state.recorded_connections.label_name):
+        return False
+    group = state.backends[legal[0]].group
+    whole_group = state.group_healthy(legal[0])
+    if (group is None or any(state.backends[bid].group != group for bid in legal)
+            or len({state.backends[bid].local for bid in whole_group}) != 1):
+        return False
+    if not state.metric_cpu_memory_history_empty:
+        return False
+    state.metric_health_history_neutral &= _public_health_packet_neutral(state)
+    return state.metric_health_history_neutral
+
+
 def _metric_rows(state, result, legal, kind):
     """Resolve the exact public instance rows used by QueryResult helpers."""
     if result["kind"] != kind:
         return None
-    by_instance = {}
-    for series in result["series"]:
-        labels = series["labels"]
-        if set(labels) != {"instance"} or labels["instance"] in by_instance:
-            return None
-        by_instance[labels["instance"]] = series["samples"]
     rows, claimed = {}, set()
     for bid in legal:
         backend = state.backends[bid]
-        if (not backend.ip or type(backend.status_port) is not int
-                or backend.status_port <= 0):
+        index, samples = _metric_samples_for_backend(result, backend)
+        if index is None or not samples:
             return None
-        instance = f"{backend.ip}:{backend.status_port}"
-        if instance in claimed:
+        if index in claimed:
             return None  # one public metric row cannot prove two backend identities
-        claimed.add(instance)
-        samples = by_instance.get(instance)
-        if not samples:
-            return None
+        claimed.add(index)
         rows[bid] = samples
     return rows
 
@@ -1207,11 +1295,22 @@ def derive_next(state, session, expect):
     else:
         legal = legal_go
     if state.selection == "prefer-idle":
+        connection_only = (state.policy in METRIC_POLICIES
+                           and metric_prefer_idle_is_connection_only(state, legal_go))
+        if connection_only:
+            # The higher-priority metric factors are publicly proven equal.
+            # Keep the full candidate set in the expectation so each engine
+            # applies its own complete retry cycle and public connection
+            # history; Go's row is checked with the same predicate here.
+            legal, _ = state.candidates(session)
+            expect["exclude_history"] = True
+            expect["prefer_idle_conn"] = True
+            legal_go = sorted(state.recorded_connections.prefer_idle(legal_go))
         # factor_balance.go:287-345 evicts a candidate when a higher-priority factor advises
         # migration. Under `location` the location factor precedes every metric factor, so a
         # remote candidate is evicted whenever a local one exists — deterministic from inputs.
         # Every other eviction (conn-count, health/memory/cpu) is not derivable: constraint.
-        if state.policy == "location":
+        elif state.policy == "location":
             if session.relative_history:
                 expect["prefer_local"] = sorted(b for b in legal if state.backends[b].local)
             else:
@@ -1224,7 +1323,7 @@ def derive_next(state, session, expect):
             expect["exclude_history"] = True
             expect["prefer_idle_conn"] = True
             legal_go = sorted(state.recorded_connections.prefer_idle(legal_go))
-        elif state.policy == "resource":
+        elif state.policy == "resource" and not connection_only:
             modeled = resource_metrics_preferred(state, session, legal_go)
             if modeled is None:
                 if len(legal) > 1:
@@ -1233,7 +1332,7 @@ def derive_next(state, session, expect):
                         state.requires.add("metrics-input")
             else:
                 legal = legal_go = modeled
-        elif len(legal) > 1:
+        elif not connection_only and len(legal) > 1:
             state.requires.add(f"policy-constraint:{state.policy}/prefer-idle")
             if state.policy in METRIC_POLICIES and state.metrics_observed:
                 state.requires.add("metrics-input")
