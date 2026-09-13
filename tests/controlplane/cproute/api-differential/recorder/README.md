@@ -315,7 +315,10 @@ settlement path separately for Go and Rust.
 
 The scripted close used by the delayed-callback probe is strict and carries the
 same reference as its following callback. It must bind an outstanding effect;
-closing that concrete connection swaps logical close handles, so the remaining
+when its logical session has no outstanding effect, the engine must have exactly
+one global unbound redirect. Multiple global candidates are ambiguous and fail
+closed rather than letting output order choose the handle. Closing the uniquely
+identified concrete connection swaps logical close handles, so the remaining
 scripted closes still settle every engine's live connection exactly once. A stale
 strict reference fails the common ledger.
 

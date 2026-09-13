@@ -280,6 +280,37 @@ class ConnectionPreferenceTests(unittest.TestCase):
         h.apply({"op": "close", "session": "b"}, {})
         self.assertEqual(h.unbound_redirects, [])
 
+    def test_strict_relative_close_rejects_multiple_global_candidates(self):
+        h = self.history()
+        for sid in ("logical", "a", "b"):
+            self.reserve(h, sid, "source", True)
+        for sid in ("a", "b"):
+            redirect = {"kind": "redirect", "session": sid, "operation": f"{sid}/1",
+                        "from": "source", "to": "target", "accepted": True}
+            h.apply({"op": "tick"}, {"effects": [redirect]})
+
+        close = {"op": "close", "session": "logical", "effect_ref": "redirect/1"}
+        with self.assertRaisesRegex(runner.Difference, "ambiguous strict relative effect"):
+            h.resolve_event(close)
+        self.assertEqual([effect["operation"] for effect in h.unbound_redirects],
+                         ["a/1", "b/1"])
+
+    def test_strict_relative_close_swaps_handles_for_one_global_candidate(self):
+        h = self.history()
+        for sid in ("logical", "actual"):
+            h.apply({"op": "open", "session": sid}, {})
+            self.reserve(h, sid, "source", True)
+        redirect = {"kind": "redirect", "session": "actual", "operation": "actual/1",
+                    "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [redirect]})
+
+        close = {"op": "close", "session": "logical", "effect_ref": "redirect/1"}
+        self.assertEqual(h.resolve_event(close), "actual")
+        self.assertEqual(h.logical_to_actual, {"logical": "actual", "actual": "logical"})
+        callback = {"op": "redirect_result", "session": "logical",
+                    "effect_ref": "redirect/1", "success": True}
+        self.assertEqual(h.resolve_operation(callback), "actual/1")
+
     def test_failed_relative_callback_keeps_per_session_cooldown(self):
         h = self.history()
         self.reserve(h, "active", "a", True)

@@ -179,14 +179,17 @@ async fn replay() -> TestResult {
                     return Err("relative callback crossed sessions".into());
                 }
             } else if !skipped_effect_refs.contains(effect_ref) {
-                let position = unbound_redirects
-                    .iter()
-                    .position(|operation| {
-                        operations
-                            .get(operation)
-                            .is_some_and(|(session, _, _)| session == &logical_actual)
-                    })
-                    .or_else(|| (op == "close" && !unbound_redirects.is_empty()).then_some(0));
+                let mut position = unbound_redirects.iter().position(|operation| {
+                    operations
+                        .get(operation)
+                        .is_some_and(|(session, _, _)| session == &logical_actual)
+                });
+                if position.is_none() && op == "close" && !unbound_redirects.is_empty() {
+                    if unbound_redirects.len() != 1 {
+                        return Err("ambiguous strict relative effect".into());
+                    }
+                    position = Some(0);
+                }
                 if let Some(position) = position {
                     resolved_operation = unbound_redirects
                         .remove(position)

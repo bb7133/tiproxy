@@ -296,6 +296,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 				}
 			}
 			if position < 0 && event.Op == "close" && len(unboundRedirects) > 0 {
+				require.Len(t, unboundRedirects, 1, "ambiguous strict relative effect at seq=%d effect_ref=%s", index, event.EffectRef)
 				position = 0
 			}
 			if referenced == nil && !alreadySkipped && position >= 0 {

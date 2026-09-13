@@ -365,7 +365,13 @@ class PublicConnections:
                          if effect["session"] == actual), None)
         if position is None and event["op"] == "close" and self.unbound_redirects:
             # The strict delayed close establishes which engine-local session
-            # the recording's logical close handle denotes.
+            # the recording's logical close handle denotes only when the public
+            # ledger identifies one possible engine-local redirect. Choosing
+            # between multiple sessions would let output order steer the handle
+            # swap and could turn either a real mismatch or a mutation into a
+            # false pass.
+            require(len(self.unbound_redirects) == 1, "EFFECT_LEDGER",
+                    f"ambiguous strict relative effect {effect_ref}")
             position = 0
         if position is not None:
             effect = self.unbound_redirects.pop(position)
