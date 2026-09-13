@@ -1,0 +1,123 @@
+[
+ {
+  "at_ms": 20000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 30000,
+  "kind": "env",
+  "args": [
+   "tidb-stop",
+   "3",
+   "kill"
+  ]
+ },
+ {
+  "at_ms": 30001,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 100000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 100001,
+  "kind": "env",
+  "args": [
+   "tidb-start",
+   "3"
+  ]
+ },
+ {
+  "at_ms": 100002,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 105000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 110000,
+  "kind": "env",
+  "args": [
+   "tidb-stop",
+   "0",
+   "kill"
+  ]
+ },
+ {
+  "at_ms": 110000,
+  "kind": "env",
+  "args": [
+   "tidb-stop",
+   "1",
+   "kill"
+  ]
+ },
+ {
+  "at_ms": 110000,
+  "kind": "env",
+  "args": [
+   "tidb-stop",
+   "2",
+   "kill"
+  ]
+ },
+ {
+  "at_ms": 110000,
+  "kind": "env",
+  "args": [
+   "tidb-stop",
+   "3",
+   "kill"
+  ]
+ },
+ {
+  "at_ms": 110001,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 180000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 180001,
+  "kind": "env",
+  "args": [
+   "tidb-start",
+   "0"
+  ]
+ },
+ {
+  "at_ms": 180001,
+  "kind": "env",
+  "args": [
+   "tidb-start",
+   "1"
+  ]
+ },
+ {
+  "at_ms": 180001,
+  "kind": "env",
+  "args": [
+   "tidb-start",
+   "2"
+  ]
+ },
+ {
+  "at_ms": 180001,
+  "kind": "env",
+  "args": [
+   "tidb-start",
+   "3"
+  ]
+ },
+ {
+  "at_ms": 180002,
+  "kind": "await_env"
+ },
+ {
+  "at_ms": 190000,
+  "kind": "checkpoint"
+ }
+]
