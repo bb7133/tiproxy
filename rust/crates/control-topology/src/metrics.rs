@@ -89,8 +89,9 @@ pub struct QueryResult {
     /// Original result order (duplicate matching series use the first).
     pub series: Vec<Series>,
     /// Reader update time in Unix nanoseconds, independent of millisecond samples.
+    /// `None` is Go's year-one zero time; `Some(0)` is the Unix epoch.
     /// Keep sub-millisecond changes: Go factors compare exact update times.
-    pub updated_nanos: i64,
+    pub updated_nanos: Option<i64>,
 }
 
 impl QueryResult {

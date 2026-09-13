@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use control_config::{ConfigNamespaceSource, RoutingConfig, RoutingRule, RoutingSelectionPolicy};
+use control_config::{
+    ConfigNamespaceSource, RoutingBalancePolicy, RoutingConfig, RoutingRule, RoutingSelectionPolicy,
+};
 use control_plane::ModuleContext;
 use control_routing::group::{ClientInfo, GroupMatcher, MatchType, PortRoutes};
 use control_routing::{RouteAssignment, RouteCode};
@@ -38,6 +40,7 @@ struct Backend {
     routing_identity: RoutingIdentity,
     account: Arc<AccountIdentity>,
     healthy: bool,
+    supports_redirection: bool,
     group: Option<u64>,
     failover_since: Option<Instant>,
 }
@@ -58,6 +61,8 @@ struct State {
     ports: PortRoutes<u64>,
     next_group: u64,
     observed: Option<(Arc<RoutingSnapshot>, Arc<HealthSnapshot>)>,
+    server_version: String,
+    supports_redirection: bool,
 }
 
 #[cfg(test)]
@@ -77,6 +82,8 @@ type RedirectOfferBarrier = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Recei
 /// Replacing/removing this router's namespace rejects new work; already minted
 /// reservations can still settle their original accounting owner.
 pub struct Router {
+    #[cfg(test)]
+    replay_wall: Mutex<Option<i64>>,
     factors_enabled: bool,
     metrics: Option<control_topology::MetricOverlayHandle>,
     sources: Sources,
@@ -105,6 +112,8 @@ impl Router {
         max_sessions: usize,
     ) -> Result<Self, RouteError> {
         Ok(Self {
+            #[cfg(test)]
+            replay_wall: Mutex::new(None),
             factors_enabled: false,
             metrics: None,
             sources: Sources::new(source, topology, context, namespace)?,
@@ -123,6 +132,8 @@ impl Router {
                 ports: PortRoutes::default(),
                 next_group: 1,
                 observed: None,
+                server_version: String::new(),
+                supports_redirection: true,
             }),
         })
     }
@@ -145,6 +156,28 @@ impl Router {
         router.factors_enabled = true;
         router.metrics = metrics;
         Ok(router)
+    }
+
+    /// Test-only public event time; it carries no query, factor or ledger state.
+    #[cfg(test)]
+    pub(crate) fn set_replay_wall(&self, now: i64) {
+        *self
+            .replay_wall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(now);
+    }
+
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn wall_now(&self) -> Result<i64, RouteError> {
+        #[cfg(test)]
+        if let Some(now) = *self
+            .replay_wall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return Ok(now);
+        }
+        now_nanos()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -220,6 +253,48 @@ impl Router {
         state.ledger.open().map_err(Into::into)
     }
 
+    /// Looks up a known assignment without selecting or charging a connection.
+    /// Retained unhealthy backends remain addressable while they own sessions.
+    /// # Errors
+    /// Returns source/admission errors or `NoBackend` for an unknown identity.
+    pub fn lookup_backend(&self, id: &str) -> Result<RouteAssignment, RouteError> {
+        let candidate = self.capture()?;
+        let mut state = self.lock();
+        self.sources.validate(&candidate)?;
+        state.refresh(&candidate)?;
+        let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
+        let result = assignment(&backend.source, candidate.health.get(id).local);
+        self.sources.validate(&candidate)?;
+        Ok(result)
+    }
+
+    /// Restores an existing connection onto its named backend without selection.
+    /// The supplied session must be idle. The whole charge and activation is
+    /// atomic; duplicate restoration cannot charge an already active session.
+    /// # Errors
+    /// Returns source/session errors or `NoBackend` for an unknown or ungrouped backend.
+    pub fn rehydrate(&self, session: &Session, id: &str) -> Result<RouteAssignment, RouteError> {
+        let candidate = self.capture()?;
+        let mut state = self.lock();
+        self.sources.validate(&candidate)?;
+        state.refresh(&candidate)?;
+        if state.ledger.pending(session)?.is_some() {
+            return Err(RouteError::AlreadyActive);
+        }
+        let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
+        // Known healthy metadata does not imply group ownership. Go refuses
+        // restoration until valid routing labels have admitted this backend.
+        backend.group.ok_or(RouteError::NoBackend)?;
+        let account = Arc::clone(&backend.account);
+        let result = assignment(&backend.source, candidate.health.get(id).local);
+        self.sources.validate(&candidate)?;
+        let reservation = state.ledger.reserve(session, &account, result)?;
+        let result = reservation.assignment().clone();
+        let settled = state.ledger.finish(&reservation, true);
+        debug_assert_eq!(settled, Settlement::Applied);
+        Ok(result)
+    }
+
     /// Captures candidate C/R/H inputs without retaining authority.
     ///
     /// # Errors
@@ -268,12 +343,19 @@ impl Router {
     ) -> Result<Reservation, RouteError> {
         let mut state = self.lock();
         self.sources.validate(candidate)?;
+        if let Some(error) = candidate.health.observer_error() {
+            return Err(error.into());
+        }
         if let Some(pending) = state.ledger.pending(session)? {
             return Ok(pending);
         }
         state.refresh(candidate)?;
         let group = state.factor_group(candidate, client, listener_port)?;
-        if self.factors_enabled && candidate.config.resource_incarnation().enabled() {
+        // Connection routing must also update Status history. A healthy-only
+        // Route call can clear/prune a rate later consumed by migration.
+        if candidate.policy.balance_policy == RoutingBalancePolicy::Connection
+            || (self.factors_enabled && candidate.config.resource_incarnation().enabled())
+        {
             return self.reserve_factors(&mut state, session, candidate, group, excluded, ticket);
         }
         let mut choices = state.routeable(group, &candidate.policy, excluded);
@@ -311,11 +393,14 @@ impl Router {
             crate::authority::MetricInputs::StaticEmpty => None,
             crate::authority::MetricInputs::Dynamic(snapshot) => snapshot.as_deref(),
         };
-        let now = now_nanos()?;
+        let now = self.wall_now()?;
         let mut select = |metrics: Option<&control_topology::MetricSnapshot>,
                           queries: &crate::factors::Queries| {
             self.sources.validate(candidate)?;
             let inputs = state.resource_inputs(group, candidate, excluded);
+            if inputs.is_empty() {
+                return Err(RouteError::NoBackend);
+            }
             let mut factors = state.prepare_factors(
                 group,
                 metrics,
@@ -325,6 +410,10 @@ impl Router {
             let report = factors
                 .core
                 .evaluate(&inputs, &candidate.policy, queries, now);
+            self.sources.validate(candidate)?;
+            // Scoring happens even when every scored backend is rejected by
+            // a factor. Persist only after the source and metric fences hold.
+            state.factors.insert(group, factors);
             let id = report
                 .choice(candidate.policy.selection_policy, ticket)
                 .ok_or(RouteError::NoBackend)?;
@@ -335,7 +424,6 @@ impl Router {
             // the effect, under this same lock and (when present) metric fence.
             self.sources.validate(candidate)?;
             let reserved = state.ledger.reserve(session, &identity, assignment)?;
-            state.factors.insert(group, factors);
             Ok(reserved)
         };
         // Keep the test barrier after reading data and before its final fence.
@@ -566,6 +654,34 @@ impl Router {
     /// Closing twice or closing a foreign session has no effect.
     pub fn close(&self, session: &Session) -> Settlement {
         self.lock().ledger.close(session)
+    }
+
+    /// Number of currently healthy backends, independent of matching groups.
+    /// An unavailable source reports zero, as Go's observer-error path does.
+    #[must_use]
+    pub fn healthy_backend_count(&self) -> usize {
+        let Ok(candidate) = self.capture() else {
+            return 0;
+        };
+        if candidate.health.observer_error().is_some() {
+            return 0;
+        }
+        let mut state = self.lock();
+        if self.sources.validate(&candidate).is_err() || state.refresh(&candidate).is_err() {
+            return 0;
+        }
+        state
+            .backends
+            .values()
+            .filter(|backend| backend.healthy && backend.failover_since.is_none())
+            .count()
+    }
+
+    /// The last nonempty version observed from a healthy backend. When a round
+    /// contains several versions either engine may retain any observed version.
+    #[must_use]
+    pub fn server_version(&self) -> String {
+        self.lock().server_version.clone()
     }
 
     /// Observes accounting for the currently retained owner of an opaque ID.
@@ -833,20 +949,37 @@ impl State {
         choices
     }
 
-    fn refresh(&mut self, candidate: &Candidate) -> Result<(), RouteError> {
-        if self.observed.as_ref().is_some_and(|(r, h)| {
-            Arc::ptr_eq(r, &candidate.routing) && Arc::ptr_eq(h, &candidate.health)
-        }) {
-            return Ok(());
-        }
+    fn refresh_backend_metadata(&mut self, candidate: &Candidate) -> Result<(), RouteError> {
+        let incoming: BTreeSet<&str> = candidate
+            .routing
+            .backends
+            .backends
+            .iter()
+            .map(|source| source.backend_id.as_ref())
+            .collect();
+        // Removed backends keep their last capability until this health update
+        // prunes them; Go includes those retained wrappers in the same round.
+        self.supports_redirection = self
+            .backends
+            .iter()
+            .filter(|(id, _)| !incoming.contains(id.as_ref()))
+            .all(|(_, backend)| backend.supports_redirection);
         for backend in self.backends.values_mut() {
             backend.healthy = false;
         }
+        let mut server_version = None;
         for source in &candidate.routing.backends.backends {
-            let healthy = candidate.health.get(&source.backend_id).healthy;
+            let health = candidate.health.get(&source.backend_id);
+            let healthy = health.healthy;
+            let supports_redirection = candidate.health.supports_redirection(&source.backend_id);
+            self.supports_redirection &= supports_redirection;
+            if healthy {
+                server_version = health.server_version;
+            }
             if let Some(backend) = self.backends.get_mut(&source.backend_id) {
                 backend.source = source.clone();
                 backend.healthy = healthy;
+                backend.supports_redirection = supports_redirection;
             } else if healthy {
                 let account = self.ledger.add_account()?;
                 self.backends.insert(
@@ -856,16 +989,30 @@ impl State {
                         routing_identity: RoutingIdentity::new(&source.backend.addr),
                         account,
                         healthy,
+                        supports_redirection,
                         group: None,
                         failover_since: None,
                     },
                 );
             }
         }
+        if let Some(version) = server_version.filter(|version| !version.is_empty()) {
+            self.server_version = version;
+        }
         // An outstanding reservation retains its original owner even if the
         // backend disappears, changes material epoch, or becomes unhealthy.
         self.backends
             .retain(|_, backend| backend.healthy || !self.ledger.prune(&backend.account));
+        Ok(())
+    }
+
+    fn refresh(&mut self, candidate: &Candidate) -> Result<(), RouteError> {
+        if self.observed.as_ref().is_some_and(|(r, h)| {
+            Arc::ptr_eq(r, &candidate.routing) && Arc::ptr_eq(h, &candidate.health)
+        }) {
+            return Ok(());
+        }
+        self.refresh_backend_metadata(candidate)?;
         let occupied: BTreeSet<u64> = self
             .backends
             .values()

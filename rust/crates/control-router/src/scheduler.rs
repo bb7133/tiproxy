@@ -36,15 +36,30 @@ impl From<ForceClose> for MigrationCommand {
         Self::ForceClose(value)
     }
 }
+#[cfg(test)]
+type CommandSink = Box<dyn Fn(&MigrationCommand) -> bool + Send + Sync>;
 pub(crate) struct CommandQueue {
     capacity: usize,
+    #[cfg(test)]
+    api_sink: Option<CommandSink>,
     entries: Mutex<VecDeque<MigrationCommand>>,
 }
 impl CommandQueue {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            #[cfg(test)]
+            api_sink: None,
             entries: Mutex::new(VecDeque::new()),
+        }
+    }
+    // Test-client acceptance at the command boundary, never internal selection.
+    #[cfg(test)]
+    pub(crate) fn with_api_sink(capacity: usize, sink: CommandSink) -> Self {
+        Self {
+            capacity,
+            entries: Mutex::new(VecDeque::new()),
+            api_sink: Some(sink),
         }
     }
     pub(crate) fn try_send(&self, command: impl Into<MigrationCommand>) -> Result<(), ()> {
@@ -52,7 +67,12 @@ impl CommandQueue {
         if entries.len() >= self.capacity {
             return Err(());
         }
-        entries.push_back(command.into());
+        let command = command.into();
+        #[cfg(test)]
+        if self.api_sink.as_ref().is_some_and(|sink| !sink(&command)) {
+            return Err(());
+        }
+        entries.push_back(command);
         Ok(())
     }
     #[cfg(test)]

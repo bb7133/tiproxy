@@ -1827,10 +1827,14 @@ func TestRouteAndRebalanceByPort(t *testing.T) {
 	tester := newRouterTester(t, bp)
 	tester.router.matchType = MatchPort
 	bp.backendToRoute = func(backends []policy.BackendCtx) policy.BackendCtx {
-		if len(backends) == 0 {
-			return nil
+		// This test needs an initial imbalance. Map iteration can otherwise
+		// distribute all ten connections evenly and leave nothing to migrate.
+		for _, backend := range backends {
+			if backend.ID() == "1" {
+				return backend
+			}
 		}
-		return backends[0]
+		return nil
 	}
 	bp.backendsToBalance = func(backends []policy.BackendCtx) (from policy.BackendCtx, to policy.BackendCtx, balanceCount float64, reason string, logFields []zapcore.Field) {
 		if len(backends) < 2 {

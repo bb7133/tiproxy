@@ -14,6 +14,7 @@ import live
 ROUTER = "crates/control-router/src/"
 TOPOLOGY = "crates/control-topology/src/"
 RESOURCE = ROUTER + "factors/window.rs"
+TIME = ROUTER + "factors/resource.rs"
 PHASES = ROUTER + "factors/phases.rs"
 FACTORS = ROUTER + "factors.rs"
 SELECTOR = ROUTER + "selector.rs"
@@ -50,7 +51,7 @@ def main():
         ("cpu-snapshot-count-includes-pending", RESOURCE, "connections: input.physical(),", "connections: input.score_count(),", "core", "cpu-pending-active-only-snapshot", "FACTOR_"),
         ("cpu-extrapolation-excludes-pending", RESOURCE, "input.score_count().difference(value.connections)", "input.physical().difference(value.connections)", "core", "cpu-pending-active-only-snapshot", "FACTOR_"),
         ("cpu-idle-estimate-reset", RESOURCE, "per = self.usage_per_conn;", "per = 0.001;", "core", "cpu-idle-per-connection-reuse", "FACTOR_"),
-        ("strict-expiry", RESOURCE, "* 1_000_000_000 < i128::from(now)", "* 1_000_000_000 <= i128::from(now)", "core", "cpu-global-expiry-strict", "FACTOR_"),
+        ("strict-expiry", TIME, "* 1_000_000_000 < nanos(now)", "* 1_000_000_000 <= nanos(now)", "core", "cpu-global-expiry-strict", "FACTOR_"),
         ("cpu-per-sample-expiry", RESOURCE, "v.time.expired(now, 120)", "query.time().expired(now, 120)", "core", "two-cluster-global-fresh-stale-cache", "FACTOR_"),
         ("cpu-equal-sample-replaced", RESOURCE, "!old.before(time)", "old != time && !old.before(time)", "core", "cpu-equal-sample-time-keeps-cache", "FACTOR_"),
         ("cpu-empty-keeps-score", RESOURCE, "let Some(query) = window.query(QueryId::Cpu)?.filter(|q| !q.empty()) else {\n            return Ok(false);", "let Some(query) = window.query(QueryId::Cpu)?.filter(|q| !q.empty()) else {\n            return Ok(true);", "core", "cpu-empty-contributes-zero", "FACTOR_"),

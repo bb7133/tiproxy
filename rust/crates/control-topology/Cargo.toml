@@ -9,6 +9,8 @@ repository.workspace = true
 
 [features]
 default = []
+# External health/merged-query delivery for the API differential test adapter only.
+api-replay = []
 
 [dependencies]
 control-config.workspace = true

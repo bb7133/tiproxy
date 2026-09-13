@@ -216,7 +216,7 @@ pub fn decode_prometheus(
     let mut result = QueryResult {
         kind,
         series,
-        updated_nanos,
+        updated_nanos: Some(updated_nanos),
     };
     result.attach_cluster(cluster);
     Ok(result)

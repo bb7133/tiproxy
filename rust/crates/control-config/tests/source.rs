@@ -479,6 +479,41 @@ addr = "127.0.0.1:7000"
 }
 
 #[test]
+fn routing_rule_update_is_accepted_for_future_router_construction() {
+    let store = ConfigNamespaceStore::from_toml(&[], None, current_dir())
+        .unwrap_or_else(|error| unreachable!("initial config: {error}"));
+    let initial = store.current();
+    store
+        .apply_toml(
+            b"[balance]\nrouting-rule = 'proxy_cidr'\n",
+            None,
+            2,
+            current_dir(),
+        )
+        .unwrap_or_else(|error| unreachable!("accepted rule: {error}"));
+    let accepted = store.current();
+    assert!(accepted.generation() > initial.generation());
+    assert_eq!(
+        accepted
+            .effective()
+            .routing()
+            .map(|policy| policy.routing_rule),
+        Ok(RoutingRule::ProxyCidr)
+    );
+    assert!(
+        store
+            .apply_toml(
+                b"[balance]\nrouting-rule = 'invalid'\n",
+                None,
+                3,
+                current_dir()
+            )
+            .is_err()
+    );
+    assert_eq!(store.current(), accepted);
+}
+
+#[test]
 fn ns_servers_are_normalized_sorted_stably_with_duplicates_preserved() {
     let build = |list: &str| {
         let toml = format!(

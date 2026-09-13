@@ -247,7 +247,7 @@ async fn read_prom(
         }
         let mut result = last?;
         result.attach_cluster(cluster);
-        result.updated_nanos = now_nanos()?;
+        result.updated_nanos = Some(now_nanos()?);
         results.insert(rule, result);
     }
     Ok(results)

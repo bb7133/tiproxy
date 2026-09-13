@@ -56,6 +56,8 @@ fn shared_go_composition_observation() {
             ports: PortRoutes::default(),
             next_group: 1,
             observed: None,
+            server_version: String::new(),
+            supports_redirection: true,
         };
         for backend in array(&scenario["backends"]) {
             let id: Arc<str> = Arc::from(string(&backend["id"]));
@@ -81,6 +83,7 @@ fn shared_go_composition_observation() {
                     routing_identity: RoutingIdentity::new(addr),
                     account: must(state.ledger.add_account()),
                     healthy: backend["healthy"].as_bool().unwrap_or(false),
+                    supports_redirection: true,
                     group: Some(number(&backend["group"])),
                     failover_since: None,
                 },

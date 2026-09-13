@@ -61,7 +61,7 @@ impl Router {
         self.sources.validate(candidate)?;
         state.refresh(candidate)?;
         self.sources.validate(candidate)?;
-        state.update_failover(candidate, now);
+        state.update_failover(candidate, now, self.wall_now()?);
         Ok(())
     }
 
@@ -81,7 +81,7 @@ impl Router {
             return Ok(());
         }
         let groups: Vec<_> = state.groups.keys().copied().collect();
-        if redirects_enabled {
+        if redirects_enabled && state.supports_redirection {
             for group in &groups {
                 if stopped(stop) {
                     return Ok(());
@@ -225,9 +225,10 @@ impl State {
             .refuse_keyspace(now, record);
     }
 
-    fn update_failover(&mut self, candidate: &Candidate, now: Instant) {
+    fn update_failover(&mut self, candidate: &Candidate, now: Instant, wall: i64) {
         let mut effective = BTreeSet::new();
-        for group in self.groups.keys().copied() {
+        let groups: Vec<_> = self.groups.keys().copied().collect();
+        for group in groups {
             let inputs = self.factor_inputs(group, candidate);
             let routeable: Vec<_> = inputs
                 .iter()
@@ -239,6 +240,39 @@ impl State {
                         .routing_identity
                         .failed(&candidate.policy)
                 });
+            if candidate.policy.balance_policy == control_config::RoutingBalancePolicy::Connection {
+                // Group.UpdateFailover scores all observed healthy members,
+                // then the proposed mask, even when that mask is unchanged.
+                // These passes reset/refresh Status history before Balance.
+                let mut observed: Vec<_> = inputs
+                    .iter()
+                    .filter(|input| input.healthy)
+                    .cloned()
+                    .collect();
+                if !observed.is_empty() {
+                    let mut factors = self.prepare_factors(
+                        group,
+                        None,
+                        &observed,
+                        &candidate.config.resource_incarnation(),
+                    );
+                    let queries = crate::factors::Queries::new();
+                    factors
+                        .core
+                        .evaluate(&observed, &candidate.policy, &queries, wall);
+                    if !routeable.is_empty() {
+                        for input in &mut observed {
+                            input.healthy = !self.backends[&input.id]
+                                .routing_identity
+                                .failed(&candidate.policy);
+                        }
+                        factors
+                            .core
+                            .evaluate(&observed, &candidate.policy, &queries, wall);
+                    }
+                    self.factors.insert(group, factors);
+                }
+            }
             if !ignore {
                 effective.extend(
                     inputs

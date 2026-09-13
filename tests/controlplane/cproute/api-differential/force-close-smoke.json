@@ -1,0 +1,857 @@
+{
+  "version": 1,
+  "id": "relative-failover-close",
+  "config": {
+    "policy": "connection",
+    "selection": "random",
+    "rule": ""
+  },
+  "provenance": {
+    "kind": "synthetic",
+    "description": "Independent public owners, failover deadline and close acceptance; not a recorded qualifying slot"
+  },
+  "events": [
+    {
+      "op": "health",
+      "at_nanos": 0,
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {},
+          "support_redirection": false
+        },
+        {
+          "address": "127.0.0.1:4001",
+          "labels": {},
+          "support_redirection": false
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "random-0",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "random-0",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "random-0",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "random-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "random-1",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "random-1",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "random-2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "random-2",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "random-2",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "random-A",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "rehydrate",
+      "at_nanos": 0,
+      "session": "random-A",
+      "backend": "default/127.0.0.1:4000",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "random-B",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "rehydrate",
+      "at_nanos": 0,
+      "session": "random-B",
+      "backend": "default/127.0.0.1:4001",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "random-pending",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "random-pending",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 10,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4000\"]\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 500000000,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4000\"]\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1000000009,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": []
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1000000010,
+      "refuse": [
+        "random-0",
+        "random-1",
+        "random-2",
+        "random-A",
+        "random-B"
+      ],
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1000000010,
+      "refuse": [
+        "random-0",
+        "random-1",
+        "random-2",
+        "random-A",
+        "random-B"
+      ],
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1000000011,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1000000012,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 1000000012,
+      "session": "random-pending",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 1000000012,
+      "session": "random-pending",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 1100000000,
+      "toml": "[proxy]\nfail-backend-list = []\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 1100000000,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": []
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 1200000000,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4000\"]\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 2200000000,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 2300000000,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4001\"]\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 3299999999,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": []
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 3300000000,
+      "refuse": [
+        "random-0",
+        "random-1",
+        "random-2",
+        "random-A",
+        "random-B"
+      ],
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4001"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 3300000001,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4001\"]\nfailover-timeout = 0\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 3300000001,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4001"
+        ]
+      }
+    },
+    {
+      "op": "checkpoint",
+      "at_nanos": 3300000001,
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 1,
+        "legal_server_versions": [
+          ""
+        ]
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 3300000002,
+      "session": "random-0",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 3300000002,
+      "session": "random-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 3300000002,
+      "session": "random-2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 3300000002,
+      "session": "random-A",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 3300000002,
+      "session": "random-B",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 3300000002,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4001"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 3400000000,
+      "toml": "[proxy]\nfail-backend-list = []\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 10000000000,
+      "toml": "[balance]\nrouting-policy = 'prefer-idle'\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-0",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-0",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-0",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-1",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-1",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-2",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-2",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-A",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "rehydrate",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-A",
+      "backend": "default/127.0.0.1:4000",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-B",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "rehydrate",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-B",
+      "backend": "default/127.0.0.1:4001",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-pending",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 10000000000,
+      "session": "prefer-idle-pending",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4000",
+          "default/127.0.0.1:4001"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 10000000010,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4000\"]\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 10500000000,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4000\"]\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 11000000009,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": []
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 11000000010,
+      "refuse": [
+        "prefer-idle-0",
+        "prefer-idle-1",
+        "prefer-idle-2",
+        "prefer-idle-A",
+        "prefer-idle-B"
+      ],
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 11000000010,
+      "refuse": [
+        "prefer-idle-0",
+        "prefer-idle-1",
+        "prefer-idle-2",
+        "prefer-idle-A",
+        "prefer-idle-B"
+      ],
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 11000000011,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 11000000012,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 11000000012,
+      "session": "prefer-idle-pending",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 11000000012,
+      "session": "prefer-idle-pending",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 11100000000,
+      "toml": "[proxy]\nfail-backend-list = []\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 11100000000,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": []
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 11200000000,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4000\"]\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 12200000000,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4000"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 12300000000,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4001\"]\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 13299999999,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": []
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 13300000000,
+      "refuse": [
+        "prefer-idle-0",
+        "prefer-idle-1",
+        "prefer-idle-2",
+        "prefer-idle-A",
+        "prefer-idle-B"
+      ],
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4001"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 13300000001,
+      "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4001\"]\nfailover-timeout = 0\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 13300000001,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4001"
+        ]
+      }
+    },
+    {
+      "op": "checkpoint",
+      "at_nanos": 13300000001,
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 1,
+        "legal_server_versions": [
+          ""
+        ]
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 13300000002,
+      "session": "prefer-idle-0",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 13300000002,
+      "session": "prefer-idle-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 13300000002,
+      "session": "prefer-idle-2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 13300000002,
+      "session": "prefer-idle-A",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 13300000002,
+      "session": "prefer-idle-B",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "at_nanos": 13300000002,
+      "expect": {
+        "outcome": "ok",
+        "force_close_due": [
+          "default/127.0.0.1:4001"
+        ]
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 13400000000,
+      "toml": "[proxy]\nfail-backend-list = []\nfailover-timeout = 1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "at_nanos": 20000000000,
+      "backends": [],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "at_nanos": 20000000000,
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          ""
+        ]
+      }
+    }
+  ]
+}

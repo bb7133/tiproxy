@@ -1,0 +1,2567 @@
+{
+  "version": 1,
+  "id": "api-metric-zero-epoch-expiry",
+  "config": {
+    "policy": "resource",
+    "selection": "prefer-idle",
+    "rule": "",
+    "clock_origin_nanos": 0
+  },
+  "provenance": {
+    "kind": "synthetic",
+    "purpose": "Go zero versus epoch, cached equal timestamps, one-nanosecond changes and strict expiry"
+  },
+  "events": [
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='resource'\nrouting-policy='prefer-idle'\n[balance.memory]\nmigrations-per-second=1\n[balance.health]\nmigrations-per-second=1\n[balance.conn-count]\nmigrations-per-second=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "at_nanos": 0,
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {},
+          "cluster": "",
+          "keyspace": "",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "held-0",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "held-0",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "held-0",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "held-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "held-1",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "held-1",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "held-2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "held-2",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "held-2",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "at_nanos": 0,
+      "backends": [
+        {
+          "address": "127.0.0.1:4000",
+          "labels": {},
+          "cluster": "",
+          "keyspace": "",
+          "ip": "127.0.0.1",
+          "status_port": 10080,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4001",
+          "labels": {},
+          "cluster": "",
+          "keyspace": "",
+          "ip": "127.0.0.1",
+          "status_port": 10081,
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='connection'\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='resource'\nrouting-policy='prefer-idle'\n[balance.memory]\nmigrations-per-second=1\n[balance.health]\nmigrations-per-second=1\n[balance.conn-count]\nmigrations-per-second=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": {
+          "kind": "matrix",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.1"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.9"
+                }
+              ]
+            }
+          ]
+        },
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "cpu-zero",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "cpu-zero",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "cpu-zero",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "cpu-zero",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": {
+          "kind": "matrix",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.1"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.9"
+                }
+              ]
+            }
+          ]
+        },
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "cpu-epoch",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "cpu-epoch",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "cpu-epoch",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "cpu-epoch",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": {
+          "kind": "matrix",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0.9"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0.1"
+                }
+              ]
+            }
+          ]
+        },
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "cpu-same-update",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "cpu-same-update",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "cpu-same-update",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "cpu-same-update",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": {
+          "kind": "matrix",
+          "updated_nanos": 1,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0.9"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0.1"
+                }
+              ]
+            }
+          ]
+        },
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "cpu-one-nanosecond",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "cpu-one-nanosecond",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "cpu-one-nanosecond",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "cpu-one-nanosecond",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": {
+          "kind": "matrix",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "0.1"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "0.9"
+                }
+              ]
+            }
+          ]
+        },
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "cpu-zero-again",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "cpu-zero-again",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "cpu-zero-again",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "cpu-zero-again",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='connection'\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='resource'\nrouting-policy='prefer-idle'\n[balance.memory]\nmigrations-per-second=1\n[balance.health]\nmigrations-per-second=1\n[balance.conn-count]\nmigrations-per-second=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": {
+          "kind": "matrix",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.1"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.9"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "memory-zero",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "memory-zero",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "memory-zero",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "memory-zero",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": {
+          "kind": "matrix",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.1"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.9"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "memory-epoch",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "memory-epoch",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "memory-epoch",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "memory-epoch",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": {
+          "kind": "matrix",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0.9"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0.1"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "memory-same-update",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "memory-same-update",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "memory-same-update",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "memory-same-update",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": {
+          "kind": "matrix",
+          "updated_nanos": 1,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0.9"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0.1"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "memory-one-nanosecond",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "memory-one-nanosecond",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "memory-one-nanosecond",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "memory-one-nanosecond",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": {
+          "kind": "matrix",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "0.1"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "0.9"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "memory-zero-again",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "memory-zero-again",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "memory-zero-again",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "memory-zero-again",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='connection'\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='resource'\nrouting-policy='prefer-idle'\n[balance.memory]\nmigrations-per-second=1\n[balance.health]\nmigrations-per-second=1\n[balance.conn-count]\nmigrations-per-second=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": {
+          "kind": "vector",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "total_pd": {
+          "kind": "vector",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "pd-zero",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "pd-zero",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "pd-zero",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "pd-zero",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": {
+          "kind": "vector",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "total_pd": {
+          "kind": "vector",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "pd-epoch",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "pd-epoch",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "pd-epoch",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "pd-epoch",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": {
+          "kind": "vector",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0"
+                }
+              ]
+            }
+          ]
+        },
+        "total_pd": {
+          "kind": "vector",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "pd-same-update",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "pd-same-update",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "pd-same-update",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "pd-same-update",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": {
+          "kind": "vector",
+          "updated_nanos": 1,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0"
+                }
+              ]
+            }
+          ]
+        },
+        "total_pd": {
+          "kind": "vector",
+          "updated_nanos": 1,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "pd-one-nanosecond",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "pd-one-nanosecond",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "pd-one-nanosecond",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "pd-one-nanosecond",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": {
+          "kind": "vector",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "total_pd": {
+          "kind": "vector",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "pd-zero-again",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "pd-zero-again",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "pd-zero-again",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "pd-zero-again",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='connection'\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='resource'\nrouting-policy='prefer-idle'\n[balance.memory]\nmigrations-per-second=1\n[balance.health]\nmigrations-per-second=1\n[balance.conn-count]\nmigrations-per-second=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": {
+          "kind": "vector",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "total_tikv": {
+          "kind": "vector",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "tikv-zero",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "tikv-zero",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "tikv-zero",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "tikv-zero",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": {
+          "kind": "vector",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "total_tikv": {
+          "kind": "vector",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "tikv-epoch",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "tikv-epoch",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "tikv-epoch",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "tikv-epoch",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": {
+          "kind": "vector",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0"
+                }
+              ]
+            }
+          ]
+        },
+        "total_tikv": {
+          "kind": "vector",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "tikv-same-update",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "tikv-same-update",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "tikv-same-update",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "tikv-same-update",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": {
+          "kind": "vector",
+          "updated_nanos": 1,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "0"
+                }
+              ]
+            }
+          ]
+        },
+        "total_tikv": {
+          "kind": "vector",
+          "updated_nanos": 1,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 1,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "tikv-one-nanosecond",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "tikv-one-nanosecond",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "tikv-one-nanosecond",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "tikv-one-nanosecond",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": {
+          "kind": "vector",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "total_tikv": {
+          "kind": "vector",
+          "updated_nanos": null,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 2,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "tikv-zero-again",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "tikv-zero-again",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "tikv-zero-again",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "tikv-zero-again",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='connection'\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 0,
+      "toml": "[balance]\npolicy='resource'\nrouting-policy='prefer-idle'\n[balance.memory]\nmigrations-per-second=1\n[balance.health]\nmigrations-per-second=1\n[balance.conn-count]\nmigrations-per-second=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 0,
+      "queries": {
+        "cpu": {
+          "kind": "matrix",
+          "updated_nanos": 0,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.1"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 0,
+                  "value": "0.9"
+                }
+              ]
+            }
+          ]
+        },
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 0,
+      "session": "cpu-fresh",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 0,
+      "session": "cpu-fresh",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 0,
+      "session": "cpu-fresh",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 0,
+      "session": "cpu-fresh",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 120000000000,
+      "session": "cpu-exact-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 120000000000,
+      "session": "cpu-exact-expiry",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 120000000000,
+      "session": "cpu-exact-expiry",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 120000000000,
+      "session": "cpu-exact-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 120000000001,
+      "session": "cpu-past-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 120000000001,
+      "session": "cpu-past-expiry",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 120000000001,
+      "session": "cpu-past-expiry",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 120000000001,
+      "session": "cpu-past-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 120000000001,
+      "toml": "[balance]\npolicy='connection'\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 120000000001,
+      "toml": "[balance]\npolicy='resource'\nrouting-policy='prefer-idle'\n[balance.memory]\nmigrations-per-second=1\n[balance.health]\nmigrations-per-second=1\n[balance.conn-count]\nmigrations-per-second=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 120000000001,
+      "queries": {
+        "cpu": null,
+        "memory": {
+          "kind": "matrix",
+          "updated_nanos": 120000000001,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 120001,
+                  "value": "0.1"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 120001,
+                  "value": "0.9"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 120000000001,
+      "session": "memory-fresh",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 120000000001,
+      "session": "memory-fresh",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 120000000001,
+      "session": "memory-fresh",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 120000000001,
+      "session": "memory-fresh",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 180000000001,
+      "session": "memory-exact-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 180000000001,
+      "session": "memory-exact-expiry",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 180000000001,
+      "session": "memory-exact-expiry",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 180000000001,
+      "session": "memory-exact-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 180000000002,
+      "session": "memory-past-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 180000000002,
+      "session": "memory-past-expiry",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 180000000002,
+      "session": "memory-past-expiry",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 180000000002,
+      "session": "memory-past-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 180000000002,
+      "toml": "[balance]\npolicy='connection'\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "at_nanos": 180000000002,
+      "toml": "[balance]\npolicy='resource'\nrouting-policy='prefer-idle'\n[balance.memory]\nmigrations-per-second=1\n[balance.health]\nmigrations-per-second=1\n[balance.conn-count]\nmigrations-per-second=1\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 180000000002,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": {
+          "kind": "vector",
+          "updated_nanos": 180000000002,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 180001,
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 180001,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "total_pd": {
+          "kind": "vector",
+          "updated_nanos": 180000000002,
+          "series": [
+            {
+              "labels": {
+                "instance": "127.0.0.1:10080"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 180001,
+                  "value": "100"
+                }
+              ]
+            },
+            {
+              "labels": {
+                "instance": "127.0.0.1:10081"
+              },
+              "samples": [
+                {
+                  "timestamp_ms": 180001,
+                  "value": "100"
+                }
+              ]
+            }
+          ]
+        },
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 180000000002,
+      "session": "pd-fresh",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 180000000002,
+      "session": "pd-fresh",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 180000000002,
+      "session": "pd-fresh",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 180000000002,
+      "session": "pd-fresh",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 240000000002,
+      "session": "pd-exact-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 240000000002,
+      "session": "pd-exact-expiry",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4000"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 240000000002,
+      "session": "pd-exact-expiry",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 240000000002,
+      "session": "pd-exact-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "at_nanos": 240000000003,
+      "session": "pd-past-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "at_nanos": 240000000003,
+      "session": "pd-past-expiry",
+      "expect": {
+        "outcome": "ok",
+        "backend": "127.0.0.1:4001"
+      }
+    },
+    {
+      "op": "finish",
+      "at_nanos": 240000000003,
+      "session": "pd-past-expiry",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 240000000003,
+      "session": "pd-past-expiry",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "metrics",
+      "at_nanos": 240000000003,
+      "queries": {
+        "cpu": null,
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+      },
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 240000000003,
+      "session": "held-0",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 240000000003,
+      "session": "held-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "at_nanos": 240000000003,
+      "session": "held-2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "at_nanos": 240000000003,
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 2,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      }
+    }
+  ]
+}

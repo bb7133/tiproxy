@@ -142,6 +142,7 @@ impl FactorReport {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Input {
     pub id: Arc<str>,
     pub owner: Arc<AccountIdentity>,
@@ -169,7 +170,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             owners: BTreeMap::new(),
-            history: window::History::new(0),
+            history: window::History::new(None),
         }
     }
 }
