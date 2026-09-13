@@ -60,20 +60,20 @@ func TestSummarizeLifecyclesUsesAPIEvents(t *testing.T) {
 	require.Equal(t, LifecycleSummary{Opened: 3, Next: 2, SuccessfulFinishes: 2, Closed: 3, Completed: 1}, SummarizeLifecycles(log))
 }
 
-func TestQualifyingLifecyclesExcludeHeldClientAddresses(t *testing.T) {
+func TestQualifyingLifecyclesExcludeHeldSessionsDespiteAddressReuse(t *testing.T) {
 	yes := true
 	log := []Recorded{
 		{Event: apireplay.Event{Op: "open", Session: "work", Client: "127.0.0.1:5000"}},
 		{Event: apireplay.Event{Op: "next", Session: "work"}},
 		{Event: apireplay.Event{Op: "finish", Session: "work", Success: &yes}},
 		{Event: apireplay.Event{Op: "close", Session: "work"}},
-		{Event: apireplay.Event{Op: "open", Session: "held", Client: "127.0.0.1:5001"}},
+		{Event: apireplay.Event{Op: "open", Session: "held", Client: "127.0.0.1:5000"}},
 		{Event: apireplay.Event{Op: "next", Session: "held"}},
 		{Event: apireplay.Event{Op: "finish", Session: "held", Success: &yes}},
 		{Event: apireplay.Event{Op: "close", Session: "held"}},
 	}
 	require.Equal(t, LifecycleSummary{Opened: 1, Next: 1, SuccessfulFinishes: 1, Closed: 1, Completed: 1},
-		SummarizeQualifyingLifecycles(log, map[string]struct{}{"127.0.0.1:5001": {}}))
+		SummarizeQualifyingLifecycles(log, map[string]struct{}{"held": {}}))
 }
 
 func TestTickRefusalsArePublicInputsAndMixedAcceptanceFailsClosed(t *testing.T) {

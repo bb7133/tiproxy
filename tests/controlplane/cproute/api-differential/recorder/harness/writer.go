@@ -75,16 +75,17 @@ func SummarizeLifecycles(log []Recorded) LifecycleSummary {
 	return summarizeLifecycles(log, nil)
 }
 
-// SummarizeQualifyingLifecycles excludes supplemental held-client connections
-// identified by their public client addresses. Their API events remain in the
-// trace for effect coverage, but cannot inflate the short-lifecycle threshold.
-func SummarizeQualifyingLifecycles(log []Recorded, heldClients map[string]struct{}) LifecycleSummary {
-	return summarizeLifecycles(log, heldClients)
+// SummarizeQualifyingLifecycles excludes supplemental held-client sessions.
+// Their API events remain in the trace for effect coverage, but cannot inflate
+// the short-lifecycle threshold. Identity is frozen at each open so a later
+// ordinary connection reusing the held connection's address is still counted.
+func SummarizeQualifyingLifecycles(log []Recorded, heldSessions map[string]struct{}) LifecycleSummary {
+	return summarizeLifecycles(log, heldSessions)
 }
 
-func summarizeLifecycles(log []Recorded, heldClients map[string]struct{}) LifecycleSummary {
+func summarizeLifecycles(log []Recorded, heldSessions map[string]struct{}) LifecycleSummary {
 	type state struct {
-		opened, established, closed, held bool
+		opened, established, closed bool
 	}
 	states := make(map[string]*state)
 	var summary LifecycleSummary
@@ -95,10 +96,7 @@ func summarizeLifecycles(log []Recorded, heldClients map[string]struct{}) Lifecy
 			s = &state{}
 			states[event.Session] = s
 		}
-		if event.Op == "open" && s != nil {
-			_, s.held = heldClients[event.Client]
-		}
-		if s != nil && s.held {
+		if _, held := heldSessions[event.Session]; held {
 			continue
 		}
 		switch event.Op {

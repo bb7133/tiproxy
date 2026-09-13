@@ -40,7 +40,7 @@ type Workload struct {
 	heldQueries atomic.Int64
 	heldFailed  atomic.Int64
 	heldMu      sync.Mutex
-	heldAddrs   map[string]struct{}
+	heldHistory map[string][]*heldInterval
 }
 
 func (w *Workload) Completed() int64   { return w.completed.Load() }
@@ -48,23 +48,54 @@ func (w *Workload) Failed() int64      { return w.failed.Load() }
 func (w *Workload) HeldQueries() int64 { return w.heldQueries.Load() }
 func (w *Workload) HeldFailed() int64  { return w.heldFailed.Load() }
 
-func (w *Workload) HeldClientAddresses() map[string]struct{} {
+// IsHeldClientAt reports whether address belonged to a held connection when
+// the recorder observed a session open. Each interval begins before DialContext
+// so a proxy accept that races the dial callback is still classified, and ends
+// at client Close so later reuse of the same ephemeral port is not classified.
+func (w *Workload) IsHeldClientAt(address string, openedAt time.Time) bool {
 	w.heldMu.Lock()
 	defer w.heldMu.Unlock()
-	result := make(map[string]struct{}, len(w.heldAddrs))
-	for address := range w.heldAddrs {
-		result[address] = struct{}{}
+	for _, interval := range w.heldHistory[address] {
+		if openedAt.Before(interval.start) {
+			continue
+		}
+		if interval.end.IsZero() || openedAt.Before(interval.end) {
+			return true
+		}
 	}
-	return result
+	return false
 }
 
-func (w *Workload) noteHeldAddress(address string) {
+func (w *Workload) trackHeldConnection(conn net.Conn, startedAt time.Time) net.Conn {
+	address := conn.LocalAddr().String()
+	interval := &heldInterval{start: startedAt}
 	w.heldMu.Lock()
-	defer w.heldMu.Unlock()
-	if w.heldAddrs == nil {
-		w.heldAddrs = make(map[string]struct{})
+	if w.heldHistory == nil {
+		w.heldHistory = make(map[string][]*heldInterval)
 	}
-	w.heldAddrs[address] = struct{}{}
+	w.heldHistory[address] = append(w.heldHistory[address], interval)
+	w.heldMu.Unlock()
+	return &heldConnection{Conn: conn, release: func() {
+		w.heldMu.Lock()
+		defer w.heldMu.Unlock()
+		interval.end = time.Now()
+	}}
+}
+
+type heldInterval struct {
+	start time.Time
+	end   time.Time
+}
+
+type heldConnection struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *heldConnection) Close() error {
+	c.once.Do(c.release)
+	return c.Conn.Close()
 }
 
 func (w *Workload) connector(listener, source string, held bool) (driver.Connector, error) {
@@ -82,9 +113,10 @@ func (w *Workload) connector(listener, source string, held bool) (driver.Connect
 	if held {
 		network := fmt.Sprintf("rec-held-%d", heldDialCounter.Add(1))
 		mysql.RegisterDialContext(network, func(ctx context.Context, addr string) (net.Conn, error) {
+			startedAt := time.Now()
 			conn, err := d.DialContext(ctx, "tcp", addr)
 			if err == nil {
-				w.noteHeldAddress(conn.LocalAddr().String())
+				conn = w.trackHeldConnection(conn, startedAt)
 			}
 			return conn, err
 		})

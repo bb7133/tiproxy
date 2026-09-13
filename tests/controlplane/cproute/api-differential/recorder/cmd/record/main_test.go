@@ -22,7 +22,7 @@ import (
 )
 
 func TestLedgerTracksAbandonedAndClosedSessions(t *testing.T) {
-	l := newLedger()
+	l := newLedger(nil)
 	l.observe(apireplay.Event{Op: "open", Session: "abandoned"})
 	if len(l.open) != 1 || len(l.active) != 0 {
 		t.Fatal("idle selector missing from finalization ledger")
@@ -44,7 +44,13 @@ func TestLedgerTracksAbandonedAndClosedSessions(t *testing.T) {
 }
 
 func TestLedgerSelectsOnlyAnEstablishedHeldClient(t *testing.T) {
-	l := newLedger()
+	heldAddresses := map[string]struct{}{
+		"127.0.0.1:2000": {}, "127.0.0.1:2001": {},
+	}
+	l := newLedger(func(address string, _ time.Time) bool {
+		_, held := heldAddresses[address]
+		return held
+	})
 	yes := true
 	for _, tc := range []struct{ session, client, backend string }{
 		{"regular", "127.0.0.1:1000", "default/127.0.0.1:4000"},
@@ -55,14 +61,40 @@ func TestLedgerSelectsOnlyAnEstablishedHeldClient(t *testing.T) {
 		l.observe(apireplay.Event{Op: "next", Session: tc.session, Outcome: "ok", Backend: tc.backend})
 		l.observe(apireplay.Event{Op: "finish", Session: tc.session, Success: &yes})
 	}
-	require.Equal(t, "default/127.0.0.1:4001", l.chooseHeldBackend(map[string]struct{}{
-		"127.0.0.1:2000": {}, "127.0.0.1:2001": {},
-	}))
-	require.Empty(t, l.chooseHeldBackend(map[string]struct{}{"127.0.0.1:9999": {}}))
+	require.Equal(t, "default/127.0.0.1:4001", l.chooseHeldBackend())
 	l.observe(apireplay.Event{Op: "close", Session: "held-a"})
-	require.Equal(t, "default/127.0.0.1:4002", l.chooseHeldBackend(map[string]struct{}{
-		"127.0.0.1:2000": {}, "127.0.0.1:2001": {},
-	}))
+	require.Equal(t, "default/127.0.0.1:4002", l.chooseHeldBackend())
+}
+
+func TestLedgerClassifiesHeldIdentityAcrossRegistrationRaceAndAddressReuse(t *testing.T) {
+	const reused = "127.0.0.1:2000"
+	activeHeld := map[string]bool{}
+	l := newLedger(func(address string, _ time.Time) bool { return activeHeld[address] })
+	yes := true
+	var log []harness.Recorded
+	observe := func(event apireplay.Event) {
+		l.observe(event)
+		log = append(log, harness.Recorded{Event: event})
+	}
+	observe(apireplay.Event{Op: "open", Session: "held", Client: reused})
+	require.Empty(t, l.heldSessions(), "the dial callback has not registered the address yet")
+	activeHeld[reused] = true
+	observe(apireplay.Event{Op: "next", Session: "held", Outcome: "ok", Backend: "default/127.0.0.1:4000"})
+	observe(apireplay.Event{Op: "finish", Session: "held", Success: &yes})
+	require.Equal(t, "default/127.0.0.1:4000", l.chooseHeldBackend(),
+		"a later event must classify a held session whose open raced registration")
+	delete(activeHeld, reused)
+	observe(apireplay.Event{Op: "close", Session: "held"})
+
+	observe(apireplay.Event{Op: "open", Session: "work", Client: reused})
+	observe(apireplay.Event{Op: "next", Session: "work", Outcome: "ok", Backend: "default/127.0.0.1:4001"})
+	observe(apireplay.Event{Op: "finish", Session: "work", Success: &yes})
+	require.Empty(t, l.chooseHeldBackend(), "the ordinary session reusing a held address is not selectable")
+	observe(apireplay.Event{Op: "close", Session: "work"})
+
+	require.Equal(t, map[string]struct{}{"held": {}}, l.heldSessions())
+	require.Equal(t, harness.LifecycleSummary{Opened: 1, Next: 1, SuccessfulFinishes: 1, Closed: 1, Completed: 1},
+		harness.SummarizeQualifyingLifecycles(log, l.heldSessions()))
 }
 
 func TestFailoverConfigUsesAddressAndPositiveTimeout(t *testing.T) {

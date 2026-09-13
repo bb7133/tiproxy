@@ -35,19 +35,25 @@ type Recorded struct {
 // the recorded order is the real consumption order and nothing interleaves
 // between a call and its record. It also owns the logical clock.
 type Scheduler struct {
-	mu      sync.Mutex
-	start   time.Time
-	nanos   int64
-	seq     int
-	log     []Recorded
-	archive *os.File
-	observe func(apireplay.Event)
-	closed  bool
-	err     error
+	mu              sync.Mutex
+	start           time.Time
+	nanos           int64
+	seq             int
+	log             []Recorded
+	archive         *os.File
+	observe         func(apireplay.Event)
+	observeRecorded func(Recorded)
+	closed          bool
+	err             error
 }
 
 // Observe registers a hook invoked with every recorded event (lock held).
 func (s *Scheduler) Observe(fn func(apireplay.Event)) { s.observe = fn }
+
+// ObserveRecorded registers a hook that also receives the exact wall timestamp
+// captured for the record. It is used when an external lifetime must be joined
+// to a public event without changing the trace protocol.
+func (s *Scheduler) ObserveRecorded(fn func(Recorded)) { s.observeRecorded = fn }
 
 // OriginNanos is the immutable Unix origin archived with the trace inputs.
 func (s *Scheduler) OriginNanos() int64 { return s.start.UnixNano() }
@@ -84,6 +90,9 @@ func (s *Scheduler) Record(ev apireplay.Event) {
 	s.log = append(s.log, r)
 	if s.observe != nil {
 		s.observe(ev)
+	}
+	if s.observeRecorded != nil {
+		s.observeRecorded(r)
 	}
 	if s.archive != nil {
 		b, err := json.Marshal(r)

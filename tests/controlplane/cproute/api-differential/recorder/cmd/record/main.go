@@ -150,6 +150,8 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	if err := validateClientCoverage(clients, listeners, sourceList); err != nil {
 		return err
 	}
+	wl := &harness.Workload{Listeners: listeners, Sources: sourceList, Clients: clients,
+		HeldClients: heldClients, Pause: pause, User: "root"}
 	// Validate the complete script before opening an attempt or starting live services.
 	var actions []Action
 	var scriptData []byte
@@ -247,8 +249,8 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	defer rt.Close()
 	inputs := harness.NewInputs(sched, driver)
 	apireplay.Install(sched, slot)
-	ledger := newLedger()
-	sched.Observe(ledger.observe)
+	ledger := newLedger(wl.IsHeldClientAt)
+	sched.ObserveRecorded(func(record harness.Recorded) { ledger.observeAt(record.Event, record.Wall) })
 
 	// Real proxy exactly as pkg/server/server.go composes it, with the recording namespace manager.
 	nsMgr := harness.NewRecordingNamespaceManager(rt)
@@ -297,8 +299,6 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		defer incompleteMu.Unlock()
 		incomplete = append(incomplete, reason)
 	}
-	wl := &harness.Workload{Listeners: listeners, Clients: clients, HeldClients: heldClients, Pause: pause, User: "root"}
-	wl.Sources = sourceList
 	var producerWG, envWG waitgroup.WaitGroup
 	checkpoints := map[int]harness.Checkpoint{}
 	selectedFailoverBackend := ""
@@ -373,7 +373,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					checkpoints[seq] = harness.Checkpoint{Seq: seq, Assignments: assignments, ConnCount: rt.ConnCount(),
 						HealthyBackendCount: rt.HealthyBackendCount(), ServerVersion: rt.ServerVersion()}
 					sched.Record(apireplay.Event{Op: "checkpoint"})
-					selectedFailoverBackend = ledger.chooseHeldBackend(wl.HeldClientAddresses())
+					selectedFailoverBackend = ledger.chooseHeldBackend()
 					selectedFailoverTimeout = a.FailoverTimeoutSeconds
 					if selectedFailoverBackend == "" {
 						markIncomplete("failover_select found no established held-client assignment")
@@ -462,7 +462,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		markIncomplete(reason)
 	}
 	records := sched.Log()
-	lifecycles := harness.SummarizeQualifyingLifecycles(records, wl.HeldClientAddresses())
+	lifecycles := harness.SummarizeQualifyingLifecycles(records, ledger.heldSessions())
 	if err := validateRecordedLifecycles(lifecycles, wl.Completed()); err != nil {
 		markIncomplete(err.Error())
 	}
@@ -721,21 +721,36 @@ func writeExclusiveFile(path string, data []byte, perm os.FileMode) error {
 type ledger struct {
 	open       map[string]bool
 	client     map[string]string
+	openedAt   map[string]time.Time
+	held       map[string]bool
 	settled    map[string]bool
 	violations []string
 	pending    map[string]string
 	active     map[string]string
+	isHeld     func(string, time.Time) bool
 }
 
-func newLedger() *ledger {
-	return &ledger{open: map[string]bool{}, client: map[string]string{}, settled: map[string]bool{}, pending: map[string]string{}, active: map[string]string{}}
+func newLedger(isHeld func(string, time.Time) bool) *ledger {
+	return &ledger{open: map[string]bool{}, client: map[string]string{}, openedAt: map[string]time.Time{}, held: map[string]bool{},
+		settled: map[string]bool{}, pending: map[string]string{}, active: map[string]string{}, isHeld: isHeld}
 }
 
 func (l *ledger) observe(ev apireplay.Event) {
+	l.observeAt(ev, time.Now())
+}
+
+func (l *ledger) observeAt(ev apireplay.Event, wall time.Time) {
+	// A TCP accept can be observed just before the held dial callback returns
+	// and records its address interval. Recheck every still-open, unclassified
+	// session at later serialized events; the immutable open time distinguishes
+	// a held lifetime from earlier or later reuse of the same ephemeral port.
+	l.refreshHeldSessions()
 	switch ev.Op {
 	case "open":
 		l.open[ev.Session] = true
 		l.client[ev.Session] = ev.Client
+		l.openedAt[ev.Session] = wall
+		l.refreshHeldSessions()
 	case "next":
 		if ev.Outcome == "ok" {
 			l.pending[ev.Session] = ev.Backend
@@ -760,16 +775,29 @@ func (l *ledger) observe(ev apireplay.Event) {
 		}
 		delete(l.open, ev.Session)
 		delete(l.client, ev.Session)
+		delete(l.openedAt, ev.Session)
 		delete(l.active, ev.Session)
 		delete(l.pending, ev.Session)
 	}
 }
 
-func (l *ledger) chooseHeldBackend(heldClients map[string]struct{}) string {
+func (l *ledger) refreshHeldSessions() {
+	if l.isHeld == nil {
+		return
+	}
+	for session, client := range l.client {
+		if !l.held[session] && l.isHeld(client, l.openedAt[session]) {
+			l.held[session] = true
+		}
+	}
+}
+
+func (l *ledger) chooseHeldBackend() string {
+	l.refreshHeldSessions()
 	choices := make([]string, 0)
 	seen := make(map[string]struct{})
 	for session, backend := range l.active {
-		if _, held := heldClients[l.client[session]]; !held || backend == "" {
+		if !l.held[session] || backend == "" {
 			continue
 		}
 		if _, exists := seen[backend]; !exists {
@@ -782,6 +810,17 @@ func (l *ledger) chooseHeldBackend(heldClients map[string]struct{}) string {
 		return ""
 	}
 	return choices[0]
+}
+
+func (l *ledger) heldSessions() map[string]struct{} {
+	l.refreshHeldSessions()
+	result := make(map[string]struct{})
+	for session, held := range l.held {
+		if held {
+			result[session] = struct{}{}
+		}
+	}
+	return result
 }
 
 func (l *ledger) assignments() map[string]string {
