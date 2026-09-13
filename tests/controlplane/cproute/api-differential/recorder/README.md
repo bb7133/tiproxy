@@ -57,13 +57,14 @@ zero time into an i64 timestamp. The synthetic 170-event metric-time case covers
 CPU, memory and both health indicators, same-update cache retention, one-nanosecond
 updates, and the exact 60/120-second boundaries followed by one nanosecond.
 Recordings that claim metric observations but contain no metric events keep their
-`metrics-input` dependency. General resource-policy/effect/cadence qualification
-remains incomplete and separately blocked.
+`metrics-input` dependency. The same 170-event input is now independently derived
+from each engine's public rows with no residual policy dependency. General
+resource effect/cadence qualification remains incomplete and separately blocked.
 
 CI pairs the synthetic real-router producer's 17 events/three publications and
 checks its input-defined A, A, B selection sequence in both engines. This small
 scenario is adapter evidence, not general resource parity or a qualifying trace.
-The raw archive, dependency-bearing derivation, stored Go result, paired engine
+The raw archive, input-derived expectations, stored Go result, paired engine
 outputs and this scenario assertion are preserved together.
 
 Every whole health/config input, timer iteration, public call and terminal callback
@@ -267,17 +268,21 @@ or tied pairs with different legal effects. It also refuses to seed a cadence
 clock from an earlier unverified migration. A synthetic timing scenario is not a
 qualifying recording and does not freeze the remaining 18-slot manifest.
 
-Resource `prefer-idle` selection now has one bounded input-derived case: two
-healthy, idle, equally local backends; no label, memory, or error-rate factor;
-and a complete CPU matrix keyed by the public health `ip:status_port` fields.
-The derivation mirrors CPU EWMA, score buckets, positive/neutral/negative advice,
-unchanged query-update retention, and the strict two-minute expiry boundary.
-Incomplete packets, zero/unknown update times, competing factor inputs,
-connection load, retries, and intervening health/config/tick scoring keep the
-explicit `policy-constraint:resource/prefer-idle` dependency. The existing
-17-event metrics-producer trace now derives all three choices from its public
-packets for both engines with no dependency; it remains synthetic and therefore
-does not count toward the frozen 18-slot corpus.
+Resource `prefer-idle` selection now has a bounded input-derived case: two
+healthy, equally local backends in one group, unique public ownership, no label
+isolation or retry cycle, and complete metric rows keyed by the public health
+`ip:status_port` fields. The derivation applies the production factor order and
+advice gates across health error ratios, memory OOM risk, CPU EWMA/buckets and
+connection count. It distinguishes Go's year-one zero time from Unix epoch zero,
+retains same-update snapshots, handles one-nanosecond changes and uses the strict
+60/120-second expiry boundaries. Policy transitions reset factor lifetimes, and
+the bounded model includes the config-time scoring call that can seed a recreated
+factor from the retained whole packet. Incomplete rows, unsupported group shapes,
+retries and intervening health/tick scoring keep the explicit
+`policy-constraint:resource/prefer-idle` dependency. The 170-event metric-time
+fixture and existing 17-event metrics-producer trace now derive their choices
+independently from both engines with no dependency; both remain synthetic and do
+not count toward the frozen 18-slot corpus.
 
 `status_cadence_smoke.py` extends constrained Connection histories to unhealthy
 status migration. The first unhealthy scoring call captures its input-derived

@@ -1,8 +1,9 @@
 # Copyright 2026 PingCAP, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded Resource/CPU expectations use public metric packets, never output rows."""
+"""Bounded Resource expectations use public metric packets, never output rows."""
 import copy
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -112,10 +113,12 @@ class ResourceMetricTests(unittest.TestCase):
         with self.assertRaisesRegex(derive.Refuse, "outside Go's own legal set"):
             derive.derive(trace, self.rows, None)
 
-    def test_incomplete_or_competing_factor_inputs_keep_the_policy_dependency(self):
-        for mutate in (lambda packet: packet["cpu"]["series"].pop(),
-                       lambda packet: packet.__setitem__("memory", copy.deepcopy(packet["cpu"])),
-                       lambda packet: packet["cpu"].__setitem__("updated_nanos", 0)):
+    def test_incomplete_factor_inputs_keep_the_policy_dependency(self):
+        def incomplete_memory(packet):
+            packet["memory"] = copy.deepcopy(packet["cpu"])
+            packet["memory"]["series"].pop()
+
+        for mutate in (lambda packet: packet["cpu"]["series"].pop(), incomplete_memory):
             trace = copy.deepcopy(self.trace)
             trace["events"] = trace["events"][:6]
             rows = copy.deepcopy(self.rows[:6])
@@ -134,6 +137,46 @@ class ResourceMetricTests(unittest.TestCase):
             row["seq"] = seq
         _, requires = derive.derive(trace, rows, None)
         self.assertIn("policy-constraint:resource/prefer-idle", requires)
+
+    def test_existing_all_factor_time_fixture_is_independently_derived(self):
+        trace = json.loads((HERE.parent / "metrics-time-smoke.json").read_text())
+        rows = []
+        for event in trace["events"]:
+            row = {"op": event["op"], "outcome": event["expect"]["outcome"],
+                   "backend": event["expect"].get("backend", ""), "effects": []}
+            if event["op"] == "checkpoint":
+                row.update(assignments={}, conn_count=0, healthy_backend_count=2, server_version="8.5.1")
+            rows.append(row)
+        derived, requires = derive.derive(trace, rows, None)
+        self.assertEqual(requires, [])
+        self.assertEqual(derive.compare_with_reference(derived, trace, requires), ([], []))
+
+    def test_all_factor_fixture_rejects_a_memory_result_from_the_wrong_backend(self):
+        trace = json.loads((HERE.parent / "metrics-time-smoke.json").read_text())
+        rows = [{"op": event["op"], "outcome": event["expect"]["outcome"],
+                 "backend": event["expect"].get("backend", ""), "effects": []}
+                for event in trace["events"]]
+        event = next(i for i, item in enumerate(trace["events"])
+                     if item.get("session") == "memory-epoch" and item["op"] == "next")
+        rows[event]["backend"] = B
+        with self.assertRaisesRegex(derive.Refuse, "outside Go's own legal set"):
+            derive.derive(trace, rows, None)
+
+    def test_memory_and_health_public_values_change_the_derivation(self):
+        for session, keys in (("memory-epoch", ("memory",)),
+                              ("pd-epoch", ("failure_pd", "total_pd"))):
+            trace = json.loads((HERE.parent / "metrics-time-smoke.json").read_text())
+            rows = [{"op": event["op"], "outcome": event["expect"]["outcome"],
+                     "backend": event["expect"].get("backend", ""), "effects": []}
+                    for event in trace["events"]]
+            next_index = next(i for i, event in enumerate(trace["events"])
+                              if event.get("session") == session and event["op"] == "next")
+            packet = trace["events"][next_index - 2]["queries"]
+            for key in keys:
+                left, right = packet[key]["series"]
+                left["samples"], right["samples"] = right["samples"], left["samples"]
+            with self.assertRaisesRegex(derive.Refuse, "outside Go's own legal set"):
+                derive.derive(trace, rows, None)
 
 
 if __name__ == "__main__":
