@@ -758,9 +758,24 @@ def connection_cadence_model(state):
     keyspace and the proof that every higher-priority factor is neutral.
     """
     if (state.policy not in {"connection"} | METRIC_POLICIES
-            or state.ambiguous_group_clocks or state.recorded_connections.label_name
-            or any(backend.ambiguous for backend in state.backends.values())):
+            or state.ambiguous_group_clocks or state.recorded_connections.label_name):
         return None
+    # `Backend.ambiguous` means only that this recorder cannot know whether an
+    # engine-relative owner retained an unhealthy member. Owner identity/count
+    # is deliberately supplied by each replay engine's public ledger. It must
+    # not disable the relative cadence model when group membership is otherwise
+    # invariant: MatchAll/Port members never change groups, while CIDR reaches
+    # here only after update_cidr_groups proved the B5 existence/value bounds.
+    # A group made solely from ambiguous members can disappear in one engine,
+    # so its epoch/cadence is still unknowable and remains fail closed.
+    ambiguous = {bid for bid, backend in state.backends.items() if backend.ambiguous}
+    if ambiguous:
+        grouped = set().union(*state.groups.values()) if state.groups else set()
+        if not ambiguous <= grouped:
+            return None
+        if any((members & ambiguous) and not (members - ambiguous)
+               for members in state.groups.values()):
+            return None
     groups = []
     for group, members in sorted(state.groups.items()):
         members = sorted(members)

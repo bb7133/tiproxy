@@ -141,6 +141,36 @@ class CadenceTests(unittest.TestCase):
         self.assertEqual(state.group_last_redirect,{})
         self.assertEqual(derive.derive_connection_redirects(state,set()),[])
 
+    def test_relative_cadence_keeps_ambiguous_owner_when_group_is_certain(self):
+        for rule, labels in (("", ({}, {})),
+                             ("port", ({"tiproxy-port":"6000"}, {"tiproxy-port":"6000"})),
+                             ("client_cidr", ({"cidr":"127.0.0.1/32"}, {"cidr":"127.0.0.1/32"}))):
+            with self.subTest(rule=rule):
+                state = derive.State({"policy":"connection", "selection":"random", "rule":rule})
+                state.apply_health([{"address":"a", "labels":labels[0]},
+                                    {"address":"b", "labels":labels[1]}])
+                session = derive.Session("relative", {"client":"127.0.0.1:1", "port":"6000"})
+                session.assigned = frozenset(("default/a", "default/b"))
+                session.relative_history = True
+                state.sessions[session.id] = session
+                state.apply_health([{"address":"b", "labels":labels[1]}])
+                self.assertTrue(state.backends["default/a"].ambiguous)
+                model = derive.connection_cadence_model(state)
+                self.assertIsNotNone(model)
+                members = model["groups"][0]["members"]
+                self.assertIn({"backend":"default/a", "healthy":False, "keyspace":""}, members)
+
+    def test_relative_cadence_refuses_ambiguous_group_existence(self):
+        state = derive.State({"policy":"connection", "selection":"random", "rule":"port"})
+        state.apply_health([{"address":"a", "labels":{"tiproxy-port":"6000"}}])
+        session = derive.Session("relative", {"port":"6000"})
+        session.assigned = frozenset(("default/a", "default/not-present"))
+        session.relative_history = True
+        state.sessions[session.id] = session
+        state.apply_health([])
+        self.assertTrue(state.backends["default/a"].ambiguous)
+        self.assertIsNone(derive.connection_cadence_model(state))
+
 
 if __name__ == "__main__":
     unittest.main()
