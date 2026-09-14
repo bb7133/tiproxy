@@ -267,6 +267,143 @@ func TestAcceptedDelayedRedirectWithoutCallbackRemainsPending(t *testing.T) {
 	}
 }
 
+func addReviewLive(conn *Conn) {
+	resetState.mu.Lock()
+	resetState.live[conn] = struct{}{}
+	resetState.mu.Unlock()
+}
+
+func beginReviewReset(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	t.Cleanup(cancel)
+	if err := BeginRouterReset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(EndRouterReset)
+}
+
+func TestRouterResetSnapshotRequiresOneSuccessfulHeldRedirect(t *testing.T) {
+	out := &reviewSink{}
+	Install(out, "reset-held")
+	c := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "s", current: reviewBackend{id: "A"}}}
+	w := &receiverWrapper{inner: reviewReceiver{}, conn: c}
+	addReviewLive(c)
+	beginReviewReset(t)
+	DelayNextRedirectResult()
+	out.Serialize(func() {
+		if !c.Redirect(reviewBackend{id: "B"}) {
+			t.Fatal("redirect refused")
+		}
+	})
+	if err := w.OnRedirectSucceed("A", "B", c); err != nil {
+		t.Fatal(err)
+	}
+	survivors, err := SurvivorsLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(survivors) != 1 || survivors[0].Backend != "B" || survivors[0].Operation != "s/1" {
+		t.Fatalf("survivors=%+v", survivors)
+	}
+}
+
+func TestRouterResetSnapshotRejectsOrdinaryPendingRedirect(t *testing.T) {
+	out := &reviewSink{}
+	Install(out, "reset-ordinary")
+	held := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "held", current: reviewBackend{id: "A"}}}
+	heldWrapper := &receiverWrapper{inner: reviewReceiver{}, conn: held}
+	ordinary := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "ordinary", current: reviewBackend{id: "A"}}}
+	addReviewLive(held)
+	addReviewLive(ordinary)
+	beginReviewReset(t)
+	DelayNextRedirectResult()
+	out.Serialize(func() {
+		if !held.Redirect(reviewBackend{id: "B"}) || !ordinary.Redirect(reviewBackend{id: "C"}) {
+			t.Fatal("redirect refused")
+		}
+	})
+	if err := heldWrapper.OnRedirectSucceed("A", "B", held); err != nil {
+		t.Fatal(err)
+	}
+	_, err := SurvivorsLocked()
+	if err == nil || err.Error() != "router reset session ordinary has an unsettled ordinary redirect" {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestRouterResetSnapshotRejectsFailedHeldRedirect(t *testing.T) {
+	out := &reviewSink{}
+	Install(out, "reset-failed")
+	c := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "s", current: reviewBackend{id: "A"}}}
+	w := &receiverWrapper{inner: reviewReceiver{}, conn: c}
+	addReviewLive(c)
+	beginReviewReset(t)
+	DelayNextRedirectResult()
+	out.Serialize(func() {
+		if !c.Redirect(reviewBackend{id: "B"}) {
+			t.Fatal("redirect refused")
+		}
+	})
+	if err := w.OnRedirectFail("A", "B", c); err != nil {
+		t.Fatal(err)
+	}
+	_, err := SurvivorsLocked()
+	if err == nil || err.Error() != "router reset session s has an invalid held redirect" {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestBeginRouterResetDrainsAndGatesSelectors(t *testing.T) {
+	Install(&reviewSink{}, "reset-gate")
+	active := BeginRoute()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- BeginRouterReset(ctx) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		resetState.mu.Lock()
+		resetting := resetState.resetting
+		resetState.mu.Unlock()
+		if resetting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("router reset did not arm")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("reset did not wait for the active selector: %v", err)
+	default:
+	}
+	active.End()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+
+	admitted := make(chan struct{})
+	var blocked *RouteGate
+	go func() {
+		blocked = BeginRoute()
+		close(admitted)
+	}()
+	select {
+	case <-admitted:
+		t.Fatal("new selector crossed the reset gate")
+	case <-time.After(10 * time.Millisecond):
+	}
+	EndRouterReset()
+	select {
+	case <-admitted:
+	case <-ctx.Done():
+		t.Fatal("new selector was not released after reset")
+	}
+	blocked.End()
+}
+
 func TestSourceErrorIdentityAndPublicReturn(t *testing.T) {
 	for _, tc := range []struct {
 		err           error

@@ -7,8 +7,7 @@ one attempt, qualify it.
 1. Preflight: the family table (normal-slots.tsv / config-slots.tsv) must match the frozen recording
    plan row for row (policy, selection, Go rule spelling, minimum duration, zero held sessions,
    parseable script; C scripts must equal gen_config_scripts.py output); the attempt directory and
-   the external manifest snapshot must not exist yet. A C row whose router close/recreate/rehydrate
-   lifecycle is still `pending:` is refused unless --trial is given (trial captures cannot qualify).
+   the external manifest snapshot must not exist yet.
 2. Set TiDB session-token redirection and per-instance labels through env.sh (only instances whose
    labels differ are restarted).
 3. Parse the post-mutation `env.sh manifest` output and assert redirection mode, the exact label map
@@ -45,7 +44,7 @@ def sh(*cmd):
     subprocess.run(cmd, check=True)
 
 
-def preflight(rows, family="normal", allow_pending=False):
+def preflight(rows, family="normal"):
     problems = []
     redirection = next(v[3] for v in FAMILIES.values() if v[0] == family)
     with open(PLAN) as f:
@@ -66,7 +65,7 @@ def preflight(rows, family="normal", allow_pending=False):
         if r["redirection"] != redirection:
             problems.append(f"{slot}: {family} family is recorded with redirection {redirection} (frozen N(off) -> F/C(on) layering)")
         if family == "config-source":
-            problems += config_row_problems(slot, r, allow_pending)
+            problems += config_row_problems(slot, r)
         if sorted(validate_normal.parse_labels(r["labels"])) != INSTANCES:
             problems.append(f"{slot}: labels must declare exactly {INSTANCES}")
         try:
@@ -83,7 +82,7 @@ def preflight(rows, family="normal", allow_pending=False):
     return problems
 
 
-def config_row_problems(slot, r, allow_pending):
+def config_row_problems(slot, r):
     problems = []
     labels = validate_normal.parse_labels(r["labels"])
     if r["source_error"] not in SOURCE_ERRORS:
@@ -100,8 +99,8 @@ def config_row_problems(slot, r, allow_pending):
             problems.append(f"{slot}: restore_labels must equal tidb-3's declared labels {labels['tidb-3']}")
         elif parsed["join_labels"] != labels["tidb-2"] or parsed["retain_labels"] == labels["tidb-3"]:
             problems.append(f"{slot}: join must use tidb-2's group labels and retain must change tidb-3's value")
-    if r["lifecycle"].startswith("pending:") and not allow_pending:
-        problems.append(f"{slot}: router close/recreate/rehydrate lifecycle is a pending placeholder; C freeze refused")
+    if r["lifecycle"] != "router-reset-v1":
+        problems.append(f"{slot}: unsupported router lifecycle {r['lifecycle']!r}")
     if (HERE / r["script"]).exists() and (HERE / r["script"]).read_text() != gen_config_scripts.render(r):
         problems.append(f"{slot}: {r['script']} differs from gen_config_scripts.py output")
     return problems
@@ -153,13 +152,12 @@ def main():
     ap.add_argument("--env", required=True, help="slice3 env.sh")
     ap.add_argument("--out", required=True)
     ap.add_argument("--clear-labels", action="store_true")
-    ap.add_argument("--trial", action="store_true", help="allow a pending C lifecycle placeholder (capture cannot qualify)")
     args = ap.parse_args()
     if args.slot[:1] not in FAMILIES:
         sys.exit(f"unknown slot family {args.slot}")
     family, validator, verdict_name, _ = FAMILIES[args.slot[:1]]
     rows = validator.slot_rows()
-    problems = preflight(rows, family, allow_pending=args.trial)
+    problems = preflight(rows, family)
     if args.slot not in rows:
         problems.append(f"unknown slot {args.slot}")
     out = Path(args.out)

@@ -251,9 +251,24 @@ The following dependencies withhold a slot from acceptance:
   Ambiguous group lifetimes, unmodeled factor advice and histories whose legal
   alternatives exceed the bounded model retain this dependency.
 
-Additional planned work includes timer boundary expansion and
-router Close/recreate/rehydrate for the config/source family. The
-presence of a row in `recording-plan.tsv` does not mean its driver is implemented.
+Config/source slots use an explicit `router_reset` lifecycle. The recorder keeps a
+real SQL connection alive, arms and observes a delayed accepted redirect, closes the
+old router, constructs a fresh router, republishes the latest complete health input,
+and rehydrates every surviving connection before releasing the late callback. Each
+recorded route is gated before namespace lookup, so a concurrent connection cannot
+retain the old router while the lifecycle swaps the namespace. Each
+rehydrate input names either its `backend_ref: previous` assignment or the delayed
+redirect's engine-relative `effect_ref`; a following Lookup uses that same effect
+reference. The recorder refuses the reset if any other accepted redirect remains
+unsettled at the boundary. Replay adapters recreate their real router and invoke the
+real rehydration boundary instead of clearing a test-only ledger. If another engine
+chose a different delayed owner, its effect-relative rehydrate swaps logical handles
+so all remaining survivors are still rehydrated exactly once. `router_reset_smoke.py`
+runs this lifecycle through both real adapters and independently re-derives their
+public rows in CI.
+
+Additional planned work includes timer boundary expansion. The presence of a row in
+`recording-plan.tsv` does not mean every other driver is implemented.
 Captures with unresolved dependencies remain raw evidence and do not count toward
 the 18 slots, three rounds or focused acceptance groups.
 

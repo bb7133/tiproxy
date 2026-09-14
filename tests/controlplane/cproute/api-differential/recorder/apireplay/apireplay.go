@@ -10,7 +10,8 @@
 // proxy through a test-build overlay of pkg/proxy/backend/backend_conn_mgr.go
 // that substitutes the public selector calls at their call site:
 //
-//	selector := r.GetBackendSelector(ci)      -> selector, session := apireplay.Open(r, ci)
+//	r, err := handshakeHandler.GetRouter(...) -> gate := apireplay.BeginRoute(); r, err := ...
+//	selector := r.GetBackendSelector(ci)      -> selector, session := apireplay.OpenRoute(gate, r, ci)
 //	backend, err = selector.Next()             -> backend, err = apireplay.Next(&selector, session)
 //	selector.Finish(mgr, err == nil)           -> apireplay.Finish(&selector, session, mgr, err == nil)
 //
@@ -29,6 +30,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -76,8 +78,12 @@ type Event struct {
 	Backend   string          `json:"backend,omitempty"`
 	Success   *bool           `json:"success,omitempty"`
 	Operation string          `json:"operation,omitempty"`
-	Outcome   string          `json:"outcome,omitempty"`
-	Effects   []Effect        `json:"effects,omitempty"`
+	// BackendRef identifies a replay-relative backend input. "previous"
+	// means this engine's assignment immediately before router_reset;
+	// Operation identifies an accepted redirect whose target is the input.
+	BackendRef string   `json:"backend_ref,omitempty"`
+	Outcome    string   `json:"outcome,omitempty"`
+	Effects    []Effect `json:"effects,omitempty"`
 }
 
 // HealthBackend is one explicit health inventory entry (every field written).
@@ -138,7 +144,102 @@ var (
 	overlayInstalled atomic.Bool
 	prefix           = "s"
 	controls         = newControls()
+	resetState       = newRouterResetState()
 )
+
+type routerResetState struct {
+	mu        sync.Mutex
+	resetting bool
+	selecting int
+	idle      chan struct{}
+	resume    chan struct{}
+	live      map[*Conn]struct{}
+}
+
+func closedSignal() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+func newRouterResetState() *routerResetState {
+	return &routerResetState{idle: closedSignal(), live: make(map[*Conn]struct{})}
+}
+
+func beginSelection() {
+	for {
+		resetState.mu.Lock()
+		if !resetState.resetting {
+			if resetState.selecting == 0 {
+				resetState.idle = make(chan struct{})
+			}
+			resetState.selecting++
+			resetState.mu.Unlock()
+			return
+		}
+		resume := resetState.resume
+		resetState.mu.Unlock()
+		<-resume
+	}
+}
+
+// RouteGate covers router lookup through selector completion. Starting the
+// gate before namespace lookup ensures a reset cannot release a caller that
+// captured the old router immediately before OpenRoute.
+type RouteGate struct{ active atomic.Bool }
+
+// BeginRoute waits out an active reset and marks one routing attempt in flight.
+func BeginRoute() *RouteGate {
+	beginSelection()
+	gate := &RouteGate{}
+	gate.active.Store(true)
+	return gate
+}
+
+// End abandons or completes a routing attempt. It is safe to call twice.
+func (g *RouteGate) End() {
+	if g == nil || !g.active.CompareAndSwap(true, false) {
+		return
+	}
+	resetState.mu.Lock()
+	resetState.selecting--
+	if resetState.selecting == 0 {
+		close(resetState.idle)
+	}
+	resetState.mu.Unlock()
+}
+
+// BeginRouterReset prevents new selectors from opening and waits until every
+// already-open selector has either finished or abandoned its reservation.
+// Finish/EndSelection and terminal callbacks remain runnable while it waits.
+func BeginRouterReset(ctx context.Context) error {
+	resetState.mu.Lock()
+	if resetState.resetting {
+		resetState.mu.Unlock()
+		return errors.New("router reset already active")
+	}
+	resetState.resetting = true
+	resetState.resume = make(chan struct{})
+	idle := resetState.idle
+	resetState.mu.Unlock()
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		EndRouterReset()
+		return fmt.Errorf("wait for idle selectors: %w", ctx.Err())
+	}
+}
+
+// EndRouterReset admits selectors that were held while the router was replaced.
+func EndRouterReset() {
+	resetState.mu.Lock()
+	if resetState.resetting {
+		resetState.resetting = false
+		close(resetState.resume)
+	}
+	resetState.mu.Unlock()
+}
 
 type delayedRedirect struct {
 	from, to string
@@ -176,6 +277,7 @@ func Install(s Sink, sessionPrefix string) {
 	defer sinkMu.Unlock()
 	sink = s
 	controls = newControls()
+	resetState = newRouterResetState()
 	if sessionPrefix != "" {
 		prefix = sessionPrefix
 	}
@@ -364,6 +466,7 @@ type Session struct {
 	// connection callback. An abandoned selector ends at its caller's return.
 	established bool
 	closed      bool
+	gate        *RouteGate
 }
 
 // ID returns the recorded session id.
@@ -371,9 +474,18 @@ func (s *Session) ID() string { return s.id }
 
 // Open calls the real GetBackendSelector and records the `open` event.
 func Open(r router.Router, ci router.ClientInfo) (sel router.BackendSelector, s *Session) {
+	return OpenRoute(BeginRoute(), r, ci)
+}
+
+// OpenRoute records a selector after BeginRoute has gated the namespace/router
+// lookup that supplied r.
+func OpenRoute(gate *RouteGate, r router.Router, ci router.ClientInfo) (sel router.BackendSelector, s *Session) {
+	if gate == nil || !gate.active.Load() {
+		panic("apireplay: OpenRoute requires an active route gate")
+	}
 	serialize(func() {
 		sel = r.GetBackendSelector(ci)
-		s = &Session{id: fmt.Sprintf("%s-%d", prefix, counter.Add(1))}
+		s = &Session{id: fmt.Sprintf("%s-%d", prefix, counter.Add(1)), gate: gate}
 		record(Event{Op: "open", Session: s.id, Client: addr(ci.ClientAddr), Proxy: addr(ci.ProxyAddr), Port: ci.ListenerPort})
 	})
 	return sel, s
@@ -405,6 +517,9 @@ func Finish(sel *router.BackendSelector, s *Session, conn router.RedirectableCon
 		sel.Finish(s.conn, succeed)
 		if succeed {
 			s.established = true
+			resetState.mu.Lock()
+			resetState.live[s.conn] = struct{}{}
+			resetState.mu.Unlock()
 		}
 		ok := succeed
 		record(Event{Op: "finish", Session: s.id, Success: &ok})
@@ -417,6 +532,7 @@ func Finish(sel *router.BackendSelector, s *Session, conn router.RedirectableCon
 func EndSelection(sel *router.BackendSelector, s *Session) {
 	serialize(func() {
 		sel.CloseObservation()
+		s.gate.End()
 		if !s.established && !s.closed {
 			s.closed = true
 			record(Event{Op: "close", Session: s.id})
@@ -434,6 +550,7 @@ type Conn struct {
 	receiver router.ConnEventReceiver
 	refuse   atomic.Bool
 	redirect *redirectOperation
+	wrapper  *receiverWrapper
 }
 
 type redirectOperation struct {
@@ -485,7 +602,8 @@ func (c *Conn) ForceClose() bool {
 
 func (c *Conn) SetEventReceiver(receiver router.ConnEventReceiver) {
 	c.receiver = receiver
-	c.RedirectableConn.SetEventReceiver(&receiverWrapper{inner: receiver, conn: c})
+	c.wrapper = &receiverWrapper{inner: receiver, conn: c}
+	c.RedirectableConn.SetEventReceiver(c.wrapper)
 }
 
 type receiverWrapper struct {
@@ -522,6 +640,9 @@ func (w *receiverWrapper) OnConnClosed(backendID string, conn router.Redirectabl
 	serialize(func() {
 		err = w.inner.OnConnClosed(backendID, w.conn)
 		w.conn.session.closed = true
+		resetState.mu.Lock()
+		delete(resetState.live, w.conn)
+		resetState.mu.Unlock()
 		record(Event{Op: "close", Session: w.conn.session.id, Operation: takeDelayedClose(w.conn)})
 		if delayed, ok := takeDelayedRedirect(w.conn); ok {
 			lateErr := w.deliverRedirectResult(delayed.from, delayed.to, delayed.success)
@@ -532,6 +653,152 @@ func (w *receiverWrapper) OnConnClosed(backendID string, conn router.Redirectabl
 		}
 	})
 	return err
+}
+
+// Survivor is one live recorded connection at a router-reset boundary. Backend
+// is the physical owner to restore: a held successful redirect has already
+// moved the socket to its target even though its callback is still pending.
+type Survivor struct {
+	Conn      *Conn
+	Session   string
+	Backend   string
+	Operation string
+}
+
+// SurvivorsLocked snapshots live connections while the recorder scheduler is
+// held after BeginRouterReset. It reads only values observed at public calls.
+// The reset is safe only when its one successful delayed callback has already
+// arrived and every other accepted redirect has settled on the old router.
+func SurvivorsLocked() ([]Survivor, error) {
+	controls.mu.Lock()
+	if controls.refuse != 0 || controls.delay != 0 || len(controls.awaiting) != 0 || len(controls.closing) != 0 {
+		controls.mu.Unlock()
+		return nil, errors.New("router reset has pending scripted controls")
+	}
+	if len(controls.delayed) != 1 {
+		count := len(controls.delayed)
+		controls.mu.Unlock()
+		return nil, fmt.Errorf("router reset requires one held redirect callback, got %d", count)
+	}
+	delayedByConn := make(map[*Conn]delayedRedirect, len(controls.delayed))
+	for conn, delayed := range controls.delayed {
+		delayedByConn[conn] = delayed
+	}
+	controls.mu.Unlock()
+
+	resetState.mu.Lock()
+	defer resetState.mu.Unlock()
+	if !resetState.resetting {
+		return nil, errors.New("router reset snapshot requires an active reset gate")
+	}
+	out := make([]Survivor, 0, len(resetState.live))
+	foundDelayed := false
+	for conn := range resetState.live {
+		backend, operation := "", ""
+		if conn.session.current != nil {
+			backend = conn.session.current.ID()
+		}
+		delayed, isDelayed := delayedByConn[conn]
+		if isDelayed {
+			op := conn.redirect
+			if !delayed.success || delayed.from == "" || delayed.to == "" || op == nil || op.settled || !op.delayed ||
+				op.from == nil || op.to == nil || op.from.ID() != delayed.from || op.to.ID() != delayed.to {
+				return nil, fmt.Errorf("router reset session %s has an invalid held redirect", conn.session.id)
+			}
+			backend = delayed.to
+			operation = op.id
+			foundDelayed = true
+		} else if conn.redirect != nil && !conn.redirect.settled {
+			return nil, fmt.Errorf("router reset session %s has an unsettled ordinary redirect", conn.session.id)
+		}
+		if backend == "" {
+			return nil, fmt.Errorf("router reset session %s has no current backend", conn.session.id)
+		}
+		out = append(out, Survivor{Conn: conn, Session: conn.session.id, Backend: backend, Operation: operation})
+	}
+	if !foundDelayed {
+		return nil, errors.New("router reset held redirect does not belong to a live connection")
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Session < out[j].Session })
+	return out, nil
+}
+
+// RecordRouterResetLocked records completion of the real old-router Close and
+// fresh-router construction. The caller owns the scheduler critical section.
+func RecordRouterResetLocked() { record(Event{Op: "router_reset", Outcome: "ok"}) }
+
+// RehydrateLocked invokes the new router's public rehydration API and records
+// either the prior-assignment reference or an accepted redirect target ref.
+func RehydrateLocked(r router.AssignmentRehydrator, survivor Survivor) error {
+	backend, ok := r.RehydrateConn(survivor.Backend, survivor.Conn)
+	ev := Event{Op: "rehydrate", Session: survivor.Session, Backend: survivor.Backend, Outcome: "unknown_backend", BackendRef: "previous"}
+	if survivor.Operation != "" {
+		ev.BackendRef = ""
+		ev.Operation = survivor.Operation
+	}
+	if ok {
+		ev.Outcome = "ok"
+		ev.Backend = backend.ID()
+	}
+	record(ev)
+	if !ok {
+		return fmt.Errorf("rehydrate %s on %s: unknown backend", survivor.Session, survivor.Backend)
+	}
+	return nil
+}
+
+// LookupDelayedTargetLocked resolves the held redirect target on the fresh
+// router and records it relative to the accepted operation.
+func LookupDelayedTargetLocked(r router.AssignmentRehydrator) (*Conn, error) {
+	controls.mu.Lock()
+	defer controls.mu.Unlock()
+	for conn, delayed := range controls.delayed {
+		if !delayed.success || conn.redirect == nil {
+			return nil, errors.New("router reset requires a successful pending redirect")
+		}
+		backend, ok := r.LookupBackend(delayed.to)
+		ev := Event{Op: "lookup", Backend: delayed.to, Operation: conn.redirect.id, Outcome: "unknown_backend"}
+		if ok {
+			ev.Outcome = "ok"
+			ev.Backend = backend.ID()
+		}
+		record(ev)
+		if !ok {
+			return nil, fmt.Errorf("lookup pending redirect target %s: unknown backend", delayed.to)
+		}
+		return conn, nil
+	}
+	return nil, errors.New("router reset requires one pending redirect")
+}
+
+// ReleaseDelayedRedirectLocked delivers the real callback after rehydration
+// and lookup. The caller owns the scheduler critical section.
+func ReleaseDelayedRedirectLocked(conn *Conn) error {
+	delayed, ok := takeDelayedRedirect(conn)
+	if !ok || conn.wrapper == nil {
+		return errors.New("pending redirect disappeared during router reset")
+	}
+	err := conn.wrapper.deliverRedirectResult(delayed.from, delayed.to, delayed.success)
+	close(delayed.settled)
+	return err
+}
+
+// WaitDelayedRedirect waits until the client produced the callback held by a
+// declared delay control. It does not consume the callback.
+func WaitDelayedRedirect(ctx context.Context) error {
+	for {
+		controls.mu.Lock()
+		ready := len(controls.delayed) == 1
+		controls.mu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for pending redirect: %w", ctx.Err())
+		case <-controls.delayedReady:
+		}
+	}
 }
 
 func (w *receiverWrapper) deliverRedirectResult(from, to string, success bool) error {

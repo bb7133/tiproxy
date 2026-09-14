@@ -72,6 +72,7 @@ type apiTraceEvent struct {
 	Backend    string                           `json:"backend,omitempty"`
 	Operation  string                           `json:"operation,omitempty"`
 	EffectRef  string                           `json:"effect_ref,omitempty"`
+	BackendRef string                           `json:"backend_ref,omitempty"`
 	Optional   bool                             `json:"optional_effect,omitempty"`
 	Refuse     []string                         `json:"refuse,omitempty"`
 	RefuseNext int                              `json:"refuse_next,omitempty"`
@@ -242,20 +243,25 @@ func TestRouterAPIDifferential(t *testing.T) {
 	initial := fmt.Sprintf("[balance]\npolicy=%q\nrouting-policy=%q\nrouting-rule=%q\n", trace.Config.Policy, trace.Config.Selection, trace.Config.Rule)
 	require.NoError(t, manager.SetTOMLConfig([]byte(initial)))
 	metricInputs := &apiMetrics{}
-	r := NewScoreBasedRouter(zap.NewNop())
 	ob := newMockBackendObserver()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	r.Init(ctx, ob, func(lg *zap.Logger) policy.BalancePolicy {
-		return factor.NewFactorBasedBalance(lg, metricInputs)
-	}, manager, nil)
-	r.wg.Wait()
-	t.Cleanup(r.Close)
+	newRouter := func() *ScoreBasedRouter {
+		next := NewScoreBasedRouter(zap.NewNop())
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		next.Init(ctx, ob, func(lg *zap.Logger) policy.BalancePolicy {
+			return factor.NewFactorBasedBalance(lg, metricInputs)
+		}, manager, nil)
+		next.wg.Wait()
+		return next
+	}
+	r := newRouter()
+	t.Cleanup(func() { r.Close() })
 	type slot struct {
 		selector BackendSelector
 		conn     *apiConn
 		current  BackendInst
 		active   bool
+		client   ClientInfo
 	}
 	sessions := make(map[string]*slot)
 	logicalSessions := make(map[string]string)
@@ -272,6 +278,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 	delayAttempts := 0
 	var delayedOperation *apiOperation
 	delayedSettledEarly := false
+	resetPrevious := make(map[string]string)
 	armRefusal := func(value, index int) {
 		require.Equal(t, 1, value, "one-shot refusal input at seq=%d", index)
 		require.Zero(t, refuseNext, "one-shot refusal armed while one is pending at seq=%d", index)
@@ -302,6 +309,41 @@ func TestRouterAPIDifferential(t *testing.T) {
 			"delayed callback survived %d accepted redirects before %s at seq=%d", delayAttempts, boundary, index)
 		delayNext = 0
 	}
+	bindBackendEffect := func(event apiTraceEvent, index int) *apiOperation {
+		operation := effectRefs[event.EffectRef]
+		if operation == nil {
+			require.NotNil(t, delayedOperation, "unknown backend effect at seq=%d effect_ref=%s", index, event.EffectRef)
+			position := -1
+			for i, candidate := range unboundRedirects {
+				if candidate == delayedOperation {
+					position = i
+					break
+				}
+			}
+			require.NotEqual(t, -1, position, "delayed backend effect left the public queue at seq=%d effect_ref=%s", index, event.EffectRef)
+			operation = delayedOperation
+			effectRefs[event.EffectRef] = operation
+		}
+		if event.Session != "" {
+			owner, ok := effectRefSessions[event.EffectRef]
+			require.True(t, !ok || owner == event.Session, "relative backend effect crossed sessions at seq=%d", index)
+			effectRefSessions[event.EffectRef] = event.Session
+		}
+		return operation
+	}
+	swapLogicalSession := func(logical, actual, boundary string, index int) {
+		var other string
+		for candidate, mapped := range logicalSessions {
+			if mapped == actual {
+				other = candidate
+				break
+			}
+		}
+		require.NotEmpty(t, other, "%s target at seq=%d", boundary, index)
+		displaced := logicalSessions[logical]
+		require.NotEmpty(t, displaced, "%s logical handle at seq=%d", boundary, index)
+		logicalSessions[logical], logicalSessions[other] = actual, displaced
+	}
 	t.Cleanup(func() {
 		if len(output) > 0 {
 			output[len(output)-1]["effects"] = effects
@@ -320,7 +362,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 		logicalActual := actualSession
 		var referenced *apiOperation
 		skippedEffect := false
-		if event.EffectRef != "" {
+		if event.EffectRef != "" && event.Op != "lookup" && event.Op != "rehydrate" {
 			referenced = effectRefs[event.EffectRef]
 			_, alreadySkipped := skippedEffectRefs[event.EffectRef]
 			if referenced != nil || alreadySkipped {
@@ -384,17 +426,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 				skippedEffect = true
 			} else if event.Op == "close" {
 				actualSession = referenced.effect.Session
-				var other string
-				for logical, actual := range logicalSessions {
-					if actual == actualSession {
-						other = logical
-						break
-					}
-				}
-				require.NotEmpty(t, other, "relative close target")
-				displaced := logicalSessions[event.Session]
-				require.NotEmpty(t, displaced, "relative close logical handle")
-				logicalSessions[event.Session], logicalSessions[other] = actualSession, displaced
+				swapLogicalSession(event.Session, actualSession, "relative close", index)
 			} else {
 				actualSession = referenced.effect.Session
 			}
@@ -448,28 +480,60 @@ func TestRouterAPIDifferential(t *testing.T) {
 		case "open":
 			require.Nil(t, s, "duplicate logical session")
 			logicalSessions[event.Session] = event.Session
-			sessions[event.Session] = &slot{selector: r.GetBackendSelector(ClientInfo{
+			client := ClientInfo{
 				ClientAddr: apiClientAddress(event.Client), ProxyAddr: apiClientAddress(event.Proxy), ListenerPort: event.Port,
-			}), conn: &apiConn{mockRedirectableConn: newMockRedirectableConn(t, uint64(index+1)), id: event.Session,
-				refuseNext: &refuseNext, refusalAttempts: &refusalAttempts, effects: &effects, operations: operations}}
+			}
+			sessions[event.Session] = &slot{selector: r.GetBackendSelector(client), client: client,
+				conn: &apiConn{mockRedirectableConn: newMockRedirectableConn(t, uint64(index+1)), id: event.Session,
+					refuseNext: &refuseNext, refusalAttempts: &refusalAttempts, effects: &effects, operations: operations}}
 		case "lookup":
-			backend, ok := r.LookupBackend(event.Backend)
+			backendID := event.Backend
+			if event.EffectRef != "" {
+				backendID = bindBackendEffect(event, index).to.ID()
+			}
+			backend, ok := r.LookupBackend(backendID)
 			if !ok {
 				row["outcome"] = "unknown_backend"
 			} else {
 				row["backend"] = backend.ID()
 			}
 		case "rehydrate":
+			backendID := event.Backend
+			if event.BackendRef == "previous" {
+				backendID = resetPrevious[actualSession]
+				require.NotEmpty(t, backendID, "missing pre-reset assignment at seq=%d session=%s", index, event.Session)
+			} else if event.EffectRef != "" {
+				operation := bindBackendEffect(event, index)
+				actualSession = operation.effect.Session
+				swapLogicalSession(event.Session, actualSession, "relative rehydrate", index)
+				row["session"] = actualSession
+				s = sessions[actualSession]
+				backendID = operation.to.ID()
+			}
 			require.NotNil(t, s)
 			require.False(t, s.active)
-			backend, ok := r.RehydrateConn(event.Backend, s.conn)
+			backend, ok := r.RehydrateConn(backendID, s.conn)
 			if !ok {
 				row["outcome"] = "unknown_backend"
 			} else {
 				row["backend"] = backend.ID()
 				s.conn.from = backend
 				s.active = true
+				delete(resetPrevious, actualSession)
 			}
+		case "router_reset":
+			require.Empty(t, resetPrevious, "router reset while one is unfinished")
+			for id, live := range sessions {
+				require.Nil(t, live.current, "router reset with a pending creation")
+				require.True(t, live.active, "router reset with an inactive session")
+				resetPrevious[id] = live.conn.from.ID()
+				live.selector.CloseObservation()
+				live.selector = BackendSelector{}
+				live.active = false
+			}
+			require.NotEmpty(t, resetPrevious, "router reset requires a live assignment")
+			r.Close()
+			r = newRouter()
 		case "tick":
 			if event.RefuseNext > 0 {
 				armRefusal(event.RefuseNext, index)
@@ -588,5 +652,6 @@ func TestRouterAPIDifferential(t *testing.T) {
 	require.Zero(t, delayNext, "trace ended with an unconsumed delayed callback")
 	require.Nil(t, delayedOperation, "trace ended before the delayed callback close")
 	require.False(t, delayedSettledEarly, "trace ended before the strict delayed-close opportunity")
+	require.Empty(t, resetPrevious, "trace ended with unrehydrated reset survivors")
 	require.Zero(t, r.ConnCount())
 }

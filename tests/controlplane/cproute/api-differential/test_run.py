@@ -56,6 +56,42 @@ class PublicClockTests(unittest.TestCase):
         runner.validate(trace)  # Older recorded inputs retain their original epoch.
 
 
+class RouterResetStructureTests(unittest.TestCase):
+    @staticmethod
+    def trace(events):
+        return {"version": 1, "id": "reset-structure",
+                "config": {"policy": "connection", "selection": "random", "rule": ""},
+                "provenance": {"kind": "synthetic"}, "events": events}
+
+    def test_reset_rejects_an_idle_open_session(self):
+        events = [
+            {"op": "open", "session": "live", "expect": {"outcome": "ok"}},
+            {"op": "next", "session": "live", "expect": {"outcome": "ok", "backend": "a"}},
+            {"op": "finish", "session": "live", "success": True, "expect": {"outcome": "ok"}},
+            {"op": "open", "session": "idle", "expect": {"outcome": "ok"}},
+            {"op": "next", "session": "idle", "expect": {"outcome": "no_backend"}},
+            {"op": "router_reset", "expect": {"outcome": "ok"}},
+            {"op": "rehydrate", "session": "live", "backend_ref": "previous",
+             "expect": {"outcome": "ok", "backend": "a"}},
+            {"op": "close", "session": "live", "expect": {"outcome": "ok"}},
+            {"op": "close", "session": "idle", "expect": {"outcome": "ok"}},
+            {"op": "checkpoint", "expect": {"outcome": "ok"}},
+        ]
+        with self.assertRaisesRegex(runner.Difference, "every open session"):
+            runner.validate(self.trace(events))
+
+    def test_relative_rehydrate_requires_an_active_reset(self):
+        events = [
+            {"op": "open", "session": "s", "expect": {"outcome": "ok"}},
+            {"op": "rehydrate", "session": "s", "backend_ref": "previous",
+             "expect": {"outcome": "ok", "backend": "a"}},
+            {"op": "close", "session": "s", "expect": {"outcome": "ok"}},
+            {"op": "checkpoint", "expect": {"outcome": "ok"}},
+        ]
+        with self.assertRaisesRegex(runner.Difference, "surviving pre-reset"):
+            runner.validate(self.trace(events))
+
+
 class PublicMetricsTests(unittest.TestCase):
     def packet(self):
         queries = dict.fromkeys(runner.METRIC_KEYS)
@@ -434,6 +470,36 @@ class ConnectionPreferenceTests(unittest.TestCase):
         self.assertEqual(h.resolve_event(callback), "")
         self.assertEqual(h.resolve_operation(callback), "")
         self.assertEqual((h.delay_next, h.delay_attempts, h.unbound_redirects), (0, 0, []))
+
+    def test_effect_relative_rehydrate_swaps_survivor_handles(self):
+        h = self.history()
+        for sid in ("recorded", "actual"):
+            h.apply({"op": "open", "session": sid}, {}, sid=sid)
+            self.reserve(h, sid, "source", True)
+        arm = {"op": "config", "delay_next": 1,
+               "toml": "[proxy]\nfail-backend-list=['source']\n"}
+        h.prepare(arm, {}, {"outcome": "ok"}, 0)
+        delayed = {"kind": "redirect", "session": "actual", "operation": "actual/1",
+                   "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [delayed]})
+        h.apply({"op": "router_reset"}, {"outcome": "ok", "effects": []})
+
+        relative = {"op": "rehydrate", "session": "recorded",
+                    "effect_ref": "redirect/1"}
+        self.assertEqual(h.resolve_event(relative), "actual")
+        self.assertEqual(h.logical_to_actual,
+                         {"recorded": "actual", "actual": "recorded"})
+        self.assertEqual(h.resolve_backend(relative), "target")
+        h.apply(relative, {"outcome": "ok", "backend": "target", "effects": []},
+                sid="actual")
+
+        previous = {"op": "rehydrate", "session": "actual", "backend_ref": "previous"}
+        self.assertEqual(h.resolve_event(previous), "recorded")
+        self.assertEqual(h.resolve_backend(previous), "source")
+        h.apply(previous, {"outcome": "ok", "backend": "source", "effects": []},
+                sid="recorded")
+        self.assertEqual(h.assigned, {"actual": "target", "recorded": "source"})
+        self.assertEqual(h.reset_previous, {})
 
     def test_delayed_arm_fails_if_accepted_binding_leaves_public_queue(self):
         h = self.history()

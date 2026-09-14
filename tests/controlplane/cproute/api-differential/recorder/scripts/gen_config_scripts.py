@@ -15,9 +15,11 @@ Group-routing input change (agreed with the reviewer):
                   another group's value, which must keep its original group; join: the added
                   tidb-4 starts without labels and joins a group once its label is set; the
                   replaced label of tidb-3 is restored before the end.
-The router Close -> new router -> RehydrateConn -> LookupBackend lifecycle has no recorder action
-yet; the `lifecycle` column keeps it an explicit pending placeholder (see record_slot.py preflight
-and validate_config.py), so these scripts cannot qualify a slot until that action exists.
+The lifecycle actions first retain a real MySQL connection on a predetermined,
+temporarily unique backend. The final router_reset creates one delayed successful
+redirect, closes the old router, constructs a fresh router, republishes the latest
+health input, rehydrates every surviving connection, looks up the pending target,
+then releases the real callback.
 
 Run with --check to verify the committed scripts equal the generated ones.
 """
@@ -43,6 +45,22 @@ def actions(r):
         add(at + 1, "await_env")
         add(checkpoint, "checkpoint")
 
+    def lifecycle():
+        listeners = r["listen"].split(",")
+        if r["go_rule"] == "":
+            keep = "default/127.0.0.1:4000"
+            excluded = [f"default/127.0.0.1:400{i}" for i in range(1, 5)]
+            listener, source = listeners[0], ""
+        else:
+            keep = "default/127.0.0.1:4002"
+            excluded = ["default/127.0.0.1:4003", "default/127.0.0.1:4004"]
+            listener = listeners[1] if r["go_rule"] in ("proxy_cidr", "port") else listeners[0]
+            source = "127.0.0.1" if r["go_rule"] == "client_cidr" else ""
+        add(195000, "lifecycle_open", backends=excluded, listener=listener, source=source,
+            timeout_ms=10000)
+        add(320000, "router_reset", backend=keep, timeout_ms=15000)
+        add(350000, "checkpoint")
+
     add(10000, "checkpoint")
     add(15000, "config", toml=f'[balance]\npolicy = "{r["policy"]}"\nrouting-policy = "{r["selection"]}"\n')
     add(20000, "config", toml='[balance]\npolicy = "invalid-policy"\n')
@@ -60,10 +78,11 @@ def actions(r):
     env(105000, "tidb-add", checkpoint=150000)
     if r["go_rule"] != "":
         env(155000, "tidb-set-labels", "4", r["join_labels"], checkpoint=190000)
+    lifecycle()
     env(205000, "tidb-remove", "4", checkpoint=280000)
     if r["go_rule"] != "":
         env(285000, "tidb-set-labels", "3", r["restore_labels"], checkpoint=310000)
-    return a
+    return sorted(a, key=lambda item: item["at_ms"])
 
 
 def render(r):

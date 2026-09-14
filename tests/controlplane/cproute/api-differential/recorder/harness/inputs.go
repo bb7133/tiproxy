@@ -30,6 +30,10 @@ func NewInputs(sched *Scheduler, driver *router.ReplayDriver) *Inputs {
 	return &Inputs{sched: sched, driver: driver}
 }
 
+// SetDriverLocked swaps the fresh router driver during a declared reset. The
+// caller owns the recorder scheduler, so no delivery can observe half a swap.
+func (in *Inputs) SetDriverLocked(driver *router.ReplayDriver) { in.driver = driver }
+
 // Forward subscribes to the real observer and delivers every result in
 // arrival order at the current logical time. It returns when ctx ends.
 func (in *Inputs) Forward(ctx context.Context, bo observer.BackendObserver, name string) {
@@ -52,24 +56,39 @@ func (in *Inputs) Forward(ctx context.Context, bo observer.BackendObserver, name
 // records it as `health` (explicit inventory) or `source_error` (identity).
 func (in *Inputs) Deliver(result observer.HealthResult) {
 	in.sched.RunNow(func() {
-		in.mu.Lock()
-		in.raw = append(in.raw, result)
-		in.mu.Unlock()
-		in.driver.DeliverHealth(result)
-		if err := result.Error(); err != nil {
-			in.sched.Record(apireplay.Event{Op: "source_error", Outcome: apireplay.ErrorIdentity(err)})
-			return
-		}
-		ev := apireplay.Event{Op: "health"}
-		for id, bh := range result.Backends() {
-			ev.Backends = append(ev.Backends, apireplay.HealthBackend{
-				Address: bh.Addr, Labels: bh.Labels, Cluster: bh.ClusterName, Keyspace: bh.Keyspace,
-				IP: bh.IP, StatusPort: bh.StatusPort, Healthy: bh.Healthy, Local: bh.Local,
-				ServerVersion: bh.ServerVersion, SupportRedirection: bh.SupportRedirection, ID: id,
-			})
-		}
-		in.sched.Record(ev)
+		in.DeliverLocked(result)
 	})
+}
+
+// DeliverLocked is Deliver for a caller that already owns the scheduler.
+func (in *Inputs) DeliverLocked(result observer.HealthResult) {
+	in.mu.Lock()
+	in.raw = append(in.raw, result)
+	in.mu.Unlock()
+	in.driver.DeliverHealth(result)
+	if err := result.Error(); err != nil {
+		in.sched.Record(apireplay.Event{Op: "source_error", Outcome: apireplay.ErrorIdentity(err)})
+		return
+	}
+	ev := apireplay.Event{Op: "health"}
+	for id, bh := range result.Backends() {
+		ev.Backends = append(ev.Backends, apireplay.HealthBackend{
+			Address: bh.Addr, Labels: bh.Labels, Cluster: bh.ClusterName, Keyspace: bh.Keyspace,
+			IP: bh.IP, StatusPort: bh.StatusPort, Healthy: bh.Healthy, Local: bh.Local,
+			ServerVersion: bh.ServerVersion, SupportRedirection: bh.SupportRedirection, ID: id,
+		})
+	}
+	in.sched.Record(ev)
+}
+
+// Latest returns the last external health result consumed by the old router.
+func (in *Inputs) Latest() (observer.HealthResult, bool) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if len(in.raw) == 0 {
+		return observer.HealthResult{}, false
+	}
+	return in.raw[len(in.raw)-1], true
 }
 
 // DeliverConfig applies a validated config through the production handler and

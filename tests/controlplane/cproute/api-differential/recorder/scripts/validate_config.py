@@ -17,8 +17,8 @@ recorded events (whole health snapshots are the fact source for labels and membe
             the original rule is restored (the router's match type is fixed at Init);
   CIDR/Port: a grouped backend's routing label changes in health, after which it is still
             selected from its original context and never from the context of its new value (retain);
-- one router close/recreate/rehydrate lifecycle: at least one successful rehydrate and a lookup.
-  The recorder has no action for it yet, so every current capture fails this requirement.
+- one explicit router_reset with settled live sessions, a fresh health publication, successful
+  rehydration of every survivor, lookup of the pending redirect target, and its late callback.
 
 The initial health labels must equal the slot's declared map. The raw capture gate is shared with
 validate_normal.raw_gate; normal-validation semantics are unchanged.
@@ -71,33 +71,51 @@ def validate(row, trace, go):
     source_done = False
     rule_change = None            # "active" | "restored"
     config_ok = config_invalid = 0
+    sessions, pending, active = set(), set(), set()
+    reset_survivors = None
+    rehydrated = set()
+    reset_at = health_after_reset = lookup_at = callback_at = None
+    accepted_refs = {}
+    settled = set()
+    accepted_redirects = 0
+    lifecycle_ref = None
+    reset_ref = None
 
     def ctx_routes(ctx, values):
         return vn.routed(rule, ctx, values)
 
     for i, (e, g) in enumerate(zip(events, go)):
         op, out = e["op"], g["outcome"]
+        for effect in g.get("effects", []):
+            if effect.get("kind") == "redirect" and effect.get("accepted"):
+                accepted_redirects += 1
+                accepted_refs[f"redirect/{accepted_redirects}"] = effect
         if op == "health":
             backends = [b for b in e.get("backends") or [] if b.get("cluster", "default") == "default"]
             snapshot = {b["address"]: b.get("labels") or {} for b in backends}
             if not health_seen:
-                for a, labels in declared.items():
-                    if a in snapshot and snapshot[a] != labels:
-                        problems.append(f"initial health labels of {a} are {snapshot[a]}, slot declares {labels}")
+                if set(snapshot) != set(declared):
+                    problems.append(f"initial health inventory is {sorted(snapshot)}, slot declares {sorted(declared)}")
+                for a in sorted(set(snapshot) & set(declared)):
+                    if snapshot[a] != declared[a]:
+                        problems.append(f"initial health labels of {a} are {snapshot[a]}, slot declares {declared[a]}")
                 health_seen = True
-            for a, labels in snapshot.items():
-                values = routing_values(labels)
-                if a not in declared and a not in added:
-                    added.add(a)
-                if values and a not in first_labels:
-                    first_labels[a] = values
-                    if a in added:
-                        added_labeled_at[a] = i
-                elif a in first_labels and values != first_labels[a]:
-                    changed[a] = values
-            for a in list(present):
-                if a not in snapshot and a in added:
-                    removed.add(a)
+            if reset_at is not None and i > reset_at and health_after_reset is None:
+                health_after_reset = i
+            if reset_at is None:
+                for a, labels in snapshot.items():
+                    values = routing_values(labels)
+                    if a not in declared and a not in added:
+                        added.add(a)
+                    if values and a not in first_labels:
+                        first_labels[a] = values
+                        if a in added:
+                            added_labeled_at[a] = i
+                    elif a in first_labels and values != first_labels[a]:
+                        changed[a] = values
+                for a in list(present):
+                    if a not in snapshot and a in added:
+                        removed.add(a)
             present = snapshot
             healthy = {b["address"] for b in backends if b.get("healthy", True)}
             if source_window is not None:
@@ -119,6 +137,7 @@ def validate(row, trace, go):
                 config_invalid += 1
         elif op == "open":
             context[e["session"]] = vn.context_key(rule, e)
+            sessions.add(e["session"])
         elif op == "next":
             ctx = context[e["session"]]
             backend = addr(g["backend"]) if out == "ok" else ""
@@ -126,8 +145,10 @@ def validate(row, trace, go):
                 s["source_window_next"] += 1
                 if out != f"source_error:{source_window}":
                     s["source_window_other"] += 1
-            elif source_done and out == "ok":
-                s["source_recovery_ok"] += 1
+            elif source_done:
+                if out == "ok":
+                    s["source_recovery_ok"] += 1
+                source_done = False
             if rule == "" and rule_change == "active":
                 s["rule_change_next"] += 1
                 if out != "ok":
@@ -136,6 +157,7 @@ def validate(row, trace, go):
                     s["rule_change_unhealthy"] += 1
             if out != "ok":
                 continue
+            pending.add(e["session"])
             if backend in added and backend in present:
                 if rule == "":
                     s["added_selected"] += 1
@@ -150,10 +172,57 @@ def validate(row, trace, go):
                     s["retained_selected"] += 1
                 if ctx_routes(ctx, changed[backend]) and not ctx_routes(ctx, first_labels[backend]):
                     s["retained_selected_new_context"] += 1
+        elif op == "finish":
+            pending.discard(e["session"])
+            if e.get("success"):
+                active.add(e["session"])
+        elif op == "close":
+            session = g.get("session", e.get("session", ""))
+            sessions.discard(session)
+            pending.discard(session)
+            active.discard(session)
+            settled.update(ref for ref, effect in accepted_refs.items()
+                           if effect.get("session") == session)
+        elif op == "router_reset":
+            if reset_at is not None:
+                problems.append(f"second router_reset at {i}")
+            if pending or not active or sessions != active or out != "ok":
+                problems.append(f"router_reset at {i} lacks settled live assignments for every open session")
+            outstanding = sorted(set(accepted_refs) - settled)
+            if len(outstanding) != 1:
+                problems.append(f"router_reset at {i} requires exactly one pending accepted redirect, got {outstanding}")
+            else:
+                reset_ref = outstanding[0]
+            reset_at = i
+            reset_survivors = set(active)
+            active.clear()
         elif op == "rehydrate" and out == "ok":
             s["rehydrate_ok"] += 1
+            session = g.get("session", e.get("session", ""))
+            if reset_at is None or health_after_reset is None or i <= health_after_reset:
+                problems.append(f"rehydrate at {i} is not after reset and fresh health")
+            if reset_survivors is None or session not in reset_survivors:
+                problems.append(f"rehydrate at {i} does not name a reset survivor")
+            rehydrated.add(session)
+            active.add(session)
+            if e.get("effect_ref"):
+                lifecycle_ref = e["effect_ref"]
+                effect = accepted_refs.get(lifecycle_ref)
+                if (lifecycle_ref != reset_ref or effect is None
+                        or effect.get("session") != session or lifecycle_ref in settled):
+                    problems.append(f"rehydrate at {i} lacks its pending accepted redirect")
         elif op == "lookup":
             s["lookup"] += 1
+            lookup_at = i
+            if (reset_survivors is None or rehydrated != reset_survivors
+                    or e.get("effect_ref") != lifecycle_ref or out != "ok"):
+                problems.append(f"lookup at {i} is not after complete effect-relative rehydration")
+        elif op == "redirect_result":
+            ref = e.get("effect_ref")
+            if ref:
+                settled.add(ref)
+            if ref == lifecycle_ref and e.get("success") is True and out == "ok":
+                callback_at = i
 
     if not config_ok:
         problems.append("no accepted config update")
@@ -192,8 +261,16 @@ def validate(row, trace, go):
             problems.append("changed backend not selected from its original group context")
         if s["retained_selected_new_context"]:
             problems.append(f"changed backend selected {s['retained_selected_new_context']} times from its new label's context")
-    if not s["rehydrate_ok"] or not s["lookup"]:
-        problems.append("no router close/recreate/rehydrate lifecycle (pending recorder action)")
+    if reset_at is None or reset_survivors is None:
+        problems.append("no router close/recreate lifecycle")
+    elif rehydrated != reset_survivors:
+        problems.append(f"router reset survivors not rehydrated: {sorted(reset_survivors - rehydrated)}")
+    if health_after_reset is None:
+        problems.append("no fresh health publication after router reset")
+    if lifecycle_ref is None or lookup_at is None:
+        problems.append("no effect-relative rehydrate and lookup after router reset")
+    if callback_at is None or lookup_at is None or callback_at <= lookup_at:
+        problems.append("no successful late redirect callback after router reset lookup")
     summary = dict(sorted(s.items())) | {"added": sorted(added), "removed": sorted(removed),
                                           "changed": {a: v for a, v in sorted(changed.items())}}
     return problems, summary

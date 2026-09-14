@@ -252,6 +252,7 @@ class State:
         self.redirect_operations = {}  # public accepted operation handles and their settlement
         self.operation_refs = {}  # recorded operation -> engine-relative accepted-effect reference
         self.ref_operations = {}  # inverse map for already-relative recorder inputs
+        self.reset_previous = {}  # surviving session -> possible assignment before explicit reset
         self.accepted_redirects = 0
         self.refuse_next = 0  # global input control, carried until the next eligible effect attempt
         self.refusal_attempts = 0  # non-session-refused attempts while that control is pending
@@ -274,6 +275,41 @@ class State:
 
     def relative_history_active(self):
         return any(session.relative_history for session in self.sessions.values())
+
+    def reset_router(self):
+        """Drop router-owned topology and selector state at an explicit lifecycle boundary."""
+        if self.reset_previous or not self.sessions or not all(
+                session.assigned for session in self.sessions.values()):
+            raise Refuse("router reset requires every open session to be a live assignment and no unfinished reset")
+        if any(session.pending for session in self.sessions.values()):
+            raise Refuse("router reset with a pending Next")
+        self.reset_previous = {
+            sid: session.assigned for sid, session in self.sessions.items() if session.assigned
+        }
+        for session in self.sessions.values():
+            session.assigned = None
+            session.pending = None
+            session.cycle = []
+            session.relative_history = False
+            session.force_closing = False
+            session.last_redirect = None
+            session.redirect_failed = False
+        self.backends = {}
+        self.groups = {}
+        self.group_epochs = {}
+        self.cidr_values = {}
+        self.cidr_networks = {}
+        self.ignore_failover = {}
+        self.failover = set()
+        self.observer_error = None
+        self.support_redirection = False
+        self.retained_version = ""
+        self.group_last_redirect = {}
+        self.ambiguous_group_clocks = set()
+        self.status_snapshots = {}
+        self.status_calls = []
+        self.reset_resource_metrics()
+        self.resource_metric_history_trusted = True
 
     def held_sure(self, bid):
         return any(bid in s.sure() for s in self.sessions.values())
@@ -1460,6 +1496,37 @@ def derive_next(state, session, expect):
     return legal_go
 
 
+def backend_authority(state, event):
+    """Return the input-authorized backend set without consulting a replay output."""
+    if event.get("backend"):
+        name = event["backend"]
+        backend = state.backends.get(name)
+        if backend is not None and backend.ambiguous:
+            raise Refuse(f"retention of {name!r} depends on an engine-relative assignment")
+        return frozenset([name])
+    sid = event.get("session", "")
+    if event.get("backend_ref") == "previous":
+        targets = state.reset_previous.get(sid)
+        if not targets:
+            raise Refuse(f"missing pre-reset assignment for {sid!r}")
+        return targets
+    effect_ref = event.get("effect_ref")
+    operation = state.ref_operations.get(effect_ref)
+    accepted = state.redirect_operations.get(operation)
+    if accepted is None or accepted[2] or not accepted[1]:
+        raise Refuse(f"backend reference {effect_ref!r} lacks a pending accepted redirect")
+    if sid and accepted[0] != sid:
+        raise Refuse(f"backend reference {effect_ref!r} crosses sessions")
+    return accepted[1]
+
+
+def set_backend_expectation(expect, targets):
+    if len(targets) == 1:
+        expect["backend"] = next(iter(targets))
+    else:
+        expect["legal_backends"] = sorted(targets)
+
+
 def derive(trace, rows, args):
     state = State(trace["config"], trace.get("provenance"))
     events = trace["events"]
@@ -1533,29 +1600,34 @@ def derive(trace, rows, args):
             for operation,(owner,targets,completed) in list(state.redirect_operations.items()):
                 if owner == sid:
                     state.redirect_operations[operation] = (owner,targets,True)
+        elif op == "router_reset":
+            state.reset_router()
+            if row["outcome"] != "ok" or row.get("backend") or row.get("effects"):
+                raise Refuse(f"seq {seq}: router reset did not complete cleanly")
         elif op == "lookup":
-            name = event["backend"]
-            b = state.backends.get(name)
-            if b is not None and b.ambiguous:
-                raise Refuse(f"seq {seq}: retention of {name!r} depends on an engine-relative assignment")
-            expect["outcome"] = "ok" if b is not None else "unknown_backend"
-            if b is not None:
-                expect["backend"] = name
+            targets = backend_authority(state, event)
+            known = frozenset(name for name in targets if name in state.backends)
+            expect["outcome"] = "ok" if known else "unknown_backend"
+            if known:
+                set_backend_expectation(expect, known)
+            if row["outcome"] != expect["outcome"] or (known and row.get("backend") not in known):
+                raise Refuse(f"seq {seq}: lookup result is outside its backend authority")
         elif op == "rehydrate":
-            name = event["backend"]
-            b = state.backends.get(name)
-            if b is not None and b.ambiguous:
-                raise Refuse(f"seq {seq}: retention of {name!r} depends on an engine-relative assignment")
+            targets = backend_authority(state, event)
             s = state.sessions.get(sid) or Session(sid, event)
             state.sessions[sid] = s
             if s.assigned or s.pending:
                 raise Refuse(f"seq {seq}: rehydrate on a non-idle session")
-            ok = b is not None and b.group is not None  # group ownership (group.go:514-520)
-            expect["outcome"] = "ok" if ok else "unknown_backend"
-            if ok:
-                expect["backend"] = name
-                s.assigned = frozenset([name])
+            known = frozenset(name for name in targets
+                              if name in state.backends and state.backends[name].group is not None)
+            expect["outcome"] = "ok" if known else "unknown_backend"
+            if known:
+                set_backend_expectation(expect, known)
+                s.assigned = known
                 s.created = seq
+                state.reset_previous.pop(sid, None)
+            if row["outcome"] != expect["outcome"] or (known and row.get("backend") not in known):
+                raise Refuse(f"seq {seq}: rehydrate result is outside its backend authority")
         elif op == "tick":
             refused = set(event.get("refuse", []) or [])
             recorded = row.get("effects", [])
@@ -1780,6 +1852,8 @@ def derive(trace, rows, args):
         state.recorded_connections.expire_refusal("trace end")
     except _RUNNER.Difference as error:
         raise Refuse(str(error)) from error
+    if state.reset_previous:
+        raise Refuse(f"router reset left sessions unrehydrated: {sorted(state.reset_previous)}")
     result = copy.deepcopy(trace)
     result["events"] = out_events
     metric_inputs = [e for e in events if e["op"] == "metrics"]

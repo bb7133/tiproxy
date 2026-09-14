@@ -154,6 +154,40 @@ func TestWriteCarriesRelativeRefusalCallbackAndDelayedClose(t *testing.T) {
 	require.NotContains(t, effects[1].(map[string]any), "delay_next")
 }
 
+func TestWriteCarriesRouterResetBackendAuthorities(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
+	yes := true
+	log := []Recorded{
+		{Seq: 0, AtNanos: 5, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", DelayNext: true}},
+		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "tick_begin"}},
+		{Seq: 2, AtNanos: 10, Event: apireplay.Event{Op: "effect", Effects: []apireplay.Effect{{
+			Kind: "redirect", Session: "s1", Operation: "s1/1", From: "a", To: "b", Accepted: true, DelayNext: true,
+		}}}},
+		{Seq: 3, AtNanos: 10, Event: apireplay.Event{Op: "tick_end"}},
+		{Seq: 4, AtNanos: 20, Event: apireplay.Event{Op: "router_reset", Outcome: "ok"}},
+		{Seq: 5, AtNanos: 30, Event: apireplay.Event{Op: "rehydrate", Session: "s1", Operation: "s1/1", Backend: "b", Outcome: "ok"}},
+		{Seq: 6, AtNanos: 30, Event: apireplay.Event{Op: "rehydrate", Session: "s2", BackendRef: "previous", Backend: "a", Outcome: "ok"}},
+		{Seq: 7, AtNanos: 30, Event: apireplay.Event{Op: "lookup", Operation: "s1/1", Backend: "b", Outcome: "ok"}},
+		{Seq: 8, AtNanos: 40, Event: apireplay.Event{Op: "redirect_result", Session: "s1", Operation: "s1/1", Success: &yes}},
+	}
+	status, err := Write(dir, "C01", "t1", TraceConfig{}, log, nil, nil, false, CaptureSummary{Synthetic: true})
+	require.NoError(t, err)
+	require.Equal(t, "recorded", status)
+	var trace struct {
+		Events []map[string]any `json:"events"`
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "trace.json"))
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(data, &trace))
+	require.Equal(t, "router_reset", trace.Events[2]["op"])
+	require.Equal(t, "redirect/1", trace.Events[3]["effect_ref"])
+	require.Equal(t, "previous", trace.Events[4]["backend_ref"])
+	require.Equal(t, "redirect/1", trace.Events[5]["effect_ref"])
+	require.Equal(t, "redirect/1", trace.Events[6]["effect_ref"])
+	require.Equal(t, true, trace.Events[6]["optional_effect"])
+}
+
 func TestWriteArmsGlobalRefusalAtConfigAndConsumesItOnALaterTick(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))

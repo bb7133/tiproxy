@@ -65,6 +65,19 @@
   "kind": "checkpoint"
  },
  {
+  "at_ms": 195000,
+  "kind": "lifecycle_open",
+  "backends": [
+   "default/127.0.0.1:4001",
+   "default/127.0.0.1:4002",
+   "default/127.0.0.1:4003",
+   "default/127.0.0.1:4004"
+  ],
+  "listener": "127.0.0.1:6000",
+  "source": "",
+  "timeout_ms": 10000
+ },
+ {
   "at_ms": 205000,
   "kind": "env",
   "args": [
@@ -78,6 +91,16 @@
  },
  {
   "at_ms": 280000,
+  "kind": "checkpoint"
+ },
+ {
+  "at_ms": 320000,
+  "kind": "router_reset",
+  "backend": "default/127.0.0.1:4000",
+  "timeout_ms": 15000
+ },
+ {
+  "at_ms": 350000,
   "kind": "checkpoint"
  }
 ]

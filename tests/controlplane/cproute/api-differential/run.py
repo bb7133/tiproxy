@@ -21,7 +21,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[4]
 MAX_BYTES = 32 * 1024 * 1024
-OPS = {"health", "source_error", "metrics", "config", "open", "next", "finish", "close", "checkpoint", "tick", "redirect_result", "lookup", "rehydrate"}
+OPS = {"health", "source_error", "metrics", "config", "open", "next", "finish", "close", "checkpoint", "tick", "redirect_result", "lookup", "rehydrate", "router_reset"}
 SOURCE_ERRORS = {"no_backend", "wrapped_no_backend", "port_conflict", "topology_unavailable", "cancelled", "deadline_exceeded"}
 METRIC_KEYS = {"cpu", "memory", "failure_pd", "total_pd", "failure_tikv", "total_tikv"}
 
@@ -90,15 +90,18 @@ def validate(trace):
         "health":{"backends"},"config":{"toml","refuse_next","delay_next"},"open":{"client","proxy","port"},
         "next":set(),"finish":{"success"},"close":{"effect_ref","optional_effect"},"checkpoint":set(),
         "tick":{"refuse","refuse_next"},"redirect_result":{"operation","effect_ref","optional_effect","success"},
-        "lookup":{"backend"},"rehydrate":{"backend"},
+        "lookup":{"backend","effect_ref"},"rehydrate":{"backend","backend_ref","effect_ref"},
+        "router_reset":set(),
         "source_error":{"error"},
         "metrics":{"queries"},
     }
     sessions, pending, active, operations = set(), set(), set(), {}
+    reset_previous = set()
     at = 0
     for index, event in enumerate(events):
         require(isinstance(event, dict) and event.get("op") in OPS, "INPUT", f"event {index}")
         op, session = event["op"], event.get("session", "")
+        was_reset_survivor = session in reset_previous
         require(set(event) <= allowed[op] | {"op","session","at_nanos","expect"} and isinstance(session,str),"INPUT",f"event fields {index}")
         timestamp = event.get("at_nanos",at)
         require(type(timestamp) is int and at <= timestamp <= 86_400_000_000_000,"INPUT","monotonic public clock")
@@ -206,6 +209,12 @@ def validate(trace):
                 effect = operations.get(operation)
                 require(effect is not None and effect["kind"] == "redirect" and effect["accepted"],"INPUT","callback operation")
                 require(session == effect["session"],"INPUT","callback owner")
+        elif op == "router_reset":
+            require(expect["outcome"] == "ok" and not pending and active
+                    and sessions == active and not reset_previous, "INPUT",
+                    "router reset requires every open session to be a live assignment")
+            reset_previous = set(active)
+            active.clear()
         elif op == "open":
             require(session and session not in sessions, "INPUT", "open identity")
             require(all(isinstance(event.get(key,""), str) for key in ("client","proxy","port")), "INPUT", "client addresses")
@@ -214,10 +223,17 @@ def validate(trace):
             require(session in sessions, "INPUT", f"unknown session {session}")
             if op in {"next","rehydrate"}:
                 require(session not in pending and session not in active, "INPUT", "attempt requires idle session")
+                if op == "rehydrate":
+                    relative = event.get("backend_ref") == "previous" or "effect_ref" in event
+                    require((not relative and not reset_previous)
+                            or (relative and session in reset_previous), "INPUT",
+                            "relative rehydrate requires a surviving pre-reset session")
                 if expect["outcome"] == "ok":
                     exact, legal = expect.get("backend"), expect.get("legal_backends")
                     require((isinstance(exact,str) and bool(exact) and legal is None) or (exact is None and isinstance(legal,list) and legal and all(isinstance(x,str) and x for x in legal) and len(set(legal)) == len(legal)), "INPUT", "declare exact backend or legal set")
                     (pending if op == "next" else active).add(session)
+                    if op == "rehydrate" and session in reset_previous:
+                        reset_previous.discard(session)
             elif op == "finish":
                 require(session in pending and type(event.get("success")) is bool, "INPUT", "Finish without pending attempt")
                 pending.remove(session)
@@ -233,8 +249,12 @@ def validate(trace):
                 sessions.remove(session)
                 active.discard(session)
         if op in {"lookup","rehydrate"}:
-            require(isinstance(event.get("backend"),str) and event["backend"],"INPUT","named backend")
-    require(not sessions and not pending and not active and events[-1]["op"] == "checkpoint", "INPUT", "trace must end at an empty checkpoint")
+            literal = isinstance(event.get("backend"),str) and bool(event["backend"])
+            previous = event.get("backend_ref") == "previous"
+            effect = isinstance(event.get("effect_ref"),str) and re.fullmatch(r"redirect/([1-9][0-9]*)", event["effect_ref"]) is not None
+            require(sum((literal, previous, effect)) == 1, "INPUT", "backend authority")
+            require(not previous or (op == "rehydrate" and was_reset_survivor), "INPUT", "previous assignment authority")
+    require(not sessions and not pending and not active and not reset_previous and events[-1]["op"] == "checkpoint", "INPUT", "trace must end at an empty checkpoint")
 
 
 def causal(effects):
@@ -263,6 +283,8 @@ class PublicConnections:
         self.logical_to_actual, self.effect_refs, self.effect_ref_sessions = {}, {}, {}
         self.unbound_redirects, self.skipped_effect_refs = [], set()
         self.strict_no_effect_refs = set()
+        self.reset_previous = {}
+        self.retired_redirects = set()
         self.refuse_next, self.refusal_attempts, self.fail_backend_list = 0, 0, set()
         self.delay_next, self.delay_attempts, self.delayed_redirect = 0, 0, None
         self.delayed_settled_early = False
@@ -271,7 +293,9 @@ class PublicConnections:
 
     def counts(self):
         counts = Counter(self.pending.values()) + Counter(self.assigned.values())
-        for effect in self.redirects.values():
+        for operation, effect in self.redirects.items():
+            if operation in self.retired_redirects:
+                continue
             counts[effect["from"]] -= 1
             counts[effect["to"]] += 1
         require(all(n >= 0 for n in counts.values()), "EFFECT_LEDGER", "negative public connection count")
@@ -403,6 +427,8 @@ class PublicConnections:
             effect = self.effect_refs[effect_ref]
             require(self.effect_ref_sessions[effect_ref] == event.get("session", ""),
                     "EFFECT_LEDGER", f"relative effect {effect_ref} crossed sessions")
+            if event["op"] == "redirect_result" and effect is self.delayed_redirect:
+                self.delayed_redirect = None
             return effect
         if effect_ref in self.skipped_effect_refs:
             require(self.effect_ref_sessions[effect_ref] == event.get("session", ""),
@@ -464,6 +490,33 @@ class PublicConnections:
         self.effect_ref_sessions[effect_ref] = event.get("session", "")
         return None
 
+    def resolve_backend(self, event):
+        """Resolve a literal, pre-reset assignment or delayed redirect target."""
+        if event.get("backend"):
+            return event["backend"]
+        logical = event.get("session", "")
+        actual = self.logical_to_actual.get(logical, logical)
+        if event.get("backend_ref") == "previous":
+            require(actual in self.reset_previous, "EFFECT_LEDGER",
+                    f"missing pre-reset assignment for {logical}")
+            return self.reset_previous[actual]
+        effect_ref = event.get("effect_ref")
+        require(effect_ref is not None, "INPUT", "missing backend authority")
+        effect = self.effect_refs.get(effect_ref)
+        if effect is None:
+            require(effect_ref not in self.skipped_effect_refs and self.delayed_redirect is not None,
+                    "EFFECT_LEDGER", f"unknown backend effect {effect_ref}")
+            require(any(candidate is self.delayed_redirect for candidate in self.unbound_redirects),
+                    "EFFECT_LEDGER", f"delayed backend effect {effect_ref} left the public queue")
+            effect = self.delayed_redirect
+            self.effect_refs[effect_ref] = effect
+        if logical:
+            owner = self.effect_ref_sessions.get(effect_ref)
+            require(owner in (None, logical), "EFFECT_LEDGER",
+                    f"relative backend effect {effect_ref} crossed sessions")
+            self.effect_ref_sessions[effect_ref] = logical
+        return effect["to"]
+
     def resolve_event(self, event):
         """Resolve a logical trace handle to this engine's concrete session.
 
@@ -474,20 +527,32 @@ class PublicConnections:
         logical = event.get("session", "")
         if "effect_ref" not in event:
             return self.logical_to_actual.get(logical, logical)
+        if event["op"] == "lookup":
+            self.resolve_backend(event)
+            return ""
+        if event["op"] == "rehydrate":
+            self.resolve_backend(event)
+            actual = self.effect_refs[event["effect_ref"]]["session"]
+            self.swap_logical_handle(logical, actual, "relative rehydrate")
+            return actual
         effect = self.resolve_effect(event)
         if effect is None:
             return self.logical_to_actual.get(logical, logical) if event["op"] == "close" else ""
         actual = effect["session"]
         if event["op"] == "close":
-            require(logical in self.logical_to_actual and actual in self.logical_to_actual.values(),
-                    "EFFECT_LEDGER", "relative close requires two live handles")
-            other = next(name for name, value in self.logical_to_actual.items() if value == actual)
-            displaced = self.logical_to_actual[logical]
-            self.logical_to_actual[logical], self.logical_to_actual[other] = actual, displaced
+            self.swap_logical_handle(logical, actual, "relative close")
         return actual
 
+    def swap_logical_handle(self, logical, actual, boundary):
+        """Bind a recorded handle to an engine-relative owner without losing its peer."""
+        require(logical in self.logical_to_actual and actual in self.logical_to_actual.values(),
+                "EFFECT_LEDGER", f"{boundary} requires two live handles")
+        other = next(name for name, value in self.logical_to_actual.items() if value == actual)
+        displaced = self.logical_to_actual[logical]
+        self.logical_to_actual[logical], self.logical_to_actual[other] = actual, displaced
+
     def resolve_operation(self, event):
-        if "effect_ref" in event:
+        if "effect_ref" in event and event["op"] not in {"lookup", "rehydrate"}:
             effect = self.resolve_effect(event)
             return effect["operation"] if effect is not None else ""
         return event.get("operation", "")
@@ -627,8 +692,18 @@ class PublicConnections:
         elif op == "rehydrate" and row["outcome"] == "ok":
             self.assigned[sid] = row["backend"]
             self.created[sid] = index
+            self.reset_previous.pop(sid, None)
+        elif op == "router_reset":
+            require(not self.pending and self.assigned
+                    and len(self.assigned) == len(self.logical_to_actual), "EFFECT_LEDGER",
+                    "router reset requires every live handle to have a settled assignment")
+            self.reset_previous = dict(self.assigned)
+            self.retired_redirects.update(self.redirects)
+            self.assigned.clear()
+            self.created.clear()
         elif op == "redirect_result":
             effect = self.redirects.pop(operation, None)
+            self.retired_redirects.discard(operation)
             if effect is self.delayed_redirect:
                 self.delayed_redirect = None
             self.unbound_redirects = [item for item in self.unbound_redirects
@@ -651,6 +726,9 @@ class PublicConnections:
             self.last_redirect.pop(sid, None)
             self.redirect_failed.pop(sid, None)
             self.closing.discard(sid)
+            closed_redirects = {key for key, effect in self.redirects.items()
+                                if effect["session"] == sid}
+            self.retired_redirects -= closed_redirects
             self.redirects = {key: ef for key, ef in self.redirects.items() if ef["session"] != sid}
             self.unbound_redirects = [effect for effect in self.unbound_redirects
                                       if effect["session"] != sid]
@@ -723,7 +801,11 @@ def observe(trace, rows, engine):
                 settled_by[effect["operation"]] = "refused"
         if op in {"next","lookup","rehydrate"} and row["outcome"] == "ok":
             backend = row.get("backend")
-            if "backend" in expect:
+            referenced_backend = connections.resolve_backend(event) if op in {"lookup", "rehydrate"} else None
+            if referenced_backend is not None and not event.get("backend"):
+                require(backend == referenced_backend, "BACKEND_RESULT",
+                        f"{engine} event {index} did not resolve its backend authority")
+            elif "backend" in expect:
                 require(backend == expect["backend"], "BACKEND_RESULT", f"{engine} event {index}")
             else:
                 require(backend in expect.get("legal_backends",[]), "ILLEGAL_CHOICE", f"{engine} event {index}")
@@ -779,6 +861,8 @@ def observe(trace, rows, engine):
                        if effect["session"] == session and key not in settled}
             settled.update(closing)
             settled_by.update((key, "close") for key in closing)
+        elif op == "router_reset":
+            ledger.clear()
         elif op == "checkpoint":
             require(type(row.get("healthy_backend_count")) is int and row["healthy_backend_count"] >= 0 and isinstance(row.get("server_version"),str),"OBSERVATION","public metadata types")
             if "healthy_backend_count" in expect:
@@ -796,7 +880,8 @@ def observe(trace, rows, engine):
             and not connections.redirects and not connections.unbound_redirects
             and not connections.logical_to_actual and connections.refuse_next == 0
             and connections.delay_next == 0 and connections.delayed_redirect is None
-            and not connections.delayed_settled_early,
+            and not connections.delayed_settled_early and not connections.reset_previous
+            and not connections.retired_redirects,
             "LEDGER", f"{engine} final state")
     accepted_redirects = [(key, effect) for key,effect in operations.items()
                           if effect["accepted"] and effect["kind"] == "redirect"]

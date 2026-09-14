@@ -90,6 +90,14 @@ class CIDRTests(unittest.TestCase):
         self.assertTrue(state.backends["default/a"].ambiguous)
         self.assertEqual(self.candidates(state, "127.0.0.8:1"), ["default/b"])
 
+    def test_literal_backend_authority_refuses_ambiguous_retention(self):
+        state = self.state()
+        state.apply_health([backend("a", "127.0.0.0/24"), backend("b", "127.0.0.0/24")])
+        self.make_retention_ambiguous(state, "a", "b")
+        state.apply_health([backend("b", "127.0.0.0/24")])
+        with self.assertRaisesRegex(derive.Refuse, "engine-relative assignment"):
+            derive.backend_authority(state, {"backend": "default/a"})
+
     def test_fresh_admission_with_engine_relative_retention_is_refused(self):
         state = self.state()
         state.apply_health([backend("a", "127.0.0.0/24"), backend("b", "127.0.0.0/24")])

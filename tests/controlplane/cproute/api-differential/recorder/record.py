@@ -34,7 +34,9 @@ OVERLAY_MARKER = "pkg/proxy/backend/api_replay_overlay_marker.go"
 
 SUBSTITUTIONS = {
     "pkg/proxy/backend/backend_conn_mgr.go": [
-        ("selector := r.GetBackendSelector(ci)", "selector, apiSession := apireplay.Open(r, ci)", 1),
+        ("r, err := mgr.handshakeHandler.GetRouter(cctx, resp)\n\tif err != nil {\n\t\treturn nil, errors.Wrap(err, ErrProxyErr)\n\t}",
+         "apiRoute := apireplay.BeginRoute()\n\tr, err := mgr.handshakeHandler.GetRouter(cctx, resp)\n\tif err != nil {\n\t\tapiRoute.End()\n\t\treturn nil, errors.Wrap(err, ErrProxyErr)\n\t}", 1),
+        ("selector := r.GetBackendSelector(ci)", "selector, apiSession := apireplay.OpenRoute(apiRoute, r, ci)", 1),
         ("defer selector.CloseObservation()", "defer apireplay.EndSelection(&selector, apiSession)", 1),
         ("if backend, err = selector.Next(); err == router.ErrNoBackend {", "if backend, err = apireplay.Next(&selector, apiSession); err == router.ErrNoBackend {", 1),
         ("selector.Finish(mgr, err == nil)", "apireplay.Finish(&selector, apiSession, mgr, err == nil)", 1),

@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -41,6 +42,49 @@ type Workload struct {
 	heldFailed  atomic.Int64
 	heldMu      sync.Mutex
 	heldHistory map[string][]*heldInterval
+}
+
+// LifecycleConnection is one real MySQL client kept open across the recorder's
+// router Close/new/Rehydrate action. It is separate from the qualifying
+// workload counters and closes through the ordinary proxy callback path.
+type LifecycleConnection struct {
+	db   *sql.DB
+	conn *sql.Conn
+}
+
+// OpenLifecycleConnection establishes and proves one real SELECT 1 session,
+// then retains its physical connection until Close.
+func (w *Workload) OpenLifecycleConnection(ctx context.Context, listener, source string) (*LifecycleConnection, error) {
+	connector, err := w.connector(listener, source, false)
+	if err != nil {
+		return nil, err
+	}
+	db := sql.OpenDB(connector)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	var one int
+	if err = conn.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil || one != 1 {
+		_ = conn.Close()
+		_ = db.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("unexpected SELECT 1 result %d", one)
+	}
+	return &LifecycleConnection{db: db, conn: conn}, nil
+}
+
+// Close releases the retained client and joins its ordinary SQL lifetime.
+func (c *LifecycleConnection) Close() error {
+	if c == nil {
+		return nil
+	}
+	return errors.Join(c.conn.Close(), c.db.Close())
 }
 
 func (w *Workload) Completed() int64   { return w.completed.Load() }

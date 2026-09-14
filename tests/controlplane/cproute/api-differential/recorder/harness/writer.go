@@ -342,8 +342,23 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			}
 			push(ev,
 				map[string]any{"op": "redirect_result", "session": e.Session, "outcome": "ok"}, r.AtNanos)
+		case "router_reset":
+			push(map[string]any{"op": "router_reset"}, map[string]any{"op": "router_reset", "outcome": e.Outcome}, r.AtNanos)
 		case "lookup", "rehydrate":
-			ev := map[string]any{"op": e.Op, "backend": e.Backend}
+			ev := map[string]any{"op": e.Op}
+			switch {
+			case e.Operation != "":
+				ref, ok := operationRefs[e.Operation]
+				if !ok {
+					incomplete = append(incomplete, fmt.Sprintf("seq %d: %s operation %s has no accepted redirect", r.Seq, e.Op, e.Operation))
+				} else {
+					ev["effect_ref"] = ref
+				}
+			case e.BackendRef != "":
+				ev["backend_ref"] = e.BackendRef
+			default:
+				ev["backend"] = e.Backend
+			}
 			if e.Op == "rehydrate" {
 				ev["session"] = e.Session
 			}

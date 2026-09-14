@@ -7,6 +7,8 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import derive_expectations as derive  # noqa: E402
 import gen_config_scripts  # noqa: E402
 import record_slot  # noqa: E402
 import validate_config as vc  # noqa: E402
@@ -22,9 +24,12 @@ class Trace:
         self.labels = {vn.instance_address(n): dict(l) for n, l in vn.parse_labels(row["labels"]).items()}
         self.events, self.go, self.n = [], [], 0
 
-    def add(self, event, outcome="ok", backend=""):
-        self.go.append({"seq": len(self.events), "op": event["op"], "session": event.get("session", ""),
-                        "outcome": outcome, "backend": backend, "effects": []})
+    def add(self, event, outcome="ok", backend="", effects=None):
+        row = {"seq": len(self.events), "op": event["op"], "session": event.get("session", ""),
+               "outcome": outcome, "backend": backend, "effects": effects or []}
+        if event["op"] == "checkpoint":
+            row.update(assignments={}, conn_count=0, healthy_backend_count=len(self.labels), server_version="")
+        self.go.append(row)
         self.events.append(event)
 
     def health(self, down=()):
@@ -42,8 +47,25 @@ class Trace:
         return s
 
     def lifecycle(self):
-        self.add({"op": "rehydrate", "session": "r", "backend": "default/127.0.0.1:4000"}, "ok", "default/127.0.0.1:4000")
-        self.add({"op": "lookup", "session": "r", "backend": "default/127.0.0.1:4000"}, "ok", "default/127.0.0.1:4000")
+        source, target, session = "default/127.0.0.1:4000", "default/127.0.0.1:4001", "r"
+        self.add({"op": "open", "session": session, "client": "127.0.0.1:1",
+                  "proxy": "127.0.0.1:1", "port": "6000"})
+        self.add({"op": "next", "session": session}, "ok", source)
+        self.add({"op": "finish", "session": session, "success": True})
+        self.add({"op": "config", "toml": "[proxy]\nfail-backend-list=['127.0.0.1:4000']\n",
+                  "delay_next": 1})
+        effect = {"kind": "redirect", "session": session, "operation": f"{session}/1",
+                  "from": source, "to": target, "accepted": True}
+        self.add({"op": "tick"}, effects=[effect])
+        self.add({"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"})
+        self.add({"op": "router_reset"})
+        self.health()
+        self.add({"op": "rehydrate", "session": session, "effect_ref": "redirect/1"}, "ok", target)
+        self.add({"op": "lookup", "effect_ref": "redirect/1"}, "ok", target)
+        self.add({"op": "redirect_result", "session": session, "effect_ref": "redirect/1",
+                  "optional_effect": True, "success": True})
+        self.add({"op": "close", "session": session})
+        self.add({"op": "checkpoint"})
 
     def result(self):
         return vc.validate(self.row, {"events": self.events}, self.go)[0]
@@ -125,21 +147,57 @@ class ConfigValidatorTests(unittest.TestCase):
         self.assertEqual(matchall_trace().result(), [])
         self.assertEqual(port_trace().result(), [])
 
-    def test_missing_lifecycle_fails_every_current_capture(self):
+    def test_router_reset_traces_derive_without_private_dependencies(self):
         for t in (matchall_trace(), port_trace()):
-            self.assertFails(without(t, lambda e, g: e["op"] in ("rehydrate", "lookup")), "pending recorder action")
+            trace = {"version": 1, "id": "config-router-reset",
+                     "config": {"policy": t.row["policy"], "selection": t.row["selection"],
+                                "rule": t.row["go_rule"]},
+                     "provenance": {"kind": "synthetic"}, "events": t.events}
+            derived, requires = derive.derive(trace, t.go, None)
+            self.assertEqual(requires, [])
+            derive._RUNNER.validate(derived)
+            derive._RUNNER.observe(derived, t.go, "go")
+
+    def test_missing_lifecycle_fails(self):
+        for t in (matchall_trace(), port_trace()):
+            self.assertFails(without(t, lambda e, g: e["op"] in ("router_reset", "rehydrate", "lookup", "redirect_result")),
+                             "no router close/recreate lifecycle")
 
     def test_common_mutations(self):
         t = matchall_trace()
         self.assertFails(without(t, lambda e, g: g["outcome"] == "invalid_config"), "no invalid public-config rejection")
         self.assertFails(edit(t, "s3", outcome="no_backend"), "did not report that source error")
         self.assertFails(without(t, lambda e, g: e["op"] == "source_error"), "no named source error")
-        self.assertFails(without(t, lambda e, g: e.get("session") in ("s4", "s5", "s6", "s7")), "no successful next after the source-error window")
-        removal = max(i for i, e in enumerate(t.events) if e["op"] == "health")
+        self.assertFails(edit(t, "s4", outcome="no_backend", backend=""), "no successful next after the source-error window")
+        reset = next(i for i, e in enumerate(t.events) if e["op"] == "router_reset")
+        removal = max(i for i, e in enumerate(t.events) if e["op"] == "health" and i < reset)
         self.assertFails(without(t, lambda e, g: g["seq"] == removal), "no added backend removed")
         relabeled = copy.deepcopy(t)
         next(e for e in relabeled.events if e["op"] == "health")["backends"][0]["labels"] = {"cidr": "127.0.0.9/32"}
         self.assertFails(relabeled, "initial health labels")
+        missing = copy.deepcopy(t)
+        next(e for e in missing.events if e["op"] == "health")["backends"].pop()
+        self.assertFails(missing, "initial health inventory")
+
+    def test_lifecycle_mutations(self):
+        t = matchall_trace()
+        self.assertFails(without(t, lambda e, g: e["op"] == "rehydrate"), "survivors not rehydrated")
+        self.assertFails(without(t, lambda e, g: e["op"] == "lookup"), "no effect-relative rehydrate and lookup")
+        self.assertFails(without(t, lambda e, g: e["op"] == "redirect_result"), "no successful late redirect callback")
+        reset = next(i for i, e in enumerate(t.events) if e["op"] == "router_reset")
+        self.assertFails(without(t, lambda e, g: g["seq"] > reset and e["op"] == "health"),
+                         "no fresh health publication")
+        previous = copy.deepcopy(t)
+        event = next(e for e in previous.events if e["op"] == "rehydrate")
+        event.pop("effect_ref")
+        event["backend_ref"] = "previous"
+        self.assertFails(previous, "no effect-relative rehydrate and lookup")
+        extra = copy.deepcopy(t)
+        tick = next(i for i, e in enumerate(extra.events) if e["op"] == "tick")
+        extra.go[tick]["effects"].append({"kind": "redirect", "session": "r",
+                                           "operation": "r/2", "from": "default/127.0.0.1:4000",
+                                           "to": "default/127.0.0.1:4002", "accepted": True})
+        self.assertFails(extra, "requires exactly one pending accepted redirect")
 
     def test_matchall_mutations(self):
         t = matchall_trace()
@@ -160,10 +218,8 @@ class ConfigValidatorTests(unittest.TestCase):
 
 
 class ConfigPreflightTests(unittest.TestCase):
-    def test_pending_lifecycle_refuses_freeze(self):
-        problems = record_slot.preflight(ROWS, "config-source")
-        self.assertEqual(len([p for p in problems if "pending placeholder" in p]), 6)
-        self.assertEqual(record_slot.preflight(ROWS, "config-source", allow_pending=True), [])
+    def test_exact_router_reset_lifecycle_allows_freeze(self):
+        self.assertEqual(record_slot.preflight(ROWS, "config-source"), [])
 
     def test_row_mutations(self):
         bad = copy.deepcopy(ROWS)
@@ -172,10 +228,11 @@ class ConfigPreflightTests(unittest.TestCase):
         bad["C03"]["source_error"] = "unclassified_source_error"
         bad["C05"]["retain_labels"] = "cidr=127.0.0.1/32"
         bad["C06"]["join_labels"] = "tiproxy-port=6000"
-        problems = record_slot.preflight(bad, "config-source", allow_pending=True)
+        bad["C01"]["lifecycle"] = "placeholder"
+        problems = record_slot.preflight(bad, "config-source")
         for needle in ("C01: config-source family is recorded with redirection on", "C02: restore_labels",
                        "C03: source_error", "C05: MatchAll uses a routing-rule config change", "C06: join must use",
-                       "C02: C02.json differs from gen_config_scripts.py output"):
+                       "C02: C02.json differs from gen_config_scripts.py output", "C01: unsupported router lifecycle"):
             self.assertTrue(any(needle in p for p in problems), (needle, problems))
 
     def test_generated_scripts_are_committed(self):

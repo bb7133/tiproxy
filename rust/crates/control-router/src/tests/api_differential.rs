@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Slot {
-    selector: Selector,
+    selector: Option<Selector>,
     pending: Option<Reservation>,
     active: Option<String>,
     client: String,
@@ -117,6 +117,25 @@ impl ClientEffects {
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or_default()
+}
+
+fn swap_logical_session(
+    logical_sessions: &mut BTreeMap<String, String>,
+    logical: &str,
+    actual: &str,
+    boundary: &str,
+) -> TestResult {
+    let other = logical_sessions
+        .iter()
+        .find_map(|(candidate, mapped)| (mapped == actual).then(|| candidate.clone()))
+        .ok_or_else(|| format!("{boundary} target"))?;
+    let displaced = logical_sessions
+        .get(logical)
+        .ok_or_else(|| format!("{boundary} logical handle"))?
+        .clone();
+    logical_sessions.insert(logical.into(), actual.into());
+    logical_sessions.insert(other, displaced);
+    Ok(())
 }
 
 fn outcome(error: RouteError) -> String {
@@ -219,6 +238,8 @@ async fn replay() -> TestResult {
     let mut effect_ref_sessions: BTreeMap<String, String> = BTreeMap::new();
     let mut skipped_effect_refs: BTreeSet<String> = BTreeSet::new();
     let mut unbound_redirects = VecDeque::new();
+    let mut reset_previous: BTreeMap<String, String> = BTreeMap::new();
+    let mut retired_operations: BTreeSet<String> = BTreeSet::new();
     let (_stop, stop) = tokio::sync::watch::channel(false);
     let events = trace["events"].as_array().ok_or("missing events")?;
     for (index, event) in events.iter().enumerate() {
@@ -232,7 +253,39 @@ async fn replay() -> TestResult {
         let mut resolved_operation = text(event, "operation").to_string();
         let effect_ref = text(event, "effect_ref");
         let mut skipped_effect = false;
-        if !effect_ref.is_empty() {
+        if !effect_ref.is_empty() && (op == "lookup" || op == "rehydrate") {
+            if let Some(operation) = effect_refs.get(effect_ref) {
+                resolved_operation = operation.clone();
+            } else {
+                let delayed = must(effects.lock()).delayed_operation.clone();
+                let operation = delayed.ok_or("unknown backend effect")?;
+                if !unbound_redirects
+                    .iter()
+                    .any(|candidate| candidate == &operation)
+                {
+                    return Err("delayed backend effect left the public queue".into());
+                }
+                resolved_operation = operation;
+                effect_refs.insert(effect_ref.into(), resolved_operation.clone());
+            }
+            if op == "rehydrate" {
+                if let Some(owner) = effect_ref_sessions.get(effect_ref) {
+                    if owner != logical_id {
+                        return Err("relative backend effect crossed sessions".into());
+                    }
+                } else {
+                    effect_ref_sessions.insert(effect_ref.into(), logical_id.into());
+                }
+                id = operations
+                    .get(&resolved_operation)
+                    .ok_or("relative backend operation")?
+                    .0
+                    .clone();
+                swap_logical_session(&mut logical_sessions, logical_id, &id, "relative rehydrate")?;
+            } else {
+                id.clear();
+            }
+        } else if !effect_ref.is_empty() {
             let delayed = must(effects.lock()).delayed_operation.clone();
             let mut settled_early = false;
             let mut expired_delay = false;
@@ -332,16 +385,7 @@ async fn replay() -> TestResult {
                     .clone();
             }
             if op == "close" && !skipped_effect {
-                let other = logical_sessions
-                    .iter()
-                    .find_map(|(logical, actual)| (actual == &id).then(|| logical.clone()))
-                    .ok_or("relative close target")?;
-                let displaced = logical_sessions
-                    .get(logical_id)
-                    .ok_or("relative close logical handle")?
-                    .clone();
-                logical_sessions.insert(logical_id.into(), id.clone());
-                logical_sessions.insert(other, displaced);
+                swap_logical_session(&mut logical_sessions, logical_id, &id, "relative close")?;
             }
         }
         let mut row =
@@ -488,7 +532,7 @@ async fn replay() -> TestResult {
                 let prior = sessions.insert(
                     logical_id.into(),
                     Slot {
-                        selector,
+                        selector: Some(selector),
                         pending: None,
                         active: None,
                         client: text(event, "client").into(),
@@ -498,23 +542,102 @@ async fn replay() -> TestResult {
                 );
                 assert!(prior.is_none(), "duplicate logical session");
             }
-            "lookup" => match h.router.lookup_backend(text(event, "backend")) {
-                Ok(assignment) => row["backend"] = json!(assignment.backend_id),
-                Err(RouteError::NoBackend) => row["outcome"] = json!("unknown_backend"),
-                Err(error) => row["outcome"] = json!(outcome(error)),
-            },
+            "lookup" => {
+                let backend = if resolved_operation.is_empty() {
+                    text(event, "backend")
+                } else {
+                    let (_, MigrationCommand::Redirect(redirect), _) = operations
+                        .get(&resolved_operation)
+                        .ok_or("lookup backend operation")?
+                    else {
+                        return Err("lookup backend effect is not a redirect".into());
+                    };
+                    redirect.to().backend_id.as_str()
+                };
+                match h.router.lookup_backend(backend) {
+                    Ok(assignment) => row["backend"] = json!(assignment.backend_id),
+                    Err(RouteError::NoBackend) => row["outcome"] = json!("unknown_backend"),
+                    Err(error) => row["outcome"] = json!(outcome(error)),
+                }
+            }
             "rehydrate" => {
                 let s = sessions.get_mut(&id).ok_or("missing session")?;
-                match s.selector.rehydrate(text(event, "backend")) {
+                let backend = if text(event, "backend_ref") == "previous" {
+                    reset_previous
+                        .get(&id)
+                        .ok_or("missing pre-reset assignment")?
+                        .as_str()
+                } else if !resolved_operation.is_empty() {
+                    let (_, MigrationCommand::Redirect(redirect), _) = operations
+                        .get(&resolved_operation)
+                        .ok_or("rehydrate backend operation")?
+                    else {
+                        return Err("rehydrate backend effect is not a redirect".into());
+                    };
+                    redirect.to().backend_id.as_str()
+                } else {
+                    text(event, "backend")
+                };
+                match s
+                    .selector
+                    .as_ref()
+                    .ok_or("missing fresh selector")?
+                    .rehydrate(backend)
+                {
                     Ok(assignment) => {
                         row["backend"] = json!(assignment.backend_id);
                         s.active = Some(assignment.backend_id);
                         must(effects.lock())
                             .names
                             .insert(assignment.connection_id, id.clone());
+                        reset_previous.remove(&id);
                     }
                     Err(RouteError::NoBackend) => row["outcome"] = json!("unknown_backend"),
                     Err(error) => row["outcome"] = json!(outcome(error)),
+                }
+            }
+            "router_reset" => {
+                if !reset_previous.is_empty() {
+                    return Err("router reset while one is unfinished".into());
+                }
+                for (session, slot) in &mut sessions {
+                    if slot.pending.is_some() {
+                        return Err("router reset with a pending reservation".into());
+                    }
+                    let backend = slot
+                        .active
+                        .take()
+                        .ok_or("router reset with an inactive session")?;
+                    reset_previous.insert(session.clone(), backend);
+                    drop(slot.selector.take());
+                }
+                if reset_previous.is_empty() {
+                    return Err("router reset requires a live assignment".into());
+                }
+                retired_operations.extend(
+                    operations
+                        .iter()
+                        .filter(|(_, (_, _, completed))| !completed)
+                        .map(|(operation, _)| operation.clone()),
+                );
+                h.router = Arc::new(
+                    Router::new_with_factors(
+                        Arc::new(h.source.clone()),
+                        &h.topology,
+                        &h.runtime.handle().module_context(),
+                        "default",
+                        100_000,
+                        Some(metric_input.handle()),
+                    )
+                    .map_err(|e| format!("router reset init: {e:?}"))?,
+                );
+                h.router.set_replay_wall(wall);
+                for slot in sessions.values_mut() {
+                    slot.selector = Some(
+                        h.router
+                            .selector()
+                            .map_err(|e| format!("router reset selector: {e:?}"))?,
+                    );
                 }
             }
             "tick" => {
@@ -579,7 +702,12 @@ async fn replay() -> TestResult {
                 };
                 let success = event["success"].as_bool().ok_or("missing success")?;
                 let settlement = h.router.finish_redirect(redirect, success, now);
-                if !*completed && let Some(s) = sessions.get_mut(session) {
+                if retired_operations.remove(&resolved_operation) {
+                    assert_eq!(settlement, Settlement::Ignored);
+                    if success && let Some(s) = sessions.get_mut(session) {
+                        s.active = Some(redirect.to().backend_id.clone());
+                    }
+                } else if !*completed && let Some(s) = sessions.get_mut(session) {
                     assert_eq!(settlement, Settlement::Applied);
                     if success {
                         s.active = Some(redirect.to().backend_id.clone());
@@ -595,7 +723,12 @@ async fn replay() -> TestResult {
                     client_address: (!s.client.is_empty()).then_some(s.client.as_str()),
                     proxy_address: (!s.proxy.is_empty()).then_some(s.proxy.as_str()),
                 };
-                match s.selector.next(client, &s.port) {
+                match s
+                    .selector
+                    .as_mut()
+                    .ok_or("missing selector")?
+                    .next(client, &s.port)
+                {
                     Ok(reservation) => {
                         row["backend"] = json!(reservation.assignment().backend_id);
                         must(effects.lock())
@@ -610,7 +743,13 @@ async fn replay() -> TestResult {
                 let s = sessions.get_mut(&id).ok_or("missing session")?;
                 let pending = s.pending.take().ok_or("missing reservation")?;
                 let connected = event["success"].as_bool().unwrap_or(false);
-                assert_eq!(s.selector.finish(&pending, connected), Settlement::Applied);
+                assert_eq!(
+                    s.selector
+                        .as_ref()
+                        .ok_or("missing selector")?
+                        .finish(&pending, connected),
+                    Settlement::Applied
+                );
                 s.active = connected.then(|| pending.assignment().backend_id.clone());
             }
             "close" => {
@@ -666,6 +805,14 @@ async fn replay() -> TestResult {
     assert!(
         logical_sessions.is_empty(),
         "trace must close every logical handle"
+    );
+    assert!(
+        reset_previous.is_empty(),
+        "trace must rehydrate every reset survivor"
+    );
+    assert!(
+        retired_operations.is_empty(),
+        "trace must settle every pre-reset operation"
     );
     assert!(
         unbound_redirects.is_empty(),

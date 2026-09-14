@@ -143,6 +143,8 @@ func TestScriptControlValidation(t *testing.T) {
 		{Kind: "failover_select", FailoverTimeoutSeconds: 60, EffectControl: "delay"},
 		{Kind: "close_delayed_redirect", TimeoutMillis: 5000},
 		{Kind: "failover_clear"},
+		{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000", TimeoutMillis: 5000},
+		{Kind: "router_reset", Backend: "default/a", TimeoutMillis: 5000},
 	}
 	require.NoError(t, validateActions(valid))
 	require.True(t, requiresEnvironmentDriver(valid))
@@ -172,6 +174,14 @@ func TestScriptControlValidation(t *testing.T) {
 		"effect control elsewhere":   {{Kind: "checkpoint", EffectControl: "refuse"}},
 		"failover timeout elsewhere": {{Kind: "checkpoint", FailoverTimeoutSeconds: 1}},
 		"active failover at end":     {{Kind: "failover_select", FailoverTimeoutSeconds: 1}},
+		"reset without lifecycle":    {{Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}},
+		"lifecycle without reset":    {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}},
+		"duplicate lifecycle":        {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "lifecycle_open", Backends: []string{"default/c"}, Listener: "127.0.0.1:6000"}},
+		"duplicate excluded backend": {{Kind: "lifecycle_open", Backends: []string{"default/b", "default/b"}, Listener: "127.0.0.1:6000"}},
+		"empty excluded backend":     {{Kind: "lifecycle_open", Backends: []string{""}, Listener: "127.0.0.1:6000"}},
+		"reset target excluded":      {{Kind: "lifecycle_open", Backends: []string{"default/a"}, Listener: "127.0.0.1:6000"}, {Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}},
+		"duplicate reset":            {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}, {Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}},
+		"reset overlaps failover":    {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "failover_select", FailoverTimeoutSeconds: 1}, {Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			require.Error(t, validateActions(actions))

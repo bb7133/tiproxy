@@ -64,6 +64,10 @@ type Action struct {
 	TimeoutMillis          int64    `json:"timeout_ms,omitempty"`
 	FailoverTimeoutSeconds int64    `json:"failover_timeout_seconds,omitempty"`
 	EffectControl          string   `json:"effect_control,omitempty"` // refuse | delay; armed atomically with failover_select
+	Backend                string   `json:"backend,omitempty"`        // router_reset: predetermined source backend
+	Backends               []string `json:"backends,omitempty"`       // lifecycle_open: predetermined temporary exclusions
+	Listener               string   `json:"listener,omitempty"`       // lifecycle_open real client endpoint
+	Source                 string   `json:"source,omitempty"`         // lifecycle_open optional loopback source
 }
 
 type environmentComponent struct {
@@ -246,7 +250,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 		return p
 	}
 	driver := router.NewReplayDriver(rt, bo, bpCreator, cfgMgr)
-	defer rt.Close()
+	defer func() { rt.Close() }()
 	inputs := harness.NewInputs(sched, driver)
 	apireplay.Install(sched, slot)
 	ledger := newLedger(wl.IsHeldClientAt)
@@ -303,6 +307,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	checkpoints := map[int]harness.Checkpoint{}
 	selectedFailoverBackend := ""
 	selectedFailoverTimeout := int64(0)
+	var lifecycleConn *harness.LifecycleConnection
 	producerWG.Run(func() {
 		for k := int64(0); runCtx.Err() == nil; k++ {
 			declared := k * hcCfg.MetricsInterval.Nanoseconds()
@@ -401,6 +406,107 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					return
 				}
 				fetcher.Set(fault)
+			case "lifecycle_open":
+				if lifecycleConn != nil {
+					markIncomplete("lifecycle_open repeated")
+					return
+				}
+				toml := failoverConfigMany(a.Backends, 600)
+				err := cfgMgr.SetTOMLConfig([]byte(toml))
+				inputs.DeliverConfig(toml, cfgMgr.GetConfig(), err)
+				if err != nil {
+					markIncomplete(fmt.Sprintf("lifecycle temporary config: %v", err))
+					return
+				}
+				openCtx, cancelOpen := context.WithTimeout(runCtx, actionTimeout(a))
+				lifecycleConn, err = wl.OpenLifecycleConnection(openCtx, a.Listener, a.Source)
+				cancelOpen()
+				if err != nil {
+					markIncomplete(fmt.Sprintf("lifecycle client: %v", err))
+					return
+				}
+				toml = failoverConfig("", 0)
+				err = cfgMgr.SetTOMLConfig([]byte(toml))
+				inputs.DeliverConfig(toml, cfgMgr.GetConfig(), err)
+				if err != nil {
+					markIncomplete(fmt.Sprintf("lifecycle clear config: %v", err))
+					return
+				}
+			case "router_reset":
+				if lifecycleConn == nil {
+					markIncomplete("router_reset requires lifecycle_open")
+					return
+				}
+				toml := failoverConfig(a.Backend, 600)
+				err := cfgMgr.SetTOMLConfig([]byte(toml))
+				sched.RunNow(func() {
+					apireplay.DelayNextRedirectResult()
+					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err, false, true)
+				})
+				if err != nil {
+					markIncomplete(fmt.Sprintf("router_reset failover config: %v", err))
+					return
+				}
+				resetCtx, cancelReset := context.WithTimeout(runCtx, actionTimeout(a))
+				if err = apireplay.WaitDelayedRedirect(resetCtx); err != nil {
+					cancelReset()
+					markIncomplete(err.Error())
+					return
+				}
+				toml = failoverConfig("", 0)
+				err = cfgMgr.SetTOMLConfig([]byte(toml))
+				inputs.DeliverConfig(toml, cfgMgr.GetConfig(), err)
+				if err == nil {
+					err = apireplay.BeginRouterReset(resetCtx)
+				}
+				if err != nil {
+					cancelReset()
+					markIncomplete(fmt.Sprintf("begin router reset: %v", err))
+					return
+				}
+				func() {
+					defer apireplay.EndRouterReset()
+					sched.RunNow(func() {
+						var survivors []apireplay.Survivor
+						survivors, err = apireplay.SurvivorsLocked()
+						if err != nil {
+							return
+						}
+						if len(survivors) == 0 {
+							err = errors.New("router_reset found no surviving connection")
+							return
+						}
+						latest, ok := inputs.Latest()
+						if !ok || latest.Error() != nil {
+							err = errors.New("router_reset requires a current successful health input")
+							return
+						}
+						rt.Close()
+						rt = router.NewScoreBasedRouter(lg.Named("router-recreated"))
+						driver = router.NewReplayDriver(rt, bo, bpCreator, cfgMgr)
+						inputs.SetDriverLocked(driver)
+						nsMgr.SwapRouter(rt)
+						apireplay.RecordRouterResetLocked()
+						inputs.DeliverLocked(latest)
+						for _, survivor := range survivors {
+							if rehydrateErr := apireplay.RehydrateLocked(rt, survivor); rehydrateErr != nil {
+								err = errors.Join(err, rehydrateErr)
+							}
+						}
+						var pending *apireplay.Conn
+						pending, lookupErr := apireplay.LookupDelayedTargetLocked(rt)
+						if lookupErr != nil {
+							err = errors.Join(err, lookupErr)
+							return
+						}
+						err = errors.Join(err, apireplay.ReleaseDelayedRedirectLocked(pending))
+					})
+				}()
+				cancelReset()
+				if err != nil {
+					markIncomplete(fmt.Sprintf("router reset: %v", err))
+					return
+				}
 			case "refuse_next_effect":
 				sched.RunNow(apireplay.RefuseNextEffect)
 			case "delay_next_redirect_result":
@@ -432,6 +538,11 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 	stop()
 	producerWG.Wait() // finishes adding environment jobs before envWG.Wait
 	envWG.Wait()
+	if lifecycleConn != nil {
+		if err := lifecycleConn.Close(); err != nil {
+			markIncomplete(fmt.Sprintf("close lifecycle client: %v", err))
+		}
+	}
 	stopInputs()
 	inputWG.Wait()
 	sqlSrv.PreClose()
@@ -504,6 +615,9 @@ func validateActions(actions []Action) error {
 	pendingDelayedRedirect := false
 	selectedFailover := false
 	activeFailover := false
+	lifecycleOpened := false
+	routerReset := false
+	var lifecycleExcluded map[string]struct{}
 	for i, a := range actions {
 		if a.AtMillis < 0 || a.AtMillis > maxDurationMillis {
 			return fmt.Errorf("action %d: at_ms is outside time.Duration range", i)
@@ -526,6 +640,12 @@ func validateActions(actions []Action) error {
 		if a.EffectControl != "" && a.Kind != "failover_select" {
 			return fmt.Errorf("action %d: effect_control is only valid for failover_select", i)
 		}
+		if (a.Backend != "") != (a.Kind == "router_reset") {
+			return fmt.Errorf("action %d: backend is required only for router_reset", i)
+		}
+		if (len(a.Backends) != 0 || a.Listener != "" || a.Source != "") && a.Kind != "lifecycle_open" {
+			return fmt.Errorf("action %d: backends/listener/source are only valid for lifecycle_open", i)
+		}
 		if pendingEnvironment && a.Kind != "env" && a.Kind != "await_env" {
 			return fmt.Errorf("action %d: env batch requires await_env before %q", i, a.Kind)
 		}
@@ -541,6 +661,38 @@ func validateActions(actions []Action) error {
 			}
 			pendingEnvironment = false
 		case "config", "checkpoint", "refuse_next_effect":
+		case "lifecycle_open":
+			if lifecycleOpened {
+				return fmt.Errorf("action %d: lifecycle_open may appear only once", i)
+			}
+			if len(a.Backends) == 0 || a.Listener == "" {
+				return fmt.Errorf("action %d: lifecycle_open requires backends and listener", i)
+			}
+			lifecycleExcluded = make(map[string]struct{}, len(a.Backends))
+			for _, backend := range a.Backends {
+				if backend == "" {
+					return fmt.Errorf("action %d: lifecycle_open backends must be nonempty", i)
+				}
+				if _, exists := lifecycleExcluded[backend]; exists {
+					return fmt.Errorf("action %d: lifecycle_open backend %q is duplicated", i, backend)
+				}
+				lifecycleExcluded[backend] = struct{}{}
+			}
+			lifecycleOpened = true
+		case "router_reset":
+			if !lifecycleOpened || routerReset {
+				return fmt.Errorf("action %d: router_reset requires exactly one preceding lifecycle_open", i)
+			}
+			if a.TimeoutMillis <= 0 {
+				return fmt.Errorf("action %d: router_reset requires a positive timeout_ms", i)
+			}
+			if pendingDelayedRedirect || activeFailover {
+				return fmt.Errorf("action %d: router_reset cannot overlap another scripted effect window", i)
+			}
+			if _, excluded := lifecycleExcluded[a.Backend]; excluded {
+				return fmt.Errorf("action %d: router_reset backend %q was excluded by lifecycle_open", i, a.Backend)
+			}
+			routerReset = true
 		case "source_error":
 			if _, err := harness.FaultError(a.Error); err != nil {
 				return fmt.Errorf("action %d: %w", i, err)
@@ -585,8 +737,8 @@ func validateActions(actions []Action) error {
 		default:
 			return fmt.Errorf("action %d: unsupported kind %q", i, a.Kind)
 		}
-		if a.TimeoutMillis != 0 && a.Kind != "close_delayed_redirect" {
-			return fmt.Errorf("action %d: timeout_ms is only valid for close_delayed_redirect", i)
+		if a.TimeoutMillis != 0 && a.Kind != "close_delayed_redirect" && a.Kind != "lifecycle_open" && a.Kind != "router_reset" {
+			return fmt.Errorf("action %d: timeout_ms is only valid for close_delayed_redirect/lifecycle_open/router_reset", i)
 		}
 	}
 	if pendingEnvironment {
@@ -597,6 +749,9 @@ func validateActions(actions []Action) error {
 	}
 	if activeFailover {
 		return errors.New("action script ends with an active selected failover")
+	}
+	if lifecycleOpened != routerReset {
+		return errors.New("action script lifecycle_open must be followed by exactly one router_reset")
 	}
 	return nil
 }
@@ -631,6 +786,14 @@ func failoverConfig(backend string, timeoutSeconds int64) string {
 		return "[proxy]\nfail-backend-list = []\n"
 	}
 	return fmt.Sprintf("[proxy]\nfail-backend-list = [%q]\nfailover-timeout = %d\n", backendAddress(backend), timeoutSeconds)
+}
+
+func failoverConfigMany(backends []string, timeoutSeconds int64) string {
+	quoted := make([]string, 0, len(backends))
+	for _, backend := range backends {
+		quoted = append(quoted, fmt.Sprintf("%q", backendAddress(backend)))
+	}
+	return fmt.Sprintf("[proxy]\nfail-backend-list = [%s]\nfailover-timeout = %d\n", strings.Join(quoted, ","), timeoutSeconds)
 }
 
 func backendAddress(backend string) string {
