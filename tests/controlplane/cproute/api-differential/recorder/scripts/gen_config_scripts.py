@@ -15,10 +15,12 @@ Group-routing input change (agreed with the reviewer):
                   another group's value, which must keep its original group; join: the added
                   tidb-4 starts without labels and joins a group once its label is set; the
                   replaced label of tidb-3 is restored before the end.
-The lifecycle actions first retain a real MySQL connection on a temporarily
-unique backend. At router_reset execution time the recorder reads that connection's
-current public assignment and fails over that backend, so intervening Resource or
-Location balancing cannot stale a predetermined target. The action creates one
+After every topology and label change has completed, the lifecycle actions retain a
+real MySQL connection on a temporarily unique backend and keep that exclusion config
+through the reset boundary. At router_reset execution time the recorder atomically
+replaces the exclusions with failover of that unique assignment. Thus ordinary
+Resource or Location balancing has neither another destination nor a config-clear
+window in which to move the lifecycle session. The action creates one
 delayed successful redirect, closes the old router, constructs a fresh router,
 republishes the latest health input, rehydrates every surviving connection, looks
 up the pending target, then releases the real callback.
@@ -56,7 +58,7 @@ def actions(r):
             excluded = ["default/127.0.0.1:4003", "default/127.0.0.1:4004"]
             listener = listeners[1] if r["go_rule"] in ("proxy_cidr", "port") else listeners[0]
             source = "127.0.0.1" if r["go_rule"] == "client_cidr" else ""
-        add(195000, "lifecycle_open", backends=excluded, listener=listener, source=source,
+        add(312000, "lifecycle_open", backends=excluded, listener=listener, source=source,
             timeout_ms=10000)
         add(320000, "router_reset", timeout_ms=15000)
         add(350000, "checkpoint")

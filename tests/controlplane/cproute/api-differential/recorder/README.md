@@ -253,8 +253,12 @@ The following dependencies withhold a slot from acceptance:
 
 Config/source slots use an explicit `router_reset` lifecycle. The recorder keeps a
 real SQL connection alive and classifies that connection as the slot's sole held
-session. At reset execution time it reads the connection's latest assignment from
-the serialized public-event ledger. The config input stores that logical session in
+session. It opens that connection only after the slot's last topology/label change,
+with every other member of its routing group failed, and holds those exclusions
+until reset. Consequently no ordinary balance pass has a legal destination for the
+lifecycle session. At reset execution time the recorder requires its assignment to
+be settled and unique, then atomically replaces the exclusions with failover of
+that assignment and arms the delayed callback. The config input stores the logical session in
 `fail_backend_ref`; its singleton TOML address remains audit evidence, while each
 adapter replaces it with the session's own current engine assignment before applying
 the config. Thus ordinary Resource/Location balancing between open and reset cannot
@@ -264,7 +268,9 @@ arms and observes a delayed accepted redirect, closes the old router, constructs
 fresh router, republishes the latest complete health input, and rehydrates every
 surviving connection before releasing the late callback. Each recorded route is
 gated before namespace lookup, so a concurrent connection cannot retain the old
-router while the lifecycle swaps the namespace. Each
+router while the lifecycle swaps the namespace. The final failover clear is issued
+only after that gate is active and is serialized with the old-router snapshot and
+retirement, so no balance tick sees a clear-but-live reset window. Each
 rehydrate input names either its `backend_ref: previous` assignment or the delayed
 redirect's engine-relative `effect_ref`; a following Lookup uses that same effect
 reference. The recorder refuses the reset if any other accepted redirect remains
@@ -274,7 +280,8 @@ chose a different delayed owner, its effect-relative rehydrate swaps logical han
 so all remaining survivors are still rehydrated exactly once. A connection closed
 before reset settles every operation owned by that session; those operations cannot
 leak into the pre-reset retirement ledger. `router_reset_smoke.py` covers one such
-close-settled redirect followed by the delayed live redirect, then runs the reset
+close-settled redirect, an isolation config held until the delayed live redirect,
+then runs the reset
 lifecycle through both real adapters and independently re-derives their public rows
 in CI. Its raw singleton intentionally names a backend different from the held
 session's assignment, proving the logical reference—not the stale literal—drives

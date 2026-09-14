@@ -20,11 +20,13 @@ recorded events (whole health snapshots are the fact source for labels and membe
             current member-CIDR union, so both the old and newly contributed contexts must route;
 - one explicit router_reset with settled live sessions, a fresh health publication, successful
   rehydration of every survivor, lookup of the pending redirect target, and its late callback.
+  The lifecycle session is opened under a nonempty exclusion list which remains unchanged until
+  the delayed failover arm; it has no ordinary or outstanding redirect before that arm.
 
 The initial health labels must equal the slot's declared map. The raw capture gate is shared with
 validate_normal.raw_gate; normal-validation semantics are unchanged.
 """
-import argparse, csv, json, sys
+import argparse, csv, json, sys, tomllib
 from collections import defaultdict
 from pathlib import Path
 
@@ -80,6 +82,11 @@ def validate(row, trace, go):
     accepted_refs = {}
     settled = set()
     accepted_redirects = 0
+    current_fail_list = None
+    pending_assignment = {}
+    assignment = {}
+    isolated_fail_list = {}
+    isolated_redirected = set()
     lifecycle_ref = None
     lifecycle_fail_ref = None
     reset_ref = None
@@ -93,6 +100,8 @@ def validate(row, trace, go):
             if effect.get("kind") == "redirect" and effect.get("accepted"):
                 accepted_redirects += 1
                 accepted_refs[f"redirect/{accepted_redirects}"] = effect
+                if effect.get("session") in isolated_fail_list:
+                    isolated_redirected.add(effect["session"])
         if op == "health":
             backends = [b for b in e.get("backends") or [] if b.get("cluster", "default") == "default"]
             snapshot = {b["address"]: b.get("labels") or {} for b in backends}
@@ -135,12 +144,46 @@ def validate(row, trace, go):
             toml = e.get("toml", "")
             if out == "ok":
                 config_ok += 1
+                try:
+                    proxy = tomllib.loads(toml).get("proxy", {})
+                except tomllib.TOMLDecodeError as error:
+                    problems.append(f"accepted config at {i} is not parseable: {error}")
+                    proxy = {}
                 if e.get("delay_next"):
                     ref = e.get("fail_backend_ref")
                     if not isinstance(ref, str) or not ref or ref not in active:
                         problems.append(f"delayed reset failover is not bound to an active session at {i}")
                     else:
                         lifecycle_fail_ref = ref
+                        prior = isolated_fail_list.get(ref)
+                        selected = assignment.get(ref)
+                        ctx = context.get(ref)
+                        if rule == "":
+                            group = set(healthy)
+                        else:
+                            original = first_labels.get(selected)
+                            group = {member for member in healthy
+                                     if first_labels.get(member) == original} if original else set()
+                            if (group and ctx is not None
+                                    and not any(ctx_routes(ctx, routing_values(present[member]))
+                                                for member in group)):
+                                group = set()
+                        available = group - set(current_fail_list or ())
+                        if (not current_fail_list or prior != current_fail_list
+                                or selected in current_fail_list or available != {selected}):
+                            problems.append(f"delayed reset failover session was not held on its unique backend through arm at {i}")
+                        if ref in isolated_redirected:
+                            problems.append(f"delayed reset failover session had an ordinary redirect during isolation at {i}")
+                        outstanding = [name for name, effect in accepted_refs.items()
+                                       if name not in settled and effect.get("session") == ref]
+                        if outstanding:
+                            problems.append(f"delayed reset failover session had an outstanding redirect before arm at {i}: {outstanding}")
+                if "fail-backend-list" in proxy:
+                    value = proxy["fail-backend-list"]
+                    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                        problems.append(f"accepted config at {i} has a non-string fail-backend-list")
+                    else:
+                        current_fail_list = tuple(sorted(value))
                 if "routing-rule" in toml:
                     rule_change = "active" if 'routing-rule = ""' not in toml else ("restored" if rule_change else None)
                     s["rule_change_configs"] += 1
@@ -171,6 +214,7 @@ def validate(row, trace, go):
             if out != "ok":
                 continue
             pending.add(e["session"])
+            pending_assignment[e["session"]] = backend
             current_group_routes = (
                 any(ctx_routes(ctx, routing_values(present[member]))
                     for member in cidr_group_members if member in present)
@@ -201,11 +245,17 @@ def validate(row, trace, go):
             pending.discard(e["session"])
             if e.get("success"):
                 active.add(e["session"])
+                assignment[e["session"]] = pending_assignment.get(e["session"], "")
+                if current_fail_list:
+                    isolated_fail_list[e["session"]] = current_fail_list
+            pending_assignment.pop(e["session"], None)
         elif op == "close":
             session = g.get("session", e.get("session", ""))
             sessions.discard(session)
             pending.discard(session)
             active.discard(session)
+            assignment.pop(session, None)
+            pending_assignment.pop(session, None)
             settled.update(ref for ref, effect in accepted_refs.items()
                            if effect.get("session") == session)
         elif op == "router_reset":
@@ -249,6 +299,9 @@ def validate(row, trace, go):
             ref = e.get("effect_ref")
             if ref:
                 settled.add(ref)
+                effect = accepted_refs.get(ref)
+                if effect is not None and e.get("success") is True:
+                    assignment[e.get("session", "")] = addr(effect.get("to", ""))
             if ref == lifecycle_ref and e.get("success") is True and out == "ok":
                 callback_at = i
 

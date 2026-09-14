@@ -70,6 +70,13 @@ func TestLedgerSelectsOnlyAnEstablishedHeldClient(t *testing.T) {
 	session, backend = l.chooseSoleHeldAssignment()
 	require.Equal(t, "held-b", session)
 	require.Equal(t, "default/127.0.0.1:4002", backend)
+	l.observe(apireplay.Event{Op: "effect", Effects: []apireplay.Effect{{
+		Kind: "redirect", Session: "held-b", Operation: "held-b/1",
+		From: "default/127.0.0.1:4002", To: "default/127.0.0.1:4003", Accepted: true,
+	}}})
+	session, backend = l.chooseSoleHeldAssignment()
+	require.Empty(t, session)
+	require.Empty(t, backend, "router reset refuses an unsettled lifecycle effect")
 	l.observe(apireplay.Event{Op: "redirect_result", Session: "held-b", Success: &yes,
 		Operation: "held-b/1", Backend: "default/127.0.0.1:4003"})
 	require.Equal(t, "default/127.0.0.1:4003", l.chooseHeldBackend(),

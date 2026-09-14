@@ -35,6 +35,9 @@ def make_case():
         {"op": "tick"},
         {"op": "close", "session": "closed", "effect_ref": "redirect/1"},
         {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"},
+        # Hold b failed until the next config atomically replaces that
+        # isolation with failover of lifecycle session a's unique owner.
+        {"op": "config", "toml": "[proxy]\nfail-backend-list=['b']\nfailover-timeout=600\n"},
         {"op": "config", "delay_next": 1, "fail_backend_ref": "a", "at_nanos": 6_000_000_000,
          # The recorded literal is deliberately stale. Both adapters must
          # replace it with logical session a's current engine assignment.
@@ -66,11 +69,11 @@ def make_case():
         rows[seq]["backend"] = A
     rows[12]["effects"] = [{"kind": "redirect", "session": "closed", "operation": "closed/1",
                             "from": A, "to": B, "accepted": True}]
-    rows[16]["effects"] = [{"kind": "redirect", "session": "a", "operation": "a/1",
+    rows[17]["effects"] = [{"kind": "redirect", "session": "a", "operation": "a/1",
                              "from": A, "to": B, "accepted": True}]
-    rows[20]["backend"] = B
-    rows[21]["backend"] = A
-    rows[22]["backend"] = B
+    rows[21]["backend"] = B
+    rows[22]["backend"] = A
+    rows[23]["backend"] = B
     rows[-1].update(assignments={}, conn_count=0, healthy_backend_count=2,
                     server_version="")
     trace = {

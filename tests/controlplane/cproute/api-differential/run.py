@@ -306,6 +306,7 @@ class PublicConnections:
         self.delayed_settled_early = False
         self.relative_fail_backend, self.relative_fail_count = None, 0
         self.relative_fail_at = None
+        self.reset_lifecycle_actual = None
         self.policy, self.selection = config["policy"], config["selection"]
         self.ratio, self.rate, self.status_rate, self.label_name = 1.2, 0.0, 0.0, ""
 
@@ -406,6 +407,13 @@ class PublicConnections:
                     actual = self.logical_to_actual.get(fail_ref, fail_ref)
                     require(actual in self.assigned, "EFFECT_LEDGER",
                             f"relative failover session {fail_ref!r} has no active assignment")
+                    require(self.reset_lifecycle_actual is None
+                            and actual not in self.closing
+                            and not any(effect["session"] == actual
+                                        for effect in self.redirects.values()),
+                            "EFFECT_LEDGER",
+                            f"relative failover session {fail_ref!r} has an outstanding effect")
+                    self.reset_lifecycle_actual = actual
                     self.relative_fail_backend = self.assigned[actual]
                     self.relative_fail_count = self.counts()[self.relative_fail_backend]
                     self.relative_fail_at = now
@@ -742,10 +750,18 @@ class PublicConnections:
             require(not self.pending and self.assigned
                     and len(self.assigned) == len(self.logical_to_actual), "EFFECT_LEDGER",
                     "router reset requires every live handle to have a settled assignment")
+            require(self.reset_lifecycle_actual is not None
+                    and not self.closing and self.delayed_redirect is not None
+                    and len(self.redirects) == 1
+                    and next(iter(self.redirects.values())) is self.delayed_redirect
+                    and self.delayed_redirect["session"] == self.reset_lifecycle_actual,
+                    "EFFECT_LEDGER",
+                    "router reset requires only its lifecycle redirect to remain outstanding")
             self.reset_previous = dict(self.assigned)
             self.retired_redirects.update(self.redirects)
             self.assigned.clear()
             self.created.clear()
+            self.reset_lifecycle_actual = None
         elif op == "redirect_result":
             effect = self.redirects.pop(operation, None)
             self.retired_redirects.discard(operation)
@@ -926,7 +942,8 @@ def observe(trace, rows, engine):
             and not connections.logical_to_actual and connections.refuse_next == 0
             and connections.delay_next == 0 and connections.delayed_redirect is None
             and not connections.delayed_settled_early and not connections.reset_previous
-            and not connections.retired_redirects,
+            and not connections.retired_redirects
+            and connections.reset_lifecycle_actual is None,
             "LEDGER", f"{engine} final state")
     accepted_redirects = [(key, effect) for key,effect in operations.items()
                           if effect["accepted"] and effect["kind"] == "redirect"]

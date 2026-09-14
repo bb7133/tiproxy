@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 import types
 import unittest
 from unittest import mock
@@ -54,6 +55,10 @@ class Trace:
         source, target, session = "default/127.0.0.1:4000", "default/127.0.0.1:4001", "r"
         if self.row["go_rule"] in ("client_cidr", "proxy_cidr"):
             source, target = "default/127.0.0.1:4002", "default/127.0.0.1:4003"
+        excluded = sorted(address for address in self.labels
+                          if "default/" + address != source)
+        self.add({"op": "config", "toml":
+                  f"[proxy]\nfail-backend-list={excluded!r}\nfailover-timeout=600\n"})
         self.add({"op": "open", "session": session, "client": "127.0.0.1:1",
                   "proxy": "127.0.0.1:1", "port": "6000"})
         self.add({"op": "next", "session": session}, "ok", source)
@@ -224,6 +229,19 @@ class ConfigValidatorTests(unittest.TestCase):
             derive._RUNNER.validate(derived)
             derive._RUNNER.observe(derived, t.go, "go")
 
+    def test_relative_failover_refuses_nonunique_or_unsettled_lifecycle(self):
+        state = derive.State({"policy": "connection", "selection": "random", "rule": ""})
+        session = derive.Session("r", {"session": "r"})
+        state.sessions["r"] = session
+        toml = "[proxy]\nfail-backend-list=['a']\n"
+        session.assigned = frozenset({"a", "b"})
+        with self.assertRaisesRegex(derive.Refuse, "active session and singleton"):
+            state.apply_config(toml, "r")
+        session.assigned = frozenset({"a"})
+        state.redirect_operations["r/1"] = ("r", frozenset({"b"}), False)
+        with self.assertRaisesRegex(derive.Refuse, "without an outstanding redirect"):
+            state.apply_config(toml, "r")
+
     def test_missing_lifecycle_fails(self):
         for t in (matchall_trace(), port_trace()):
             self.assertFails(without(t, lambda e, g: e["op"] in ("router_reset", "rehydrate", "lookup", "redirect_result")),
@@ -252,6 +270,31 @@ class ConfigValidatorTests(unittest.TestCase):
         literal = copy.deepcopy(t)
         next(e for e in literal.events if e.get("delay_next"))["fail_backend_ref"] = ""
         self.assertFails(literal, "delayed reset failover is not bound to an active session")
+        released = copy.deepcopy(t)
+        isolation = next(e for e in released.events
+                         if e["op"] == "config" and "failover-timeout=600" in e.get("toml", ""))
+        isolation["toml"] = "[proxy]\nfail-backend-list=[]\nfailover-timeout=600\n"
+        self.assertFails(released, "not held on its unique backend through arm")
+        partial = copy.deepcopy(t)
+        isolation = next(e for e in partial.events
+                         if e["op"] == "config" and "failover-timeout=600" in e.get("toml", ""))
+        document = tomllib.loads(isolation["toml"])
+        document["proxy"]["fail-backend-list"].pop()
+        isolation["toml"] = ("[proxy]\nfail-backend-list="
+                             f"{document['proxy']['fail-backend-list']!r}\nfailover-timeout=600\n")
+        self.assertFails(partial, "not held on its unique backend through arm")
+        ordinary = copy.deepcopy(t)
+        arm = next(i for i, e in enumerate(ordinary.events) if e.get("delay_next"))
+        source = ordinary.go[arm - 2]["backend"]
+        target = "default/127.0.0.1:4001"
+        ordinary.events.insert(arm, {"op": "tick"})
+        ordinary.go.insert(arm, {
+            "op": "tick", "session": "", "outcome": "ok", "backend": "",
+            "effects": [{"kind": "redirect", "session": "r", "operation": "r/pre",
+                         "from": source, "to": target, "accepted": True}],
+        })
+        ordinary.go = [dict(item, seq=i) for i, item in enumerate(ordinary.go)]
+        self.assertFails(ordinary, "ordinary redirect during isolation")
         reset = next(i for i, e in enumerate(t.events) if e["op"] == "router_reset")
         self.assertFails(without(t, lambda e, g: g["seq"] > reset and e["op"] == "health"),
                          "no fresh health publication")

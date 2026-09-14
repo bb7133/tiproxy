@@ -424,13 +424,6 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					markIncomplete(fmt.Sprintf("lifecycle client: %v", err))
 					return
 				}
-				toml = failoverConfig("", 0)
-				err = cfgMgr.SetTOMLConfig([]byte(toml))
-				inputs.DeliverConfig(toml, cfgMgr.GetConfig(), err)
-				if err != nil {
-					markIncomplete(fmt.Sprintf("lifecycle clear config: %v", err))
-					return
-				}
 			case "router_reset":
 				if lifecycleConn == nil {
 					markIncomplete("router_reset requires lifecycle_open")
@@ -464,12 +457,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					markIncomplete(err.Error())
 					return
 				}
-				toml = failoverConfig("", 0)
-				err = cfgMgr.SetTOMLConfig([]byte(toml))
-				inputs.DeliverConfig(toml, cfgMgr.GetConfig(), err)
-				if err == nil {
-					err = apireplay.BeginRouterReset(resetCtx)
-				}
+				err = apireplay.BeginRouterReset(resetCtx)
 				if err != nil {
 					cancelReset()
 					markIncomplete(fmt.Sprintf("begin router reset: %v", err))
@@ -478,6 +466,15 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 				func() {
 					defer apireplay.EndRouterReset()
 					sched.RunNow(func() {
+						// Clear the failover only after new selectors are gated, and
+						// serialize that clear with the old-router snapshot/retirement.
+						// No ordinary balance tick can enter between these boundaries.
+						toml = failoverConfig("", 0)
+						err = cfgMgr.SetTOMLConfig([]byte(toml))
+						inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err, "", false, false)
+						if err != nil {
+							return
+						}
 						var survivors []apireplay.Survivor
 						survivors, err = apireplay.SurvivorsLocked()
 						if err != nil {
@@ -887,20 +884,21 @@ func writeExclusiveFile(path string, data []byte, perm os.FileMode) error {
 // ledger mirrors run.py's public assignment ledger from the recorded events so
 // checkpoints carry `assignments` the way the adapter reports them.
 type ledger struct {
-	open       map[string]bool
-	client     map[string]string
-	openedAt   map[string]time.Time
-	held       map[string]bool
-	settled    map[string]bool
-	violations []string
-	pending    map[string]string
-	active     map[string]string
-	isHeld     func(string, time.Time) bool
+	open        map[string]bool
+	client      map[string]string
+	openedAt    map[string]time.Time
+	held        map[string]bool
+	settled     map[string]bool
+	outstanding map[string]string
+	violations  []string
+	pending     map[string]string
+	active      map[string]string
+	isHeld      func(string, time.Time) bool
 }
 
 func newLedger(isHeld func(string, time.Time) bool) *ledger {
 	return &ledger{open: map[string]bool{}, client: map[string]string{}, openedAt: map[string]time.Time{}, held: map[string]bool{},
-		settled: map[string]bool{}, pending: map[string]string{}, active: map[string]string{}, isHeld: isHeld}
+		settled: map[string]bool{}, outstanding: map[string]string{}, pending: map[string]string{}, active: map[string]string{}, isHeld: isHeld}
 }
 
 func (l *ledger) observe(ev apireplay.Event) {
@@ -934,6 +932,13 @@ func (l *ledger) observeAt(ev apireplay.Event, wall time.Time) {
 			l.active[ev.Session] = ev.Backend
 		}
 		l.settled[ev.Operation] = true
+		delete(l.outstanding, ev.Operation)
+	case "effect":
+		for _, effect := range ev.Effects {
+			if effect.Accepted {
+				l.outstanding[effect.Operation] = effect.Session
+			}
+		}
 	case "close":
 		if l.pending[ev.Session] != "" {
 			l.violations = append(l.violations, "close with pending reservation: "+ev.Session)
@@ -946,6 +951,11 @@ func (l *ledger) observeAt(ev apireplay.Event, wall time.Time) {
 		delete(l.openedAt, ev.Session)
 		delete(l.active, ev.Session)
 		delete(l.pending, ev.Session)
+		for operation, owner := range l.outstanding {
+			if owner == ev.Session {
+				delete(l.outstanding, operation)
+			}
+		}
 	}
 }
 
@@ -992,6 +1002,11 @@ func (l *ledger) chooseSoleHeldAssignment() (string, string) {
 		}
 		if session != "" {
 			return "", ""
+		}
+		for _, owner := range l.outstanding {
+			if owner == candidate {
+				return "", ""
+			}
 		}
 		session, backend = candidate, assignment
 	}

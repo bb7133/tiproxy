@@ -270,6 +270,20 @@ class ConnectionPreferenceTests(unittest.TestCase):
         self.assertEqual(literal.expected_effect_alternatives(
             {"op": "tick"}, {"redirect_cadence": plain}, 0), [[]])
 
+    def test_relative_failover_refuses_an_outstanding_lifecycle_effect(self):
+        h = self.history()
+        h.apply({"op": "open", "session": "lifecycle"}, {})
+        self.reserve(h, "lifecycle", "a", True)
+        ordinary = {"kind": "redirect", "session": "lifecycle",
+                    "operation": "lifecycle/1", "from": "a", "to": "b",
+                    "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [ordinary]})
+        arm = {"op": "config", "delay_next": 1,
+               "fail_backend_ref": "lifecycle",
+               "toml": "[proxy]\nfail-backend-list=['a']\nfailover-timeout=60\n"}
+        with self.assertRaisesRegex(runner.Difference, "outstanding effect"):
+            h.prepare(arm, {}, {"outcome": "ok"}, 0)
+
     def test_saturated_factor_ties_use_clamped_ordering(self):
         h = self.history()
         h.pending = {f"a{i}": "a" for i in range(65535)} | {f"b{i}": "b" for i in range(65537)}
@@ -528,6 +542,7 @@ class ConnectionPreferenceTests(unittest.TestCase):
             h.apply({"op": "open", "session": sid}, {}, sid=sid)
             self.reserve(h, sid, "source", True)
         arm = {"op": "config", "delay_next": 1,
+               "fail_backend_ref": "actual",
                "toml": "[proxy]\nfail-backend-list=['source']\n"}
         h.prepare(arm, {}, {"outcome": "ok"}, 0)
         delayed = {"kind": "redirect", "session": "actual", "operation": "actual/1",

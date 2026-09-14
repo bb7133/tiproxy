@@ -241,6 +241,7 @@ class State:
         self.support_redirection = False
         self.fail_list = set()
         self.relative_fail_backend_ref = None
+        self.reset_lifecycle_ref = None
         self.failover_timeout = 60  # lib/config/proxy.go:171 default; seconds
         self.now = 0  # logical clock of the event being consumed
         self.sessions = {}
@@ -284,6 +285,11 @@ class State:
             raise Refuse("router reset requires every open session to be a live assignment and no unfinished reset")
         if any(session.pending for session in self.sessions.values()):
             raise Refuse("router reset with a pending Next")
+        outstanding = [(owner, targets) for owner, targets, completed
+                       in self.redirect_operations.values() if not completed]
+        if (self.reset_lifecycle_ref is None or len(outstanding) != 1
+                or outstanding[0][0] != self.reset_lifecycle_ref or not outstanding[0][1]):
+            raise Refuse("router reset requires only its lifecycle redirect to remain outstanding")
         self.reset_previous = {
             sid: session.assigned for sid, session in self.sessions.items() if session.assigned
         }
@@ -312,6 +318,7 @@ class State:
         self.reset_resource_metrics()
         self.resource_metric_history_trusted = True
         self.relative_fail_backend_ref = None
+        self.reset_lifecycle_ref = None
 
     def held_sure(self, bid):
         return any(bid in s.sure() for s in self.sessions.values())
@@ -522,10 +529,17 @@ class State:
             if fail_backend_ref is not None:
                 session = self.sessions.get(fail_backend_ref)
                 if (not isinstance(fail_backend_ref, str) or not fail_backend_ref
-                        or len(v) != 1 or not v[0] or session is None or not session.assigned):
+                        or len(v) != 1 or not v[0] or session is None
+                        or session.assigned is None or len(session.assigned) != 1):
                     raise Refuse("relative failover requires an active session and singleton list")
+                if (self.reset_lifecycle_ref is not None or session.pending or session.inflight
+                        or session.force_closing
+                        or any(owner == fail_backend_ref and not completed
+                               for owner, _, completed in self.redirect_operations.values())):
+                    raise Refuse("relative failover requires a settled lifecycle session without an outstanding redirect")
                 self.fail_list = set()
                 self.relative_fail_backend_ref = fail_backend_ref
+                self.reset_lifecycle_ref = fail_backend_ref
                 session.relative_history = True
                 self.unique_history = False
             else:
@@ -1873,6 +1887,8 @@ def derive(trace, rows, args):
         raise Refuse(str(error)) from error
     if state.reset_previous:
         raise Refuse(f"router reset left sessions unrehydrated: {sorted(state.reset_previous)}")
+    if state.reset_lifecycle_ref is not None:
+        raise Refuse(f"relative failover for {state.reset_lifecycle_ref!r} was not consumed by router reset")
     result = copy.deepcopy(trace)
     result["events"] = out_events
     metric_inputs = [e for e in events if e["op"] == "metrics"]
