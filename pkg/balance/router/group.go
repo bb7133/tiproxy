@@ -417,13 +417,18 @@ func (g *Group) logCrossKeyspaceSkip(fromBackend, toBackend *backendWrapper,
 }
 
 func (g *Group) Balance(ctx context.Context) {
-	g.balanceAt(ctx, time.Now())
+	g.balance(ctx, nil)
 }
 
-// balanceAt keeps the production clock read at the public boundary while
-// allowing deterministic boundary evidence to exercise the exact admission
-// predicates without sleeping around wall-clock deadlines.
+// balanceAt allows deterministic boundary evidence to exercise the exact
+// admission predicates without sleeping around wall-clock deadlines.
 func (g *Group) balanceAt(ctx context.Context, curTime time.Time) {
+	g.balance(ctx, &curTime)
+}
+
+// balance retains the production clock read at its original locked decision
+// point. An override is accepted only from deterministic package tests.
+func (g *Group) balance(ctx context.Context, curTimeOverride *time.Time) {
 	g.Lock()
 	defer g.Unlock()
 	backends := make([]policy.BackendCtx, 0, len(g.backends))
@@ -439,6 +444,10 @@ func (g *Group) balanceAt(ctx context.Context, curTime time.Time) {
 	fromBackend, toBackend := busiestBackend.(*backendWrapper), idlestBackend.(*backendWrapper)
 
 	// Control the speed of migration.
+	curTime := time.Now()
+	if curTimeOverride != nil {
+		curTime = *curTimeOverride
+	}
 	// Cross-keyspace fast path (DPL-07 #41): the WHOLE pair is refused
 	// for this round before the per-connection loop runs — one counted
 	// attempt and one rate-limited record, never a warning per
@@ -798,19 +807,29 @@ func (g *Group) ConnCount() int {
 }
 
 func (g *Group) SetConfig(cfg *config.Config) {
-	g.setConfigAt(cfg, time.Now())
+	g.setConfig(cfg, nil)
 }
 
 // setConfigAt applies the same failover transition as SetConfig at a declared
 // clock instant. It is deliberately private: production always calls
 // SetConfig, while the focused time suite proves before/equal/after behavior.
 func (g *Group) setConfigAt(cfg *config.Config, now time.Time) {
+	g.setConfig(cfg, &now)
+}
+
+// setConfig retains SetConfig's original locked clock-read position. An
+// override is accepted only from deterministic package tests.
+func (g *Group) setConfig(cfg *config.Config, nowOverride *time.Time) {
 	g.Lock()
 	defer g.Unlock()
 	g.policy.SetConfig(cfg)
 	g.publishPolicyObservationLocked()
 	g.setFailoverConfigLocked(cfg)
-	g.updateFailoverLocked(now)
+	if nowOverride != nil {
+		g.updateFailoverLocked(*nowOverride)
+		return
+	}
+	g.updateFailoverLocked(time.Now())
 }
 
 // The actual call has returned; its Group critical section still protects both
