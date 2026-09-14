@@ -387,7 +387,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					toml := failoverConfig(selectedFailoverBackend, selectedFailoverTimeout)
 					err := cfgMgr.SetTOMLConfig([]byte(toml))
 					armEffectControl(a.EffectControl)
-					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err,
+					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err, "",
 						a.EffectControl == "refuse", a.EffectControl == "delay")
 				})
 			case "failover_repeat":
@@ -436,11 +436,11 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					markIncomplete("router_reset requires lifecycle_open")
 					return
 				}
-				lifecycleBackend := ""
+				lifecycleSession, lifecycleBackend := "", ""
 				toml := ""
 				var err error
 				sched.RunNow(func() {
-					lifecycleBackend = ledger.chooseHeldBackend()
+					lifecycleSession, lifecycleBackend = ledger.chooseSoleHeldAssignment()
 					if lifecycleBackend == "" {
 						markIncomplete("router_reset found no current lifecycle assignment")
 						sched.Record(apireplay.Event{Op: "recorder_error", Outcome: "router_reset_without_lifecycle_assignment"})
@@ -449,7 +449,7 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					toml = failoverConfig(lifecycleBackend, 600)
 					err = cfgMgr.SetTOMLConfig([]byte(toml))
 					apireplay.DelayNextRedirectResult()
-					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err, false, true)
+					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err, lifecycleSession, false, true)
 				})
 				if lifecycleBackend == "" {
 					return
@@ -978,6 +978,24 @@ func (l *ledger) chooseHeldBackend() string {
 		return ""
 	}
 	return choices[0]
+}
+
+// chooseSoleHeldAssignment returns the only live held session and its current
+// public assignment. Router reset records the session identity so every replay
+// engine can resolve its own possibly different assignment at that boundary.
+func (l *ledger) chooseSoleHeldAssignment() (string, string) {
+	l.refreshHeldSessions()
+	session, backend := "", ""
+	for candidate, assignment := range l.active {
+		if !l.held[candidate] || assignment == "" {
+			continue
+		}
+		if session != "" {
+			return "", ""
+		}
+		session, backend = candidate, assignment
+	}
+	return session, backend
 }
 
 func (l *ledger) heldSessions() map[string]struct{} {

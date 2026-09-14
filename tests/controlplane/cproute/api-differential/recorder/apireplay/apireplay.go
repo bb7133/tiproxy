@@ -69,15 +69,18 @@ type Event struct {
 	RefuseNext bool `json:"refuse_next,omitempty"`
 	// DelayNext marks the same serialized config boundary that arms the first
 	// subsequently accepted redirect for delayed callback delivery.
-	DelayNext bool            `json:"delay_next,omitempty"`
-	Backends  []HealthBackend `json:"backends,omitempty"`
-	Session   string          `json:"session,omitempty"`
-	Client    string          `json:"client,omitempty"`
-	Proxy     string          `json:"proxy,omitempty"`
-	Port      string          `json:"port,omitempty"`
-	Backend   string          `json:"backend,omitempty"`
-	Success   *bool           `json:"success,omitempty"`
-	Operation string          `json:"operation,omitempty"`
+	DelayNext bool `json:"delay_next,omitempty"`
+	// FailBackendRef makes a singleton fail-backend-list replay-relative: each
+	// engine substitutes the current public assignment of this logical session.
+	FailBackendRef string          `json:"fail_backend_ref,omitempty"`
+	Backends       []HealthBackend `json:"backends,omitempty"`
+	Session        string          `json:"session,omitempty"`
+	Client         string          `json:"client,omitempty"`
+	Proxy          string          `json:"proxy,omitempty"`
+	Port           string          `json:"port,omitempty"`
+	Backend        string          `json:"backend,omitempty"`
+	Success        *bool           `json:"success,omitempty"`
+	Operation      string          `json:"operation,omitempty"`
 	// BackendRef identifies a replay-relative backend input. "previous"
 	// means this engine's assignment immediately before router_reset;
 	// Operation identifies an accepted redirect whose target is the input.

@@ -119,6 +119,10 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or_default()
 }
 
+fn backend_address(id: &str) -> &str {
+    id.split_once('/').map_or(id, |(_, address)| address)
+}
+
 fn swap_logical_session(
     logical_sessions: &mut BTreeMap<String, String>,
     logical: &str,
@@ -465,6 +469,22 @@ async fn replay() -> TestResult {
                 if delay > 0 {
                     must(effects.lock()).arm_delay(delay, index);
                 }
+                let relative_toml = if text(event, "fail_backend_ref").is_empty() {
+                    None
+                } else {
+                    let logical = text(event, "fail_backend_ref");
+                    let actual = logical_sessions
+                        .get(logical)
+                        .map_or(logical, String::as_str);
+                    let backend = sessions
+                        .get(actual)
+                        .and_then(|slot| slot.active.as_deref())
+                        .ok_or("relative failover requires an active session")?;
+                    Some(format!(
+                        "[proxy]\nfail-backend-list=[{:?}]\n",
+                        backend_address(backend)
+                    ))
+                };
                 let prior_backend_clusters = h.source.store.current().topology()?.backend_clusters;
                 if h.source
                     .store
@@ -478,6 +498,19 @@ async fn replay() -> TestResult {
                 {
                     row["outcome"] = json!("invalid_config");
                 } else {
+                    if let Some(relative_toml) = relative_toml {
+                        h.source
+                            .store
+                            .apply_toml(
+                                relative_toml.as_bytes(),
+                                None,
+                                u64::try_from(index)? + 4,
+                                Path::new("/tmp"),
+                            )
+                            .map_err(|error| {
+                                format!("relative failover config at event {index}: {error}")
+                            })?;
+                    }
                     let backend_clusters_replaced =
                         h.source.store.current().topology()?.backend_clusters
                             != prior_backend_clusters;

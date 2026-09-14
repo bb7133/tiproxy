@@ -289,6 +289,9 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			push(map[string]any{"op": "source_error", "error": e.Outcome}, map[string]any{"op": "source_error", "outcome": "ok"}, r.AtNanos)
 		case "config":
 			ev := map[string]any{"op": "config", "toml": e.TOML}
+			if e.FailBackendRef != "" {
+				ev["fail_backend_ref"] = e.FailBackendRef
+			}
 			if e.RefuseNext {
 				if pendingGlobalRefusal {
 					incomplete = append(incomplete, fmt.Sprintf("seq %d: global refusal armed while one is pending", r.Seq))

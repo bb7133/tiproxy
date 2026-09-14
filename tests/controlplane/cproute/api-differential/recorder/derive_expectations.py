@@ -240,6 +240,7 @@ class State:
         self.observer_error = None
         self.support_redirection = False
         self.fail_list = set()
+        self.relative_fail_backend_ref = None
         self.failover_timeout = 60  # lib/config/proxy.go:171 default; seconds
         self.now = 0  # logical clock of the event being consumed
         self.sessions = {}
@@ -310,6 +311,7 @@ class State:
         self.status_calls = []
         self.reset_resource_metrics()
         self.resource_metric_history_trusted = True
+        self.relative_fail_backend_ref = None
 
     def held_sure(self, bid):
         return any(bid in s.sure() for s in self.sessions.values())
@@ -510,14 +512,27 @@ class State:
         # been consumed by a different candidate subset in each engine.
         self.metric_health_history_neutral = True
 
-    def apply_config(self, toml):
+    def apply_config(self, toml, fail_backend_ref=None):
         old_policy = self.policy
         doc = parse_toml(toml)
         v = toml_get(doc, "proxy", "fail-backend-list")
         if v is not None:
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise Refuse("proxy.fail-backend-list must be an array of strings")
-            self.fail_list = set(v)
+            if fail_backend_ref is not None:
+                session = self.sessions.get(fail_backend_ref)
+                if (not isinstance(fail_backend_ref, str) or not fail_backend_ref
+                        or len(v) != 1 or not v[0] or session is None or not session.assigned):
+                    raise Refuse("relative failover requires an active session and singleton list")
+                self.fail_list = set()
+                self.relative_fail_backend_ref = fail_backend_ref
+                session.relative_history = True
+                self.unique_history = False
+            else:
+                self.fail_list = set(v)
+                self.relative_fail_backend_ref = None
+        elif fail_backend_ref is not None:
+            raise Refuse("relative failover requires fail-backend-list")
         v = toml_get(doc, "proxy", "failover-timeout")
         if v is not None:
             if not isinstance(v, (int, float)) or v < 0:
@@ -823,7 +838,10 @@ def connection_cadence_model(state):
             "members": [{"backend": bid, "healthy": state.healthy(bid),
                          "keyspace": state.backends[bid].keyspace} for bid in members],
         })
-    return {"kind": "connection", "groups": groups}
+    model = {"kind": "connection", "groups": groups}
+    if state.relative_fail_backend_ref is not None:
+        model["fail_backend_ref"] = state.relative_fail_backend_ref
+    return model
 
 
 def remember_redirect(state, effect, modeled):
@@ -1564,8 +1582,9 @@ def derive(trace, rows, args):
                 raise Refuse(f"seq {seq}: config outcome {row['outcome']!r} not a public class")
             expect["outcome"] = row["outcome"]  # validator result at the validation entry (README §2)
             if row["outcome"] == "ok":
-                state.apply_config(event.get("toml", ""))
-                if not state.fail_list and state.refuse_next:
+                state.apply_config(event.get("toml", ""), event.get("fail_backend_ref"))
+                if (not state.fail_list and state.relative_fail_backend_ref is None
+                        and state.refuse_next):
                     if state.refusal_attempts:
                         raise Refuse(f"seq {seq}: one-shot refusal survived {state.refusal_attempts} eligible attempts before failover clear")
                     state.refuse_next = 0

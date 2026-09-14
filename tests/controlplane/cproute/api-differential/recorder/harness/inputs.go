@@ -95,16 +95,24 @@ func (in *Inputs) Latest() (observer.HealthResult, bool) {
 // records the `config` input with the validator's public outcome.
 func (in *Inputs) DeliverConfig(toml string, cfg *config.Config, validationErr error) {
 	in.sched.RunNow(func() {
-		in.DeliverConfigLocked(toml, cfg, validationErr, false, false)
+		in.DeliverConfigLocked(toml, cfg, validationErr, "", false, false)
 	})
 }
 
 // DeliverConfigLocked is DeliverConfig for a caller that already owns the
 // Scheduler critical section. Dynamic recording actions use it to snapshot a
 // public assignment, arm a client control and apply the resulting config as one
-// indivisible input boundary. Other callers should use DeliverConfig.
-func (in *Inputs) DeliverConfigLocked(toml string, cfg *config.Config, validationErr error, refuseNext, delayNext bool) {
-	ev := apireplay.Event{Op: "config", TOML: toml, Outcome: "ok", RefuseNext: refuseNext, DelayNext: delayNext}
+// indivisible input boundary. failBackendRef binds a singleton recorded fail
+// list to that logical session's current engine assignment during replay. Other
+// callers should use DeliverConfig.
+func (in *Inputs) DeliverConfigLocked(
+	toml string,
+	cfg *config.Config,
+	validationErr error,
+	failBackendRef string,
+	refuseNext, delayNext bool,
+) {
+	ev := apireplay.Event{Op: "config", TOML: toml, Outcome: "ok", FailBackendRef: failBackendRef, RefuseNext: refuseNext, DelayNext: delayNext}
 	if validationErr != nil {
 		ev.Outcome = "invalid_config"
 	} else {

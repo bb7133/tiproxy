@@ -91,6 +91,29 @@ class RouterResetStructureTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.Difference, "surviving pre-reset"):
             runner.validate(self.trace(events))
 
+    def test_relative_failover_requires_active_session_and_singleton_list(self):
+        events = [
+            {"op": "open", "session": "s", "expect": {"outcome": "ok"}},
+            {"op": "next", "session": "s", "expect": {"outcome": "ok", "backend": "a"}},
+            {"op": "finish", "session": "s", "success": True, "expect": {"outcome": "ok"}},
+            {"op": "config", "fail_backend_ref": "s",
+             "toml": "[proxy]\nfail-backend-list=['recorded']\n",
+             "expect": {"outcome": "ok"}},
+            {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n",
+             "expect": {"outcome": "ok"}},
+            {"op": "close", "session": "s", "expect": {"outcome": "ok"}},
+            {"op": "checkpoint", "expect": {"outcome": "ok"}},
+        ]
+        runner.validate(self.trace(events))
+        missing = copy.deepcopy(events)
+        missing[3]["fail_backend_ref"] = "missing"
+        with self.assertRaisesRegex(runner.Difference, "active session"):
+            runner.validate(self.trace(missing))
+        plural = copy.deepcopy(events)
+        plural[3]["toml"] = "[proxy]\nfail-backend-list=['a','b']\n"
+        with self.assertRaisesRegex(runner.Difference, "singleton list"):
+            runner.validate(self.trace(plural))
+
 
 class PublicMetricsTests(unittest.TestCase):
     def packet(self):
@@ -218,6 +241,34 @@ class ConnectionPreferenceTests(unittest.TestCase):
         for value in ("nan", "inf", "-1"):
             with self.assertRaisesRegex(runner.Difference, "INPUT"):
                 self.config(h, f"[balance.conn-count]\nmigrations-per-second = {value}\n")
+
+    def test_relative_failover_uses_session_assignment_after_balance_move(self):
+        h = self.history()
+        h.apply({"op": "open", "session": "lifecycle"}, {})
+        self.reserve(h, "lifecycle", "b", True)
+        arm = {"op": "config", "delay_next": 1,
+               "fail_backend_ref": "lifecycle",
+               "toml": "[proxy]\nfail-backend-list=['a']\nfailover-timeout=60\n"}
+        h.prepare(arm, {}, {"outcome": "ok"}, 0)
+        model = {"kind": "connection", "fail_backend_ref": "lifecycle",
+                 "groups": [{"group": "group/1", "members": [
+                     {"backend": "a", "healthy": True, "keyspace": ""},
+                     {"backend": "b", "healthy": True, "keyspace": ""},
+                 ]}]}
+        effects = h.expected_effect_alternatives(
+            {"op": "tick"}, {"redirect_cadence": model}, 0)
+        self.assertEqual(len(effects), 1)
+        self.assertEqual([(effect["session"], effect["from"], effect["to"])
+                          for effect in effects[0]], [("lifecycle", "b", "a")])
+
+        literal = self.history()
+        literal.apply({"op": "open", "session": "lifecycle"}, {})
+        self.reserve(literal, "lifecycle", "b", True)
+        literal.prepare({"op": "config", "delay_next": 1,
+                         "toml": arm["toml"]}, {}, {"outcome": "ok"}, 0)
+        plain = {"kind": "connection", "groups": model["groups"]}
+        self.assertEqual(literal.expected_effect_alternatives(
+            {"op": "tick"}, {"redirect_cadence": plain}, 0), [[]])
 
     def test_saturated_factor_ties_use_clamped_ordering(self):
         h = self.history()

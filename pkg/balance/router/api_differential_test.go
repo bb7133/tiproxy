@@ -58,26 +58,34 @@ func apiString(value *string, fallback string) string {
 	return *value
 }
 
+func apiBackendAddress(id string) string {
+	if _, address, ok := strings.Cut(id, "/"); ok {
+		return address
+	}
+	return id
+}
+
 type apiTraceEvent struct {
-	Queries    map[string]*replaymetrics.Result `json:"queries,omitempty"`
-	Op         string                           `json:"op"`
-	Session    string                           `json:"session,omitempty"`
-	Client     string                           `json:"client,omitempty"`
-	Proxy      string                           `json:"proxy,omitempty"`
-	Port       string                           `json:"port,omitempty"`
-	Backends   []apiTraceBackend                `json:"backends,omitempty"`
-	Success    bool                             `json:"success,omitempty"`
-	TOML       string                           `json:"toml,omitempty"`
-	AtNanos    int64                            `json:"at_nanos,omitempty"`
-	Backend    string                           `json:"backend,omitempty"`
-	Operation  string                           `json:"operation,omitempty"`
-	EffectRef  string                           `json:"effect_ref,omitempty"`
-	BackendRef string                           `json:"backend_ref,omitempty"`
-	Optional   bool                             `json:"optional_effect,omitempty"`
-	Refuse     []string                         `json:"refuse,omitempty"`
-	RefuseNext int                              `json:"refuse_next,omitempty"`
-	DelayNext  int                              `json:"delay_next,omitempty"`
-	Error      string                           `json:"error,omitempty"`
+	Queries        map[string]*replaymetrics.Result `json:"queries,omitempty"`
+	Op             string                           `json:"op"`
+	Session        string                           `json:"session,omitempty"`
+	Client         string                           `json:"client,omitempty"`
+	Proxy          string                           `json:"proxy,omitempty"`
+	Port           string                           `json:"port,omitempty"`
+	Backends       []apiTraceBackend                `json:"backends,omitempty"`
+	Success        bool                             `json:"success,omitempty"`
+	TOML           string                           `json:"toml,omitempty"`
+	AtNanos        int64                            `json:"at_nanos,omitempty"`
+	Backend        string                           `json:"backend,omitempty"`
+	Operation      string                           `json:"operation,omitempty"`
+	EffectRef      string                           `json:"effect_ref,omitempty"`
+	BackendRef     string                           `json:"backend_ref,omitempty"`
+	Optional       bool                             `json:"optional_effect,omitempty"`
+	Refuse         []string                         `json:"refuse,omitempty"`
+	RefuseNext     int                              `json:"refuse_next,omitempty"`
+	DelayNext      int                              `json:"delay_next,omitempty"`
+	FailBackendRef string                           `json:"fail_backend_ref,omitempty"`
+	Error          string                           `json:"error,omitempty"`
 }
 
 // The test overlays route/group/factor clocks to one public event timestamp.
@@ -466,7 +474,18 @@ func TestRouterAPIDifferential(t *testing.T) {
 			if err := manager.SetTOMLConfig([]byte(event.TOML)); err != nil {
 				row["outcome"] = "invalid_config"
 			} else {
-				cfg := manager.GetConfig()
+				cfg := manager.GetConfig().Clone()
+				if event.FailBackendRef != "" {
+					actual := logicalSessions[event.FailBackendRef]
+					if actual == "" {
+						actual = event.FailBackendRef
+					}
+					live := sessions[actual]
+					require.NotNil(t, live, "relative failover session at seq=%d", index)
+					require.True(t, live.active, "relative failover requires an active session at seq=%d", index)
+					require.NotNil(t, live.conn.from, "relative failover assignment at seq=%d", index)
+					cfg.Proxy.FailBackendList = []string{apiBackendAddress(live.conn.from.ID())}
+				}
 				r.setConfig(cfg)
 				if event.RefuseNext > 0 || event.DelayNext > 0 {
 					require.NotEmpty(t, cfg.Proxy.FailBackendList,

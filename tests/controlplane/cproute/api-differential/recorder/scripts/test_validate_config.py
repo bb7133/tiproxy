@@ -52,12 +52,14 @@ class Trace:
 
     def lifecycle(self):
         source, target, session = "default/127.0.0.1:4000", "default/127.0.0.1:4001", "r"
+        if self.row["go_rule"] in ("client_cidr", "proxy_cidr"):
+            source, target = "default/127.0.0.1:4002", "default/127.0.0.1:4003"
         self.add({"op": "open", "session": session, "client": "127.0.0.1:1",
                   "proxy": "127.0.0.1:1", "port": "6000"})
         self.add({"op": "next", "session": session}, "ok", source)
         self.add({"op": "finish", "session": session, "success": True})
         self.add({"op": "config", "toml": "[proxy]\nfail-backend-list=['127.0.0.1:4000']\n",
-                  "delay_next": 1})
+                  "delay_next": 1, "fail_backend_ref": session})
         effect = {"kind": "redirect", "session": session, "operation": f"{session}/1",
                   "from": source, "to": target, "accepted": True}
         self.add({"op": "tick"}, effects=[effect])
@@ -125,6 +127,28 @@ def port_trace():
     return t
 
 
+def cidr_trace():
+    t = Trace(ROWS["C02"])
+    common_prefix(t, "127.0.0.1:4002", client="127.0.0.1")
+    t.labels["127.0.0.1:4003"] = {"cidr": "127.0.0.2/32"}  # retained group union is now .1 + .2
+    t.health()
+    t.session("ok", "127.0.0.1:4003", client="127.0.0.1")
+    t.session("ok", "127.0.0.1:4003", client="127.0.0.2")
+    t.labels[NEW] = {}
+    t.health()
+    t.session("ok", "127.0.0.1:4002", client="127.0.0.1")
+    t.labels[NEW] = {"cidr": "127.0.0.1/32"}
+    t.health()
+    t.session("ok", NEW, client="127.0.0.2")
+    del t.labels[NEW]
+    t.health()
+    t.labels["127.0.0.1:4003"] = {"cidr": "127.0.0.1/32"}
+    t.health()
+    t.session("ok", "127.0.0.1:4003", client="127.0.0.1")
+    t.lifecycle()
+    return t
+
+
 def edit(t, session, **fields):
     t = copy.deepcopy(t)
     for e, g in zip(t.events, t.go):
@@ -172,6 +196,7 @@ class ConfigValidatorTests(unittest.TestCase):
 
     def test_positive_traces_pass(self):
         self.assertEqual(matchall_trace().result(), [])
+        self.assertEqual(cidr_trace().result(), [])
         self.assertEqual(port_trace().result(), [])
 
     def test_source_recovery_waits_through_no_match_next(self):
@@ -189,7 +214,7 @@ class ConfigValidatorTests(unittest.TestCase):
         self.assertFails(no_recovery, "no successful next after the source-error window")
 
     def test_router_reset_traces_derive_without_private_dependencies(self):
-        for t in (matchall_trace(), port_trace()):
+        for t in (matchall_trace(), cidr_trace(), port_trace()):
             trace = {"version": 1, "id": "config-router-reset",
                      "config": {"policy": t.row["policy"], "selection": t.row["selection"],
                                 "rule": t.row["go_rule"]},
@@ -224,6 +249,9 @@ class ConfigValidatorTests(unittest.TestCase):
         self.assertFails(without(t, lambda e, g: e["op"] == "rehydrate"), "survivors not rehydrated")
         self.assertFails(without(t, lambda e, g: e["op"] == "lookup"), "no effect-relative rehydrate and lookup")
         self.assertFails(without(t, lambda e, g: e["op"] == "redirect_result"), "no successful late redirect callback")
+        literal = copy.deepcopy(t)
+        next(e for e in literal.events if e.get("delay_next"))["fail_backend_ref"] = ""
+        self.assertFails(literal, "delayed reset failover is not bound to an active session")
         reset = next(i for i, e in enumerate(t.events) if e["op"] == "router_reset")
         self.assertFails(without(t, lambda e, g: g["seq"] > reset and e["op"] == "health"),
                          "no fresh health publication")
@@ -247,7 +275,7 @@ class ConfigValidatorTests(unittest.TestCase):
 
     def test_port_mutations(self):
         t = port_trace()
-        self.assertFails(edit(t, "s6", backend="default/127.0.0.1:4003"), "from its new label's context")
+        self.assertFails(edit(t, "s6", backend="default/127.0.0.1:4003"), "outside its retained group context")
         self.assertFails(edit(edit(t, "s5", backend="default/127.0.0.1:4002"), "s9", backend="default/127.0.0.1:4002"),
                          "not selected from its original group context")
         self.assertFails(edit(t, "s7", backend="default/" + NEW), "before its routing label")
@@ -255,6 +283,18 @@ class ConfigValidatorTests(unittest.TestCase):
         outside = copy.deepcopy(t)
         outside.events[[i for i, e in enumerate(outside.events) if e.get("session") == "s8"][0]]["port"] = "6000"
         self.assertFails(outside, "outside its joined group")
+
+    def test_cidr_member_union_and_outside_context(self):
+        t = cidr_trace()
+        refreshed = next(g for e, g in zip(t.events, t.go)
+                         if e.get("session") == "s6" and e["op"] == "next")
+        self.assertEqual(refreshed["backend"], "default/127.0.0.1:4003")
+
+        outside = copy.deepcopy(t)
+        event = next(e for e in outside.events
+                     if e.get("session") == "s6" and e["op"] == "open")
+        event["client"] = "127.0.0.3:1"
+        self.assertFails(outside, "outside its current member-union context")
 
 
 class ConfigPreflightTests(unittest.TestCase):

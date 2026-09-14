@@ -254,13 +254,17 @@ The following dependencies withhold a slot from acceptance:
 Config/source slots use an explicit `router_reset` lifecycle. The recorder keeps a
 real SQL connection alive and classifies that connection as the slot's sole held
 session. At reset execution time it reads the connection's latest assignment from
-the serialized public-event ledger and builds `fail-backend-list` from that value;
-ordinary Resource/Location balancing between open and reset therefore cannot stale
-the target. It arms and observes a delayed accepted redirect, closes the old router,
-constructs a fresh router, republishes the latest complete health input, and
-rehydrates every surviving connection before releasing the late callback. Each
-recorded route is gated before namespace lookup, so a concurrent connection cannot
-retain the old router while the lifecycle swaps the namespace. Each
+the serialized public-event ledger. The config input stores that logical session in
+`fail_backend_ref`; its singleton TOML address remains audit evidence, while each
+adapter replaces it with the session's own current engine assignment before applying
+the config. Thus ordinary Resource/Location balancing between open and reset cannot
+stale the target or accidentally fail a different backend in the other engine. A
+missing/inactive reference or a non-singleton raw list fails closed. The recorder
+arms and observes a delayed accepted redirect, closes the old router, constructs a
+fresh router, republishes the latest complete health input, and rehydrates every
+surviving connection before releasing the late callback. Each recorded route is
+gated before namespace lookup, so a concurrent connection cannot retain the old
+router while the lifecycle swaps the namespace. Each
 rehydrate input names either its `backend_ref: previous` assignment or the delayed
 redirect's engine-relative `effect_ref`; a following Lookup uses that same effect
 reference. The recorder refuses the reset if any other accepted redirect remains
@@ -272,7 +276,9 @@ before reset settles every operation owned by that session; those operations can
 leak into the pre-reset retirement ledger. `router_reset_smoke.py` covers one such
 close-settled redirect followed by the delayed live redirect, then runs the reset
 lifecycle through both real adapters and independently re-derives their public rows
-in CI.
+in CI. Its raw singleton intentionally names a backend different from the held
+session's assignment, proving the logical reference—not the stale literal—drives
+both engines.
 
 Additional planned work includes timer boundary expansion. The presence of a row in
 `recording-plan.tsv` does not mean every other driver is implemented.
@@ -317,8 +323,12 @@ combines raw qualification with `validate_failover.py`. The event gate requires
 checkpoint-derived activation, unchanged activation, clear/reentry, a refused
 then accepted redirect, a redirect completion after close, health loss/recovery,
 the all-members failover guard, zero duplicate/unsettled operations and an empty
-final ledger. CIDR match/no-match and Port conflict/recovery are checked in every
-applicable slot. These scripts and synthetic validator tests are candidate
+final ledger. CIDR captures additionally prove that a retained group's refreshed
+match set is the union of its current member CIDRs: both old and newly contributed
+contexts route, while an outside context does not. Port captures keep the original
+fixed group value and reject the changed label's outside context. CIDR
+match/no-match and Port conflict/recovery are checked in every applicable slot.
+These scripts and synthetic validator tests are candidate
 infrastructure; they do not count as recorded corpus evidence by themselves.
 
 The writer distinguishes the existing per-session `refuse` input from the scripted

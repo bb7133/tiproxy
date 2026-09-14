@@ -15,8 +15,9 @@ recorded events (whole health snapshots are the fact source for labels and membe
 - group-routing input change:
   MatchAll: an accepted runtime balance.routing-rule change after which every next is ok until
             the original rule is restored (the router's match type is fixed at Init);
-  CIDR/Port: a grouped backend's routing label changes in health, after which it is still
-            selected from its original context and never from the context of its new value (retain);
+  CIDR/Port: a grouped backend's routing label changes in health and remains in its original
+            group. Port keeps the fixed group value; CIDR refreshes that group's match set to the
+            current member-CIDR union, so both the old and newly contributed contexts must route;
 - one explicit router_reset with settled live sessions, a fresh health publication, successful
   rehydration of every survivor, lookup of the pending redirect target, and its late callback.
 
@@ -66,6 +67,7 @@ def validate(row, trace, go):
     changed = {}                  # address -> routing values after a label change
     added = set()
     added_labeled_at = {}
+    cidr_group_members = set()   # C02/C03 declare one CIDR group; membership is retained
     removed = set()
     source_window = None          # identity while inside a source-error window
     source_done = False           # source window ended; wait through no-match nexts for recovery
@@ -79,6 +81,7 @@ def validate(row, trace, go):
     settled = set()
     accepted_redirects = 0
     lifecycle_ref = None
+    lifecycle_fail_ref = None
     reset_ref = None
 
     def ctx_routes(ctx, values):
@@ -109,6 +112,8 @@ def validate(row, trace, go):
                         added.add(a)
                     if values and a not in first_labels:
                         first_labels[a] = values
+                        if rule in ("client_cidr", "proxy_cidr"):
+                            cidr_group_members.add(a)
                         if a in added:
                             added_labeled_at[a] = i
                     elif a in first_labels and values != first_labels[a]:
@@ -130,6 +135,12 @@ def validate(row, trace, go):
             toml = e.get("toml", "")
             if out == "ok":
                 config_ok += 1
+                if e.get("delay_next"):
+                    ref = e.get("fail_backend_ref")
+                    if not isinstance(ref, str) or not ref or ref not in active:
+                        problems.append(f"delayed reset failover is not bound to an active session at {i}")
+                    else:
+                        lifecycle_fail_ref = ref
                 if "routing-rule" in toml:
                     rule_change = "active" if 'routing-rule = ""' not in toml else ("restored" if rule_change else None)
                     s["rule_change_configs"] += 1
@@ -160,12 +171,21 @@ def validate(row, trace, go):
             if out != "ok":
                 continue
             pending.add(e["session"])
+            current_group_routes = (
+                any(ctx_routes(ctx, routing_values(present[member]))
+                    for member in cidr_group_members if member in present)
+                if rule in ("client_cidr", "proxy_cidr") and backend in cidr_group_members
+                else None
+            )
+            if current_group_routes is False:
+                s["cidr_selected_outside_group"] += 1
             if backend in added and backend in present:
                 if rule == "":
                     s["added_selected"] += 1
                 elif backend not in added_labeled_at:
                     s["added_selected_unlabeled"] += 1
-                elif ctx_routes(ctx, first_labels[backend]):
+                elif (current_group_routes if rule in ("client_cidr", "proxy_cidr")
+                      else ctx_routes(ctx, first_labels[backend])):
                     s["added_joined_selected"] += 1
                 else:
                     s["added_selected_outside_group"] += 1
@@ -173,7 +193,10 @@ def validate(row, trace, go):
                 if ctx_routes(ctx, first_labels[backend]):
                     s["retained_selected"] += 1
                 if ctx_routes(ctx, changed[backend]) and not ctx_routes(ctx, first_labels[backend]):
-                    s["retained_selected_new_context"] += 1
+                    if rule in ("client_cidr", "proxy_cidr") and current_group_routes:
+                        s["retained_selected_new_context"] += 1
+                    else:
+                        s["retained_selected_outside_group"] += 1
         elif op == "finish":
             pending.discard(e["session"])
             if e.get("success"):
@@ -195,6 +218,9 @@ def validate(row, trace, go):
                 problems.append(f"router_reset at {i} requires exactly one pending accepted redirect, got {outstanding}")
             else:
                 reset_ref = outstanding[0]
+                effect = accepted_refs[reset_ref]
+                if lifecycle_fail_ref is None or effect.get("session") != lifecycle_fail_ref:
+                    problems.append(f"router_reset at {i} delayed redirect does not belong to its failover reference")
             reset_at = i
             reset_survivors = set(active)
             active.clear()
@@ -261,7 +287,13 @@ def validate(row, trace, go):
             problems.append("no grouped backend routing label change in health")
         if not s["retained_selected"]:
             problems.append("changed backend not selected from its original group context")
-        if s["retained_selected_new_context"]:
+        if rule in ("client_cidr", "proxy_cidr") and not s["retained_selected_new_context"]:
+            problems.append("changed CIDR backend never selected from its refreshed member-union context")
+        if s["cidr_selected_outside_group"]:
+            problems.append(f"CIDR backend selected {s['cidr_selected_outside_group']} times outside its current member-union context")
+        if s["retained_selected_outside_group"]:
+            problems.append(f"changed backend selected {s['retained_selected_outside_group']} times outside its retained group context")
+        if rule == "port" and s["retained_selected_new_context"]:
             problems.append(f"changed backend selected {s['retained_selected_new_context']} times from its new label's context")
     if reset_at is None or reset_survivors is None:
         problems.append("no router close/recreate lifecycle")

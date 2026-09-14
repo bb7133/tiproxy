@@ -35,8 +35,10 @@ def make_case():
         {"op": "tick"},
         {"op": "close", "session": "closed", "effect_ref": "redirect/1"},
         {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"},
-        {"op": "config", "delay_next": 1, "at_nanos": 6_000_000_000,
-         "toml": "[proxy]\nfail-backend-list=['a']\nfailover-timeout=60\n"},
+        {"op": "config", "delay_next": 1, "fail_backend_ref": "a", "at_nanos": 6_000_000_000,
+         # The recorded literal is deliberately stale. Both adapters must
+         # replace it with logical session a's current engine assignment.
+         "toml": "[proxy]\nfail-backend-list=['b']\nfailover-timeout=60\n"},
         {"op": "tick", "at_nanos": 6_000_000_000},
         {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n", "at_nanos": 6_000_000_000},
         {"op": "router_reset", "at_nanos": 6_000_000_000},

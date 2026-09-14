@@ -117,7 +117,7 @@ func TestWriteCarriesRelativeRefusalCallbackAndDelayedClose(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
 	yes := true
 	log := []Recorded{
-		{Seq: 0, AtNanos: 5, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", DelayNext: true}},
+		{Seq: 0, AtNanos: 5, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", DelayNext: true, FailBackendRef: "s1"}},
 		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "tick_begin"}},
 		{Seq: 2, AtNanos: 10, Event: apireplay.Event{Op: "effect", Effects: []apireplay.Effect{
 			{Kind: "redirect", Session: "first", Operation: "first/1", From: "a", To: "b", Accepted: false, RefuseNext: true},
@@ -137,6 +137,7 @@ func TestWriteCarriesRelativeRefusalCallbackAndDelayedClose(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(dir, "trace.json"))
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(data, &trace))
+	require.Equal(t, "s1", trace.Events[0]["fail_backend_ref"])
 	require.Equal(t, float64(1), trace.Events[0]["delay_next"])
 	require.Equal(t, float64(1), trace.Events[1]["refuse_next"])
 	require.NotContains(t, trace.Events[1], "refuse")

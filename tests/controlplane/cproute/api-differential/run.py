@@ -87,7 +87,7 @@ def validate(trace):
     events = trace["events"]
     require(isinstance(events, list) and 0 < len(events) <= 100_000, "INPUT", "event count")
     allowed = {
-        "health":{"backends"},"config":{"toml","refuse_next","delay_next"},"open":{"client","proxy","port"},
+        "health":{"backends"},"config":{"toml","refuse_next","delay_next","fail_backend_ref"},"open":{"client","proxy","port"},
         "next":set(),"finish":{"success"},"close":{"effect_ref","optional_effect"},"checkpoint":set(),
         "tick":{"refuse","refuse_next"},"redirect_result":{"operation","effect_ref","optional_effect","success"},
         "lookup":{"backend","effect_ref"},"rehydrate":{"backend","backend_ref","effect_ref"},
@@ -125,9 +125,13 @@ def validate(trace):
         if "redirect_cadence" in expect:
             model = expect["redirect_cadence"]
             require(op == "tick" and expect["outcome"] == "ok" and "effects" not in expect
-                    and isinstance(model, dict) and set(model) == {"kind", "groups"}
+                    and isinstance(model, dict) and {"kind", "groups"} <= set(model) <= {"kind", "groups", "fail_backend_ref"}
                     and model["kind"] == "connection" and isinstance(model["groups"], list),
                     "INPUT", "redirect cadence model")
+            if "fail_backend_ref" in model:
+                require(isinstance(model["fail_backend_ref"], str)
+                        and model["fail_backend_ref"] in active,
+                        "INPUT", "redirect cadence failover reference")
             group_ids, members = set(), set()
             for group in model["groups"]:
                 require(isinstance(group, dict) and set(group) == {"group", "members"}
@@ -192,6 +196,18 @@ def validate(trace):
                     and (not (event.get("refuse_next", 0) or event.get("delay_next", 0))
                          or expect["outcome"] == "ok"),
                     "INPUT", "config one-shot effect control")
+            fail_ref = event.get("fail_backend_ref")
+            if fail_ref is not None:
+                try:
+                    proxy = tomllib.loads(event["toml"]).get("proxy", {})
+                except tomllib.TOMLDecodeError as error:
+                    raise Difference(f"INPUT: relative failover config cannot be parsed: {error}") from error
+                fail_list = proxy.get("fail-backend-list")
+                require(isinstance(fail_ref, str) and fail_ref in active
+                        and expect["outcome"] == "ok"
+                        and isinstance(fail_list, list) and len(fail_list) == 1
+                        and isinstance(fail_list[0], str) and bool(fail_list[0]),
+                        "INPUT", "relative failover requires an active session and singleton list")
         elif op == "tick":
             require(isinstance(event.get("refuse",[]),list) and all(id in active for id in event.get("refuse",[])),"INPUT","effect refusal inputs")
             require(type(event.get("refuse_next", 0)) is int and 0 <= event.get("refuse_next", 0) <= 1,
@@ -288,6 +304,8 @@ class PublicConnections:
         self.refuse_next, self.refusal_attempts, self.fail_backend_list = 0, 0, set()
         self.delay_next, self.delay_attempts, self.delayed_redirect = 0, 0, None
         self.delayed_settled_early = False
+        self.relative_fail_backend, self.relative_fail_count = None, 0
+        self.relative_fail_at = None
         self.policy, self.selection = config["policy"], config["selection"]
         self.ratio, self.rate, self.status_rate, self.label_name = 1.2, 0.0, 0.0, ""
 
@@ -383,7 +401,20 @@ class PublicConnections:
                         and bool(proxy["fail-backend-list"]), "INPUT",
                         "config effect arm requires a nonempty failover list")
             if "fail-backend-list" in proxy:
-                self.fail_backend_list = set(proxy["fail-backend-list"])
+                fail_ref = event.get("fail_backend_ref")
+                if fail_ref is not None:
+                    actual = self.logical_to_actual.get(fail_ref, fail_ref)
+                    require(actual in self.assigned, "EFFECT_LEDGER",
+                            f"relative failover session {fail_ref!r} has no active assignment")
+                    self.relative_fail_backend = self.assigned[actual]
+                    self.relative_fail_count = self.counts()[self.relative_fail_backend]
+                    self.relative_fail_at = now
+                    self.fail_backend_list = {self.relative_fail_backend}
+                else:
+                    self.relative_fail_backend = None
+                    self.relative_fail_count = 0
+                    self.relative_fail_at = None
+                    self.fail_backend_list = set(proxy["fail-backend-list"])
                 if not self.fail_backend_list:
                     self.expire_refusal("failover clear")
                     self.expire_delay("failover clear")
@@ -557,13 +588,21 @@ class PublicConnections:
             return effect["operation"] if effect is not None else ""
         return event.get("operation", "")
 
-    def _group_redirect_options(self, event, group, now, refuse_next):
+    def _group_redirect_options(self, event, group, now, refuse_next, fail_backend_ref=None):
         members = {item["backend"]: item for item in group["members"]}
         if len(members) <= 1:
             return [([], refuse_next)]
         counts = self.counts()
         physical = Counter(self.assigned.values())
-        bits = {backend: (int(not item["healthy"]), min(counts[backend], 65535))
+        failed = None
+        if fail_backend_ref is not None:
+            actual = self.logical_to_actual.get(fail_backend_ref, fail_backend_ref)
+            require(actual in self.assigned, "EFFECT_LEDGER",
+                    f"redirect cadence failover session {fail_backend_ref!r} has no assignment")
+            failed = self.assigned[actual]
+        healthy = {backend: item["healthy"] and backend != failed
+                   for backend, item in members.items()}
+        bits = {backend: (int(not healthy[backend]), min(counts[backend], 65535))
                 for backend, item in members.items()}
         minimum = min(bits.values())
         if minimum[0]:
@@ -575,10 +614,15 @@ class PublicConnections:
             for source in members:
                 if bits[source] <= minimum or physical[source] == 0 or counts[source] <= 0:
                     continue
-                if not members[source]["healthy"]:
+                if not healthy[source]:
                     snapshot = self.status_snapshots.get(group["group"], {}).get(source)
-                    require(snapshot is not None, "EFFECT_LEDGER", f"missing status cadence for {source}")
-                    rate = self.status_rate if self.status_rate > 0 else snapshot[0]
+                    if (snapshot is None and source == self.relative_fail_backend
+                            and self.relative_fail_at is not None and self.relative_fail_at <= now):
+                        rate = (self.status_rate if self.status_rate > 0
+                                else float(self.relative_fail_count) / 5.0)
+                    else:
+                        require(snapshot is not None, "EFFECT_LEDGER", f"missing status cadence for {source}")
+                        rate = self.status_rate if self.status_rate > 0 else snapshot[0]
                 else:
                     if float(counts[source]) <= float(counts[target] + 1) * self.ratio:
                         continue
@@ -643,7 +687,8 @@ class PublicConnections:
             for group in order:
                 expanded = []
                 for effects, refusal in partial:
-                    for more, remaining in self._group_redirect_options(event, group, now, refusal):
+                    for more, remaining in self._group_redirect_options(
+                            event, group, now, refusal, model.get("fail_backend_ref")):
                         expanded.append((effects + more, remaining))
                         require(len(expanded) <= 256, "INPUT", "redirect cadence alternatives")
                 partial = expanded

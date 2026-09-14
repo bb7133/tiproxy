@@ -62,12 +62,21 @@ func TestLedgerSelectsOnlyAnEstablishedHeldClient(t *testing.T) {
 		l.observe(apireplay.Event{Op: "finish", Session: tc.session, Success: &yes})
 	}
 	require.Equal(t, "default/127.0.0.1:4001", l.chooseHeldBackend())
+	session, backend := l.chooseSoleHeldAssignment()
+	require.Empty(t, session)
+	require.Empty(t, backend, "router reset refuses ambiguous held identities")
 	l.observe(apireplay.Event{Op: "close", Session: "held-a"})
 	require.Equal(t, "default/127.0.0.1:4002", l.chooseHeldBackend())
+	session, backend = l.chooseSoleHeldAssignment()
+	require.Equal(t, "held-b", session)
+	require.Equal(t, "default/127.0.0.1:4002", backend)
 	l.observe(apireplay.Event{Op: "redirect_result", Session: "held-b", Success: &yes,
 		Operation: "held-b/1", Backend: "default/127.0.0.1:4003"})
 	require.Equal(t, "default/127.0.0.1:4003", l.chooseHeldBackend(),
 		"router reset must select the lifecycle connection's current assignment")
+	session, backend = l.chooseSoleHeldAssignment()
+	require.Equal(t, "held-b", session)
+	require.Equal(t, "default/127.0.0.1:4003", backend)
 }
 
 func TestLedgerClassifiesHeldIdentityAcrossRegistrationRaceAndAddressReuse(t *testing.T) {
