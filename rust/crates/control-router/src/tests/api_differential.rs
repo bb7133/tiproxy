@@ -248,6 +248,7 @@ async fn replay() -> TestResult {
                     if event["optional_effect"].as_bool() != Some(true) {
                         return Err("missing delayed redirect".into());
                     }
+                    must(effects.lock()).expire_delay("delayed-close opportunity", index);
                     None
                 } else {
                     unbound_redirects.iter().position(|operation| {

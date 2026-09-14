@@ -418,10 +418,11 @@ class PublicConnections:
             self.delayed_redirect = None
         elif event["op"] == "close" and self.delay_next:
             # This engine had no accepted redirect before the recording's
-            # delayed-close opportunity. Preserve every unrelated redirect;
-            # the arm may expire only at clear/end with zero attempts.
+            # delayed-close opportunity. That input closes the window: expire
+            # the zero-attempt arm now so a later redirect is ordinary.
             require(event.get("optional_effect") is True, "EFFECT_LEDGER",
                     f"missing delayed redirect {effect_ref}")
+            self.expire_delay("delayed-close opportunity")
         else:
             position = next((i for i, effect in enumerate(self.unbound_redirects)
                              if effect["session"] == actual), None)

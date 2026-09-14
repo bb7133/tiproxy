@@ -337,6 +337,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 				delayedOperation = nil
 			} else if referenced == nil && !alreadySkipped && event.Op == "close" && delayNext > 0 {
 				require.True(t, event.Optional, "missing delayed redirect at seq=%d effect_ref=%s", index, event.EffectRef)
+				expireDelay("delayed-close opportunity", index)
 			} else if referenced == nil && !alreadySkipped {
 				for i, candidate := range unboundRedirects {
 					if candidate.effect.Session == logicalActual {

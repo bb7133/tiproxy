@@ -400,10 +400,33 @@ class ConnectionPreferenceTests(unittest.TestCase):
         self.assertEqual(h.resolve_event(close), "logical")
         self.assertEqual(h.resolve_operation(close), "")
         h.apply(close, {"outcome": "no_effect", "effects": []}, sid="logical")
+        self.assertEqual((h.delay_next, h.delay_attempts), (0, 0))
+        later = {"kind": "redirect", "session": "other", "operation": "other/1",
+                 "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [later]})
+        self.assertIsNone(h.delayed_redirect)
+        self.assertEqual([effect["operation"] for effect in h.unbound_redirects], ["other/1"])
         clear = {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"}
         h.prepare(clear, {}, {"outcome": "ok"}, 1)
         self.assertEqual((h.delay_next, h.delay_attempts), (0, 0))
         self.assertEqual(h.assigned, {"other": "source"})
+
+    def test_delayed_arm_fails_if_accepted_binding_leaves_public_queue(self):
+        h = self.history()
+        for sid in ("logical", "actual"):
+            h.apply({"op": "open", "session": sid}, {})
+            self.reserve(h, sid, "source", True)
+        arm = {"op": "config", "delay_next": 1,
+               "toml": "[proxy]\nfail-backend-list=['source']\n"}
+        h.prepare(arm, {}, {"outcome": "ok"}, 0)
+        accepted = {"kind": "redirect", "session": "actual", "operation": "actual/1",
+                    "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [accepted]})
+        h.unbound_redirects.clear()
+        close = {"op": "close", "session": "logical",
+                 "effect_ref": "redirect/1", "optional_effect": True}
+        with self.assertRaisesRegex(runner.Difference, "left the public queue"):
+            h.resolve_event(close)
 
     def test_failed_relative_callback_keeps_per_session_cooldown(self):
         h = self.history()
