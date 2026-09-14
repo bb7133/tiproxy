@@ -68,7 +68,7 @@ def validate(row, trace, go):
     added_labeled_at = {}
     removed = set()
     source_window = None          # identity while inside a source-error window
-    source_done = False
+    source_done = False           # source window ended; wait through no-match nexts for recovery
     rule_change = None            # "active" | "restored"
     config_ok = config_invalid = 0
     sessions, pending, active = set(), set(), set()
@@ -145,9 +145,11 @@ def validate(row, trace, go):
                 s["source_window_next"] += 1
                 if out != f"source_error:{source_window}":
                     s["source_window_other"] += 1
-            elif source_done:
-                if out == "ok":
-                    s["source_recovery_ok"] += 1
+            elif source_done and out == "ok":
+                # CIDR/Port captures intentionally keep no-match clients busy.
+                # Their first post-window next may correctly report no_backend;
+                # that does not disprove recovery for a routed context.
+                s["source_recovery_ok"] += 1
                 source_done = False
             if rule == "" and rule_change == "active":
                 s["rule_change_next"] += 1

@@ -138,6 +138,29 @@ def without(t, predicate):
     return t
 
 
+def post_source_no_match_first(t):
+    """Insert a legal no-match request between source recovery health and the first routed success."""
+    t = copy.deepcopy(t)
+    source = next(i for i, e in enumerate(t.events) if e["op"] == "source_error")
+    insert = next(i for i, e in enumerate(t.events) if i > source and e["op"] == "health") + 1
+    session = "source-recovery-no-match"
+    events = [
+        {"op": "open", "session": session, "client": "127.0.0.1:1",
+         "proxy": "127.0.0.1:1", "port": "6999"},
+        {"op": "next", "session": session},
+        {"op": "close", "session": session},
+    ]
+    rows = [
+        {"op": "open", "session": session, "outcome": "ok", "backend": "", "effects": []},
+        {"op": "next", "session": session, "outcome": "no_backend", "backend": "", "effects": []},
+        {"op": "close", "session": session, "outcome": "ok", "backend": "", "effects": []},
+    ]
+    t.events[insert:insert] = events
+    t.go[insert:insert] = rows
+    t.go = [dict(row, seq=i) for i, row in enumerate(t.go)]
+    return t
+
+
 class ConfigValidatorTests(unittest.TestCase):
     def assertFails(self, t, needle):
         problems = t.result()
@@ -146,6 +169,20 @@ class ConfigValidatorTests(unittest.TestCase):
     def test_positive_traces_pass(self):
         self.assertEqual(matchall_trace().result(), [])
         self.assertEqual(port_trace().result(), [])
+
+    def test_source_recovery_waits_through_no_match_next(self):
+        t = post_source_no_match_first(port_trace())
+        self.assertEqual(t.result(), [])
+
+        no_recovery = copy.deepcopy(t)
+        source = next(i for i, e in enumerate(no_recovery.events) if e["op"] == "source_error")
+        recovery_health = next(i for i, e in enumerate(no_recovery.events)
+                               if i > source and e["op"] == "health")
+        for event, row in zip(no_recovery.events[recovery_health + 1:],
+                              no_recovery.go[recovery_health + 1:]):
+            if event["op"] == "next" and row["outcome"] == "ok":
+                row.update(outcome="no_backend", backend="")
+        self.assertFails(no_recovery, "no successful next after the source-error window")
 
     def test_router_reset_traces_derive_without_private_dependencies(self):
         for t in (matchall_trace(), port_trace()):
@@ -168,7 +205,6 @@ class ConfigValidatorTests(unittest.TestCase):
         self.assertFails(without(t, lambda e, g: g["outcome"] == "invalid_config"), "no invalid public-config rejection")
         self.assertFails(edit(t, "s3", outcome="no_backend"), "did not report that source error")
         self.assertFails(without(t, lambda e, g: e["op"] == "source_error"), "no named source error")
-        self.assertFails(edit(t, "s4", outcome="no_backend", backend=""), "no successful next after the source-error window")
         reset = next(i for i, e in enumerate(t.events) if e["op"] == "router_reset")
         removal = max(i for i, e in enumerate(t.events) if e["op"] == "health" and i < reset)
         self.assertFails(without(t, lambda e, g: g["seq"] == removal), "no added backend removed")
