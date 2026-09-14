@@ -127,7 +127,6 @@
  {
   "at_ms": 320000,
   "kind": "router_reset",
-  "backend": "default/127.0.0.1:4002",
   "timeout_ms": 15000
  },
  {

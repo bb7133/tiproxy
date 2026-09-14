@@ -252,9 +252,13 @@ The following dependencies withhold a slot from acceptance:
   alternatives exceed the bounded model retain this dependency.
 
 Config/source slots use an explicit `router_reset` lifecycle. The recorder keeps a
-real SQL connection alive, arms and observes a delayed accepted redirect, closes the
-old router, constructs a fresh router, republishes the latest complete health input,
-and rehydrates every surviving connection before releasing the late callback. Each
+real SQL connection alive and classifies that connection as the slot's sole held
+session. At reset execution time it reads the connection's latest assignment from
+the serialized public-event ledger and builds `fail-backend-list` from that value;
+ordinary Resource/Location balancing between open and reset therefore cannot stale
+the target. It arms and observes a delayed accepted redirect, closes the old router,
+constructs a fresh router, republishes the latest complete health input, and
+rehydrates every surviving connection before releasing the late callback. Each
 recorded route is gated before namespace lookup, so a concurrent connection cannot
 retain the old router while the lifecycle swaps the namespace. Each
 rehydrate input names either its `backend_ref: previous` assignment or the delayed
@@ -263,9 +267,12 @@ reference. The recorder refuses the reset if any other accepted redirect remains
 unsettled at the boundary. Replay adapters recreate their real router and invoke the
 real rehydration boundary instead of clearing a test-only ledger. If another engine
 chose a different delayed owner, its effect-relative rehydrate swaps logical handles
-so all remaining survivors are still rehydrated exactly once. `router_reset_smoke.py`
-runs this lifecycle through both real adapters and independently re-derives their
-public rows in CI.
+so all remaining survivors are still rehydrated exactly once. A connection closed
+before reset settles every operation owned by that session; those operations cannot
+leak into the pre-reset retirement ledger. `router_reset_smoke.py` covers one such
+close-settled redirect followed by the delayed live redirect, then runs the reset
+lifecycle through both real adapters and independently re-derives their public rows
+in CI.
 
 Additional planned work includes timer boundary expansion. The presence of a row in
 `recording-plan.tsv` does not mean every other driver is implemented.

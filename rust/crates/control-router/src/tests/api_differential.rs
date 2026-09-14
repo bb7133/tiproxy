@@ -777,6 +777,19 @@ async fn replay() -> TestResult {
                         .get(operation)
                         .is_none_or(|(session, _, _)| session != &id)
                 });
+                let close_settled: Vec<String> = operations
+                    .iter_mut()
+                    .filter_map(|(operation, (session, _, completed))| {
+                        if session != &id {
+                            return None;
+                        }
+                        *completed = true;
+                        Some(operation.clone())
+                    })
+                    .collect();
+                for operation in close_settled {
+                    retired_operations.remove(&operation);
+                }
                 logical_sessions.remove(logical_id);
             }
             "checkpoint" => {

@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Config/source-change validator, C preflight and generated scripts: positives and one-fault mutations."""
 import copy
+import json
 from pathlib import Path
 import sys
+import tempfile
+import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -284,6 +288,47 @@ class ConfigPreflightTests(unittest.TestCase):
         manifest["tidb"][3]["runtime_labels"] = {"cidr": "127.0.0.2/32"}
         manifest["tidb"][2]["topology_labels"] = {}
         self.assertEqual(len(record_slot.check_manifest(manifest, row)), 2)
+
+    def test_record_slot_main_writes_verdict_without_retired_trial_flag(self):
+        row = copy.deepcopy(ROWS["C01"])
+        labels = vn.parse_labels(row["labels"])
+        manifest = {"tidb": [{"name": name, "labels": labels[name]} for name in record_slot.INSTANCES]}
+        validator = types.SimpleNamespace(
+            __file__="fake_validate_config.py",
+            slot_rows=lambda: {"C01": row},
+            validate_dir=lambda *_: ([], {"main_path": "covered"}),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_run(cmd, **kwargs):
+                if cmd[1:] == ["manifest"]:
+                    payload = json.dumps(manifest)
+                    return types.SimpleNamespace(
+                        returncode=0,
+                        stdout=payload if kwargs.get("text") else payload.encode(),
+                    )
+                attempt = Path(cmd[cmd.index("-out") + 1]) / "C01-a1"
+                attempt.mkdir()
+                (attempt / "trace.json").write_text("{}\n")
+                return types.SimpleNamespace(returncode=0, stdout=b"")
+
+            argv = ["record_slot.py", "C01", "--attempt", "a1", "--recorder", "recorder",
+                    "--env", "env", "--out", tmp]
+            with mock.patch.object(record_slot, "FAMILIES", {
+                    "C": ("config-source", validator, "config-validation.json", "on")}), \
+                    mock.patch.object(record_slot, "preflight", return_value=[]), \
+                    mock.patch.object(record_slot, "check_manifest", return_value=[]), \
+                    mock.patch.object(record_slot, "restore_environment"), \
+                    mock.patch.object(record_slot, "sh"), \
+                    mock.patch.object(record_slot.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(sys, "argv", argv):
+                with self.assertRaises(SystemExit) as exit_status:
+                    record_slot.main()
+            self.assertEqual(exit_status.exception.code, 0)
+            verdict = json.loads((Path(tmp) / "C01-a1" / "config-validation.json").read_text())
+            self.assertEqual(verdict["passed"], True)
+            self.assertEqual(verdict["contexts"], {"main_path": "covered"})
+            self.assertNotIn("trial", verdict)
 
 
 if __name__ == "__main__":

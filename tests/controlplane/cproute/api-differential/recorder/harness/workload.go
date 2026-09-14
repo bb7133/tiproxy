@@ -55,7 +55,9 @@ type LifecycleConnection struct {
 // OpenLifecycleConnection establishes and proves one real SELECT 1 session,
 // then retains its physical connection until Close.
 func (w *Workload) OpenLifecycleConnection(ctx context.Context, listener, source string) (*LifecycleConnection, error) {
-	connector, err := w.connector(listener, source, false)
+	// Treat this retained SQL connection as held so the public-event ledger can
+	// identify its current assignment even after ordinary balancing moves it.
+	connector, err := w.connector(listener, source, true)
 	if err != nil {
 		return nil, err
 	}

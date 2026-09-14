@@ -64,7 +64,6 @@ type Action struct {
 	TimeoutMillis          int64    `json:"timeout_ms,omitempty"`
 	FailoverTimeoutSeconds int64    `json:"failover_timeout_seconds,omitempty"`
 	EffectControl          string   `json:"effect_control,omitempty"` // refuse | delay; armed atomically with failover_select
-	Backend                string   `json:"backend,omitempty"`        // router_reset: predetermined source backend
 	Backends               []string `json:"backends,omitempty"`       // lifecycle_open: predetermined temporary exclusions
 	Listener               string   `json:"listener,omitempty"`       // lifecycle_open real client endpoint
 	Source                 string   `json:"source,omitempty"`         // lifecycle_open optional loopback source
@@ -437,12 +436,24 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					markIncomplete("router_reset requires lifecycle_open")
 					return
 				}
-				toml := failoverConfig(a.Backend, 600)
-				err := cfgMgr.SetTOMLConfig([]byte(toml))
+				lifecycleBackend := ""
+				toml := ""
+				var err error
 				sched.RunNow(func() {
+					lifecycleBackend = ledger.chooseHeldBackend()
+					if lifecycleBackend == "" {
+						markIncomplete("router_reset found no current lifecycle assignment")
+						sched.Record(apireplay.Event{Op: "recorder_error", Outcome: "router_reset_without_lifecycle_assignment"})
+						return
+					}
+					toml = failoverConfig(lifecycleBackend, 600)
+					err = cfgMgr.SetTOMLConfig([]byte(toml))
 					apireplay.DelayNextRedirectResult()
 					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err, false, true)
 				})
+				if lifecycleBackend == "" {
+					return
+				}
 				if err != nil {
 					markIncomplete(fmt.Sprintf("router_reset failover config: %v", err))
 					return
@@ -617,7 +628,6 @@ func validateActions(actions []Action) error {
 	activeFailover := false
 	lifecycleOpened := false
 	routerReset := false
-	var lifecycleExcluded map[string]struct{}
 	for i, a := range actions {
 		if a.AtMillis < 0 || a.AtMillis > maxDurationMillis {
 			return fmt.Errorf("action %d: at_ms is outside time.Duration range", i)
@@ -639,9 +649,6 @@ func validateActions(actions []Action) error {
 		}
 		if a.EffectControl != "" && a.Kind != "failover_select" {
 			return fmt.Errorf("action %d: effect_control is only valid for failover_select", i)
-		}
-		if (a.Backend != "") != (a.Kind == "router_reset") {
-			return fmt.Errorf("action %d: backend is required only for router_reset", i)
 		}
 		if (len(a.Backends) != 0 || a.Listener != "" || a.Source != "") && a.Kind != "lifecycle_open" {
 			return fmt.Errorf("action %d: backends/listener/source are only valid for lifecycle_open", i)
@@ -668,7 +675,7 @@ func validateActions(actions []Action) error {
 			if len(a.Backends) == 0 || a.Listener == "" {
 				return fmt.Errorf("action %d: lifecycle_open requires backends and listener", i)
 			}
-			lifecycleExcluded = make(map[string]struct{}, len(a.Backends))
+			lifecycleExcluded := make(map[string]struct{}, len(a.Backends))
 			for _, backend := range a.Backends {
 				if backend == "" {
 					return fmt.Errorf("action %d: lifecycle_open backends must be nonempty", i)
@@ -688,9 +695,6 @@ func validateActions(actions []Action) error {
 			}
 			if pendingDelayedRedirect || activeFailover {
 				return fmt.Errorf("action %d: router_reset cannot overlap another scripted effect window", i)
-			}
-			if _, excluded := lifecycleExcluded[a.Backend]; excluded {
-				return fmt.Errorf("action %d: router_reset backend %q was excluded by lifecycle_open", i, a.Backend)
 			}
 			routerReset = true
 		case "source_error":

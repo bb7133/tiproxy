@@ -195,7 +195,7 @@ def main():
             sys.exit(f"recorder exited {rc} without a trace")
         problems, contexts = validator.validate_dir(args.slot, args.attempt, attempt_dir, snapshot)
         verdict = {"slot": args.slot, "attempt": args.attempt, "validator": Path(validator.__file__).name,
-                   "trial": args.trial, "passed": not problems and not args.trial, "problems": problems, "contexts": contexts}
+                   "passed": not problems, "problems": problems, "contexts": contexts}
         write_exclusive(attempt_dir / verdict_name, (json.dumps(verdict, indent=2) + "\n").encode())
         for p in problems:
             print("FAIL:", p)

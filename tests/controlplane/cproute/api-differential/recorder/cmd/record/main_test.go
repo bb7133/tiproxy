@@ -64,6 +64,10 @@ func TestLedgerSelectsOnlyAnEstablishedHeldClient(t *testing.T) {
 	require.Equal(t, "default/127.0.0.1:4001", l.chooseHeldBackend())
 	l.observe(apireplay.Event{Op: "close", Session: "held-a"})
 	require.Equal(t, "default/127.0.0.1:4002", l.chooseHeldBackend())
+	l.observe(apireplay.Event{Op: "redirect_result", Session: "held-b", Success: &yes,
+		Operation: "held-b/1", Backend: "default/127.0.0.1:4003"})
+	require.Equal(t, "default/127.0.0.1:4003", l.chooseHeldBackend(),
+		"router reset must select the lifecycle connection's current assignment")
 }
 
 func TestLedgerClassifiesHeldIdentityAcrossRegistrationRaceAndAddressReuse(t *testing.T) {
@@ -110,6 +114,7 @@ func TestInvalidActionsFailBeforeCapture(t *testing.T) {
 		`[{"kind":"source_error","error":"wrapped_no_backend"}]`,
 		`[{"kind":"source_error","error":"port_conflict"}]`,
 		`[{"kind":"source_error","erorr":"cancelled"}]`,
+		`[{"kind":"lifecycle_open","backends":["default/b"],"listener":"127.0.0.1:6000"},{"kind":"router_reset","backend":"default/a","timeout_ms":1}]`,
 		`[{"kind":"unknown"}]`,
 		`[{"kind":"checkpoint","at_ms":-1}]`,
 	} {
@@ -144,7 +149,7 @@ func TestScriptControlValidation(t *testing.T) {
 		{Kind: "close_delayed_redirect", TimeoutMillis: 5000},
 		{Kind: "failover_clear"},
 		{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000", TimeoutMillis: 5000},
-		{Kind: "router_reset", Backend: "default/a", TimeoutMillis: 5000},
+		{Kind: "router_reset", TimeoutMillis: 5000},
 	}
 	require.NoError(t, validateActions(valid))
 	require.True(t, requiresEnvironmentDriver(valid))
@@ -174,14 +179,13 @@ func TestScriptControlValidation(t *testing.T) {
 		"effect control elsewhere":   {{Kind: "checkpoint", EffectControl: "refuse"}},
 		"failover timeout elsewhere": {{Kind: "checkpoint", FailoverTimeoutSeconds: 1}},
 		"active failover at end":     {{Kind: "failover_select", FailoverTimeoutSeconds: 1}},
-		"reset without lifecycle":    {{Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}},
+		"reset without lifecycle":    {{Kind: "router_reset", TimeoutMillis: 1}},
 		"lifecycle without reset":    {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}},
 		"duplicate lifecycle":        {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "lifecycle_open", Backends: []string{"default/c"}, Listener: "127.0.0.1:6000"}},
 		"duplicate excluded backend": {{Kind: "lifecycle_open", Backends: []string{"default/b", "default/b"}, Listener: "127.0.0.1:6000"}},
 		"empty excluded backend":     {{Kind: "lifecycle_open", Backends: []string{""}, Listener: "127.0.0.1:6000"}},
-		"reset target excluded":      {{Kind: "lifecycle_open", Backends: []string{"default/a"}, Listener: "127.0.0.1:6000"}, {Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}},
-		"duplicate reset":            {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}, {Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}},
-		"reset overlaps failover":    {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "failover_select", FailoverTimeoutSeconds: 1}, {Kind: "router_reset", Backend: "default/a", TimeoutMillis: 1}},
+		"duplicate reset":            {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "router_reset", TimeoutMillis: 1}, {Kind: "router_reset", TimeoutMillis: 1}},
+		"reset overlaps failover":    {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "failover_select", FailoverTimeoutSeconds: 1}, {Kind: "router_reset", TimeoutMillis: 1}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			require.Error(t, validateActions(actions))
