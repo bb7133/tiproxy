@@ -235,6 +235,7 @@ async fn replay() -> TestResult {
         if !effect_ref.is_empty() {
             let delayed = must(effects.lock()).delayed_operation.clone();
             let mut settled_early = false;
+            let mut expired_delay = false;
             if let Some(operation) = effect_refs.get(effect_ref) {
                 resolved_operation = operation.clone();
                 if effect_ref_sessions.get(effect_ref).map(String::as_str) != Some(logical_id) {
@@ -263,6 +264,7 @@ async fn replay() -> TestResult {
                         return Err("missing delayed redirect".into());
                     }
                     must(effects.lock()).expire_delay("delayed-close opportunity", index);
+                    expired_delay = true;
                     None
                 } else {
                     unbound_redirects.iter().position(|operation| {
@@ -308,6 +310,7 @@ async fn replay() -> TestResult {
                             && sessions.contains_key(session)
                             && (op == "close" || Some(operation) != delayed.as_ref())
                             && !settled_early
+                            && !expired_delay
                     })
                 {
                     return Err("relative callback skipped a same-session redirect".into());

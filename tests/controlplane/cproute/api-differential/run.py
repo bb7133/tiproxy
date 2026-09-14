@@ -262,6 +262,7 @@ class PublicConnections:
         self.backend_groups = {}
         self.logical_to_actual, self.effect_refs, self.effect_ref_sessions = {}, {}, {}
         self.unbound_redirects, self.skipped_effect_refs = [], set()
+        self.strict_no_effect_refs = set()
         self.refuse_next, self.refusal_attempts, self.fail_backend_list = 0, 0, set()
         self.delay_next, self.delay_attempts, self.delayed_redirect = 0, 0, None
         self.delayed_settled_early = False
@@ -406,7 +407,8 @@ class PublicConnections:
         if effect_ref in self.skipped_effect_refs:
             require(self.effect_ref_sessions[effect_ref] == event.get("session", ""),
                     "EFFECT_LEDGER", f"relative callback {effect_ref} crossed sessions")
-            require(not any(effect["session"] == actual
+            require(effect_ref in self.strict_no_effect_refs or not any(
+                            effect["session"] == actual
                             and (event["op"] == "close" or effect is not self.delayed_redirect)
                             for effect in self.redirects.values()),
                     "EFFECT_LEDGER",
@@ -414,6 +416,7 @@ class PublicConnections:
             return None
         position = None
         settled_early = event["op"] == "close" and self.delayed_settled_early
+        expired_delay = False
         if settled_early:
             require(event.get("optional_effect") is True, "EFFECT_LEDGER",
                     f"early-settled delayed redirect {effect_ref} was not optional")
@@ -431,6 +434,7 @@ class PublicConnections:
             require(event.get("optional_effect") is True, "EFFECT_LEDGER",
                     f"missing delayed redirect {effect_ref}")
             self.expire_delay("delayed-close opportunity")
+            expired_delay = True
         else:
             position = next((i for i, effect in enumerate(self.unbound_redirects)
                              if effect["session"] == actual
@@ -446,7 +450,7 @@ class PublicConnections:
             self.effect_refs[effect_ref] = effect
             self.effect_ref_sessions[effect_ref] = event.get("session", "")
             return effect
-        require(settled_early or not any(
+        require(settled_early or expired_delay or not any(
                     effect["session"] == actual
                     and (event["op"] == "close" or effect is not self.delayed_redirect)
                     for effect in self.redirects.values()),
@@ -454,6 +458,8 @@ class PublicConnections:
                 f"relative callback {effect_ref} skipped a same-session redirect")
         require(event.get("optional_effect") is True, "EFFECT_LEDGER",
                 f"unknown relative effect {effect_ref}")
+        if settled_early or expired_delay:
+            self.strict_no_effect_refs.add(effect_ref)
         self.skipped_effect_refs.add(effect_ref)
         self.effect_ref_sessions[effect_ref] = event.get("session", "")
         return None

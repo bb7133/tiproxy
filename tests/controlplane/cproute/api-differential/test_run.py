@@ -411,6 +411,30 @@ class ConnectionPreferenceTests(unittest.TestCase):
         self.assertEqual((h.delay_next, h.delay_attempts), (0, 0))
         self.assertEqual(h.assigned, {"other": "source"})
 
+    def test_expired_delay_ignores_pre_arm_same_session_redirect(self):
+        h = self.history()
+        for sid in ("logical", "other"):
+            h.apply({"op": "open", "session": sid}, {})
+            self.reserve(h, sid, "source", True)
+        old = {"kind": "redirect", "session": "logical", "operation": "logical/1",
+               "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [old]})
+        arm = {"op": "config", "delay_next": 1,
+               "toml": "[proxy]\nfail-backend-list=['source']\n"}
+        h.prepare(arm, {}, {"outcome": "ok"}, 0)
+
+        close = {"op": "close", "session": "logical",
+                 "effect_ref": "redirect/1", "optional_effect": True}
+        self.assertEqual(h.resolve_event(close), "logical")
+        self.assertEqual(h.resolve_operation(close), "")
+        h.apply(close, {"outcome": "no_effect", "effects": []}, sid="logical")
+        callback = {"op": "redirect_result", "session": "logical",
+                    "effect_ref": "redirect/1", "optional_effect": True,
+                    "success": True}
+        self.assertEqual(h.resolve_event(callback), "")
+        self.assertEqual(h.resolve_operation(callback), "")
+        self.assertEqual((h.delay_next, h.delay_attempts, h.unbound_redirects), (0, 0, []))
+
     def test_delayed_arm_fails_if_accepted_binding_leaves_public_queue(self):
         h = self.history()
         for sid in ("logical", "actual"):

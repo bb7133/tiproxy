@@ -348,7 +348,10 @@ optional close uses its ordinary logical handle and cannot borrow an unrelated
 redirect. If an engine issues no accepted redirect before the strict-close
 opportunity, that opportunity expires the zero-attempt arm, closes its ordinary
 logical handle and makes the following callback `no_effect`; later redirects are
-ordinary. Losing a delayed operation without either settlement remains an error.
+ordinary. A still-outstanding redirect accepted before the arm is not evidence of
+a post-arm attempt and cannot be borrowed by that strict close, even when it belongs
+to the same logical session. Losing a delayed operation without either settlement
+remains an error.
 Older traces without the config arm retain the strict sole-global-candidate
 fallback; multiple candidates remain ambiguous and fail closed.
 
@@ -422,8 +425,9 @@ a cadence clock from an earlier unverified migration. The Python relative-effect
 counterexample lets two engine rows choose different legal owners and callback counts.
 The generated relative-effects smoke consumes a global refusal and resolves
 a strict delayed close plus late callback through the accepted-effect alias in both
-real adapters. Both are synthetic evidence, not a qualifying recording, and neither
-freezes the 18-slot manifest.
+real adapters. `delay_window_smoke.py` separately leaves a pre-arm redirect outstanding,
+then proves that a zero-attempt delayed window expires without binding it. These are
+synthetic evidence, not qualifying recordings, and do not freeze the 18-slot manifest.
 
 Resource `prefer-idle` selection now has a bounded input-derived case: two
 healthy, equally local backends in one group, unique public ownership, no label

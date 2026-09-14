@@ -332,6 +332,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 			}
 			position := -1
 			settledEarly := referenced == nil && !alreadySkipped && event.Op == "close" && delayedSettledEarly
+			expiredDelay := false
 			if settledEarly {
 				require.True(t, event.Optional, "early-settled delayed redirect at seq=%d effect_ref=%s", index, event.EffectRef)
 				delayedSettledEarly = false
@@ -347,6 +348,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 			} else if referenced == nil && !alreadySkipped && event.Op == "close" && delayNext > 0 {
 				require.True(t, event.Optional, "missing delayed redirect at seq=%d effect_ref=%s", index, event.EffectRef)
 				expireDelay("delayed-close opportunity", index)
+				expiredDelay = true
 			} else if referenced == nil && !alreadySkipped {
 				for i, candidate := range unboundRedirects {
 					if candidate.effect.Session == logicalActual && (event.Op == "close" || candidate != delayedOperation) {
@@ -369,7 +371,7 @@ func TestRouterAPIDifferential(t *testing.T) {
 				for _, candidate := range operations {
 					if candidate.effect.Kind == "redirect" && candidate.effect.Session == logicalActual &&
 						!candidate.completed && sessions[candidate.effect.Session] != nil &&
-						(event.Op == "close" || candidate != delayedOperation) && !settledEarly {
+						(event.Op == "close" || candidate != delayedOperation) && !settledEarly && !expiredDelay {
 						require.Failf(t, "same-session redirect", "seq=%d effect_ref=%s", index, event.EffectRef)
 					}
 				}
