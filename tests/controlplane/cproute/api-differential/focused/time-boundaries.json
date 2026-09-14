@@ -1,0 +1,15 @@
+{
+  "suite": "time-boundaries",
+  "contract": "a9c497c3 section 4",
+  "positions": [
+    {"name": "before", "delta_nanos": -1, "expected_effect": false},
+    {"name": "equal", "delta_nanos": 0, "expected_effect": true},
+    {"name": "after", "delta_nanos": 1, "expected_effect": true}
+  ],
+  "cases": [
+    {"name": "failed_redirect_cooldown", "deadline_nanos": 3000000000},
+    {"name": "failover_close_timeout", "deadline_nanos": 2000000000},
+    {"name": "migration_cadence", "deadline_nanos": 1000000000},
+    {"name": "repeated_activation_preserves_deadline", "deadline_nanos": 2000000000}
+  ]
+}

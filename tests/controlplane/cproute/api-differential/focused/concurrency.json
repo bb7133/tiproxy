@@ -1,0 +1,28 @@
+{
+  "suite": "concurrency",
+  "contract": "a9c497c3 section 4",
+  "cases": [
+    "update_racing_next_finish",
+    "close_racing_redirect_completion",
+    "duplicate_late_completion",
+    "shutdown_outstanding_requests"
+  ],
+  "schedules": [
+    {"id": "s01", "release": "AAAABBBB"},
+    {"id": "s02", "release": "AAABABBB"},
+    {"id": "s03", "release": "AAABBABB"},
+    {"id": "s04", "release": "AABAABBB"},
+    {"id": "s05", "release": "AABABABB"},
+    {"id": "s06", "release": "AABBABAB"},
+    {"id": "s07", "release": "ABAABABB"},
+    {"id": "s08", "release": "ABABABAB"},
+    {"id": "s09", "release": "ABABBABA"},
+    {"id": "s10", "release": "ABBAABAB"},
+    {"id": "s11", "release": "ABBABABA"},
+    {"id": "s12", "release": "BAAABBBA"},
+    {"id": "s13", "release": "BAABABAB"},
+    {"id": "s14", "release": "BABAABAB"},
+    {"id": "s15", "release": "BABABABA"},
+    {"id": "s16", "release": "BBBBAAAA"}
+  ]
+}

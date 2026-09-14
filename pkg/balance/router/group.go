@@ -417,6 +417,13 @@ func (g *Group) logCrossKeyspaceSkip(fromBackend, toBackend *backendWrapper,
 }
 
 func (g *Group) Balance(ctx context.Context) {
+	g.balanceAt(ctx, time.Now())
+}
+
+// balanceAt keeps the production clock read at the public boundary while
+// allowing deterministic boundary evidence to exercise the exact admission
+// predicates without sleeping around wall-clock deadlines.
+func (g *Group) balanceAt(ctx context.Context, curTime time.Time) {
 	g.Lock()
 	defer g.Unlock()
 	backends := make([]policy.BackendCtx, 0, len(g.backends))
@@ -432,7 +439,6 @@ func (g *Group) Balance(ctx context.Context) {
 	fromBackend, toBackend := busiestBackend.(*backendWrapper), idlestBackend.(*backendWrapper)
 
 	// Control the speed of migration.
-	curTime := time.Now()
 	// Cross-keyspace fast path (DPL-07 #41): the WHOLE pair is refused
 	// for this round before the per-connection loop runs — one counted
 	// attempt and one rate-limited record, never a warning per
@@ -792,12 +798,19 @@ func (g *Group) ConnCount() int {
 }
 
 func (g *Group) SetConfig(cfg *config.Config) {
+	g.setConfigAt(cfg, time.Now())
+}
+
+// setConfigAt applies the same failover transition as SetConfig at a declared
+// clock instant. It is deliberately private: production always calls
+// SetConfig, while the focused time suite proves before/equal/after behavior.
+func (g *Group) setConfigAt(cfg *config.Config, now time.Time) {
 	g.Lock()
 	defer g.Unlock()
 	g.policy.SetConfig(cfg)
 	g.publishPolicyObservationLocked()
 	g.setFailoverConfigLocked(cfg)
-	g.updateFailoverLocked(time.Now())
+	g.updateFailoverLocked(now)
 }
 
 // The actual call has returned; its Group critical section still protects both

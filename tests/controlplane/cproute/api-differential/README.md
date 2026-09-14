@@ -22,6 +22,24 @@ Use a new output directory for each run. The runner preserves both raw outputs,
 input hash, source identity and command logs. CI runs it in one 45-minute job.
 Synthetic adapter checks count as zero recorded traces and zero corpus rounds.
 
+Run the three fixed focused suites against both native engines:
+
+```sh
+python3 tests/controlplane/cproute/api-differential/focused/resource_release.py \
+  --output /tmp/focused-resource-release
+python3 tests/controlplane/cproute/api-differential/focused/concurrency.py \
+  --output /tmp/focused-concurrency
+python3 tests/controlplane/cproute/api-differential/focused/time_boundaries.py \
+  --output /tmp/focused-time-boundaries
+```
+
+Concurrency executes four cases over 16 fixed two-actor schedules and always
+runs the Go entrypoint with the race detector. Time boundaries execute the
+four declared API/effect cases immediately before, exactly at, and immediately
+after each deadline. Both runners preserve native manifests and fail closed on
+missing executables/manifests, a changed matrix, public-history/accounting
+violations, or an undetected runner mutation.
+
 Go replay drains its background loop after the real Init and delivers inputs
 synchronously to the exact production health/config handlers. Rust replay uses
 the existing config/module fixture. The test-only `api-replay` feature delivers
@@ -56,8 +74,13 @@ Implementation is limited to three increments of the same replacement PR:
    six fixed distribution comparisons and K=3 corpus rounds on the candidate
    tree. Diagnose actual failures without replacing traces or changing limits.
 
-Current acceptance counts: recordings 0/18, rounds 0/3, focused suites 0/3,
-comparator mutants 8/8 on reviewed a71d65b6 (repeat on the final candidate). The initial adapter rejects unsupported operations;
+The preserved historic 3c762a49 tree completed recordings 18/18, rounds 3/3,
+focused suites 1/3, comparator mutants 8/8, and same-tree workflows 5/5. That
+evidence remains attached only to that exact tree. This source delta implements
+the two missing fixed focused suites; it starts a new candidate, so none of the
+historic recording or corpus evidence is promoted. The final candidate must
+repeat all 18 recordings, K=3 corpus rounds, all three focused suites, the eight
+comparator mutations, and the same-tree workflows before acceptance. The initial adapter rejects unsupported operations;
 it does not silently treat missing implementation as a passing observation.
 Old instrumentation deletion stays in a separate PR after replacement
 acceptance. No old per-getter, caller-envelope or per-boundary fault work is

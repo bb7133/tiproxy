@@ -49,6 +49,7 @@ use crate::{Candidate, Reservation, RouteError, Router, Settlement, Unsupported}
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 mod api_differential;
+mod concurrency;
 mod factors_live;
 mod locality;
 mod migration;
@@ -56,6 +57,7 @@ mod registration;
 mod resource;
 mod resource_release;
 mod sources;
+mod time_boundaries;
 mod worker;
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {

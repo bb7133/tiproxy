@@ -610,6 +610,14 @@ jobs:
         run: |
           python3 tests/controlplane/cproute/api-differential/focused/resource_release.py \
             --output "${RUNNER_TEMP}/focused-resource-release"
+      - name: Run the concurrency focused suite
+        run: |
+          python3 tests/controlplane/cproute/api-differential/focused/concurrency.py \
+            --output "${RUNNER_TEMP}/focused-concurrency"
+      - name: Run the time-boundaries focused suite
+        run: |
+          python3 tests/controlplane/cproute/api-differential/focused/time_boundaries.py \
+            --output "${RUNNER_TEMP}/focused-time-boundaries"
       - name: Preserve API inputs, outputs and first failure
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -644,6 +652,8 @@ jobs:
             ${{ runner.temp }}/routing-api-recorded-metrics
             ${{ runner.temp }}/routing-api-recorded-metrics-paired
             ${{ runner.temp }}/focused-resource-release
+            ${{ runner.temp }}/focused-concurrency
+            ${{ runner.temp }}/focused-time-boundaries
           if-no-files-found: error
 
   routing-shadow:
