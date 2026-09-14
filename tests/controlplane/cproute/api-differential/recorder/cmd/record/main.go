@@ -383,7 +383,8 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					toml := failoverConfig(selectedFailoverBackend, selectedFailoverTimeout)
 					err := cfgMgr.SetTOMLConfig([]byte(toml))
 					armEffectControl(a.EffectControl)
-					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err, a.EffectControl == "refuse")
+					inputs.DeliverConfigLocked(toml, cfgMgr.GetConfig(), err,
+						a.EffectControl == "refuse", a.EffectControl == "delay")
 				})
 			case "failover_repeat":
 				toml := failoverConfig(selectedFailoverBackend, selectedFailoverTimeout)

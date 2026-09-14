@@ -87,8 +87,8 @@ def validate(trace):
     events = trace["events"]
     require(isinstance(events, list) and 0 < len(events) <= 100_000, "INPUT", "event count")
     allowed = {
-        "health":{"backends"},"config":{"toml","refuse_next"},"open":{"client","proxy","port"},
-        "next":set(),"finish":{"success"},"close":{"effect_ref"},"checkpoint":set(),
+        "health":{"backends"},"config":{"toml","refuse_next","delay_next"},"open":{"client","proxy","port"},
+        "next":set(),"finish":{"success"},"close":{"effect_ref","optional_effect"},"checkpoint":set(),
         "tick":{"refuse","refuse_next"},"redirect_result":{"operation","effect_ref","optional_effect","success"},
         "lookup":{"backend"},"rehydrate":{"backend"},
         "source_error":{"error"},
@@ -184,8 +184,11 @@ def validate(trace):
         elif op == "config":
             require(isinstance(event.get("toml"), str), "INPUT", "config update")
             require(type(event.get("refuse_next", 0)) is int and 0 <= event.get("refuse_next", 0) <= 1
-                    and (not event.get("refuse_next", 0) or expect["outcome"] == "ok"),
-                    "INPUT", "config one-shot effect refusal")
+                    and type(event.get("delay_next", 0)) is int and 0 <= event.get("delay_next", 0) <= 1
+                    and event.get("refuse_next", 0) + event.get("delay_next", 0) <= 1
+                    and (not (event.get("refuse_next", 0) or event.get("delay_next", 0))
+                         or expect["outcome"] == "ok"),
+                    "INPUT", "config one-shot effect control")
         elif op == "tick":
             require(isinstance(event.get("refuse",[]),list) and all(id in active for id in event.get("refuse",[])),"INPUT","effect refusal inputs")
             require(type(event.get("refuse_next", 0)) is int and 0 <= event.get("refuse_next", 0) <= 1,
@@ -224,6 +227,9 @@ def validate(trace):
                 if "effect_ref" in event:
                     require(re.fullmatch(r"redirect/[1-9][0-9]*", event["effect_ref"]) is not None,
                             "INPUT", "relative close authority")
+                optional = event.get("optional_effect", False)
+                require(type(optional) is bool and (not optional or "effect_ref" in event),
+                        "INPUT", "optional relative close authority")
                 sessions.remove(session)
                 active.discard(session)
         if op in {"lookup","rehydrate"}:
@@ -257,6 +263,7 @@ class PublicConnections:
         self.logical_to_actual, self.effect_refs, self.effect_ref_sessions = {}, {}, {}
         self.unbound_redirects, self.skipped_effect_refs = [], set()
         self.refuse_next, self.refusal_attempts, self.fail_backend_list = 0, 0, set()
+        self.delay_next, self.delay_attempts, self.delayed_redirect = 0, 0, None
         self.policy, self.selection = config["policy"], config["selection"]
         self.ratio, self.rate, self.status_rate, self.label_name = 1.2, 0.0, 0.0, ""
 
@@ -296,6 +303,14 @@ class PublicConnections:
                 f"one-shot refusal survived {self.refusal_attempts} eligible attempts before {boundary}")
         self.refuse_next = 0
 
+    def expire_delay(self, boundary):
+        """Drop an engine-relative delayed-callback arm only with no accepted redirect."""
+        if not self.delay_next:
+            return
+        require(self.delay_attempts == 0, "EFFECT_LEDGER",
+                f"delayed callback survived {self.delay_attempts} accepted redirects before {boundary}")
+        self.delay_next = 0
+
     def _force_close_effects(self, event, due, refuse_next):
         """Resolve input-defined deadlines against this engine's public owners.
 
@@ -325,20 +340,27 @@ class PublicConnections:
             require(self.refuse_next == 0, "EFFECT_LEDGER", "one-shot refusal armed while one is pending")
             self.refuse_next = event["refuse_next"]
             self.refusal_attempts = 0
+        if event.get("delay_next", 0):
+            require(event["delay_next"] == 1 and self.delay_next == 0
+                    and self.delayed_redirect is None,
+                    "EFFECT_LEDGER", "delayed callback armed while one is pending")
+            self.delay_next = 1
+            self.delay_attempts = 0
         if event["op"] == "config" and row["outcome"] == "ok":
             try:
                 document = tomllib.loads(event["toml"])
             except tomllib.TOMLDecodeError as error:
                 raise Difference(f"INPUT: accepted config cannot be parsed: {error}") from error
             proxy = document.get("proxy", {})
-            if event.get("refuse_next", 0):
+            if event.get("refuse_next", 0) or event.get("delay_next", 0):
                 require(isinstance(proxy.get("fail-backend-list"), list)
                         and bool(proxy["fail-backend-list"]), "INPUT",
-                        "config refusal arm requires a nonempty failover list")
+                        "config effect arm requires a nonempty failover list")
             if "fail-backend-list" in proxy:
                 self.fail_backend_list = set(proxy["fail-backend-list"])
                 if not self.fail_backend_list:
                     self.expire_refusal("failover clear")
+                    self.expire_delay("failover clear")
             balance = document.get("balance", {})
             self.policy = balance.get("policy", self.policy) or "resource"
             self.selection = balance.get("routing-policy", self.selection) or "prefer-idle"
@@ -387,18 +409,28 @@ class PublicConnections:
                     "EFFECT_LEDGER",
                     f"relative callback {effect_ref} skipped a same-session redirect")
             return None
-        position = next((i for i, effect in enumerate(self.unbound_redirects)
-                         if effect["session"] == actual), None)
-        if position is None and event["op"] == "close" and self.unbound_redirects:
-            # The strict delayed close establishes which engine-local session
-            # the recording's logical close handle denotes only when the public
-            # ledger identifies one possible engine-local redirect. Choosing
-            # between multiple sessions would let output order steer the handle
-            # swap and could turn either a real mismatch or a mutation into a
-            # false pass.
-            require(len(self.unbound_redirects) == 1, "EFFECT_LEDGER",
-                    f"ambiguous strict relative effect {effect_ref}")
-            position = 0
+        position = None
+        if event["op"] == "close" and self.delayed_redirect is not None:
+            position = next((i for i, effect in enumerate(self.unbound_redirects)
+                             if effect is self.delayed_redirect), None)
+            require(position is not None, "EFFECT_LEDGER",
+                    f"delayed redirect {effect_ref} left the public queue")
+            self.delayed_redirect = None
+        elif event["op"] == "close" and self.delay_next:
+            # This engine had no accepted redirect before the recording's
+            # delayed-close opportunity. Preserve every unrelated redirect;
+            # the arm may expire only at clear/end with zero attempts.
+            require(event.get("optional_effect") is True, "EFFECT_LEDGER",
+                    f"missing delayed redirect {effect_ref}")
+        else:
+            position = next((i for i, effect in enumerate(self.unbound_redirects)
+                             if effect["session"] == actual), None)
+            if position is None and event["op"] == "close" and self.unbound_redirects:
+                # Backward compatibility for pre-arm traces: the strict close
+                # may bind a sole public candidate but never guess among many.
+                require(len(self.unbound_redirects) == 1, "EFFECT_LEDGER",
+                        f"ambiguous strict relative effect {effect_ref}")
+                position = 0
         if position is not None:
             effect = self.unbound_redirects.pop(position)
             self.effect_refs[effect_ref] = effect
@@ -425,7 +457,7 @@ class PublicConnections:
             return self.logical_to_actual.get(logical, logical)
         effect = self.resolve_effect(event)
         if effect is None:
-            return ""
+            return self.logical_to_actual.get(logical, logical) if event["op"] == "close" else ""
         actual = effect["session"]
         if event["op"] == "close":
             require(logical in self.logical_to_actual and actual in self.logical_to_actual.values(),
@@ -586,6 +618,8 @@ class PublicConnections:
                     self.assigned[sid] = effect["to"]
                     self.created[sid] = index
         elif op == "close":
+            if not sid:
+                return
             self.assigned.pop(sid, None)
             self.pending.pop(sid, None)
             self.created.pop(sid, None)
@@ -625,6 +659,10 @@ class PublicConnections:
                 if group is not None:
                     self.group_last_redirect[group] = event.get("at_nanos", 0)
                 self.unbound_redirects.append(effect)
+                if self.delay_next:
+                    self.delay_attempts += 1
+                    self.delay_next = 0
+                    self.delayed_redirect = effect
 
 
 def observe(trace, rows, engine):
@@ -727,10 +765,12 @@ def observe(trace, rows, engine):
     unsettled = [key for key,effect in operations.items()
                  if effect["accepted"] and key not in settled]
     connections.expire_refusal("trace end")
+    connections.expire_delay("trace end")
     require(not ledger and not pending and not unsettled
             and not connections.pending and not connections.assigned
             and not connections.redirects and not connections.unbound_redirects
-            and not connections.logical_to_actual and connections.refuse_next == 0,
+            and not connections.logical_to_actual and connections.refuse_next == 0
+            and connections.delay_next == 0 and connections.delayed_redirect is None,
             "LEDGER", f"{engine} final state")
     accepted_redirects = [(key, effect) for key,effect in operations.items()
                           if effect["accepted"] and effect["kind"] == "redirect"]

@@ -167,6 +167,15 @@ def validate(row, trace, go):
         problems.append(f"expected select, unchanged repeat and reentry singleton configs, got {len(singleton)}")
     else:
         first, repeat, reentry = singleton
+        if events[first[0]].get("refuse_next") != 1:
+            problems.append("initial activation lacks its atomic refusal arm")
+        if events[reentry[0]].get("delay_next") != 1:
+            problems.append("reentry lacks its atomic delayed-callback arm")
+        for i, event in enumerate(events):
+            if event.get("refuse_next") and i != first[0]:
+                problems.append(f"unexpected refusal arm at {i}")
+            if event.get("delay_next") and i != reentry[0]:
+                problems.append(f"unexpected delayed-callback arm at {i}")
         if repeat[1:] != first[1:]:
             problems.append("unchanged activation did not repeat the same target and timeout")
         if any(first[0] < i < repeat[0] and not targets for i, targets, _ in config_rows):
@@ -224,6 +233,11 @@ def validate(row, trace, go):
                              and (event.get("operation")
                                   or effect_refs.get(event.get("effect_ref"), "")) == operation), None)
             if result_i is not None and any(issued_i < close_i < result_i for close_i in closes[session]):
+                close_event = next(event for i, event in enumerate(events)
+                                   if i in closes[session] and issued_i < i < result_i)
+                result_event = events[result_i]
+                if close_event.get("optional_effect") is not True or result_event.get("optional_effect") is not True:
+                    problems.append("delayed close/result are not marked engine-relative optional")
                 late.append(operation)
         if not late:
             problems.append("no accepted redirect completed after its session closed")

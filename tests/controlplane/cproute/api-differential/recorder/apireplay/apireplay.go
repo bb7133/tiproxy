@@ -49,6 +49,9 @@ type Effect struct {
 	// RefuseNext records which rejected request consumed the external one-shot
 	// control. The writer moves it into the tick input; adapter output omits it.
 	RefuseNext bool `json:"refuse_next,omitempty"`
+	// DelayNext proves which accepted redirect consumed the external delayed
+	// callback arm. The writer projects only the arm, never this Go operation.
+	DelayNext bool `json:"delay_next,omitempty"`
 }
 
 // Event is one trace v1 event as recorded (inputs carry their own fields; the
@@ -61,17 +64,20 @@ type Event struct {
 	// RefuseNext marks the serialized input boundary that arms the global
 	// one-shot client refusal. The consuming Effect carries the same bit only
 	// so the writer can prove that the control was consumed exactly once.
-	RefuseNext bool            `json:"refuse_next,omitempty"`
-	Backends   []HealthBackend `json:"backends,omitempty"`
-	Session    string          `json:"session,omitempty"`
-	Client     string          `json:"client,omitempty"`
-	Proxy      string          `json:"proxy,omitempty"`
-	Port       string          `json:"port,omitempty"`
-	Backend    string          `json:"backend,omitempty"`
-	Success    *bool           `json:"success,omitempty"`
-	Operation  string          `json:"operation,omitempty"`
-	Outcome    string          `json:"outcome,omitempty"`
-	Effects    []Effect        `json:"effects,omitempty"`
+	RefuseNext bool `json:"refuse_next,omitempty"`
+	// DelayNext marks the same serialized config boundary that arms the first
+	// subsequently accepted redirect for delayed callback delivery.
+	DelayNext bool            `json:"delay_next,omitempty"`
+	Backends  []HealthBackend `json:"backends,omitempty"`
+	Session   string          `json:"session,omitempty"`
+	Client    string          `json:"client,omitempty"`
+	Proxy     string          `json:"proxy,omitempty"`
+	Port      string          `json:"port,omitempty"`
+	Backend   string          `json:"backend,omitempty"`
+	Success   *bool           `json:"success,omitempty"`
+	Operation string          `json:"operation,omitempty"`
+	Outcome   string          `json:"outcome,omitempty"`
+	Effects   []Effect        `json:"effects,omitempty"`
 }
 
 // HealthBackend is one explicit health inventory entry (every field written).
@@ -144,6 +150,7 @@ type controlState struct {
 	mu           sync.Mutex
 	refuse       uint64
 	delay        uint64
+	awaiting     map[*Conn]string
 	delayed      map[*Conn]delayedRedirect
 	closing      map[*Conn]string
 	delayedReady chan struct{}
@@ -151,7 +158,7 @@ type controlState struct {
 }
 
 func newControls() *controlState {
-	return &controlState{delayed: make(map[*Conn]delayedRedirect), closing: make(map[*Conn]string), delayedReady: make(chan struct{}, 1)}
+	return &controlState{awaiting: make(map[*Conn]string), delayed: make(map[*Conn]delayedRedirect), closing: make(map[*Conn]string), delayedReady: make(chan struct{}, 1)}
 }
 
 // MarkOverlayInstalled is called by a generated source file that record.py
@@ -245,6 +252,9 @@ func PendingControls() []string {
 	if controls.delay != 0 {
 		pending = append(pending, fmt.Sprintf("unconsumed delay_next_redirect_result=%d", controls.delay))
 	}
+	if len(controls.awaiting) != 0 {
+		pending = append(pending, fmt.Sprintf("accepted delayed redirects without callback=%d", len(controls.awaiting)))
+	}
 	if len(controls.delayed) != 0 {
 		pending = append(pending, fmt.Sprintf("unsettled delayed redirect callbacks=%d", len(controls.delayed)))
 	}
@@ -265,13 +275,33 @@ func consumeRefusal() bool {
 	return true
 }
 
-func holdRedirectResult(conn *Conn, result delayedRedirect) bool {
+func consumeDelay() bool {
 	controls.mu.Lock()
 	defer controls.mu.Unlock()
 	if controls.delay == 0 {
 		return false
 	}
 	controls.delay--
+	return true
+}
+
+func markDelayedOperation(conn *Conn, operation string) {
+	controls.mu.Lock()
+	defer controls.mu.Unlock()
+	if _, exists := controls.awaiting[conn]; exists {
+		controls.errors = append(controls.errors, "multiple delayed operations for one connection")
+		return
+	}
+	controls.awaiting[conn] = operation
+}
+
+func holdRedirectResult(conn *Conn, result delayedRedirect) bool {
+	controls.mu.Lock()
+	defer controls.mu.Unlock()
+	if conn.redirect == nil || !conn.redirect.delayed || controls.awaiting[conn] != conn.redirect.id {
+		return false
+	}
+	delete(controls.awaiting, conn)
 	if _, exists := controls.delayed[conn]; exists {
 		controls.errors = append(controls.errors, "multiple delayed redirect callbacks for one connection")
 		return false
@@ -410,15 +440,16 @@ type redirectOperation struct {
 	id       string
 	from, to router.BackendInst
 	settled  bool
+	delayed  bool
 }
 
 // Refuse makes the next Redirect/ForceClose be refused at the client boundary
 // (a scripted, declared refusal — recorder README §4).
 func (c *Conn) Refuse(v bool) { c.refuse.Store(v) }
 
-func (c *Conn) effect(kind string, to router.BackendInst, accepted, refuseNext bool) string {
+func (c *Conn) effect(kind string, to router.BackendInst, accepted, refuseNext, delayNext bool) string {
 	n := c.session.ordinal.Add(1)
-	e := Effect{Kind: kind, Session: c.session.id, Operation: fmt.Sprintf("%s/%d", c.session.id, n), Accepted: accepted, RefuseNext: refuseNext}
+	e := Effect{Kind: kind, Session: c.session.id, Operation: fmt.Sprintf("%s/%d", c.session.id, n), Accepted: accepted, RefuseNext: refuseNext, DelayNext: delayNext}
 	if c.session.current != nil {
 		e.From = c.session.current.ID()
 	}
@@ -433,9 +464,13 @@ func (c *Conn) Redirect(to router.BackendInst) bool {
 	refused := c.refuse.Load()
 	refuseNext := !refused && consumeRefusal()
 	accepted := !refused && !refuseNext && c.RedirectableConn.Redirect(to)
-	op := c.effect("redirect", to, accepted, refuseNext)
+	delayNext := accepted && consumeDelay()
+	op := c.effect("redirect", to, accepted, refuseNext, delayNext)
 	if accepted {
-		c.redirect = &redirectOperation{id: op, from: c.session.current, to: to}
+		c.redirect = &redirectOperation{id: op, from: c.session.current, to: to, delayed: delayNext}
+		if delayNext {
+			markDelayedOperation(c, op)
+		}
 	}
 	return accepted
 }
@@ -444,7 +479,7 @@ func (c *Conn) ForceClose() bool {
 	refused := c.refuse.Load()
 	refuseNext := !refused && consumeRefusal()
 	accepted := !refused && !refuseNext && c.RedirectableConn.ForceClose()
-	c.effect("force_close", nil, accepted, refuseNext)
+	c.effect("force_close", nil, accepted, refuseNext, false)
 	return accepted
 }
 

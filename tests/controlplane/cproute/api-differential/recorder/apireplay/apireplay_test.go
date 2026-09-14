@@ -167,12 +167,15 @@ func TestDelayedRedirectResultIsReleasedAfterRealClose(t *testing.T) {
 	c := &Conn{RedirectableConn: reviewConn{forced: &forced, forcedReady: forcedReady}, session: &Session{id: "s", current: reviewBackend{id: "A"}}}
 	order := []string{}
 	w := &receiverWrapper{inner: reviewReceiver{order: &order}, conn: c}
+	DelayNextRedirectResult()
 	out.Serialize(func() {
 		if !c.Redirect(reviewBackend{id: "B"}) {
 			t.Fatal("redirect refused")
 		}
 	})
-	DelayNextRedirectResult()
+	if len(out.events) != 1 || !out.events[0].Effects[0].DelayNext {
+		t.Fatalf("delayed redirect provenance=%+v", out.events)
+	}
 	if err := w.OnRedirectSucceed("A", "B", c); err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +213,30 @@ func TestDelayedRedirectResultIsReleasedAfterRealClose(t *testing.T) {
 	}
 }
 
+func TestDelayedRedirectArmBindsFirstAcceptedRedirect(t *testing.T) {
+	out := &reviewSink{}
+	Install(out, "delayed-first")
+	first := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "first", current: reviewBackend{id: "A"}}}
+	second := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "second", current: reviewBackend{id: "A"}}}
+	third := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "third", current: reviewBackend{id: "A"}}}
+	DelayNextRedirectResult()
+	first.Refuse(true)
+	out.Serialize(func() {
+		if first.Redirect(reviewBackend{id: "B"}) {
+			t.Fatal("session-refused redirect was accepted")
+		}
+	})
+	out.Serialize(func() {
+		if !second.Redirect(reviewBackend{id: "B"}) || !third.Redirect(reviewBackend{id: "C"}) {
+			t.Fatal("accepted redirect was refused")
+		}
+	})
+	if len(out.events) != 3 || out.events[0].Effects[0].DelayNext ||
+		!out.events[1].Effects[0].DelayNext || out.events[2].Effects[0].DelayNext {
+		t.Fatalf("first accepted delay binding=%+v", out.events)
+	}
+}
+
 func TestDelayedRedirectControlTimesOutAndRemainsPending(t *testing.T) {
 	Install(&reviewSink{}, "timeout")
 	DelayNextRedirectResult()
@@ -220,6 +247,22 @@ func TestDelayedRedirectControlTimesOutAndRemainsPending(t *testing.T) {
 	}
 	pending := PendingControls()
 	if len(pending) != 1 || pending[0] != "unconsumed delay_next_redirect_result=1" {
+		t.Fatalf("pending controls=%v", pending)
+	}
+}
+
+func TestAcceptedDelayedRedirectWithoutCallbackRemainsPending(t *testing.T) {
+	out := &reviewSink{}
+	Install(out, "missing-callback")
+	c := &Conn{RedirectableConn: reviewConn{}, session: &Session{id: "s", current: reviewBackend{id: "A"}}}
+	DelayNextRedirectResult()
+	out.Serialize(func() {
+		if !c.Redirect(reviewBackend{id: "B"}) {
+			t.Fatal("redirect refused")
+		}
+	})
+	pending := PendingControls()
+	if len(pending) != 1 || pending[0] != "accepted delayed redirects without callback=1" {
 		t.Fatalf("pending controls=%v", pending)
 	}
 }

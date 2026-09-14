@@ -50,7 +50,7 @@ class Trace:
                  conn_count=len(assignments) if conn_count is None else conn_count,
                  healthy_backend_count=4, server_version="v")
 
-    def config(self, targets, timeout=60, clusters=0):
+    def config(self, targets, timeout=60, clusters=0, control=""):
         if clusters:
             entries = "".join(f'[[proxy.backend-clusters]]\nname = "{name}"\n' for name in ("default", "conflict")[:clusters])
             toml = "[proxy]\n" + entries
@@ -59,7 +59,10 @@ class Trace:
             toml = f"[proxy]\nfail-backend-list = [{values}]\nfailover-timeout = {timeout}\n"
         else:
             toml = "[proxy]\nfail-backend-list = []\n"
-        self.add({"op": "config", "toml": toml})
+        event = {"op": "config", "toml": toml}
+        if control:
+            event["refuse_next" if control == "refuse" else "delay_next"] = 1
+        self.add(event)
 
     def tick(self, *effects):
         self.add({"op": "tick"}, effects=list(effects))
@@ -113,7 +116,7 @@ def positive(slot):
         t.close("other-port")
 
     t.checkpoint({"held-1": "default/" + first})
-    t.config([first])
+    t.config([first], control="refuse")
     t.tick({"kind": "redirect", "session": "held-1", "operation": "held-1/1",
             "from": "default/" + first, "to": "default/" + second, "accepted": False})
     t.tick({"kind": "redirect", "session": "held-1", "operation": "held-1/2",
@@ -126,11 +129,13 @@ def positive(slot):
     t.next("held-2", backend=second)
     t.finish("held-2")
     t.checkpoint({"held-1": "default/" + second, "held-2": "default/" + second})
-    t.config([second])
+    t.config([second], control="delay")
     t.tick({"kind": "redirect", "session": "held-2", "operation": "held-2/1",
             "from": "default/" + second, "to": "default/" + first, "accepted": True})
     t.close("held-2")
+    t.events[-1]["optional_effect"] = True
     t.redirect_result("held-2", "held-2/1")
+    t.events[-1]["optional_effect"] = True
     t.config([])
 
     t.config(guard_targets)
@@ -213,6 +218,23 @@ class FailoverValidatorTests(unittest.TestCase):
                        if event["op"] == "close" and event.get("session") == "held-2")
         delayed["effect_ref"] = "redirect/999"
         self.assertFails(trace, "invalid accepted-effect reference")
+
+    def test_atomic_effect_arms_and_optional_delayed_settlement_are_required(self):
+        trace = positive("F02")
+        first = next(event for event in trace.events if event.get("refuse_next"))
+        first.pop("refuse_next")
+        self.assertFails(trace, "initial activation lacks its atomic refusal arm")
+
+        trace = positive("F02")
+        reentry = next(event for event in trace.events if event.get("delay_next"))
+        reentry.pop("delay_next")
+        self.assertFails(trace, "reentry lacks its atomic delayed-callback arm")
+
+        trace = positive("F02")
+        delayed_close = next(event for event in trace.events
+                             if event["op"] == "close" and event.get("session") == "held-2")
+        delayed_close.pop("optional_effect")
+        self.assertFails(trace, "delayed close/result are not marked engine-relative optional")
 
     def test_activation_checkpoint_timeout_and_sequence_are_required(self):
         trace = positive("F02")

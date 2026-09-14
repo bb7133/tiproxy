@@ -32,18 +32,18 @@ def make_case():
         # have other live owners but zero attempts from the failed backend. Its
         # explicit zero-attempt window expires at clear; the real recorder
         # remains stricter and must consume its armed control.
-        {"op": "config", "refuse_next": 1,
+        {"op": "config", "delay_next": 1,
          "toml": "[proxy]\nfail-backend-list=[\"b\"]\nfailover-timeout=60\n"},
         {"op": "tick"},
         {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"},
         {"op": "health", "backends": [
             {"address": "a", "labels": {}, "support_redirection": True},
         ]},
-        {"op": "config", "refuse_next": 1,
+        {"op": "config", "delay_next": 1,
          "toml": "[proxy]\nfail-backend-list=[\"a\"]\nfailover-timeout=60\n"},
         # The input control belongs to the whole failover window, not to the
-        # recording engine's concrete effect tick. This empty round proves that
-        # each adapter retains it until its own first eligible attempt.
+        # recording engine's concrete operation. This empty round proves that
+        # each adapter retains it until its own first accepted redirect.
         {"op": "tick", "at_nanos": 1},
         {"op": "health", "at_nanos": 2, "backends": [
         {"address": "a", "labels": {}, "support_redirection": True},
@@ -53,11 +53,12 @@ def make_case():
     tick = len(events)
     effect_ref = "redirect/1"
     events += [
-        {"op": "tick", "at_nanos": 3},
+        {"op": "tick", "at_nanos": 3, "refuse": ["a"]},
         {"op": "config", "at_nanos": 4, "toml": "[proxy]\nfail-backend-list=[]\n"},
-        {"op": "close", "at_nanos": 5, "session": "b", "effect_ref": effect_ref},
+        {"op": "close", "at_nanos": 5, "session": "b", "effect_ref": effect_ref,
+         "optional_effect": True},
         {"op": "redirect_result", "at_nanos": 5, "session": "b",
-         "effect_ref": effect_ref, "success": True},
+         "effect_ref": effect_ref, "optional_effect": True, "success": True},
     ]
     events += [{"op": "close", "at_nanos": 6, "session": session}
                for session in "acde"]

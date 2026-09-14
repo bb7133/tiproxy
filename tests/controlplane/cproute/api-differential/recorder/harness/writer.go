@@ -164,6 +164,7 @@ func publicEffects(effects []apireplay.Effect) []apireplay.Effect {
 	copy(public, effects)
 	for i := range public {
 		public[i].RefuseNext = false
+		public[i].DelayNext = false
 	}
 	return public
 }
@@ -191,7 +192,9 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	var tickAt int64
 	var metricPublications int
 	var pendingGlobalRefusal bool
+	var pendingGlobalDelay bool
 	operationRefs := make(map[string]string)
+	delayedOperations := make(map[string]struct{})
 	acceptedRedirects := 0
 	push := func(ev map[string]any, row map[string]any, at int64) {
 		ev["at_nanos"] = at
@@ -239,10 +242,18 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			if refuseNext > 1 {
 				incomplete = append(incomplete, fmt.Sprintf("tick at %d: global refusal consumed %d effects", tickAt, refuseNext))
 			}
-			for _, effect := range effects {
+			for i, effect := range effects {
 				if effect.Kind == "redirect" && effect.Accepted {
 					acceptedRedirects++
 					operationRefs[effect.Operation] = fmt.Sprintf("redirect/%d", acceptedRedirects)
+				}
+				if tickEffects[i].DelayNext {
+					if !pendingGlobalDelay || effect.Kind != "redirect" || !effect.Accepted {
+						incomplete = append(incomplete, fmt.Sprintf("tick at %d: delayed callback marker lacks one pending accepted redirect", tickAt))
+					} else {
+						pendingGlobalDelay = false
+						delayedOperations[effect.Operation] = struct{}{}
+					}
 				}
 			}
 			for _, session := range mixed {
@@ -285,8 +296,18 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 				pendingGlobalRefusal = true
 				ev["refuse_next"] = 1
 			}
+			if e.DelayNext {
+				if pendingGlobalDelay {
+					incomplete = append(incomplete, fmt.Sprintf("seq %d: delayed callback armed while one is pending", r.Seq))
+				}
+				pendingGlobalDelay = true
+				ev["delay_next"] = 1
+			}
 			if e.Outcome == "ok" && clearsFailover(e.TOML) && pendingGlobalRefusal {
 				incomplete = append(incomplete, fmt.Sprintf("seq %d: global refusal was not consumed before failover clear", r.Seq))
+			}
+			if e.Outcome == "ok" && clearsFailover(e.TOML) && pendingGlobalDelay {
+				incomplete = append(incomplete, fmt.Sprintf("seq %d: delayed callback was not consumed before failover clear", r.Seq))
 			}
 			push(ev, map[string]any{"op": "config", "outcome": e.Outcome}, r.AtNanos)
 		case "open":
@@ -304,6 +325,9 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 					incomplete = append(incomplete, fmt.Sprintf("seq %d: delayed close operation %s has no accepted redirect", r.Seq, e.Operation))
 				} else {
 					ev["effect_ref"] = ref
+					if _, delayed := delayedOperations[e.Operation]; delayed {
+						ev["optional_effect"] = true
+					}
 				}
 			}
 			push(ev, map[string]any{"op": "close", "session": e.Session, "outcome": "ok"}, r.AtNanos)
@@ -312,7 +336,11 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 			if !ok {
 				incomplete = append(incomplete, fmt.Sprintf("seq %d: redirect result operation %s has no accepted effect", r.Seq, e.Operation))
 			}
-			push(map[string]any{"op": "redirect_result", "session": e.Session, "effect_ref": ref, "success": *e.Success},
+			ev := map[string]any{"op": "redirect_result", "session": e.Session, "effect_ref": ref, "success": *e.Success}
+			if _, delayed := delayedOperations[e.Operation]; delayed {
+				ev["optional_effect"] = true
+			}
+			push(ev,
 				map[string]any{"op": "redirect_result", "session": e.Session, "outcome": "ok"}, r.AtNanos)
 		case "lookup", "rehydrate":
 			ev := map[string]any{"op": e.Op, "backend": e.Backend}
@@ -339,6 +367,9 @@ func Write(dir, slot, attempt string, cfg TraceConfig, log []Recorded, checkpoin
 	}
 	if pendingGlobalRefusal {
 		incomplete = append(incomplete, "global refusal input was never consumed")
+	}
+	if pendingGlobalDelay {
+		incomplete = append(incomplete, "delayed callback input was never consumed")
 	}
 	// MetricsInputs can observe nonempty source data only while recording the
 	// corresponding whole publication under this scheduler. Treat disagreement

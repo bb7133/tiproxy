@@ -117,16 +117,17 @@ func TestWriteCarriesRelativeRefusalCallbackAndDelayedClose(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
 	yes := true
 	log := []Recorded{
-		{Seq: 0, AtNanos: 10, Event: apireplay.Event{Op: "tick_begin"}},
-		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "effect", Effects: []apireplay.Effect{
+		{Seq: 0, AtNanos: 5, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", DelayNext: true}},
+		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "tick_begin"}},
+		{Seq: 2, AtNanos: 10, Event: apireplay.Event{Op: "effect", Effects: []apireplay.Effect{
 			{Kind: "redirect", Session: "first", Operation: "first/1", From: "a", To: "b", Accepted: false, RefuseNext: true},
 		}}},
-		{Seq: 2, AtNanos: 10, Event: apireplay.Event{Op: "effect", Effects: []apireplay.Effect{
-			{Kind: "redirect", Session: "held", Operation: "held/1", From: "a", To: "b", Accepted: true},
+		{Seq: 3, AtNanos: 10, Event: apireplay.Event{Op: "effect", Effects: []apireplay.Effect{
+			{Kind: "redirect", Session: "held", Operation: "held/1", From: "a", To: "b", Accepted: true, DelayNext: true},
 		}}},
-		{Seq: 3, AtNanos: 10, Event: apireplay.Event{Op: "tick_end"}},
-		{Seq: 4, AtNanos: 20, Event: apireplay.Event{Op: "close", Session: "held", Operation: "held/1"}},
-		{Seq: 5, AtNanos: 20, Event: apireplay.Event{Op: "redirect_result", Session: "held", Operation: "held/1", Success: &yes}},
+		{Seq: 4, AtNanos: 10, Event: apireplay.Event{Op: "tick_end"}},
+		{Seq: 5, AtNanos: 20, Event: apireplay.Event{Op: "close", Session: "held", Operation: "held/1"}},
+		{Seq: 6, AtNanos: 20, Event: apireplay.Event{Op: "redirect_result", Session: "held", Operation: "held/1", Success: &yes}},
 	}
 	_, err := Write(dir, "F01", "t1", TraceConfig{}, log, nil, nil, false, CaptureSummary{Synthetic: true})
 	require.NoError(t, err)
@@ -136,17 +137,21 @@ func TestWriteCarriesRelativeRefusalCallbackAndDelayedClose(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(dir, "trace.json"))
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(data, &trace))
-	require.Equal(t, float64(1), trace.Events[0]["refuse_next"])
-	require.NotContains(t, trace.Events[0], "refuse")
-	require.Equal(t, "redirect/1", trace.Events[1]["effect_ref"])
+	require.Equal(t, float64(1), trace.Events[0]["delay_next"])
+	require.Equal(t, float64(1), trace.Events[1]["refuse_next"])
+	require.NotContains(t, trace.Events[1], "refuse")
 	require.Equal(t, "redirect/1", trace.Events[2]["effect_ref"])
+	require.Equal(t, true, trace.Events[2]["optional_effect"])
+	require.Equal(t, "redirect/1", trace.Events[3]["effect_ref"])
+	require.Equal(t, true, trace.Events[3]["optional_effect"])
 
 	var rows []map[string]any
 	data, err = os.ReadFile(filepath.Join(dir, "go.json"))
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(data, &rows))
-	effects := rows[0]["effects"].([]any)
+	effects := rows[1]["effects"].([]any)
 	require.NotContains(t, effects[0].(map[string]any), "refuse_next")
+	require.NotContains(t, effects[1].(map[string]any), "delay_next")
 }
 
 func TestWriteArmsGlobalRefusalAtConfigAndConsumesItOnALaterTick(t *testing.T) {
@@ -194,6 +199,26 @@ func TestWriteFailsClosedWhenGlobalRefusalReachesFailoverClear(t *testing.T) {
 	var manifest map[string]any
 	require.NoError(t, json.Unmarshal(data, &manifest))
 	require.Contains(t, manifest["incomplete"], "seq 3: global refusal was not consumed before failover clear")
+}
+
+func TestWriteFailsClosedWhenDelayedCallbackReachesFailoverClear(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "archive.jsonl"), nil, 0o600))
+	log := []Recorded{
+		{Seq: 0, AtNanos: 5, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[\"a\"]\n", Outcome: "ok", DelayNext: true}},
+		{Seq: 1, AtNanos: 10, Event: apireplay.Event{Op: "tick_begin"}},
+		{Seq: 2, AtNanos: 10, Event: apireplay.Event{Op: "tick_end"}},
+		{Seq: 3, AtNanos: 20, Event: apireplay.Event{Op: "config", TOML: "[proxy]\nfail-backend-list=[]\n", Outcome: "ok"}},
+	}
+	status, err := Write(dir, "F01", "t1", TraceConfig{}, log, nil, nil, false, CaptureSummary{Synthetic: true})
+	require.NoError(t, err)
+	require.Equal(t, "incomplete", status)
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	require.NoError(t, err)
+	var manifest map[string]any
+	require.NoError(t, json.Unmarshal(data, &manifest))
+	require.Contains(t, manifest["incomplete"], "seq 3: delayed callback was not consumed before failover clear")
+	require.Contains(t, manifest["incomplete"], "delayed callback input was never consumed")
 }
 
 func TestWriteFailsClosedWhenGlobalRefusalIsArmedTwice(t *testing.T) {

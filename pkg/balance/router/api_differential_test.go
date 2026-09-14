@@ -75,6 +75,7 @@ type apiTraceEvent struct {
 	Optional   bool                             `json:"optional_effect,omitempty"`
 	Refuse     []string                         `json:"refuse,omitempty"`
 	RefuseNext int                              `json:"refuse_next,omitempty"`
+	DelayNext  int                              `json:"delay_next,omitempty"`
 	Error      string                           `json:"error,omitempty"`
 }
 
@@ -267,6 +268,9 @@ func TestRouterAPIDifferential(t *testing.T) {
 	unboundRedirects := []*apiOperation{}
 	refuseNext := 0
 	refusalAttempts := 0
+	delayNext := 0
+	delayAttempts := 0
+	var delayedOperation *apiOperation
 	armRefusal := func(value, index int) {
 		require.Equal(t, 1, value, "one-shot refusal input at seq=%d", index)
 		require.Zero(t, refuseNext, "one-shot refusal armed while one is pending at seq=%d", index)
@@ -280,6 +284,21 @@ func TestRouterAPIDifferential(t *testing.T) {
 		require.Zero(t, refusalAttempts,
 			"one-shot refusal survived %d eligible attempts before %s at seq=%d", refusalAttempts, boundary, index)
 		refuseNext = 0
+	}
+	armDelay := func(value, index int) {
+		require.Equal(t, 1, value, "delayed callback input at seq=%d", index)
+		require.Zero(t, delayNext, "delayed callback armed while one is pending at seq=%d", index)
+		require.Nil(t, delayedOperation, "delayed callback operation still pending at seq=%d", index)
+		delayNext = value
+		delayAttempts = 0
+	}
+	expireDelay := func(boundary string, index int) {
+		if delayNext == 0 {
+			return
+		}
+		require.Zero(t, delayAttempts,
+			"delayed callback survived %d accepted redirects before %s at seq=%d", delayAttempts, boundary, index)
+		delayNext = 0
 	}
 	t.Cleanup(func() {
 		if len(output) > 0 {
@@ -307,15 +326,28 @@ func TestRouterAPIDifferential(t *testing.T) {
 					"relative callback crossed sessions")
 			}
 			position := -1
-			for i, candidate := range unboundRedirects {
-				if candidate.effect.Session == logicalActual {
-					position = i
-					break
+			if referenced == nil && !alreadySkipped && event.Op == "close" && delayedOperation != nil {
+				for i, candidate := range unboundRedirects {
+					if candidate == delayedOperation {
+						position = i
+						break
+					}
 				}
-			}
-			if position < 0 && event.Op == "close" && len(unboundRedirects) > 0 {
-				require.Len(t, unboundRedirects, 1, "ambiguous strict relative effect at seq=%d effect_ref=%s", index, event.EffectRef)
-				position = 0
+				require.NotEqual(t, -1, position, "delayed redirect left the public queue at seq=%d effect_ref=%s", index, event.EffectRef)
+				delayedOperation = nil
+			} else if referenced == nil && !alreadySkipped && event.Op == "close" && delayNext > 0 {
+				require.True(t, event.Optional, "missing delayed redirect at seq=%d effect_ref=%s", index, event.EffectRef)
+			} else if referenced == nil && !alreadySkipped {
+				for i, candidate := range unboundRedirects {
+					if candidate.effect.Session == logicalActual {
+						position = i
+						break
+					}
+				}
+				if position < 0 && event.Op == "close" && len(unboundRedirects) > 0 {
+					require.Len(t, unboundRedirects, 1, "ambiguous strict relative effect at seq=%d effect_ref=%s", index, event.EffectRef)
+					position = 0
+				}
 			}
 			if referenced == nil && !alreadySkipped && position >= 0 {
 				referenced = unboundRedirects[position]
@@ -333,7 +365,9 @@ func TestRouterAPIDifferential(t *testing.T) {
 				require.True(t, event.Optional, "seq=%d effect_ref=%s", index, event.EffectRef)
 				skippedEffectRefs[event.EffectRef] = struct{}{}
 				effectRefSessions[event.EffectRef] = event.Session
-				actualSession = ""
+				if event.Op != "close" {
+					actualSession = ""
+				}
 				skippedEffect = true
 			} else if event.Op == "close" {
 				actualSession = referenced.effect.Session
@@ -381,17 +415,21 @@ func TestRouterAPIDifferential(t *testing.T) {
 			if event.RefuseNext > 0 {
 				armRefusal(event.RefuseNext, index)
 			}
+			if event.DelayNext > 0 {
+				armDelay(event.DelayNext, index)
+			}
 			if err := manager.SetTOMLConfig([]byte(event.TOML)); err != nil {
 				row["outcome"] = "invalid_config"
 			} else {
 				cfg := manager.GetConfig()
 				r.setConfig(cfg)
-				if event.RefuseNext > 0 {
+				if event.RefuseNext > 0 || event.DelayNext > 0 {
 					require.NotEmpty(t, cfg.Proxy.FailBackendList,
-						"config refusal arm requires a nonempty failover list at seq=%d", index)
+						"config effect arm requires a nonempty failover list at seq=%d", index)
 				}
 				if len(cfg.Proxy.FailBackendList) == 0 {
 					expireRefusal("failover clear", index)
+					expireDelay("failover clear", index)
 				}
 			}
 		case "open":
@@ -434,7 +472,13 @@ func TestRouterAPIDifferential(t *testing.T) {
 			r.rebalance(context.Background())
 			for i := range effects {
 				if effects[i].Kind == "redirect" && effects[i].Accepted {
-					unboundRedirects = append(unboundRedirects, operations[effects[i].Operation])
+					operation := operations[effects[i].Operation]
+					unboundRedirects = append(unboundRedirects, operation)
+					if delayNext > 0 {
+						delayAttempts++
+						delayNext--
+						delayedOperation = operation
+					}
 				}
 			}
 		case "redirect_result":
@@ -489,6 +533,9 @@ func TestRouterAPIDifferential(t *testing.T) {
 			if s.active {
 				require.NoError(t, s.conn.receiver.OnConnClosed(s.conn.from.ID(), s.conn))
 			}
+			if skippedEffect {
+				row["outcome"] = "no_effect"
+			}
 			s.selector.CloseObservation()
 			kept := unboundRedirects[:0]
 			for _, operation := range unboundRedirects {
@@ -519,6 +566,9 @@ func TestRouterAPIDifferential(t *testing.T) {
 	require.Empty(t, logicalSessions, "trace must close every logical handle")
 	require.Empty(t, unboundRedirects, "trace must close or bind every accepted redirect")
 	expireRefusal("trace end", len(trace.Events))
+	expireDelay("trace end", len(trace.Events))
 	require.Zero(t, refuseNext, "trace ended with an unconsumed one-shot refusal")
+	require.Zero(t, delayNext, "trace ended with an unconsumed delayed callback")
+	require.Nil(t, delayedOperation, "trace ended before the delayed callback close")
 	require.Zero(t, r.ConnCount())
 }

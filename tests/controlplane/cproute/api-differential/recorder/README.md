@@ -334,14 +334,19 @@ Every paired manifest reports accepted redirects, callback and close settlement
 counts, no-effect callbacks, zero unsettled accepted effects and the per-operation
 settlement path separately for Go and Rust.
 
-The scripted close used by the delayed-callback probe is strict and carries the
-same reference as its following callback. It must bind an outstanding effect;
-when its logical session has no outstanding effect, the engine must have exactly
-one global unbound redirect. Multiple global candidates are ambiguous and fail
-closed rather than letting output order choose the handle. Closing the uniquely
-identified concrete connection swaps logical close handles, so the remaining
-scripted closes still settle every engine's live connection exactly once. A stale
-strict reference fails the common ledger.
+`failover_select.effect_control=delay` is projected as `delay_next: 1` on the
+same serialized config input that arms the real client control. Each engine binds
+that arm to its own first subsequently accepted redirect; neither the recording
+Go operation id nor the recording engine's session identity enters replay. The
+scripted close and following late callback carry one logical effect reference and
+follow that engine-local binding. Closing the identified concrete connection
+swaps logical close handles, so the remaining scripted closes still settle every
+live connection exactly once. If an engine issues no accepted redirect in the
+window, the optional close closes its ordinary logical handle, the callback emits
+`no_effect`, and the still-armed control may expire at clear/end only with an
+explicit zero accepted-attempt count. Older traces without the config arm retain
+the strict sole-global-candidate fallback; multiple candidates remain ambiguous
+and fail closed.
 
 Run `run.py.validate()` on a derived trace before any replay claim. A nonempty
 `requires` list remains a blocker even when that structural validation passes.

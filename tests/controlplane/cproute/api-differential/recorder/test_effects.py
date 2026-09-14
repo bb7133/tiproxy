@@ -293,12 +293,15 @@ class RelativeCloseTests(unittest.TestCase):
         for sid in sessions:
             events += [{"op":"open", "session":sid}, {"op":"next", "session":sid},
                        {"op":"finish", "session":sid, "success":True}]
+        events.append({"op":"config", "delay_next":1,
+                       "toml":"[proxy]\nfail-backend-list=['a']\nfailover-timeout=60\n"})
         tick = len(events)
         events.append({"op":"tick", "at_nanos":1, "refuse_next":1})
         events.append({"op":"close", "at_nanos":2, "session":"b",
-                       "effect_ref":"redirect/1"})
+                       "effect_ref":"redirect/1", "optional_effect":True})
         events.append({"op":"redirect_result", "at_nanos":2, "session":"b",
-                       "effect_ref":"redirect/1", "success":True})
+                       "effect_ref":"redirect/1", "optional_effect":True,
+                       "success":True})
         for sid in "acde":
             events.append({"op":"close", "at_nanos":3, "session":sid})
         events += [{"op":"health", "at_nanos":4, "backends":[]},

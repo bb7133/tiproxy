@@ -362,6 +362,49 @@ class ConnectionPreferenceTests(unittest.TestCase):
                     "effect_ref": "redirect/1", "success": True}
         self.assertEqual(h.resolve_operation(callback), "actual/1")
 
+    def test_delayed_arm_binds_each_engines_first_accepted_redirect(self):
+        def bound(order):
+            h = self.history()
+            for sid in ("logical", "a", "b"):
+                h.apply({"op": "open", "session": sid}, {})
+                self.reserve(h, sid, "source", True)
+            arm = {"op": "config", "delay_next": 1,
+                   "toml": "[proxy]\nfail-backend-list=['source']\n"}
+            h.prepare(arm, {}, {"outcome": "ok"}, 0)
+            effects = [{"kind": "redirect", "session": sid,
+                        "operation": f"{sid}/1", "from": "source",
+                        "to": "target", "accepted": True} for sid in order]
+            h.apply({"op": "tick"}, {"effects": effects})
+            close = {"op": "close", "session": "logical",
+                     "effect_ref": "redirect/1", "optional_effect": True}
+            actual = h.resolve_event(close)
+            operation = h.resolve_operation(close)
+            return actual, operation, h
+
+        left_actual, left_operation, _ = bound(["a", "b"])
+        right_actual, right_operation, right = bound(["b", "a"])
+        self.assertEqual((left_actual, left_operation), ("a", "a/1"))
+        self.assertEqual((right_actual, right_operation), ("b", "b/1"))
+        self.assertEqual([effect["operation"] for effect in right.unbound_redirects], ["a/1"])
+
+    def test_delayed_arm_with_zero_accepted_redirects_expires_without_borrowing(self):
+        h = self.history()
+        for sid in ("logical", "other"):
+            h.apply({"op": "open", "session": sid}, {})
+            self.reserve(h, sid, "source", True)
+        arm = {"op": "config", "delay_next": 1,
+               "toml": "[proxy]\nfail-backend-list=['source']\n"}
+        h.prepare(arm, {}, {"outcome": "ok"}, 0)
+        close = {"op": "close", "session": "logical",
+                 "effect_ref": "redirect/1", "optional_effect": True}
+        self.assertEqual(h.resolve_event(close), "logical")
+        self.assertEqual(h.resolve_operation(close), "")
+        h.apply(close, {"outcome": "no_effect", "effects": []}, sid="logical")
+        clear = {"op": "config", "toml": "[proxy]\nfail-backend-list=[]\n"}
+        h.prepare(clear, {}, {"outcome": "ok"}, 1)
+        self.assertEqual((h.delay_next, h.delay_attempts), (0, 0))
+        self.assertEqual(h.assigned, {"other": "source"})
+
     def test_failed_relative_callback_keeps_per_session_cooldown(self):
         h = self.history()
         self.reserve(h, "active", "a", True)

@@ -32,6 +32,9 @@ struct ClientEffects {
     refused: BTreeSet<String>,
     refuse_next: u64,
     refusal_attempts: u64,
+    delay_next: u64,
+    delay_attempts: u64,
+    delayed_operation: Option<String>,
     offered: Vec<(Value, MigrationCommand)>,
 }
 impl ClientEffects {
@@ -57,6 +60,32 @@ impl ClientEffects {
         self.refuse_next = 0;
     }
 
+    fn arm_delay(&mut self, delay: u64, index: usize) {
+        assert_eq!(delay, 1, "delayed callback input at event {index}");
+        assert_eq!(
+            self.delay_next, 0,
+            "delayed callback armed while one is pending at event {index}"
+        );
+        assert!(
+            self.delayed_operation.is_none(),
+            "delayed callback operation still pending at event {index}"
+        );
+        self.delay_next = delay;
+        self.delay_attempts = 0;
+    }
+
+    fn expire_delay(&mut self, boundary: &str, index: usize) {
+        if self.delay_next == 0 {
+            return;
+        }
+        assert_eq!(
+            self.delay_attempts, 0,
+            "delayed callback survived {} accepted redirects before {boundary} at event {index}",
+            self.delay_attempts
+        );
+        self.delay_next = 0;
+    }
+
     fn accept(&mut self, command: &MigrationCommand) -> bool {
         let (kind, from, to) = match command {
             MigrationCommand::Redirect(r) => ("redirect", r.from(), r.to().backend_id.as_str()),
@@ -72,7 +101,13 @@ impl ClientEffects {
             refused = true;
         }
         let accepted = !refused;
-        let effect = json!({"kind":kind,"session":id,"operation":format!("{id}/{ordinal}"),
+        let operation = format!("{id}/{ordinal}");
+        if accepted && kind == "redirect" && self.delay_next > 0 {
+            self.delay_attempts += 1;
+            self.delay_next -= 1;
+            self.delayed_operation = Some(operation.clone());
+        }
+        let effect = json!({"kind":kind,"session":id,"operation":operation,
             "from":from.backend_id,"to":to,"accepted":accepted});
         self.offered.push((effect, command.clone()));
         accepted
@@ -203,12 +238,34 @@ async fn replay() -> TestResult {
                     return Err("relative callback crossed sessions".into());
                 }
             } else if !skipped_effect_refs.contains(effect_ref) {
-                let mut position = unbound_redirects.iter().position(|operation| {
-                    operations
-                        .get(operation)
-                        .is_some_and(|(session, _, _)| session == &logical_actual)
-                });
-                if position.is_none() && op == "close" && !unbound_redirects.is_empty() {
+                let delayed = must(effects.lock()).delayed_operation.clone();
+                let delay_pending = must(effects.lock()).delay_next > 0;
+                let mut position = if op == "close" && delayed.is_some() {
+                    unbound_redirects
+                        .iter()
+                        .position(|operation| Some(operation) == delayed.as_ref())
+                } else if op == "close" && delay_pending {
+                    if event["optional_effect"].as_bool() != Some(true) {
+                        return Err("missing delayed redirect".into());
+                    }
+                    None
+                } else {
+                    unbound_redirects.iter().position(|operation| {
+                        operations
+                            .get(operation)
+                            .is_some_and(|(session, _, _)| session == &logical_actual)
+                    })
+                };
+                if op == "close" && delayed.is_some() {
+                    if position.is_none() {
+                        return Err("delayed redirect left the public queue".into());
+                    }
+                    must(effects.lock()).delayed_operation = None;
+                } else if position.is_none()
+                    && op == "close"
+                    && !delay_pending
+                    && !unbound_redirects.is_empty()
+                {
                     if unbound_redirects.len() != 1 {
                         return Err("ambiguous strict relative effect".into());
                     }
@@ -236,7 +293,9 @@ async fn replay() -> TestResult {
                 if event["optional_effect"].as_bool() != Some(true) {
                     return Err("unknown relative effect".into());
                 }
-                id.clear();
+                if op != "close" {
+                    id.clear();
+                }
                 skipped_effect = true;
                 skipped_effect_refs.insert(effect_ref.into());
                 effect_ref_sessions.insert(effect_ref.into(), logical_id.into());
@@ -333,6 +392,10 @@ async fn replay() -> TestResult {
                 if refusal > 0 {
                     must(effects.lock()).arm_refusal(refusal, index);
                 }
+                let delay = event["delay_next"].as_u64().unwrap_or(0);
+                if delay > 0 {
+                    must(effects.lock()).arm_delay(delay, index);
+                }
                 let prior_backend_clusters = h.source.store.current().topology()?.backend_clusters;
                 if h.source
                     .store
@@ -382,14 +445,15 @@ async fn replay() -> TestResult {
                         .routing()?
                         .failed_backends
                         .is_empty();
-                    if refusal > 0 {
+                    if refusal > 0 || delay > 0 {
                         assert!(
                             !failover_empty,
-                            "config refusal arm requires a nonempty failover list at event {index}"
+                            "config effect arm requires a nonempty failover list at event {index}"
                         );
                     }
                     if failover_empty {
                         must(effects.lock()).expire_refusal("failover clear", index);
+                        must(effects.lock()).expire_delay("failover clear", index);
                     }
                 }
             }
@@ -531,6 +595,9 @@ async fn replay() -> TestResult {
                     "pending creation requires its Finish callback"
                 );
                 drop(s);
+                if skipped_effect {
+                    row["outcome"] = json!("no_effect");
+                }
                 unbound_redirects.retain(|operation| {
                     operations
                         .get(operation)
@@ -569,9 +636,12 @@ async fn replay() -> TestResult {
         unbound_redirects.is_empty(),
         "trace must close or bind every accepted redirect"
     );
-    must(effects.lock()).expire_refusal(
-        "trace end",
-        trace["events"].as_array().ok_or("events")?.len(),
+    let event_count = trace["events"].as_array().ok_or("events")?.len();
+    must(effects.lock()).expire_refusal("trace end", event_count);
+    must(effects.lock()).expire_delay("trace end", event_count);
+    assert!(
+        must(effects.lock()).delayed_operation.is_none(),
+        "trace ended before the delayed callback close"
     );
     assert_eq!(
         known
