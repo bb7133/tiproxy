@@ -428,6 +428,50 @@ class ConnectionPreferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.Difference, "left the public queue"):
             h.resolve_event(close)
 
+    def test_delayed_operation_settled_by_its_own_early_close_is_not_borrowed(self):
+        h = self.history()
+        for sid in ("logical", "actual", "other"):
+            h.apply({"op": "open", "session": sid}, {})
+            self.reserve(h, sid, "source", True)
+        arm = {"op": "config", "delay_next": 1,
+               "toml": "[proxy]\nfail-backend-list=['source']\n"}
+        h.prepare(arm, {}, {"outcome": "ok"}, 0)
+        delayed = {"kind": "redirect", "session": "actual", "operation": "actual/1",
+                   "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [delayed]})
+        h.apply({"op": "close", "session": "actual"}, {}, sid="actual")
+        ordinary = {"kind": "redirect", "session": "other", "operation": "other/1",
+                    "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [ordinary]})
+
+        close = {"op": "close", "session": "logical",
+                 "effect_ref": "redirect/1", "optional_effect": True}
+        self.assertEqual(h.resolve_event(close), "logical")
+        self.assertEqual(h.resolve_operation(close), "")
+        self.assertEqual([effect["operation"] for effect in h.unbound_redirects], ["other/1"])
+
+    def test_ordinary_callback_cannot_consume_delayed_operation(self):
+        h = self.history()
+        for sid in ("logical", "actual"):
+            h.apply({"op": "open", "session": sid}, {})
+            self.reserve(h, sid, "source", True)
+        arm = {"op": "config", "delay_next": 1,
+               "toml": "[proxy]\nfail-backend-list=['source']\n"}
+        h.prepare(arm, {}, {"outcome": "ok"}, 0)
+        delayed = {"kind": "redirect", "session": "actual", "operation": "actual/1",
+                   "from": "source", "to": "target", "accepted": True}
+        h.apply({"op": "tick"}, {"effects": [delayed]})
+        callback = {"op": "redirect_result", "session": "actual",
+                    "effect_ref": "redirect/99", "optional_effect": True,
+                    "success": True}
+        self.assertEqual(h.resolve_event(callback), "")
+        self.assertEqual(h.resolve_operation(callback), "")
+        self.assertEqual([effect["operation"] for effect in h.unbound_redirects], ["actual/1"])
+        close = {"op": "close", "session": "logical",
+                 "effect_ref": "redirect/1", "optional_effect": True}
+        self.assertEqual(h.resolve_event(close), "actual")
+        self.assertEqual(h.resolve_operation(close), "actual/1")
+
     def test_failed_relative_callback_keeps_per_session_cooldown(self):
         h = self.history()
         self.reserve(h, "active", "a", True)

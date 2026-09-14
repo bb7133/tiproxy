@@ -341,12 +341,16 @@ Go operation id nor the recording engine's session identity enters replay. The
 scripted close and following late callback carry one logical effect reference and
 follow that engine-local binding. Closing the identified concrete connection
 swaps logical close handles, so the remaining scripted closes still settle every
-live connection exactly once. If an engine issues no accepted redirect in the
-window, the optional close closes its ordinary logical handle, the callback emits
-`no_effect`, and the still-armed control may expire at clear/end only with an
-explicit zero accepted-attempt count. Older traces without the config arm retain
-the strict sole-global-candidate fallback; multiple candidates remain ambiguous
-and fail closed.
+live connection exactly once. An ordinary callback opportunity cannot consume the
+deliberately delayed operation. If that operation's own connection closes before
+the scripted strict-close opportunity, that earlier close settles it; the later
+optional close uses its ordinary logical handle and cannot borrow an unrelated
+redirect. If an engine issues no accepted redirect before the strict-close
+opportunity, that opportunity expires the zero-attempt arm, closes its ordinary
+logical handle and makes the following callback `no_effect`; later redirects are
+ordinary. Losing a delayed operation without either settlement remains an error.
+Older traces without the config arm retain the strict sole-global-candidate
+fallback; multiple candidates remain ambiguous and fail closed.
 
 Run `run.py.validate()` on a derived trace before any replay claim. A nonempty
 `requires` list remains a blocker even when that structural validation passes.

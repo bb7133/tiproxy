@@ -35,6 +35,7 @@ struct ClientEffects {
     delay_next: u64,
     delay_attempts: u64,
     delayed_operation: Option<String>,
+    delayed_settled_early: bool,
     offered: Vec<(Value, MigrationCommand)>,
 }
 impl ClientEffects {
@@ -67,7 +68,7 @@ impl ClientEffects {
             "delayed callback armed while one is pending at event {index}"
         );
         assert!(
-            self.delayed_operation.is_none(),
+            self.delayed_operation.is_none() && !self.delayed_settled_early,
             "delayed callback operation still pending at event {index}"
         );
         self.delay_next = delay;
@@ -232,15 +233,28 @@ async fn replay() -> TestResult {
         let effect_ref = text(event, "effect_ref");
         let mut skipped_effect = false;
         if !effect_ref.is_empty() {
+            let delayed = must(effects.lock()).delayed_operation.clone();
+            let mut settled_early = false;
             if let Some(operation) = effect_refs.get(effect_ref) {
                 resolved_operation = operation.clone();
                 if effect_ref_sessions.get(effect_ref).map(String::as_str) != Some(logical_id) {
                     return Err("relative callback crossed sessions".into());
                 }
+                let mut client = must(effects.lock());
+                if op == "redirect_result" && client.delayed_operation.as_ref() == Some(operation) {
+                    client.delayed_operation = None;
+                }
             } else if !skipped_effect_refs.contains(effect_ref) {
-                let delayed = must(effects.lock()).delayed_operation.clone();
                 let delay_pending = must(effects.lock()).delay_next > 0;
-                let mut position = if op == "close" && delayed.is_some() {
+                let early = must(effects.lock()).delayed_settled_early;
+                let mut position = if op == "close" && early {
+                    if event["optional_effect"].as_bool() != Some(true) {
+                        return Err("early-settled delayed redirect was not optional".into());
+                    }
+                    must(effects.lock()).delayed_settled_early = false;
+                    settled_early = true;
+                    None
+                } else if op == "close" && delayed.is_some() {
                     unbound_redirects
                         .iter()
                         .position(|operation| Some(operation) == delayed.as_ref())
@@ -252,9 +266,10 @@ async fn replay() -> TestResult {
                     None
                 } else {
                     unbound_redirects.iter().position(|operation| {
-                        operations
-                            .get(operation)
-                            .is_some_and(|(session, _, _)| session == &logical_actual)
+                        operations.get(operation).is_some_and(|(session, _, _)| {
+                            session == &logical_actual
+                                && (op == "close" || Some(operation) != delayed.as_ref())
+                        })
                     })
                 };
                 if op == "close" && delayed.is_some() {
@@ -265,6 +280,7 @@ async fn replay() -> TestResult {
                 } else if position.is_none()
                     && op == "close"
                     && !delay_pending
+                    && !settled_early
                     && !unbound_redirects.is_empty()
                 {
                     if unbound_redirects.len() != 1 {
@@ -283,12 +299,17 @@ async fn replay() -> TestResult {
                 return Err("relative callback crossed sessions".into());
             }
             if resolved_operation.is_empty() {
-                if operations.iter().any(|(_, (session, command, completed))| {
-                    matches!(command, MigrationCommand::Redirect(_))
-                        && session == &logical_actual
-                        && !completed
-                        && sessions.contains_key(session)
-                }) {
+                if operations
+                    .iter()
+                    .any(|(operation, (session, command, completed))| {
+                        matches!(command, MigrationCommand::Redirect(_))
+                            && session == &logical_actual
+                            && !completed
+                            && sessions.contains_key(session)
+                            && (op == "close" || Some(operation) != delayed.as_ref())
+                            && !settled_early
+                    })
+                {
                     return Err("relative callback skipped a same-session redirect".into());
                 }
                 if event["optional_effect"].as_bool() != Some(true) {
@@ -599,6 +620,16 @@ async fn replay() -> TestResult {
                 if skipped_effect {
                     row["outcome"] = json!("no_effect");
                 }
+                let delayed = must(effects.lock()).delayed_operation.clone();
+                if delayed.as_ref().is_some_and(|operation| {
+                    operations
+                        .get(operation)
+                        .is_some_and(|(session, _, _)| session == &id)
+                }) {
+                    let mut client = must(effects.lock());
+                    client.delayed_operation = None;
+                    client.delayed_settled_early = true;
+                }
                 unbound_redirects.retain(|operation| {
                     operations
                         .get(operation)
@@ -643,6 +674,10 @@ async fn replay() -> TestResult {
     assert!(
         must(effects.lock()).delayed_operation.is_none(),
         "trace ended before the delayed callback close"
+    );
+    assert!(
+        !must(effects.lock()).delayed_settled_early,
+        "trace ended before the strict delayed-close opportunity"
     );
     assert_eq!(
         known

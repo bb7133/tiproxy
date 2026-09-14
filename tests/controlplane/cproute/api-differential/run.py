@@ -264,6 +264,7 @@ class PublicConnections:
         self.unbound_redirects, self.skipped_effect_refs = [], set()
         self.refuse_next, self.refusal_attempts, self.fail_backend_list = 0, 0, set()
         self.delay_next, self.delay_attempts, self.delayed_redirect = 0, 0, None
+        self.delayed_settled_early = False
         self.policy, self.selection = config["policy"], config["selection"]
         self.ratio, self.rate, self.status_rate, self.label_name = 1.2, 0.0, 0.0, ""
 
@@ -342,7 +343,7 @@ class PublicConnections:
             self.refusal_attempts = 0
         if event.get("delay_next", 0):
             require(event["delay_next"] == 1 and self.delay_next == 0
-                    and self.delayed_redirect is None,
+                    and self.delayed_redirect is None and not self.delayed_settled_early,
                     "EFFECT_LEDGER", "delayed callback armed while one is pending")
             self.delay_next = 1
             self.delay_attempts = 0
@@ -405,12 +406,19 @@ class PublicConnections:
         if effect_ref in self.skipped_effect_refs:
             require(self.effect_ref_sessions[effect_ref] == event.get("session", ""),
                     "EFFECT_LEDGER", f"relative callback {effect_ref} crossed sessions")
-            require(not any(effect["session"] == actual for effect in self.redirects.values()),
+            require(not any(effect["session"] == actual
+                            and (event["op"] == "close" or effect is not self.delayed_redirect)
+                            for effect in self.redirects.values()),
                     "EFFECT_LEDGER",
                     f"relative callback {effect_ref} skipped a same-session redirect")
             return None
         position = None
-        if event["op"] == "close" and self.delayed_redirect is not None:
+        settled_early = event["op"] == "close" and self.delayed_settled_early
+        if settled_early:
+            require(event.get("optional_effect") is True, "EFFECT_LEDGER",
+                    f"early-settled delayed redirect {effect_ref} was not optional")
+            self.delayed_settled_early = False
+        elif event["op"] == "close" and self.delayed_redirect is not None:
             position = next((i for i, effect in enumerate(self.unbound_redirects)
                              if effect is self.delayed_redirect), None)
             require(position is not None, "EFFECT_LEDGER",
@@ -425,7 +433,8 @@ class PublicConnections:
             self.expire_delay("delayed-close opportunity")
         else:
             position = next((i for i, effect in enumerate(self.unbound_redirects)
-                             if effect["session"] == actual), None)
+                             if effect["session"] == actual
+                             and (event["op"] == "close" or effect is not self.delayed_redirect)), None)
             if position is None and event["op"] == "close" and self.unbound_redirects:
                 # Backward compatibility for pre-arm traces: the strict close
                 # may bind a sole public candidate but never guess among many.
@@ -437,7 +446,10 @@ class PublicConnections:
             self.effect_refs[effect_ref] = effect
             self.effect_ref_sessions[effect_ref] = event.get("session", "")
             return effect
-        require(not any(effect["session"] == actual for effect in self.redirects.values()),
+        require(settled_early or not any(
+                    effect["session"] == actual
+                    and (event["op"] == "close" or effect is not self.delayed_redirect)
+                    for effect in self.redirects.values()),
                 "EFFECT_LEDGER",
                 f"relative callback {effect_ref} skipped a same-session redirect")
         require(event.get("optional_effect") is True, "EFFECT_LEDGER",
@@ -611,6 +623,8 @@ class PublicConnections:
             self.created[sid] = index
         elif op == "redirect_result":
             effect = self.redirects.pop(operation, None)
+            if effect is self.delayed_redirect:
+                self.delayed_redirect = None
             self.unbound_redirects = [item for item in self.unbound_redirects
                                       if item["operation"] != operation]
             if effect is not None:
@@ -621,6 +635,10 @@ class PublicConnections:
         elif op == "close":
             if not sid:
                 return
+            if (self.delayed_redirect is not None
+                    and self.delayed_redirect["session"] == sid):
+                self.delayed_redirect = None
+                self.delayed_settled_early = True
             self.assigned.pop(sid, None)
             self.pending.pop(sid, None)
             self.created.pop(sid, None)
@@ -771,7 +789,8 @@ def observe(trace, rows, engine):
             and not connections.pending and not connections.assigned
             and not connections.redirects and not connections.unbound_redirects
             and not connections.logical_to_actual and connections.refuse_next == 0
-            and connections.delay_next == 0 and connections.delayed_redirect is None,
+            and connections.delay_next == 0 and connections.delayed_redirect is None
+            and not connections.delayed_settled_early,
             "LEDGER", f"{engine} final state")
     accepted_redirects = [(key, effect) for key,effect in operations.items()
                           if effect["accepted"] and effect["kind"] == "redirect"]
