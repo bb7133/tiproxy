@@ -17,6 +17,7 @@
 mod authority;
 mod factors;
 mod ledger;
+mod namespace;
 mod policy;
 mod retry;
 mod scheduler;
@@ -29,6 +30,7 @@ pub mod shadow;
 pub use authority::{Candidate, RouteError, Unsupported};
 pub use factors::{BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore};
 pub use ledger::{Accounting, ForceClose, Redirect, Reservation, Session, Settlement};
+pub use namespace::{ResolvedNamespace, RouteCandidateValidator, UserNamespaceResolver};
 pub use retry::Selector;
 pub use selector::Router;
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};

@@ -2116,6 +2116,7 @@ dependencies = [
  "control-external",
  "control-plane",
  "control-proto",
+ "control-router",
  "control-topology",
  "dataplane",
  "hyper",

@@ -46,6 +46,7 @@ use control_proto::control_transport::ClientConfig;
 use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
+use control_router::RouteCandidateValidator;
 use control_topology::{InterfaceAdvertiseResolver, TopologyModule};
 use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
 use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
@@ -889,6 +890,7 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
     ));
     let validator = Arc::new(CompositeCandidateValidator::new(
         serving,
+        Arc::new(RouteCandidateValidator),
         Arc::new(TopologyCandidateValidator::new(Arc::clone(
             &allowed_tls_roots,
         ))),

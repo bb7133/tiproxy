@@ -159,16 +159,19 @@ fn cluster_tls_material(
         .map_err(|_| "cluster_tls_invalid")
 }
 
-/// Runs two candidate validators in a fixed order and publishes a single
+/// Runs three candidate validators in a fixed order and publishes a single
 /// artifact.
 ///
 /// The serving validator runs first so a serving-TLS or protocol rejection fails
-/// the candidate before topology material is prepared; the topology validator
-/// then prepares the [`PreparedClusterSet`] that becomes the generation's
-/// published artifact. Only the topology stage prepares an artifact today, so
-/// exactly one artifact is published per accepted generation.
+/// the candidate before routing identity is accepted or topology material is
+/// prepared. The routing validator then rejects ambiguous nonempty frontend-user
+/// identity, and the topology validator prepares the [`PreparedClusterSet`] that
+/// becomes the generation's published artifact. Only the topology stage prepares
+/// a retained artifact today, so exactly one artifact is published per accepted
+/// generation.
 pub struct CompositeCandidateValidator {
     serving: Arc<dyn CandidateValidator>,
+    routing: Arc<dyn CandidateValidator>,
     topology: Arc<dyn CandidateValidator>,
 }
 
@@ -177,9 +180,14 @@ impl CompositeCandidateValidator {
     #[must_use]
     pub fn new(
         serving: Arc<dyn CandidateValidator>,
+        routing: Arc<dyn CandidateValidator>,
         topology: Arc<dyn CandidateValidator>,
     ) -> Self {
-        Self { serving, topology }
+        Self {
+            serving,
+            routing,
+            topology,
+        }
     }
 }
 
@@ -189,9 +197,11 @@ impl CandidateValidator for CompositeCandidateValidator {
         effective: &EffectiveConfig,
         namespaces: &[NamespaceConfig],
     ) -> Result<PreparedArtifact, &'static str> {
-        // Serving validates first and prepares nothing today; its artifact is
-        // intentionally discarded. Topology prepares the published artifact.
+        // Serving and routing validate first and prepare nothing retained today;
+        // their artifacts are intentionally discarded. Topology prepares the
+        // published artifact.
         let _ = self.serving.validate(effective, namespaces)?;
+        let _ = self.routing.validate(effective, namespaces)?;
         self.topology.validate(effective, namespaces)
     }
 }
