@@ -15,25 +15,30 @@
 //! Real binding and bounded, qualified owner-history writes.
 
 use super::{
-    Arc, ClusterResult, Duration, GenerationGate, JoinSet, MetricCapture, Mutex, PoisonError,
-    Shared, SocketAddr, TcpListener, owner,
+    Arc, ClusterResult, Duration, GenerationGate, JoinSet, MetricCapture, MetricConnectionStream,
+    Mutex, PoisonError, Shared, SocketAddr, TcpListener, owner,
 };
 use control_plane::OwnerToken;
 use std::io;
+use std::pin::Pin;
 use std::sync::OnceLock;
-use tokio::io::AsyncReadExt;
+use std::task::Poll;
+use tokio::io::{AsyncReadExt, AsyncWrite};
+#[cfg(test)]
 use tokio::net::TcpStream;
 
 pub(super) struct Binding {
-    pub address: SocketAddr,
+    pub address: Arc<str>,
+    pub local_address: SocketAddr,
     gate: GenerationGate,
     owner: OnceLock<OwnerToken>,
     writes: Mutex<()>,
 }
 impl Binding {
-    pub fn new(address: SocketAddr) -> Self {
+    pub fn new(local_address: SocketAddr, address: Arc<str>) -> Self {
         Self {
             address,
+            local_address,
             gate: GenerationGate::new(),
             owner: OnceLock::new(),
             writes: Mutex::new(()),
@@ -75,7 +80,11 @@ pub(super) async fn serve(listener: TcpListener, shared: Arc<Shared>) {
                 let Ok((socket, _)) = result else { break; };
                 let shared = Arc::clone(&shared);
                 tasks.spawn(async move {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), handle(socket, shared)).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        let socket = shared.acceptor.accept(socket).await?;
+                        handle(socket, shared).await
+                    })
+                    .await;
                 });
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
@@ -168,7 +177,7 @@ impl Response {
             })
             .flatten()
     }
-    async fn write(self, socket: &TcpStream) -> io::Result<()> {
+    async fn write(self, socket: &mut MetricConnectionStream) -> io::Result<()> {
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.bytes.len()
@@ -176,57 +185,83 @@ impl Response {
         for bytes in [header.as_bytes(), self.bytes.as_ref()] {
             let mut sent = 0;
             while sent < bytes.len() {
-                socket.writable().await?;
                 let end = bytes.len().min(sent + 16 * 1024);
-                let result = self
-                    .with_current(|| socket.try_write(&bytes[sent..end]))
-                    .ok_or_else(|| io::Error::other("retired metric response"))?;
+                let result = std::future::poll_fn(|context| {
+                    self.with_current(|| {
+                        AsyncWrite::poll_write(Pin::new(&mut **socket), context, &bytes[sent..end])
+                    })
+                    .unwrap_or_else(|| {
+                        Poll::Ready(Err(io::Error::other("retired metric response")))
+                    })
+                })
+                .await;
                 match result {
                     Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                     Ok(count) => sent += count,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error),
                 }
             }
         }
+        std::future::poll_fn(|context| {
+            self.with_current(|| AsyncWrite::poll_flush(Pin::new(&mut **socket), context))
+                .unwrap_or_else(|| Poll::Ready(Err(io::Error::other("retired metric response"))))
+        })
+        .await?;
         Ok(())
     }
 }
 
-async fn handle(mut socket: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+async fn handle(mut socket: MetricConnectionStream, shared: Arc<Shared>) -> io::Result<()> {
     let mut request = Vec::with_capacity(1024);
     while !request.ends_with(b"\r\n\r\n") {
         if request.len() >= 8192 {
-            return write_status(&socket, &shared.serving, 431).await;
+            return write_status(&mut socket, &shared.serving, 431).await;
         }
         let mut byte = [0];
         socket.read_exact(&mut byte).await?;
         request.push(byte[0]);
     }
     let Some(cluster) = parse_request(&request) else {
-        return write_status(&socket, &shared.serving, 400).await;
+        return write_status(&mut socket, &shared.serving, 400).await;
     };
     let Some(response) = Response::capture(&shared, &cluster) else {
-        return write_status(&socket, &shared.serving, 503).await;
+        return write_status(&mut socket, &shared.serving, 503).await;
     };
-    response.write(&socket).await
+    response.write(&mut socket).await
 }
-async fn write_status(socket: &TcpStream, binding: &Binding, status: u16) -> io::Result<()> {
+async fn write_status(
+    socket: &mut MetricConnectionStream,
+    binding: &Binding,
+    status: u16,
+) -> io::Result<()> {
     let bytes =
         format!("HTTP/1.1 {status} Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     let mut sent = 0;
     while sent < bytes.len() {
-        socket.writable().await?;
-        match binding
-            .with_live(|| socket.try_write(&bytes.as_bytes()[sent..]))
-            .ok_or_else(|| io::Error::other("retired metric listener"))?
-        {
+        let result = std::future::poll_fn(|context| {
+            binding
+                .with_live(|| {
+                    AsyncWrite::poll_write(
+                        Pin::new(&mut **socket),
+                        context,
+                        &bytes.as_bytes()[sent..],
+                    )
+                })
+                .unwrap_or_else(|| Poll::Ready(Err(io::Error::other("retired metric listener"))))
+        })
+        .await;
+        match result {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => sent += count,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
     }
+    std::future::poll_fn(|context| {
+        binding
+            .with_live(|| AsyncWrite::poll_flush(Pin::new(&mut **socket), context))
+            .unwrap_or_else(|| Poll::Ready(Err(io::Error::other("retired metric binding"))))
+    })
+    .await?;
     Ok(())
 }
 fn parse_request(bytes: &[u8]) -> Option<String> {

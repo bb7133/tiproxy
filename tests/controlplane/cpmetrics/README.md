@@ -106,9 +106,11 @@ CP-ETCD authority eight mutants and CP-ROUTE 46 mutants remain unchanged.
 
 The collector is an opt-in `ControlModule`. `MetricCollector::bind` binds the real
 in-process HTTP socket before an owner can advertise it. Only `run` activates
-serving under its original process owner. No binary/production composition is
-enabled here. The later composition slice must use the authorized same-process
-endpoint and deployment TLS policy; this staged standalone listener is plain HTTP.
+serving under its original process owner. The #223 production composition uses
+`bind_for_routing_endpoint`: it binds an independent port-zero socket on the SQL
+listener's address family, advertises the topology-resolved host plus actual port,
+and selects plaintext or the exact retained `server-http-tls` identity for every
+accepted config generation. The legacy standalone test binding remains plain HTTP.
 
 The immediate first round and restart-pinned interval use applied cluster material.
 Every Prom round re-reads the endpoint, captures one range end, tries job then
@@ -180,7 +182,7 @@ The public `Router::factor_report` is a diagnostic consumer and cannot reserve o
 migrate a connection. Resource/Location capture/reserve remain typed Unsupported
 until the subsequent selector-composition slice. Static-source empty metric
 qualification and the final policy-subscription lifecycle belong to that slice;
-production composition remains disabled until CP integration.
+the #223 production route-owner composition now installs this overlay.
 
 Each collector cluster issues an opaque cache lineage for its selected history.
 Ordinary same-source rounds retain it despite replacement of the snapshot's round

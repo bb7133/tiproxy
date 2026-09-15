@@ -267,6 +267,26 @@ fn tls_paths_must_remain_beneath_the_allowlist() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn detached_server_tls_is_prepared_without_publishing() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::create()?;
+    let pair = write_valid_pair(directory.path(), "metric-owner")?;
+    let store = SnapshotStore::new([directory.path().to_path_buf()])?;
+    let prepared = store.prepare_server_tls("server_http_tls", &pair, validation_time())?;
+    assert!(prepared.is_some(), "a complete server identity is retained");
+    assert!(
+        store.current()?.is_none(),
+        "detached preparation never publishes snapshot state"
+    );
+    assert!(
+        store
+            .prepare_server_tls("server_http_tls", &TlsPolicy::default(), validation_time(),)?
+            .is_none(),
+        "an accepted empty policy selects plaintext"
+    );
+    Ok(())
+}
+
 fn valid_snapshot(frontend_tls: TlsPolicy) -> StateSnapshot {
     let keepalive = KeepalivePolicy {
         enabled: true,

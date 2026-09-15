@@ -10,8 +10,8 @@ data-core and CP-002/003/004/TOPO entrypoints remain required.
 
 `Router::new_with_factors` explicitly enables Resource/Location selection.
 `Router::new` retains its Connection-only staged behavior, including typed
-`Unsupported` evidence. Production dataplane/manifest composition is still off
-until the integration slice; timed balancing/migration is separate work.
+`Unsupported` evidence. The #223 Rust route-owner composition now installs the
+routing overlay; timed balancing/migration remains separate work.
 
 Candidates retain actual C/R/H and the namespace's `BackendSourceSnapshot`.
 Only `Sources` can construct static empty inputs, after observing its applied

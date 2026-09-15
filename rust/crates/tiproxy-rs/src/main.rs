@@ -47,7 +47,9 @@ use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
 use control_router::{RouteCandidateValidator, RoutePlane};
-use control_topology::{InterfaceAdvertiseResolver, TopologyModule};
+use control_topology::{
+    AdvertiseEndpointResolver, InterfaceAdvertiseResolver, MetricCollector, TopologyModule,
+};
 use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
 use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
 use dataplane::session::SessionLoopConfig;
@@ -60,8 +62,8 @@ use dataplane::{
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use topology_composition::{
-    ArtifactClusterFactory, CompositeCandidateValidator, TopologyCandidateValidator,
-    interface_advertise_candidates,
+    ArtifactClusterFactory, CompositeCandidateValidator, MetricServerConnectionAcceptor,
+    TopologyCandidateValidator, interface_advertise_candidates, metric_owner_bind_address,
 };
 
 const VERSION: &str = env!("TIPROXY_BUILD_VERSION");
@@ -520,12 +522,30 @@ async fn run(options: Options) -> Result<(), String> {
     // constructor validates it (an invalid policy rolls back through the armed
     // startup guard) and owns it immutably thereafter — there is no runtime
     // reload path.
+    let advertise_resolver = Arc::new(InterfaceAdvertiseResolver::new(Arc::new(
+        interface_advertise_candidates,
+    )));
+    let initial_topology = match config_owner.handle.source().current().topology() {
+        Ok(topology) => topology,
+        Err(error) => {
+            return Err(guard
+                .rollback(format!("project metric owner endpoint: {error}"))
+                .await);
+        }
+    };
+    let metric_advertise_host = match advertise_resolver.resolve(&initial_topology) {
+        Ok(host) => host,
+        Err(error) => {
+            return Err(guard
+                .rollback(format!("resolve metric owner endpoint: {error}"))
+                .await);
+        }
+    };
+    let metric_bind_address = metric_owner_bind_address(&initial_topology, &metric_advertise_host);
     let (topology_module, mut topology_handle) = match TopologyModule::new(
         Arc::new(config_owner.handle.source().clone()),
         Box::new(ArtifactClusterFactory),
-        Arc::new(InterfaceAdvertiseResolver::new(Arc::new(
-            interface_advertise_candidates,
-        ))),
+        advertise_resolver,
         topology_identity,
         HealthCheckConfig::default(),
     ) {
@@ -533,6 +553,14 @@ async fn run(options: Options) -> Result<(), String> {
         Err(error) => {
             return Err(guard
                 .rollback(format!("invalid pinned health config: {error}"))
+                .await);
+        }
+    };
+    let topology_module = match topology_module.with_metrics() {
+        Ok(module) => module,
+        Err(error) => {
+            return Err(guard
+                .rollback(format!("invalid pinned metric config: {error}"))
                 .await);
         }
     };
@@ -544,6 +572,33 @@ async fn run(options: Options) -> Result<(), String> {
     if let Err(error) = topology_handle.wait_ready().await {
         return Err(guard
             .rollback(format!("initialize topology module: {error}"))
+            .await);
+    }
+    // Bind the same-process owner-history endpoint before its control module can
+    // campaign. It uses the topology advertise host plus the actual port-zero
+    // bind result, and applies the exact server-HTTP TLS identity retained by
+    // each accepted config generation. This listener is independent of Go's API
+    // status port, so the two processes cannot collide.
+    let (metric_collector, metric_overlay) = match MetricCollector::bind_for_routing_endpoint(
+        topology_handle.metric_source(),
+        metric_bind_address,
+        metric_advertise_host.as_ref(),
+        Arc::new(MetricServerConnectionAcceptor::new(Arc::new(
+            config_owner.handle.source().clone(),
+        ))),
+    )
+    .await
+    {
+        Ok(parts) => parts,
+        Err(error) => {
+            return Err(guard
+                .rollback(format!("bind metric owner endpoint: {error}"))
+                .await);
+        }
+    };
+    if let Err(error) = guard.spawn_module(metric_collector) {
+        return Err(guard
+            .rollback(format!("start metric collector module: {error}"))
             .await);
     }
     // The local route plane must bind every namespace's exact incarnation to a
@@ -568,7 +623,7 @@ async fn run(options: Options) -> Result<(), String> {
         Arc::new(config_owner.handle.source().clone()),
         topology_handle.clone(),
         max_sessions,
-        None,
+        Some(metric_overlay),
     );
     if let Err(error) = guard.spawn_module(route_plane) {
         return Err(guard

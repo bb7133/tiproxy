@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Staged in-process metrics collection and owner history service.
+//! In-process metrics collection and owner-history service.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use control_external::GenerationGate;
 use control_plane::{ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -47,7 +51,43 @@ const MAX_CLUSTERS: usize = 128;
 pub enum MetricCollectorError {
     /// The requested in-process listener could not be bound.
     #[error("metric owner listener could not bind")]
-    Bind(#[source] std::io::Error),
+    Bind(#[source] io::Error),
+    /// The host that peers would read from is not a bounded host-only value.
+    #[error("metric owner advertised host is invalid")]
+    AdvertisedHost,
+}
+
+/// One accepted metric-owner connection after applying the deployment's
+/// plaintext/TLS policy.
+pub trait MetricConnection: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> MetricConnection for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// Type-erased transport consumed by the bounded owner-history HTTP service.
+pub type MetricConnectionStream = Box<dyn MetricConnection>;
+
+/// Future returned by a [`MetricConnectionAcceptor`].
+pub type MetricAcceptFuture =
+    Pin<Box<dyn Future<Output = io::Result<MetricConnectionStream>> + Send>>;
+
+/// Applies the deployment's connection policy before the owner-history HTTP
+/// parser sees a socket.
+///
+/// Production uses this seam to select the exact TLS identity retained by the
+/// accepted config generation. Tests and the legacy [`MetricCollector::bind`]
+/// path use [`PlainMetricConnectionAcceptor`].
+pub trait MetricConnectionAcceptor: Send + Sync {
+    /// Converts one TCP socket into the plaintext HTTP byte stream.
+    fn accept(&self, stream: tokio::net::TcpStream) -> MetricAcceptFuture;
+}
+
+/// Plain HTTP policy retained for tests and explicitly plaintext deployments.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlainMetricConnectionAcceptor;
+
+impl MetricConnectionAcceptor for PlainMetricConnectionAcceptor {
+    fn accept(&self, stream: tokio::net::TcpStream) -> MetricAcceptFuture {
+        Box::pin(async move { Ok(Box::new(stream) as MetricConnectionStream) })
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +148,7 @@ impl Published {
 struct Shared {
     source: MetricSourceHandle,
     serving: Arc<service::Binding>,
+    acceptor: Arc<dyn MetricConnectionAcceptor>,
     queries: Mutex<BTreeSet<QueryId>>,
     routing_queries: bool,
     published: Mutex<Published>,
@@ -387,7 +428,8 @@ impl MetricOverlayHandle {
 
 /// Opt-in collector owning one real in-process owner HTTP binding.
 /// Binding is completed before any election can advertise its address. This
-/// module is not installed in the production composition by this API.
+/// module accepts either its legacy plaintext policy or an injected production
+/// connection policy while retaining the same bounded HTTP core.
 pub struct MetricCollector {
     listener: Option<TcpListener>,
     shared: Arc<Shared>,
@@ -401,7 +443,14 @@ impl MetricCollector {
         source: MetricSourceHandle,
         address: SocketAddr,
     ) -> Result<(Self, MetricOverlayHandle), MetricCollectorError> {
-        Self::bind_queries(source, address, false).await
+        Self::bind_queries(
+            source,
+            address,
+            None,
+            Arc::new(PlainMetricConnectionAcceptor),
+            false,
+        )
+        .await
     }
     /// Binds an opt-in routing collector. The accepted config owns all six
     /// expressions while Resource/Location factors exist; Connection removes
@@ -412,20 +461,62 @@ impl MetricCollector {
         source: MetricSourceHandle,
         address: SocketAddr,
     ) -> Result<(Self, MetricOverlayHandle), MetricCollectorError> {
-        Self::bind_queries(source, address, true).await
+        Self::bind_queries(
+            source,
+            address,
+            None,
+            Arc::new(PlainMetricConnectionAcceptor),
+            true,
+        )
+        .await
+    }
+
+    /// Binds a routing collector to `bind_address`, advertises the same-process
+    /// endpoint at `advertised_host:<actual-port>`, and applies `acceptor` to
+    /// every accepted connection.
+    ///
+    /// The port is selected by the real bind (so port zero is supported) before
+    /// any election can publish it. Separating bind and advertise hosts permits
+    /// a wildcard local listener while peers use the same DNS/IP identity as
+    /// topology registration.
+    ///
+    /// # Errors
+    /// Returns a bind failure or a bounded invalid advertised-host error before
+    /// any worker starts.
+    pub async fn bind_for_routing_endpoint(
+        source: MetricSourceHandle,
+        bind_address: SocketAddr,
+        advertised_host: impl AsRef<str>,
+        acceptor: Arc<dyn MetricConnectionAcceptor>,
+    ) -> Result<(Self, MetricOverlayHandle), MetricCollectorError> {
+        Self::bind_queries(
+            source,
+            bind_address,
+            Some(advertised_host.as_ref()),
+            acceptor,
+            true,
+        )
+        .await
     }
     async fn bind_queries(
         source: MetricSourceHandle,
         address: SocketAddr,
+        advertised_host: Option<&str>,
+        acceptor: Arc<dyn MetricConnectionAcceptor>,
         routing_queries: bool,
     ) -> Result<(Self, MetricOverlayHandle), MetricCollectorError> {
         let listener = TcpListener::bind(address)
             .await
             .map_err(MetricCollectorError::Bind)?;
-        let address = listener.local_addr().map_err(MetricCollectorError::Bind)?;
+        let local_address = listener.local_addr().map_err(MetricCollectorError::Bind)?;
+        let address = advertised_host.map_or_else(
+            || Ok(Arc::<str>::from(local_address.to_string())),
+            |host| advertised_address(host, local_address.port()),
+        )?;
         let shared = Arc::new(Shared {
             source,
-            serving: Arc::new(service::Binding::new(address)),
+            serving: Arc::new(service::Binding::new(local_address, address)),
+            acceptor,
             queries: Mutex::new(BTreeSet::new()),
             routing_queries,
             published: Mutex::new(Published::default()),
@@ -441,7 +532,14 @@ impl MetricCollector {
     /// The address of the real bound listener, fixed for this service lifetime.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
-        self.shared.serving.address
+        self.shared.serving.local_address
+    }
+
+    /// The peer-reachable host and actual bound port advertised through owner
+    /// election for this service lifetime.
+    #[must_use]
+    pub fn advertised_addr(&self) -> &str {
+        &self.shared.serving.address
     }
 
     async fn run_inner(mut self: Box<Self>, context: ModuleContext) -> Result<(), ModuleError> {
@@ -523,6 +621,30 @@ impl MetricCollector {
             })
         })
     }
+}
+
+fn advertised_address(host: &str, port: u16) -> Result<Arc<str>, MetricCollectorError> {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let parsed_ip = host.parse::<std::net::IpAddr>();
+    if host.is_empty()
+        || host.len() > 253
+        || (parsed_ip.is_err()
+            && !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')))
+    {
+        return Err(MetricCollectorError::AdvertisedHost);
+    }
+    let address = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok(Arc::from(address))
 }
 impl Drop for MetricCollector {
     fn drop(&mut self) {

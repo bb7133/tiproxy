@@ -21,6 +21,10 @@ use crate::{BackendSourceMode, MergedTopology, RoutingSnapshotPublisher, Topolog
 use control_config::{ConfigNamespaceStore, HealthCheckConfig};
 use control_external::{EtcdClientConfig, EtcdConnector};
 use control_plane::{OwnerLease, OwnerScope, OwnershipRegistry};
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 pub(super) type TestError = Box<dyn std::error::Error>;
 pub(super) struct Fixture {
@@ -127,6 +131,97 @@ pub(super) fn result() -> ClusterResult {
         owner: None,
         export: Arc::from(b"{}".as_slice()),
     }
+}
+
+#[tokio::test]
+async fn routing_endpoint_separates_bind_and_peer_identity() -> Result<(), TestError> {
+    let fixture = Fixture::new("127.0.0.1:1").await?;
+    let (collector, _) = MetricCollector::bind_for_routing_endpoint(
+        fixture.handle.clone(),
+        "127.0.0.1:0".parse()?,
+        "metric-peer.internal",
+        Arc::new(PlainMetricConnectionAcceptor),
+    )
+    .await?;
+    assert_eq!(collector.local_addr().ip().to_string(), "127.0.0.1");
+    assert_eq!(
+        collector.advertised_addr(),
+        format!("metric-peer.internal:{}", collector.local_addr().port())
+    );
+
+    let (ipv6, _) = MetricCollector::bind_for_routing_endpoint(
+        fixture.handle.clone(),
+        "127.0.0.1:0".parse()?,
+        "2001:db8::7",
+        Arc::new(PlainMetricConnectionAcceptor),
+    )
+    .await?;
+    assert_eq!(
+        ipv6.advertised_addr(),
+        format!("[2001:db8::7]:{}", ipv6.local_addr().port()),
+        "an IPv6 owner value must remain an unambiguous host:port"
+    );
+
+    for invalid_host in ["bad host", "metric.example:1234", "metric.example?query"] {
+        assert!(
+            matches!(
+                MetricCollector::bind_for_routing_endpoint(
+                    fixture.handle.clone(),
+                    "127.0.0.1:0".parse()?,
+                    invalid_host,
+                    Arc::new(PlainMetricConnectionAcceptor),
+                )
+                .await,
+                Err(MetricCollectorError::AdvertisedHost)
+            ),
+            "an invalid peer identity is rejected before any module starts"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn routing_endpoint_applies_the_injected_connection_policy() -> Result<(), TestError> {
+    struct RejectingAcceptor(Arc<AtomicUsize>);
+    impl MetricConnectionAcceptor for RejectingAcceptor {
+        fn accept(&self, _stream: TcpStream) -> MetricAcceptFuture {
+            let calls = Arc::clone(&self.0);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("rejected by test connection policy"))
+            })
+        }
+    }
+
+    let fixture = Fixture::new("127.0.0.1:1").await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (mut collector, _) = MetricCollector::bind_for_routing_endpoint(
+        fixture.handle,
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1",
+        Arc::new(RejectingAcceptor(Arc::clone(&calls))),
+    )
+    .await?;
+    collector.shared.serving.activate(fixture.lease.token());
+    let listener = collector.listener.take().ok_or("listener")?;
+    let address = collector.local_addr();
+    let server = tokio::spawn(service::serve(listener, Arc::clone(&collector.shared)));
+    let mut client = TcpStream::connect(address).await?;
+    client.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
+    let mut body = Vec::new();
+    let read = client.read_to_end(&mut body).await;
+    assert!(
+        body.is_empty(),
+        "a rejected transport reaches no HTTP parser"
+    );
+    assert!(
+        read.is_ok() || read.is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset),
+        "the rejected TCP connection either closes or resets"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+    let _ = server.await;
+    Ok(())
 }
 
 #[tokio::test]

@@ -14,24 +14,32 @@
 
 //! Composition-root wiring for CP-TOPO self-registration.
 //!
-//! The [`TopologyCandidateValidator`] reads the backend-cluster TLS PEM material
-//! once, at validation time, and binds it into a [`PreparedClusterSet`] carried
-//! by the published snapshot's opaque `PreparedArtifact`. The
-//! [`ArtifactClusterFactory`] then downcasts that artifact and hands the module
-//! the already-built clients without re-reading any file, so a swap or delete of
-//! the PEM between validation and application cannot change the material a
-//! generation registers with (closing the validate->apply TOCTOU).
+//! The serving and [`TopologyCandidateValidator`] stages read HTTP-server and
+//! backend-cluster TLS PEM material once, at validation time, and bind it into a
+//! [`PreparedProcessSet`] carried by the published snapshot's opaque
+//! `PreparedArtifact`. Runtime factories and acceptors then consume the retained
+//! identities without re-reading any file, so a swap or deletion between
+//! validation and application cannot change what a generation serves or
+//! registers with (closing the validate->apply TOCTOU).
 
-use std::net::IpAddr;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use control_config::{
-    CandidateValidator, ClientTlsConfig, ConfigNamespaceSnapshot, EffectiveConfig, NamespaceConfig,
-    PreparedArtifact, TopologyConfig,
+    CandidateValidator, ClientTlsConfig, ConfigNamespaceSnapshot, ConfigNamespaceSource,
+    EffectiveConfig, NamespaceConfig, PreparedArtifact, TopologyConfig,
 };
 use control_external::{EtcdClientConfig, EtcdTlsConfig, EtcdTlsPolicy, EtcdTlsVersion};
-use control_topology::{TopologyClientFactory, TopologyClusterClient};
+use control_topology::{
+    MetricAcceptFuture, MetricConnectionAcceptor, MetricConnectionStream, TopologyClientFactory,
+    TopologyClusterClient,
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::config_composition::PreparedServingSet;
 use crate::tls_material::{TlsRoots, read_tls_material};
 
 /// The concrete artifact a [`TopologyCandidateValidator`] prepares: the exact
@@ -46,6 +54,176 @@ use crate::tls_material::{TlsRoots, read_tls_material};
 pub struct PreparedClusterSet {
     topology: TopologyConfig,
     clusters: Vec<TopologyClusterClient>,
+}
+
+/// Complete process-local artifact retained by an accepted config generation.
+///
+/// Serving and topology validation remain ordered independent stages. Their
+/// outputs are combined only after every stage succeeds, so the source
+/// publishes one opaque handle containing the exact HTTP server identity and
+/// topology clients that were prepared from that candidate.
+pub(crate) struct PreparedProcessSet {
+    serving: PreparedServingSet,
+    topology: PreparedClusterSet,
+}
+
+impl PreparedProcessSet {
+    #[must_use]
+    pub(crate) fn server_http_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.serving.server_http_tls()
+    }
+}
+
+/// Applies the server-HTTP TLS identity retained by the currently accepted
+/// process generation to metric owner connections.
+///
+/// The acceptor never reads PEM paths. Every handshake, request, response, and
+/// flush poll is generation-fenced; once the config source advances, the old
+/// connection rejects further I/O while the collector's next accept captures
+/// the new prepared identity.
+pub(crate) struct MetricServerConnectionAcceptor {
+    source: Arc<dyn ConfigNamespaceSource>,
+}
+
+impl MetricServerConnectionAcceptor {
+    #[must_use]
+    pub(crate) fn new(source: Arc<dyn ConfigNamespaceSource>) -> Self {
+        Self { source }
+    }
+}
+
+struct ConfigGenerationStream<S> {
+    inner: S,
+    snapshot: Arc<ConfigNamespaceSnapshot>,
+    source: Arc<dyn ConfigNamespaceSource>,
+}
+
+impl<S> ConfigGenerationStream<S> {
+    fn new(
+        inner: S,
+        snapshot: Arc<ConfigNamespaceSnapshot>,
+        source: Arc<dyn ConfigNamespaceSource>,
+    ) -> Self {
+        Self {
+            inner,
+            snapshot,
+            source,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        Arc::ptr_eq(&self.snapshot, &self.source.current())
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ConfigGenerationStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.is_current() {
+            return Poll::Ready(Err(io::Error::other(
+                "metric server policy generation retired",
+            )));
+        }
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ConfigGenerationStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        if !self.is_current() {
+            return Poll::Ready(Err(io::Error::other(
+                "metric server policy generation retired",
+            )));
+        }
+        Pin::new(&mut self.inner).poll_write(context, bytes)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        if !self.is_current() {
+            return Poll::Ready(Err(io::Error::other(
+                "metric server policy generation retired",
+            )));
+        }
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        if !self.is_current() {
+            return Poll::Ready(Err(io::Error::other(
+                "metric server policy generation retired",
+            )));
+        }
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+impl MetricConnectionAcceptor for MetricServerConnectionAcceptor {
+    fn accept(&self, stream: tokio::net::TcpStream) -> MetricAcceptFuture {
+        let source = Arc::clone(&self.source);
+        Box::pin(async move {
+            let snapshot = source.current();
+            let prepared = snapshot
+                .prepared()
+                .downcast_ref::<PreparedProcessSet>()
+                .ok_or_else(|| io::Error::other("prepared metric server policy missing"))?;
+            let stream =
+                ConfigGenerationStream::new(stream, Arc::clone(&snapshot), Arc::clone(&source));
+            let connection: MetricConnectionStream =
+                if let Some(config) = prepared.server_http_tls() {
+                    Box::new(
+                        tokio_rustls::TlsAcceptor::from(config)
+                            .accept(stream)
+                            .await
+                            .map_err(|_| io::Error::other("metric TLS handshake failed"))?,
+                    )
+                } else {
+                    Box::new(stream)
+                };
+            Ok(connection)
+        })
+    }
+}
+
+/// Selects a local port-zero bind from the SQL listener's restart-pinned bind
+/// host. A concrete IP is reused; wildcard or hostname binds select a wildcard
+/// matching an advertised IP literal, defaulting DNS names to IPv4. The
+/// separately resolved topology advertise host is what peers receive through
+/// election.
+#[must_use]
+pub(crate) fn metric_owner_bind_address(
+    topology: &TopologyConfig,
+    advertised_host: &str,
+) -> SocketAddr {
+    let host = topology.bind_sql_host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let advertised_host = advertised_host.trim();
+    let advertised_host = advertised_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(advertised_host);
+    match host.parse::<IpAddr>() {
+        Ok(ip) if !ip.is_unspecified() => SocketAddr::new(ip, 0),
+        _ => match advertised_host.parse::<IpAddr>() {
+            Ok(IpAddr::V6(_)) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+            Ok(IpAddr::V4(_)) | Err(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        },
+    }
 }
 
 impl PreparedClusterSet {
@@ -165,9 +343,9 @@ fn cluster_tls_material(
 /// The serving validator runs first so a serving-TLS or protocol rejection fails
 /// the candidate before routing identity is accepted or topology material is
 /// prepared. The routing validator then rejects ambiguous nonempty frontend-user
-/// identity, and the topology validator prepares the [`PreparedClusterSet`] that
-/// becomes the generation's published artifact. Only the topology stage prepares
-/// a retained artifact today, so exactly one artifact is published per accepted
+/// identity, and the topology validator prepares the [`PreparedClusterSet`]. The
+/// two retained outputs are combined into one [`PreparedProcessSet`] only after
+/// every stage succeeds, so exactly one artifact is published per accepted
 /// generation.
 pub struct CompositeCandidateValidator {
     serving: Arc<dyn CandidateValidator>,
@@ -197,18 +375,29 @@ impl CandidateValidator for CompositeCandidateValidator {
         effective: &EffectiveConfig,
         namespaces: &[NamespaceConfig],
     ) -> Result<PreparedArtifact, &'static str> {
-        // Serving and routing validate first and prepare nothing retained today;
-        // their artifacts are intentionally discarded. Topology prepares the
-        // published artifact.
-        let _ = self.serving.validate(effective, namespaces)?;
+        let serving = self.serving.validate(effective, namespaces)?;
         let _ = self.routing.validate(effective, namespaces)?;
-        self.topology.validate(effective, namespaces)
+        let topology = self.topology.validate(effective, namespaces)?;
+        let serving = serving
+            .downcast_ref::<PreparedServingSet>()
+            .ok_or("prepared serving set missing")?;
+        let topology = topology
+            .downcast_ref::<PreparedClusterSet>()
+            .ok_or("prepared topology cluster set missing")?;
+        Ok(PreparedArtifact::new(Arc::new(PreparedProcessSet {
+            serving: serving.clone(),
+            topology: PreparedClusterSet {
+                topology: topology.topology.clone(),
+                clusters: topology.clusters.clone(),
+            },
+        })))
     }
 }
 
 /// Builds a generation's cluster clients by downcasting the snapshot's opaque
-/// artifact to the [`PreparedClusterSet`] the [`TopologyCandidateValidator`]
-/// prepared — with no PEM re-read.
+/// artifact to the [`PreparedProcessSet`] composed from the serving and topology
+/// validators (or a standalone [`PreparedClusterSet`] in focused factory tests)
+/// — with no PEM re-read.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ArtifactClusterFactory;
 
@@ -242,7 +431,11 @@ impl TopologyClientFactory for ArtifactClusterFactory {
         // registered with re-read or missing material.
         let set = snapshot
             .prepared()
-            .downcast_ref::<PreparedClusterSet>()
+            .downcast_ref::<PreparedProcessSet>()
+            .map_or_else(
+                || snapshot.prepared().downcast_ref::<PreparedClusterSet>(),
+                |process| Some(&process.topology),
+            )
             .ok_or_else(|| "prepared topology cluster set missing".to_owned())?;
         // Closed loop: the artifact must belong to exactly this snapshot. A
         // same-type artifact bound to a different normalized projection (a
@@ -263,12 +456,23 @@ impl TopologyClientFactory for ArtifactClusterFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactClusterFactory, TopologyCandidateValidator, interface_advertise_candidates,
+        ArtifactClusterFactory, CompositeCandidateValidator, ConfigGenerationStream,
+        MetricServerConnectionAcceptor, PreparedProcessSet, TopologyCandidateValidator,
+        interface_advertise_candidates, metric_owner_bind_address,
     };
     use std::sync::Arc;
 
-    use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
-    use control_topology::TopologyClientFactory;
+    use control_config::{CandidateValidator, ConfigNamespaceSource, ConfigNamespaceStore};
+    use control_proto::snapshot::SnapshotStore;
+    use control_router::RouteCandidateValidator;
+    use control_topology::{MetricConnectionAcceptor, TopologyClientFactory};
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, ServerName};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsConnector;
+
+    use crate::config_composition::ServingCandidateValidator;
 
     fn config_toml(max_connections: u64, ca_path: &str) -> Vec<u8> {
         config_toml_named(max_connections, ca_path, "cluster-a")
@@ -277,6 +481,8 @@ mod tests {
     fn config_toml_named(max_connections: u64, ca_path: &str, cluster: &str) -> Vec<u8> {
         format!(
             r#"
+enable-traffic-replay = false
+
 [proxy]
 addr = "0.0.0.0:6000"
 max-connections = {max_connections}
@@ -468,6 +674,189 @@ ca = "{ca_path}"
         for candidate in interface_advertise_candidates() {
             let _ = candidate.is_loopback();
         }
+    }
+
+    #[test]
+    fn metric_owner_bind_follows_concrete_sql_or_advertised_ip_family() {
+        let dir = std::env::temp_dir();
+        let store = ConfigNamespaceStore::from_toml(&config_toml(100, ""), None, &dir)
+            .unwrap_or_else(|error| unreachable!("generation 1: {error}"));
+        let mut topology = store
+            .current()
+            .topology()
+            .unwrap_or_else(|error| unreachable!("topology: {error}"));
+
+        assert_eq!(
+            metric_owner_bind_address(&topology, "192.0.2.10"),
+            "0.0.0.0:0"
+                .parse()
+                .unwrap_or_else(|error| unreachable!("address: {error}")),
+            "a wildcard SQL bind uses the advertised IPv4 family"
+        );
+        assert_eq!(
+            metric_owner_bind_address(&topology, "2001:db8::10"),
+            "[::]:0"
+                .parse()
+                .unwrap_or_else(|error| unreachable!("address: {error}")),
+            "a wildcard SQL bind uses the advertised IPv6 family"
+        );
+        topology.bind_sql_host = Arc::from("127.0.0.1");
+        assert_eq!(
+            metric_owner_bind_address(&topology, "metric.example"),
+            "127.0.0.1:0"
+                .parse()
+                .unwrap_or_else(|error| unreachable!("address: {error}")),
+            "a concrete SQL bind remains the local metric bind"
+        );
+    }
+
+    #[test]
+    fn composite_generation_retains_serving_and_topology_artifacts() {
+        let dir = std::env::temp_dir();
+        let roots = Arc::new(crate::tls_material::open_tls_roots(std::slice::from_ref(
+            &dir,
+        )));
+        let validator: Arc<dyn CandidateValidator> = Arc::new(CompositeCandidateValidator::new(
+            Arc::new(ServingCandidateValidator::new(
+                SnapshotStore::new([dir.clone()])
+                    .unwrap_or_else(|error| unreachable!("snapshot store: {error}")),
+                None,
+            )),
+            Arc::new(RouteCandidateValidator),
+            Arc::new(TopologyCandidateValidator::new(roots)),
+        ));
+        let store = ConfigNamespaceStore::from_toml_with_validator(
+            &config_toml(100, ""),
+            None,
+            &dir,
+            validator,
+        )
+        .unwrap_or_else(|error| unreachable!("generation 1: {error}"));
+        let current = store.current();
+        let process = current
+            .prepared()
+            .downcast_ref::<PreparedProcessSet>()
+            .unwrap_or_else(|| unreachable!("complete process artifact"));
+        assert!(process.server_http_tls().is_none());
+        assert_eq!(
+            ArtifactClusterFactory
+                .build(&current)
+                .unwrap_or_else(|error| unreachable!("factory: {error}"))
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_connection_io_is_fenced_by_the_exact_config_generation() {
+        let dir = std::env::temp_dir();
+        let store = Arc::new(
+            ConfigNamespaceStore::from_toml(&config_toml(100, ""), None, &dir)
+                .unwrap_or_else(|error| unreachable!("generation 1: {error}")),
+        );
+        let snapshot = store.current();
+        let source: Arc<dyn ConfigNamespaceSource> = store.clone();
+        let (mut peer, stream) = tokio::io::duplex(32);
+        let mut stream = ConfigGenerationStream::new(stream, snapshot, source);
+
+        stream
+            .write_all(b"a")
+            .await
+            .unwrap_or_else(|error| unreachable!("current write: {error}"));
+        let mut byte = [0];
+        peer.read_exact(&mut byte)
+            .await
+            .unwrap_or_else(|error| unreachable!("current read: {error}"));
+        assert_eq!(byte, *b"a");
+
+        store
+            .apply_toml(&config_toml(101, ""), None, 2, &dir)
+            .unwrap_or_else(|error| unreachable!("generation 2: {error}"))
+            .unwrap_or_else(|| unreachable!("changed config publishes"));
+        assert!(
+            stream.write_all(b"b").await.is_err(),
+            "a retired TLS/plaintext connection cannot write another byte"
+        );
+        assert!(
+            stream.read_exact(&mut byte).await.is_err(),
+            "a retired TLS/plaintext connection cannot read another byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_tls_uses_retained_material_after_the_pem_files_are_deleted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir();
+        let name = format!("tiproxy-metric-owner-{}", std::process::id());
+        let certificate_path = dir.join(format!("{name}.crt"));
+        let private_key_path = dir.join(format!("{name}.key"));
+        let generated = rcgen::generate_simple_self_signed(["localhost".to_owned()])?;
+        let certificate_pem = generated.cert.pem();
+        std::fs::write(&certificate_path, &certificate_pem)?;
+        std::fs::write(&private_key_path, generated.signing_key.serialize_pem())?;
+        let config = format!(
+            "{}\n[security.server-http-tls]\ncert = {:?}\nkey = {:?}\nmin-tls-version = \"1.2\"\n",
+            String::from_utf8(config_toml(100, ""))?,
+            certificate_path,
+            private_key_path,
+        );
+        let roots = Arc::new(crate::tls_material::open_tls_roots(std::slice::from_ref(
+            &dir,
+        )));
+        let validator: Arc<dyn CandidateValidator> = Arc::new(CompositeCandidateValidator::new(
+            Arc::new(ServingCandidateValidator::new(
+                SnapshotStore::new([dir.clone()])?,
+                None,
+            )),
+            Arc::new(RouteCandidateValidator),
+            Arc::new(TopologyCandidateValidator::new(roots)),
+        ));
+        let store = Arc::new(ConfigNamespaceStore::from_toml_with_validator(
+            config.as_bytes(),
+            None,
+            &dir,
+            validator,
+        )?);
+        assert!(
+            store
+                .current()
+                .prepared()
+                .downcast_ref::<PreparedProcessSet>()
+                .and_then(PreparedProcessSet::server_http_tls)
+                .is_some(),
+            "the complete process artifact retains the server identity"
+        );
+
+        std::fs::remove_file(&certificate_path)?;
+        std::fs::remove_file(&private_key_path)?;
+
+        let source: Arc<dyn ConfigNamespaceSource> = store;
+        let acceptor = MetricServerConnectionAcceptor::new(source);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut stream = acceptor.accept(stream).await?;
+            stream.write_all(b"ok").await?;
+            stream.flush().await
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in CertificateDer::pem_slice_iter(certificate_pem.as_bytes()) {
+            roots.add(certificate?)?;
+        }
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let stream = TcpStream::connect(address).await?;
+        let mut stream = TlsConnector::from(Arc::new(client))
+            .connect(ServerName::try_from("localhost")?.to_owned(), stream)
+            .await?;
+        let mut body = [0; 2];
+        stream.read_exact(&mut body).await?;
+        assert_eq!(&body, b"ok");
+        server.await??;
+        Ok(())
     }
 }
 

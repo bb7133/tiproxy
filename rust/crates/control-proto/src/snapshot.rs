@@ -691,6 +691,30 @@ impl SnapshotStore {
             .map(|_| ())
     }
 
+    /// Validates and prepares one detached server TLS identity without
+    /// publishing snapshot state.
+    ///
+    /// This is the retained counterpart of [`Self::validate_tls_material`] for
+    /// process-local HTTP services. The returned `ServerConfig` owns the exact
+    /// certificate, key, client-CA, common-name policy, and protocol-version
+    /// material read during candidate validation, so the eventual listener
+    /// never re-reads paths after the generation is published. `None` means the
+    /// accepted policy is plaintext.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded validation errors as
+    /// [`Self::validate_tls_material`].
+    pub fn prepare_server_tls(
+        &self,
+        field: &str,
+        policy: &TlsPolicy,
+        now: UnixTime,
+    ) -> Result<Option<Arc<ServerConfig>>, SnapshotError> {
+        self.validate_tls(field, Some(policy), now, true)
+            .map(|(_, server)| server)
+    }
+
     /// Phase two: publishes a staged snapshot. The staged token still
     /// holds the store's writer reservation, so **no concurrent writer
     /// can have advanced the store between the phases** — the commit

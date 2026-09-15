@@ -73,6 +73,23 @@ pub struct ServingCandidateValidator {
     drain_grace_override: Option<Duration>,
 }
 
+/// Server-HTTP TLS identity prepared with the accepted config generation.
+///
+/// The opaque config artifact retains this value together with topology
+/// clients, so the metric owner listener can select plaintext or the exact
+/// accepted TLS identity without re-reading a path after publication.
+#[derive(Clone)]
+pub(crate) struct PreparedServingSet {
+    server_http_tls: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl PreparedServingSet {
+    #[must_use]
+    pub(crate) fn server_http_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.server_http_tls.clone()
+    }
+}
+
 /// Supervised adapter applying every accepted CP-CFG generation to both the
 /// CP-001 dynamic subset and the SQL serving snapshot. The source validator
 /// makes these applications deterministic; any unexpected failure terminates
@@ -222,7 +239,11 @@ impl CandidateValidator for ServingCandidateValidator {
         self.snapshots
             .validate_composed(1, 1, candidate, unix_time_now())
             .map_err(|_| "serving_validation")?;
-        self.validate_material("server_http_tls", effective.server_http_tls(), now, true)?;
+        let server_http_policy = wire_tls(&effective.server_http_tls().material_policy());
+        let server_http_tls = self
+            .snapshots
+            .prepare_server_tls("server_http_tls", &server_http_policy, now)
+            .map_err(|_| "tls_material_validation")?;
         self.validate_material("cluster_tls", effective.cluster_tls(), now, false)?;
         for namespace in namespaces {
             self.validate_material(
@@ -233,7 +254,9 @@ impl CandidateValidator for ServingCandidateValidator {
             )?;
             self.validate_material("namespace_backend_tls", namespace.backend_tls(), now, false)?;
         }
-        Ok(PreparedArtifact::empty())
+        Ok(PreparedArtifact::new(Arc::new(PreparedServingSet {
+            server_http_tls,
+        })))
     }
 }
 
