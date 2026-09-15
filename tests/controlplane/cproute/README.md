@@ -116,8 +116,11 @@ and port tables are refreshed under the ledger lock only when the observed R/H
 pair changes. Their cost, plus per-selection sorting, needs workload measurement
 before production composition in 220-3.
 
-The new API is **not wired to dataplane or tiproxy-rs**; the evidence gate rejects
-those manifest dependencies. Resource (including the global default), location,
+At the 220-2 checkpoint the new API was **not wired to dataplane or
+tiproxy-rs**; that checkpoint's evidence rejected those manifest dependencies.
+The later #223 T1 composition boundary is documented below and now flips the
+entrypoint to require process-root ownership without a direct dataplane crate
+dependency. Resource (including the global default), location,
 nonempty proxy-zone metadata and static-only
 fallback return typed Unsupported before reservation. Global config acceptance
 is unchanged. Static backends must later obtain authoritative health; namespace
@@ -332,7 +335,8 @@ window row specifically. The full entry contains 46 mutations (6 group,
 `make controlplane-cproute-resource-evidence` adds actual factor reservations,
 automatic query lifetimes, static-empty qualification and missing-metric source
 windows. See [resource/README.md](resource/README.md). The original entrypoint
-and its 46 mutations remain unchanged; production composition remains gated.
+and its 46 mutations remain mandatory; #223 T1 additionally requires the
+production `RoutePlane` dependency and construction at the process root.
 
 
 ### Isolated migration ledger and bounded admission

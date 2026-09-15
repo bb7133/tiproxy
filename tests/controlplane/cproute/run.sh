@@ -26,10 +26,19 @@ if grep -R -n -E 'control_proto|control-proto' \
     echo "CP-ROUTE domain leaks the legacy protocol dependency" >&2
     exit 1
 fi
-# Temporary selector capability gaps must never reach production callers.
-if grep -n -E 'control-router|control_router' \
-    rust/crates/dataplane/Cargo.toml rust/crates/tiproxy-rs/Cargo.toml; then
-    echo "CP-ROUTE staged selector is prematurely wired to production" >&2
+# T1 composes the Rust route owner at the process root, while the session
+# dataplane remains behind the route-channel abstraction and cannot take a
+# direct dependency on the owner crate.
+if grep -n -E 'control-router|control_router' rust/crates/dataplane/Cargo.toml; then
+    echo "CP-ROUTE owner leaked into the session dataplane" >&2
+    exit 1
+fi
+if ! grep -q -E '^control-router\.workspace = true$' rust/crates/tiproxy-rs/Cargo.toml; then
+    echo "CP-ROUTE owner is missing from the Rust process composition" >&2
+    exit 1
+fi
+if ! grep -q 'RoutePlane::new(' rust/crates/tiproxy-rs/src/main.rs; then
+    echo "CP-ROUTE production RoutePlane is not constructed" >&2
     exit 1
 fi
 while IFS= read -r file; do
