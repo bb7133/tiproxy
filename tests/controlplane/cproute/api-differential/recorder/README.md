@@ -122,17 +122,18 @@ workload forms a product of listeners and optional source addresses. The client 
 must cover that declared product or the attempt is rejected before capture; a scripted
 one-shot probe may then reserve one product target outside the recurring rotation. The
 clients still drive complete connect/query/close lifecycles.
-N02 and N03 workloads use 64 concurrent clients instead of the default eight. All
-64 recurring clients use the matching ClientCIDR source or ProxyCIDR listener. Each
-script also declares exactly one 10-second `client_probe` through the other, no-match
+N02 and N03 use the same eight concurrent clients as the other normal slots. All
+eight recurring clients use the matching ClientCIDR source or ProxyCIDR listener.
+Each script also declares exactly one 10-second `client_probe` through the other, no-match
 target; it performs one real MySQL connection attempt and remains visible in the
 ordinary workload counters and public API trace. Excluding that target from the
 recurring rotation avoids a continuous `ErrNoBackend` → observer-refresh loop that
 would otherwise collapse the backend-loss observation window, while preserving the
 same real proxy path, fault schedule, validator and production router behavior.
 `record_slot.py` proves the probe is unique and no-match, every recurring target is
-matching, N02/N03 remain at 64 clients, and the other four normal slots remain at
-eight clients.
+matching, and all six normal slots remain at eight clients. Keeping the recurring
+rate common also avoids exhausting the macOS loopback ephemeral-port range before
+the first declared backend fault.
 
 `-held-clients` adds
 supplemental long-lived query sessions for real redirect/force-close callbacks;

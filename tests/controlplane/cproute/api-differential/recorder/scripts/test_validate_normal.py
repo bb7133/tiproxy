@@ -180,13 +180,13 @@ class NormalValidatorTests(unittest.TestCase):
         bad["N03"]["go_rule"] = "proxy-cidr"
         bad["N05"]["held_clients"] = "2"
         bad["N02"]["redirection"] = "on"
-        bad["N02"]["clients"] = "8"
-        bad["N03"]["clients"] = "8"
+        bad["N02"]["clients"] = "64"
+        bad["N03"]["clients"] = "64"
         del bad["N06"]
         problems = record_slot.preflight(bad)
         for needle in ("N01: duration 30s below plan minimum", "N01: clients='64', plan requires '8'",
-                       "N02: clients='8', plan requires '64'",
-                       "N03: clients='8', plan requires '64'", "N03: go_rule='proxy-cidr'",
+                       "N02: clients='64', plan requires '8'",
+                       "N03: clients='64', plan requires '8'", "N03: go_rule='proxy-cidr'",
                        "N05: held_clients='2'", "N02: normal family is recorded with redirection off",
                        "differ from the plan's normal rows"):
             self.assertTrue(any(needle in p for p in problems), (needle, problems))

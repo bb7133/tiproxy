@@ -37,7 +37,7 @@ FAMILIES = {  # slot prefix -> plan family, validator, verdict file, frozen redi
     "N": ("normal", validate_normal, "normal-validation.json", "off"),
     "C": ("config-source", validate_config, "config-validation.json", "on"),
 }
-NORMAL_CLIENTS = {f"N{i:02d}": ("64" if i in (2, 3) else "8") for i in range(1, 7)}
+NORMAL_CLIENTS = {f"N{i:02d}": "8" for i in range(1, 7)}
 
 
 def sh(*cmd):
