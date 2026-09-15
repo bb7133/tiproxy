@@ -21,7 +21,7 @@ In a finally block: an added tidb-4 is removed, an instance whose runtime labels
 config labels is restarted (TiDB cannot delete runtime labels), and with --clear-labels configured
 labels are cleared.
 """
-import argparse, csv, json, os, subprocess, sys
+import argparse, csv, ipaddress, json, os, subprocess, sys
 from pathlib import Path
 
 import gen_config_scripts
@@ -71,18 +71,65 @@ def preflight(rows, family="normal"):
             problems += config_row_problems(slot, r)
         if sorted(validate_normal.parse_labels(r["labels"])) != INSTANCES:
             problems.append(f"{slot}: labels must declare exactly {INSTANCES}")
+        actions = None
         try:
             actions = json.loads((HERE / r["script"]).read_text())
             if not isinstance(actions, list) or not actions:
                 problems.append(f"{slot}: script {r['script']} is not a non-empty action list")
         except (OSError, ValueError) as err:
             problems.append(f"{slot}: script {r['script']}: {err}")
+        if family == "normal" and isinstance(actions, list):
+            problems += normal_probe_problems(slot, r, actions)
         want_listeners = 2 if r["go_rule"] in ("proxy_cidr", "port") else 1
         if len(r["listen"].split(",")) != want_listeners:
             problems.append(f"{slot}: rule {r['go_rule']!r} needs {want_listeners} listener(s)")
         if r["go_rule"] == "client_cidr" and len(r["sources"].split(",")) != 2:
             problems.append(f"{slot}: client_cidr needs two client source addresses")
     return problems
+
+
+def normal_probe_problems(slot, row, actions):
+    """Bind one real no-match probe while every recurring CIDR target matches."""
+    problems = []
+    probes = [a for a in actions if isinstance(a, dict) and a.get("kind") == "client_probe"]
+    expected = slot in ("N02", "N03")
+    if len(probes) != (1 if expected else 0):
+        problems.append(f"{slot}: expected {1 if expected else 0} client_probe action(s), got {len(probes)}")
+        return problems
+    if not expected:
+        return problems
+    probe = probes[0]
+    if probe.get("at_ms") != 10000 or probe.get("timeout_ms") != 5000:
+        problems.append(f"{slot}: client_probe must use at_ms=10000 and timeout_ms=5000")
+    target = (probe.get("listener", ""), probe.get("source", ""))
+    listeners = row["listen"].split(",")
+    sources = row["sources"].split(",") if row["sources"] else [""]
+    all_targets = [(listener, source) for listener in listeners for source in sources]
+    if target not in all_targets:
+        problems.append(f"{slot}: client_probe target {target} is not in declared listener/source product")
+        return problems
+    if target_matches(row, *target):
+        problems.append(f"{slot}: client_probe target {target} is not a no-match context")
+    regular = [candidate for candidate in all_targets if candidate != target]
+    if not regular:
+        problems.append(f"{slot}: client_probe leaves no recurring client target")
+    for candidate in regular:
+        if not target_matches(row, *candidate):
+            problems.append(f"{slot}: recurring target {candidate} is not a matching context")
+    return problems
+
+
+def target_matches(row, listener, source):
+    labels = validate_normal.parse_labels(row["labels"])
+    if row["go_rule"] == "client_cidr":
+        address = source
+    elif row["go_rule"] == "proxy_cidr":
+        address = listener.rsplit(":", 1)[0]
+    else:
+        return True
+    return any("cidr" in backend_labels and
+               ipaddress.ip_address(address) in ipaddress.ip_network(backend_labels["cidr"], strict=False)
+               for backend_labels in labels.values())
 
 
 def config_row_problems(slot, r):

@@ -65,8 +65,8 @@ type Action struct {
 	FailoverTimeoutSeconds int64    `json:"failover_timeout_seconds,omitempty"`
 	EffectControl          string   `json:"effect_control,omitempty"` // refuse | delay; armed atomically with failover_select
 	Backends               []string `json:"backends,omitempty"`       // lifecycle_open: predetermined temporary exclusions
-	Listener               string   `json:"listener,omitempty"`       // lifecycle_open real client endpoint
-	Source                 string   `json:"source,omitempty"`         // lifecycle_open optional loopback source
+	Listener               string   `json:"listener,omitempty"`       // lifecycle_open/client_probe real client endpoint
+	Source                 string   `json:"source,omitempty"`         // lifecycle_open/client_probe optional loopback source
 }
 
 type environmentComponent struct {
@@ -181,6 +181,9 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 			return errors.New("-env is required by env actions")
 		}
 		scriptSHA = fmt.Sprintf("%x", sha256.Sum256(scriptData))
+	}
+	if err := wl.ConfigureProbeTargets(probeTargets(actions)); err != nil {
+		return err
 	}
 	envManifestData, envManifestSHA, err := loadEnvironmentManifest(envManifestPath)
 	if err != nil {
@@ -405,6 +408,10 @@ func run(slot, attempt, policyName, selection, rule, listen, pd string, duration
 					return
 				}
 				fetcher.Set(fault)
+			case "client_probe":
+				probeCtx, cancelProbe := context.WithTimeout(runCtx, actionTimeout(a))
+				_ = wl.Probe(probeCtx, a.Listener, a.Source)
+				cancelProbe()
 			case "lifecycle_open":
 				if lifecycleConn != nil {
 					markIncomplete("lifecycle_open repeated")
@@ -647,8 +654,11 @@ func validateActions(actions []Action) error {
 		if a.EffectControl != "" && a.Kind != "failover_select" {
 			return fmt.Errorf("action %d: effect_control is only valid for failover_select", i)
 		}
-		if (len(a.Backends) != 0 || a.Listener != "" || a.Source != "") && a.Kind != "lifecycle_open" {
-			return fmt.Errorf("action %d: backends/listener/source are only valid for lifecycle_open", i)
+		if len(a.Backends) != 0 && a.Kind != "lifecycle_open" {
+			return fmt.Errorf("action %d: backends is only valid for lifecycle_open", i)
+		}
+		if (a.Listener != "" || a.Source != "") && a.Kind != "lifecycle_open" && a.Kind != "client_probe" {
+			return fmt.Errorf("action %d: listener/source are only valid for lifecycle_open/client_probe", i)
 		}
 		if pendingEnvironment && a.Kind != "env" && a.Kind != "await_env" {
 			return fmt.Errorf("action %d: env batch requires await_env before %q", i, a.Kind)
@@ -665,6 +675,10 @@ func validateActions(actions []Action) error {
 			}
 			pendingEnvironment = false
 		case "config", "checkpoint", "refuse_next_effect":
+		case "client_probe":
+			if a.Listener == "" || a.TimeoutMillis <= 0 {
+				return fmt.Errorf("action %d: client_probe requires listener and a positive timeout_ms", i)
+			}
 		case "lifecycle_open":
 			if lifecycleOpened {
 				return fmt.Errorf("action %d: lifecycle_open may appear only once", i)
@@ -738,8 +752,8 @@ func validateActions(actions []Action) error {
 		default:
 			return fmt.Errorf("action %d: unsupported kind %q", i, a.Kind)
 		}
-		if a.TimeoutMillis != 0 && a.Kind != "close_delayed_redirect" && a.Kind != "lifecycle_open" && a.Kind != "router_reset" {
-			return fmt.Errorf("action %d: timeout_ms is only valid for close_delayed_redirect/lifecycle_open/router_reset", i)
+		if a.TimeoutMillis != 0 && a.Kind != "close_delayed_redirect" && a.Kind != "lifecycle_open" && a.Kind != "router_reset" && a.Kind != "client_probe" {
+			return fmt.Errorf("action %d: timeout_ms is only valid for close_delayed_redirect/lifecycle_open/router_reset/client_probe", i)
 		}
 	}
 	if pendingEnvironment {
@@ -755,6 +769,16 @@ func validateActions(actions []Action) error {
 		return errors.New("action script lifecycle_open must be followed by exactly one router_reset")
 	}
 	return nil
+}
+
+func probeTargets(actions []Action) []harness.ClientTarget {
+	targets := make([]harness.ClientTarget, 0)
+	for _, action := range actions {
+		if action.Kind == "client_probe" {
+			targets = append(targets, harness.ClientTarget{Listener: action.Listener, Source: action.Source})
+		}
+	}
+	return targets
 }
 
 func requiresEnvironmentDriver(actions []Action) bool {

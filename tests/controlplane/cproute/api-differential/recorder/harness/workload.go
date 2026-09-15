@@ -29,19 +29,51 @@ var heldDialCounter atomic.Uint64
 // supplemental long-lived sessions so failover scripts can exercise real
 // redirect and force-close callbacks while the lifecycle workload continues.
 type Workload struct {
-	Listener    string   // legacy single listener; ignored when Listeners is nonempty
-	Listeners   []string // proxy listener host:ports
-	Sources     []string // loopback source IPs; empty = default
-	Clients     int
-	HeldClients int
-	Pause       time.Duration
-	User        string
-	completed   atomic.Int64
-	failed      atomic.Int64
-	heldQueries atomic.Int64
-	heldFailed  atomic.Int64
-	heldMu      sync.Mutex
-	heldHistory map[string][]*heldInterval
+	Listener     string   // legacy single listener; ignored when Listeners is nonempty
+	Listeners    []string // proxy listener host:ports
+	Sources      []string // loopback source IPs; empty = default
+	Clients      int
+	HeldClients  int
+	Pause        time.Duration
+	User         string
+	completed    atomic.Int64
+	failed       atomic.Int64
+	heldQueries  atomic.Int64
+	heldFailed   atomic.Int64
+	heldMu       sync.Mutex
+	heldHistory  map[string][]*heldInterval
+	probeTargets map[ClientTarget]struct{}
+}
+
+// ClientTarget identifies one real proxy listener/source-address context.
+type ClientTarget struct {
+	Listener string
+	Source   string
+}
+
+// ConfigureProbeTargets removes declared one-shot probes from the recurring
+// client rotation. This keeps an explicit no-match context in the recording
+// without continuously driving ErrNoBackend and its observer refresh path.
+func (w *Workload) ConfigureProbeTargets(targets []ClientTarget) error {
+	configured := make(map[ClientTarget]struct{}, len(targets))
+	available := make(map[ClientTarget]struct{})
+	for _, target := range w.allTargets() {
+		available[target] = struct{}{}
+	}
+	for _, target := range targets {
+		if _, ok := available[target]; !ok {
+			return fmt.Errorf("probe target %s/%s is not a configured listener/source combination", target.Listener, target.Source)
+		}
+		if _, duplicate := configured[target]; duplicate {
+			return fmt.Errorf("probe target %s/%s is duplicated", target.Listener, target.Source)
+		}
+		configured[target] = struct{}{}
+	}
+	if len(configured) == len(available) && len(configured) != 0 {
+		return errors.New("probe targets exclude every recurring listener/source combination")
+	}
+	w.probeTargets = configured
+	return nil
 }
 
 // LifecycleConnection is one real MySQL client kept open across the recorder's
@@ -212,20 +244,68 @@ func (w *Workload) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+// Probe drives exactly one real MySQL connection attempt. A no-match probe is
+// expected to fail backend selection during the handshake, but still records
+// the public open/next/close sequence and is disclosed in the ordinary workload
+// failure counter. Calling Connector.Connect directly prevents database/sql
+// from transparently retrying the declared one-shot action.
+func (w *Workload) Probe(ctx context.Context, listener, source string) error {
+	connector, err := w.connector(listener, source, false)
+	if err != nil {
+		w.failed.Add(1)
+		return err
+	}
+	conn, err := connector.Connect(ctx)
+	if err != nil {
+		w.failed.Add(1)
+		return err
+	}
+	w.failed.Add(1)
+	return errors.Join(errors.New("client probe unexpectedly connected to a backend"), conn.Close())
+}
+
 func (w *Workload) target(i int) (listener, source string) {
+	targets := w.regularTargets()
+	if len(targets) == 0 {
+		return "", ""
+	}
+	target := targets[i%len(targets)]
+	return target.Listener, target.Source
+}
+
+func (w *Workload) allTargets() []ClientTarget {
 	listeners := w.Listeners
 	if len(listeners) == 0 && w.Listener != "" {
 		listeners = []string{w.Listener}
 	}
 	if len(listeners) == 0 {
-		return "", ""
+		return nil
 	}
-	listenerIndex := i
-	if len(w.Sources) > 0 {
-		source = w.Sources[i%len(w.Sources)]
-		listenerIndex = i / len(w.Sources)
+	sources := w.Sources
+	if len(sources) == 0 {
+		sources = []string{""}
 	}
-	return listeners[listenerIndex%len(listeners)], source
+	targets := make([]ClientTarget, 0, len(listeners)*len(sources))
+	for _, listener := range listeners {
+		for _, source := range sources {
+			targets = append(targets, ClientTarget{Listener: listener, Source: source})
+		}
+	}
+	return targets
+}
+
+func (w *Workload) regularTargets() []ClientTarget {
+	all := w.allTargets()
+	if len(w.probeTargets) == 0 {
+		return all
+	}
+	regular := make([]ClientTarget, 0, len(all)-len(w.probeTargets))
+	for _, target := range all {
+		if _, excluded := w.probeTargets[target]; !excluded {
+			regular = append(regular, target)
+		}
+	}
+	return regular
 }
 
 func (w *Workload) once(ctx context.Context, connector driver.Connector) error {

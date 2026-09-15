@@ -100,6 +100,7 @@ resurrect a session. An unmatched callback is preserved as a recorder error.
 The harness composes a real proxy, factor policy, PD-backed observer and cluster
 manager. Scripted actions support environment commands, an explicit `await_env`
 barrier, config changes, fetcher-boundary source-error windows, checkpoints, a
+single real client probe,
 global one-shot refusal, and one delayed real redirect callback followed by a
 scripted client close. Failover scripts use `failover_select` to take a public
 checkpoint, choose one backend currently assigned to a held client, arm an optional
@@ -117,15 +118,21 @@ real `BackendFetcher`; the real observer then publishes the error. Stopping PD a
 is not guaranteed to publish an error because the production fetcher retries.
 
 `-listen` accepts the same comma-separated address list as the real proxy and the
-workload covers listeners and optional source addresses as a product. The regular
-client count must cover every listener/source combination or the attempt is rejected
-before capture. The clients still drive complete connect/query/close lifecycles.
-N02 and N03 workloads use 64 concurrent clients instead of the default eight. The
-round-robin product therefore keeps 32 clients in the matching ClientCIDR source or
-ProxyCIDR listener and 32 in the required no-match context. This widens the real
-dial-failure window without changing the fault schedule, validator, or production
-router behavior; `record_slot.py` fails preflight if either slot is reduced or if
-any of the other four normal slots moves away from eight clients.
+workload forms a product of listeners and optional source addresses. The client count
+must cover that declared product or the attempt is rejected before capture; a scripted
+one-shot probe may then reserve one product target outside the recurring rotation. The
+clients still drive complete connect/query/close lifecycles.
+N02 and N03 workloads use 64 concurrent clients instead of the default eight. All
+64 recurring clients use the matching ClientCIDR source or ProxyCIDR listener. Each
+script also declares exactly one 10-second `client_probe` through the other, no-match
+target; it performs one real MySQL connection attempt and remains visible in the
+ordinary workload counters and public API trace. Excluding that target from the
+recurring rotation avoids a continuous `ErrNoBackend` → observer-refresh loop that
+would otherwise collapse the backend-loss observation window, while preserving the
+same real proxy path, fault schedule, validator and production router behavior.
+`record_slot.py` proves the probe is unique and no-match, every recurring target is
+matching, N02/N03 remain at 64 clients, and the other four normal slots remain at
+eight clients.
 
 `-held-clients` adds
 supplemental long-lived query sessions for real redirect/force-close callbacks;

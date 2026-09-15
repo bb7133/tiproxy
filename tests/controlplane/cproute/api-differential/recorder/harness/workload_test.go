@@ -58,3 +58,25 @@ func TestWorkloadListenerFallbackAndRoundRobin(t *testing.T) {
 	listener, _ = w.target(3)
 	require.Equal(t, "127.0.0.1:6001", listener)
 }
+
+func TestWorkloadExcludesOneShotProbeFromRecurringTargets(t *testing.T) {
+	w := &Workload{Listeners: []string{"127.0.0.1:6000"}, Sources: []string{"127.0.0.1", "127.0.0.2"}}
+	require.NoError(t, w.ConfigureProbeTargets([]ClientTarget{{Listener: "127.0.0.1:6000", Source: "127.0.0.2"}}))
+	for i := 0; i < 128; i++ {
+		listener, source := w.target(i)
+		require.Equal(t, "127.0.0.1:6000", listener)
+		require.Equal(t, "127.0.0.1", source)
+	}
+}
+
+func TestWorkloadProbeTargetsFailClosed(t *testing.T) {
+	w := &Workload{Listeners: []string{"127.0.0.1:6000", "127.0.0.2:6000"}}
+	require.EqualError(t, w.ConfigureProbeTargets([]ClientTarget{{Listener: "127.0.0.3:6000"}}),
+		"probe target 127.0.0.3:6000/ is not a configured listener/source combination")
+	require.EqualError(t, w.ConfigureProbeTargets([]ClientTarget{
+		{Listener: "127.0.0.1:6000"}, {Listener: "127.0.0.1:6000"},
+	}), "probe target 127.0.0.1:6000/ is duplicated")
+	require.EqualError(t, w.ConfigureProbeTargets([]ClientTarget{
+		{Listener: "127.0.0.1:6000"}, {Listener: "127.0.0.2:6000"},
+	}), "probe targets exclude every recurring listener/source combination")
+}

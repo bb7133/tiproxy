@@ -149,6 +149,7 @@ func TestInvalidActionsFailBeforeCapture(t *testing.T) {
 
 func TestScriptControlValidation(t *testing.T) {
 	valid := []Action{
+		{Kind: "client_probe", Listener: "127.0.0.1:6000", Source: "127.0.0.2", TimeoutMillis: 5000},
 		{Kind: "env", Args: []string{"tidb-stop", "0"}},
 		{Kind: "env", Args: []string{"tidb-stop", "1"}},
 		{Kind: "await_env"},
@@ -202,9 +203,33 @@ func TestScriptControlValidation(t *testing.T) {
 		"empty excluded backend":     {{Kind: "lifecycle_open", Backends: []string{""}, Listener: "127.0.0.1:6000"}},
 		"duplicate reset":            {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "router_reset", TimeoutMillis: 1}, {Kind: "router_reset", TimeoutMillis: 1}},
 		"reset overlaps failover":    {{Kind: "lifecycle_open", Backends: []string{"default/b"}, Listener: "127.0.0.1:6000"}, {Kind: "failover_select", FailoverTimeoutSeconds: 1}, {Kind: "router_reset", TimeoutMillis: 1}},
+		"probe missing listener":     {{Kind: "client_probe", TimeoutMillis: 1}},
+		"probe missing timeout":      {{Kind: "client_probe", Listener: "127.0.0.1:6000"}},
+		"probe with backends":        {{Kind: "client_probe", Listener: "127.0.0.1:6000", TimeoutMillis: 1, Backends: []string{"default/b"}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			require.Error(t, validateActions(actions))
+		})
+	}
+}
+
+func TestCheckedInNormalScriptsAndProbeTargetsValidate(t *testing.T) {
+	paths, err := filepath.Glob("../../scripts/N*.json")
+	require.NoError(t, err)
+	require.Len(t, paths, 6)
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+			var actions []Action
+			require.NoError(t, json.Unmarshal(data, &actions))
+			require.NoError(t, validateActions(actions))
+			targets := probeTargets(actions)
+			if filepath.Base(path) == "N02.json" || filepath.Base(path) == "N03.json" {
+				require.Len(t, targets, 1)
+			} else {
+				require.Empty(t, targets)
+			}
 		})
 	}
 }

@@ -1,5 +1,12 @@
 [
  {
+  "at_ms": 10000,
+  "kind": "client_probe",
+  "listener": "127.0.0.1:6000",
+  "source": "127.0.0.2",
+  "timeout_ms": 5000
+ },
+ {
   "at_ms": 20000,
   "kind": "checkpoint"
  },

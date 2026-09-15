@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Normal-slot event validator and record_slot preflight: positive traces and one-fault mutations."""
 import copy
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -189,6 +190,24 @@ class NormalValidatorTests(unittest.TestCase):
                        "N05: held_clients='2'", "N02: normal family is recorded with redirection off",
                        "differ from the plan's normal rows"):
             self.assertTrue(any(needle in p for p in problems), (needle, problems))
+
+    def test_normal_probe_preflight_mutations(self):
+        n02 = json.loads((record_slot.HERE / "N02.json").read_text())
+        n03 = json.loads((record_slot.HERE / "N03.json").read_text())
+        self.assertEqual(record_slot.normal_probe_problems("N02", ROWS["N02"], n02), [])
+        self.assertEqual(record_slot.normal_probe_problems("N03", ROWS["N03"], n03), [])
+
+        cases = {
+            "missing": ("N02", []),
+            "duplicate": ("N02", [n02[0], copy.deepcopy(n02[0])]),
+            "matching target": ("N02", [dict(n02[0], source="127.0.0.1")]),
+            "undeclared target": ("N03", [dict(n03[0], listener="127.0.0.3:6000")]),
+            "wrong schedule": ("N03", [dict(n03[0], at_ms=9999)]),
+            "probe in another slot": ("N01", [dict(n03[0])]),
+        }
+        for name, (slot, actions) in cases.items():
+            with self.subTest(name=name):
+                self.assertTrue(record_slot.normal_probe_problems(slot, ROWS[slot], actions))
 
     def test_manifest_assertions(self):
         row = ROWS["N02"]
