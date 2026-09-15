@@ -1,0 +1,995 @@
+{
+  "version": 1,
+  "id": "api-proxy-cidr-history",
+  "config": {
+    "policy": "connection",
+    "selection": "random",
+    "rule": "proxy_cidr"
+  },
+  "provenance": {
+    "kind": "synthetic"
+  },
+  "events": [
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"connection\"\nrouting-policy=\"random\"\nrouting-rule=\"proxy_cidr\"\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": " , 127.0.0.0/24, "
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-1",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-1",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-1",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-2",
+      "proxy": "198.51.100.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-2",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-3",
+      "proxy": "",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-3",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-3",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-4",
+      "proxy": "127.0.0.9",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-4",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-4",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-5",
+      "proxy": "localhost:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-5",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-5",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-6",
+      "proxy": "127.0.0.9:8]",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-6",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-6",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-7",
+      "proxy": "[::ffff:127.0.0.9]:named",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-7",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-7",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-7",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-8",
+      "proxy": "[127.0.0.9]:",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-8",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-8",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-8",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"connection\"\nrouting-policy=\"random\"\nrouting-rule=\"client_cidr\"\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-9",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-9",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-9",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-9",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": "127.0.0.0/24"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4021",
+          "labels": {
+            "cidr": "127.0.0.0/24"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-10",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-10",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4020",
+          "default/127.0.0.1:4021"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-10",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-10",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": "192.0.2.0/24"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4021",
+          "labels": {
+            "cidr": "127.0.0.0/24"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-11",
+      "proxy": "192.0.2.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-11",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4020",
+          "default/127.0.0.1:4021"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-11",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-11",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-12",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-12",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4020",
+          "default/127.0.0.1:4021"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-12",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-12",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": "192.0.2.0/24"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-13",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-13",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-13",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-14",
+      "proxy": "192.0.2.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-14",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-14",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-14",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": "invalid"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-15",
+      "proxy": "192.0.2.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-15",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-15",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-15",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": ""
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-16",
+      "proxy": "192.0.2.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-16",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-16",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "lookup",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": "2001:db8::/64"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-17",
+      "proxy": "[2001:db8::9]:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-17",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-17",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-17",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-18",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-18",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-18",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": "2001:db8::1"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-19",
+      "proxy": "[2001:db8:abcd::9]:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-19",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-19",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-19",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": ""
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4021",
+          "labels": {
+            "cidr": "127.0.0.1/33"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-20",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-20",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-20",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "ungrouped",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "rehydrate",
+      "session": "ungrouped",
+      "backend": "default/127.0.0.1:4020",
+      "expect": {
+        "outcome": "unknown_backend"
+      }
+    },
+    {
+      "op": "close",
+      "session": "ungrouped",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4020",
+          "labels": {
+            "cidr": "::ffff:127.0.0.0/120"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4021",
+          "labels": {
+            "cidr": "192.0.2.0/24"
+          },
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-21",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-21",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-21",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-21",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-22",
+      "proxy": "192.0.2.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-22",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4021"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-22",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-22",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"connection\"\nrouting-policy=\"random\"\n[proxy]\nfail-backend-list=[\"127.0.0.1:4020\"]\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "proxy-23",
+      "proxy": "127.0.0.9:8000",
+      "client": "198.51.100.9:8000",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "proxy-23",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4020"
+      }
+    },
+    {
+      "op": "finish",
+      "session": "proxy-23",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "proxy-23",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 2,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      }
+    },
+    {
+      "op": "health",
+      "backends": [],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok",
+        "healthy_backend_count": 0,
+        "legal_server_versions": [
+          "8.5.1"
+        ]
+      }
+    }
+  ]
+}

@@ -296,7 +296,7 @@ impl History {
                     QueryResult {
                         kind,
                         series,
-                        updated_nanos,
+                        updated_nanos: Some(updated_nanos),
                     },
                 ))
             })

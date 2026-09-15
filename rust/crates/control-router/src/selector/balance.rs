@@ -14,7 +14,7 @@
 
 //! Factor migration preparation under the existing namespace ledger lock.
 
-use super::{Arc, Candidate, ClientInfo, RouteError, Router, now_nanos, read_queries};
+use super::{Arc, Candidate, ClientInfo, RouteError, Router, read_queries};
 
 impl Router {
     pub(crate) fn prepare_balance(
@@ -31,7 +31,7 @@ impl Router {
             &mut state,
             candidate,
             group,
-            now_nanos()?,
+            self.wall_now()?,
             |_, prepared, _| prepared,
         )
     }

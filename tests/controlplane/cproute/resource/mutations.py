@@ -15,6 +15,7 @@ COLLECT = "crates/control-topology/src/metric_collector/collect.rs"
 SERVICE = "crates/control-topology/src/metric_collector/service.rs"
 SOURCE = "crates/control-router/src/authority.rs"
 SELECTOR = "crates/control-router/src/selector.rs"
+SCHEDULER = "crates/control-router/src/selector/scheduler.rs"
 
 
 def main():
@@ -38,11 +39,13 @@ def main():
     add("overlay-accepts-foreign-policy", COLLECTOR, "|| !incarnation.same_as(&self.shared.source.resource_incarnation())", "|| false && !incarnation.same_as(&self.shared.source.resource_incarnation())", "queries", "COMPOSE_OVERLAY_FOREIGN_POLICY")
     add("static-empty-not-source-qualified", SOURCE, "candidate.backend.mode() == control_topology::BackendSourceMode::Static", "candidate.backend.mode() == control_topology::BackendSourceMode::Dynamic", "static", "COMPOSE_STATIC_ACTUAL_EMPTY_SOURCE")
     add("missing-metrics-block-reserve", SELECTOR, "select(None, &crate::factors::Queries::new())", "Err(RouteError::NoBackend)", "missing", "fixture: NoBackend")
-    add("resource-path-not-composed", SELECTOR, "if self.factors_enabled && candidate.config.resource_incarnation().enabled() {", "if false && self.factors_enabled && candidate.config.resource_incarnation().enabled() {", "live", "COMPOSE_REAL_RESOURCE_PREFERS_HEALTH")
+    add("resource-path-not-composed", SELECTOR, "|| (self.factors_enabled && candidate.config.resource_incarnation().enabled())", "|| (false && self.factors_enabled && candidate.config.resource_incarnation().enabled())", "live", "COMPOSE_REAL_RESOURCE_PREFERS_HEALTH")
     add("consumer-uses-foreign-current-R", SELECTOR, "metrics.filter(|metrics| Arc::ptr_eq(&candidate.routing, metrics.source().routing()))", "metrics.filter(|metrics| true || Arc::ptr_eq(&candidate.routing, metrics.source().routing()))", "live", "COMPOSE_FOREIGN_CURRENT_R_DATA_IGNORED")
     add("reserve-final-metric-fence-bypassed", SELECTOR, "metrics.with_current(|| select(Some(metrics), &queries))", "Some(select(Some(metrics), &queries))", "live", "COMPOSE_FINAL_INPUT_FENCE_RESERVES_EMPTY")
     add("label-prefilter-changes-CPU-pool", SELECTOR, "input.healthy\n                    && !excluded.contains(&input.id.as_ref())", "input.healthy && input.label_matches\n                    && !excluded.contains(&input.id.as_ref())", "live", "COMPOSE_LABEL_REMAINS_IN_FACTOR_POOL")
     add("retry-exclusion-ignored", SELECTOR, "&& !excluded.contains(&input.id.as_ref())", "&& (true || !excluded.contains(&input.id.as_ref()))", "missing", "COMPOSE_RETRY_EXCLUSION")
+    add("missing-metrics-clear-resource-history", SCHEDULER, "if factor_metrics.is_none()\n                    && candidate.policy.balance_policy", "if false && factor_metrics.is_none()\n                    && candidate.policy.balance_policy", "failover-resource", "RESOURCE_REFRESH_MISSING_METRICS_RETAINS_HISTORY")
+    add("stale-failover-update-committed", SCHEDULER, "self.sources.validate(candidate)?;\n        state.apply_failover(update, now);\n        Ok(())", "state.apply_failover(update, now);\n        self.sources.validate(candidate)", "failover-stale", "STALE_FAILOVER_REFRESH_HAS_NO_PARTIAL_COMMIT")
     # Policy and metric lineage both retire caches. Disable both deliberately
     # to test the actual cold-start outcome rather than a redundant guard.
     cases.append(("resource-cache-survives-both-retirement-signals", [
@@ -94,6 +97,8 @@ def main():
                         "service": ("control_topology", "routing_query_retirement_"),
                         "static": ("control_router", "composed_static_"),
                         "missing": ("control_router", "composed_missing_"),
+                        "failover-resource": ("control_router", "resource_failover_refresh_"),
+                        "failover-stale": ("control_router", "stale_failover_refresh_"),
                     }[family]
                     result = live.run(binaries[binary], selection, environment)
                 if result.returncode != 101 or "test result: FAILED" not in result.stdout or marker not in result.stdout:

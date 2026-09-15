@@ -1,0 +1,22 @@
+[
+  {"at_ms": 12000, "kind": "checkpoint"},
+  {"at_ms": 15000, "kind": "failover_select", "failover_timeout_seconds": 60, "effect_control": "refuse"},
+  {"at_ms": 25000, "kind": "checkpoint"},
+  {"at_ms": 30000, "kind": "failover_repeat"},
+  {"at_ms": 35000, "kind": "checkpoint"},
+  {"at_ms": 40000, "kind": "failover_clear"},
+  {"at_ms": 45000, "kind": "checkpoint"},
+  {"at_ms": 50000, "kind": "failover_select", "failover_timeout_seconds": 60, "effect_control": "delay"},
+  {"at_ms": 65000, "kind": "close_delayed_redirect", "timeout_ms": 20000},
+  {"at_ms": 70000, "kind": "checkpoint"},
+  {"at_ms": 75000, "kind": "failover_clear"},
+  {"at_ms": 80000, "kind": "config", "toml": "[proxy]\nfail-backend-list = [\"127.0.0.1:4002\", \"127.0.0.1:4003\"]\nfailover-timeout = 60\n"},
+  {"at_ms": 85000, "kind": "checkpoint"},
+  {"at_ms": 90000, "kind": "config", "toml": "[proxy]\nfail-backend-list = []\n"},
+  {"at_ms": 100000, "kind": "env", "args": ["tidb-stop", "3", "kill"]},
+  {"at_ms": 100001, "kind": "await_env"},
+  {"at_ms": 180000, "kind": "checkpoint"},
+  {"at_ms": 180001, "kind": "env", "args": ["tidb-start", "3"]},
+  {"at_ms": 180002, "kind": "await_env"},
+  {"at_ms": 200000, "kind": "checkpoint"}
+]

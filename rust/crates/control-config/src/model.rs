@@ -493,6 +493,8 @@ impl EffectiveConfig {
     }
 
     /// Rejects a hot reload that changes any restart-required field.
+    /// Routing-rule updates are accepted for future router incarnations; an
+    /// existing router retains the rule it read during construction, like Go.
     ///
     /// # Errors
     ///
@@ -516,10 +518,6 @@ impl EffectiveConfig {
             (self.api != previous.api, "api"),
             (self.log.encoder != previous.log.encoder, "log.encoder"),
             (self.log.simple != previous.log.simple, "log.simple"),
-            (
-                self.balance.routing_rule != previous.balance.routing_rule,
-                "balance.routing-rule",
-            ),
             (self.ha != previous.ha, "ha"),
             (self.metering != previous.metering, "metering"),
             (

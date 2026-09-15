@@ -16,8 +16,10 @@ GROUP = 'pkg/balance/router/group.go'
 
 runner.CASES = [
     go('native-publish-after-group-unlock', 'TestNativeGroupPublicationCannotCrossUnlock', 'NATIVE_GROUP_LOCK_PUBLICATION', [
-        edit(GROUP, '"reflect"', '"reflect"\n "runtime"'),
-        edit(GROUP, 'g.publishPolicyObservationLocked()', 'g.Unlock()\n runtime.Gosched()\n g.publishPolicyObservationLocked()\n g.Lock()',
+        # Force a legal config interleaving in the exposed critical-section gap.
+        # Gosched only offers a turn; it does not guarantee the queued contender
+        # acquires the lock before publication on every Go scheduler/architecture.
+        edit(GROUP, 'g.publishPolicyObservationLocked()', 'g.Unlock()\n g.SetConfig(config.NewConfig())\n g.publishPolicyObservationLocked()\n g.Lock()',
              'func (g *Group) routeObserved(', '// crossKeyspaceWarnInterval'),
     ], 'router'),
 ]

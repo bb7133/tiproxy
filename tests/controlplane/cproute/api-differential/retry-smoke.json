@@ -1,0 +1,1269 @@
+{
+  "version": 1,
+  "id": "api-retry-and-connection-history",
+  "config": {
+    "clock_origin_nanos": 1790000000123456789,
+    "policy": "connection",
+    "selection": "random",
+    "rule": ""
+  },
+  "provenance": {
+    "kind": "synthetic"
+  },
+  "events": [
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4101",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4102",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4103",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "cycle",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "cycle",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "cycle",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "cycle",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "cycle",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "cycle",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "cycle",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "cycle",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "cycle",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "cycle",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "changing",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "changing",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "changing",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4101",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4102",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "changing",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "changing",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4101",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4102",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4103",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "changing",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "changing",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "changing",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4101",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "errors",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "errors",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "errors",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "source_error",
+      "error": "wrapped_no_backend",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "errors",
+      "expect": {
+        "outcome": "wrapped_no_backend"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4101",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4102",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "errors",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "errors",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "source_error",
+      "error": "no_backend",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "errors",
+      "expect": {
+        "outcome": "no_backend"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4101",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4102",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4103",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "errors",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "errors",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "errors",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"location\"\nrouting-policy=\"prefer-idle\"\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4101",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4102",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        },
+        {
+          "address": "127.0.0.1:4103",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.1",
+          "support_redirection": true
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "local",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "local",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_local": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "local",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "local",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_local": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "local",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "local",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_local": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "local",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "local",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_local": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102"
+        ]
+      }
+    },
+    {
+      "op": "finish",
+      "session": "local",
+      "success": true,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "local",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "health",
+      "backends": [
+        {
+          "address": "127.0.0.1:4101",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        },
+        {
+          "address": "127.0.0.1:4102",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": true,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        },
+        {
+          "address": "127.0.0.1:4103",
+          "cluster": "default",
+          "labels": {},
+          "healthy": true,
+          "local": false,
+          "server_version": "8.5.1",
+          "support_redirection": false
+        }
+      ],
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance]\npolicy=\"connection\"\nrouting-policy=\"prefer-idle\"\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "held1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "rehydrate",
+      "session": "held1",
+      "backend": "default/127.0.0.1:4101",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4101"
+      }
+    },
+    {
+      "op": "open",
+      "session": "held2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "rehydrate",
+      "session": "held2",
+      "backend": "default/127.0.0.1:4101",
+      "expect": {
+        "outcome": "ok",
+        "backend": "default/127.0.0.1:4101"
+      }
+    },
+    {
+      "op": "open",
+      "session": "busy-cycle",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "busy-cycle",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "busy-cycle",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "busy-cycle",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "busy-cycle",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "busy-cycle",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "busy-cycle",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "busy-cycle",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "busy-cycle",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "busy-cycle",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "tick",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance.conn-count]\nmigrations-per-second=0.0001\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "at-cutoff",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "at-cutoff",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "at-cutoff",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "at-cutoff",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "at-cutoff",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "at-cutoff",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "at-cutoff",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "at-cutoff",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance.conn-count]\nmigrations-per-second=0.0001001\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "above-cutoff",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "above-cutoff",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "above-cutoff",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "above-cutoff",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "above-cutoff",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "above-cutoff",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "above-cutoff",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "above-cutoff",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance.conn-count]\ncount-ratio-threshold=3.0\nmigrations-per-second=0\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "wide-ratio",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "wide-ratio",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "wide-ratio",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "wide-ratio",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "wide-ratio",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "wide-ratio",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "wide-ratio",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "wide-ratio",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "config",
+      "toml": "[balance.conn-count]\ncount-ratio-threshold=0\n",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "reset-ratio",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "reset-ratio",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "reset-ratio",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "reset-ratio",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "reset-ratio",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "reset-ratio",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "reset-ratio",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "reset-ratio",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "held1",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "held2",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "open",
+      "session": "after-close",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "after-close",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "after-close",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "after-close",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "after-close",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "next",
+      "session": "after-close",
+      "expect": {
+        "outcome": "ok",
+        "legal_backends": [
+          "default/127.0.0.1:4101",
+          "default/127.0.0.1:4102",
+          "default/127.0.0.1:4103"
+        ],
+        "exclude_history": true,
+        "prefer_idle_conn": true
+      }
+    },
+    {
+      "op": "finish",
+      "session": "after-close",
+      "success": false,
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "close",
+      "session": "after-close",
+      "expect": {
+        "outcome": "ok"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "expect": {
+        "outcome": "ok"
+      }
+    }
+  ]
+}

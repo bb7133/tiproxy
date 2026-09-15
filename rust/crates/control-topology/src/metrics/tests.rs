@@ -27,7 +27,7 @@ fn history_keeps_source_selection_separate_from_backend_result_updates() {
                 value,
             }],
         }],
-        updated_nanos: 1,
+        updated_nanos: Some(1),
     };
     let mut reader = ReaderState::default();
     reader.complete_backend(BTreeMap::from([(QueryId::FailurePd, query(1.0))]), true);
@@ -129,7 +129,7 @@ fn actual_go_core_observations() -> Result<(), Box<dyn std::error::Error>> {
                                             value,
                                         }],
                                     }],
-                                    updated_nanos: 1,
+                                    updated_nanos: Some(1),
                                 },
                             )])
                         } else {
@@ -372,7 +372,7 @@ fn history_raw_sample_survives_missing_range_until_a_valid_cpu_interval()
         }]
     );
     let result = history.results(&[QueryId::Cpu], "cluster", 2_000_000_001);
-    assert_eq!(result[&QueryId::Cpu].updated_nanos, 2_000_000_001);
+    assert_eq!(result[&QueryId::Cpu].updated_nanos, Some(2_000_000_001));
     assert_eq!(
         result[&QueryId::Cpu].series[0].samples[0].timestamp_ms,
         2000

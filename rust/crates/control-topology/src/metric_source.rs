@@ -339,6 +339,36 @@ impl MetricPublication {
         self.shared.changed.notify_waiters();
     }
 
+    /// Test-only input source at the already-merged query boundary. No network
+    /// worker may use this material: its transport map is deliberately empty.
+    /// Actual discovery, routing, mode and owner capabilities still fence every
+    /// capture. Trace values never carry an epoch or manufacture those gates.
+    #[cfg(feature = "api-replay")]
+    pub(crate) fn pair_replay(
+        &self,
+        routing: Arc<RoutingSnapshot>,
+        discovery: DiscoveryCapture,
+        mode: Arc<ModeEpoch>,
+        owner: &OwnerToken,
+    ) -> Result<(), &'static str> {
+        let needs_material = {
+            let slot = self.shared.lock();
+            slot.material.as_ref().is_none_or(|material| {
+                !material.discovery.still_current()
+                    || material.discovery.client_epoch() != discovery.client_epoch()
+            })
+        };
+        if needs_material {
+            let prepared = self
+                .prepare(owner, &[])
+                .map_err(|_| "replay metric material")?;
+            self.withdraw_material();
+            self.install(prepared, discovery);
+        }
+        self.reconcile(Some(routing), mode);
+        Ok(())
+    }
+
     pub(crate) fn close(&self) {
         let mut slot = self.shared.lock();
         if slot.closed {

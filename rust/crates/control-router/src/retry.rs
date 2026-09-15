@@ -43,6 +43,13 @@ impl Router {
 }
 
 impl Selector {
+    /// Restores a surviving client assignment into this fresh selector.
+    /// # Errors
+    /// Returns the owning router's source, backend, or session error.
+    pub fn rehydrate(&self, backend: &str) -> Result<control_routing::RouteAssignment, RouteError> {
+        self.router.rehydrate(&self.session, backend)
+    }
+
     #[cfg(test)]
     pub(crate) fn exclusions(&self) -> &[String] {
         &self.excluded

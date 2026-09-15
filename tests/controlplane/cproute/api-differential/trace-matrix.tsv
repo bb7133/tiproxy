@@ -1,0 +1,19 @@
+trace_id	family	balance_policy	routing_policy	routing_rule	min_seconds	min_completed_connections	source	recorded_at_utc	trace_sha256	go_source_sha	environment_manifest_sha256	status
+N01	normal	connection	prefer-idle	all	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+N02	normal	connection	random	client-cidr	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+N03	normal	resource	prefer-idle	proxy-cidr	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+N04	normal	resource	random	port	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+N05	normal	location	prefer-idle	all	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+N06	normal	location	random	port	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+F01	failover	connection	prefer-idle	all	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+F02	failover	connection	random	client-cidr	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+F03	failover	resource	prefer-idle	proxy-cidr	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+F04	failover	resource	random	port	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+F05	failover	location	prefer-idle	all	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+F06	failover	location	random	port	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+C01	config-source	connection	prefer-idle	all	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+C02	config-source	connection	random	client-cidr	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+C03	config-source	resource	prefer-idle	proxy-cidr	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+C04	config-source	resource	random	port	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+C05	config-source	location	prefer-idle	all	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending
+C06	config-source	location	random	port	60	100	actual-Go-TiProxy-TiDB-PD-Prometheus-run					pending

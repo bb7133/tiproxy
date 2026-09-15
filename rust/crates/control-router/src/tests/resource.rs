@@ -37,23 +37,18 @@ async fn composed(policy: &str) -> TestResult<Harness> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn composed_missing_metrics_never_block_reservation_or_retry() -> TestResult {
     for policy in ["resource", "location", "connection"] {
-        // Seed through Connection so this setup is independent of the factor
-        // retry filter under test. Four active sessions make A strictly better
+        // Rehydrate known assignments so setup does not use the retry filter
+        // under test. Four active sessions make A strictly better
         // than B even under Go's prefer-idle tolerance, regardless of ticket.
         let h = composed("connection").await?;
-        let initial = h.ready().await;
+        let _initial = h.ready().await;
         let a = "default/127.0.0.1:4000";
         let b = "default/127.0.0.1:4001";
         let mut load = Vec::new();
         for _ in 0..4 {
             let session = must(h.router.open());
-            let pending =
-                must(
-                    h.router
-                        .reserve(&session, &initial, ClientInfo::default(), "", &[a]),
-                );
-            assert_eq!(pending.assignment().backend_id, b);
-            assert_eq!(h.router.finish(&pending, true), Settlement::Applied);
+            let assignment = must(h.router.rehydrate(&session, b));
+            assert_eq!(assignment.backend_id, b);
             load.push(session);
         }
         h.patch(&format!("[balance]\npolicy=\"{policy}\""), 3);
@@ -127,6 +122,122 @@ async fn composed_reserve_validates_config_after_acquiring_ledger_lock() -> Test
     assert!(
         h.router.accounting("default/127.0.0.1:4000").is_none(),
         "COMPOSE_STALE_NO_LEDGER_EFFECT"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resource_failover_refresh_without_current_metrics_retains_factor_history() -> TestResult {
+    let mut h = Harness::with_backends(
+        "",
+        "resource",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h.topology.routing_handle().current().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let mut metrics = h
+        .topology
+        .replay_metric_input(h.runtime.handle().module_context().owner().clone())
+        .await?;
+    metrics.deliver(serde_json::json!({
+        "cpu": {
+            "kind": "matrix",
+            "updated_nanos": 10_000_000_000_i64,
+            "series": [{
+                "labels": {"instance": "127.0.0.1:0"},
+                "samples": [
+                    {"timestamp_ms": 9_000_i64, "value": "0.2"},
+                    {"timestamp_ms": 10_000_i64, "value": "0.8"}
+                ]
+            }]
+        },
+        "memory": null,
+        "failure_pd": null,
+        "total_pd": null,
+        "failure_tikv": null,
+        "total_tikv": null
+    }))?;
+    h.router = Arc::new(must(Router::new_with_factors(
+        Arc::new(h.source.clone()),
+        &h.topology,
+        &h.runtime.handle().module_context(),
+        "default",
+        100,
+        Some(metrics.handle()),
+    )));
+    h.router.set_replay_wall(10_000_000_000);
+    let current = h.ready().await;
+    assert!(matches!(
+        current.metrics,
+        crate::authority::MetricInputs::Dynamic(Some(_))
+    ));
+    must(
+        h.router
+            .refresh_failover(&current, std::time::Instant::now()),
+    );
+    let before = h.router.scheduler_state_for_test();
+    assert!(
+        before.resource_entries() > 0,
+        "RESOURCE_REFRESH_SEEDS_REAL_HISTORY"
+    );
+
+    drop(metrics);
+    let missing = h.ready().await;
+    assert!(matches!(
+        missing.metrics,
+        crate::authority::MetricInputs::Dynamic(None)
+    ));
+    h.router.set_replay_wall(11_000_000_000);
+    must(
+        h.router
+            .refresh_failover(&missing, std::time::Instant::now()),
+    );
+    let after = h.router.scheduler_state_for_test();
+    assert!(
+        before.same_as(&after),
+        "RESOURCE_REFRESH_MISSING_METRICS_RETAINS_HISTORY"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_failover_refresh_commits_no_scheduler_state() -> TestResult {
+    let h = composed("connection").await?;
+    let initial = h.ready().await;
+    must(
+        h.router
+            .refresh_failover(&initial, std::time::Instant::now()),
+    );
+    let before = h.router.scheduler_state_for_test();
+
+    h.patch(
+        "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\n[balance]\npolicy=\"connection\"",
+        3,
+    );
+    let candidate = h.ready().await;
+    let (prepared, release) = h.router.hold_next_failover_commit_for_test();
+    let router = Arc::clone(&h.router);
+    let task =
+        std::thread::spawn(move || router.refresh_failover(&candidate, std::time::Instant::now()));
+    prepared.recv_timeout(Duration::from_secs(3))?;
+    h.patch(
+        "[proxy]\nfail-backend-list=[\"127.0.0.1:4001\"]\n[balance]\npolicy=\"connection\"",
+        4,
+    );
+    release.send(())?;
+    assert!(matches!(
+        task.join().map_err(|_| "refresh thread")?,
+        Err(RouteError::StaleCandidate)
+    ));
+    let after = h.router.scheduler_state_for_test();
+    assert!(
+        before.same_as(&after),
+        "STALE_FAILOVER_REFRESH_HAS_NO_PARTIAL_COMMIT"
     );
     Ok(())
 }

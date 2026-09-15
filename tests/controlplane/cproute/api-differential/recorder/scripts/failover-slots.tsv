@@ -1,0 +1,7 @@
+slot	family	policy	selection	go_rule	listen	sources	clients	held_clients	duration	redirection	labels	script
+F01	failover	connection	prefer-idle		127.0.0.1:6000		8	8	270s	on	tidb-0=;tidb-1=;tidb-2=;tidb-3=	F01.json
+F02	failover	connection	random	client_cidr	127.0.0.1:6000	127.0.0.1,127.0.0.2	8	8	270s	on	tidb-0=;tidb-1=;tidb-2=cidr=127.0.0.1/32;tidb-3=cidr=127.0.0.1/32	F02.json
+F03	failover	resource	prefer-idle	proxy_cidr	127.0.0.1:6000,127.0.0.2:6000		8	8	270s	on	tidb-0=;tidb-1=;tidb-2=cidr=127.0.0.2/32;tidb-3=cidr=127.0.0.2/32	F03.json
+F04	failover	resource	random	port	127.0.0.1:6000,127.0.0.1:6001		8	8	270s	on	tidb-0=tiproxy-port=6000;tidb-1=tiproxy-port=6000;tidb-2=tiproxy-port=6001;tidb-3=tiproxy-port=6001	F04.json
+F05	failover	location	prefer-idle		127.0.0.1:6000		8	8	270s	on	tidb-0=;tidb-1=;tidb-2=;tidb-3=	F05.json
+F06	failover	location	random	port	127.0.0.1:6000,127.0.0.1:6001		8	8	270s	on	tidb-0=tiproxy-port=6000;tidb-1=tiproxy-port=6000;tidb-2=tiproxy-port=6001;tidb-3=tiproxy-port=6001	F06.json

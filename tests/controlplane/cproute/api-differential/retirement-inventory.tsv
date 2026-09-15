@@ -1,0 +1,139 @@
+path	change_at_reference	action	boundary
+.github/workflows/rust.yml	M	edit-integration	Wire finite API acceptance; remove retired v4 gates and correct capability claims
+Makefile	M	edit-integration	Wire finite API acceptance; remove retired v4 gates and correct capability claims
+docs/design/rust-dataplane-parity.md	M	edit-integration	Wire finite API acceptance; remove retired v4 gates and correct capability claims
+pkg/balance/factor/factor_balance.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/factor/native_capture.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/observation/caller.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_balance.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_balance_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_metadata.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_pass.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_pass_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_route.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_route_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_router_route.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_selection.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_selection_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/caller_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/balance/observation/evaluation.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/observation/recorder.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/observation/values.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/router/backend_selector.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/router/balance_observation.go	A	retire	PR-only observation hook/factory; remove corresponding call sites together
+pkg/balance/router/balance_observation_test.go	A	rework-scenarios	Reuse external routing/lifecycle failure scenarios; remove internal capture/encoding assertions
+pkg/balance/router/finish_observation.go	A	retire	PR-only observation hook/factory; remove corresponding call sites together
+pkg/balance/router/finish_observation_test.go	A	rework-scenarios	Reuse external routing/lifecycle failure scenarios; remove internal capture/encoding assertions
+pkg/balance/router/group.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/router/metadata_observation.go	A	retire	PR-only observation hook/factory; remove corresponding call sites together
+pkg/balance/router/metadata_observation_test.go	A	rework-scenarios	Reuse external routing/lifecycle failure scenarios; remove internal capture/encoding assertions
+pkg/balance/router/observation.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/router/port_conflict_detector.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/router/route_observation.go	A	retire	PR-only observation hook/factory; remove corresponding call sites together
+pkg/balance/router/route_observation_test.go	A	rework-scenarios	Reuse external routing/lifecycle failure scenarios; remove internal capture/encoding assertions
+pkg/balance/router/router.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/router/router_attempt_observation.go	A	retire	PR-only observation hook/factory; remove corresponding call sites together
+pkg/balance/router/router_attempt_observation_test.go	A	rework-scenarios	Reuse external routing/lifecycle failure scenarios; remove internal capture/encoding assertions
+pkg/balance/router/router_score.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/balance/router/selector_observation.go	A	retire	PR-only observation hook/factory; remove corresponding call sites together
+pkg/balance/router/selector_route_test.go	A	rework-scenarios	Reuse external routing/lifecycle failure scenarios; remove internal capture/encoding assertions
+pkg/balance/router/selector_transition_test.go	A	rework-scenarios	Reuse external routing/lifecycle failure scenarios; remove internal capture/encoding assertions
+pkg/balance/router/startup_observation.go	A	retire	PR-only observation hook/factory; remove corresponding call sites together
+pkg/balance/router/startup_observation_test.go	A	rework-scenarios	Reuse external routing/lifecycle failure scenarios; remove internal capture/encoding assertions
+pkg/controlbridge/shadow/caller_balance_codec.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_balance_codec_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_codec.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_codec_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_finish_codec.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_metadata_codec.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_metadata_codec_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_route_codec.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_route_codec_test.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_router_route_codec.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/caller_selection_codec.go	A	retire	PR-only v4 caller ownership/schema/codec; archive evidence, not public API contract
+pkg/controlbridge/shadow/codec.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+pkg/controlbridge/shadow/native_codec.go	M	retain-fix	Keep shared v3 borrowed-text allocation fix/tests while native codec remains; remove no shared functionality blindly
+pkg/controlbridge/shadow/native_codec_test.go	M	retain-fix	Keep shared v3 borrowed-text allocation fix/tests while native codec remains; remove no shared functionality blindly
+pkg/util/netutil/netutil.go	M	remove-capture-only-delta	Preserve base runtime and functional fixes; remove only retired parent/tape/dispatch/helper changes
+rust/crates/control-router/src/shadow/ledger.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+rust/crates/control-router/src/shadow/live.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+rust/crates/control-router/src/shadow/live/caller.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/arithmetic.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/arithmetic/tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/balance.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/balance/tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/finish.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/metadata.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/metadata/snapshot.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/metadata/state.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/metadata/tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/metadata_state.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/metadata_state/tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/pass.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/pass/tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/route.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/route/tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/router_route.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/selection.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/selection/tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/selector_state.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/selector_state_tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/caller/tests.rs	A	rework-scenarios-retire-framework	Keep external behavioral cases as API expectations; retire internal caller reconstruction/staging
+rust/crates/control-router/src/shadow/live/native.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+rust/crates/control-router/src/shadow/live/native_tests.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+rust/crates/control-router/src/shadow/native.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+rust/crates/control-router/src/shadow/native_compute.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+rust/crates/control-routing/src/group.rs	M	remove-shadow-only-additions	Retire snapshot-charge layout helpers/tests when references vanish; retain production grouping/matching behavior
+rust/crates/control-routing/tests/heap_charge.rs	A	remove-shadow-only-additions	Retire snapshot-charge layout helpers/tests when references vanish; retain production grouping/matching behavior
+rust/crates/legacy-router-shadow/examples/balance_hook_check.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/examples/metadata_check.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/examples/route_hook_check.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/examples/router_attempt_check.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/examples/selector_check.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/examples/selector_route_check.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/examples/startup_check.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/examples/support/route_prefix.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller/balance_tests.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller/balance_wire.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller/finish_wire.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller/metadata_tests.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller/route_wire.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller/router_route_wire.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller/selection_wire.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/caller/tests.rs	A	retire	PR-only v4 codec/replay checker; common API comparator replaces this entry point
+rust/crates/legacy-router-shadow/src/lib.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+rust/crates/legacy-router-shadow/src/live.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+rust/crates/legacy-router-shadow/src/native.rs	M	remove-caller-only-delta	Preserve base native/lifecycle functionality; remove retired caller state/decoder/charge integration
+tests/controlplane/cproute/shadow/balance-hooks-mutations.py	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/balance-hooks-run.sh	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/balance-hooks.md	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/isolation.py	M	edit-integration	Remove PR-only caller runner/allowlist wiring; keep pre-existing regression for retained code
+tests/controlplane/cproute/shadow/metadata-mutations.py	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/metadata-run.sh	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/native-anchors.py	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/native-mutations.py	M	edit-integration	Remove PR-only caller runner/allowlist wiring; keep pre-existing regression for retained code
+tests/controlplane/cproute/shadow/native-run.sh	M	edit-integration	Remove PR-only caller runner/allowlist wiring; keep pre-existing regression for retained code
+tests/controlplane/cproute/shadow/route-hooks-mutations.py	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/route-hooks-run.sh	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/router-attempt-mutations.py	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/router-attempt-run.sh	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/selector-core-mutations.py	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/selector-core-run.sh	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/selector-route-mutations.py	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/selector-route-run.sh	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/startup-contract.md	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/startup-mutations.py	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/startup-run.sh	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-group-balance-zero.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-group-balance.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-group-route.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-metadata-assign-removed.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-metadata-assign.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-metadata-begin-error.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-metadata-begin.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-metadata-end.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-metadata-refresh-port.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-metadata-refresh.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-pass-begin.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable
+tests/controlplane/cproute/shadow/v4-pass-end.json	A	archive-retire	PR-only per-boundary runner/golden/contract; migrate behavioral scenario where applicable

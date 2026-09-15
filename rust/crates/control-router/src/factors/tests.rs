@@ -54,7 +54,7 @@ fn queries(step: &Value) -> Queries {
         .iter()
         .map(|(name, query)| {
             let result = QueryResult {
-                updated_nanos: integer(&query["time"]),
+                updated_nanos: Some(integer(&query["time"])),
                 kind: if query["matrix"] == true {
                     ValueKind::Matrix
                 } else {
@@ -327,7 +327,7 @@ fn retained_cache_requires_exact_ledger_owner() {
     let now = 1_000_000_000_000;
     let query = QueryResult {
         kind: ValueKind::Matrix,
-        updated_nanos: now,
+        updated_nanos: Some(now),
         series: inputs
             .iter()
             .map(|input| Series {
@@ -401,7 +401,7 @@ fn other_cluster_lineage_preserves_cached_health_indicator() {
     let now = 1_000_000_000_000;
     let query = |value| QueryResult {
         kind: ValueKind::Vector,
-        updated_nanos: now,
+        updated_nanos: Some(now),
         series: vec![Series {
             labels: BTreeMap::from([
                 ("instance".into(), "b:10080".into()),
@@ -457,9 +457,9 @@ impl<'a> window::Window<'a, QueryResult> for RecordedWindow<'a> {
         self.reads.push(ReadKey::Query(id));
         Ok(self.queries.get(&id))
     }
-    fn clock(&mut self, site: window::ClockSite) -> Result<i64, Self::Error> {
+    fn clock(&mut self, site: window::ClockSite) -> Result<Option<i64>, Self::Error> {
         self.reads.push(ReadKey::Clock(site));
-        Ok(self.now)
+        Ok(Some(self.now))
     }
 }
 fn same_history(left: &State, right: &State) {
@@ -572,7 +572,7 @@ fn single_time_entry_matches_ordered_windows_and_next_history() {
                 query_map.insert(
                     id,
                     QueryResult {
-                        updated_nanos: now,
+                        updated_nanos: Some(now),
                         kind: if matches!(id, QueryId::Cpu | QueryId::Memory) {
                             ValueKind::Matrix
                         } else {

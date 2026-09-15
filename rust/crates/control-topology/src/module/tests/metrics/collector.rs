@@ -37,21 +37,75 @@ async fn exported(
     http: &reqwest::Client,
     address: std::net::SocketAddr,
 ) -> Result<serde_json::Value, TestError> {
-    let bytes = http
+    // Publication retires the previous response even between header/body
+    // writes. Readiness callers already poll within a fixed deadline: they
+    // still require a complete, valid export, rather than a successful first
+    // read racing a refresh. The retired-material 503 assertion below uses
+    // its own request and must not be weakened by this readiness helper.
+    let response = match http
         .get(format!(
             "http://{address}/api/backend/metrics?cluster=cluster-a"
         ))
         .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+        .await
+    {
+        Ok(response) => response.error_for_status()?,
+        Err(error) => {
+            eprintln!("collector readiness request incomplete: {error}");
+            return Ok(serde_json::Value::Null);
+        }
+    };
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("collector readiness body incomplete: {error}");
+            return Ok(serde_json::Value::Null);
+        }
+    };
     if bytes.is_empty() {
         Ok(serde_json::Value::Null)
     } else {
         Ok(serde_json::from_slice(&bytes)?)
     }
 }
+
+#[tokio::test]
+async fn metrics_export_readiness_requires_a_complete_valid_response() -> Result<(), TestError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        for reply in [
+            "HTTP/1.1 200 OK\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n!",
+            "HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await?);
+            }
+            socket.write_all(reply.as_bytes()).await?;
+            socket.shutdown().await?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()?;
+    assert!(exported(&http, address).await?.is_null());
+    assert!(exported(&http, address).await?.is_null());
+    assert_eq!(exported(&http, address).await?, serde_json::json!({}));
+    assert!(exported(&http, address).await.is_err(), "invalid JSON");
+    assert!(exported(&http, address).await.is_err(), "HTTP failure");
+    tokio::time::timeout(Duration::from_secs(1), server).await???;
+    Ok(())
+}
+
 async fn owner_in_zone(
     etcd: &mut etcd_client::Client,
     zone: &str,
