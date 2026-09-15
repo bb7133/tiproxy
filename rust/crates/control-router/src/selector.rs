@@ -184,6 +184,43 @@ impl Router {
         })
     }
 
+    pub(crate) fn new_resolved(
+        source: Arc<dyn ConfigNamespaceSource>,
+        topology: &TopologyModuleHandle,
+        context: &ModuleContext,
+        resolved: &crate::ResolvedNamespace,
+        max_sessions: usize,
+        metrics: Option<control_topology::MetricOverlayHandle>,
+    ) -> Result<Self, RouteError> {
+        Ok(Self {
+            #[cfg(test)]
+            replay_wall: Mutex::new(None),
+            factors_enabled: true,
+            metrics,
+            sources: Sources::new_retained(source, topology, context, resolved)?,
+            #[cfg(test)]
+            next_lock: Mutex::new(None),
+            #[cfg(test)]
+            next_metric_use: Mutex::new(None),
+            #[cfg(test)]
+            next_redirect_offer: Mutex::new(None),
+            #[cfg(test)]
+            next_failover_commit: Mutex::new(None),
+            state: Mutex::new(State {
+                ledger: Ledger::new(max_sessions),
+                factors: BTreeMap::new(),
+                schedules: BTreeMap::new(),
+                backends: BTreeMap::new(),
+                groups: BTreeMap::new(),
+                ports: PortRoutes::default(),
+                next_group: 1,
+                observed: None,
+                server_version: String::new(),
+                supports_redirection: true,
+            }),
+        })
+    }
+
     /// Explicitly enables Resource/Location selection using the existing
     /// ledger. Dynamic metrics are optional inputs from a routing-bound
     /// collector; static empty inputs come from the actual backend source.
@@ -330,7 +367,7 @@ impl Router {
     /// # Errors
     /// Returns source/admission errors or `NoBackend` for an unknown identity.
     pub fn lookup_backend(&self, id: &str) -> Result<RouteAssignment, RouteError> {
-        let candidate = self.capture()?;
+        let candidate = self.capture_retained()?;
         let mut state = self.lock();
         self.sources.validate(&candidate)?;
         state.refresh(&candidate)?;
@@ -346,7 +383,7 @@ impl Router {
     /// # Errors
     /// Returns source/session errors or `NoBackend` for an unknown or ungrouped backend.
     pub fn rehydrate(&self, session: &Session, id: &str) -> Result<RouteAssignment, RouteError> {
-        let candidate = self.capture()?;
+        let candidate = self.capture_retained()?;
         let mut state = self.lock();
         self.sources.validate(&candidate)?;
         state.refresh(&candidate)?;
@@ -377,6 +414,15 @@ impl Router {
             self.sources.capture_composed(self.metrics.as_ref())
         } else {
             self.sources.capture()
+        }
+    }
+
+    pub(crate) fn capture_retained(&self) -> Result<Candidate, RouteError> {
+        if self.factors_enabled {
+            self.sources
+                .capture_composed_retained(self.metrics.as_ref())
+        } else {
+            self.sources.capture_retained()
         }
     }
 
@@ -732,7 +778,7 @@ impl Router {
     /// An unavailable source reports zero, as Go's observer-error path does.
     #[must_use]
     pub fn healthy_backend_count(&self) -> usize {
-        let Ok(candidate) = self.capture() else {
+        let Ok(candidate) = self.capture_retained() else {
             return 0;
         };
         if candidate.health.observer_error().is_some() {

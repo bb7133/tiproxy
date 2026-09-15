@@ -145,6 +145,7 @@ pub struct Candidate {
     pub(crate) health: Arc<HealthSnapshot>,
     pub(crate) policy: RoutingConfig,
     pub(crate) metrics: MetricInputs,
+    pub(crate) admission: bool,
 }
 
 pub(crate) struct Sources {
@@ -166,6 +167,33 @@ impl Sources {
         namespace: &str,
     ) -> Result<Self, RouteError> {
         let current = source.current();
+        Self::new_at(source, topology, context, namespace, current, false)
+    }
+
+    pub(crate) fn new_retained(
+        source: Arc<dyn ConfigNamespaceSource>,
+        topology: &TopologyModuleHandle,
+        context: &ModuleContext,
+        resolved: &crate::ResolvedNamespace,
+    ) -> Result<Self, RouteError> {
+        Self::new_at(
+            source,
+            topology,
+            context,
+            resolved.namespace(),
+            resolved.origin(),
+            true,
+        )
+    }
+
+    fn new_at(
+        source: Arc<dyn ConfigNamespaceSource>,
+        topology: &TopologyModuleHandle,
+        context: &ModuleContext,
+        namespace: &str,
+        current: Arc<ConfigNamespaceSnapshot>,
+        retained: bool,
+    ) -> Result<Self, RouteError> {
         let routing_rule = current
             .effective()
             .routing()
@@ -177,12 +205,16 @@ impl Sources {
             .find(|ns| ns.namespace == namespace)
             .ok_or(RouteError::NamespaceMissing)?
             .routing();
+        let backend = if retained {
+            topology.retained_backend_source(Arc::clone(&current), namespace.name.as_ref())
+        } else {
+            topology.backend_source(namespace.name.as_ref())
+        }
+        .ok_or(RouteError::ControlUnavailable)?;
         Ok(Self {
             identity: Arc::new(()),
             source,
-            backend: topology
-                .backend_source(namespace.name.as_ref())
-                .ok_or(RouteError::ControlUnavailable)?,
+            backend,
             owner: context.owner().clone(),
             lifecycle: context.lifecycle(),
             namespace,
@@ -240,14 +272,18 @@ impl Sources {
     }
 
     pub(crate) fn capture(&self) -> Result<Candidate, RouteError> {
-        self.capture_inputs(false)
+        self.capture_inputs(false, true)
+    }
+
+    pub(crate) fn capture_retained(&self) -> Result<Candidate, RouteError> {
+        self.capture_inputs(false, false)
     }
 
     pub(crate) fn capture_composed(
         &self,
         overlay: Option<&control_topology::MetricOverlayHandle>,
     ) -> Result<Candidate, RouteError> {
-        let mut candidate = self.capture_inputs(true)?;
+        let mut candidate = self.capture_inputs(true, true)?;
         candidate.metrics =
             if candidate.backend.mode() == control_topology::BackendSourceMode::Static {
                 MetricInputs::StaticEmpty
@@ -266,11 +302,38 @@ impl Sources {
     }
 
     pub(crate) fn capture_factors(&self) -> Result<Candidate, RouteError> {
-        self.capture_inputs(true)
+        self.capture_inputs(true, true)
     }
 
-    fn capture_inputs(&self, factors_only: bool) -> Result<Candidate, RouteError> {
-        let config = self.admit()?;
+    pub(crate) fn capture_composed_retained(
+        &self,
+        overlay: Option<&control_topology::MetricOverlayHandle>,
+    ) -> Result<Candidate, RouteError> {
+        let mut candidate = self.capture_inputs(true, false)?;
+        candidate.metrics =
+            if candidate.backend.mode() == control_topology::BackendSourceMode::Static {
+                MetricInputs::StaticEmpty
+            } else {
+                MetricInputs::Dynamic(overlay.and_then(|overlay| {
+                    overlay
+                        .routing_current_for(
+                            &candidate.routing,
+                            &candidate.config.resource_incarnation(),
+                        )
+                        .map(Arc::new)
+                }))
+            };
+        self.validate(&candidate)?;
+        Ok(candidate)
+    }
+
+    fn capture_inputs(&self, factors_only: bool, admission: bool) -> Result<Candidate, RouteError> {
+        let config = if admission {
+            self.admit()?
+        } else {
+            self.live()?;
+            self.source.current()
+        };
         let mut policy = config
             .effective()
             .routing()
@@ -294,6 +357,7 @@ impl Sources {
             backend,
             policy,
             metrics: MetricInputs::Dynamic(None),
+            admission,
         };
         self.validate(&candidate)?;
         Ok(candidate)
@@ -309,7 +373,10 @@ impl Sources {
         {
             return Err(RouteError::StaleCandidate);
         }
-        self.namespace_current(&candidate.config)
+        if candidate.admission {
+            self.namespace_current(&candidate.config)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn current_config(&self, config: &Arc<ConfigNamespaceSnapshot>) -> bool {

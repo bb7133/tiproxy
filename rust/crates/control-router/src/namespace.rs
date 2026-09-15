@@ -65,6 +65,20 @@ pub struct ResolvedNamespace {
 }
 
 impl ResolvedNamespace {
+    pub(crate) fn named(
+        origin: Arc<ConfigNamespaceSnapshot>,
+        namespace: &str,
+    ) -> Result<Self, RouteError> {
+        let incarnation = origin
+            .namespace_incarnation(namespace)
+            .ok_or(RouteError::NamespaceMissing)?;
+        Ok(Self {
+            namespace: Arc::from(namespace),
+            incarnation,
+            origin,
+        })
+    }
+
     /// The resolved namespace name.
     #[must_use]
     pub fn namespace(&self) -> &str {
@@ -82,6 +96,10 @@ impl ResolvedNamespace {
     pub fn is_current(&self, source: &dyn ConfigNamespaceSource) -> bool {
         self.origin
             .same_namespace_incarnation(&source.current(), &self.namespace)
+    }
+
+    pub(crate) fn origin(&self) -> Arc<ConfigNamespaceSnapshot> {
+        Arc::clone(&self.origin)
     }
 }
 

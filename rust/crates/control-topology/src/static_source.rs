@@ -27,13 +27,17 @@
 //! or epoch is published. One [`StaticBackendProducer`] per namespace
 //! incarnation composes the existing routing publisher, health feed/overlay and
 //! health loop over the static list; it probes only while the mode is Static
-//! (parked otherwise) and is revoked synchronously when its namespace is
-//! replaced or removed. Consumers hold an opaque [`BackendSourceHandle`] and
-//! capture a [`BackendSourceSnapshot`] that carries the exact mode epoch, the
-//! routing source and the exact health round, and re-check all of them (plus the
-//! namespace incarnation at the config source) at their side-effect boundary.
+//! (parked otherwise). An ordinary admission source is revoked synchronously
+//! when its namespace is replaced or removed; an explicitly retained source
+//! keeps that incarnation's producer until its last logical lease drops, after
+//! which the module fences and joins the producer. Consumers hold an opaque
+//! [`BackendSourceHandle`] and capture a [`BackendSourceSnapshot`] that carries
+//! the exact mode epoch, routing source and health round, and re-check all of
+//! them (plus current-namespace authority for an admission handle) at their
+//! side-effect boundary.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceSource, NamespaceIncarnation};
@@ -171,13 +175,85 @@ struct RegisteredProducer {
     incarnation: NamespaceIncarnation,
     routing: RoutingSnapshotHandle,
     health: HealthOverlayHandle,
+    leases: Arc<ProducerLeaseCounter>,
+}
+
+/// Counts retained consumers of one static producer. Registry lookups increment
+/// the counter while holding the registry lock, so replacement either observes
+/// the lease or makes the producer unreachable before it can be acquired.
+struct ProducerLeaseCounter {
+    active: AtomicUsize,
+    updates: watch::Sender<u64>,
+}
+
+impl ProducerLeaseCounter {
+    fn new(updates: watch::Sender<u64>) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            updates,
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> Option<StaticProducerLease> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .ok()?;
+        Some(StaticProducerLease {
+            _guard: Arc::new(ProducerLeaseGuard {
+                counter: Arc::clone(self),
+            }),
+        })
+    }
+
+    fn is_unused(&self) -> bool {
+        self.active.load(Ordering::Acquire) == 0
+    }
+}
+
+struct ProducerLeaseGuard {
+    counter: Arc<ProducerLeaseCounter>,
+}
+
+impl Drop for ProducerLeaseGuard {
+    fn drop(&mut self) {
+        let previous = self.counter.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "a static producer lease cannot underflow");
+        if previous == 1 {
+            self.counter
+                .updates
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+}
+
+/// A logical retained lease. Cloning a bound backend handle shares this guard;
+/// only the final clone releases the producer.
+#[derive(Clone)]
+struct StaticProducerLease {
+    _guard: Arc<ProducerLeaseGuard>,
 }
 
 /// The registry the module handle consults to bind a [`BackendSourceHandle`] to
-/// the producer of a namespace's CURRENT incarnation.
-#[derive(Default)]
+/// the producer of a namespace's current incarnation, or to acquire a retained
+/// lease while that exact incarnation remains registered.
 pub(crate) struct StaticRegistry {
     producers: Mutex<HashMap<String, RegisteredProducer>>,
+    updates: watch::Sender<u64>,
+    #[cfg(test)]
+    retired: AtomicUsize,
+}
+
+impl Default for StaticRegistry {
+    fn default() -> Self {
+        Self {
+            producers: Mutex::new(HashMap::new()),
+            updates: watch::channel(0).0,
+            #[cfg(test)]
+            retired: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl StaticRegistry {
@@ -197,11 +273,46 @@ impl StaticRegistry {
             .then(|| (entry.routing.clone(), entry.health.clone()))
     }
 
+    fn lookup_retained(
+        &self,
+        namespace: &str,
+        incarnation: &NamespaceIncarnation,
+    ) -> Option<(
+        RoutingSnapshotHandle,
+        HealthOverlayHandle,
+        StaticProducerLease,
+    )> {
+        let producers = self
+            .producers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entry = producers.get(namespace)?;
+        if !entry.incarnation.same_as(incarnation) {
+            return None;
+        }
+        Some((
+            entry.routing.clone(),
+            entry.health.clone(),
+            entry.leases.acquire()?,
+        ))
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.updates.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_count(&self) -> usize {
+        self.retired.load(Ordering::Acquire)
+    }
+
     fn insert(&self, namespace: String, entry: RegisteredProducer) {
         self.producers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(namespace, entry);
+        self.updates
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     fn remove(&self, namespace: &str) {
@@ -209,6 +320,8 @@ impl StaticRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(namespace);
+        self.updates
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     fn clear(&self) {
@@ -216,6 +329,8 @@ impl StaticRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.updates
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 
@@ -261,6 +376,7 @@ pub(crate) struct StaticBackendProducer {
     feeder: HealthGenerationFeeder,
     source: Arc<RoutingSnapshot>,
     networks: Option<Arc<HashMap<Arc<str>, ClusterHealthNetwork>>>,
+    leases: Arc<ProducerLeaseCounter>,
     active: bool,
     task: JoinHandle<()>,
 }
@@ -279,6 +395,7 @@ impl StaticBackendProducer {
         owner: OwnerToken,
         runtime: &HealthRuntime,
         zone: Arc<dyn ConfigNamespaceSource>,
+        updates: watch::Sender<u64>,
         activate: bool,
     ) -> Result<Self, ClusterHttpConfigError> {
         let networks = match runtime.probe_policy() {
@@ -305,6 +422,7 @@ impl StaticBackendProducer {
             .unwrap_or_else(|| unreachable!("a fresh static publisher publishes its first source"));
         let (feeder, feed) = HealthGenerationFeeder::new();
         let (overlay, health) = HealthOverlayPublisher::new();
+        let leases = Arc::new(ProducerLeaseCounter::new(updates));
         let task = tokio::spawn(run_health_loop(
             feed,
             routing_handle.clone(),
@@ -323,6 +441,7 @@ impl StaticBackendProducer {
             feeder,
             source,
             networks,
+            leases,
             active: false,
             task,
         };
@@ -341,6 +460,7 @@ impl StaticBackendProducer {
             incarnation: self.incarnation.clone(),
             routing: self.routing_handle.clone(),
             health: self.health.clone(),
+            leases: Arc::clone(&self.leases),
         }
     }
 
@@ -367,17 +487,31 @@ impl StaticBackendProducer {
         self.feeder.withdraw();
     }
 
+    fn has_retained_lease(&self) -> bool {
+        !self.leases.is_unused()
+    }
+
     /// Revokes every reader gate synchronously, then aborts the loop.
-    pub(crate) fn revoke(self) {
+    fn fence(&mut self) {
         self.routing.revoke_and_clear();
         self.feeder.close();
         self.task.abort();
+    }
+
+    async fn retire(mut self) {
+        self.fence();
+        let _ = self.task.await;
+    }
+
+    async fn join(self) {
+        let _ = self.task.await;
     }
 }
 
 /// The run-loop-owned set of static producers plus the registry readers use.
 pub(crate) struct StaticProducers {
     producers: HashMap<String, StaticBackendProducer>,
+    retired: Vec<StaticBackendProducer>,
     registry: Arc<StaticRegistry>,
 }
 
@@ -385,15 +519,17 @@ impl StaticProducers {
     pub(crate) fn new(registry: Arc<StaticRegistry>) -> Self {
         Self {
             producers: HashMap::new(),
+            retired: Vec::new(),
             registry,
         }
     }
 
     /// Reconciles the producers with the namespaces of `snapshot` (Go
     /// `CommitNamespaces`): keep the same incarnation untouched, replace a changed
-    /// one, create a new one, revoke a removed one. Independent of whether the
-    /// generation's cluster material is applied.
-    pub(crate) fn reconcile(
+    /// one, create a new one, and fence/join a removed producer once no retained
+    /// lease remains. Independent of whether the generation's cluster material
+    /// is applied.
+    pub(crate) async fn reconcile(
         &mut self,
         snapshot: &ConfigNamespaceSnapshot,
         owner: &OwnerToken,
@@ -401,6 +537,7 @@ impl StaticProducers {
         zone: &Arc<dyn ConfigNamespaceSource>,
         mode: Option<BackendSourceMode>,
     ) {
+        self.retire_unused().await;
         let activate = mode == Some(BackendSourceMode::Static);
         let mut retain: Vec<&str> = Vec::with_capacity(snapshot.namespaces().len());
         for namespace in snapshot.namespaces() {
@@ -418,7 +555,7 @@ impl StaticProducers {
             }
             if let Some(old) = self.producers.remove(name) {
                 self.registry.remove(name);
-                old.revoke();
+                self.retain_or_retire(old).await;
             }
             // The only build failure is a probe timeout the health runtime already
             // validated at construction; a namespace without a producer simply has
@@ -429,6 +566,7 @@ impl StaticProducers {
                 owner.clone(),
                 runtime,
                 Arc::clone(zone),
+                self.registry.updates.clone(),
                 activate,
             ) {
                 self.registry.insert(name.to_owned(), producer.registered());
@@ -444,8 +582,32 @@ impl StaticProducers {
         for name in removed {
             if let Some(old) = self.producers.remove(&name) {
                 self.registry.remove(&name);
-                old.revoke();
+                self.retain_or_retire(old).await;
             }
+        }
+        self.retire_unused().await;
+    }
+
+    async fn retain_or_retire(&mut self, producer: StaticBackendProducer) {
+        if producer.has_retained_lease() {
+            #[cfg(test)]
+            self.registry.retired.fetch_add(1, Ordering::AcqRel);
+            self.retired.push(producer);
+        } else {
+            producer.retire().await;
+        }
+    }
+
+    pub(crate) async fn retire_unused(&mut self) {
+        let mut index = 0;
+        while index < self.retired.len() {
+            if self.retired[index].has_retained_lease() {
+                index += 1;
+                continue;
+            }
+            self.retired.swap_remove(index).retire().await;
+            #[cfg(test)]
+            self.registry.retired.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -458,13 +620,33 @@ impl StaticProducers {
                 producer.park();
             }
         }
+        for producer in &mut self.retired {
+            if mode == Some(BackendSourceMode::Static) {
+                producer.activate();
+            } else {
+                producer.park();
+            }
+        }
     }
 
     /// Revokes every producer (terminal fence).
-    pub(crate) fn revoke_all(&mut self) {
+    pub(crate) fn fence_all(&mut self) {
         self.registry.clear();
+        for producer in self.producers.values_mut() {
+            producer.fence();
+        }
+        for producer in &mut self.retired {
+            producer.fence();
+        }
+    }
+
+    /// Joins every producer after [`Self::fence_all`] on normal teardown.
+    pub(crate) async fn join_all(&mut self) {
         for (_, producer) in self.producers.drain() {
-            producer.revoke();
+            producer.join().await;
+        }
+        for producer in self.retired.drain(..) {
+            producer.join().await;
         }
     }
 }
@@ -504,8 +686,10 @@ impl BackendSourceSnapshot {
 
 /// The capability a consumer holds for one namespace's backend source.
 ///
-/// Private fields only; not serializable. Bound to the namespace incarnation
-/// current when it was created and to the producer registered for it.
+/// Private fields only; not serializable. Bound to an exact namespace
+/// incarnation and to the producer registered for it. Ordinary handles require
+/// that incarnation to remain current; explicitly retained handles keep it alive
+/// for existing-session callbacks after replacement.
 #[derive(Clone)]
 pub struct BackendSourceHandle {
     bundle: Arc<()>,
@@ -515,6 +699,7 @@ pub struct BackendSourceHandle {
     mode: watch::Receiver<Arc<ModeEpoch>>,
     dynamic: (RoutingSnapshotHandle, HealthOverlayHandle),
     stationary: (RoutingSnapshotHandle, HealthOverlayHandle),
+    retained: Option<StaticProducerLease>,
 }
 
 impl BackendSourceHandle {
@@ -536,6 +721,29 @@ impl BackendSourceHandle {
             mode,
             dynamic,
             stationary,
+            retained: None,
+        })
+    }
+
+    pub(crate) fn bind_retained(
+        namespace: &str,
+        origin: Arc<ConfigNamespaceSnapshot>,
+        config: Arc<dyn ConfigNamespaceSource>,
+        mode: watch::Receiver<Arc<ModeEpoch>>,
+        dynamic: (RoutingSnapshotHandle, HealthOverlayHandle),
+        registry: &StaticRegistry,
+    ) -> Option<Self> {
+        let incarnation = origin.namespace_incarnation(namespace)?;
+        let (routing, health, retained) = registry.lookup_retained(namespace, &incarnation)?;
+        Some(Self {
+            bundle: Arc::new(()),
+            namespace: Arc::from(namespace),
+            origin,
+            config,
+            mode,
+            dynamic,
+            stationary: (routing, health),
+            retained: Some(retained),
         })
     }
 
@@ -568,13 +776,14 @@ impl BackendSourceHandle {
         &self.stationary
     }
 
-    /// Whether the bound namespace incarnation is still the config source's
-    /// current one. Checked at the SOURCE on every call, so a namespace removed
-    /// or replaced in the committed config fails closed at once, in every mode,
-    /// regardless of the topology run loop's progress.
+    /// Whether this handle has namespace authority. An ordinary admission handle
+    /// checks the current source on every call; an explicitly retained handle is
+    /// authorized by its producer lease until that handle's final clone drops.
     fn namespace_current(&self) -> bool {
-        self.origin
-            .same_namespace_incarnation(&self.config.current(), &self.namespace)
+        self.retained.is_some()
+            || self
+                .origin
+                .same_namespace_incarnation(&self.config.current(), &self.namespace)
     }
 
     const fn side(&self, epoch: &ModeEpoch) -> &(RoutingSnapshotHandle, HealthOverlayHandle) {

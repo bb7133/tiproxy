@@ -239,6 +239,7 @@ impl MetricSnapshot {
                     && result.selected_proofs().iter().all(owner::Proof::is_live)
             })
     }
+    #[cfg_attr(not(feature = "api-replay"), allow(clippy::unused_self))]
     fn input_current(&self) -> bool {
         #[cfg(feature = "api-replay")]
         if self

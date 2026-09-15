@@ -86,7 +86,7 @@ impl MigrationSimulation {
             if stopped(&stop) || lifecycle.borrow().phase != control_plane::LifecyclePhase::Ready {
                 return Ok(());
             }
-            let candidate = match self.router.capture() {
+            let candidate = match self.router.capture_retained() {
                 Ok(candidate) => candidate,
                 Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => continue,
                 Err(error) => return Err(error),
@@ -110,7 +110,7 @@ impl MigrationSimulation {
         }
     }
     fn refresh_worker_state(&self) -> Result<(), RouteError> {
-        match self.router.capture() {
+        match self.router.capture_retained() {
             Ok(candidate) => match self
                 .router
                 .refresh_failover(&candidate, tokio::time::Instant::now().into_std())

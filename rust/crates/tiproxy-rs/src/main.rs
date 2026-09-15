@@ -46,7 +46,7 @@ use control_proto::control_transport::ClientConfig;
 use control_proto::control_transport::ControlClient;
 use control_proto::snapshot::SnapshotStore;
 use control_proto::v1::{ControlCapability, Hello, Role};
-use control_router::RouteCandidateValidator;
+use control_router::{RouteCandidateValidator, RoutePlane};
 use control_topology::{InterfaceAdvertiseResolver, TopologyModule};
 use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
 use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
@@ -546,6 +546,41 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("initialize topology module: {error}"))
             .await);
     }
+    // The local route plane must bind every namespace's exact incarnation to a
+    // retained topology source before any serving snapshot can open listeners.
+    // T2 consumes the handle for local initial routing; T1 establishes the
+    // ownership/readiness boundary without changing the bridge route path yet.
+    let route_serving = match config_owner.handle.source().current().effective().serving() {
+        Ok(serving) => serving,
+        Err(error) => {
+            return Err(guard
+                .rollback(format!("project route-plane capacity: {error}"))
+                .await);
+        }
+    };
+    let configured_max_sessions = route_serving.max_connections;
+    let max_sessions = if configured_max_sessions == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(configured_max_sessions).unwrap_or(usize::MAX)
+    };
+    let (route_plane, mut route_plane_handle) = RoutePlane::new(
+        Arc::new(config_owner.handle.source().clone()),
+        topology_handle.clone(),
+        max_sessions,
+        None,
+    );
+    if let Err(error) = guard.spawn_module(route_plane) {
+        return Err(guard
+            .rollback(format!("start route-plane module: {error}"))
+            .await);
+    }
+    if let Err(error) = route_plane_handle.wait_ready().await {
+        return Err(guard
+            .rollback(format!("initialize route-plane module: {error}"))
+            .await);
+    }
+    let _route_plane_handle = route_plane_handle;
     if let Err(error) = guard.spawn_module(ConfigServingAdapter::new(
         config_owner.handle.source().clone(),
         serving.clone(),

@@ -65,7 +65,7 @@ impl Selector {
         client: ClientInfo<'_>,
         listener_port: &str,
     ) -> Result<Reservation, RouteError> {
-        let candidate = self.router.capture()?;
+        let candidate = self.router.capture_retained()?;
         self.next_candidate(&candidate, client, listener_port)
     }
 

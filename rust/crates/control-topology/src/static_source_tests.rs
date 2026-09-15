@@ -566,6 +566,85 @@ async fn a_removed_namespace_fails_closed_at_the_source_and_recreation_is_new() 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retained_source_survives_replacement_until_its_last_lease_drops() -> TestResult {
+    let old = Greeter::spawn(Greeting::V10, false).await?;
+    let new = Greeter::spawn(Greeting::V10, false).await?;
+    let store = store_with(
+        &zero_cluster_config(),
+        vec![namespace("default", &[&old.address])],
+    )?;
+    let observed = store.clone();
+    let origin = observed.current();
+    let module = spawn_module(store, health(true)).await?;
+    let admission = wait_handle(&module, "default").await?;
+    let retained = module
+        .handle
+        .retained_backend_source(origin, "default")
+        .ok_or("retained source")?;
+    let before = wait_snapshot(&retained, |_| true).await?;
+    assert_eq!(
+        before.routing().backends.backends[0].backend_id.as_ref(),
+        old.address.as_str()
+    );
+
+    apply(
+        &observed,
+        &zero_cluster_config(),
+        vec![namespace("default", &[&new.address])],
+        3,
+    )?;
+    assert!(
+        retained.current().is_some(),
+        "the exact retained source does not lose authority at config publication"
+    );
+    assert!(
+        admission.current().is_none(),
+        "an ordinary admission source still fails closed immediately"
+    );
+    wait_applied(&module, 3).await?;
+    assert_eq!(module.handle.retired_static_producers(), 1);
+
+    let retained_after = wait_snapshot(&retained, |snapshot| {
+        snapshot
+            .routing()
+            .backends
+            .backends
+            .first()
+            .is_some_and(|backend| backend.backend_id.as_ref() == old.address)
+    })
+    .await?;
+    assert!(retained.still_current(&retained_after));
+    let fresh = wait_handle(&module, "default").await?;
+    let fresh_snapshot = wait_snapshot(&fresh, |snapshot| {
+        snapshot
+            .routing()
+            .backends
+            .backends
+            .first()
+            .is_some_and(|backend| backend.backend_id.as_ref() == new.address)
+    })
+    .await?;
+    assert!(fresh.still_current(&fresh_snapshot));
+    assert!(
+        module
+            .handle
+            .retained_backend_source(observed.current(), "default")
+            .is_some(),
+        "the replacement incarnation can acquire its own retained source"
+    );
+
+    drop(retained);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while module.handle.retired_static_producers() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    drop(module);
+    Ok(())
+}
+
 /// Installs the synchronous publish hook that records, at the very instant the
 /// Dynamic epoch is published, whether the bound static overlay is still
 /// authoritative (it must not be: the producer is parked before the publish).
@@ -793,6 +872,7 @@ impl ModeHandleFixture {
         let lease = registry_lease.claim(OwnerScope::Process, "mode-handle-row")?;
         let owner = lease.token();
         let registry = StaticRegistry::default();
+        let producer_leases = Arc::new(super::ProducerLeaseCounter::new(registry.updates.clone()));
         registry.insert(
             "default".to_owned(),
             RegisteredProducer {
@@ -802,6 +882,7 @@ impl ModeHandleFixture {
                     .ok_or("incarnation")?,
                 routing: st_handle,
                 health: st_health,
+                leases: producer_leases,
             },
         );
         let handle = BackendSourceHandle::bind(

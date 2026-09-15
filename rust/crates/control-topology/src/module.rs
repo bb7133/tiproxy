@@ -337,6 +337,7 @@ fn reconcile_health_feed(
 /// The composition root waits on [`TopologyModuleHandle::wait_ready`] before
 /// starting modules that depend on registration and discovery having begun, then
 /// pulls discovery through [`TopologyModuleHandle::discovery_handle`].
+#[derive(Clone)]
 pub struct TopologyModuleHandle {
     ready: watch::Receiver<bool>,
     status: watch::Receiver<TopologyStatus>,
@@ -465,6 +466,11 @@ impl TopologyModuleHandle {
         epoch.is_live().then(|| epoch.mode())
     }
 
+    #[cfg(test)]
+    pub(crate) fn retired_static_producers(&self) -> usize {
+        self.statics.retired_count()
+    }
+
     /// Binds a [`BackendSourceHandle`] to `namespace`'s CURRENT incarnation
     /// (CP-ROUTE 220-3 B2), or `None` when the namespace is absent from the
     /// committed config or its static producer is not (yet, or any longer)
@@ -478,6 +484,39 @@ impl TopologyModuleHandle {
             (self.routing.clone(), self.health.clone()),
             &self.statics,
         )
+    }
+
+    /// Binds a retained backend-source lease to `namespace` in the exact
+    /// supplied configuration snapshot.
+    ///
+    /// Unlike [`Self::backend_source`], the returned handle deliberately stays
+    /// usable after that namespace incarnation is replaced or removed. It
+    /// retains the old static producer while following later globally applied
+    /// mode and dynamic topology/health publications. Only an owner such as the
+    /// route-incarnation registry should mint this capability; dropping its last
+    /// clone lets the module fence and join the retired static producer.
+    #[must_use]
+    pub fn retained_backend_source(
+        &self,
+        snapshot: Arc<ConfigNamespaceSnapshot>,
+        namespace: &str,
+    ) -> Option<BackendSourceHandle> {
+        BackendSourceHandle::bind_retained(
+            namespace,
+            snapshot,
+            Arc::clone(&self.source),
+            self.mode.clone(),
+            (self.routing.clone(), self.health.clone()),
+            &self.statics,
+        )
+    }
+
+    /// Subscribes to static-source registry changes. A wake-up grants no source
+    /// authority; callers must retry an exact [`Self::retained_backend_source`]
+    /// bind against their configuration snapshot.
+    #[must_use]
+    pub fn backend_source_updates(&self) -> watch::Receiver<u64> {
+        self.statics.subscribe()
     }
 }
 
@@ -701,6 +740,7 @@ impl TopologyModule {
         let mut active_health: Option<AppliedHealthMaterial> = None;
         let routing_reader = self.routing.handle();
         let mut routing_observer = self.routing.handle();
+        let mut static_updates = self.statics.subscribe();
         // Owns the routing-refresh child, the health child, the unique feeder, and
         // the routing + discovery withdrawal authority. Created before the first
         // apply so an early rejection (or the task being dropped/aborted) still
@@ -800,6 +840,12 @@ impl TopologyModule {
                     }
                     reconcile_health_feed(&runtime.feeder, active_health.as_ref(), &routing_reader);
                     self.reconcile_metrics();
+                }
+                changed = static_updates.changed() => {
+                    if changed.is_err() {
+                        break Err(module_error("static_release_observer_closed"));
+                    }
+                    runtime.statics.retire_unused().await;
                 }
                 exited = children.tasks.join_next(), if !children.tasks.is_empty() => {
                     // A child completed while we were not tearing it down: an
@@ -1169,13 +1215,15 @@ impl TopologyModule {
         let generation = snapshot.generation();
         // Namespaces follow the committed config (Go `CommitNamespaces`),
         // independently of whether this generation's cluster material applies.
-        statics.reconcile(
-            snapshot,
-            owner,
-            &self.health_runtime,
-            &self.source,
-            self.mode.applied(),
-        );
+        statics
+            .reconcile(
+                snapshot,
+                owner,
+                &self.health_runtime,
+                &self.source,
+                self.mode.applied(),
+            )
+            .await;
         let outcome = self
             .reconfigure(children, active_plan, snapshot, owner, health, statics)
             .await;
@@ -1369,7 +1417,7 @@ impl ModuleRuntime<'_> {
         self.discovery.revoke();
         self.metrics.close();
         self.feeder.close();
-        self.statics.revoke_all();
+        self.statics.fence_all();
     }
 
     async fn retire(mut self) {
@@ -1388,6 +1436,7 @@ impl ModuleRuntime<'_> {
         if let Some(handle) = self.refresh.take() {
             let _ = handle.await;
         }
+        self.statics.join_all().await;
     }
 }
 

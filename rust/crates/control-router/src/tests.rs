@@ -44,7 +44,7 @@ use tonic::codegen::{BoxFuture, Service, http};
 use tonic::server::{Grpc, NamedService, UnaryService};
 use tonic_prost::ProstCodec;
 
-use crate::{Candidate, Reservation, RouteError, Router, Settlement, Unsupported};
+use crate::{Candidate, Reservation, RouteError, RoutePlane, Router, Settlement, Unsupported};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -723,6 +723,70 @@ async fn namespace_revocation_and_owner_retirement_allow_only_old_settlement() -
         harness.router.finish(&reservation, true),
         Settlement::Ignored
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_plane_replaces_admission_but_retains_an_existing_selector() -> TestResult {
+    let harness = Harness::new("", "connection").await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        100,
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+    assert_eq!(handle.current_incarnations(), 1);
+
+    let mut retained = must(handle.admit(""));
+    assert_eq!(retained.namespace(), "default");
+
+    let current = harness.source.store.current();
+    let mut replacement = NamespaceConfig {
+        namespace: "default".to_owned(),
+        ..NamespaceConfig::default()
+    };
+    replacement.frontend.user = "replacement".to_owned();
+    harness.source.store.apply(
+        (**current.effective()).clone(),
+        vec![replacement],
+        SourceRevision {
+            file_revision: 3,
+            etcd_revision: 0,
+        },
+        Path::new("/tmp"),
+    )?;
+    harness.source.deliver();
+
+    let replacement = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(replacement) = handle.admit("replacement")
+                && !retained.same_router_incarnation(&replacement)
+            {
+                break replacement;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(replacement.namespace(), "default");
+    assert_eq!(handle.current_incarnations(), 1);
+
+    let reservation = must(retained.selector_mut().next(ClientInfo::default(), ""));
+    assert_eq!(
+        reservation.assignment().backend_id,
+        "default/127.0.0.1:4000"
+    );
+    assert_eq!(
+        retained.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    drop(retained);
+    drop(replacement);
+    plane_task.abort();
+    let _ = plane_task.await;
     Ok(())
 }
 
