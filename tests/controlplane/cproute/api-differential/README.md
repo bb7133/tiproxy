@@ -185,11 +185,18 @@ an authoritative empty result. CI runs all three synthetic inputs through the
 same runner and uploads a third `routing-api-source-error` directory. The common
 eight comparator mutations remain a single round on the primary trace.
 
-Error publication is currently enabled by the test-only `api-replay` feature.
-The existing network discovery refresh still retains its last successful result
-on a failed poll; forwarding its qualified failure into the observer publisher
-belongs to the remaining producer integration. This slice does not claim that
-live-source error forwarding or arbitrary error identities are complete.
+The #223 Rust route-owner composition now forwards the production discovery
+class that can be qualified at the final source fence:
+`TopologyUnavailable { client_epoch, source }`. The exact epoch is carried in
+the failure itself, so a rotation after the failed I/O cannot attach it to a
+newer source. The routing publisher mints an error generation only for the
+exact current epoch, retains the last successful backend inventory, and the
+health loop immediately republishes the prior whole health/redirection map
+under the new source/feed/owner gates. Later health rounds keep the error; an
+explicit successful discovery result clears it, including an authoritative
+empty result. `Stale`, `Revoked`, and wrong-epoch errors have no publication
+authority. The other synthetic error identities remain `api-replay` contract
+coverage rather than claimed live discovery outputs.
 
 
 The first source-error run at 1773e57f failed its synthetic expectation at

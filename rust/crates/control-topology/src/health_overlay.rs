@@ -290,6 +290,7 @@ impl HealthOverlayPublisher {
     /// later feed transition invalidates this overlay synchronously), the previous
     /// published round's gate is revoked, and the new snapshot is swapped in with a
     /// single `send_replace` — one whole-map publish per round.
+    #[cfg(test)]
     pub(crate) fn publish_round(
         &self,
         source: &Arc<RoutingSnapshot>,
@@ -300,11 +301,28 @@ impl HealthOverlayPublisher {
         self.publish_result(source, health, HashMap::new(), feed_gate, owner)
     }
 
+    #[cfg(any(test, feature = "api-replay"))]
     pub(crate) fn publish_result(
         &self,
         source: &Arc<RoutingSnapshot>,
         health: HashMap<Arc<str>, BackendHealth>,
         redirection: HashMap<Arc<str>, bool>,
+        feed_gate: GenerationGate,
+        owner: &OwnerToken,
+    ) -> HealthPublishOutcome {
+        self.publish_observation(source, health, redirection, None, feed_gate, owner)
+    }
+
+    /// Publishes one completed observation while preserving any qualified error
+    /// carried by its exact routing source. This is the production path used by
+    /// the health loop; API replay keeps using [`Self::publish_result`] to inject
+    /// successful observer rows explicitly.
+    pub(crate) fn publish_observation(
+        &self,
+        source: &Arc<RoutingSnapshot>,
+        health: HashMap<Arc<str>, BackendHealth>,
+        redirection: HashMap<Arc<str>, bool>,
+        observer_error: Option<ObserverError>,
         feed_gate: GenerationGate,
         owner: &OwnerToken,
     ) -> HealthPublishOutcome {
@@ -319,11 +337,48 @@ impl HealthOverlayPublisher {
             owner: owner.clone(),
             health,
             redirection,
-            observer_error: None,
+            observer_error,
         });
         // Revoke the PREVIOUS published round's gate so a retained overlay loses
         // authority immediately, then swap the new snapshot in atomically.
         let previous = self.published.borrow().clone();
+        if let Some(previous) = &previous {
+            previous.gate.revoke();
+        }
+        self.published.send_replace(Some(new));
+        HealthPublishOutcome::Published
+    }
+
+    /// Publishes a new source's qualified error immediately, before its first
+    /// health round completes, while retaining the previous whole-map health and
+    /// redirection values. The caller holds the feed lock and supplies the new
+    /// live slot gate. The previous feed gate may already be revoked by the source
+    /// transition and is intentionally not required for copying immutable data.
+    pub(crate) fn publish_retained_error(
+        &self,
+        source: &Arc<RoutingSnapshot>,
+        error: ObserverError,
+        feed_gate: GenerationGate,
+        owner: &OwnerToken,
+    ) -> HealthPublishOutcome {
+        let state = self.lock();
+        if state.retired {
+            return HealthPublishOutcome::Retired;
+        }
+        let previous = self.published.borrow().clone();
+        let (health, redirection) = previous.as_ref().map_or_else(
+            || (HashMap::new(), HashMap::new()),
+            |snapshot| (snapshot.health.clone(), snapshot.redirection.clone()),
+        );
+        let new = Arc::new(HealthSnapshot {
+            source: Arc::clone(source),
+            gate: GenerationGate::new(),
+            feed_gate,
+            owner: owner.clone(),
+            health,
+            redirection,
+            observer_error: Some(error),
+        });
         if let Some(previous) = &previous {
             previous.gate.revoke();
         }
@@ -402,7 +457,7 @@ mod tests {
     use control_external::GenerationGate;
     use control_plane::{OwnerLease, OwnerScope, OwnerToken, OwnershipRegistry};
 
-    use super::{HealthOverlayPublisher, HealthPublishOutcome};
+    use super::{HealthOverlayPublisher, HealthPublishOutcome, ObserverError};
     use crate::backend_health::BackendHealth;
     use crate::discovery_publish::EpochResult;
     use crate::merge::{MergedBackend, MergedTopology};
@@ -582,6 +637,56 @@ mod tests {
         assert!(
             !handle.still_current_for(&first, &source, &routing),
             "the retained first snapshot is no longer authority"
+        );
+    }
+
+    #[test]
+    fn a_new_error_source_retains_the_previous_whole_map_under_new_authority() {
+        let (publisher, routing, source, owner) = published_source(7, "10.0.0.1:4000");
+        let (overlay, handle) = HealthOverlayPublisher::new();
+        let old_feed_gate = GenerationGate::new();
+        overlay.publish_round(&source, healthy_map(&source), old_feed_gate.clone(), &owner);
+        let old_health = handle
+            .current_for(&source)
+            .unwrap_or_else(|| unreachable!("the successful round is published"));
+
+        publisher
+            .publish_error(7, ObserverError::TopologyUnavailable)
+            .unwrap_or_else(|_| unreachable!("no overflow"));
+        let error_source = routing
+            .current()
+            .unwrap_or_else(|| unreachable!("the error source is published"));
+        old_feed_gate.revoke();
+        assert!(
+            handle.current_for(&source).is_none(),
+            "the previous source/feed authority is dead before replacement"
+        );
+
+        assert_eq!(
+            overlay.publish_retained_error(
+                &error_source,
+                ObserverError::TopologyUnavailable,
+                GenerationGate::new(),
+                &owner,
+            ),
+            HealthPublishOutcome::Published
+        );
+        let retained = handle
+            .current_for(&error_source)
+            .unwrap_or_else(|| unreachable!("the retained error overlay is authoritative"));
+        assert_eq!(
+            retained.observer_error(),
+            Some(ObserverError::TopologyUnavailable)
+        );
+        assert_eq!(
+            retained.get("cluster-a/10.0.0.1:4000"),
+            old_health.get("cluster-a/10.0.0.1:4000"),
+            "the exact previous verdict is retained"
+        );
+        assert!(handle.still_current_for(&retained, &error_source, &routing));
+        assert!(
+            !old_health.gate.is_live(),
+            "installing the error overlay revokes the previous round gate"
         );
     }
 

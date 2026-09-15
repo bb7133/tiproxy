@@ -23,6 +23,8 @@ mod tls_material;
 mod topology_composition;
 
 use std::env;
+use std::fmt::Display;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -74,6 +76,11 @@ const CONTROL_SOCKET_ENV: &str = "TIPROXY_CONTROL_SOCKET";
 const CONTROL_UID_ENV: &str = "TIPROXY_CONTROL_UID";
 const TLS_ROOTS_ENV: &str = "TIPROXY_TLS_ROOTS";
 const CONFIG_FILE_ENV: &str = "TIPROXY_CONFIG";
+
+/// Bounds every pre-listener control-module readiness wait. A producer that
+/// stops making progress therefore reaches the armed startup rollback seam with
+/// a module-qualified diagnostic instead of freezing process startup forever.
+const CONTROL_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound for `--drain-grace-seconds` (30 days, the drain
 /// subsystem's shared deadline cap): far above any real grace and small
@@ -367,6 +374,24 @@ where
     }
 }
 
+/// Waits for one startup producer under an explicit deadline and returns a
+/// module-qualified diagnostic for both channel closure and timeout. The caller
+/// owns the armed rollback guard and routes either error through that one seam.
+async fn wait_module_ready<E: Display>(
+    module: &str,
+    budget: Duration,
+    ready: impl Future<Output = Result<(), E>>,
+) -> Result<(), String> {
+    match tokio::time::timeout(budget, ready).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("initialize {module}: {error}")),
+        Err(_) => Err(format!(
+            "initialize {module}: readiness_timeout after {}s",
+            budget.as_secs()
+        )),
+    }
+}
+
 // This is the executable's composition root: keeping the startup resources,
 // three-way supervisor, and reverse-order shutdown visible in one function
 // makes the fail-closed ownership order auditable.
@@ -495,10 +520,14 @@ async fn run(options: Options) -> Result<(), String> {
     // Persistent `/config` is part of generation one. Do not let the legacy
     // bridge open SQL listeners against the file-only base while the initial
     // linearizable relist is still outstanding.
-    if let Err(error) = config_owner.handle.wait_ready().await {
-        return Err(guard
-            .rollback(format!("initialize config owner: {error}"))
-            .await);
+    if let Err(error) = wait_module_ready(
+        "config owner",
+        CONTROL_STARTUP_READY_TIMEOUT,
+        config_owner.handle.wait_ready(),
+    )
+    .await
+    {
+        return Err(guard.rollback(error).await);
     }
     // CP-TOPO self-registration and discovery publication come online before any
     // SQL admission: register this instance's SQL topology and publish the
@@ -569,16 +598,20 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("start topology module: {error}"))
             .await);
     }
-    if let Err(error) = topology_handle.wait_ready().await {
-        return Err(guard
-            .rollback(format!("initialize topology module: {error}"))
-            .await);
+    if let Err(error) = wait_module_ready(
+        "topology module",
+        CONTROL_STARTUP_READY_TIMEOUT,
+        topology_handle.wait_ready(),
+    )
+    .await
+    {
+        return Err(guard.rollback(error).await);
     }
     // Bind the same-process owner-history endpoint before its control module can
-    // campaign. It uses the topology advertise host plus the actual port-zero
-    // bind result, and applies the exact server-HTTP TLS identity retained by
-    // each accepted config generation. This listener is independent of Go's API
-    // status port, so the two processes cannot collide.
+    // campaign. It uses the topology advertise host plus the actual bind result
+    // (ephemeral for configured port zero), and applies the exact server-HTTP
+    // TLS identity retained by each accepted config generation. Candidate
+    // validation keeps this listener distinct from Go's SQL and API ports.
     let (metric_collector, metric_overlay) = match MetricCollector::bind_for_routing_endpoint(
         topology_handle.metric_source(),
         metric_bind_address,
@@ -630,10 +663,14 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("start route-plane module: {error}"))
             .await);
     }
-    if let Err(error) = route_plane_handle.wait_ready().await {
-        return Err(guard
-            .rollback(format!("initialize route-plane module: {error}"))
-            .await);
+    if let Err(error) = wait_module_ready(
+        "route-plane module",
+        CONTROL_STARTUP_READY_TIMEOUT,
+        route_plane_handle.wait_ready(),
+    )
+    .await
+    {
+        return Err(guard.rollback(error).await);
     }
     let _route_plane_handle = route_plane_handle;
     if let Err(error) = guard.spawn_module(ConfigServingAdapter::new(
@@ -1230,7 +1267,7 @@ mod tests {
     use super::{
         Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options, StartupGuard,
         config_persistence_client, parse_options, persistence_options, session_loop_config,
-        version_output,
+        version_output, wait_module_ready,
     };
     use crate::config_composition::control_config;
     use crate::startup::{Teardown, TeardownFuture};
@@ -1254,6 +1291,31 @@ mod tests {
         log.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(label);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn module_readiness_is_bounded_and_diagnostic() {
+        let timeout = wait_module_ready(
+            "route-plane module",
+            Duration::from_secs(3),
+            std::future::pending::<Result<(), &'static str>>(),
+        )
+        .await;
+        assert_eq!(
+            timeout,
+            Err("initialize route-plane module: readiness_timeout after 3s".to_owned())
+        );
+
+        let closed = wait_module_ready(
+            "topology module",
+            Duration::from_secs(3),
+            std::future::ready(Err::<(), _>("ready channel closed")),
+        )
+        .await;
+        assert_eq!(
+            closed,
+            Err("initialize topology module: ready channel closed".to_owned())
+        );
     }
 
     /// A fake optional resource that records its slot label when torn down, so a
@@ -1705,6 +1767,21 @@ mod tests {
         assert!(
             !region.contains("?;"),
             "no `?` operator may bypass the guard in the startup region"
+        );
+        assert_eq!(
+            region.matches("wait_module_ready(").count(),
+            3,
+            "config, topology, and route-plane readiness are all deadline-bounded"
+        );
+        for module in ["config owner", "topology module", "route-plane module"] {
+            assert!(
+                region.contains(&format!("\"{module}\"")),
+                "the readiness diagnostic names {module}"
+            );
+        }
+        assert!(
+            region.contains("bind metric owner endpoint"),
+            "an occupied fixed owner port reaches startup rollback with a stable diagnostic"
         );
     }
 

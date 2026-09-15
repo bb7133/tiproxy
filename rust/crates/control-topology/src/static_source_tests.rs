@@ -32,7 +32,7 @@ use crate::module::tests::kv_fixture::{FixtureFactory, spawn_fixture};
 use crate::module::{ChildRunner, TopologyClientFactory, TopologyClusterClient, TopologyModule};
 use crate::resolver::StaticAdvertiseResolver;
 use crate::routing_snapshot::RoutingSnapshotPublisher;
-use crate::static_source::{RegisteredProducer, StaticRegistry};
+use crate::static_source::{ProducerLeaseCounter, RegisteredProducer, StaticRegistry};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -645,6 +645,82 @@ async fn a_retained_source_survives_replacement_until_its_last_lease_drops() -> 
     Ok(())
 }
 
+#[test]
+fn concurrent_retained_lookup_and_remove_is_atomic() -> TestResult {
+    const WORKERS: usize = 8;
+    const ITERATIONS: usize = 2_000;
+    let store = store_with(
+        &zero_cluster_config(),
+        vec![namespace("default", &["127.0.0.1:4000"])],
+    )?;
+    let incarnation = store
+        .current()
+        .namespace_incarnation("default")
+        .ok_or("default incarnation")?;
+    let registry = Arc::new(StaticRegistry::default());
+    let (routing_publisher, routing) = RoutingSnapshotPublisher::new();
+    routing_publisher
+        .publish(EpochResult {
+            client_epoch: 0,
+            value: MergedTopology::default(),
+        })
+        .unwrap_or_else(|_| unreachable!("the first publication cannot overflow"));
+    let (overlay_publisher, health) = HealthOverlayPublisher::new();
+
+    let entry = || RegisteredProducer {
+        incarnation: incarnation.clone(),
+        routing: routing.clone(),
+        health: health.clone(),
+        leases: Arc::new(ProducerLeaseCounter::new(registry.updates.clone())),
+    };
+    registry.insert("default".to_owned(), entry());
+
+    let barrier = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+    let successes = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let registry = Arc::clone(&registry);
+        let incarnation = incarnation.clone();
+        let barrier = Arc::clone(&barrier);
+        let successes = Arc::clone(&successes);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..ITERATIONS {
+                if let Some((_routing, _health, lease)) =
+                    registry.lookup_retained("default", &incarnation)
+                {
+                    successes.fetch_add(1, Ordering::Relaxed);
+                    drop(lease);
+                }
+                std::thread::yield_now();
+            }
+        }));
+    }
+    barrier.wait();
+    for _ in 0..ITERATIONS {
+        registry.remove("default");
+        std::thread::yield_now();
+        registry.insert("default".to_owned(), entry());
+    }
+    for worker in workers {
+        worker
+            .join()
+            .unwrap_or_else(|_| unreachable!("lookup worker must not panic"));
+    }
+
+    assert!(
+        successes.load(Ordering::Relaxed) > 0,
+        "at least one exact retained lookup wins an insertion interval"
+    );
+    let final_lease = registry
+        .lookup_retained("default", &incarnation)
+        .ok_or("final exact producer remains registered")?
+        .2;
+    drop(final_lease);
+    drop(overlay_publisher);
+    Ok(())
+}
+
 /// Installs the synchronous publish hook that records, at the very instant the
 /// Dynamic epoch is published, whether the bound static overlay is still
 /// authoritative (it must not be: the producer is parked before the publish).
@@ -872,7 +948,7 @@ impl ModeHandleFixture {
         let lease = registry_lease.claim(OwnerScope::Process, "mode-handle-row")?;
         let owner = lease.token();
         let registry = StaticRegistry::default();
-        let producer_leases = Arc::new(super::ProducerLeaseCounter::new(registry.updates.clone()));
+        let producer_leases = Arc::new(ProducerLeaseCounter::new(registry.updates.clone()));
         registry.insert(
             "default".to_owned(),
             RegisteredProducer {

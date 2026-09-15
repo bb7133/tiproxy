@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -785,6 +785,107 @@ async fn route_plane_replaces_admission_but_retains_an_existing_selector() -> Te
     );
     drop(retained);
     drop(replacement);
+    plane_task.abort();
+    let _ = plane_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_plane_concurrent_admission_and_namespace_removal_never_stalls_or_resurrects()
+-> TestResult {
+    const WORKERS: usize = 8;
+    const CYCLES: u64 = 50;
+    let harness = Harness::new("", "connection").await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        100,
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let successes = Arc::new(AtomicUsize::new(0));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+    let mut workers = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let handle = handle.clone();
+        let stop = Arc::clone(&stop);
+        let successes = Arc::clone(&successes);
+        let failures = Arc::clone(&failures);
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            while !stop.load(Ordering::Acquire) {
+                match handle.admit("") {
+                    Ok(admission) => {
+                        assert_eq!(admission.namespace(), "default");
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                std::thread::yield_now();
+            }
+        }));
+    }
+    barrier.wait();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let effective = (**harness.source.store.current().effective()).clone();
+    for cycle in 0..CYCLES {
+        let remove_revision = 3 + cycle * 2;
+        harness.source.store.apply(
+            effective.clone(),
+            Vec::new(),
+            SourceRevision {
+                file_revision: remove_revision,
+                etcd_revision: 0,
+            },
+            Path::new("/tmp"),
+        )?;
+        harness.source.deliver();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        harness.source.store.apply(
+            effective.clone(),
+            vec![NamespaceConfig {
+                namespace: "default".to_owned(),
+                ..NamespaceConfig::default()
+            }],
+            SourceRevision {
+                file_revision: remove_revision + 1,
+                etcd_revision: 0,
+            },
+            Path::new("/tmp"),
+        )?;
+        harness.source.deliver();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if handle.current_incarnations() == 1 && handle.admit("").is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    stop.store(true, Ordering::Release);
+    for worker in workers {
+        worker
+            .join()
+            .unwrap_or_else(|_| unreachable!("admission worker must not panic"));
+    }
+    assert!(successes.load(Ordering::Relaxed) > 0);
+    assert!(failures.load(Ordering::Relaxed) > 0);
+    assert_eq!(handle.current_incarnations(), 1);
+
     plane_task.abort();
     let _ = plane_task.await;
     Ok(())

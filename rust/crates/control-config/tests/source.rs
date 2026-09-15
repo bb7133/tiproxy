@@ -1024,7 +1024,7 @@ fn canonical_full_config_checksum_matches_production_go_encoder() {
     let store = ConfigNamespaceStore::from_toml(data, None, current_dir())
         .unwrap_or_else(|error| unreachable!("full parity fixture: {error}"));
     // Generated from lib/config.Config.ToBytes using the same full fixture.
-    assert_eq!(store.current().config_checksum(), 3_154_465_263);
+    assert_eq!(store.current().config_checksum(), 2_137_169_756);
 }
 
 fn proxy_max_connections(snapshot: &control_config::ConfigNamespaceSnapshot) -> u64 {
@@ -1206,6 +1206,71 @@ routing-shadow-socket="/tmp/observer.sock"
         assert!(
             load(format!("enable-traffic-replay=false\n{invalid}").as_bytes()).is_err(),
             "routing observer validation: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn metrics_owner_port_is_explicit_restart_pinned_and_collision_free() {
+    let load = |text: &[u8]| ConfigNamespaceStore::from_toml(text, None, current_dir());
+    let disabled = load(&[]).unwrap_or_else(|error| unreachable!("default: {error}"));
+    assert_eq!(
+        disabled
+            .current()
+            .effective()
+            .topology()
+            .unwrap_or_else(|error| unreachable!("default topology: {error}"))
+            .metrics_owner_port,
+        0
+    );
+
+    let input = b"[rust-dataplane]\nmetrics-owner-port=7443\n";
+    let fixed = load(input).unwrap_or_else(|error| unreachable!("fixed port: {error}"));
+    assert_eq!(
+        fixed
+            .current()
+            .effective()
+            .topology()
+            .unwrap_or_else(|error| unreachable!("fixed topology: {error}"))
+            .metrics_owner_port,
+        7443
+    );
+    assert!(matches!(
+        fixed.apply_toml(
+            b"[rust-dataplane]\nmetrics-owner-port=7444\n",
+            None,
+            2,
+            current_dir()
+        ),
+        Err(StoreError::Config(ConfigError::RestartRequired {
+            field: "rust-dataplane"
+        }))
+    ));
+    assert_eq!(
+        fixed.current().generation(),
+        1,
+        "a restart-level change must not publish or invalidate the retained generation"
+    );
+    assert_eq!(
+        fixed
+            .current()
+            .effective()
+            .topology()
+            .unwrap_or_else(|error| unreachable!("retained topology: {error}"))
+            .metrics_owner_port,
+        7443
+    );
+
+    for invalid in [
+        "[rust-dataplane]\nmetrics-owner-port=-1",
+        "[rust-dataplane]\nmetrics-owner-port=65536",
+        "[rust-dataplane]\nmetrics-owner-port=6000",
+        "[api]\naddr='0.0.0.0:7443'\n[rust-dataplane]\nmetrics-owner-port=7443",
+        "[proxy]\nport-range=[6001,6003]\n[rust-dataplane]\nmetrics-owner-port=6002",
+    ] {
+        assert!(
+            load(invalid.as_bytes()).is_err(),
+            "invalid metrics owner port candidate: {invalid}"
         );
     }
 }

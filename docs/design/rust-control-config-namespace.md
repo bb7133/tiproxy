@@ -210,7 +210,7 @@ would activate the value is rejected by the serving validator.
 | `balance.routing-rule` | Restart | Modeled; listener-group construction is fixed at startup. |
 | `ha.virtual-ip`, `ha.interface`, `ha.garp-burst-count`, `ha.garp-refresh-count` | Restart | Modeled; CP-HA consumes them at startup. |
 | `metering.type`, `region`, `bucket`, `prefix`, `endpoint`, `shared-pool-id`; every field below `metering.aws`, `.oss`, `.cos`, `.azure`, `.localfs` | Restart | Modeled with secret-safe debug output; CP-METER consumes them at startup. |
-| `rust-dataplane.enabled`, `.control-socket`, `.allowed-uid`, `.tls-allowed-roots` | Restart | Modeled; process/transport and TLS trust roots cannot change online. |
+| `rust-dataplane.enabled`, `.control-socket`, `.routing-shadow-socket`, `.allowed-uid`, `.tls-allowed-roots`, `.metrics-owner-port` | Restart | Modeled; process/transport, TLS trust roots, observer socket, and metrics-owner bind cannot change online. A nonzero metrics-owner port must differ from every SQL/API listener port. |
 | `proxy.max-connections`, `proxy.high-memory-usage-reject-threshold`, `proxy.conn-buffer-size` | Dynamic | Applied by the Rust SQL serving snapshot. |
 | all five fields `enabled`, `idle`, `cnt`, `intvl`, `timeout` below each of `proxy.frontend-keepalive`, `.backend-healthy-keepalive`, `.backend-unhealthy-keepalive` | Dynamic | Applied by the Rust SQL serving snapshot. |
 | `proxy.proxy-protocol`, `.graceful-wait-before-shutdown`, `.graceful-close-conn-timeout`, `.public-endpoints` | Dynamic | Applied by the Rust SQL serving snapshot, including the latest graceful-close value at process drain. |

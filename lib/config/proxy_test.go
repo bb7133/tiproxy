@@ -155,6 +155,37 @@ func TestRoutingObservationConfigIsExplicitAndRestartPinned(t *testing.T) {
 	require.ErrorContains(t, cfg.Check(), "routing-shadow-socket")
 }
 
+func TestMetricsOwnerPortIsExplicitRestartPinnedAndCollisionFree(t *testing.T) {
+	cfg := NewConfig()
+	require.Zero(t, cfg.RustDataplane.MetricsOwnerPort)
+	cfg.RustDataplane.Enabled = true
+	cfg.EnableTrafficReplay = false
+	cfg.RustDataplane.MetricsOwnerPort = 7443
+	require.NoError(t, cfg.Check())
+	require.Equal(t, uint16(7443), cfg.Clone().RustDataplane.MetricsOwnerPort)
+
+	encoded, err := cfg.ToBytes()
+	require.NoError(t, err)
+	var decoded Config
+	require.NoError(t, toml.Unmarshal(encoded, &decoded))
+	require.Equal(t, uint16(7443), decoded.RustDataplane.MetricsOwnerPort)
+
+	cfg.RustDataplane.MetricsOwnerPort = 6000
+	require.ErrorContains(t, cfg.Check(), "metrics-owner-port conflicts with proxy SQL port")
+	cfg.Proxy.PortRange = []int{6001, 6003}
+	cfg.RustDataplane.MetricsOwnerPort = 6002
+	require.ErrorContains(t, cfg.Check(), "metrics-owner-port conflicts with proxy SQL port")
+	cfg.Proxy.PortRange = nil
+	cfg.RustDataplane.MetricsOwnerPort = 3080
+	require.ErrorContains(t, cfg.Check(), "metrics-owner-port conflicts with api.addr port")
+
+	for _, invalid := range []string{"-1", "65536"} {
+		var invalidConfig Config
+		err := toml.Unmarshal([]byte("[rust-dataplane]\nmetrics-owner-port="+invalid), &invalidConfig)
+		require.Error(t, err, "out-of-range port %s must fail TOML decoding", invalid)
+	}
+}
+
 func TestProxyConfigCOS(t *testing.T) {
 	data := []byte(`
 [metering]

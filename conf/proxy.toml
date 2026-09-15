@@ -9,6 +9,11 @@
 # control-socket = "/var/run/tiproxy/tiproxy-rust-control.sock"
 # allowed-uid = 1000
 # tls-allowed-roots = ["/etc/tiproxy/tls"]
+# metrics-owner-port = 7443
+# The metrics-owner port is restart-required and must differ from every SQL
+# listener and the API port. Zero (the default) selects an ephemeral port.
+# Cluster firewalls must allow this TCP port between TiProxy nodes. The endpoint
+# is plaintext unless security.server-http-tls is configured.
 
 [proxy]
 # addr = "0.0.0.0:6000"

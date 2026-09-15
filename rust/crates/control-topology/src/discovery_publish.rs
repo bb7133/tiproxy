@@ -86,8 +86,16 @@ pub enum DiscoveryError {
         /// The source epoch the absence was observed in.
         client_epoch: u64,
     },
-    /// Every cluster's topology fetch failed (Go `empty && any_error`).
-    TopologyUnavailable(TopologyUnavailable),
+    /// Every cluster's topology fetch failed (Go `empty && any_error`) after the
+    /// final source fence. The exact captured epoch travels with the failure so a
+    /// downstream publisher cannot accidentally attach it to a newer source that
+    /// rotates immediately after this method returns.
+    TopologyUnavailable {
+        /// The source epoch fenced after the failed fetch.
+        client_epoch: u64,
+        /// Bounded per-cluster failure counts.
+        source: TopologyUnavailable,
+    },
     /// The Prometheus read failed (transport, timeout, or a malformed record).
     /// A read failure that is actually a retired epoch surfaces as [`Stale`]
     /// instead, via the post-pull re-validation.
@@ -200,8 +208,8 @@ impl DiscoveryHandle {
     }
 
     /// The epoch of the currently published set, or `None` when nothing live is
-    /// published. Test-only: lets a module test observe that a rejected
-    /// generation retained the last-good discovery epoch.
+    /// published. Test-only: lets module tests prove rejected generations retain
+    /// exact discovery authority.
     #[cfg(test)]
     pub(crate) fn current_epoch(&self) -> Option<u64> {
         self.published
@@ -239,7 +247,10 @@ impl DiscoveryHandle {
         // failed or hung merge): a rotation or revoke during the poll surfaces as
         // Stale, never a stale `TopologyUnavailable`.
         self.still_current(&set)?;
-        let merged = merged.map_err(DiscoveryError::TopologyUnavailable)?;
+        let merged = merged.map_err(|source| DiscoveryError::TopologyUnavailable {
+            client_epoch: set.client_epoch,
+            source,
+        })?;
         Ok(EpochResult {
             client_epoch: set.client_epoch,
             value: merged,
@@ -393,7 +404,10 @@ impl DiscoveryCapture {
         )
         .await;
         self.handle.still_current(&self.set)?;
-        result.map_err(DiscoveryError::TopologyUnavailable)
+        result.map_err(|source| DiscoveryError::TopologyUnavailable {
+            client_epoch: self.set.client_epoch,
+            source,
+        })
     }
 
     /// Reads the current Prometheus record through this exact retained set.

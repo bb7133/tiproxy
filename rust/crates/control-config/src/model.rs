@@ -147,6 +147,9 @@ pub struct TopologyConfig {
     pub sql_port: u16,
     /// HTTP status port.
     pub status_port: u16,
+    /// Restart-pinned TCP port for the Rust metrics-owner endpoint. Zero asks
+    /// the OS for an ephemeral port at process startup.
+    pub metrics_owner_port: u16,
     /// The raw HA virtual IP string (empty when HA is disabled). Kept verbatim
     /// because the resolver excludes it with Go's `HasPrefix` compatibility.
     pub ha_virtual_ip: Arc<str>,
@@ -484,6 +487,11 @@ impl EffectiveConfig {
         if self.rust_dataplane.enabled && self.enable_traffic_replay {
             return invalid("enable-traffic-replay", "conflicts_with_rust_dataplane");
         }
+        validate_metrics_owner_port(
+            &self.proxy,
+            &self.api,
+            self.rust_dataplane.metrics_owner_port,
+        )?;
         // These conversions used to happen only inside Go's bridge adapter.
         // Validate them before publishing a Rust-owned generation so the
         // process-local source can never get ahead of the serving projection.
@@ -561,6 +569,7 @@ impl EffectiveConfig {
             bind_sql_host,
             sql_port,
             status_port,
+            metrics_owner_port: self.rust_dataplane.metrics_owner_port,
             ha_virtual_ip: Arc::from(self.ha.virtual_ip.as_str()),
             backend_clusters: Arc::from(backend_clusters),
             cluster_tls: client_tls(&self.security.cluster_tls),
@@ -1038,6 +1047,11 @@ impl EffectiveConfig {
             1,
             "tls-allowed-roots",
             &self.rust_dataplane.tls_allowed_roots,
+        );
+        output.unsigned(
+            1,
+            "metrics-owner-port",
+            self.rust_dataplane.metrics_owner_port,
         );
         output.0
     }
@@ -1922,6 +1936,7 @@ struct RustDataplaneConfig {
     control_socket: String,
     allowed_uid: i64,
     tls_allowed_roots: Vec<String>,
+    metrics_owner_port: u16,
 }
 
 impl Default for RustDataplaneConfig {
@@ -1932,8 +1947,36 @@ impl Default for RustDataplaneConfig {
             control_socket: String::new(),
             allowed_uid: -1,
             tls_allowed_roots: Vec::new(),
+            metrics_owner_port: 0,
         }
     }
+}
+
+fn validate_metrics_owner_port(
+    proxy: &ProxyConfig,
+    api: &ApiConfig,
+    owner_port: u16,
+) -> Result<(), ConfigError> {
+    if owner_port == 0 {
+        return Ok(());
+    }
+    if serving_listeners(proxy)?
+        .iter()
+        .any(|listener| listener.port == owner_port)
+    {
+        return invalid(
+            "rust-dataplane.metrics-owner-port",
+            "conflicts_with_proxy_sql_port",
+        );
+    }
+    let (_, api_port) = split_host_port(&api.addr, "api.addr")?;
+    if api_port == owner_port {
+        return invalid(
+            "rust-dataplane.metrics-owner-port",
+            "conflicts_with_api_port",
+        );
+    }
+    Ok(())
 }
 
 fn validate_proxy(proxy: &mut ProxyConfig) -> Result<(), ConfigError> {

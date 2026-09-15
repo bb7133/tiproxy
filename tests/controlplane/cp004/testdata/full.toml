@@ -176,3 +176,4 @@ enabled = true
 control-socket = "/tmp/tiproxy-cp004/control.sock"
 allowed-uid = 501
 tls-allowed-roots = ["/tmp/tiproxy-cp004"]
+metrics-owner-port = 7443

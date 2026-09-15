@@ -13,6 +13,13 @@ crate; only the edge adapter converts route metadata to and from wire messages.
 `proto-wire-files.txt` freezes the three existing bridge files that may still
 handle route envelopes; any expansion or domain leak makes the gate fail.
 
+The Rust metrics-owner endpoint uses restart-required
+`rust-dataplane.metrics-owner-port`. Its default `0` selects an ephemeral port;
+a nonzero value binds and advertises that exact port and must differ from every
+SQL listener and the Go API port. Deployments choosing a fixed port must allow
+that TCP port between TiProxy nodes. The endpoint is plaintext unless
+`security.server-http-tls` supplies its server TLS identity.
+
 Run:
 
 ```bash
@@ -284,7 +291,16 @@ immediately before reserving. Current C, router identity, namespace incarnation,
 owner and lifecycle remain independent checks. The raw config cluster list no
 longer blocks capture, and `Unsupported::StaticFallback` is removed. A newly
 replaced namespace must have its producer reconciled before a new router binds.
-Resource/location factors and production dataplane wiring remain gated.
+The #223 T1 `RoutePlane` registry constructs one router per exact namespace
+incarnation before listeners open, binds the production metric overlay for
+Resource/Location, and retains the router plus topology-source lease for an
+existing selector after replacement. New admission never falls back across a
+missing/replaced incarnation. Config-owner, topology, and route-plane readiness
+are each bounded to 30 seconds and every closure/timeout reaches the single
+armed startup rollback seam. Concurrency rows repeatedly race eight admission
+readers with namespace removal/re-creation and eight retained-source readers
+with registry removal/insertion; the existing static-mode row proves producers
+park before Dynamic publication and reactivate with a fresh health round.
 
 `control-router/src/tests/sources.rs` uses real topology/health producers:
 static greeting failure/recovery changes actual reservation eligibility;

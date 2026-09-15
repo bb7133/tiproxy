@@ -66,14 +66,15 @@ use tokio::time::MissedTickBehavior;
 
 use crate::backend_health::{ClusterHealthNetwork, PreparedClusterHealthNetwork};
 use crate::discovery_publish::{
-    DiscoveryConnector, DiscoveryHandle, DiscoveryPublisher, default_discovery_connector,
+    DiscoveryConnector, DiscoveryError, DiscoveryHandle, DiscoveryPublisher,
+    default_discovery_connector,
 };
 use crate::health_config::{HealthConfigError, HealthRuntime};
 use crate::health_feed::{HealthGenerationFeed, HealthGenerationFeeder};
 use crate::health_loop::{
     HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
 };
-use crate::health_overlay::{HealthOverlayHandle, HealthOverlayPublisher};
+use crate::health_overlay::{HealthOverlayHandle, HealthOverlayPublisher, ObserverError};
 use crate::metric_source::{MetricConfigError, MetricPublication, MetricSourceHandle};
 use crate::registrar::RegistrarError;
 use crate::resolver::AdvertiseEndpointResolver;
@@ -1343,8 +1344,10 @@ const fn module_error(error_class: &'static str) -> ModuleError {
 }
 
 /// The routing-topology refresh loop: on each tick it pulls the merged topology
-/// from discovery and republishes it, retaining the last-good snapshot on any pull
-/// failure (transport error, or the epoch/gate fence returning `Stale`/`Revoked`).
+/// from discovery and republishes it. A final-fenced `TopologyUnavailable` becomes
+/// a new exact routing generation carrying the typed error while retaining the
+/// last successful backend inventory. `Stale`/`Revoked` and other non-topology
+/// failures have no publication authority and retain the current snapshot.
 ///
 /// The first tick fires immediately; subsequent ticks keep a fixed start-to-start
 /// cadence and *skip* (never burst) if a pull runs longer than the interval, so a
@@ -1365,10 +1368,34 @@ async fn run_refresh<Seam, Fut>(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        if let Ok(result) = handle.poll_merged_topology().await {
-            after_poll().await;
+        match handle.poll_merged_topology().await {
+            Ok(result) => {
+                after_poll().await;
+                publish_refresh_result(&routing, Ok(result));
+            }
+            Err(error) => publish_refresh_result(&routing, Err(error)),
+        }
+    }
+}
+
+/// Applies one final-fenced refresh outcome. Kept separate from the ticker so the
+/// qualified-error versus stale/revoked publication boundary is unit-testable
+/// without a network or a wall-clock race.
+fn publish_refresh_result(
+    routing: &RoutingSnapshotPublisher,
+    result: Result<
+        crate::discovery_publish::EpochResult<crate::merge::MergedTopology>,
+        DiscoveryError,
+    >,
+) {
+    match result {
+        Ok(result) => {
             let _ = routing.publish(result);
         }
+        Err(DiscoveryError::TopologyUnavailable { client_epoch, .. }) => {
+            let _ = routing.publish_error(client_epoch, ObserverError::TopologyUnavailable);
+        }
+        Err(_) => {}
     }
 }
 
@@ -1458,7 +1485,7 @@ pub(crate) mod tests {
     use super::{
         ChildRunner, HealthFactory, ModePublisher, ModuleRuntime, ROUTING_REFRESH_INTERVAL,
         RefreshFactory, RegistrarError, RejectionClass, StaticProducers, StaticRegistry,
-        TopologyClusterClient, TopologyModule, TopologyStatus, run_refresh,
+        TopologyClusterClient, TopologyModule, TopologyStatus, publish_refresh_result, run_refresh,
     };
     use std::future::pending;
     use std::path::PathBuf;
@@ -1483,7 +1510,8 @@ pub(crate) mod tests {
         DiscoveryConnector, DiscoveryError, DiscoveryHandle, DiscoveryPublisher, EpochResult,
     };
     use crate::health_feed::{HealthGenerationFeed, HealthGenerationFeeder};
-    use crate::merge::{MergedBackend, MergedTopology};
+    use crate::health_overlay::ObserverError;
+    use crate::merge::{MergedBackend, MergedTopology, TopologyUnavailable};
     use crate::model::BackendInfo;
     use crate::resolver::StaticAdvertiseResolver;
     use crate::routing_snapshot::{
@@ -2612,7 +2640,7 @@ pub(crate) mod tests {
             unreachable!("the poll resolves within the deadline");
         };
         assert!(
-            matches!(result, Err(DiscoveryError::TopologyUnavailable(_))),
+            matches!(result, Err(DiscoveryError::TopologyUnavailable { .. })),
             "the retained set is admitted and current; only its I/O fails: {result:?}"
         );
 
@@ -3699,10 +3727,89 @@ ns-servers = ["dns-a:53"]
         assert_refresh_supervision_fails_loud(true).await
     }
 
-    // ----- Row 5 (+6 routing side): a pull error retains the last good ------
+    // ----- Row 5 (+6 routing side): qualified errors publish; others retain -
+
+    #[test]
+    fn only_an_exact_qualified_topology_failure_publishes_a_retained_error() {
+        let (routing, handle) = RoutingSnapshotPublisher::new();
+        publish_refresh_result(
+            &routing,
+            Ok(EpochResult {
+                client_epoch: 7,
+                value: MergedTopology::default(),
+            }),
+        );
+        let good = handle
+            .current()
+            .unwrap_or_else(|| unreachable!("the successful result is published"));
+
+        publish_refresh_result(&routing, Err(DiscoveryError::Stale));
+        assert!(
+            Arc::ptr_eq(
+                &good,
+                &handle
+                    .current()
+                    .unwrap_or_else(|| unreachable!("stale retains the snapshot"))
+            ),
+            "an unfenced stale failure has no publication authority"
+        );
+        publish_refresh_result(
+            &routing,
+            Err(DiscoveryError::TopologyUnavailable {
+                client_epoch: 6,
+                source: TopologyUnavailable {
+                    failed_clusters: 1,
+                    total_clusters: 1,
+                },
+            }),
+        );
+        assert!(
+            Arc::ptr_eq(
+                &good,
+                &handle
+                    .current()
+                    .unwrap_or_else(|| unreachable!("wrong epoch retains the snapshot"))
+            ),
+            "a qualified failure cannot attach to a different epoch"
+        );
+
+        publish_refresh_result(
+            &routing,
+            Err(DiscoveryError::TopologyUnavailable {
+                client_epoch: 7,
+                source: TopologyUnavailable {
+                    failed_clusters: 1,
+                    total_clusters: 2,
+                },
+            }),
+        );
+        let failed = handle
+            .current()
+            .unwrap_or_else(|| unreachable!("the source error is published"));
+        assert_eq!(failed.generation, 2);
+        assert_eq!(failed.backends, good.backends, "inventory is retained");
+        assert_eq!(
+            failed.observer_error(),
+            Some(ObserverError::TopologyUnavailable)
+        );
+
+        publish_refresh_result(
+            &routing,
+            Ok(EpochResult {
+                client_epoch: 7,
+                value: MergedTopology::default(),
+            }),
+        );
+        let recovered = handle
+            .current()
+            .unwrap_or_else(|| unreachable!("recovery is published"));
+        assert_eq!(recovered.generation, 3);
+        assert_eq!(recovered.observer_error(), None);
+    }
 
     #[tokio::test(start_paused = true)]
-    async fn a_pull_error_never_clears_or_advances_the_routing_snapshot() -> Result<(), TestError> {
+    async fn an_unqualified_pull_error_never_clears_or_advances_the_routing_snapshot()
+    -> Result<(), TestError> {
         // Start with NO committed discovery set: the first poll errors.
         let registry = OwnershipRegistry::new();
         let lease = registry
@@ -3740,9 +3847,9 @@ ns-servers = ["dns-a:53"]
             .unwrap_or_else(|| unreachable!("a successful pull publishes generation 1"));
         assert_eq!(good.generation, 1);
 
-        // Revoke discovery so the next pull errors (the Stale/Revoked class the
-        // refresh loop must treat as retain-last-good): the routing snapshot must
-        // keep the SAME Arc and generation, never clear or advance.
+        // Revoke discovery so the next pull errors (the unqualified Stale/Revoked
+        // class the refresh loop must treat as retain-last-good): the routing
+        // snapshot must keep the SAME Arc and generation, never clear or advance.
         publisher.revoke();
         tokio::time::advance(ROUTING_REFRESH_INTERVAL).await;
         settle().await;
@@ -3755,7 +3862,7 @@ ns-servers = ["dns-a:53"]
         );
         assert_eq!(
             after.generation, 1,
-            "a pull error never advances the generation"
+            "an unqualified pull error never advances the generation"
         );
 
         child.abort();

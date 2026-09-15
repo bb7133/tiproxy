@@ -49,6 +49,7 @@ type RustDataplane struct {
 	ControlSocket       string   `yaml:"control-socket,omitempty" toml:"control-socket,omitempty" json:"control-socket,omitempty" reloadable:"false"`
 	AllowedUID          int64    `yaml:"allowed-uid,omitempty" toml:"allowed-uid,omitempty" json:"allowed-uid,omitempty" reloadable:"false"`
 	TLSAllowedRoots     []string `yaml:"tls-allowed-roots,omitempty" toml:"tls-allowed-roots,omitempty" json:"tls-allowed-roots,omitempty" reloadable:"false"`
+	MetricsOwnerPort    uint16   `yaml:"metrics-owner-port,omitempty" toml:"metrics-owner-port,omitempty" json:"metrics-owner-port,omitempty" reloadable:"false"`
 }
 
 type KeepAlive struct {
@@ -261,7 +262,48 @@ func (cfg *Config) Check() error {
 		return errors.Wrapf(ErrInvalidConfigValue,
 			"enable-traffic-replay must be false when rust-dataplane.enabled is true")
 	}
+	if err := cfg.checkRustMetricsOwnerPort(); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+func (cfg *Config) checkRustMetricsOwnerPort() error {
+	ownerPort := int(cfg.RustDataplane.MetricsOwnerPort)
+	if ownerPort == 0 {
+		return nil
+	}
+	sqlAddrs, err := cfg.Proxy.GetSQLAddrs()
+	if err != nil {
+		return err
+	}
+	for _, addr := range sqlAddrs {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return errors.Wrapf(ErrInvalidConfigValue, "invalid proxy.addr: %s", err.Error())
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return errors.Wrapf(ErrInvalidConfigValue, "invalid proxy.addr port %s", port)
+		}
+		if portNumber == ownerPort {
+			return errors.Wrapf(ErrInvalidConfigValue,
+				"rust-dataplane.metrics-owner-port conflicts with proxy SQL port %d", ownerPort)
+		}
+	}
+	_, apiPort, err := net.SplitHostPort(cfg.API.Addr)
+	if err != nil {
+		return errors.Wrapf(ErrInvalidConfigValue, "invalid api.addr: %s", err.Error())
+	}
+	apiPortNumber, err := strconv.Atoi(apiPort)
+	if err != nil || apiPortNumber < 1 || apiPortNumber > 65535 {
+		return errors.Wrapf(ErrInvalidConfigValue, "invalid api.addr port %s", apiPort)
+	}
+	if apiPortNumber == ownerPort {
+		return errors.Wrapf(ErrInvalidConfigValue,
+			"rust-dataplane.metrics-owner-port conflicts with api.addr port %d", ownerPort)
+	}
 	return nil
 }
 

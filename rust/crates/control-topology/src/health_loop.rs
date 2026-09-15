@@ -45,7 +45,7 @@ use tokio::time::Instant;
 
 use crate::backend_health::{BackendHealth, ClusterHealthNetwork};
 use crate::health_feed::HealthGenerationFeed;
-use crate::health_overlay::HealthOverlayPublisher;
+use crate::health_overlay::{HealthOverlayPublisher, HealthPublishOutcome};
 use crate::merge::MergedBackend;
 use crate::routing_snapshot::{RoutingSnapshot, RoutingSnapshotHandle};
 
@@ -542,6 +542,12 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
         guard.publisher.revoke_and_clear();
         return;
     }
+    if let Some(generation) = current.as_ref()
+        && generation.source.observer_error().is_some()
+        && !publish_source_error(&mut guard, &feed, generation, &routing, &owner)
+    {
+        guard.publisher.transient_clear();
+    }
 
     loop {
         let Some(generation) = current.clone() else {
@@ -602,7 +608,15 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
                 return;
             }
             RoundEvent::Rotated => {
-                if handle_rotation(&mut guard, &feed, &mut current, &mut seen_revision).await
+                if handle_rotation(
+                    &mut guard,
+                    &feed,
+                    &mut current,
+                    &mut seen_revision,
+                    &routing,
+                    &owner,
+                )
+                .await
                     == LoopControl::Stop
                 {
                     return;
@@ -620,9 +634,14 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
                     // gate, so the just-published overlay is immediately non-current).
                     feed.publish_current(&generation, |feed_gate| {
                         if round_authoritative(&routing, &source, &owner) {
-                            guard
-                                .publisher
-                                .publish_round(&source, map, feed_gate, &owner);
+                            guard.publisher.publish_observation(
+                                &source,
+                                map,
+                                HashMap::new(),
+                                source.observer_error(),
+                                feed_gate,
+                                &owner,
+                            );
                         }
                     });
                 }
@@ -648,8 +667,15 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
                 };
                 match cadence {
                     CadenceOutcome::Changed => {
-                        if handle_rotation(&mut guard, &feed, &mut current, &mut seen_revision)
-                            .await
+                        if handle_rotation(
+                            &mut guard,
+                            &feed,
+                            &mut current,
+                            &mut seen_revision,
+                            &routing,
+                            &owner,
+                        )
+                        .await
                             == LoopControl::Stop
                         {
                             return;
@@ -675,6 +701,33 @@ enum LoopControl {
     Stop,
 }
 
+/// Installs a qualified error carried by the exact current routing source under
+/// the feed lock. This makes the error visible immediately on a source rotation,
+/// before a fresh probe round completes, while copying the previous immutable
+/// health data. The returned `bool` says an authoritative error was installed.
+fn publish_source_error(
+    guard: &mut HealthLoopGuard,
+    feed: &HealthGenerationFeed,
+    generation: &Arc<HealthGeneration>,
+    routing: &RoutingSnapshotHandle,
+    owner: &OwnerToken,
+) -> bool {
+    let Some(error) = generation.source.observer_error() else {
+        return false;
+    };
+    let mut installed = false;
+    let accepted = feed.publish_current(generation, |feed_gate| {
+        if round_authoritative(routing, &generation.source, owner) {
+            installed =
+                guard
+                    .publisher
+                    .publish_retained_error(&generation.source, error, feed_gate, owner)
+                    == HealthPublishOutcome::Published;
+        }
+    });
+    accepted && installed
+}
+
 /// Handles a feed change: a terminal feed (closed/overflowed) terminally
 /// withdraws the overlay and stops the loop; otherwise fail-closed FIRST (transient
 /// clear), then abort + drain the in-flight round, then adopt the new generation.
@@ -683,6 +736,8 @@ async fn handle_rotation(
     feed: &HealthGenerationFeed,
     current: &mut Option<Arc<HealthGeneration>>,
     seen_revision: &mut u64,
+    routing: &RoutingSnapshotHandle,
+    owner: &OwnerToken,
 ) -> LoopControl {
     let (next, revision, terminal) = feed.snapshot();
     if terminal {
@@ -692,10 +747,16 @@ async fn handle_rotation(
         abort_and_drain(&mut guard.set).await;
         return LoopControl::Stop;
     }
-    // Fail-closed FIRST: the retained overlay loses authority immediately, BEFORE
-    // any in-flight probe is joined. (The feed transition already revoked the old
-    // slot gate synchronously; this also clears the overlay slot.)
-    guard.publisher.transient_clear();
+    // Fail-closed FIRST: the feed transition already revoked the old slot gate.
+    // A qualified error source atomically replaces it with a new error overlay
+    // retaining immutable data; every other transition clears the overlay. Both
+    // happen BEFORE any in-flight probe is joined.
+    let error_installed = next
+        .as_ref()
+        .is_some_and(|generation| publish_source_error(guard, feed, generation, routing, owner));
+    if !error_installed {
+        guard.publisher.transient_clear();
+    }
     abort_and_drain(&mut guard.set).await;
     *current = next;
     *seen_revision = revision;
@@ -748,6 +809,7 @@ mod tests {
     use crate::backend_health::BackendHealth;
     use crate::discovery_publish::EpochResult;
     use crate::health_feed::HealthGenerationFeeder;
+    use crate::health_overlay::ObserverError;
     use crate::merge::{MergedBackend, MergedTopology};
     use crate::model::BackendInfo;
     use crate::routing_snapshot::{
@@ -1653,6 +1715,145 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn a_qualified_source_error_is_immediate_retains_health_and_survives_rounds_until_recovery()
+     {
+        let (_registry, lease) = owner_lease();
+        let owner = lease.token();
+        let (routing_publisher, routing, healthy_source) = published_source(7, 1);
+        let (overlay, overlay_handle) = HealthOverlayPublisher::new();
+        let (feeder, feed) = HealthGenerationFeeder::new();
+        feeder.set(generation(&healthy_source, true));
+
+        // The first successful round completes immediately. Every later round is
+        // held so an error-source transition can be observed before any new probe
+        // result exists, and recovery can likewise be observed before its round.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let probe = {
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            move |_generation: Arc<HealthGeneration>,
+                  _source: Arc<RoutingSnapshot>,
+                  _routing: RoutingSnapshotHandle,
+                  _backend: MergedBackend,
+                  _policy: HealthPolicy| {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    if index > 0 {
+                        let _permit = release.acquire().await;
+                    }
+                    BackendHealth {
+                        healthy: true,
+                        server_version: Some("v8".to_owned()),
+                        local: false,
+                    }
+                }) as std::pin::Pin<Box<dyn Future<Output = BackendHealth> + Send>>
+            }
+        };
+        let policy = HealthPolicy::new(Duration::from_secs(60), 0, Duration::from_secs(1))
+            .unwrap_or_else(|_| unreachable!("a valid policy"));
+        let task = tokio::spawn(run_health_loop(
+            feed,
+            routing.clone(),
+            overlay,
+            policy,
+            owner,
+            1,
+            probe,
+            TestZone::none(),
+        ));
+
+        wait_until("the first successful health round publishes", || {
+            overlay_handle.current_for(&healthy_source).is_some()
+        })
+        .await;
+        let healthy = overlay_handle
+            .current_for(&healthy_source)
+            .unwrap_or_else(|| unreachable!("the successful overlay is current"));
+        let backend_id = Arc::clone(&healthy_source.backends.backends[0].backend_id);
+        assert_eq!(
+            healthy.get(&backend_id).server_version.as_deref(),
+            Some("v8")
+        );
+
+        routing_publisher
+            .publish_error(7, ObserverError::TopologyUnavailable)
+            .unwrap_or_else(|_| unreachable!("no generation overflow"));
+        let error_source = routing
+            .current()
+            .unwrap_or_else(|| unreachable!("the error source is current"));
+        feeder.set(generation(&error_source, true));
+        wait_until(
+            "the retained error overlay publishes before the held round",
+            || overlay_handle.current_for(&error_source).is_some(),
+        )
+        .await;
+        let retained = overlay_handle
+            .current_for(&error_source)
+            .unwrap_or_else(|| unreachable!("the retained error overlay is current"));
+        assert_eq!(
+            retained.observer_error(),
+            Some(ObserverError::TopologyUnavailable)
+        );
+        assert_eq!(
+            retained.get(&backend_id),
+            healthy.get(&backend_id),
+            "the previous health verdict is retained before a new probe completes"
+        );
+
+        // A later completed health round must carry, rather than erase, the exact
+        // source error. The new overlay Arc distinguishes it from the immediate
+        // retained publication.
+        release.add_permits(1);
+        wait_until("the error-source health round republishes", || {
+            overlay_handle
+                .current_for(&error_source)
+                .is_some_and(|current| !Arc::ptr_eq(&current, &retained))
+        })
+        .await;
+        let refreshed_error = overlay_handle
+            .current_for(&error_source)
+            .unwrap_or_else(|| unreachable!("the refreshed error overlay is current"));
+        assert_eq!(
+            refreshed_error.observer_error(),
+            Some(ObserverError::TopologyUnavailable)
+        );
+
+        routing_publisher
+            .publish(EpochResult {
+                client_epoch: 7,
+                value: healthy_source.backends.clone(),
+            })
+            .unwrap_or_else(|_| unreachable!("no generation overflow"));
+        let recovered_source = routing
+            .current()
+            .unwrap_or_else(|| unreachable!("the recovery source is current"));
+        feeder.set(generation(&recovered_source, true));
+        assert!(
+            overlay_handle.current_for(&error_source).is_none(),
+            "the error authority dies synchronously on feed rotation"
+        );
+        assert!(
+            overlay_handle.current_for(&recovered_source).is_none(),
+            "recovery waits for an explicit successful health round"
+        );
+        release.add_permits(1);
+        wait_until("the recovery health round publishes", || {
+            overlay_handle.current_for(&recovered_source).is_some()
+        })
+        .await;
+        let recovered = overlay_handle
+            .current_for(&recovered_source)
+            .unwrap_or_else(|| unreachable!("the recovered overlay is current"));
+        assert_eq!(recovered.observer_error(), None);
+
+        task.abort();
+        let _ = task.await;
+    }
+
     // ================================================================
     // B2: rotation fails closed FIRST, then aborts + drains, then starts.
     // ================================================================
@@ -1666,7 +1867,7 @@ mod tests {
                 return;
             }
             if Instant::now() > deadline {
-                unreachable!("a B2 condition was not reached in time: {label}");
+                unreachable!("a health-loop condition was not reached in time: {label}");
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }

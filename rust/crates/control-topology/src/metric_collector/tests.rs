@@ -24,7 +24,7 @@ use control_plane::{OwnerLease, OwnerScope, OwnershipRegistry};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 pub(super) type TestError = Box<dyn std::error::Error>;
 pub(super) struct Fixture {
@@ -177,6 +177,43 @@ async fn routing_endpoint_separates_bind_and_peer_identity() -> Result<(), TestE
             "an invalid peer identity is rejected before any module starts"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn routing_endpoint_uses_a_fixed_port_and_rejects_an_occupied_one() -> Result<(), TestError> {
+    let fixture = Fixture::new("127.0.0.1:1").await?;
+    let reservation = TcpListener::bind("127.0.0.1:0").await?;
+    let fixed_address = reservation.local_addr()?;
+    drop(reservation);
+
+    let (collector, _) = MetricCollector::bind_for_routing_endpoint(
+        fixture.handle.clone(),
+        fixed_address,
+        "metric-peer.internal",
+        Arc::new(PlainMetricConnectionAcceptor),
+    )
+    .await?;
+    assert_eq!(collector.local_addr(), fixed_address);
+    assert_eq!(
+        collector.advertised_addr(),
+        format!("metric-peer.internal:{}", fixed_address.port()),
+        "the fixed local port is also the elected peer identity"
+    );
+    drop(collector);
+
+    let occupied = TcpListener::bind(fixed_address).await?;
+    assert!(matches!(
+        MetricCollector::bind_for_routing_endpoint(
+            fixture.handle,
+            fixed_address,
+            "metric-peer.internal",
+            Arc::new(PlainMetricConnectionAcceptor),
+        )
+        .await,
+        Err(MetricCollectorError::Bind(_))
+    ));
+    drop(occupied);
     Ok(())
 }
 

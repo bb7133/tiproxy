@@ -197,16 +197,17 @@ impl MetricConnectionAcceptor for MetricServerConnectionAcceptor {
     }
 }
 
-/// Selects a local port-zero bind from the SQL listener's restart-pinned bind
-/// host. A concrete IP is reused; wildcard or hostname binds select a wildcard
-/// matching an advertised IP literal, defaulting DNS names to IPv4. The
-/// separately resolved topology advertise host is what peers receive through
-/// election.
+/// Selects a local bind from the SQL listener's restart-pinned bind host and
+/// metrics-owner port. Port zero asks the OS for an ephemeral port. A concrete
+/// IP is reused; wildcard or hostname binds select a wildcard matching an
+/// advertised IP literal, defaulting DNS names to IPv4. The separately resolved
+/// topology advertise host is what peers receive through election.
 #[must_use]
 pub(crate) fn metric_owner_bind_address(
     topology: &TopologyConfig,
     advertised_host: &str,
 ) -> SocketAddr {
+    let port = topology.metrics_owner_port;
     let host = topology.bind_sql_host.trim();
     let host = host
         .strip_prefix('[')
@@ -218,10 +219,10 @@ pub(crate) fn metric_owner_bind_address(
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(advertised_host);
     match host.parse::<IpAddr>() {
-        Ok(ip) if !ip.is_unspecified() => SocketAddr::new(ip, 0),
+        Ok(ip) if !ip.is_unspecified() => SocketAddr::new(ip, port),
         _ => match advertised_host.parse::<IpAddr>() {
-            Ok(IpAddr::V6(_)) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-            Ok(IpAddr::V4(_)) | Err(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            Ok(IpAddr::V6(_)) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+            Ok(IpAddr::V4(_)) | Err(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
         },
     }
 }
@@ -707,6 +708,31 @@ ca = "{ca_path}"
                 .parse()
                 .unwrap_or_else(|error| unreachable!("address: {error}")),
             "a concrete SQL bind remains the local metric bind"
+        );
+
+        topology.bind_sql_host = Arc::from("0.0.0.0");
+        topology.metrics_owner_port = 7443;
+        assert_eq!(
+            metric_owner_bind_address(&topology, "192.0.2.10"),
+            "0.0.0.0:7443"
+                .parse()
+                .unwrap_or_else(|error| unreachable!("address: {error}")),
+            "a configured restart-pinned port is used exactly"
+        );
+        assert_eq!(
+            metric_owner_bind_address(&topology, "2001:db8::10"),
+            "[::]:7443"
+                .parse()
+                .unwrap_or_else(|error| unreachable!("address: {error}")),
+            "the fixed port is retained for an IPv6 wildcard bind"
+        );
+        topology.bind_sql_host = Arc::from("127.0.0.1");
+        assert_eq!(
+            metric_owner_bind_address(&topology, "metric.example"),
+            "127.0.0.1:7443"
+                .parse()
+                .unwrap_or_else(|error| unreachable!("address: {error}")),
+            "the fixed port is retained for a concrete SQL bind"
         );
     }
 
@@ -3139,7 +3165,8 @@ ns-servers = [{ns_servers}]
     /// opening the gate after entry lets the in-flight poll complete and publish.
     /// Paused clock (the bug): holding the gate closed leaves the runtime nothing
     /// runnable, so it auto-advances straight to the production per-cluster timeout
-    /// inside the poll — Ranges are served, yet nothing is published.
+    /// inside the poll. Ranges are served, but only the qualified retained-inventory
+    /// error generation is published; the candidate content never is.
     #[tokio::test(start_paused = true)]
     async fn a_paused_clock_lets_the_inner_timeout_beat_a_served_range_but_real_time_does_not() {
         let body = async {
@@ -3188,8 +3215,9 @@ ns-servers = [{ns_servers}]
                 // The same content change; hold the gate closed across the poll. It is
                 // entered (Range served), then the only pending work is timers, so the
                 // paused runtime auto-advances: the poll's inner timeout fires (the
-                // poll fails), the ticker fires, the next poll is entered — and
-                // NOTHING is published.
+                // poll fails), the ticker fires, and the next poll is entered. The
+                // failure publishes one retained-inventory error generation, never
+                // the gated candidate content; repeated identical errors are a no-op.
                 fixture.swap(seed(&[(ADDR_A, "10.0.0.1"), (ADDR_B, "10.0.0.2")]));
                 fixture.close_gate();
                 let before = fixture.tidb_range_count();
@@ -3201,13 +3229,13 @@ ns-servers = [{ns_servers}]
                     .current()
                     .unwrap_or_else(|| unreachable!("a routing source is published"));
                 assert_eq!(
-                    stuck.generation, 1,
+                    stuck.generation, 2,
                     "Ranges were served, but the paused clock let the inner timeout beat \
-                     the response: nothing was published"
+                     the response: only the retained-inventory error was published"
                 );
                 assert!(
                     fixture.tidb_range_count() >= before + 2,
-                    "at least two Ranges were served while nothing published"
+                    "at least two Ranges were served while candidate content stayed unpublished"
                 );
                 fixture.open_gate();
                 comp.task.abort();

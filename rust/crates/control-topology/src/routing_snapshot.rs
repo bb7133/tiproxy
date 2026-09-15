@@ -22,11 +22,13 @@
 //! for the first snapshot and advanced only on a real change, with the previous
 //! generation's authority revoked at each swap.
 //!
-//! "Real change" is the `(client_epoch, backends)` tuple, not the backends alone:
+//! "Real change" is the `(client_epoch, backends, observer_error)` tuple, not the
+//! backends alone:
 //! a discovery-plan epoch change must advance the generation even when the backend
 //! bytes are identical, so a consumer never routes on a snapshot whose stated
-//! provenance is stale. Two successive polls of the same epoch that return the same
-//! backends are a true no-op — nothing is swapped and the generation holds.
+//! provenance is stale. Two successive successful polls of the same epoch that
+//! return the same backends are a true no-op — unless the current generation
+//! carries an error that the success must clear.
 //!
 //! Old generations are fenced by *authority*, not merely by `Arc` immutability:
 //! every snapshot carries its own private revocable [`GenerationGate`], and a
@@ -47,6 +49,7 @@ use control_external::GenerationGate;
 use tokio::sync::watch;
 
 use crate::discovery_publish::EpochResult;
+use crate::health_overlay::ObserverError;
 use crate::merge::MergedTopology;
 
 /// One immutable, generation-stamped routing view of the merged multi-cluster
@@ -62,6 +65,10 @@ pub struct RoutingSnapshot {
     pub client_epoch: u64,
     /// The merged backends for this generation.
     pub backends: MergedTopology,
+    /// A qualified live-source failure. The last successful backend inventory is
+    /// retained while new selection fails closed; a later successful publication
+    /// clears the error by minting another exact generation.
+    observer_error: Option<ObserverError>,
     /// This generation's revocable authority, revoked when a newer generation is
     /// published or the source is withdrawn.
     gate: GenerationGate,
@@ -75,6 +82,12 @@ impl RoutingSnapshot {
     pub(crate) fn source_gate(&self) -> &GenerationGate {
         &self.gate
     }
+
+    /// The qualified live-source failure carried by this generation, if any.
+    #[must_use]
+    pub(crate) const fn observer_error(&self) -> Option<ObserverError> {
+        self.observer_error
+    }
 }
 
 /// The outcome of a [`RoutingSnapshotPublisher::publish`] call.
@@ -85,12 +98,12 @@ pub enum PublishOutcome {
         /// The generation just published.
         generation: u64,
     },
-    /// The result matched the live snapshot's `(client_epoch, backends)`; nothing
-    /// was swapped and the generation held.
+    /// The result matched the live snapshot's `(client_epoch, backends,
+    /// observer_error)`; nothing was swapped and the generation held.
     Unchanged,
-    /// The result's `client_epoch` predates the live snapshot's, so it was refused
-    /// as stale; nothing was swapped. Discovery normally fences a retired epoch as
-    /// `Stale` upstream, but the publisher does not trust callers to serialise.
+    /// The result's `client_epoch` is not admissible for the live snapshot, so it
+    /// was refused as stale; nothing was swapped. Successful values accept a
+    /// newer epoch, while retained errors require the exact current epoch.
     RejectedStale,
     /// The publisher has been withdrawn ([`RoutingSnapshotPublisher::revoke_and_clear`]);
     /// the result is refused and the source stays fail-closed.
@@ -195,12 +208,14 @@ impl RoutingSnapshotPublisher {
     ///
     /// A withdrawn publisher refuses every result ([`PublishOutcome::Retired`]). A
     /// result whose `client_epoch` predates the live snapshot is refused
-    /// ([`PublishOutcome::RejectedStale`]); a result matching the live
-    /// `(client_epoch, backends)` tuple is a no-op ([`PublishOutcome::Unchanged`]);
-    /// otherwise a new generation is reserved, built with its own gate, the old
-    /// gate is revoked, and the new snapshot is swapped in atomically
-    /// ([`PublishOutcome::Published`]). An authoritative empty topology is a normal
-    /// publishable value.
+    /// ([`PublishOutcome::RejectedStale`]); a result matching a successful live
+    /// `(client_epoch, backends)` tuple is a no-op
+    /// ([`PublishOutcome::Unchanged`]). The same value after a qualified error is
+    /// a recovery and mints a generation that clears the error. Otherwise a new
+    /// generation is reserved, built with its own gate, the old gate is revoked,
+    /// and the new snapshot is swapped in atomically
+    /// ([`PublishOutcome::Published`]). An authoritative empty topology is a
+    /// normal publishable value.
     ///
     /// # Errors
     ///
@@ -220,10 +235,64 @@ impl RoutingSnapshotPublisher {
             if result.client_epoch < current.client_epoch {
                 return Ok(PublishOutcome::RejectedStale);
             }
-            if result.client_epoch == current.client_epoch && result.value == current.backends {
+            if result.client_epoch == current.client_epoch
+                && result.value == current.backends
+                && current.observer_error.is_none()
+            {
                 return Ok(PublishOutcome::Unchanged);
             }
         }
+        self.publish_locked(
+            &mut state,
+            current.as_ref(),
+            result.client_epoch,
+            result.value,
+            None,
+        )
+    }
+
+    /// Publishes a qualified discovery failure for the exact current epoch while
+    /// retaining its last successful backend inventory. A failure cannot create
+    /// an inventory from nothing and cannot attach to any non-current epoch.
+    /// Repeating the same qualified failure is a no-op; recovery is an ordinary
+    /// successful [`publish`](Self::publish), which clears the error.
+    pub(crate) fn publish_error(
+        &self,
+        client_epoch: u64,
+        error: ObserverError,
+    ) -> Result<PublishOutcome, GenerationOverflow> {
+        let mut state = self.lock();
+        if state.retired {
+            return Ok(PublishOutcome::Retired);
+        }
+        let current = self.published.borrow().clone();
+        let Some(live) = current.as_ref() else {
+            return Ok(PublishOutcome::RejectedStale);
+        };
+        if client_epoch != live.client_epoch {
+            return Ok(PublishOutcome::RejectedStale);
+        }
+        if live.observer_error == Some(error) {
+            return Ok(PublishOutcome::Unchanged);
+        }
+        let backends = live.backends.clone();
+        self.publish_locked(
+            &mut state,
+            current.as_ref(),
+            client_epoch,
+            backends,
+            Some(error),
+        )
+    }
+
+    fn publish_locked(
+        &self,
+        state: &mut PublisherState,
+        current: Option<&Arc<RoutingSnapshot>>,
+        client_epoch: u64,
+        backends: MergedTopology,
+        observer_error: Option<ObserverError>,
+    ) -> Result<PublishOutcome, GenerationOverflow> {
         // Reserve the generation first: building the snapshot cannot fail, so an
         // exhausted counter is refused here before any gate is revoked or swap
         // performed, leaving the last-good snapshot fully intact. The last-issued
@@ -234,13 +303,14 @@ impl RoutingSnapshotPublisher {
             Some(last) => last.checked_add(1).ok_or(GenerationOverflow)?,
         };
         let gate = GenerationGate::new();
-        if let Some(current) = &current {
+        if let Some(current) = current {
             current.gate.revoke();
         }
         self.published.send_replace(Some(Arc::new(RoutingSnapshot {
             generation,
-            client_epoch: result.client_epoch,
-            backends: result.value,
+            client_epoch,
+            backends,
+            observer_error,
             gate,
         })));
         state.last_generation = Some(generation);
@@ -377,6 +447,7 @@ mod tests {
         EpochResult, GenerationOverflow, MergedTopology, PublishOutcome, RoutingSnapshotPublisher,
         RoutingSourceClosed,
     };
+    use crate::ObserverError;
     use crate::merge::MergedBackend;
     use crate::model::BackendInfo;
 
@@ -517,6 +588,70 @@ mod tests {
             "a rejected result must not swap the Arc"
         );
         assert_eq!(after.client_epoch, 5);
+    }
+
+    #[test]
+    fn a_qualified_error_retains_exact_inventory_and_recovery_clears_it() {
+        let (publisher, handle) = RoutingSnapshotPublisher::new();
+        let expected = topology("10.0.0.1:4000");
+        publish_ok(&publisher, 7, expected.clone());
+        let healthy = handle
+            .current()
+            .unwrap_or_else(|| unreachable!("a snapshot is published"));
+
+        assert_eq!(
+            publisher
+                .publish_error(8, ObserverError::TopologyUnavailable)
+                .unwrap_or_else(|_| unreachable!("no overflow")),
+            PublishOutcome::RejectedStale,
+            "an error cannot attach to a different epoch"
+        );
+        assert_eq!(
+            publisher
+                .publish_error(7, ObserverError::TopologyUnavailable)
+                .unwrap_or_else(|_| unreachable!("no overflow")),
+            PublishOutcome::Published { generation: 2 }
+        );
+        let failed = handle
+            .current()
+            .unwrap_or_else(|| unreachable!("the error snapshot is published"));
+        assert_eq!(failed.backends, expected, "inventory is retained exactly");
+        assert_eq!(
+            failed.observer_error(),
+            Some(ObserverError::TopologyUnavailable)
+        );
+        assert!(!handle.still_current(&healthy));
+        assert_eq!(
+            publisher
+                .publish_error(7, ObserverError::TopologyUnavailable)
+                .unwrap_or_else(|_| unreachable!("no overflow")),
+            PublishOutcome::Unchanged,
+            "repeating the same source error is a no-op"
+        );
+
+        assert_eq!(
+            publish_ok(&publisher, 7, expected.clone()),
+            PublishOutcome::Published { generation: 3 },
+            "a same-data success must mint a recovery generation"
+        );
+        let recovered = handle
+            .current()
+            .unwrap_or_else(|| unreachable!("recovery is published"));
+        assert_eq!(recovered.backends, expected);
+        assert_eq!(recovered.observer_error(), None);
+        assert!(!handle.still_current(&failed));
+    }
+
+    #[test]
+    fn an_error_cannot_create_inventory_before_the_first_success() {
+        let (publisher, handle) = RoutingSnapshotPublisher::new();
+        assert_eq!(
+            publisher
+                .publish_error(0, ObserverError::TopologyUnavailable)
+                .unwrap_or_else(|_| unreachable!("no overflow")),
+            PublishOutcome::RejectedStale
+        );
+        assert!(handle.current().is_none());
     }
 
     #[test]
