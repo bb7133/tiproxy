@@ -37,6 +37,7 @@ FAMILIES = {  # slot prefix -> plan family, validator, verdict file, frozen redi
     "N": ("normal", validate_normal, "normal-validation.json", "off"),
     "C": ("config-source", validate_config, "config-validation.json", "on"),
 }
+NORMAL_CLIENTS = {f"N{i:02d}": ("64" if i in (2, 3) else "8") for i in range(1, 7)}
 
 
 def sh(*cmd):
@@ -57,6 +58,8 @@ def preflight(rows, family="normal"):
             continue
         expect = {"family": p["family"], "policy": p["balance_policy"], "selection": p["routing_policy"],
                   "go_rule": PLAN_RULES.get(p["routing_rule"], "?" + p["routing_rule"]), "held_clients": "0"}
+        if family == "normal":
+            expect["clients"] = NORMAL_CLIENTS[slot]
         for k, v in expect.items():
             if r[k] != v:
                 problems.append(f"{slot}: {k}={r[k]!r}, plan requires {v!r}")

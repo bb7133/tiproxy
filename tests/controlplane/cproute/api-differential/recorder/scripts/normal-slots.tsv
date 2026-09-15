@@ -1,7 +1,7 @@
 slot	family	policy	selection	go_rule	listen	sources	clients	held_clients	duration	redirection	labels	script
 N01	normal	connection	prefer-idle		127.0.0.1:6000		8	0	240s	off	tidb-0=;tidb-1=;tidb-2=;tidb-3=	N01.json
-N02	normal	connection	random	client_cidr	127.0.0.1:6000	127.0.0.1,127.0.0.2	8	0	240s	off	tidb-0=;tidb-1=;tidb-2=cidr=127.0.0.1/32;tidb-3=cidr=127.0.0.1/32	N02.json
-N03	normal	resource	prefer-idle	proxy_cidr	127.0.0.1:6000,127.0.0.2:6000		8	0	240s	off	tidb-0=;tidb-1=;tidb-2=cidr=127.0.0.2/32;tidb-3=cidr=127.0.0.2/32	N03.json
+N02	normal	connection	random	client_cidr	127.0.0.1:6000	127.0.0.1,127.0.0.2	64	0	240s	off	tidb-0=;tidb-1=;tidb-2=cidr=127.0.0.1/32;tidb-3=cidr=127.0.0.1/32	N02.json
+N03	normal	resource	prefer-idle	proxy_cidr	127.0.0.1:6000,127.0.0.2:6000		64	0	240s	off	tidb-0=;tidb-1=;tidb-2=cidr=127.0.0.2/32;tidb-3=cidr=127.0.0.2/32	N03.json
 N04	normal	resource	random	port	127.0.0.1:6000,127.0.0.1:6001		8	0	255s	off	tidb-0=tiproxy-port=6000;tidb-1=tiproxy-port=6000;tidb-2=tiproxy-port=6001;tidb-3=tiproxy-port=6001	N04.json
 N05	normal	location	prefer-idle		127.0.0.1:6000		8	0	240s	off	tidb-0=;tidb-1=;tidb-2=;tidb-3=	N05.json
 N06	normal	location	random	port	127.0.0.1:6000,127.0.0.1:6001		8	0	255s	off	tidb-0=tiproxy-port=6000;tidb-1=tiproxy-port=6000;tidb-2=tiproxy-port=6001;tidb-3=tiproxy-port=6001	N06.json

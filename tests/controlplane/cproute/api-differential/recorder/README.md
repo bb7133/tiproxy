@@ -119,7 +119,15 @@ is not guaranteed to publish an error because the production fetcher retries.
 `-listen` accepts the same comma-separated address list as the real proxy and the
 workload covers listeners and optional source addresses as a product. The regular
 client count must cover every listener/source combination or the attempt is rejected
-before capture. The clients still drive complete connect/query/close lifecycles. `-held-clients` adds
+before capture. The clients still drive complete connect/query/close lifecycles.
+N02 and N03 workloads use 64 concurrent clients instead of the default eight. The
+round-robin product therefore keeps 32 clients in the matching ClientCIDR source or
+ProxyCIDR listener and 32 in the required no-match context. This widens the real
+dial-failure window without changing the fault schedule, validator, or production
+router behavior; `record_slot.py` fails preflight if either slot is reduced or if
+any of the other four normal slots moves away from eight clients.
+
+`-held-clients` adds
 supplemental long-lived query sessions for real redirect/force-close callbacks;
 their public client addresses identify their API sessions during finalization, so
 their query counts are reported separately and they never inflate the completed-

@@ -175,12 +175,19 @@ class NormalValidatorTests(unittest.TestCase):
         self.assertEqual(record_slot.preflight(ROWS), [])
         bad = copy.deepcopy(ROWS)
         bad["N01"]["duration"] = "30s"
+        bad["N01"]["clients"] = "64"
         bad["N03"]["go_rule"] = "proxy-cidr"
         bad["N05"]["held_clients"] = "2"
         bad["N02"]["redirection"] = "on"
+        bad["N02"]["clients"] = "8"
+        bad["N03"]["clients"] = "8"
         del bad["N06"]
         problems = record_slot.preflight(bad)
-        for needle in ("N01: duration 30s below plan minimum", "N03: go_rule='proxy-cidr'", "N05: held_clients='2'", "N02: normal family is recorded with redirection off", "differ from the plan's normal rows"):
+        for needle in ("N01: duration 30s below plan minimum", "N01: clients='64', plan requires '8'",
+                       "N02: clients='8', plan requires '64'",
+                       "N03: clients='8', plan requires '64'", "N03: go_rule='proxy-cidr'",
+                       "N05: held_clients='2'", "N02: normal family is recorded with redirection off",
+                       "differ from the plan's normal rows"):
             self.assertTrue(any(needle in p for p in problems), (needle, problems))
 
     def test_manifest_assertions(self):
