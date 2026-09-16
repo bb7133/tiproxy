@@ -84,6 +84,14 @@ pub struct LocalRouteChannel {
     requested: bool,
 }
 
+/// Releases the orderly session's exact local route authority. Aborted engine
+/// tasks retain the field-level drop fallback; the normal end path calls this
+/// seam so tests can observe the accounting edge explicitly.
+pub(crate) fn release_local_route_lease(lease: &mut Option<LocalRouteChannel>) {
+    drop(lease.take());
+    debug_assert!(lease.is_none());
+}
+
 impl LocalRouteChannel {
     /// Captures the immutable connection metadata used by every retry.
     #[must_use]
@@ -229,6 +237,7 @@ mod tests {
         calls: Vec<(String, String, String)>,
         finishes: Vec<(String, bool)>,
         drops: usize,
+        active: usize,
     }
 
     struct FakeAuthority {
@@ -236,14 +245,16 @@ mod tests {
         observed: Arc<Mutex<Observed>>,
         answers: VecDeque<Result<RouteAssignment, RouteError>>,
         pending: Option<String>,
+        active: bool,
     }
 
     impl Drop for FakeAuthority {
         fn drop(&mut self) {
-            self.observed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .drops += 1;
+            let mut observed = self.observed.lock().unwrap_or_else(PoisonError::into_inner);
+            observed.drops += 1;
+            if self.active {
+                observed.active -= 1;
+            }
         }
     }
 
@@ -283,11 +294,15 @@ mod tests {
                 return None;
             }
             self.pending = None;
-            self.observed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+            let mut observed = self.observed.lock().unwrap_or_else(PoisonError::into_inner);
+            observed
                 .finishes
                 .push((assignment_id.to_owned(), connected));
+            if connected {
+                assert!(!self.active, "a fake session can become active only once");
+                self.active = true;
+                observed.active += 1;
+            }
             Some(Settlement::Applied)
         }
     }
@@ -311,6 +326,7 @@ mod tests {
             observed: Arc::clone(&observed),
             answers: answers.into_iter().collect(),
             pending: None,
+            active: false,
         };
         (
             LocalRouteChannel::with_authority(
@@ -454,14 +470,21 @@ mod tests {
                 .finishes,
             [("active".to_owned(), true)]
         );
-        drop(channel);
         assert_eq!(
             observed
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .drops,
+                .active,
             1,
-            "the session authority is released exactly once"
+            "a successful settlement remains charged for the live session"
+        );
+        let mut lease = Some(channel);
+        super::release_local_route_lease(&mut lease);
+        let observed = observed.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(observed.drops, 1, "the session authority is released once");
+        assert_eq!(
+            observed.active, 0,
+            "the explicit orderly-end seam returns active accounting to baseline"
         );
     }
 }

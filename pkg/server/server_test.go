@@ -11,8 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pingcap/tiproxy/lib/util/logger"
+	"github.com/pingcap/tiproxy/pkg/proxy/backend"
 	"github.com/pingcap/tiproxy/pkg/sctx"
 	"github.com/pingcap/tiproxy/pkg/util/etcd"
 	"github.com/prometheus/client_golang/prometheus"
@@ -107,6 +109,50 @@ func TestRustRouteOwnerRejectsCustomHandshakeHandler(t *testing.T) {
 	require.NoError(t, validateRustHandshakeHandler(true, false))
 	err := validateRustHandshakeHandler(true, true)
 	require.EqualError(t, err, "custom Go handshake handler is unsupported with Rust route owner")
+}
+
+type testServerHandler struct {
+	backend.HandshakeHandler
+}
+
+func (*testServerHandler) RegisterHTTP(*gin.Engine) error {
+	return nil
+}
+
+func TestRustRouteOwnerRejectsCustomHandlerBeforeStartingListeners(t *testing.T) {
+	restore := resetPromRegistry()
+	defer restore()
+
+	dir, err := os.MkdirTemp("", "tiproxy-rust-custom-handler-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	controlSocket := filepath.Join(dir, "control.sock")
+	configFile := filepath.Join(dir, "config.toml")
+	content := []byte("workdir = \"" + filepath.Join(dir, "work") + "\"\n" +
+		"enable-traffic-replay = false\n" +
+		"[rust-dataplane]\n" +
+		"enabled = true\n" +
+		"control-socket = \"" + controlSocket + "\"\n" +
+		"allowed-uid = -1\n" +
+		"[proxy]\n" +
+		"pd-addrs = \"\"\n" +
+		"addr = \"127.0.0.1:6000\"\n")
+	require.NoError(t, os.WriteFile(configFile, content, 0o644))
+
+	server, err := NewServer(context.Background(), &sctx.Context{
+		ConfigFile: configFile,
+		Handler: &testServerHandler{
+			HandshakeHandler: backend.NewStaticHandshakeHandler("127.0.0.1:4000"),
+		},
+	})
+	require.EqualError(t, err, "custom Go handshake handler is unsupported with Rust route owner")
+	require.NotNil(t, server)
+	require.Nil(t, server.proxy)
+	require.Nil(t, server.controlBridge)
+	require.Nil(t, server.apiServer)
+	_, statErr := os.Stat(controlSocket)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+	require.NoError(t, server.Close())
 }
 
 func resetPromRegistry() func() {

@@ -390,12 +390,17 @@ if [[ $mode == rust ]]; then
 	echo "MTR-005 lifecycle addresses: peer=$mtr005_peer proxy-client=$mtr005_source"
 fi
 
-# T2-focused checkpoint: prove the production local resolver's exact client
-# error after a Rust-only restart whose completed CP-CFG relist contains a
-# namespace but no `default`. The initial process deliberately seeded default;
-# persisting only tenant before restart also proves that startup seeding is not
-# an empty-set fallback and does not resurrect default after a nonempty relist.
-if [[ $mode == rust && $variant == plain && ${DATAPLANE_T2_FOCUSED:-0} == 1 ]]; then
+# T2 gate: prove the production local resolver's exact client error after a
+# Rust-only restart whose completed CP-CFG relist contains a namespace but no
+# `default`. The initial process deliberately seeded default; persisting only
+# tenant before restart also proves that startup seeding is not an empty-set
+# fallback and does not resurrect default after a nonempty relist.
+#
+# The public `dataplane-t2-integration` make target and its required CI job set
+# the internal focused switch so this gate stays independent from the later T4
+# namespace matrix, without requiring developers to remember a hidden env var.
+run_t2_namespace_missing_probe() {
+	local etcdctl_bin
 	etcdctl_bin=$(command -v etcdctl || true)
 	if [[ -z $etcdctl_bin ]]; then
 		etcdctl_bin=$(find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl" \
@@ -419,7 +424,7 @@ if [[ $mode == rust && $variant == plain && ${DATAPLANE_T2_FOCUSED:-0} == 1 ]]; 
 		>>"$run_dir/tiproxy-rs.log" 2>&1 &
 	RUST_PID=$!
 	write_state
-	restarted=false
+	local restarted=false
 	for _ in {1..180}; do
 		if curl --noproxy '*' --fail --silent --max-time 5 \
 			"http://127.0.0.1:$RUST_HEALTH_PORT/health" \
@@ -438,6 +443,8 @@ if [[ $mode == rust && $variant == plain && ${DATAPLANE_T2_FOCUSED:-0} == 1 ]]; 
 		exit 1
 	fi
 	set +e
+	local namespace_missing
+	local namespace_missing_status
 	namespace_missing=$(mysql_ingress 'SELECT 1' 2>&1)
 	namespace_missing_status=$?
 	set -e
@@ -450,6 +457,11 @@ if [[ $mode == rust && $variant == plain && ${DATAPLANE_T2_FOCUSED:-0} == 1 ]]; 
 		exit 1
 	fi
 	echo "PASS: T2 local route, retry recovery, lease lifetime, and NamespaceMissing 1105"
+	return 0
+}
+
+if [[ $mode == rust && $variant == plain && ${DATAPLANE_T2_FOCUSED:-0} == 1 ]]; then
+	run_t2_namespace_missing_probe
 	exit 0
 fi
 

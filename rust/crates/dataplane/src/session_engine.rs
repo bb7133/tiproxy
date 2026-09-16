@@ -145,6 +145,7 @@ use crate::route::{
 use crate::route_control::{
     ClusterTcpDialer, TrafficTotals, route_assignment_from_wire, route_result_to_wire,
 };
+use crate::route_local::release_local_route_lease;
 use crate::server::{AcceptedConnection, ConnectionFuture, SessionSeat};
 use crate::session::{
     EffectHandler, SessionControl, SessionEnd, SessionEventSource, SessionLoop, SessionLoopConfig,
@@ -1464,6 +1465,12 @@ impl Engine {
                 )
             },
         );
+        // Make the normal session-end accounting edge explicit. Task aborts
+        // still fall back to Engine's field drop, but an orderly exit releases
+        // the exact local selector only after I/O shutdown and metering have
+        // observed the final backend totals. The route-local drop test protects
+        // this from becoming an inert "retained but unread" field.
+        release_local_route_lease(&mut self.local_route_lease);
         EngineExit {
             totals: TrafficTotals {
                 client_in: self.client_counters.inbound(),
