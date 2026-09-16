@@ -54,6 +54,12 @@ func TestServerWithoutBackendCluster(t *testing.T) {
 		ConfigFile: configFile,
 	})
 	require.NoError(t, err)
+	require.False(t, server.configManager.GetConfig().RustDataplane.Enabled)
+	namespaces, err := server.configManager.ListAllNamespace(t.Context())
+	require.NoError(t, err)
+	require.Len(t, namespaces, 1)
+	require.Equal(t, "default", namespaces[0].Namespace,
+		"the all-Go startup seed is visible through its process-local config API")
 	require.NoError(t, server.Close())
 }
 
@@ -94,6 +100,13 @@ func TestRustDataplaneGateOwnsNoGoListenerAndCloses(t *testing.T) {
 	}
 	_, err = os.Stat(controlSocket)
 	require.True(t, errors.Is(err, os.ErrNotExist), "control socket survives close: %v", err)
+}
+
+func TestRustRouteOwnerRejectsCustomHandshakeHandler(t *testing.T) {
+	require.NoError(t, validateRustHandshakeHandler(false, true))
+	require.NoError(t, validateRustHandshakeHandler(true, false))
+	err := validateRustHandshakeHandler(true, true)
+	require.EqualError(t, err, "custom Go handshake handler is unsupported with Rust route owner")
 }
 
 func resetPromRegistry() func() {

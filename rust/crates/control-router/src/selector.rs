@@ -802,6 +802,10 @@ impl Router {
         self.lock().server_version.clone()
     }
 
+    pub(crate) fn set_max_sessions(&self, max_sessions: usize) {
+        self.lock().ledger.set_max_sessions(max_sessions);
+    }
+
     /// Observes accounting for the currently retained owner of an opaque ID.
     /// This is diagnostic only; a backend ID never authorizes settlement.
     #[must_use]

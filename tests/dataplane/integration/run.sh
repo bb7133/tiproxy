@@ -390,6 +390,69 @@ if [[ $mode == rust ]]; then
 	echo "MTR-005 lifecycle addresses: peer=$mtr005_peer proxy-client=$mtr005_source"
 fi
 
+# T2-focused checkpoint: prove the production local resolver's exact client
+# error after a Rust-only restart whose completed CP-CFG relist contains a
+# namespace but no `default`. The initial process deliberately seeded default;
+# persisting only tenant before restart also proves that startup seeding is not
+# an empty-set fallback and does not resurrect default after a nonempty relist.
+if [[ $mode == rust && $variant == plain && ${DATAPLANE_T2_FOCUSED:-0} == 1 ]]; then
+	etcdctl_bin=$(command -v etcdctl || true)
+	if [[ -z $etcdctl_bin ]]; then
+		etcdctl_bin=$(find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl" \
+			-type f -name etcdctl -perm -111 2>/dev/null | sort | tail -1)
+	fi
+	if [[ -z $etcdctl_bin || ! -x $etcdctl_bin ]]; then
+		echo "T2 focused NamespaceMissing probe needs etcdctl" >&2
+		exit 1
+	fi
+	ETCDCTL_API=3 "$etcdctl_bin" --endpoints "http://127.0.0.1:$PD_PORT" put \
+		/config/ns/tenant '{"namespace":"tenant","frontend":{"user":"alice"}}' \
+		>"$run_dir/t2-etcd-put.log"
+
+	kill "$RUST_PID"
+	wait "$RUST_PID" || true
+	RUST_PID=
+	write_state
+	"$rust_binary" --config "$run_dir/tiproxy.toml" \
+		--control-socket "$RUST_SOCKET" --control-uid "$(id -u)" \
+		--health-port "$RUST_HEALTH_PORT" \
+		>>"$run_dir/tiproxy-rs.log" 2>&1 &
+	RUST_PID=$!
+	write_state
+	restarted=false
+	for _ in {1..180}; do
+		if curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$RUST_HEALTH_PORT/health" \
+			>"$run_dir/t2-restart-health.json" 2>/dev/null; then
+			restarted=true
+			break
+		fi
+		if ! kill -0 "$RUST_PID" 2>/dev/null; then
+			echo "T2 focused Rust restart exited before readiness" >&2
+			exit 1
+		fi
+		sleep 1
+	done
+	if [[ $restarted != true ]]; then
+		echo "T2 focused Rust restart did not become ready" >&2
+		exit 1
+	fi
+	set +e
+	namespace_missing=$(mysql_ingress 'SELECT 1' 2>&1)
+	namespace_missing_status=$?
+	set -e
+	printf '%s\n' "$namespace_missing" >"$run_dir/t2-namespace-missing.out"
+	if ((namespace_missing_status == 0)) || \
+		! grep -Fq 'ERROR 1105 (HY000): failed to find a namespace' \
+			"$run_dir/t2-namespace-missing.out"; then
+		echo "T2 focused NamespaceMissing did not return the exact 1105 tuple" >&2
+		cat "$run_dir/t2-namespace-missing.out" >&2
+		exit 1
+	fi
+	echo "PASS: T2 local route, retry recovery, lease lifetime, and NamespaceMissing 1105"
+	exit 0
+fi
+
 # Namespace/topology matrix (DPL-07 #41): three username-resolved
 # combinations against the REAL cluster, identical in both modes.
 # `proxy.pd-addrs` always registers an implicit PD-backed backend

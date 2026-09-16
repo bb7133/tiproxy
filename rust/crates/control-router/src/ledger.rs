@@ -252,6 +252,13 @@ impl Ledger {
         }
     }
 
+    pub(crate) const fn set_max_sessions(&mut self, max_sessions: usize) {
+        // Shrinking below the current population never evicts a live route.
+        // It only rejects new opens until normal closes bring usage below the
+        // reloadable bound.
+        self.max_sessions = max_sessions;
+    }
+
     pub(crate) fn open(&mut self) -> Result<Session, LedgerError> {
         if self.sessions.len() >= self.max_sessions {
             return Err(LedgerError::Capacity);

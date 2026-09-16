@@ -86,6 +86,50 @@ pub enum RouteError {
     CrossKeyspace,
 }
 
+impl RouteError {
+    /// Closed, payload-free category suitable for client-independent routing
+    /// diagnostics and the local dataplane adapter.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig => "invalid_config",
+            Self::WorkerRunning => "worker_running",
+            Self::NamespaceMissing => "namespace_missing",
+            Self::NamespaceReplaced => "namespace_replaced",
+            Self::ControlUnavailable => "control_unavailable",
+            Self::StaleCandidate => "stale_candidate",
+            Self::NoBackend | Self::Observer(control_topology::ObserverError::NoBackend) => {
+                "no_backend"
+            }
+            Self::WrappedNoBackend
+            | Self::Observer(control_topology::ObserverError::WrappedNoBackend) => {
+                "wrapped_no_backend"
+            }
+            Self::PortConflict | Self::Observer(control_topology::ObserverError::PortConflict) => {
+                "port_conflict"
+            }
+            Self::Observer(control_topology::ObserverError::TopologyUnavailable) => {
+                "topology_unavailable"
+            }
+            Self::Observer(control_topology::ObserverError::Cancelled) => "cancelled",
+            Self::Observer(control_topology::ObserverError::DeadlineExceeded) => {
+                "deadline_exceeded"
+            }
+            Self::Unsupported(_) => "unsupported",
+            Self::InvalidSession => "invalid_session",
+            Self::AlreadyActive => "already_active",
+            Self::Capacity => "capacity",
+            Self::Exhausted => "exhausted",
+            Self::NotActive => "not_active",
+            Self::RedirectPending => "redirect_pending",
+            Self::CoolingDown => "cooling_down",
+            Self::ForceClosing => "force_closing",
+            Self::SameBackend => "same_backend",
+            Self::CrossKeyspace => "cross_keyspace",
+        }
+    }
+}
+
 impl From<LedgerError> for RouteError {
     fn from(error: LedgerError) -> Self {
         match error {

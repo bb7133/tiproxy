@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use control_config::source::decode_proxy_online;
 use control_config::{
     ConfigNamespaceSnapshot, ConfigNamespaceSource, ConfigNamespaceStore, HealthCheckConfig,
     NamespaceConfig, SourceRevision, TopologyRuntimeIdentity,
@@ -62,6 +63,22 @@ mod worker;
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
     result.unwrap_or_else(|error| unreachable!("fixture: {error:?}"))
+}
+
+#[test]
+fn route_error_categories_preserve_first_poll_source_identity() {
+    assert_eq!(
+        RouteError::Observer(control_topology::ObserverError::TopologyUnavailable).category(),
+        "topology_unavailable"
+    );
+    assert_eq!(
+        RouteError::Observer(control_topology::ObserverError::Cancelled).category(),
+        "cancelled"
+    );
+    assert_eq!(
+        RouteError::Observer(control_topology::ObserverError::DeadlineExceeded).category(),
+        "deadline_exceeded"
+    );
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -732,7 +749,6 @@ async fn route_plane_replaces_admission_but_retains_an_existing_selector() -> Te
     let (plane, mut handle) = RoutePlane::new(
         Arc::new(harness.source.clone()),
         harness.topology.clone(),
-        100,
         None,
     );
     let context = harness.runtime.handle().module_context();
@@ -758,19 +774,17 @@ async fn route_plane_replaces_admission_but_retains_an_existing_selector() -> Te
         },
         Path::new("/tmp"),
     )?;
+    let waiting = handle.admit_within("replacement", Duration::from_secs(1));
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+            .await
+            .is_err(),
+        "the candidate snapshot is current but its exact router is not yet published"
+    );
     harness.source.deliver();
-
-    let replacement = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(replacement) = handle.admit("replacement")
-                && !retained.same_router_incarnation(&replacement)
-            {
-                break replacement;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
+    let replacement = must(tokio::time::timeout(Duration::from_secs(5), waiting).await?);
+    assert!(!retained.same_router_incarnation(&replacement));
     assert_eq!(replacement.namespace(), "default");
     assert_eq!(handle.current_incarnations(), 1);
 
@@ -799,12 +813,12 @@ async fn route_plane_concurrent_admission_and_namespace_removal_never_stalls_or_
     let (plane, mut handle) = RoutePlane::new(
         Arc::new(harness.source.clone()),
         harness.topology.clone(),
-        100,
         None,
     );
     let context = harness.runtime.handle().module_context();
     let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
     tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+    let original = must(handle.admit(""));
 
     let stop = Arc::new(AtomicBool::new(false));
     let successes = Arc::new(AtomicUsize::new(0));
@@ -867,15 +881,21 @@ async fn route_plane_concurrent_admission_and_namespace_removal_never_stalls_or_
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let current = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if handle.current_incarnations() == 1 && handle.admit("").is_ok() {
-                break;
+            if handle.current_incarnations() == 1
+                && let Ok(current) = handle.admit("")
+            {
+                break current;
             }
             tokio::task::yield_now().await;
         }
     })
     .await?;
+    assert!(
+        !original.same_router_incarnation(&current),
+        "remove/recreate with identical content must mint a fresh route owner"
+    );
     stop.store(true, Ordering::Release);
     for worker in workers {
         worker
@@ -885,6 +905,90 @@ async fn route_plane_concurrent_admission_and_namespace_removal_never_stalls_or_
     assert!(successes.load(Ordering::Relaxed) > 0);
     assert!(failures.load(Ordering::Relaxed) > 0);
     assert_eq!(handle.current_incarnations(), 1);
+
+    drop(original);
+    drop(current);
+
+    plane_task.abort();
+    let _ = plane_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_plane_applies_reloadable_capacity_without_evicting_live_leases() -> TestResult {
+    let harness = Harness::new("", "connection").await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let mut first = must(handle.admit(""));
+    let mut second = must(handle.admit(""));
+    let router = first.test_router();
+    let backend_id = "default/127.0.0.1:4000";
+    for admission in [&mut first, &mut second] {
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        assert_eq!(reservation.assignment().backend_id, backend_id);
+        assert_eq!(
+            admission.selector().finish(&reservation, true),
+            Settlement::Applied
+        );
+    }
+    assert_eq!(
+        router
+            .accounting(backend_id)
+            .map(super::ledger::Accounting::active),
+        Some(2),
+        "both established session leases remain charged before shrink"
+    );
+    let current = harness.source.store.current();
+    let mut effective = (**current.effective()).clone();
+    effective.apply_proxy_online(decode_proxy_online(br#"{"max-connections":1}"#)?);
+    harness.source.store.apply(
+        effective,
+        current.namespaces().to_vec(),
+        SourceRevision {
+            file_revision: 3,
+            etcd_revision: 0,
+        },
+        Path::new("/tmp"),
+    )?;
+    harness.source.deliver();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(handle.admit(""), Err(RouteError::Capacity)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    drop(first);
+    assert_eq!(
+        router
+            .accounting(backend_id)
+            .map(super::ledger::Accounting::active),
+        Some(1),
+        "dropping one session lease releases exactly one active owner"
+    );
+    assert!(
+        matches!(handle.admit(""), Err(RouteError::Capacity)),
+        "shrinking never evicts the second live lease and does not admit above the new limit"
+    );
+    drop(second);
+    assert_eq!(
+        router.accounting(backend_id).unwrap_or_default().active(),
+        0,
+        "normal teardown returns active accounting to the empty baseline"
+    );
+    let after_close = must(handle.admit(""));
+    assert_eq!(after_close.namespace(), "default");
+    drop(after_close);
 
     plane_task.abort();
     let _ = plane_task.await;

@@ -14,10 +14,11 @@
 
 //! Route client, dial retry, and assignment lifecycle (DPL-02).
 //!
-//! Rust never duplicates balance policy: backend choice stays on the Go
-//! side behind the control protocol's route messages. The engine here
-//! implements the **consumer** half exactly as `pkg/controlbridge`'s
-//! `RouterAdapter` expects it:
+//! Rust never duplicates balance policy: a [`RouteChannel`] is the sole route
+//! authority for one acquisition. The production Rust-owner composition backs
+//! it with the process-local selector; compatibility tests may still back it
+//! with `pkg/controlbridge`'s legacy `RouterAdapter` exchange. The engine keeps
+//! the same push/result lifecycle for both:
 //!
 //! - One [`RouteChannel::request_route`] opens the exchange; the adapter
 //!   then pushes one `RouteAssignment` immediately and **another after
@@ -152,9 +153,9 @@ pub enum AcquireError {
     Channel(RouteChannelError),
 }
 
-/// The engine's view of the control-plane route conversation. The
-/// transport (currently the legacy bridge client) implements this; tests fake
-/// it.
+/// The engine's view of one route conversation. Production uses the local
+/// selector adapter; the legacy bridge adapter and tests implement the same
+/// lifecycle without changing dial/retry accounting.
 pub trait RouteChannel: Send {
     /// Sends the initial `RouteRequest` for this connection. Called
     /// exactly once per acquisition sequence.

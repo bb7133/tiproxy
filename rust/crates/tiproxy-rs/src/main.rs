@@ -35,7 +35,7 @@ use config_composition::{
 };
 use control_config::{
     ConfigModule, ConfigModuleHandle, ConfigModuleOptions, ConfigNamespaceSource,
-    HealthCheckConfig, TopologyRuntimeIdentity,
+    HealthCheckConfig, NamespaceConfig, TopologyRuntimeIdentity,
 };
 use control_etcd::ElectionConfig;
 use control_external::{EtcdClientConfig, EtcdTlsConfig};
@@ -476,32 +476,6 @@ async fn run(options: Options) -> Result<(), String> {
     let (metering_shutdown_tx, metering_shutdown_rx) = watch::channel(false);
     let loop_config = session_loop_config(in_process_config.drain_grace());
     let (metrics, observations) = MetricsRecorder::channel(DEFAULT_OBSERVATION_CAPACITY);
-    let owner: Arc<dyn BoundSessionHandler> = Arc::new(
-        EngineSessionOwner::new(
-            Arc::clone(&shared_client),
-            "default",
-            session_shutdown_rx.clone(),
-            drain_rx,
-            loop_config,
-        )
-        .with_metrics(metrics.clone())
-        .with_metering(metering.clone()),
-    );
-    let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
-    let composer = Arc::new(RustConfigComposer::new(
-        config_owner.handle.source().clone(),
-        options.drain_grace,
-    ));
-    let (consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
-        Arc::new(SystemMemoryProbe::new()),
-        Arc::new(connection_handler),
-        composer,
-    );
-    // Forced shutdown lets each session owner finish its bounded
-    // terminal work (close notice + engine join) before the abort
-    // backstop fires.
-    let consumer =
-        consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
     let runtime_handle = in_process.handle();
     let modules = ControlModuleSet::new(&runtime_handle);
     // Arm the startup guard before the first module is spawned. From here every
@@ -528,6 +502,17 @@ async fn run(options: Options) -> Result<(), String> {
     .await
     {
         return Err(guard.rollback(error).await);
+    }
+    if let Err(error) = config_owner.handle.source().bootstrap_namespaces_if_empty(
+        vec![NamespaceConfig {
+            namespace: "default".to_owned(),
+            ..NamespaceConfig::default()
+        }],
+        &config_owner.current_dir,
+    ) {
+        return Err(guard
+            .rollback(format!("bootstrap default namespace: {error}"))
+            .await);
     }
     // CP-TOPO self-registration and discovery publication come online before any
     // SQL admission: register this instance's SQL topology and publish the
@@ -636,26 +621,11 @@ async fn run(options: Options) -> Result<(), String> {
     }
     // The local route plane must bind every namespace's exact incarnation to a
     // retained topology source before any serving snapshot can open listeners.
-    // T2 consumes the handle for local initial routing; T1 establishes the
-    // ownership/readiness boundary without changing the bridge route path yet.
-    let route_serving = match config_owner.handle.source().current().effective().serving() {
-        Ok(serving) => serving,
-        Err(error) => {
-            return Err(guard
-                .rollback(format!("project route-plane capacity: {error}"))
-                .await);
-        }
-    };
-    let configured_max_sessions = route_serving.max_connections;
-    let max_sessions = if configured_max_sessions == 0 {
-        usize::MAX
-    } else {
-        usize::try_from(configured_max_sessions).unwrap_or(usize::MAX)
-    };
+    // T2 consumes that ready handle for local initial routing; the bridge route
+    // path remains available only to compatibility tests.
     let (route_plane, mut route_plane_handle) = RoutePlane::new(
         Arc::new(config_owner.handle.source().clone()),
         topology_handle.clone(),
-        max_sessions,
         Some(metric_overlay),
     );
     if let Err(error) = guard.spawn_module(route_plane) {
@@ -672,7 +642,35 @@ async fn run(options: Options) -> Result<(), String> {
     {
         return Err(guard.rollback(error).await);
     }
-    let _route_plane_handle = route_plane_handle;
+    // Only now compose the SQL session owner: every production session receives
+    // the ready process-local route plane, so no listener can observe the
+    // compatibility bridge acquisition path.
+    let owner: Arc<dyn BoundSessionHandler> = Arc::new(
+        EngineSessionOwner::new(
+            Arc::clone(&shared_client),
+            "default",
+            session_shutdown_rx.clone(),
+            drain_rx,
+            loop_config,
+        )
+        .with_metrics(metrics.clone())
+        .with_metering(metering.clone())
+        .with_route_plane(route_plane_handle.clone()),
+    );
+    let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
+    let composer = Arc::new(RustConfigComposer::new(
+        config_owner.handle.source().clone(),
+        options.drain_grace,
+    ));
+    let (consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
+        Arc::new(SystemMemoryProbe::new()),
+        Arc::new(connection_handler),
+        composer,
+    );
+    // Forced shutdown lets each session owner finish its bounded terminal work
+    // before the abort backstop fires.
+    let consumer =
+        consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
     if let Err(error) = guard.spawn_module(ConfigServingAdapter::new(
         config_owner.handle.source().clone(),
         serving.clone(),
@@ -963,6 +961,7 @@ struct ConfigOwner {
     handle: ConfigModuleHandle,
     snapshots: SnapshotStore,
     tls_roots: Vec<PathBuf>,
+    current_dir: PathBuf,
 }
 
 fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner, String> {
@@ -970,7 +969,7 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
     let base = ConfigModuleOptions {
         config_file: Some(options.config_file.clone()),
         advertise_addr: None,
-        current_dir,
+        current_dir: current_dir.clone(),
         etcd: None,
         election: None,
         persistence_factory: None,
@@ -1032,6 +1031,7 @@ fn load_config_owner(options: &Options, process_id: &str) -> Result<ConfigOwner,
         handle,
         snapshots,
         tls_roots,
+        current_dir,
     })
 }
 

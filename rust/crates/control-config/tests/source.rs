@@ -1113,6 +1113,136 @@ fn namespace_incarnation_tracks_continuity_without_changing_content_identity()
 }
 
 #[test]
+fn startup_namespace_seed_is_one_shot_and_explicit_empty_can_remove_it() -> Result<(), StoreError> {
+    let store = ConfigNamespaceStore::from_toml(b"", None, Path::new("/tmp"))?;
+    let default = NamespaceConfig {
+        namespace: "default".to_owned(),
+        ..NamespaceConfig::default()
+    };
+    let seeded = store.bootstrap_namespaces_if_empty(vec![default.clone()], Path::new("/tmp"))?;
+    assert_eq!(
+        seeded.as_ref().map(|snapshot| snapshot.generation()),
+        Some(2)
+    );
+    let incarnation = store
+        .current()
+        .namespace_incarnation("default")
+        .unwrap_or_else(|| unreachable!("the bootstrap namespace has an incarnation"));
+    assert!(
+        store
+            .bootstrap_namespaces_if_empty(
+                vec![NamespaceConfig {
+                    namespace: "replacement".to_owned(),
+                    ..NamespaceConfig::default()
+                }],
+                Path::new("/tmp"),
+            )?
+            .is_none()
+    );
+    assert!(
+        store
+            .current()
+            .namespace_incarnation("default")
+            .is_some_and(|current| current.same_as(&incarnation))
+    );
+
+    assert!(
+        store
+            .apply_persistent(
+                PersistentConfigSnapshot {
+                    namespaces: vec![default.clone()],
+                    ..PersistentConfigSnapshot::default()
+                },
+                1,
+                Path::new("/tmp"),
+            )?
+            .is_none(),
+        "an equal completed relist preserves the seeded incarnation"
+    );
+    assert!(
+        store
+            .current()
+            .namespace_incarnation("default")
+            .is_some_and(|current| current.same_as(&incarnation))
+    );
+
+    let mut replacement = default;
+    replacement.frontend.user = "replacement".to_owned();
+    store.apply_persistent(
+        PersistentConfigSnapshot {
+            namespaces: vec![replacement],
+            ..PersistentConfigSnapshot::default()
+        },
+        2,
+        Path::new("/tmp"),
+    )?;
+    assert!(
+        store
+            .current()
+            .namespace_incarnation("default")
+            .is_some_and(|current| !current.same_as(&incarnation)),
+        "a real replacement mints a fresh namespace incarnation"
+    );
+
+    store.apply_persistent(PersistentConfigSnapshot::default(), 3, Path::new("/tmp"))?;
+    assert!(store.current().namespaces().is_empty());
+    assert!(
+        store
+            .bootstrap_namespaces_if_empty(
+                vec![NamespaceConfig {
+                    namespace: "default".to_owned(),
+                    ..NamespaceConfig::default()
+                }],
+                Path::new("/tmp"),
+            )?
+            .is_none(),
+        "an explicit empty relist cannot revive the startup-only seed"
+    );
+    assert!(store.current().namespaces().is_empty());
+
+    assert_preexisting_namespace_consumes_startup_seed()?;
+    Ok(())
+}
+
+fn assert_preexisting_namespace_consumes_startup_seed() -> Result<(), StoreError> {
+    let store = ConfigNamespaceStore::new(
+        EffectiveConfig::default(),
+        vec![NamespaceConfig {
+            namespace: "tenant".to_owned(),
+            ..NamespaceConfig::default()
+        }],
+        SourceRevision::default(),
+        Path::new("/tmp"),
+    )?;
+    assert!(
+        store
+            .bootstrap_namespaces_if_empty(
+                vec![NamespaceConfig {
+                    namespace: "default".to_owned(),
+                    ..NamespaceConfig::default()
+                }],
+                Path::new("/tmp"),
+            )?
+            .is_none(),
+        "a nonempty startup relist consumes the one startup attempt without seeding"
+    );
+    store.apply_persistent(PersistentConfigSnapshot::default(), 1, Path::new("/tmp"))?;
+    assert!(
+        store
+            .bootstrap_namespaces_if_empty(
+                vec![NamespaceConfig {
+                    namespace: "default".to_owned(),
+                    ..NamespaceConfig::default()
+                }],
+                Path::new("/tmp"),
+            )?
+            .is_none()
+    );
+    assert!(store.current().namespaces().is_empty());
+    Ok(())
+}
+
+#[test]
 fn resource_incarnation_records_coalesced_policy_lifetimes() {
     fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
         result.unwrap_or_else(|error| unreachable!("config fixture: {error:?}"))

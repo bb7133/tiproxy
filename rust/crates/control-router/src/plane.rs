@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceSource, NamespaceIncarnation};
 use control_plane::{ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture};
@@ -73,12 +74,18 @@ impl RouteAdmission {
     pub fn same_router_incarnation(&self, other: &Self) -> bool {
         self.entry.incarnation.same_as(&other.entry.incarnation)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_router(&self) -> Arc<Router> {
+        Arc::clone(&self.entry.router)
+    }
 }
 
 /// Readiness and admission handle for the process-local route plane.
 #[derive(Clone)]
 pub struct RoutePlaneHandle {
     ready: watch::Receiver<bool>,
+    updates: watch::Receiver<u64>,
     source: Arc<dyn ConfigNamespaceSource>,
     resolver: UserNamespaceResolver,
     registry: Arc<Mutex<RegistryState>>,
@@ -135,6 +142,55 @@ impl RoutePlaneHandle {
         Ok(RouteAdmission { entry, selector })
     }
 
+    /// Waits across the narrow config-publication/registry-reconcile window.
+    /// Semantic rejections (missing namespace, invalid config, capacity) return
+    /// immediately; only transient authority drift is retried under `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic admission error, or the last transient error when
+    /// the bounded wait expires or the route plane terminates.
+    pub async fn admit_within(
+        &self,
+        user: &str,
+        timeout: Duration,
+    ) -> Result<RouteAdmission, RouteError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut updates = self.updates.clone();
+        updates.borrow_and_update();
+        loop {
+            let error = match self.admit(user) {
+                Ok(admission) => return Ok(admission),
+                Err(error @ (RouteError::ControlUnavailable | RouteError::StaleCandidate)) => error,
+                Err(error) => return Err(error),
+            };
+            match tokio::time::timeout_at(deadline, updates.changed()).await {
+                Ok(Ok(())) => {
+                    updates.borrow_and_update();
+                }
+                Ok(Err(_)) | Err(_) => return Err(error),
+            }
+        }
+    }
+
+    /// Returns the latest nonempty backend version retained by the current
+    /// `default` router. The caller supplies the process protocol fallback when
+    /// no default namespace/version exists.
+    #[must_use]
+    pub fn default_server_version(&self) -> Option<String> {
+        let entry = {
+            let registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+            if registry.terminal {
+                return None;
+            }
+            registry.current.get("default").cloned()
+        };
+        // Never acquire a router lock while holding the registry lock.
+        entry
+            .map(|entry| entry.router.server_version())
+            .filter(|version| !version.is_empty())
+    }
+
     #[cfg(test)]
     pub(crate) fn current_incarnations(&self) -> usize {
         self.registry
@@ -149,9 +205,9 @@ impl RoutePlaneHandle {
 pub struct RoutePlane {
     source: Arc<dyn ConfigNamespaceSource>,
     topology: TopologyModuleHandle,
-    max_sessions: usize,
     metrics: Option<MetricOverlayHandle>,
     ready: watch::Sender<bool>,
+    updates: watch::Sender<u64>,
     registry: Arc<Mutex<RegistryState>>,
 }
 
@@ -161,23 +217,24 @@ impl RoutePlane {
     pub fn new(
         source: Arc<dyn ConfigNamespaceSource>,
         topology: TopologyModuleHandle,
-        max_sessions: usize,
         metrics: Option<MetricOverlayHandle>,
     ) -> (Self, RoutePlaneHandle) {
         let (ready, ready_rx) = watch::channel(false);
+        let (updates, updates_rx) = watch::channel(0);
         let registry = Arc::new(Mutex::new(RegistryState::default()));
         let resolver = UserNamespaceResolver::new(Arc::clone(&source));
         (
             Self {
                 source: Arc::clone(&source),
                 topology,
-                max_sessions,
                 metrics,
                 ready,
+                updates,
                 registry: Arc::clone(&registry),
             },
             RoutePlaneHandle {
                 ready: ready_rx,
+                updates: updates_rx,
                 source,
                 resolver,
                 registry,
@@ -190,6 +247,16 @@ impl RoutePlane {
         snapshot: &Arc<ConfigNamespaceSnapshot>,
         context: &ModuleContext,
     ) -> Result<(), RouteError> {
+        let configured_max_sessions = snapshot
+            .effective()
+            .serving()
+            .map_err(|_| RouteError::InvalidConfig)?
+            .max_connections;
+        let max_sessions = if configured_max_sessions == 0 {
+            usize::MAX
+        } else {
+            usize::try_from(configured_max_sessions).unwrap_or(usize::MAX)
+        };
         let previous = self
             .registry
             .lock()
@@ -205,6 +272,7 @@ impl RoutePlane {
                 .get(&namespace.namespace)
                 .filter(|entry| entry.incarnation.same_as(&incarnation))
             {
+                entry.router.set_max_sessions(max_sessions);
                 next.insert(namespace.namespace.clone(), Arc::clone(entry));
                 continue;
             }
@@ -214,7 +282,7 @@ impl RoutePlane {
                 &self.topology,
                 context,
                 &resolved,
-                self.max_sessions,
+                max_sessions,
                 self.metrics.clone(),
             )?);
             next.insert(
@@ -238,6 +306,9 @@ impl RoutePlane {
         };
         // Router/source leases must never be dropped under the registry lock.
         drop(retired);
+        self.updates.send_modify(|revision| {
+            *revision = revision.saturating_add(1);
+        });
         Ok(())
     }
 
@@ -249,6 +320,9 @@ impl RoutePlane {
         };
         self.ready.send_replace(false);
         drop(retired);
+        self.updates.send_modify(|revision| {
+            *revision = revision.saturating_add(1);
+        });
     }
 
     async fn run_inner(self: Box<Self>, context: ModuleContext) -> Result<(), ModuleError> {

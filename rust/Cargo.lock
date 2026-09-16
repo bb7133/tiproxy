@@ -509,7 +509,9 @@ name = "dataplane"
 version = "0.1.0"
 dependencies = [
  "control-proto",
+ "control-router",
  "control-routing",
+ "control-topology",
  "getrandom 0.2.17",
  "mysql-wire",
  "prost",

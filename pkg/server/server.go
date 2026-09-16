@@ -74,6 +74,9 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 		return
 	}
 	cfg := srv.configManager.GetConfig()
+	if err = validateRustHandshakeHandler(cfg.RustDataplane.Enabled, handler != nil); err != nil {
+		return
+	}
 
 	// set up logger
 	var lg *zap.Logger
@@ -241,6 +244,13 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 
 	ready.Toggle()
 	return
+}
+
+func validateRustHandshakeHandler(rustEnabled, customHandler bool) error {
+	if rustEnabled && customHandler {
+		return errors.New("custom Go handshake handler is unsupported with Rust route owner")
+	}
+	return nil
 }
 
 func printInfo(lg *zap.Logger, cfg *config.Config) {

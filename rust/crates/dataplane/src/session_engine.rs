@@ -81,6 +81,7 @@ use control_proto::v1::{
     ConnectionIdentity, ControlEnvelope, ErrorCode, ErrorSource as WireErrorSource,
     HandshakeMetadata, HandshakeResponseEvent, Priority, ProxyProtocolMode, RouteRequest,
 };
+use control_router::{RouteError, RoutePlaneHandle};
 use control_routing::{RouteAssignment, RouteResult};
 use mysql_wire::{
     Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams, StatusFlags,
@@ -130,6 +131,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
+use crate::LocalRouteChannel;
 use crate::control_dispatch::{CommandKind, CommandToken, RedirectTarget, ResponseKind};
 use crate::metering::{
     MeteringAttribution, MeteringSamplerError, MeteringSourceRegistry, is_public_endpoint,
@@ -358,6 +360,7 @@ const ENGINE_CMD_CAPACITY: usize = 16;
 /// Engine → owner report queue depth.
 const ENGINE_REPORT_CAPACITY: usize = 8;
 const BACKEND_HEALTH_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+const LOCAL_ROUTE_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 /// Server-version bytes advertised in the proxy greeting.
 const SERVER_VERSION: &[u8] = b"8.0.11-TiProxy-rs";
 
@@ -537,6 +540,47 @@ impl RouteChannel for BindingRouteChannel {
     }
 }
 
+/// Transitional channel shape while focused tests still exercise the legacy
+/// bridge adapter. The production binary always installs `Local` after T2.
+enum SessionRouteChannel {
+    Local(LocalRouteChannel),
+    Bridge(BindingRouteChannel),
+}
+
+const fn local_admission_client_error(error: RouteError) -> Option<(u16, [u8; 5], &'static str)> {
+    match error {
+        RouteError::NamespaceMissing => Some((1105, *b"HY000", "failed to find a namespace")),
+        RouteError::InvalidConfig => Some((1105, *b"HY000", "invalid namespace configuration")),
+        _ => None,
+    }
+}
+
+impl RouteChannel for SessionRouteChannel {
+    async fn request_route(
+        &mut self,
+        excluded_backend_ids: Vec<String>,
+    ) -> Result<(), RouteChannelError> {
+        match self {
+            Self::Local(channel) => channel.request_route(excluded_backend_ids).await,
+            Self::Bridge(channel) => channel.request_route(excluded_backend_ids).await,
+        }
+    }
+
+    async fn next_assignment(&mut self) -> Result<RouteAssignment, RouteChannelError> {
+        match self {
+            Self::Local(channel) => channel.next_assignment().await,
+            Self::Bridge(channel) => channel.next_assignment().await,
+        }
+    }
+
+    async fn report_result(&mut self, result: RouteResult) -> Result<(), RouteChannelError> {
+        match self {
+            Self::Local(channel) => channel.report_result(result).await,
+            Self::Bridge(channel) => channel.report_result(result).await,
+        }
+    }
+}
+
 /// The production [`BoundSessionHandler`]: composes the engine for each
 /// registered connection.
 pub struct EngineSessionOwner {
@@ -547,6 +591,7 @@ pub struct EngineSessionOwner {
     loop_config: SessionLoopConfig,
     metrics: MetricsRecorder,
     metering: Option<MeteringSourceRegistry>,
+    route_plane: Option<RoutePlaneHandle>,
 }
 
 impl EngineSessionOwner {
@@ -567,6 +612,7 @@ impl EngineSessionOwner {
             loop_config,
             metrics: MetricsRecorder::default(),
             metering: None,
+            route_plane: None,
         }
     }
 
@@ -581,6 +627,15 @@ impl EngineSessionOwner {
     #[must_use]
     pub fn with_metering(mut self, metering: MeteringSourceRegistry) -> Self {
         self.metering = Some(metering);
+        self
+    }
+
+    /// Uses the process-local Rust route plane for handshake resolution and
+    /// initial backend acquisition. Without this handle, the legacy bridge
+    /// path remains available to focused compatibility tests only.
+    #[must_use]
+    pub fn with_route_plane(mut self, route_plane: RoutePlaneHandle) -> Self {
+        self.route_plane = Some(route_plane);
         self
     }
 }
@@ -598,9 +653,19 @@ impl BoundSessionHandler for EngineSessionOwner {
         let config = self.loop_config;
         let metrics = self.metrics.clone();
         let metering = self.metering.clone();
+        let route_plane = self.route_plane.clone();
         Box::pin(async move {
             run_bound_session_observed(
-                connection, binding, client, namespace, shutdown, drain, config, metrics, metering,
+                connection,
+                binding,
+                client,
+                namespace,
+                shutdown,
+                drain,
+                config,
+                metrics,
+                metering,
+                route_plane,
             )
             .await;
         })
@@ -631,6 +696,7 @@ pub async fn run_bound_session(
         loop_config,
         MetricsRecorder::default(),
         None,
+        None,
     )
     .await;
 }
@@ -646,6 +712,7 @@ async fn run_bound_session_observed(
     loop_config: SessionLoopConfig,
     metrics: MetricsRecorder,
     metering: Option<MeteringSourceRegistry>,
+    route_plane: Option<RoutePlaneHandle>,
 ) {
     let accepted_at = tokio::time::Instant::now();
     let (stream, seat) = connection.into_session_io();
@@ -681,7 +748,8 @@ async fn run_bound_session_observed(
     // The inbound header is consumed only after the greeting, inside the
     // Engine socket owner. Share its immutable decoded inet source with the
     // outer owner so even a force-aborted engine keeps the correct close-log
-    // attribution; routing, public/private metering, and IPC remain peer-based.
+    // attribution. Local CIDR routing also uses that logical source; residual
+    // IPC identity and public/private metering remain peer-based.
     let proxy_client_source = Arc::new(OnceLock::new());
     let public_endpoint = identity.public_endpoint;
 
@@ -723,7 +791,9 @@ async fn run_bound_session_observed(
             responses,
             identity: identity.clone(),
             namespace,
+            route_plane,
         }),
+        local_route_lease: None,
         salt: [0; 20],
         negotiated: CapabilityFlags::from_bits_retain(0),
         client_handshake_raw: Vec::new(),
@@ -1006,6 +1076,7 @@ struct RouteSeed {
     responses: ResponseStream,
     identity: ConnectionIdentity,
     namespace: String,
+    route_plane: Option<RoutePlaneHandle>,
 }
 
 /// The dialed backend's I/O and identity.
@@ -1127,6 +1198,10 @@ struct Engine {
     cmds: mpsc::Receiver<EngineCmd>,
     reports: mpsc::Sender<EngineReport>,
     route: Option<RouteSeed>,
+    /// Process-local selector/router incarnation retained until the session
+    /// engine itself exits. Selector drop is the final accounting backstop for
+    /// the active assignment and any locally terminal pending attempt.
+    local_route_lease: Option<LocalRouteChannel>,
     salt: [u8; 20],
     negotiated: CapabilityFlags,
     /// The client's raw handshake-response payload, re-sent verbatim to
@@ -1610,70 +1685,108 @@ impl Engine {
             return Some(WireErrorSource::Proxy);
         };
         let commander = seed.commander.clone();
-        // The handshake event is a correlated exchange, not
-        // fire-and-forget: the Go adapter ALWAYS answers it with a
-        // HandshakeDecision, which must be consumed under its own armed
-        // expectation — and a rejected handshake refuses the client
-        // with the decision's approved message instead of routing.
-        let Some(decision_id) = seed.client.allocate_request_id() else {
-            return Some(WireErrorSource::Proxy);
-        };
-        if seed
-            .commander
-            .expect_response(decision_id, ResponseKind::HandshakeDecision)
-            .await
-            .is_err()
-        {
-            return Some(WireErrorSource::Proxy);
-        }
-        // Provenance: the adapter validates that handshake/route
-        // envelopes carry the nonzero generation this connection was
-        // admitted under.
         let admission_generation = self.seat.snapshot().generation();
-        let event_envelope = ControlEnvelope {
-            request_id: decision_id,
-            generation: admission_generation,
-            priority: Priority::Control.into(),
-            body: Some(Body::HandshakeResponse(HandshakeResponseEvent {
-                connection: Some(seed.identity.clone()),
-                handshake: Some(metadata.clone()),
-            })),
-            ..ControlEnvelope::default()
-        };
-        if seed.client.send(event_envelope).await.is_err() {
-            return Some(WireErrorSource::Proxy);
-        }
-        let decision = loop {
-            let Some(answer) = seed.responses.recv().await else {
+        let (resolved_namespace, channel) = if let Some(route_plane) = seed.route_plane.take() {
+            // Rust-owner mode resolves the raw client user and opens the exact
+            // namespace incarnation locally. No HandshakeResponseEvent,
+            // HandshakeDecision, RouteRequest, RouteAssignment, or RouteResult
+            // body crosses the control bridge on this path.
+            let admission_wait = self
+                .handshake_budget_remaining()
+                .min(LOCAL_ROUTE_ADMISSION_WAIT);
+            let admission = match route_plane
+                .admit_within(&metadata.user, admission_wait)
+                .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    if let Some((code, state, message)) = local_admission_client_error(error) {
+                        let seq = self.client_io.expected_read_sequence();
+                        self.client_io.reset_write_sequence(seq);
+                        let _ = self.write_client_error(code, state, message).await;
+                    }
+                    let _ = self.events.send(SessionEvent::ClientIoError).await;
+                    return Some(WireErrorSource::Proxy);
+                }
+            };
+            let resolved_namespace = admission.namespace().to_owned();
+            let logical_client = self
+                .inbound_proxy_header
+                .as_ref()
+                .and_then(InboundProxyV2Header::source)
+                .unwrap_or(self.endpoints.client_addr)
+                .to_string();
+            let channel = LocalRouteChannel::new(
+                admission,
+                self.connection_id,
+                logical_client,
+                self.endpoints.client_addr.to_string(),
+                self.endpoints.listener_addr.port().to_string(),
+            );
+            (resolved_namespace, SessionRouteChannel::Local(channel))
+        } else {
+            // Compatibility-only bridge path retained until the later dead-path
+            // deletion slice. Every response expectation is armed before the
+            // request that provokes it.
+            let Some(decision_id) = seed.client.allocate_request_id() else {
                 return Some(WireErrorSource::Proxy);
             };
-            if let Some(Body::HandshakeDecision(decision)) = answer.body {
-                break decision;
+            if seed
+                .commander
+                .expect_response(decision_id, ResponseKind::HandshakeDecision)
+                .await
+                .is_err()
+            {
+                return Some(WireErrorSource::Proxy);
             }
-        };
-        if !decision.accept {
-            let message = if decision.client_message.is_empty() {
-                "handshake rejected"
-            } else {
-                decision.client_message.as_str()
+            let event_envelope = ControlEnvelope {
+                request_id: decision_id,
+                generation: admission_generation,
+                priority: Priority::Control.into(),
+                body: Some(Body::HandshakeResponse(HandshakeResponseEvent {
+                    connection: Some(seed.identity.clone()),
+                    handshake: Some(metadata.clone()),
+                })),
+                ..ControlEnvelope::default()
             };
-            let seq = self.client_io.expected_read_sequence();
-            self.client_io.reset_write_sequence(seq);
-            let _ = self.write_client_error(1105, *b"HY000", message).await;
-            let _ = self.events.send(SessionEvent::ClientIoError).await;
-            return Some(WireErrorSource::Proxy);
-        }
-        // The accepted decision names the namespace the Go handshake
-        // handler RESOLVED for this connection — the routing truth.
-        // Adopt it VERBATIM for the route conversation and every wire
-        // surface: Go imposes no 255-byte namespace bound, so any local
-        // truncation would silently rename an identity (and a byte
-        // bound could split a multibyte character). Only the log layer
-        // bounds it, via its char-boundary-safe field escaping.
-        let mut resolved_namespace = decision.namespace;
-        if resolved_namespace.is_empty() {
-            resolved_namespace = seed.namespace;
-        }
+            if seed.client.send(event_envelope).await.is_err() {
+                return Some(WireErrorSource::Proxy);
+            }
+            let decision = loop {
+                let Some(answer) = seed.responses.recv().await else {
+                    return Some(WireErrorSource::Proxy);
+                };
+                if let Some(Body::HandshakeDecision(decision)) = answer.body {
+                    break decision;
+                }
+            };
+            if !decision.accept {
+                let message = if decision.client_message.is_empty() {
+                    "handshake rejected"
+                } else {
+                    decision.client_message.as_str()
+                };
+                let seq = self.client_io.expected_read_sequence();
+                self.client_io.reset_write_sequence(seq);
+                let _ = self.write_client_error(1105, *b"HY000", message).await;
+                let _ = self.events.send(SessionEvent::ClientIoError).await;
+                return Some(WireErrorSource::Proxy);
+            }
+            let mut resolved_namespace = decision.namespace;
+            if resolved_namespace.is_empty() {
+                resolved_namespace = seed.namespace;
+            }
+            let channel = BindingRouteChannel {
+                client: seed.client,
+                commander: seed.commander,
+                responses: seed.responses,
+                identity: seed.identity,
+                metadata,
+                namespace: resolved_namespace.clone(),
+                generation: admission_generation,
+            };
+            (resolved_namespace, SessionRouteChannel::Bridge(channel))
+        };
         self.log_context.namespace.clone_from(&resolved_namespace);
         // The dispatcher's per-session record adopts it too, so CLOSED
         // events and reconciliation carry the routing truth on the
@@ -1681,18 +1794,17 @@ impl Engine {
         // lost acknowledgement means later observers could still see
         // the pre-decision seed, so the session fails closed instead
         // of routing with ambiguous attribution.
-        if !commander.set_namespace(resolved_namespace.clone()).await {
+        let local_route_owner = matches!(&channel, SessionRouteChannel::Local(_));
+        let namespace_applied = if local_route_owner {
+            commander
+                .set_local_namespace(resolved_namespace.clone())
+                .await
+        } else {
+            commander.set_namespace(resolved_namespace.clone()).await
+        };
+        if !namespace_applied {
             return Some(WireErrorSource::Proxy);
         }
-        let channel = BindingRouteChannel {
-            client: seed.client,
-            commander: seed.commander,
-            responses: seed.responses,
-            identity: seed.identity,
-            metadata,
-            namespace: resolved_namespace,
-            generation: admission_generation,
-        };
         let mut route_engine = RouteEngine::new(
             channel,
             ClusterTcpDialer::new(self.metrics.clone()),
@@ -1735,6 +1847,14 @@ impl Engine {
                 return Some(WireErrorSource::Proxy);
             }
         };
+        let (channel, _) = route_engine.into_parts();
+        if let SessionRouteChannel::Local(lease) = channel {
+            // Successful acquisition moves the exact selector authority out of
+            // the short-lived dial engine and into the SQL session owner. It is
+            // installed before backend greeting/auth work so a later handshake
+            // failure still closes the active ledger entry.
+            self.local_route_lease = Some(lease);
+        }
         let backend_id = acquired.backend.backend_id.clone();
         let backend_address = acquired.backend.address.clone();
         let backend_cluster = acquired.backend.cluster_name.clone();
@@ -4108,10 +4228,31 @@ impl Engine {
 
     async fn send_greeting(&mut self) -> Result<(), WireErrorSource> {
         fill_salt(&mut self.salt);
+        // Rust-owner mode reads the current default router's retained backend
+        // version. Before the first successful health publication (or when the
+        // default namespace is absent), use the static Go/pnet-compatible value
+        // retained in the serving snapshot; the historical Rust constant is
+        // only the compatibility-test fallback.
+        let server_version = self
+            .route
+            .as_ref()
+            .and_then(|seed| seed.route_plane.as_ref())
+            .and_then(RoutePlaneHandle::default_server_version)
+            .or_else(|| {
+                self.seat
+                    .snapshot()
+                    .raw()
+                    .config
+                    .as_ref()
+                    .map(|config| config.server_version.trim().to_owned())
+                    .filter(|version| !version.is_empty())
+            });
         let params = build_greeting(
             proxy_capabilities(self.frontend_tls_available()),
             &self.salt,
-            SERVER_VERSION,
+            server_version
+                .as_deref()
+                .map_or(SERVER_VERSION, str::as_bytes),
             self.connection_id,
             45,
             StatusFlags::from_bits_retain(0),
@@ -4735,11 +4876,12 @@ mod error_classification_tests {
 mod tls_wiring_tests {
     use super::{
         backend_health_in_snapshot, backend_server_name, candidate_budget, leading_capabilities,
-        migration_auth_capabilities, normalize_leading_capabilities, proxy_capabilities,
-        proxy_client_log_address, record_proxy_client_log_source,
+        local_admission_client_error, migration_auth_capabilities, normalize_leading_capabilities,
+        proxy_capabilities, proxy_client_log_address, record_proxy_client_log_source,
     };
     use crate::observability::SessionLogContext;
     use control_proto::v1::BackendSnapshot;
+    use control_router::RouteError;
     use mysql_wire::{
         CapabilityFlags, HandshakeResponseParams, encode_handshake_response, encode_ssl_request,
         parse_handshake_response, parse_ssl_request,
@@ -4761,6 +4903,23 @@ mod tls_wiring_tests {
         assert_eq!(
             proxy_capabilities(true).without(CapabilityFlags::SSL),
             proxy_capabilities(false),
+        );
+    }
+
+    #[test]
+    fn local_namespace_rejection_uses_the_approved_mysql_1105_message() {
+        assert_eq!(
+            local_admission_client_error(RouteError::NamespaceMissing),
+            Some((1105, *b"HY000", "failed to find a namespace"))
+        );
+        assert_eq!(
+            local_admission_client_error(RouteError::InvalidConfig),
+            Some((1105, *b"HY000", "invalid namespace configuration"))
+        );
+        assert_eq!(
+            local_admission_client_error(RouteError::ControlUnavailable),
+            None,
+            "transient owner drift is retried/fails closed, never mislabeled as namespace missing"
         );
     }
 

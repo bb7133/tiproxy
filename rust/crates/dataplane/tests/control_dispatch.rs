@@ -2661,6 +2661,70 @@ async fn failed_repair_send_withholds_the_namespace_ack() {
     }
 }
 
+/// A namespace chosen by the process-local route owner is complete once the
+/// local dispatch record is updated. Even when a stale seed was exported and
+/// every bridge-scoped send now fails, the local barrier must acknowledge so
+/// new Rust-owned SQL admission does not depend on bridge availability. A
+/// later reconnect still exports the retained local truth.
+#[tokio::test(start_paused = true)]
+async fn local_namespace_adoption_does_not_wait_for_a_bridge_repair() {
+    let harness = spawn_scripted_loop(scripted_stale_export_handler());
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 1,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    let _ = wait_for_scripted_sent(&harness.sender, 1).await;
+    harness
+        .sender
+        .fail_scoped_with(Some(ScriptedFailure::Closed));
+
+    let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+    assert!(
+        harness
+            .notice_tx
+            .send(DispatchNotice::SetLocalNamespace {
+                connection_id: 1,
+                namespace: "ns-local".to_owned(),
+                applied: applied_tx,
+            })
+            .await
+            .is_ok()
+    );
+    assert!(
+        applied_rx.await.is_ok(),
+        "local route authority never waits for a bridge repair"
+    );
+    assert_eq!(
+        harness.sender.sent().len(),
+        1,
+        "the local barrier emits no repair frame"
+    );
+
+    harness.sender.fail_scoped_with(None);
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: full_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    let sent = wait_for_scripted_sent(&harness.sender, 2).await;
+    let Some(Body::ReconcileRequest(request)) = &sent[sent.len() - 1].body else {
+        unreachable!("the reconnect reconciles automatically")
+    };
+    assert_eq!(request.connections[0].namespace, "ns-local");
+    harness.task.abort();
+}
+
 /// A stale-epoch repair withholds the ack (the session fails closed),
 /// and the gate still converges for accounting: it holds the adopted
 /// value, so the next Connected transition's automatic reconcile

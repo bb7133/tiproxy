@@ -1481,6 +1481,17 @@ pub enum DispatchNotice {
         /// Completed when the update is applied.
         applied: tokio::sync::oneshot::Sender<()>,
     },
+    /// Adopts a namespace chosen by the process-local route owner. Unlike the
+    /// legacy bridge decision path, this barrier never waits for or repairs a
+    /// Go reconcile export: bridge availability is not local route authority.
+    SetLocalNamespace {
+        /// Stable connection id.
+        connection_id: u64,
+        /// The locally resolved namespace.
+        namespace: String,
+        /// Completed when the process-local record is updated.
+        applied: tokio::sync::oneshot::Sender<()>,
+    },
     /// The session's backend attached or changed.
     SetBackend {
         /// Connection id.
@@ -1717,6 +1728,25 @@ impl ControlDispatchHandle {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
         if !self
             .notify(DispatchNotice::SetNamespace {
+                connection_id,
+                namespace,
+                applied: applied_tx,
+            })
+            .await
+        {
+            return false;
+        }
+        applied_rx.await.is_ok()
+    }
+
+    /// Adopts a namespace resolved by the process-local route plane without a
+    /// bridge repair barrier. The dispatch record remains useful for residual
+    /// lifecycle/reconcile evidence, but a disconnected Go peer cannot block
+    /// Rust-owned SQL admission.
+    pub async fn set_local_namespace(&self, connection_id: u64, namespace: String) -> bool {
+        let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::SetLocalNamespace {
                 connection_id,
                 namespace,
                 applied: applied_tx,
@@ -2705,6 +2735,22 @@ async fn apply_notice<S: DispatchSender>(
                 true
             };
             if upheld {
+                let _ = applied.send(());
+            }
+        }
+        DispatchNotice::SetLocalNamespace {
+            connection_id,
+            namespace,
+            applied,
+        } => {
+            // Local routing owns the decision, so process-local publication is
+            // the complete causal barrier. A later reconnect may export this
+            // residual record, but no send or repair is required to admit SQL.
+            // A vanished registration is still fail closed: acknowledging it
+            // would claim that residual lifecycle state was updated when no
+            // such session exists.
+            if handler.sessions.contains_key(&connection_id) {
+                let _ = handler.set_namespace(connection_id, &namespace);
                 let _ = applied.send(());
             }
         }

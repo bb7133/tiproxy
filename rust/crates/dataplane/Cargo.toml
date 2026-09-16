@@ -12,6 +12,7 @@ default = []
 
 [dependencies]
 control-proto.workspace = true
+control-router.workspace = true
 control-routing.workspace = true
 mysql-wire.workspace = true
 proxy-io.workspace = true
@@ -22,6 +23,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+control-topology.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true

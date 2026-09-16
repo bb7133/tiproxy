@@ -29,6 +29,7 @@ pub mod observability;
 pub mod registry;
 pub mod route;
 pub mod route_control;
+pub mod route_local;
 pub mod runtime_config;
 pub mod server;
 pub mod session;
@@ -64,6 +65,7 @@ pub use route_control::{
     AssignmentRouter, ControlRouteChannel, EnvelopeSink, TcpDialer, TrafficTotals,
     connection_closed, connection_opened,
 };
+pub use route_local::LocalRouteChannel;
 pub use runtime_config::{
     DataplaneServingHandle, DataplaneSnapshotConsumer, GenerationStatus, GenerationStatusSnapshot,
     ServingSnapshotComposer,

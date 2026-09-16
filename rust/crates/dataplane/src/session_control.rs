@@ -129,6 +129,15 @@ impl SessionControlBinding {
             .await
     }
 
+    /// Adopts a namespace resolved by the process-local route owner. This
+    /// updates residual lifecycle/reconcile state without making a live bridge
+    /// send a prerequisite for Rust-owned admission.
+    pub async fn set_local_namespace(&self, namespace: impl Into<String>) -> bool {
+        self.dispatch
+            .set_local_namespace(self.connection_id, namespace.into())
+            .await
+    }
+
     /// Receives the next control directive for the single-owner session
     /// loop: the signal plus — for gate-admitted per-session commands —
     /// the exact [`CommandToken`](crate::control_dispatch::CommandToken)
@@ -235,6 +244,14 @@ impl SessionCommander {
     pub async fn set_namespace(&self, namespace: impl Into<String>) -> bool {
         self.dispatch
             .set_namespace(self.connection_id, namespace.into())
+            .await
+    }
+
+    /// Adopts a namespace resolved by the process-local route owner without a
+    /// bridge repair barrier.
+    pub async fn set_local_namespace(&self, namespace: impl Into<String>) -> bool {
+        self.dispatch
+            .set_local_namespace(self.connection_id, namespace.into())
             .await
     }
 

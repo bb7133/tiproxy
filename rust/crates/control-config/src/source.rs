@@ -379,6 +379,7 @@ struct StoreState {
     file_base: EffectiveConfig,
     file_revision: u64,
     persistent: PersistentConfigSnapshot,
+    bootstrap_namespaces_attempted: bool,
 }
 
 /// Atomic last-good config/namespace owner.
@@ -447,6 +448,7 @@ impl ConfigNamespaceStore {
                     log: None,
                     namespaces,
                 },
+                bootstrap_namespaces_attempted: false,
             })),
             updates,
             validator,
@@ -621,6 +623,55 @@ impl ConfigNamespaceStore {
         };
         let namespaces = persistent.namespaces.clone();
         let prepared = self.validate_candidate(&effective, &namespaces)?;
+        let published = publish_candidate(
+            &mut state,
+            &self.updates,
+            effective,
+            namespaces,
+            source_revision,
+            prepared,
+        )?;
+        state.persistent = persistent;
+        Ok(published)
+    }
+
+    /// Seeds a process-composition namespace only when the completed startup
+    /// view contains no namespaces at all.
+    ///
+    /// This models `TiProxy`'s startup-only implicit `default` namespace without
+    /// making an empty namespace set a permanent fallback. A later committed
+    /// persistent view may still delete the seed and publish an empty set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary candidate validation or generation error while
+    /// retaining the previous last-good view.
+    pub fn bootstrap_namespaces_if_empty(
+        &self,
+        namespaces: Vec<NamespaceConfig>,
+        current_dir: &Path,
+    ) -> Result<Option<Arc<ConfigNamespaceSnapshot>>, StoreError> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.bootstrap_namespaces_attempted {
+            return Ok(None);
+        }
+        // This is a startup action, not an empty-set fallback. Consume it even
+        // when the completed relist is nonempty (or validation fails), so a
+        // later explicit empty generation can never resurrect the implicit
+        // namespace.
+        state.bootstrap_namespaces_attempted = true;
+        if !state.current.namespaces.is_empty() {
+            return Ok(None);
+        }
+        let mut persistent = state.persistent.clone();
+        persistent.namespaces.clone_from(&namespaces);
+        let effective = compose_effective(&state.file_base, &persistent).validated(current_dir)?;
+        effective.check_reload_from(state.current.effective())?;
+        let prepared = self.validate_candidate(&effective, &namespaces)?;
+        let source_revision = state.current.source_revision;
         let published = publish_candidate(
             &mut state,
             &self.updates,
