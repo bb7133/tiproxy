@@ -37,6 +37,46 @@ esac
 FAKE_MYSQL
 chmod 0700 "$temp_dir/tools/tiup" "$temp_dir/tools/mysql"
 
+# A required check must report on every pull request while provisioning the
+# real topology only for changes that can affect T2 local routing. Exercise
+# both sides of that classification with single and mixed path sets.
+if [[ $(printf '%s\n' docs/README.md | "$script_dir/t2-required-paths.sh") != false ]]; then
+	echo "an unrelated documentation change was classified as T2-relevant" >&2
+	exit 1
+fi
+if [[ $(printf '%s\n' docs/README.md rust/crates/dataplane/src/lib.rs | "$script_dir/t2-required-paths.sh") != true ]]; then
+	echo "a Rust dataplane change was not classified as T2-relevant" >&2
+	exit 1
+fi
+for relevant_path in \
+	.github/workflows/dataplane-t2-local-route.yml \
+	Makefile \
+	go.mod \
+	lib/config/config.go \
+	pkg/controlbridge/bridge.go \
+	pkg/server/server.go \
+	rust-toolchain.toml \
+	rust/Cargo.lock \
+	tests/dataplane/integration/run.sh; do
+	if [[ $(printf '%s\n' "$relevant_path" | "$script_dir/t2-required-paths.sh") != true ]]; then
+		echo "T2-relevant path was not classified: $relevant_path" >&2
+		exit 1
+	fi
+done
+
+# If GitHub cannot provide a trustworthy comparison base, the decision must
+# fail open into the real probe rather than falsely satisfying the check.
+for missing_base in "" 0000000000000000000000000000000000000000 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; do
+	if [[ $("$script_dir/t2-required-decision.sh" pull_request "$missing_base" HEAD) != true ]]; then
+		echo "a missing comparison base did not fail open: '$missing_base'" >&2
+		exit 1
+	fi
+done
+if [[ $("$script_dir/t2-required-decision.sh" workflow_dispatch "" HEAD) != true ]]; then
+	echo "manual dispatch did not force the real T2 probe" >&2
+	exit 1
+fi
+
 go test "$repo_root/tests/dataplane/integration/faultproxy"
 go test "$repo_root/tests/dataplane/integration/controldropper"
 

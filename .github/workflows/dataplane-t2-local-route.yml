@@ -1,0 +1,91 @@
+name: Required Rust local route
+
+on:
+  # This workflow intentionally has no pull-request path filter. The job is a
+  # required check, so it must report a conclusion for every pull request.
+  # Its first step gates the expensive probe on the changed paths instead.
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dataplane-t2-local-route-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  t2-local-route:
+    name: Run required Rust local-route gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DATAPLANE_ARTIFACT_ROOT: ${{ github.workspace }}/tests/dataplane/integration/artifacts
+    steps:
+      - name: Check out source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Decide whether the real topology is relevant
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          base=""
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE" ;;
+            push) base="$PUSH_BASE" ;;
+          esac
+          relevant=$(tests/dataplane/integration/t2-required-decision.sh "$EVENT_NAME" "$base" HEAD)
+          echo "relevant=$relevant" >>"$GITHUB_OUTPUT"
+          echo "T2 local-route probe relevant=$relevant"
+      - name: Report success for an unrelated change
+        if: steps.changes.outputs.relevant != 'true'
+        run: echo "No T2 local-route inputs changed; the required check is satisfied without provisioning TiDB."
+      - name: Select repository Go toolchain
+        if: steps.changes.outputs.relevant == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install checksum-pinned TiUP
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          source tests/dataplane/integration/versions.env
+          archive="$RUNNER_TEMP/tiup-v${TIUP_VERSION}-linux-amd64.tar.gz"
+          install_root="$RUNNER_TEMP/tiup-v${TIUP_VERSION}"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "$archive" \
+            "https://github.com/pingcap/tiup/releases/download/v${TIUP_VERSION}/tiup-v${TIUP_VERSION}-linux-amd64.tar.gz"
+          echo "$TIUP_LINUX_AMD64_SHA256  $archive" | sha256sum -c -
+          mkdir -p "$install_root"
+          tar -xzf "$archive" -C "$install_root"
+          "$install_root/bin/tiup" --version
+          echo "$install_root/bin" >>"$GITHUB_PATH"
+          echo "TIUP_HOME=$install_root" >>"$GITHUB_ENV"
+      - name: Verify host prerequisites
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          command -v mysql
+          mysql --version
+          openssl version
+      - name: Build the Rust executable
+        if: steps.changes.outputs.relevant == 'true'
+        run: make rust-build
+      - name: Run local-route and NamespaceMissing regression
+        if: steps.changes.outputs.relevant == 'true'
+        run: make dataplane-t2-integration
+      - name: Upload redacted diagnostics
+        if: always() && steps.changes.outputs.relevant == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dataplane-t2-local-route-${{ github.run_id }}
+          path: tests/dataplane/integration/artifacts/*/diagnostics/**
+          if-no-files-found: error
+          retention-days: 14
