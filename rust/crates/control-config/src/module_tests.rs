@@ -14,9 +14,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{
-    ConfigModule, ConfigModuleOptions, NamespaceUpdate, PROXY_CONFIG_KEY, RawCandidate, join_reader,
+    ConfigModule, ConfigModuleOptions, NAMESPACE_CONFIG_PREFIX, NamespaceUpdate, PROXY_CONFIG_KEY,
+    RawCandidate, join_reader,
 };
 use crate::{ConfigNamespaceSource, NamespaceConfig};
 
@@ -85,12 +87,17 @@ fn proxy_only_candidate_preserves_seeded_namespace_and_explicit_delete_stays_emp
         .namespace_incarnation("default")
         .ok_or("seeded namespace has no incarnation")?;
 
+    let mut proxy_only_entries = BTreeMap::from([(
+        PROXY_CONFIG_KEY.as_bytes().to_vec(),
+        br#"{"max-connections":20}"#.to_vec(),
+    )]);
+    proxy_only_entries.insert(
+        format!("{NAMESPACE_CONFIG_PREFIX}rejected").into_bytes(),
+        b"not-json".to_vec(),
+    );
     module.apply_raw_candidate(RawCandidate {
         revision: 1,
-        entries: BTreeMap::from([(
-            PROXY_CONFIG_KEY.as_bytes().to_vec(),
-            br#"{"max-connections":20}"#.to_vec(),
-        )]),
+        entries: proxy_only_entries,
         namespace_update: NamespaceUpdate::Preserve,
     })?;
     let proxy_only = module.source.current();
@@ -103,8 +110,26 @@ fn proxy_only_candidate_preserves_seeded_namespace_and_explicit_delete_stays_emp
     );
     assert_eq!(proxy_only.effective().serving()?.max_connections, 20);
 
+    assert!(
+        module
+            .apply_raw_candidate(RawCandidate {
+                revision: 2,
+                entries: BTreeMap::from([(
+                    format!("{NAMESPACE_CONFIG_PREFIX}rejected").into_bytes(),
+                    b"not-json".to_vec(),
+                )]),
+                namespace_update: NamespaceUpdate::Replace,
+            })
+            .is_err(),
+        "a namespace operation still decodes and rejects malformed material"
+    );
+    assert!(
+        Arc::ptr_eq(&proxy_only, &module.source.current()),
+        "a rejected namespace replacement publishes nothing"
+    );
+
     module.apply_raw_candidate(RawCandidate {
-        revision: 2,
+        revision: 3,
         entries: BTreeMap::from([(
             PROXY_CONFIG_KEY.as_bytes().to_vec(),
             br#"{"max-connections":20}"#.to_vec(),

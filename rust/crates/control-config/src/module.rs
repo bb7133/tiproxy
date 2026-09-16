@@ -552,18 +552,30 @@ impl ConfigModule {
     }
 
     fn apply_raw_candidate(&mut self, candidate: RawCandidate) -> Result<(), ModuleError> {
-        self.source.observe_etcd_revision(candidate.revision);
-        let decoded = decode_persistent_entries(candidate.entries)
+        let RawCandidate {
+            revision,
+            mut entries,
+            namespace_update,
+        } = candidate;
+        self.source.observe_etcd_revision(revision);
+        if namespace_update == NamespaceUpdate::Preserve {
+            // A watch batch carries the reader's complete accumulated prefix,
+            // including a namespace value that may have been rejected by an
+            // earlier namespace event.  A later proxy/log-only event must not
+            // retry, decode or accidentally adopt that unrelated material.
+            entries.retain(|key, _| !is_namespace_key(key));
+        }
+        let decoded = decode_persistent_entries(entries)
             .map_err(|_| module_error("persistent_candidate_decode_rejected"))?;
-        let applied = match candidate.namespace_update {
+        let applied = match namespace_update {
             NamespaceUpdate::Preserve => self.source.apply_persistent_preserving_namespaces(
                 decoded,
-                candidate.revision,
+                revision,
                 &self.options.current_dir,
             ),
             NamespaceUpdate::Replace => {
                 self.source
-                    .apply_persistent(decoded, candidate.revision, &self.options.current_dir)
+                    .apply_persistent(decoded, revision, &self.options.current_dir)
             }
         };
         applied.map_err(|_| module_error("persistent_candidate_apply_rejected"))?;
