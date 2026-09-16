@@ -143,7 +143,29 @@ stop_owned_process "${FAULT_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
 # graceful drain -> force -> join); its command line carries this run's
 # unique control-socket path, satisfying the ownership check.
 if [[ -n ${RUST_SOCKET:-} ]]; then
-	stop_owned_process "${RUST_PID:-}" "$RUST_SOCKET" || cleanup_status=1
+	stop_owned_process "${RUST_PID:-}" "${RUST_CONTROL_SOCKET:-$RUST_SOCKET}" || cleanup_status=1
+	if [[ -n ${T3_DROP_SOCKET:-} ]]; then
+		t3_drop_stopped=0
+		if stop_owned_process "${T3_DROP_PID:-}" "$run_dir/controldropper"; then
+			t3_drop_stopped=1
+		else
+			cleanup_status=1
+		fi
+		if [[ -e $T3_DROP_SOCKET ]]; then
+			if [[ ! -S $T3_DROP_SOCKET ]]; then
+				echo "refusing to remove $T3_DROP_SOCKET: not a socket" >&2
+				cleanup_status=1
+			elif lsof -- "$T3_DROP_SOCKET" >/dev/null 2>&1; then
+				echo "refusing to remove $T3_DROP_SOCKET: still held open" >&2
+				cleanup_status=1
+			elif ((t3_drop_stopped)); then
+				rm -f "$T3_DROP_SOCKET"
+			else
+				echo "refusing to remove $T3_DROP_SOCKET: owner stop unconfirmed" >&2
+				cleanup_status=1
+			fi
+		fi
+	fi
 	rm -f "$RUST_SOCKET"
 fi
 

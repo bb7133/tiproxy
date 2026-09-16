@@ -21,8 +21,10 @@ use std::time::Duration;
 use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceSource, NamespaceIncarnation};
 use control_plane::{ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture};
 use control_topology::{MetricOverlayHandle, TopologyModuleHandle};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
 
+use crate::scheduler::{RouteCommandDispatcher, RouteCommandReceiver, RouteCommandRegistration};
 use crate::{ResolvedNamespace, RouteError, Router, Selector, UserNamespaceResolver};
 
 const MODULE_NAME: &str = "control_router";
@@ -31,6 +33,14 @@ struct RegisteredRouter {
     namespace: Arc<str>,
     incarnation: NamespaceIncarnation,
     router: Arc<Router>,
+    dispatcher: Arc<RouteCommandDispatcher>,
+    stop_worker: watch::Sender<bool>,
+}
+
+impl Drop for RegisteredRouter {
+    fn drop(&mut self) {
+        self.stop_worker.send_replace(true);
+    }
 }
 
 #[derive(Default)]
@@ -73,6 +83,26 @@ impl RouteAdmission {
     #[must_use]
     pub fn same_router_incarnation(&self, other: &Self) -> bool {
         self.entry.incarnation.same_as(&other.entry.incarnation)
+    }
+
+    /// Registers this exact opaque route session with its incarnation's local
+    /// production command dispatcher.  The returned registration must live
+    /// until session teardown; dropping it unregisters and drains before the
+    /// selector closes its router ledger entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AlreadyActive` if this exact session was registered twice.
+    pub fn register_commands(
+        &self,
+        public_connection_id: u64,
+        capacity: usize,
+    ) -> Result<(RouteCommandRegistration, RouteCommandReceiver), RouteError> {
+        self.entry.dispatcher.register(
+            self.selector.route_session(),
+            public_connection_id,
+            capacity,
+        )
     }
 
     #[cfg(test)]
@@ -209,6 +239,7 @@ pub struct RoutePlane {
     ready: watch::Sender<bool>,
     updates: watch::Sender<u64>,
     registry: Arc<Mutex<RegistryState>>,
+    workers: JoinSet<Result<(), RouteError>>,
 }
 
 impl RoutePlane {
@@ -231,6 +262,7 @@ impl RoutePlane {
                 ready,
                 updates,
                 registry: Arc::clone(&registry),
+                workers: JoinSet::new(),
             },
             RoutePlaneHandle {
                 ready: ready_rx,
@@ -242,8 +274,8 @@ impl RoutePlane {
         )
     }
 
-    fn reconcile(
-        &self,
+    async fn reconcile(
+        &mut self,
         snapshot: &Arc<ConfigNamespaceSnapshot>,
         context: &ModuleContext,
     ) -> Result<(), RouteError> {
@@ -285,12 +317,26 @@ impl RoutePlane {
                 max_sessions,
                 self.metrics.clone(),
             )?);
+            let dispatcher = RouteCommandDispatcher::new(Arc::clone(&router));
+            let (stop_worker, stop) = watch::channel(false);
+            let (started, started_rx) = oneshot::channel();
+            self.workers.spawn(run_route_worker(
+                Arc::clone(&router),
+                Arc::clone(&dispatcher),
+                stop,
+                started,
+            ));
+            started_rx
+                .await
+                .map_err(|_| RouteError::ControlUnavailable)?;
             next.insert(
                 namespace.namespace.clone(),
                 Arc::new(RegisteredRouter {
                     namespace: Arc::from(namespace.namespace.as_str()),
                     incarnation,
                     router,
+                    dispatcher,
+                    stop_worker,
                 }),
             );
         }
@@ -325,13 +371,13 @@ impl RoutePlane {
         });
     }
 
-    async fn run_inner(self: Box<Self>, context: ModuleContext) -> Result<(), ModuleError> {
+    async fn run_inner(mut self: Box<Self>, context: ModuleContext) -> Result<(), ModuleError> {
         let mut config_updates = self.source.subscribe();
         let mut topology_updates = self.topology.backend_source_updates();
         let mut lifecycle = context.lifecycle();
 
         loop {
-            match self.reconcile(&self.source.current(), &context) {
+            match self.reconcile(&self.source.current(), &context).await {
                 Ok(()) => break,
                 Err(RouteError::ControlUnavailable | RouteError::StaleCandidate) => {}
                 Err(error) => {
@@ -355,7 +401,21 @@ impl RoutePlane {
                 changed = lifecycle.changed() => {
                     if changed.is_err() || stopping(lifecycle.borrow().phase) {
                         self.retire_registry();
+                        while self.workers.join_next().await.is_some() {}
                         return Ok(());
+                    }
+                }
+                worker = self.workers.join_next(), if !self.workers.is_empty() => {
+                    match worker {
+                        Some(Ok(Ok(()))) | None => {}
+                        Some(Ok(Err(error))) => {
+                            self.retire_registry();
+                            return Err(worker_module_error(error));
+                        }
+                        Some(Err(error)) => {
+                            self.retire_registry();
+                            return Err(worker_module_error(error));
+                        }
                     }
                 }
             }
@@ -379,12 +439,27 @@ impl RoutePlane {
                 changed = lifecycle.changed() => {
                     if changed.is_err() || stopping(lifecycle.borrow().phase) {
                         self.retire_registry();
+                        while self.workers.join_next().await.is_some() {}
                         return Ok(());
                     }
                     continue;
                 }
+                worker = self.workers.join_next(), if !self.workers.is_empty() => {
+                    match worker {
+                        Some(Ok(Ok(()))) | None => {}
+                        Some(Ok(Err(error))) => {
+                            self.retire_registry();
+                            return Err(worker_module_error(error));
+                        }
+                        Some(Err(error)) => {
+                            self.retire_registry();
+                            return Err(worker_module_error(error));
+                        }
+                    }
+                    continue;
+                }
             }
-            match self.reconcile(&self.source.current(), &context) {
+            match self.reconcile(&self.source.current(), &context).await {
                 Ok(()) | Err(RouteError::ControlUnavailable | RouteError::StaleCandidate) => {}
                 Err(error) => {
                     self.retire_registry();
@@ -392,6 +467,90 @@ impl RoutePlane {
                 }
             }
         }
+    }
+}
+
+async fn run_route_worker(
+    router: Arc<Router>,
+    dispatcher: Arc<RouteCommandDispatcher>,
+    mut stop: watch::Receiver<bool>,
+    started: oneshot::Sender<()>,
+) -> Result<(), RouteError> {
+    let (mut config, mut backend, mut lifecycle) = router.migration_updates();
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + crate::scheduler::TICK,
+        crate::scheduler::TICK,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    if lifecycle.borrow().phase == LifecyclePhase::Ready {
+        refresh_worker_state(&router)?;
+    }
+    let _ = started.send(());
+    loop {
+        if worker_stopped(&stop) || stopping(lifecycle.borrow().phase) {
+            return Ok(());
+        }
+        let tick = tokio::select! {
+            biased;
+            _ = stop.changed() => false,
+            changed = lifecycle.changed() => {
+                if changed.is_err() { return Ok(()); }
+                false
+            },
+            changed = config.changed() => {
+                changed.map_err(|_| RouteError::ControlUnavailable)?;
+                false
+            },
+            changed = backend.changed() => {
+                changed.map_err(|_| RouteError::ControlUnavailable)?;
+                false
+            },
+            _ = ticker.tick() => true,
+        };
+        if worker_stopped(&stop) || stopping(lifecycle.borrow().phase) {
+            return Ok(());
+        }
+        if lifecycle.borrow().phase != LifecyclePhase::Ready {
+            continue;
+        }
+        let candidate = match router.capture_retained() {
+            Ok(candidate) => candidate,
+            Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => continue,
+            Err(error) => return Err(error),
+        };
+        let now = tokio::time::Instant::now().into_std();
+        let result = if tick {
+            router.migration_round(
+                &candidate,
+                dispatcher.as_ref(),
+                true,
+                &stop,
+                &crate::scheduler::RoundClock::default(),
+            )
+        } else {
+            router.refresh_failover(&candidate, now)
+        };
+        match result {
+            Ok(()) | Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => (),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn worker_stopped(stop: &watch::Receiver<bool>) -> bool {
+    stop.has_changed().is_err() || *stop.borrow()
+}
+
+fn refresh_worker_state(router: &Router) -> Result<(), RouteError> {
+    match router.capture_retained() {
+        Ok(candidate) => {
+            match router.refresh_failover(&candidate, tokio::time::Instant::now().into_std()) {
+                Ok(()) | Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -428,5 +587,13 @@ fn module_error(error: RouteError) -> ModuleError {
     ModuleError {
         module: MODULE_NAME,
         error_class,
+    }
+}
+
+fn worker_module_error(error: impl std::fmt::Debug) -> ModuleError {
+    let _ = error;
+    ModuleError {
+        module: MODULE_NAME,
+        error_class: "migration_worker_failed",
     }
 }

@@ -604,6 +604,32 @@ impl ConfigNamespaceStore {
         etcd_revision: i64,
         current_dir: &Path,
     ) -> Result<Option<Arc<ConfigNamespaceSnapshot>>, StoreError> {
+        self.apply_persistent_inner(persistent, etcd_revision, current_dir, false)
+    }
+
+    /// Applies a persistent proxy/log candidate which carries no namespace
+    /// operation, preserving the complete accepted namespace set atomically.
+    ///
+    /// An absent `/config/ns/*` key is not itself a namespace deletion. The
+    /// etcd reader uses this path for ranges and watch batches which contain no
+    /// namespace key, while explicit namespace puts/deletes continue to use
+    /// [`Self::apply_persistent`] and replace the complete set.
+    pub(crate) fn apply_persistent_preserving_namespaces(
+        &self,
+        persistent: PersistentConfigSnapshot,
+        etcd_revision: i64,
+        current_dir: &Path,
+    ) -> Result<Option<Arc<ConfigNamespaceSnapshot>>, StoreError> {
+        self.apply_persistent_inner(persistent, etcd_revision, current_dir, true)
+    }
+
+    fn apply_persistent_inner(
+        &self,
+        mut persistent: PersistentConfigSnapshot,
+        etcd_revision: i64,
+        current_dir: &Path,
+        preserve_namespaces: bool,
+    ) -> Result<Option<Arc<ConfigNamespaceSnapshot>>, StoreError> {
         self.observe_source_revision(SourceRevision {
             file_revision: 0,
             etcd_revision,
@@ -614,6 +640,11 @@ impl ConfigNamespaceStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if etcd_revision < state.current.source_revision.etcd_revision {
             return Ok(None);
+        }
+        if preserve_namespaces {
+            persistent
+                .namespaces
+                .clone_from(&state.persistent.namespaces);
         }
         let effective = compose_effective(&state.file_base, &persistent).validated(current_dir)?;
         effective.check_reload_from(state.current.effective())?;

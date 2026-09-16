@@ -81,7 +81,9 @@ use control_proto::v1::{
     ConnectionIdentity, ControlEnvelope, ErrorCode, ErrorSource as WireErrorSource,
     HandshakeMetadata, HandshakeResponseEvent, Priority, ProxyProtocolMode, RouteRequest,
 };
-use control_router::{RouteError, RoutePlaneHandle};
+use control_router::{
+    MigrationCommand, RouteCommandEnvelope, RouteCommandReceiver, RouteError, RoutePlaneHandle,
+};
 use control_routing::{RouteAssignment, RouteResult};
 use mysql_wire::{
     Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams, StatusFlags,
@@ -395,6 +397,9 @@ enum EngineCmd {
 /// Reports from the engine to the session owner.
 #[derive(Debug)]
 enum EngineReport {
+    /// The bridge-independent command receiver registered before the local
+    /// selector can reserve its first backend.
+    LocalRouteCommands(RouteCommandReceiver),
     /// A redirect attempt finished.
     RedirectFinished {
         /// Whether the migration succeeded.
@@ -837,6 +842,9 @@ async fn run_bound_session_observed(
     // tokens, consumes engine reports, and waits for the loop.
     let mut redirect_token: Option<CommandToken> = None;
     let mut close_token: Option<CommandToken> = None;
+    let mut local_commands: Option<RouteCommandReceiver> = None;
+    let mut local_redirect: Option<RouteCommandEnvelope> = None;
+    let mut local_close: Option<RouteCommandEnvelope> = None;
     let mut directives_open = true;
     let mut forced_by_control = false;
     // One absolute force budget: armed when the force signal is first
@@ -908,14 +916,106 @@ async fn run_bound_session_observed(
                 }
                 let _ = control_tx.send(directive.control).await;
             }
+            local_command = recv_local_command(&mut local_commands), if local_commands.is_some() => {
+                let Some(envelope) = local_command else {
+                    local_commands = None;
+                    continue;
+                };
+                match envelope.command() {
+                    MigrationCommand::Redirect(redirect) => {
+                        if local_close.is_some() {
+                            let _ = envelope.finish_redirect(false);
+                            continue;
+                        }
+                        if let Some(pending) = local_redirect.as_ref() {
+                            if pending.same_operation(&envelope) {
+                                envelope.ignore_duplicate();
+                            } else {
+                                let _ = envelope.finish_redirect(false);
+                            }
+                            continue;
+                        }
+                        let Some(budget) = envelope.redirect_budget() else {
+                            let _ = envelope.finish_redirect(false);
+                            continue;
+                        };
+                        if budget.is_zero() {
+                            let _ = envelope.finish_redirect(false);
+                            continue;
+                        }
+                        let assignment = redirect.to();
+                        let deadline = u64::try_from(
+                            SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .saturating_add(budget)
+                            .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX);
+                        let target = RedirectTarget {
+                            backend_id: assignment.backend_id.clone(),
+                            backend_address: assignment.backend_address.clone(),
+                            cluster_name: assignment.cluster_name.clone(),
+                            keyspace: assignment.keyspace.clone(),
+                            backend_healthy: assignment.healthy,
+                            backend_local: assignment.local,
+                            deadline_unix_millis: deadline,
+                        };
+                        local_redirect = Some(envelope);
+                        if (cmd_tx.send(EngineCmd::PrepareRedirect(target)).await.is_err()
+                            || control_tx.send(SessionControl::Redirect).await.is_err())
+                            && let Some(envelope) = local_redirect.take()
+                        {
+                            let _ = envelope.finish_redirect(false);
+                        }
+                    }
+                    MigrationCommand::ForceClose(_) => {
+                        if let Some(pending) = local_close.as_ref() {
+                            if pending.same_operation(&envelope) {
+                                envelope.ignore_duplicate();
+                            } else {
+                                // A second exact close cannot be minted by one
+                                // ledger. Its guard remains the conservative
+                                // terminal backstop for fault injection.
+                                drop(envelope);
+                            }
+                            continue;
+                        }
+                        if let Some(redirect) = local_redirect.take() {
+                            let _ = redirect.finish_redirect(false);
+                        }
+                        local_close = Some(envelope);
+                        forced_by_control = true;
+                        force_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + loop_config.cleanup_deadline
+                        });
+                        let _ = control_tx.send(SessionControl::CloseImmediate).await;
+                    }
+                }
+            }
             report = report_rx.recv() => {
                 if let Some(report) = report {
-                    consume_report(report, &commander, &mut redirect_token).await;
+                    consume_report(
+                        report,
+                        &commander,
+                        &mut redirect_token,
+                        &mut local_commands,
+                        &mut local_redirect,
+                    ).await;
                 }
             }
         }
     };
 
+    // The session loop has observed the physical close. Settle its exact local
+    // close token while the engine still owns the route lease; selector-drop
+    // remains only an abort/backstop path.
+    if let Some(envelope) = local_redirect.take() {
+        let _ = envelope.finish_redirect(false);
+    }
+    if let Some(envelope) = local_close.take() {
+        let _ = envelope.observe_close();
+    }
     // The loop returned: its handler (holding one cmd sender clone) is
     // gone; drop ours so the engine drains and exits, then join it.
     drop(cmd_tx);
@@ -936,7 +1036,14 @@ async fn run_bound_session_observed(
             None
         };
     while let Ok(report) = report_rx.try_recv() {
-        consume_report(report, &commander, &mut redirect_token).await;
+        consume_report(
+            report,
+            &commander,
+            &mut redirect_token,
+            &mut local_commands,
+            &mut local_redirect,
+        )
+        .await;
     }
 
     let totals = engine_exit.as_ref().map_or_else(
@@ -1054,8 +1161,18 @@ async fn consume_report(
     report: EngineReport,
     commander: &SessionCommander,
     redirect_token: &mut Option<CommandToken>,
+    local_commands: &mut Option<RouteCommandReceiver>,
+    local_redirect: &mut Option<RouteCommandEnvelope>,
 ) {
     match report {
+        EngineReport::LocalRouteCommands(receiver) => {
+            // There is exactly one local route lease per session. Replacing a
+            // live receiver would close and drain the previous FIFO, so fail
+            // closed by retaining the first registration.
+            if local_commands.is_none() {
+                *local_commands = Some(receiver);
+            }
+        }
         EngineReport::RedirectFinished {
             succeeded,
             backend_id,
@@ -1066,7 +1183,19 @@ async fn consume_report(
                     .redirect_finished(token.id.to_string(), succeeded, backend_id, code)
                     .await;
             }
+            if let Some(envelope) = local_redirect.take() {
+                let _ = envelope.finish_redirect(succeeded);
+            }
         }
+    }
+}
+
+async fn recv_local_command(
+    receiver: &mut Option<RouteCommandReceiver>,
+) -> Option<RouteCommandEnvelope> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1723,13 +1852,32 @@ impl Engine {
                 .and_then(InboundProxyV2Header::source)
                 .unwrap_or(self.endpoints.client_addr)
                 .to_string();
-            let channel = LocalRouteChannel::new(
+            let (channel, commands) = match LocalRouteChannel::new(
                 admission,
                 self.connection_id,
                 logical_client,
                 self.endpoints.client_addr.to_string(),
                 self.endpoints.listener_addr.port().to_string(),
-            );
+            ) {
+                Ok(channel) => channel,
+                Err(error) => {
+                    if let Some((code, state, message)) = local_admission_client_error(error) {
+                        let seq = self.client_io.expected_read_sequence();
+                        self.client_io.reset_write_sequence(seq);
+                        let _ = self.write_client_error(code, state, message).await;
+                    }
+                    let _ = self.events.send(SessionEvent::ClientIoError).await;
+                    return Some(WireErrorSource::Proxy);
+                }
+            };
+            if self
+                .reports
+                .send(EngineReport::LocalRouteCommands(commands))
+                .await
+                .is_err()
+            {
+                return Some(WireErrorSource::Proxy);
+            }
             (resolved_namespace, SessionRouteChannel::Local(channel))
         } else {
             // Compatibility-only bridge path retained until the later dead-path

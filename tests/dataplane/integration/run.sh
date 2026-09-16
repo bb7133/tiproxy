@@ -125,6 +125,21 @@ if [[ $mode == rust && $variant == plain ]]; then
 	go build -o "$run_dir/controldropper" "$script_dir/controldropper"
 fi
 "$script_dir/render-configs.sh" "$run_dir" "$variant" "$port_offset" >"$run_dir/render.log"
+# The focused T3 oracle needs all three live backends in one route group: A0
+# and A1 share ks-old while B carries ks-new. This lets the final phase fail
+# both same-keyspace backends without tripping the all-failed safeguard; the
+# sole healthy candidate is then a real cross-keyspace refusal, so timeout-zero
+# must issue ForceClose instead of Redirect. Other integration modes retain the
+# listener-port topology used by their cluster-isolation matrix.
+if [[ $mode == rust && $variant == plain && ${DATAPLANE_T3_FOCUSED:-0} == 1 ]]; then
+	if [[ $(grep -Fxc 'routing-rule = "port"' "$run_dir/tiproxy.toml") != 1 ]]; then
+		echo "T3 focused config expected exactly one listener-port routing rule" >&2
+		exit 1
+	fi
+	sed 's/^routing-rule = "port"$/routing-rule = ""/' \
+		"$run_dir/tiproxy.toml" >"$run_dir/tiproxy-t3.toml"
+	mv "$run_dir/tiproxy-t3.toml" "$run_dir/tiproxy.toml"
+fi
 # shellcheck disable=SC1090
 source "$run_dir/variant.env"
 
@@ -134,6 +149,12 @@ PORTS="$PORTS $PD_PORT_B $((2380 + PORT_OFFSET_B)) $((20160 + PORT_OFFSET_B)) $(
 tag_b="$tag-b"
 RUST_HEALTH_PORT=$((8090 + port_offset))
 RUST_SOCKET="${TMPDIR:-/tmp}/$tag.sock"
+RUST_CONTROL_SOCKET=$RUST_SOCKET
+T3_DROP_PID=
+T3_DROP_SOCKET="${TMPDIR:-/tmp}/$tag-t3-drop.sock"
+T3_DROP_ADMIN_PORT=$((8091 + port_offset))
+MIG_SESSION_PID=
+MIG_FIFO=
 if [[ $mode == rust ]]; then
 	# The Go process cedes the SQL listeners entirely: with the gate
 	# enabled it serves only the control plane and API, and the Rust
@@ -149,6 +170,9 @@ if [[ $mode == rust ]]; then
 		printf 'tls-allowed-roots = ["%s"]\n' "$run_dir/certs" >>"$run_dir/tiproxy.toml"
 	fi
 	PORTS="$PORTS $RUST_HEALTH_PORT"
+	if [[ $variant == plain && ${DATAPLANE_T3_FOCUSED:-0} == 1 ]]; then
+		PORTS="$PORTS $T3_DROP_ADMIN_PORT"
+	fi
 fi
 FAULT_PROXY_BIN="$run_dir/faultproxy"
 TIUP_PID=
@@ -163,6 +187,11 @@ write_state() {
 		printf 'FAULT_PID=%q\n' "$FAULT_PID"
 		printf 'RUST_PID=%q\n' "$RUST_PID"
 		printf 'RUST_SOCKET=%q\n' "$RUST_SOCKET"
+		printf 'RUST_CONTROL_SOCKET=%q\n' "$RUST_CONTROL_SOCKET"
+		printf 'T3_DROP_PID=%q\n' "$T3_DROP_PID"
+		printf 'T3_DROP_SOCKET=%q\n' "$T3_DROP_SOCKET"
+		printf 'MIG_SESSION_PID=%q\n' "$MIG_SESSION_PID"
+		printf 'MIG_FIFO=%q\n' "$MIG_FIFO"
 		printf 'FAULT_PROXY_BIN=%q\n' "$FAULT_PROXY_BIN"
 		printf 'PORTS=%q\n' "$PORTS"
 	} >"$run_dir/state.env"
@@ -239,6 +268,37 @@ if [[ $mode == rust ]]; then
 	if [[ ! -S $control_socket ]]; then
 		echo "Rust control socket did not appear: $control_socket" >&2
 		exit 1
+	fi
+	if [[ $variant == plain && ${DATAPLANE_T3_FOCUSED:-0} == 1 ]]; then
+		# T3 interposes a byte-transparent bridge process from startup. The
+		# focused probe later removes only this owned process, creating a real
+		# bridge disconnect while Go's API and both TiDB clusters stay alive.
+		"$run_dir/controldropper" \
+			--front-socket "$T3_DROP_SOCKET" \
+			--target-socket "$RUST_SOCKET" \
+			--admin "127.0.0.1:$T3_DROP_ADMIN_PORT" \
+			>"$run_dir/t3-controldropper.log" 2>&1 &
+		T3_DROP_PID=$!
+		RUST_CONTROL_SOCKET=$T3_DROP_SOCKET
+		write_state
+		t3_drop_ready=false
+		for _ in {1..100}; do
+			if [[ -S $T3_DROP_SOCKET ]] &&
+				curl --noproxy '*' --fail --silent --max-time 5 \
+					"http://127.0.0.1:$T3_DROP_ADMIN_PORT/state" -o /dev/null; then
+				t3_drop_ready=true
+				break
+			fi
+			if ! kill -0 "$T3_DROP_PID" 2>/dev/null; then
+				break
+			fi
+			sleep 0.1
+		done
+		if [[ $t3_drop_ready != true ]]; then
+			echo "T3 focused control dropper did not become ready" >&2
+			exit 1
+		fi
+		control_socket=$RUST_CONTROL_SOCKET
 	fi
 	rust_tls_args=()
 	if [[ $TLS_ENABLED == true ]]; then
@@ -462,6 +522,330 @@ run_t2_namespace_missing_probe() {
 
 if [[ $mode == rust && $variant == plain && ${DATAPLANE_T2_FOCUSED:-0} == 1 ]]; then
 	run_t2_namespace_missing_probe
+	exit 0
+fi
+
+# T3 gate: exercise the production dispatcher and the existing atomic session
+# migration engine without any Go route command.  The old session is held in a
+# transaction until the Rust owner has absorbed the A0 -> A1 fail-list swap;
+# the transparent control intermediary is then stopped, creating a real bridge
+# disconnect before COMMIT releases the safe boundary.  The same disconnected
+# Rust process must migrate with database/user-variable state intact, directly
+# force-close through the local FIFO, and admit a fresh session after recovery.
+run_t3_local_migration_probe() {
+	local etcdctl_bin
+	etcdctl_bin=$(command -v etcdctl || true)
+	if [[ -z $etcdctl_bin ]]; then
+		etcdctl_bin=$(find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl" \
+			-type f -name etcdctl -perm -111 2>/dev/null | sort | tail -1)
+	fi
+	if [[ -z $etcdctl_bin || ! -x $etcdctl_bin ]]; then
+		echo "T3 focused migration needs etcdctl" >&2
+		exit 1
+	fi
+	if ! command -v jq >/dev/null 2>&1; then
+		echo "T3 focused migration needs jq" >&2
+		exit 1
+	fi
+	t3_set_route_policy() {
+		local failed=$1 timeout=$2 phase=$3 current value
+		current=$(ETCDCTL_API=3 "$etcdctl_bin" \
+			--endpoints "http://127.0.0.1:$PD_PORT" \
+			get /config/proxy --print-value-only)
+		# The first mutation owns seeding: the config owner intentionally does
+		# not materialize /config/proxy until a writer commits one.  Construct
+		# the complete dynamic subset from this topology instead of writing a
+		# partial JSON object whose serde defaults would zero max-connections or
+		# erase the two clusters.
+		if [[ -z $current ]]; then
+			current=$(jq -cn \
+				--arg pd_a "127.0.0.1:$PD_PORT" \
+				--arg pd_b "127.0.0.1:$PD_PORT_B" \
+				'{
+					"max-connections": 100,
+					"high-memory-usage-reject-threshold": 0.9,
+					"conn-buffer-size": 32768,
+					"frontend-keepalive": {"enabled":true,"idle":0,"cnt":0,"intvl":0,"timeout":0},
+					"backend-healthy-keepalive": {"enabled":true,"idle":60000000000,"cnt":5,"intvl":3000000000,"timeout":15000000000},
+					"backend-unhealthy-keepalive": {"enabled":true,"idle":10000000000,"cnt":5,"intvl":1000000000,"timeout":5000000000},
+					"proxy-protocol": "",
+					"graceful-wait-before-shutdown": 0,
+					"graceful-close-conn-timeout": 5,
+					"public-endpoints": [],
+					"backend-clusters": [
+						{"name":"cluster-a","pd-addrs":$pd_a,"ns-servers":[]},
+						{"name":"cluster-b","pd-addrs":$pd_b,"ns-servers":[]}
+					],
+					"fail-backend-list": [],
+					"failover-timeout": 60
+				}')
+		fi
+		value=$(jq -c --argjson failed "$failed" --argjson timeout "$timeout" \
+			'.["fail-backend-list"] = $failed | .["failover-timeout"] = $timeout' \
+			<<<"$current")
+		printf '%s\n' "$value" >"$run_dir/t3-online-$phase.json"
+		ETCDCTL_API=3 "$etcdctl_bin" --endpoints "http://127.0.0.1:$PD_PORT" put \
+			/config/proxy "$value" >"$run_dir/t3-etcd-$phase.log"
+	}
+	t3_backend_query() {
+		local port=$1 query=$2
+		mysql --batch --skip-column-names --connect-timeout=2 \
+			-h 127.0.0.1 -P "$port" -u root --ssl-mode=DISABLED -e "$query"
+	}
+	t3_set_route_policy \
+		"[\"127.0.0.1:$TIDB_PORT_1\",\"127.0.0.1:$TIDB_PORT_B\"]" 300 pin
+	local pin_ready=false pin_port= pin_streak=0
+	for _ in {1..80}; do
+		pin_port=$(mysql_ingress 'SELECT @@port' 2>>"$run_dir/t3-pin.err" || true)
+		if [[ $pin_port == "$TIDB_PORT_0" ]]; then
+			pin_streak=$((pin_streak + 1))
+			if ((pin_streak >= 5)); then
+				pin_ready=true
+				break
+			fi
+		else
+			pin_streak=0
+		fi
+		sleep 0.25
+	done
+	if [[ $pin_ready != true ]]; then
+		echo "T3 focused A0 pin did not absorb (landed '$pin_port')" >&2
+		tail -8 "$run_dir/t3-pin.err" >&2 || true
+		exit 1
+	fi
+	mysql --batch --skip-column-names --connect-timeout=2 \
+		-h 127.0.0.1 -P "$TIDB_PORT_0" -u root --ssl-mode=DISABLED \
+		-e 'CREATE DATABASE IF NOT EXISTS t3_local_migration;'
+
+	MIG_FIFO="$run_dir/t3-migration-session.fifo"
+	mkfifo "$MIG_FIFO"
+	local rust_offset
+	rust_offset=$(wc -l <"$run_dir/tiproxy-rs.log" | tr -d ' ')
+	mysql --batch --skip-column-names --skip-reconnect --unbuffered \
+		-h 127.0.0.1 -P "$FAULT_PORT" -u root \
+		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} \
+		<"$MIG_FIFO" >"$run_dir/t3-migration-session.out" 2>&1 &
+	MIG_SESSION_PID=$!
+	write_state
+	exec 8>"$MIG_FIFO"
+	t3_migration_query() {
+		local marker=$1 sql=$2 line=
+		printf '%s\n' "$sql" >&8
+		for _ in {1..60}; do
+			line=$(grep -s "^$marker|" "$run_dir/t3-migration-session.out" | tail -1 || true)
+			if [[ -n $line ]]; then
+				printf '%s\n' "$line"
+				return 0
+			fi
+			if ! kill -0 "$MIG_SESSION_PID" 2>/dev/null; then
+				echo "T3 focused migration session exited before $marker" >&2
+				tail -8 "$run_dir/t3-migration-session.out" >&2 || true
+				return 1
+			fi
+			sleep 0.25
+		done
+		echo "T3 focused migration session never answered $marker" >&2
+		return 1
+	}
+	local baseline
+	baseline=$(t3_migration_query T3BASE \
+		"USE t3_local_migration; SET @t3_marker = 'state-live'; BEGIN; SELECT CONCAT('T3BASE|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(), 'NULL'), '|', COALESCE(@t3_marker, 'NULL'));" ) || exit 1
+	if [[ $(cut -d'|' -f3 <<<"$baseline") != "$TIDB_PORT_0" ||
+		$(cut -d'|' -f4 <<<"$baseline") != t3_local_migration ||
+		$(cut -d'|' -f5 <<<"$baseline") != state-live ]]; then
+		echo "T3 focused invalid baseline: $baseline" >&2
+		exit 1
+	fi
+	local proxy_connection_id=
+	for _ in {1..30}; do
+		proxy_connection_id=$(tail -n "+$((rust_offset + 1))" "$run_dir/tiproxy-rs.log" |
+			grep '"event":"connection_ready"' | head -1 |
+			sed -n 's/.*"connection_id":\([0-9]*\).*/\1/p')
+		[[ -n $proxy_connection_id ]] && break
+		sleep 0.25
+	done
+	if [[ -z $proxy_connection_id ]]; then
+		echo "T3 focused could not identify the persistent Rust session" >&2
+		exit 1
+	fi
+
+	t3_set_route_policy \
+		"[\"127.0.0.1:$TIDB_PORT_0\",\"127.0.0.1:$TIDB_PORT_B\"]" 300 swap
+	local swap_ready=false swap_port= swap_streak=0
+	for _ in {1..80}; do
+		swap_port=$(mysql_ingress 'SELECT @@port' 2>>"$run_dir/t3-swap.err" || true)
+		if [[ $swap_port == "$TIDB_PORT_1" ]]; then
+			swap_streak=$((swap_streak + 1))
+			if ((swap_streak >= 5)); then
+				swap_ready=true
+				break
+			fi
+		else
+			swap_streak=0
+		fi
+		sleep 0.25
+	done
+	if [[ $swap_ready != true ]]; then
+		echo "T3 focused A1 swap did not absorb (landed '$swap_port')" >&2
+		tail -8 "$run_dir/t3-swap.err" >&2 || true
+		exit 1
+	fi
+
+	curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+		"http://127.0.0.1:$T3_DROP_ADMIN_PORT/state" \
+		-o "$run_dir/t3-bridge-before-disconnect.json"
+	local bridge_state bridge_connects bridge_forwarded
+	bridge_state=$(<"$run_dir/t3-bridge-before-disconnect.json")
+	bridge_connects=$(sed -n 's/.*"connect_count":\([0-9][0-9]*\).*/\1/p' <<<"$bridge_state")
+	bridge_forwarded=$(sed -n 's/.*"forwarded":\([0-9][0-9]*\).*/\1/p' <<<"$bridge_state")
+	if [[ $bridge_state != *"\"target\":\"$RUST_SOCKET\""* ||
+		! $bridge_connects =~ ^[1-9][0-9]*$ || ! $bridge_forwarded =~ ^[1-9][0-9]*$ ]]; then
+		echo "T3 bridge intermediary was not transparently active: $bridge_state" >&2
+		exit 1
+	fi
+	kill -s INT "$T3_DROP_PID"
+	for _ in {1..100}; do
+		kill -0 "$T3_DROP_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	if kill -0 "$T3_DROP_PID" 2>/dev/null; then
+		echo "T3 focused control intermediary did not stop" >&2
+		exit 1
+	fi
+	wait "$T3_DROP_PID" 2>/dev/null || true
+	T3_DROP_PID=
+	write_state
+	if ! kill -0 "$RUST_PID" 2>/dev/null ||
+		! curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$RUST_HEALTH_PORT/health" -o /dev/null; then
+		echo "T3 focused Rust owner stopped when the route bridge disconnected" >&2
+		exit 1
+	fi
+
+	local migrated= row= row_port= row_db= row_marker=
+	# COMMIT opens the safe boundary only after the bridge has disappeared.
+	row=$(t3_migration_query T3COMMIT \
+		"COMMIT; SELECT CONCAT('T3COMMIT|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(), 'NULL'), '|', COALESCE(@t3_marker, 'NULL'));" ) || exit 1
+	for attempt in {1..60}; do
+		local marker="T3TRY$attempt"
+		row=$(t3_migration_query "$marker" \
+			"SELECT CONCAT('$marker|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(), 'NULL'), '|', COALESCE(@t3_marker, 'NULL'));" ) || exit 1
+		row_port=$(cut -d'|' -f3 <<<"$row")
+		row_db=$(cut -d'|' -f4 <<<"$row")
+		row_marker=$(cut -d'|' -f5 <<<"$row")
+		if [[ $row_port == "$TIDB_PORT_1" ]]; then
+			migrated=true
+			break
+		fi
+		sleep 0.25
+	done
+	if [[ $migrated != true || $row_db != t3_local_migration || $row_marker != state-live ]]; then
+		echo "T3 focused local redirect failed or lost session state: ${row:-<none>}" >&2
+		exit 1
+	fi
+	# A0/A1 remain directly queryable throughout this phase. B is the sole
+	# non-failed member of the all-rule group, but its ks-new identity cannot
+	# accept the retained ks-old session. The timeout-zero worker therefore has
+	# no legal redirect and must deliver ForceClose through the local FIFO.
+	local backend_connection_id backend_port
+	backend_connection_id=$(cut -d'|' -f2 <<<"$row")
+	for backend_port in "$TIDB_PORT_0" "$TIDB_PORT_1" "$TIDB_PORT_B"; do
+		if [[ $(t3_backend_query "$backend_port" 'SELECT 1') != 1 ]]; then
+			echo "T3 focused backend $backend_port was not live before ForceClose" >&2
+			exit 1
+		fi
+	done
+	# Keep the mysql client blocked on a real backend response so the locally
+	# forced socket close is observed immediately; --skip-reconnect prevents a
+	# successful new session from hiding the terminal.
+	printf '%s\n' "SELECT CONCAT('T3FORCECLOSEPROBE|', SLEEP(30));" >&8
+	local force_probe_running=false
+	for _ in {1..40}; do
+		if [[ $(t3_backend_query "$TIDB_PORT_1" \
+			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.PROCESSLIST WHERE ID = $backend_connection_id AND INFO LIKE '%T3FORCECLOSEPROBE%'") == 1 ]]; then
+			force_probe_running=true
+			break
+		fi
+		sleep 0.1
+	done
+	if [[ $force_probe_running != true ]]; then
+		echo "T3 focused ForceClose probe never became active on A1 connection $backend_connection_id" >&2
+		exit 1
+	fi
+	t3_set_route_policy \
+		"[\"127.0.0.1:$TIDB_PORT_0\",\"127.0.0.1:$TIDB_PORT_1\"]" 0 close
+	local force_closed=false
+	for _ in {1..160}; do
+		if ! kill -0 "$MIG_SESSION_PID" 2>/dev/null; then
+			force_closed=true
+			break
+		fi
+		sleep 0.25
+	done
+	if [[ $force_closed != true ]]; then
+		echo "T3 focused local ForceClose did not terminate the session" >&2
+		exit 1
+	fi
+	exec 8>&-
+	wait "$MIG_SESSION_PID" 2>/dev/null || true
+	rm -f "$MIG_FIFO"
+	MIG_SESSION_PID=
+	MIG_FIFO=
+	write_state
+	if grep -Fq 'T3FORCECLOSEPROBE|0' "$run_dir/t3-migration-session.out"; then
+		echo "T3 focused probe completed instead of being force-closed" >&2
+		exit 1
+	fi
+	local force_close_record=
+	for _ in {1..40}; do
+		force_close_record=$(grep "\"event\":\"connection_closed\".*\"connection_id\":$proxy_connection_id.*\"quit_source\":\"proxy shutdown\"" \
+			"$run_dir/tiproxy-rs.log" | tail -1 || true)
+		[[ -n $force_close_record ]] && break
+		sleep 0.1
+	done
+	if [[ -z $force_close_record ]]; then
+		echo "T3 focused ForceClose lacked the exact local connection terminal" >&2
+		exit 1
+	fi
+	for backend_port in "$TIDB_PORT_0" "$TIDB_PORT_1" "$TIDB_PORT_B"; do
+		if [[ $(t3_backend_query "$backend_port" 'SELECT 1') != 1 ]]; then
+			echo "T3 focused backend $backend_port was not live after ForceClose" >&2
+			exit 1
+		fi
+	done
+	if ! kill -0 "$RUST_PID" 2>/dev/null ||
+		! curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$RUST_HEALTH_PORT/health" -o /dev/null; then
+		echo "T3 focused Rust owner stopped while delivering ForceClose" >&2
+		exit 1
+	fi
+
+	t3_set_route_policy \
+		"[\"127.0.0.1:$TIDB_PORT_0\",\"127.0.0.1:$TIDB_PORT_B\"]" 300 recover
+	local recovered=false recovered_port= recovered_streak=0
+	for _ in {1..160}; do
+		recovered_port=$(mysql_ingress 'SELECT @@port' 2>>"$run_dir/t3-recover.err" || true)
+		if [[ $recovered_port == "$TIDB_PORT_1" ]]; then
+			recovered_streak=$((recovered_streak + 1))
+			if ((recovered_streak >= 5)); then
+				recovered=true
+				break
+			fi
+		else
+			recovered_streak=0
+		fi
+		sleep 0.25
+	done
+	if [[ $recovered != true ]]; then
+		echo "T3 focused disconnected Rust owner did not admit after recovery" >&2
+		tail -8 "$run_dir/t3-recover.err" >&2 || true
+		exit 1
+	fi
+	echo "PASS: T3 local redirect A0->$TIDB_PORT_1, direct ForceClose, and fresh admission survived bridge disconnect (connection $proxy_connection_id)"
+}
+
+if [[ $mode == rust && $variant == plain && ${DATAPLANE_T3_FOCUSED:-0} == 1 ]]; then
+	run_t3_local_migration_probe
 	exit 0
 fi
 

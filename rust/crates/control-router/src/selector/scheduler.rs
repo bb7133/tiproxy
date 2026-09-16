@@ -14,7 +14,9 @@
 
 //! The complete per-round selection/scan/admission boundary uses one router lock.
 use super::{Arc, Candidate, GroupFactors, RouteError, Router, State, read_queries};
-use crate::scheduler::{CommandQueue, MigrationProgress};
+#[cfg(test)]
+use crate::scheduler::CommandQueue;
+use crate::scheduler::{MigrationCommandSink, MigrationProgress, RejectedCommand};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -114,79 +116,99 @@ impl Router {
     pub(crate) fn migration_round(
         &self,
         candidate: &Candidate,
-        sender: &CommandQueue,
+        sender: &dyn MigrationCommandSink,
         redirects_enabled: bool,
         stop: &watch::Receiver<bool>,
         clock: &crate::scheduler::RoundClock,
     ) -> Result<(), RouteError> {
-        let mut state = self.lock();
-        self.sources.validate(candidate)?;
-        state.refresh(candidate)?;
-        self.sources.validate(candidate)?;
-        if stopped(stop) {
-            return Ok(());
-        }
-        let groups: Vec<_> = state.groups.keys().copied().collect();
-        if redirects_enabled && state.supports_redirection {
-            for group in &groups {
+        let mut rejected = Vec::new();
+        let result = {
+            let mut state = self.lock();
+            (|| {
+                self.sources.validate(candidate)?;
+                state.refresh(candidate)?;
+                self.sources.validate(candidate)?;
                 if stopped(stop) {
                     return Ok(());
                 }
-                let now = clock.balance_now();
-                self.with_balance_group(
-                    &mut state,
-                    candidate,
-                    *group,
-                    clock.wall()?,
-                    |state, prepared, pair| {
-                        let plan = match prepared {
-                            Ok(Some(plan)) => plan,
-                            Ok(None) => return Ok(()),
-                            Err(RouteError::CrossKeyspace) => {
-                                if let Some(pair) = pair {
-                                    let source = Arc::clone(&state.backends[&pair.from].account);
-                                    state.record_keyspace_refusal(
-                                        &source,
-                                        &pair.to,
-                                        Some(pair.reason),
-                                        now,
-                                    );
-                                }
-                                return Ok(());
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let budget = state.schedules.entry(*group).or_default().budget(
-                            plan.pair.rate,
-                            now,
-                            plan.redirects.len(),
-                        );
-                        let mut accepted = 0;
-                        for redirect in &plan.redirects {
-                            if stopped(stop) || accepted >= budget {
-                                break;
-                            }
-                            match self.offer_redirect_locked(state, redirect, sender, now) {
-                                Ok(true) => {
-                                    accepted += 1;
-                                    state.schedules.entry(*group).or_default().accepted(now);
-                                }
-                                Ok(false)
-                                | Err(
-                                    RouteError::RedirectPending
-                                    | RouteError::CoolingDown
-                                    | RouteError::ForceClosing
-                                    | RouteError::NotActive,
-                                ) => (),
-                                Err(error) => return Err(error),
-                            }
+                let groups: Vec<_> = state.groups.keys().copied().collect();
+                if redirects_enabled && state.supports_redirection {
+                    for group in &groups {
+                        if stopped(stop) {
+                            return Ok(());
                         }
-                        Ok(())
-                    },
-                )?;
-            }
-        }
-        self.close_timed_out(&mut state, candidate, sender, stop, clock)
+                        let now = clock.balance_now();
+                        self.with_balance_group(
+                            &mut state,
+                            candidate,
+                            *group,
+                            clock.wall()?,
+                            |state, prepared, pair| {
+                                let plan = match prepared {
+                                    Ok(Some(plan)) => plan,
+                                    Ok(None) => return Ok(()),
+                                    Err(RouteError::CrossKeyspace) => {
+                                        if let Some(pair) = pair {
+                                            let source =
+                                                Arc::clone(&state.backends[&pair.from].account);
+                                            state.record_keyspace_refusal(
+                                                &source,
+                                                &pair.to,
+                                                Some(pair.reason),
+                                                now,
+                                            );
+                                        }
+                                        return Ok(());
+                                    }
+                                    Err(error) => return Err(error),
+                                };
+                                let budget = state.schedules.entry(*group).or_default().budget(
+                                    plan.pair.rate,
+                                    now,
+                                    plan.redirects.len(),
+                                );
+                                let mut accepted = 0;
+                                for redirect in &plan.redirects {
+                                    if stopped(stop) || accepted >= budget {
+                                        break;
+                                    }
+                                    match self.offer_redirect_locked(
+                                        state,
+                                        redirect,
+                                        sender,
+                                        now,
+                                        &mut rejected,
+                                    ) {
+                                        Ok(true) => {
+                                            accepted += 1;
+                                            state
+                                                .schedules
+                                                .entry(*group)
+                                                .or_default()
+                                                .accepted(now);
+                                        }
+                                        Ok(false)
+                                        | Err(
+                                            RouteError::RedirectPending
+                                            | RouteError::CoolingDown
+                                            | RouteError::ForceClosing
+                                            | RouteError::NotActive,
+                                        ) => (),
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                }
+                self.close_timed_out(&mut state, candidate, sender, stop, clock, &mut rejected)
+            })()
+        };
+        // Rejected envelopes were disarmed while the router still serialized
+        // cooldown state, but their values leave the router lock before drop.
+        drop(rejected);
+        result
     }
 
     // The caller retains the same router lock across every balance and close pass.
@@ -194,9 +216,10 @@ impl Router {
         &self,
         state: &mut State,
         candidate: &Candidate,
-        sender: &CommandQueue,
+        sender: &dyn MigrationCommandSink,
         stop: &watch::Receiver<bool>,
         clock: &crate::scheduler::RoundClock,
+        rejected: &mut Vec<RejectedCommand>,
     ) -> Result<(), RouteError> {
         // Go runs timeout closure even when migration capability is disabled.
         for group in state.groups.keys().copied().collect::<Vec<_>>() {
@@ -218,16 +241,26 @@ impl Router {
                     if stopped(stop) {
                         return Ok(());
                     }
-                    let close = match state.ledger.prepare_close(&session) {
+                    let close = match state.ledger.prepare_close(&session, now) {
                         Ok(close) => close,
-                        Err(crate::ledger::LedgerError::ForceClosing) => continue,
+                        Err(
+                            crate::ledger::LedgerError::ForceClosing
+                            | crate::ledger::LedgerError::CoolingDown,
+                        ) => continue,
                         Err(error) => return Err(error.into()),
                     };
                     self.sources.validate(candidate)?;
-                    if sender.try_send(close.clone()).is_ok() {
-                        state.ledger.admit_close(close);
-                        let progress = &mut state.schedules.entry(group).or_default().progress;
-                        progress.closes = progress.closes.saturating_add(1);
+                    match sender.try_send(close.clone().into()) {
+                        Ok(()) => {
+                            state.ledger.admit_close(close);
+                            let progress = &mut state.schedules.entry(group).or_default().progress;
+                            progress.closes = progress.closes.saturating_add(1);
+                        }
+                        Err(mut returned) => {
+                            returned.disarm();
+                            rejected.push(returned);
+                            state.ledger.reject_close(&session, now)?;
+                        }
                     }
                 }
             }
@@ -406,21 +439,26 @@ impl Router {
         sender: &CommandQueue,
         now: Instant,
     ) -> Result<bool, RouteError> {
-        let mut state = self.lock();
-        self.sources.validate(candidate)?;
-        let source = Arc::clone(state.ledger.active_owner(session)?);
-        let target = state
-            .backends
-            .values()
-            .find(|b| b.source.backend_id.ends_with("4001"))
-            .ok_or(RouteError::NoBackend)?;
-        let prepared = crate::PreparedRedirect {
-            session: session.clone(),
-            candidate: candidate.clone(),
-            source,
-            target: Arc::clone(&target.account),
-            target_id: Arc::clone(&target.source.backend_id),
+        let mut rejected = Vec::new();
+        let result = {
+            let mut state = self.lock();
+            self.sources.validate(candidate)?;
+            let source = Arc::clone(state.ledger.active_owner(session)?);
+            let target = state
+                .backends
+                .values()
+                .find(|b| b.source.backend_id.ends_with("4001"))
+                .ok_or(RouteError::NoBackend)?;
+            let prepared = crate::PreparedRedirect {
+                session: session.clone(),
+                candidate: candidate.clone(),
+                source,
+                target: Arc::clone(&target.account),
+                target_id: Arc::clone(&target.source.backend_id),
+            };
+            self.offer_redirect_locked(&mut state, &prepared, sender, now, &mut rejected)
         };
-        self.offer_redirect_locked(&mut state, &prepared, sender, now)
+        drop(rejected);
+        result
     }
 }

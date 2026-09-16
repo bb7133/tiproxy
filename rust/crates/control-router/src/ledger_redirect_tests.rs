@@ -406,13 +406,14 @@ fn redirect_old_same_pair_terminal_cannot_settle_new_operation() {
 #[test]
 fn worker_close_tokens_reject_foreign_sequence_and_exhaustion() {
     let mut ledger = Ledger::new(8);
+    let now = Instant::now();
     let owner = must(ledger.add_account());
     let session = active(&mut ledger, &owner);
     let mut foreign = Ledger::new(8);
     let other_owner = must(foreign.add_account());
     let other_session = active(&mut foreign, &other_owner);
-    let own = must(ledger.prepare_close(&session));
-    let other = must(foreign.prepare_close(&other_session));
+    let own = must(ledger.prepare_close(&session, now));
+    let other = must(foreign.prepare_close(&other_session, now));
     ledger.admit_close(own.clone());
     foreign.admit_close(other.clone());
     assert_eq!(
@@ -433,7 +434,7 @@ fn worker_close_tokens_reject_foreign_sequence_and_exhaustion() {
         "WORKER_CLOSE_ADMISSION_COUNTS"
     );
     assert!(matches!(
-        ledger.prepare_close(&session),
+        ledger.prepare_close(&session, now),
         Err(LedgerError::ForceClosing)
     ));
     assert_eq!(ledger.observe_close(&own), Settlement::Applied);
@@ -446,7 +447,10 @@ fn worker_close_tokens_reject_foreign_sequence_and_exhaustion() {
     );
     ledger.next_close = u64::MAX;
     assert!(
-        matches!(ledger.prepare_close(&next), Err(LedgerError::Exhausted)),
+        matches!(
+            ledger.prepare_close(&next, now),
+            Err(LedgerError::Exhausted)
+        ),
         "WORKER_CLOSE_EXHAUSTED"
     );
     assert_eq!(counts(&ledger, &owner), (1, 1, 0, 0, 0));

@@ -555,9 +555,18 @@ impl ConfigModule {
         self.source.observe_etcd_revision(candidate.revision);
         let decoded = decode_persistent_entries(candidate.entries)
             .map_err(|_| module_error("persistent_candidate_decode_rejected"))?;
-        self.source
-            .apply_persistent(decoded, candidate.revision, &self.options.current_dir)
-            .map_err(|_| module_error("persistent_candidate_apply_rejected"))?;
+        let applied = match candidate.namespace_update {
+            NamespaceUpdate::Preserve => self.source.apply_persistent_preserving_namespaces(
+                decoded,
+                candidate.revision,
+                &self.options.current_dir,
+            ),
+            NamespaceUpdate::Replace => {
+                self.source
+                    .apply_persistent(decoded, candidate.revision, &self.options.current_dir)
+            }
+        };
+        applied.map_err(|_| module_error("persistent_candidate_apply_rejected"))?;
         self.external_material = external_material_fingerprint(&self.source);
         Ok(())
     }
@@ -647,6 +656,13 @@ async fn join_reader(
 struct RawCandidate {
     revision: i64,
     entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    namespace_update: NamespaceUpdate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamespaceUpdate {
+    Preserve,
+    Replace,
 }
 
 async fn run_etcd_reader(
@@ -707,7 +723,12 @@ async fn read_until_disconnect(
         .iter()
         .map(|value| (value.key().to_vec(), value.value().to_vec()))
         .collect::<BTreeMap<_, _>>();
-    send_candidate(lifecycle, candidates, revision, &entries).await?;
+    let namespace_update = if entries.keys().any(|key| is_namespace_key(key)) {
+        NamespaceUpdate::Replace
+    } else {
+        NamespaceUpdate::Preserve
+    };
+    send_candidate(lifecycle, candidates, revision, &entries, namespace_update).await?;
 
     let start_revision = revision.saturating_add(1).max(1);
     let mut stream = connection
@@ -745,10 +766,14 @@ async fn read_until_disconnect(
             .header()
             .map_or(0, etcd_client::ResponseHeader::revision);
         let mut changed = false;
+        let mut namespace_update = NamespaceUpdate::Preserve;
         for event in response.events() {
             let Some(value) = event.kv() else {
                 continue;
             };
+            if is_namespace_key(value.key()) {
+                namespace_update = NamespaceUpdate::Replace;
+            }
             match event.event_type() {
                 EventType::Put => {
                     entries.insert(value.key().to_vec(), value.value().to_vec());
@@ -760,9 +785,13 @@ async fn read_until_disconnect(
             changed = true;
         }
         if changed {
-            send_candidate(lifecycle, candidates, revision, &entries).await?;
+            send_candidate(lifecycle, candidates, revision, &entries, namespace_update).await?;
         }
     }
+}
+
+fn is_namespace_key(key: &[u8]) -> bool {
+    key.starts_with(NAMESPACE_CONFIG_PREFIX.as_bytes())
 }
 
 async fn send_candidate(
@@ -770,6 +799,7 @@ async fn send_candidate(
     candidates: &mpsc::Sender<RawCandidate>,
     revision: i64,
     entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+    namespace_update: NamespaceUpdate,
 ) -> Result<(), ReaderError> {
     tokio::select! {
         changed = lifecycle.changed() => {
@@ -782,6 +812,7 @@ async fn send_candidate(
         result = candidates.send(RawCandidate {
             revision,
             entries: entries.clone(),
+            namespace_update,
         }) => result.map_err(|_| ReaderError::Dependency),
     }
 }

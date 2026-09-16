@@ -43,7 +43,7 @@ CARGO_DENY_VERSION := 0.20.2
 RUST_TOOL_ROOT ?= $(GOBIN)/rust-tools
 RUST_TOOL_BIN := $(RUST_TOOL_ROOT)/bin
 
-.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests control-proto-generate control-proto-generate-check controlplane-contracts controlplane-differential controlplane-differential-self-test controlplane-cp001-evidence controlplane-cp002-evidence controlplane-cp003-evidence controlplane-cp003-authority-evidence controlplane-cp004-evidence controlplane-cproute-evidence controlplane-cpmetrics-evidence controlplane-cpmetrics-applied-evidence controlplane-cpmetrics-collector-evidence controlplane-cpmetrics-factor-evidence controlplane-cproute-resource-evidence controlplane-cproute-migration-evidence controlplane-cproute-balance-evidence controlplane-cproute-worker-evidence controlplane-cproute-shadow-evidence controlplane-cproute-recorder-evidence controlplane-cproute-read-foundation-evidence controlplane-cproute-time-evidence controlplane-cproute-native-evidence controlplane-cptopo-evidence dataplane-differential dataplane-differential-coverage dataplane-differential-mutation dataplane-integration dataplane-t2-integration dataplane-integration-go dataplane-integration-self-test
+.PHONY: cmd_% test lint parity-drift parity-drift-weekly docker docker-release golangci-lint gocovmerge clean rust-build rust-test rust-doc-test rust-lint rust-release rust-install-tools rust-supply-chain rust-negative-tests control-proto-generate control-proto-generate-check controlplane-contracts controlplane-differential controlplane-differential-self-test controlplane-cp001-evidence controlplane-cp002-evidence controlplane-cp003-evidence controlplane-cp003-authority-evidence controlplane-cp004-evidence controlplane-cproute-evidence controlplane-cpmetrics-evidence controlplane-cpmetrics-applied-evidence controlplane-cpmetrics-collector-evidence controlplane-cpmetrics-factor-evidence controlplane-cproute-resource-evidence controlplane-cproute-migration-evidence controlplane-cproute-balance-evidence controlplane-cproute-worker-evidence controlplane-cproute-shadow-evidence controlplane-cproute-recorder-evidence controlplane-cproute-read-foundation-evidence controlplane-cproute-time-evidence controlplane-cproute-native-evidence controlplane-cptopo-evidence dataplane-differential dataplane-differential-coverage dataplane-differential-mutation dataplane-integration dataplane-t2-integration dataplane-t3-integration dataplane-integration-go dataplane-integration-self-test
 
 default: cmd
 
@@ -223,6 +223,12 @@ dataplane-integration:
 # callers never need to know the script's internal focused switch.
 dataplane-t2-integration:
 	DATAPLANE_T2_FOCUSED=1 ./tests/dataplane/integration/run.sh --mode rust --variant plain
+
+# T3's production migration/force-close gate deliberately severs the legacy
+# bridge after a local session is active. It remains separate from T4's full
+# ownership/tombstone matrix.
+dataplane-t3-integration:
+	DATAPLANE_T3_FOCUSED=1 ./tests/dataplane/integration/run.sh --mode rust --variant plain
 
 dataplane-integration-go:
 	./tests/dataplane/integration/run.sh --mode go --variant all

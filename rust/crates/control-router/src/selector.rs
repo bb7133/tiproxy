@@ -650,41 +650,37 @@ impl Router {
     pub(crate) fn offer_redirect(
         &self,
         prepared: &crate::PreparedRedirect,
-        sender: &crate::scheduler::CommandQueue,
+        sender: &dyn crate::scheduler::MigrationCommandSink,
         now: Instant,
     ) -> Result<bool, RouteError> {
-        let mut state = self.lock();
-        let Some(redirect) = self.prepare_offer_locked(&mut state, prepared, now)? else {
-            return Ok(false);
+        let mut rejected = Vec::new();
+        let result = {
+            let mut state = self.lock();
+            self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected)
         };
-        let accepted = sender.try_send(redirect.clone()).is_ok();
-        #[cfg(test)]
-        if let Some((signal, wait)) = self
-            .next_redirect_offer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            let _ = signal.send(());
-            // The test bounds its waits and owns release. Do not let elapsed
-            // time open this barrier; dropping release also unblocks cleanup.
-            let _ = wait.recv();
-        }
-        state.ledger.admit_redirect(redirect, accepted, now);
-        Ok(accepted)
+        drop(rejected);
+        result
     }
 
     fn offer_redirect_locked(
         &self,
         state: &mut State,
         prepared: &crate::PreparedRedirect,
-        sender: &crate::scheduler::CommandQueue,
+        sender: &dyn crate::scheduler::MigrationCommandSink,
         now: Instant,
+        rejected: &mut Vec<crate::scheduler::RejectedCommand>,
     ) -> Result<bool, RouteError> {
         let Some(redirect) = self.prepare_offer_locked(state, prepared, now)? else {
             return Ok(false);
         };
-        let accepted = sender.try_send(redirect.clone()).is_ok();
+        let accepted = match sender.try_send(redirect.clone().into()) {
+            Ok(()) => true,
+            Err(mut returned) => {
+                returned.disarm();
+                rejected.push(returned);
+                false
+            }
+        };
         #[cfg(test)]
         if let Some((signal, wait)) = self
             .next_redirect_offer

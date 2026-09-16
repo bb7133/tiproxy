@@ -40,4 +40,7 @@ pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};
 #[cfg(test)]
 mod tests;
 
-pub use scheduler::{KeyspaceRefusal, MigrationCommand, MigrationProgress};
+pub use scheduler::{
+    KeyspaceRefusal, MigrationCommand, MigrationProgress, RouteCommandDispatcher,
+    RouteCommandEnvelope, RouteCommandReceiver, RouteCommandRegistration,
+};

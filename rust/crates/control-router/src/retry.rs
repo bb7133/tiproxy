@@ -43,6 +43,10 @@ impl Router {
 }
 
 impl Selector {
+    pub(crate) const fn route_session(&self) -> &Session {
+        &self.session
+    }
+
     /// Restores a surviving client assignment into this fresh selector.
     /// # Errors
     /// Returns the owning router's source, backend, or session error.

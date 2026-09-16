@@ -19,7 +19,10 @@
 //! the reservation authority for the whole SQL session; dropping it closes the
 //! selector ledger through `RouteAdmission` without involving the Go bridge.
 
-use control_router::{Reservation, RouteAdmission, RouteError, Settlement};
+use control_router::{
+    Reservation, RouteAdmission, RouteCommandReceiver, RouteCommandRegistration, RouteError,
+    Settlement,
+};
 use control_routing::group::ClientInfo;
 use control_routing::{RouteAssignment, RouteCode, RouteResult};
 
@@ -37,6 +40,9 @@ trait LocalRouteAuthority: Send + Sync {
 }
 
 struct PlaneRouteAuthority {
+    // Field order is intentional: unregister and drain exact command guards
+    // before dropping the admission/selector that closes the ledger session.
+    _commands: RouteCommandRegistration,
     admission: RouteAdmission,
     pending: Option<Reservation>,
 }
@@ -94,24 +100,35 @@ pub(crate) fn release_local_route_lease(lease: &mut Option<LocalRouteChannel>) {
 
 impl LocalRouteChannel {
     /// Captures the immutable connection metadata used by every retry.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this exact route session already has a command
+    /// registration.
     pub fn new(
         admission: RouteAdmission,
         connection_id: u64,
         client_address: impl Into<String>,
         proxy_address: impl Into<String>,
         listener_port: impl Into<String>,
-    ) -> Self {
-        Self::with_authority(
-            Box::new(PlaneRouteAuthority {
-                admission,
-                pending: None,
-            }),
-            connection_id,
-            client_address.into(),
-            proxy_address.into(),
-            listener_port.into(),
-        )
+    ) -> Result<(Self, RouteCommandReceiver), RouteError> {
+        const COMMAND_CAPACITY: usize = 8;
+
+        let (commands, receiver) = admission.register_commands(connection_id, COMMAND_CAPACITY)?;
+        Ok((
+            Self::with_authority(
+                Box::new(PlaneRouteAuthority {
+                    _commands: commands,
+                    admission,
+                    pending: None,
+                }),
+                connection_id,
+                client_address.into(),
+                proxy_address.into(),
+                listener_port.into(),
+            ),
+            receiver,
+        ))
     }
 
     fn with_authority(

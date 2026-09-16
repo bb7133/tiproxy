@@ -104,6 +104,12 @@ pub struct Session {
     sequence: u64,
 }
 
+impl Session {
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AccountIdentity {
     sequence: u64,
@@ -148,6 +154,10 @@ pub struct Redirect {
 }
 
 impl Redirect {
+    pub(crate) const fn session(&self) -> &Session {
+        &self.session
+    }
+
     /// Captured physical assignment before this operation.
     #[must_use]
     pub const fn from(&self) -> &RouteAssignment {
@@ -157,6 +167,20 @@ impl Redirect {
     #[must_use]
     pub const fn to(&self) -> &RouteAssignment {
         &self.to
+    }
+
+    /// Whether `other` is the same exact migration operation.
+    ///
+    /// Assignment ids and public connection ids are diagnostics.  Exact
+    /// equality also requires the private router ledger/session incarnation
+    /// and both retained backend owners.
+    #[must_use]
+    pub fn same_operation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.session.ledger, &other.session.ledger)
+            && self.session.sequence == other.session.sequence
+            && self.sequence == other.sequence
+            && Arc::ptr_eq(&self.source, &other.source)
+            && Arc::ptr_eq(&self.target, &other.target)
     }
 }
 
@@ -169,10 +193,22 @@ pub struct ForceClose {
     assignment: RouteAssignment,
 }
 impl ForceClose {
+    pub(crate) const fn session(&self) -> &Session {
+        &self.session
+    }
+
     /// Assignment at close admission; diagnostic, not a settlement lookup.
     #[must_use]
     pub const fn assignment(&self) -> &RouteAssignment {
         &self.assignment
+    }
+
+    /// Whether `other` is the same exact admitted close operation.
+    #[must_use]
+    pub fn same_operation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.session.ledger, &other.session.ledger)
+            && self.session.sequence == other.session.sequence
+            && self.sequence == other.sequence
     }
 }
 
@@ -617,12 +653,22 @@ impl Ledger {
         active.failed_at = Some(now);
         Ok(())
     }
-    pub(crate) fn prepare_close(&self, session: &Session) -> Result<ForceClose, LedgerError> {
+    pub(crate) fn prepare_close(
+        &self,
+        session: &Session,
+        now: Instant,
+    ) -> Result<ForceClose, LedgerError> {
         let Stage::Active(active) = self.stage(session)? else {
             return Err(LedgerError::NotActive);
         };
         if active.closing.is_some() {
             return Err(LedgerError::ForceClosing);
+        }
+        if active
+            .failed_at
+            .is_some_and(|failed| now.saturating_duration_since(failed) < Duration::from_secs(3))
+        {
+            return Err(LedgerError::CoolingDown);
         }
         self.next_close
             .checked_add(1)
@@ -632,6 +678,24 @@ impl Ledger {
             sequence: self.next_close,
             assignment: active.assignment.clone(),
         })
+    }
+
+    pub(crate) fn reject_close(
+        &mut self,
+        session: &Session,
+        now: Instant,
+    ) -> Result<(), LedgerError> {
+        let Stage::Active(active) = self.stage(session)? else {
+            return Err(LedgerError::NotActive);
+        };
+        if active.closing.is_some() {
+            return Err(LedgerError::ForceClosing);
+        }
+        let Some(Stage::Active(active)) = self.sessions.get_mut(&session.sequence) else {
+            unreachable!("checked active session")
+        };
+        active.failed_at = Some(now);
+        Ok(())
     }
     pub(crate) fn admit_close(&mut self, close: ForceClose) {
         self.next_close += 1;

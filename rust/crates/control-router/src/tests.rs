@@ -54,6 +54,7 @@ mod concurrency;
 mod factors_live;
 mod locality;
 mod migration;
+mod production_dispatch;
 mod registration;
 mod resource;
 mod resource_release;
@@ -801,6 +802,178 @@ async fn route_plane_replaces_admission_but_retains_an_existing_selector() -> Te
     drop(replacement);
     plane_task.abort();
     let _ = plane_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replaced_route_plane_keeps_the_retained_incarnation_worker_alive() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let mut retained = must(handle.admit(""));
+    let reservation = must(retained.selector_mut().next(ClientInfo::default(), ""));
+    let from = reservation.assignment().backend_id.clone();
+    let failed_address = reservation.assignment().backend_address.clone();
+    let to = if from.ends_with("4000") {
+        "default/127.0.0.1:4001"
+    } else {
+        "default/127.0.0.1:4000"
+    };
+    assert_eq!(
+        retained.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    let (registration, mut receiver) = must(retained.register_commands(12001, 4));
+
+    let current = harness.source.store.current();
+    let mut replacement = NamespaceConfig {
+        namespace: "default".to_owned(),
+        ..NamespaceConfig::default()
+    };
+    replacement.frontend.user = "replacement".to_owned();
+    harness.source.store.apply(
+        (**current.effective()).clone(),
+        vec![replacement],
+        SourceRevision {
+            file_revision: 3,
+            etcd_revision: 0,
+        },
+        Path::new("/tmp"),
+    )?;
+    harness.source.deliver();
+    let replacement = must(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.admit_within("replacement", Duration::from_secs(4)),
+        )
+        .await?,
+    );
+    assert!(!retained.same_router_incarnation(&replacement));
+
+    // Only after the old incarnation is withdrawn from new admission, publish
+    // the failover policy. Its session-held RegisteredRouter must keep the old
+    // worker and exact dispatcher alive long enough to migrate that session.
+    harness.patch(
+        &format!(
+            "[proxy]\nfail-backend-list=[\"{failed_address}\"]\nfailover-timeout=60\n[balance.status]\nmigrations-per-second=100"
+        ),
+        4,
+    );
+    harness.source.deliver();
+    let envelope = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await?
+        .ok_or("retained worker command channel closed")?;
+    let crate::MigrationCommand::Redirect(redirect) = envelope.command() else {
+        return Err("retained worker emitted a close before its 60s timeout".into());
+    };
+    assert_eq!(redirect.from().backend_id, from);
+    assert_eq!(redirect.to().backend_id, to);
+    assert_eq!(envelope.finish_redirect(false), Settlement::Applied);
+
+    drop(registration);
+    drop(retained);
+    drop(replacement);
+    plane_task.abort();
+    let _ = plane_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_plane_restart_cleans_lost_terminal_and_starts_with_a_fresh_ledger() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+    let mut admission = must(handle.admit(""));
+    let old_router = admission.test_router();
+    let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+    let old_backend = reservation.assignment().backend_id.clone();
+    let old_address = reservation.assignment().backend_address.clone();
+    assert_eq!(
+        admission.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    let (registration, mut receiver) = must(admission.register_commands(13001, 2));
+
+    harness.patch(
+        &format!(
+            "[proxy]\nfail-backend-list=[\"{old_address}\"]\nfailover-timeout=60\n[balance.status]\nmigrations-per-second=100"
+        ),
+        3,
+    );
+    harness.source.deliver();
+    let lost = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await?
+        .ok_or("missing lost terminal fixture")?;
+    assert!(matches!(
+        lost.command(),
+        crate::MigrationCommand::Redirect(_)
+    ));
+
+    // Model a Rust owner crash/restart: the command was removed from the FIFO
+    // but never reported. Lease teardown closes the pending ledger entry; its
+    // later RAII/exact terminal is ignored rather than resurrecting ownership.
+    drop(receiver);
+    drop(registration);
+    drop(admission);
+    assert_eq!(
+        old_router
+            .accounting(&old_backend)
+            .unwrap_or_default()
+            .active(),
+        0
+    );
+    assert_eq!(lost.finish_redirect(false), Settlement::Ignored);
+    plane_task.abort();
+    let _ = plane_task.await;
+
+    let (fresh_plane, mut fresh_handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let fresh_task = tokio::spawn(async move { Box::new(fresh_plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), fresh_handle.wait_ready()).await??;
+    let fresh = must(fresh_handle.admit(""));
+    let fresh_router = fresh.test_router();
+    assert!(
+        !Arc::ptr_eq(&old_router, &fresh_router),
+        "restart creates a new in-memory route ledger"
+    );
+    assert_eq!(
+        fresh_router
+            .accounting(&old_backend)
+            .unwrap_or_default()
+            .active(),
+        0,
+        "no ghost owner crosses the restart"
+    );
+    drop(fresh);
+    fresh_task.abort();
+    let _ = fresh_task.await;
     Ok(())
 }
 
