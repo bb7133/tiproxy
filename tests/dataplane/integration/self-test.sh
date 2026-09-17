@@ -66,6 +66,20 @@ for required_fragment in \
 	fi
 done
 
+if ! grep -Fq -- 'make -C "$repo_root" rust-build cmd_tiproxy' "$script_dir/qualify-route-owner.sh"; then
+	echo "T4 qualification does not build both clean-runner binaries" >&2
+	exit 1
+fi
+for required_fragment in \
+	'for binary in "$rust_binary" "$go_binary"; do' \
+	'if [[ ! -x $binary ]]; then' \
+	'qualification binary missing or not executable: $binary'; do
+	if ! grep -Fq -- "$required_fragment" "$script_dir/qualify-route-owner.sh"; then
+		echo "T4 qualification is missing its binary-negative guard: $required_fragment" >&2
+		exit 1
+	fi
+done
+
 # The formal recorder is piped through tee so its complete first-failure log
 # survives. Keep pipefail explicit in the workflow so a recorder/build failure
 # cannot be turned into a successful recording step by tee.

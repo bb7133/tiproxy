@@ -124,9 +124,19 @@ if [[ -e $root_manifest || -d $artifact_root/cells ]]; then
 fi
 mkdir -p "$artifact_root/cells"
 
-make -C "$repo_root" rust-build
+# A clean qualification runner has neither implementation binary. The Rust
+# dataplane is the route owner under test, while the Go TiProxy remains the
+# residual control bridge used by the real-topology harness and is also hashed
+# into every immutable receipt.
+make -C "$repo_root" rust-build cmd_tiproxy
 rust_binary=${TIPROXY_RS_BIN:-$repo_root/rust/target/debug/tiproxy-rs}
 go_binary="$repo_root/bin/tiproxy"
+for binary in "$rust_binary" "$go_binary"; do
+	if [[ ! -x $binary ]]; then
+		echo "qualification binary missing or not executable: $binary" >&2
+		exit 1
+	fi
+done
 rust_sha=$(sha256_file "$rust_binary")
 go_sha=$(sha256_file "$go_binary")
 
