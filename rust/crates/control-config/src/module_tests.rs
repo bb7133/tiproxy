@@ -18,13 +18,13 @@ use std::sync::Arc;
 
 use super::{
     ConfigModule, ConfigModuleOptions, NAMESPACE_CONFIG_PREFIX, NamespaceUpdate, PROXY_CONFIG_KEY,
-    RawCandidate, join_reader,
+    RawCandidate, join_reader, persistent_candidate_rejection_log,
 };
-use crate::{ConfigNamespaceSource, NamespaceConfig};
+use crate::{ConfigNamespaceSource, NamespaceConfig, StoreError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn module() -> Result<ConfigModule, crate::StoreError> {
+fn module() -> Result<ConfigModule, StoreError> {
     ConfigModule::load(ConfigModuleOptions {
         config_file: None,
         advertise_addr: None,
@@ -152,4 +152,22 @@ fn proxy_only_candidate_preserves_seeded_namespace_and_explicit_delete_stays_emp
     );
     assert!(module.source.current().namespaces().is_empty());
     Ok(())
+}
+
+#[test]
+fn malformed_namespace_rejection_log_names_the_exact_key_without_value() {
+    let error = StoreError::PersistentNamespace {
+        key: "/config/ns/rejected".to_owned(),
+        class: "json_decode_failed",
+    };
+    let log = persistent_candidate_rejection_log(42, &error)
+        .unwrap_or_else(|| unreachable!("persistent namespace rejection is logged"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&log).unwrap_or_else(|error| unreachable!("valid JSON: {error}"));
+    assert_eq!(parsed["component"], "control-config");
+    assert_eq!(parsed["event"], "persistent_candidate_rejected");
+    assert_eq!(parsed["revision"], 42);
+    assert_eq!(parsed["key"], "/config/ns/rejected");
+    assert_eq!(parsed["error_class"], "json_decode_failed");
+    assert!(!log.contains("not-json"), "persisted values stay redacted");
 }

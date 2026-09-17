@@ -24,6 +24,7 @@ use control_config::{
 use control_plane::ModuleContext;
 use control_routing::group::{ClientInfo, GroupMatcher, MatchType, PortRoutes};
 use control_routing::{RouteAssignment, RouteCode};
+use control_topology::metrics::QueryId;
 use control_topology::{HealthSnapshot, MergedBackend, RoutingSnapshot, TopologyModuleHandle};
 
 use crate::authority::{Candidate, RouteError, Sources};
@@ -128,6 +129,7 @@ pub struct Router {
     replay_wall: Mutex<Option<i64>>,
     factors_enabled: bool,
     metrics: Option<control_topology::MetricOverlayHandle>,
+    input_diagnostics: Option<Arc<crate::plane::RouteInputDiagnostics>>,
     sources: Sources,
     state: Mutex<State>,
     #[cfg(test)]
@@ -160,6 +162,7 @@ impl Router {
             replay_wall: Mutex::new(None),
             factors_enabled: false,
             metrics: None,
+            input_diagnostics: None,
             sources: Sources::new(source, topology, context, namespace)?,
             #[cfg(test)]
             next_lock: Mutex::new(None),
@@ -191,12 +194,14 @@ impl Router {
         resolved: &crate::ResolvedNamespace,
         max_sessions: usize,
         metrics: Option<control_topology::MetricOverlayHandle>,
+        input_diagnostics: Arc<crate::plane::RouteInputDiagnostics>,
     ) -> Result<Self, RouteError> {
         Ok(Self {
             #[cfg(test)]
             replay_wall: Mutex::new(None),
             factors_enabled: true,
             metrics,
+            input_diagnostics: Some(input_diagnostics),
             sources: Sources::new_retained(source, topology, context, resolved)?,
             #[cfg(test)]
             next_lock: Mutex::new(None),
@@ -542,6 +547,20 @@ impl Router {
             // the effect, under this same lock and (when present) metric fence.
             self.sources.validate(candidate)?;
             let reserved = state.ledger.reserve(session, &identity, assignment)?;
+            if metrics.is_some()
+                && let Some(diagnostics) = &self.input_diagnostics
+            {
+                diagnostics.record(
+                    inputs.len(),
+                    inputs.iter().filter(|input| input.healthy).count(),
+                    queries
+                        .get(&QueryId::Cpu)
+                        .map_or(0, |result| result.series.len()),
+                    queries
+                        .get(&QueryId::Memory)
+                        .map_or(0, |result| result.series.len()),
+                );
+            }
             Ok(reserved)
         };
         // Keep the test barrier after reading data and before its final fence.
@@ -811,6 +830,10 @@ impl Router {
             .backends
             .get(backend_id)
             .and_then(|backend| state.ledger.counts(&backend.account))
+    }
+
+    pub(crate) fn ledger_evidence(&self) -> crate::RouteLedgerEvidence {
+        self.lock().ledger.evidence()
     }
 }
 

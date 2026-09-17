@@ -499,6 +499,7 @@ struct ExportTotals {
     dispatch_stale: u64,
     dispatch_send_failures: u64,
     dispatch_metering_failures: u64,
+    dispatch_legacy_route_violations: u64,
 }
 
 impl ExportTotals {
@@ -528,6 +529,9 @@ impl ExportTotals {
                 dispatch_stale: dispatch.stale_dropped.load(Ordering::Relaxed),
                 dispatch_send_failures: dispatch.send_failures.load(Ordering::Relaxed),
                 dispatch_metering_failures: dispatch.metering_failures.load(Ordering::Relaxed),
+                dispatch_legacy_route_violations: dispatch
+                    .legacy_route_violations
+                    .load(Ordering::Relaxed),
             },
             server.active_connections as f64,
         )
@@ -610,6 +614,11 @@ impl ExportTotals {
                 "rust_metering_failure",
                 self.dispatch_metering_failures,
                 previous.dispatch_metering_failures,
+            ),
+            (
+                "rust_legacy_route_violation",
+                self.dispatch_legacy_route_violations,
+                previous.dispatch_legacy_route_violations,
             ),
         ] {
             aggregator.counter(

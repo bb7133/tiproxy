@@ -16,6 +16,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_config::{
@@ -29,9 +30,10 @@ use control_plane::{
 };
 use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime};
 use control_proto::v1::{
-    ConfigSnapshot, KeepalivePolicy, Listener, NamespaceSnapshot, ProxyProtocolMode, StateSnapshot,
-    TlsPolicy as WireTlsPolicy,
+    BackendSnapshot, ConfigSnapshot, KeepalivePolicy, Listener, NamespaceSnapshot,
+    ProxyProtocolMode, StateSnapshot, TlsPolicy as WireTlsPolicy,
 };
+use control_topology::{TopologyModuleHandle, TopologyUpdateObserver};
 use dataplane::ServingSnapshotComposer;
 use dataplane::control_runtime::SnapshotComposition;
 
@@ -39,6 +41,8 @@ use dataplane::control_runtime::SnapshotComposition;
 /// protocol/static handshake facts from the legacy bridge.
 pub struct RustConfigComposer {
     source: ConfigNamespaceStore,
+    topology: Option<TopologyModuleHandle>,
+    generation: AtomicU64,
     drain_grace_override: Option<Duration>,
 }
 
@@ -47,15 +51,44 @@ impl RustConfigComposer {
     pub const fn new(source: ConfigNamespaceStore, drain_grace_override: Option<Duration>) -> Self {
         Self {
             source,
+            topology: None,
+            generation: AtomicU64::new(1),
             drain_grace_override,
         }
+    }
+
+    /// Installs the process-local CP-TOPO source used after
+    /// `RUST_ROUTE_OWNER` empties the bridge backend list.
+    #[must_use]
+    pub fn with_topology(mut self, topology: TopologyModuleHandle) -> Self {
+        self.topology = Some(topology);
+        self
+    }
+
+    fn updates(&self) -> Option<TopologyUpdateObserver> {
+        self.topology.as_ref().map(TopologyModuleHandle::updates)
+    }
+
+    fn advance_generation(&self) -> Result<(), ModuleError> {
+        self.generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|_| ())
+            .map_err(|_| module_error("serving_generation_exhausted"))
     }
 
     fn compose_current(
         &self,
         bridge: &StateSnapshot,
     ) -> Result<SnapshotComposition, SnapshotError> {
-        compose_snapshot(&self.source.current(), bridge, self.drain_grace_override)
+        compose_snapshot(
+            &self.source.current(),
+            bridge,
+            self.topology.as_ref(),
+            self.generation.load(Ordering::Acquire),
+            self.drain_grace_override,
+        )
     }
 }
 
@@ -102,19 +135,23 @@ pub struct ConfigServingAdapter {
     health_port: u16,
     tls_roots: Arc<[std::path::PathBuf]>,
     drain_grace_override: Option<Duration>,
+    composer: Arc<RustConfigComposer>,
+    topology_updates: Option<TopologyUpdateObserver>,
 }
 
 impl ConfigServingAdapter {
     #[must_use]
     pub fn new(
-        source: ConfigNamespaceStore,
         serving: dataplane::DataplaneServingHandle,
         snapshots: SnapshotStore,
         runtime: Arc<InProcessControlRuntime>,
         health_port: u16,
         tls_roots: Vec<std::path::PathBuf>,
         drain_grace_override: Option<Duration>,
+        composer: Arc<RustConfigComposer>,
     ) -> Self {
+        let topology_updates = composer.updates();
+        let source = composer.source.clone();
         Self {
             source,
             serving,
@@ -123,10 +160,12 @@ impl ConfigServingAdapter {
             health_port,
             tls_roots: Arc::from(tls_roots),
             drain_grace_override,
+            composer,
+            topology_updates,
         }
     }
 
-    async fn run_inner(self, context: ModuleContext) -> Result<(), ModuleError> {
+    async fn run_inner(mut self, context: ModuleContext) -> Result<(), ModuleError> {
         let mut updates = self.source.subscribe();
         let mut lifecycle = context.lifecycle();
         // The process-local runtime is constructed from the file-only
@@ -156,11 +195,24 @@ impl ConfigServingAdapter {
                     let snapshot = updates.borrow_and_update().clone();
                     self.apply_snapshot(&snapshot).await?;
                 }
+                changed = async {
+                    match self.topology_updates.as_mut() {
+                        Some(updates) => updates.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.topology_updates.is_some() => {
+                    if changed.is_err() {
+                        return Err(module_error("topology_source_stopped"));
+                    }
+                    self.composer.advance_generation()?;
+                    self.reload_serving().await?;
+                }
             }
         }
     }
 
     async fn apply_snapshot(&self, snapshot: &ConfigNamespaceSnapshot) -> Result<(), ModuleError> {
+        self.composer.advance_generation()?;
         // `watch` deliberately coalesces bursts. CP-001's local config
         // lineage is immediate-successor-only, so advance that consumer
         // lineage once for the latest accepted CP-CFG view instead of
@@ -178,6 +230,10 @@ impl ConfigServingAdapter {
         self.runtime
             .apply_config(config)
             .map_err(|_| module_error("control_apply_rejected"))?;
+        self.reload_serving().await
+    }
+
+    async fn reload_serving(&self) -> Result<(), ModuleError> {
         self.serving
             .reload_composed(&self.snapshots, unix_time_now())
             .await
@@ -326,8 +382,15 @@ fn control_config_at_generation(
 fn compose_snapshot(
     owned: &ConfigNamespaceSnapshot,
     bridge: &StateSnapshot,
+    topology: Option<&TopologyModuleHandle>,
+    composition_generation: u64,
     drain_grace_override: Option<Duration>,
 ) -> Result<SnapshotComposition, SnapshotError> {
+    if !bridge.backends.is_empty() || !bridge.namespaces.is_empty() {
+        return Err(SnapshotError::invalid(
+            "RUST_ROUTE_OWNER bridge snapshot contains backend or namespace state",
+        ));
+    }
     let mut serving = owned
         .effective()
         .serving()
@@ -343,11 +406,40 @@ fn compose_snapshot(
                 bridge_config.advertised_capability,
                 &bridge_config.server_version,
             )),
-            backends: bridge.backends.clone(),
+            backends: topology.map_or_else(Vec::new, wire_backends),
             namespaces: wire_namespaces(owned.namespaces()),
         },
-        generation: owned.generation(),
+        generation: composition_generation,
     })
+}
+
+fn wire_backends(topology: &TopologyModuleHandle) -> Vec<BackendSnapshot> {
+    let routing_handle = topology.routing_handle();
+    let Some(routing) = routing_handle.current() else {
+        return Vec::new();
+    };
+    let health = topology.health_overlay_handle().current_for(&routing);
+    routing
+        .backends
+        .backends
+        .iter()
+        .map(|merged| {
+            let verdict = health
+                .as_ref()
+                .map(|snapshot| snapshot.get(merged.backend_id.as_ref()));
+            BackendSnapshot {
+                backend_id: merged.backend_id.to_string(),
+                address: merged.backend.addr.clone(),
+                cluster_name: merged.cluster_name.to_string(),
+                keyspace: merged.backend.keyspace.clone(),
+                healthy: verdict.as_ref().is_some_and(|value| value.healthy),
+                local: verdict.as_ref().is_some_and(|value| value.local),
+                draining: false,
+                cidrs: Vec::new(),
+                labels: merged.backend.labels.clone(),
+            }
+        })
+        .collect()
 }
 
 fn apply_drain_override(serving: &mut ServingConfig, override_value: Option<Duration>) {
@@ -497,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_ignores_bridge_owned_config_and_namespaces()
+    fn composer_rejects_bridge_route_state_and_keeps_only_static_config()
     -> Result<(), Box<dyn std::error::Error>> {
         let owned = ConfigNamespaceStore::from_toml(
             b"enable-traffic-replay = false\n[proxy]\naddr = '127.0.0.1:7001'\nmax-connections = 41\n",
@@ -505,7 +597,7 @@ mod tests {
             Path::new("/tmp"),
         )?;
         let composer = RustConfigComposer::new(owned, None);
-        let bridge = StateSnapshot {
+        let nonempty = StateSnapshot {
             config: Some(ConfigSnapshot {
                 max_connections: 999,
                 advertised_capability: 123,
@@ -516,6 +608,15 @@ mod tests {
                 name: "bridge-owned".to_owned(),
                 ..NamespaceSnapshot::default()
             }],
+            backends: vec![BackendSnapshot {
+                backend_id: "bridge-owned".to_owned(),
+                address: "127.0.0.1:4000".to_owned(),
+                ..BackendSnapshot::default()
+            }],
+        };
+        assert!(composer.compose_current(&nonempty).is_err());
+        let bridge = StateSnapshot {
+            config: nonempty.config,
             ..StateSnapshot::default()
         };
         let composition = composer.compose_current(&bridge)?;
@@ -526,6 +627,8 @@ mod tests {
         assert_eq!(config.advertised_capability, 123);
         assert_eq!(config.server_version, "TiProxy-test");
         assert!(composition.snapshot.namespaces.is_empty());
+        composer.advance_generation()?;
+        assert_eq!(composer.compose_current(&bridge)?.generation, 2);
         Ok(())
     }
 
@@ -685,16 +788,16 @@ mod tests {
         let (_consumer, serving) = dataplane::DataplaneSnapshotConsumer::new_with_composer(
             Arc::new(dataplane::SystemMemoryProbe::new()),
             handler,
-            composer,
+            composer.clone(),
         );
         let adapter = ConfigServingAdapter::new(
-            source,
             serving,
             snapshots,
             Arc::clone(&runtime),
             0,
             Vec::new(),
             None,
+            composer,
         );
         let context = runtime.handle().module_context();
         let task = tokio::spawn(adapter.run_inner(context));

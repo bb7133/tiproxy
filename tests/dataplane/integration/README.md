@@ -40,7 +40,7 @@ tests/dataplane/integration/run.sh --mode rust --variant tls-proxy-zstd
 
 `preflight.sh` demands the capability contract from
 `tiproxy-rs --integration-capabilities` — currently
-`control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd`.
+`in-process-control-runtime,control-bridge-v1,rust-route-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd`.
 The launcher refuses any variant whose required capability is absent; it never
 substitutes a raw TCP relay or the Go dataplane for a Rust success.
 The launcher enables the Go config's `rust-dataplane` gate (the Go
@@ -51,14 +51,21 @@ tag: macOS caps `sun_path` well below the artifact path length), starts
 only after the first applied generation, and then runs the same
 `SELECT 1`, drop-next recovery, diagnostics, and port-release checks as
 the Go baseline. Both modes additionally prove the namespace/topology
-matrix (DPL-07 #41): two admin-API-seeded namespaces map alice and bob
+matrix (DPL-07 #41): two namespaces map alice and bob
 over the PD-backed backend set (with any explicit backend cluster
 configured — as here — the `FallbackFetcher` serves the merged PD
 topology and `backend.instances` cannot pin a backend),
 `SELECT @@port` proves each user lands on a real backend, and
 delta-scoped per-connection log evidence attributes each row's single
 connection to exactly its expected namespace — ns-alpha, ns-beta, and
-root's PD-backed default. The cluster×listener matrix (DPL-07 cluster
+root's PD-backed default. Go mode seeds them through its process-local admin
+API; cap6 Rust mode writes the authoritative persistent
+`/config/ns/{default,ns-alpha,ns-beta}` set. Persisting `default` is deliberate:
+the first explicit namespace set replaces the one-shot process seed, so an
+operator who wants to retain the fallback must materialize
+`/config/ns/default` before or with that first update. A directed Rust
+regression locks both outcomes (omitted default disappears; materialized
+default coexists with the exact seed incarnation). The cluster×listener matrix (DPL-07 cluster
 dimension) then proves deterministic backend-class selection: the
 topology runs TWO real PD-backed clusters (a second playground under
 its own tag and port window), the proxy exposes two consecutive
@@ -76,22 +83,21 @@ isolated MatchAll instance puts both clusters (label-injected
 keyspaces ks-old/ks-new, with session-token signing certs on every
 backend so redirection support is real and evidenced per backend)
 into one group, pins a persistent FIFO-driven session onto ks-old via
-fail-backend-list, hot-swaps the list so the router genuinely tries
-to push it to ks-new, and asserts the bounded structured guard hit
-attributed to that exact connection, the swap's absorption through a
-NEW connection landing on ks-new, and the old session's unchanged
-CONNECTION_ID and backend. The claim is deliberately scoped: the
-guard constrains router-issued redirects at their shared issuance
-boundary; direct connection-manager Redirect calls are a separate
-seam. Error parity (same
+fail-backend-list, and hot-swaps the list so ks-new is the sole routeable
+target. In legacy Go mode the runner retains the bounded structured guard
+record. In cap6 Rust mode it instead requires the authoritative `/config/proxy`
+generation to absorb (a NEW connection lands on ks-new), while the exact old
+session keeps its CONNECTION_ID and ks-old backend and the Rust route ledger
+has zero incoming/outgoing/unsettled tokens. This proves the local issuance
+boundary refused the healthy sole candidate without consulting or emitting a
+Go route command. Error parity (same
 slice family) then
 proves the same semantic ERR in both modes: a bind conflict fails fast
 naming the port with no residue, and with ALL THREE TiDB servers (both clusters) killed and
 evicted a new connection receives Go's approved 1105/HY000 "No
-available TiDB instances" vocabulary; the unknown-namespace refusal is
-documented as unreachable under the current public bootstrap/admin
-semantics (in-memory namespace store + default auto-create + upsert-only
-commit) with the vocabulary contract pinned by a session-engine e2e. Cleanup stops the Rust process with SIGINT — the
+available TiDB instances" vocabulary. The namespace regression above also
+pins the exact 1105/HY000 namespace-missing response once an explicit
+persistent set intentionally omits `default`. Cleanup stops the Rust process with SIGINT — the
 coordinated-shutdown path. The PROXY protocol variant additionally exercises
 WIRE-activation B: the fault proxy prepends an inbound PROXY v2 header on the
 client leg (consumed by a greeting-first probe), the dataplane emits an
@@ -101,6 +107,91 @@ compression variants exercise WIRE-C over real TiDB: classic zlib, negotiated
 zstd, and the combined frontend TLS + inbound/outbound PROXY v2 + zstd path.
 Each run proves a real query, recovery, migration, diagnostics, and owned
 cleanup under the selected transport.
+
+### T4 route-owner capability fence
+
+The focused ownership regression is a public target:
+
+```sh
+make dataplane-t4-integration
+```
+
+It starts the real Rust process and real TiDB topology through a byte-transparent
+control intermediary, proves compatible cap6 negotiation by successful SQL and
+forwarded frames, then replaces only the intermediary with a test Go-role peer
+whose negotiated set deliberately omits `RUST_ROUTE_OWNER`. Rust advertises
+cap6 and closes before acknowledging that incomplete session. The same Rust
+process stays healthy and admits a new real `SELECT 1` after 32 seconds, beyond
+the removed legacy route-authority grace. The JSON artifact records attempts,
+missing-capability rejections, Rust cap6 advertisement, and any unexpected
+negotiated session (which must remain zero).
+
+This gate does not delete the v1 route messages. Phase 1 keeps their protobuf
+tags/types as non-actionable tombstones and counts an injected retired body
+without effects. Any later Phase 2 is a separate dead-path-only PR: delete
+legacy adapters/handlers, retain the numeric tombstones until protocol v2, and
+do not add routing behavior or repair a Phase-1 qualification failure there.
+
+Full T4 qualification additionally sets `DATAPLANE_T4_QUALIFICATION=1`. For
+each physical run it also requires `DATAPLANE_T4_ROW=M1` through `M9`, places
+the byte-transparent control tap on the complete process lifetime for every
+protocol variant, and retains both `t4-route-audit-final.json` (the main
+topology) and `t4-route-audit-ka-final.json` (the migration/restart topology).
+The tap audits both
+directions without decoding/remarshalling and fails the cell if it observes any
+of the eleven retired Handshake/Route/Connection/Redirect/Close bodies, any
+backend/namespace in `StateSnapshot`, or any connection/event-sequence routing
+state in reconcile. A positive connect and forwarded-frame count proves the
+zero is from the live control path rather than an unattached observer.
+
+Every cell also retains an append-only `t4-process-lineage.json`: start,
+crash/restart, predecessor PID, parent PID, and OS process-start evidence for
+both TiDB playgrounds, both Go/Rust pairs, the ingress proxy, and each control
+tap. The before/after Rust health receipts carry exact payload-free
+config-file/etcd, topology observed/applied, and routing generation/client-epoch
+stamps. The cell manifest hashes those receipts, the two route audits, process
+lineage, row receipt, binaries, and rendered configs; missing evidence fails
+closed instead of producing a partial pass.
+
+The Rust health surface also publishes payload-free totals across current and
+retained router incarnations. Qualification captures
+`t4-ledger-before.json` and `t4-ledger-after.json` and requires zero sessions,
+reserved/active/incoming/outgoing counts, and unsettled redirect/close
+terminals at both boundaries. Retired namespace routers stay in the diagnostic
+until their last session/worker lease drops, so replacement cannot hide a leak.
+
+For M5, each physical run repeatedly admits a real SQL connection until the
+production route plane's payload-free health diagnostic proves that the
+successful reservation consumed nonempty live health, CPU, and memory inputs.
+The exact JSON response is retained as `t4-m5-route-inputs.json`; a mock
+selector, replay fixture, or API-only probe cannot satisfy this gate.
+The M5 row (and any later cell that depends on CPU/memory inputs) must be
+recorded on Linux with real TiDB: the Go process collector depends on procfs,
+so Darwin TiDB exports neither `process_cpu_seconds_total` nor
+`process_resident_memory_bytes`. A Darwin M5 run is preserved as incomplete,
+never counted as pass. Every physical artifact records `uname -sm` so this
+boundary is machine-checkable.
+
+M9 runs a separate live owner-restart oracle. It drops the control bridge for
+more than 30 seconds, performs a real A0-to-A1 local redirect during the loss,
+and requires both the existing session and a fresh post-grace admission to
+work. It then executes Go-only, Rust-only, and whole-process restarts in quiet
+and real backend-command-in-flight states. A pre-restart CP-ADMIN drain seeds
+wire sequence 1; after a Go restart the tap must see reconcile restore
+watermark 1 and the next targeted drain use sequence 2 and close its one
+session exactly once. Replacement Rust processes must expose a zero ledger
+before fresh admission, and whole restarts must rebind the same endpoints and
+workdirs without port, lease, or WAL identity collision.
+
+Namespace setup in Rust mode writes the real CP-CFG input at
+`/config/ns/*`; the legacy Go namespace HTTP API is process-local and is not a
+Rust routing authority. The startup `default` namespace is only a one-shot
+in-process seed. Before an operator writes the first explicit namespace, they
+must persist `/config/ns/default` too if default fallback must remain: the
+first explicit namespace mutation makes that prefix the complete authoritative
+set, and an omitted default then correctly yields namespace-missing
+1105/HY000. The runner materializes `default` before `ns-alpha`/`ns-beta`, and
+the control-router regression locks both the omitted and materialized cases.
 
 ### VAL-01 external-driver smoke (#48)
 
@@ -174,10 +265,11 @@ Rust runs also exercise a real same-keyspace backend migration inside the
 isolated keyspace-guard topology. After every TiDB backend has published a
 session-token signing certificate, a FIFO-driven client is pinned to cluster
 A's first backend, selects a nonempty current database, and sets a user
-variable. The test then changes the real Go router's fail-backend list so the
-second backend is the only routeable member of that keyspace. A fresh
-connection proves the new route has absorbed, and fresh structured Go evidence
-binds the exact A0 -> A1 redirect command to the persistent proxy connection.
+variable. The test then changes the active owner's fail-backend list so the
+second backend is the only routeable member of that keyspace. In cap6 rows the
+mutation is committed to `/config/proxy`, consumed by Rust CP-CFG, and scheduled
+by the local route owner; the legacy Go admin API is used only in Go mode. A
+fresh connection proves the new route has absorbed.
 The same still-running client must subsequently report A1's `@@port` while
 retaining both `DATABASE()` and the user variable. This is the live oracle for
 TiDB's signed `SHOW SESSION_STATES` result, the `tidb_session_token` second
@@ -196,13 +288,12 @@ checking exact retired-plus-current raw-byte totals.
 ### MIG-02 atomic redirect lifecycle (#44)
 
 MIG-02 closes the control/accounting boundary around that live MIG-01 swap.
-The production Rust command gate binds each accepted redirect id and sequence to
-the router-issued target backend. A successful terminal changes the physical
-owner; a failed terminal keeps the old owner but still reports the attempted
-target, because the Go router opened its pending score and metric route under
-that exact `(old,target)` pair. This prevents failed redirects from leaking a
-pending gauge under one label while decrementing an unrelated `(old,old)`
-label.
+The production Rust local FIFO binds each accepted redirect token to the
+router-issued target backend. A successful terminal changes the physical
+owner; a failed terminal keeps the old owner and settles that exact local
+`(old,target)` ledger operation. This prevents failed redirects from leaking an
+incoming/outgoing count while a late or duplicate terminal touches an unrelated
+assignment.
 
 The deterministic acceptance rows deliberately complement, rather than repeat,
 the real-TiDB migration phase:
@@ -228,12 +319,13 @@ with generation-safe, idempotent control effects and balanced Go accounting.
 ## Control-frame dropper (chaos-E2E control-loss)
 
 `controldropper/` is a test-only man-in-the-middle for the Go/Rust **control**
-Unix socket, used by the CTL-06 chaos-E2E chains to model a control message the
-Go side accepted-as-sent but never observed. It is inserted between the Rust
+Unix socket. In cap6 qualification it is a byte-transparent full-run audit tap;
+its old CTL-06 route-frame loss mode is retained only for explicit
+`DATAPLANE_LEGACY_ROUTE_CHAOS=1` compatibility testing. It is inserted between the Rust
 dataplane (`--control-socket <front>`) and the Go control socket
-(`--target-socket <go.sock>`), copies Go→Rust raw, and inspects Rust→Go frames
-by a field-level protowire scan — forwarding every frame **byte-identical**
-except the single frame a chain arms it to lose.
+(`--target-socket <go.sock>`), audits both directions by a field-level
+protowire scan, and forwards every frame **byte-identical** except the single
+Rust→Go frame a chaos chain arms it to lose. Go→Rust has no fault seam.
 
 Selection always carries a mandatory `connection_id`, never a bare kind filter,
 so a concurrent same-kind frame for a *different* connection/health probe is
@@ -269,8 +361,18 @@ list whose records carry each lost frame's exact wire identity
 `backend_id`). With `--pause-after-drop` the link tears down the instant the
 frame is lost and refuses to dial upstream until `POST /release`, modeling a
 control link wedged until the chain lets it recover (a `release` advances the
-reconnect count as the successor session dials again). The front socket is
-clamped to `0600` and owned by the run's user. Its self-tests run in
+reconnect count as the successor session dials again). It also exposes
+`route_audit`, whose fixed retired-body catalog, aggregate state/reconcile
+routing-field counts, CP-ADMIN drain-command maximum, reconcile drain
+watermark, and ordered metering watermarks are copied under the same mutex
+before JSON encoding. Metering batch/ACK entries include only a one-way
+SHA-256 producer-id fingerprint, never the raw producer id or metering payload;
+qualification rejects a missing/malformed fingerprint or any producer change
+within one audited WAL lineage. CP-ADMIN is not retired route traffic; M9 uses
+the drain sequences and producer fingerprint to prove restart recovery while
+the route fields remain zero. The front socket is clamped to
+`0600` and owned by the run's
+user. Its self-tests run in
 `self-test.sh` (`go test .../controldropper`): byte-equivalence, exact
 single-frame drop, exact-selector enforcement (partial/incompatible/unknown
 selectors are refused), a concurrent same-kind frame for **another** connection
@@ -282,11 +384,13 @@ a later assignment while the strict selector does not — both directions are
 covered.
 
 The **runtime wiring** has landed: the keyspace-guard phase of `run.sh` (for
-`--mode rust --variant plain`) launches and holds the dropper, points the Rust
+Rust/plain or every formal T4 cell) launches and holds the dropper, points the Rust
 dataplane's `--control-socket` at the dropper front while the dropper dials the
-Go control socket, asserts byte-transparent passthrough while unarmed, then
-drives `/arm` + `/state` + `/release` for the four chaos chains before cleaning
-up the process/socket under ownership checks. The four chains built on it are:
+Go control socket, and asserts byte-transparent passthrough while unarmed. A
+formal M9 row uses only disconnect/restart and CP-ADMIN observation—never a
+retired route body. The optional legacy comparison drives `/arm` + `/state` +
+`/release` for four old chaos chains before cleaning up the process/socket
+under ownership checks. Those compatibility-only chains are:
 (a) a lost `RouteResult{connected}` leaves a live-but-uncounted session that the
 automatic reconcile restores to exactly +1; (b) a lost `ConnectionEvent{CLOSED}`
 leaves a ghost that the reconcile clears to exactly the live count; (c) a
@@ -324,6 +428,14 @@ relevant pull requests and pushes. Its manual dispatch is the CI entrypoint for
 a real topology: it installs the exact TiUP release from `versions.env` only
 after verifying the published archive SHA-256, runs the selected mode/variant,
 and uploads the redacted artifact directory even on failure.
+
+GitHub exposes `workflow_dispatch` only after that workflow file exists on the
+repository's default branch. A fork-only/exact-tree commit cannot be manually
+dispatched by workflow name before merge; that is a CI control-plane
+availability limit, not a test pass. Until then, run the same public Make
+targets on the exact tree and preserve their artifact directory. Once the
+workflow exists on the default branch, manual dispatch must use the exact
+qualified ref and record the Actions run ID in the evidence manifest.
 
 Override `DATAPLANE_PORT_OFFSET` for a reserved CI port range. The default is a
 process-derived offset between 10000 and 11900; each run consumes two 100-port

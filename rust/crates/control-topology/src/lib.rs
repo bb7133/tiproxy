@@ -78,7 +78,7 @@ pub use metric_source::{
 pub use model::{BackendInfo, PrometheusInfo, TopologySnapshot, parse_tidb_topology};
 pub use module::{
     RejectionClass, TopologyClientFactory, TopologyClusterClient, TopologyModule,
-    TopologyModuleHandle, TopologyStatus,
+    TopologyModuleHandle, TopologyStatus, TopologyUpdateObserver,
 };
 pub use register::{
     TIPROXY_TOPOLOGY_PATH, TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo,

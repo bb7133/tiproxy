@@ -229,6 +229,34 @@ RSP-001 through RSP-008 where applicable.
 | LIFE-004 | Recover managed background-task panics, close affected connection resources, and keep listener/config loops cancellable without orphan tasks. | `pkg/proxy/proxy.go:Run`; `pkg/proxy/backend/backend_conn_mgr.go:Connect`; `pkg/util/waitgroup/` | `pkg/proxy/proxy_test.go:TestRecoverPanic`; `pkg/proxy/backend/backend_conn_mgr_test.go:TestProcessSignalsPanic` | `dataplane` | `PARITY-LIFE-004` | GO-VERIFIED / RUST-TODO | P1 | P0 |
 | LIFE-005 | Preserve normal versus abnormal quit classification for client quit, client network, backend network, backend SQL error, proxy shutdown, handshake, and control-hook failures. | `pkg/proxy/backend/error.go`; `pkg/proxy/client/client_conn.go:Run`; `rust/crates/session-core/src/error_source.rs`; `rust/crates/dataplane/src/session_engine.rs` | `pkg/proxy/backend/backend_conn_mgr_test.go:TestReturnMySQLError`, `TestDisconnectLog`, `TestHandlerReturnError`; `pkg/proxy/backend/cmd_processor_test.go:TestNetworkError`; `session_core::error_source::tests`; `dataplane::observability::quit_source_labels_match_go_exactly`; `rust/crates/dataplane/tests/session_engine.rs:session_path_emits_query_traffic_and_exact_quit_source` | `session-core`, `dataplane` | `PARITY-LIFE-005` | GO-VERIFIED / RUST-IMPLEMENTED | P1 | P1 |
 
+## Phase-1 Rust route-owner inventory
+
+`CONTROL_CAPABILITY_RUST_ROUTE_OWNER` (6) is the production compatibility
+fence. The bundled pair requires it at handshake; a missing capability rejects
+the session and never selects Go as a fallback owner. Once negotiated, this is
+the exact bridge inventory:
+
+| Family | Production count/effect | Retained reason |
+| --- | --- | --- |
+| `StateSnapshot` / `SnapshotResult` | Residual only: backends/namespaces empty; config carries static MySQL capability/version facts. Nonempty route state is rejected. | Snapshot/static acknowledgement until an owner-specific protocol v2. |
+| `Handshake*`, `Route*`, `ConnectionEvent`, `Redirect*`, `Close*` | Zero. An injected body increments `rust_legacy_route_violation` and leaves the route-state hash unchanged. | Numeric v1 tags/types are non-actionable tombstones. |
+| `ReconcileRequest` / `ReconcileSnapshot` | Connections empty, connection-event sequence zero, response connections empty; no route callback/effect. | Snapshot, metrics/metering and CP-ADMIN drain watermarks. |
+| `Drain*`, `MetricsBatch`, `MeteringBatch` / `MeteringAck` | Retained on their dedicated owner paths. | CP-ADMIN, observability, and durable CP-METER are not route ownership. |
+
+Production Go constructs the residual handler without `RouterAdapter`, does
+not attach a handshake/router/topology fallback, and does not call
+`ResolveOrphans`. The legacy adapter and capabilities 1–3 remain Phase-1 test
+oracles only. After the full 36-logical/48-physical live qualification, Phase
+2 is a separate dead-path deletion PR; it may simplify the residual handler but
+must retain the deprecated v1 schema numbers until protocol v2 and may not add
+or repair routing semantics.
+
+CP-METER protocol-v2 candidate: add `producer_id` beside
+`ReconcileSnapshot.metering_sequence`. In v1 the snapshot is only a
+current-session readiness gate and cannot trim a producer-qualified WAL; the
+existing `MeteringAck` is the sole safe trim authority. Until v2, the WAL is
+the only cross-session owner and every metering wire copy is session-scoped.
+
 ## Explicit exclusion
 
 | ID | Excluded behavior | Go source | Required Rust-mode behavior | Rust owner | Target test ID | Status | Canary | Cutover |

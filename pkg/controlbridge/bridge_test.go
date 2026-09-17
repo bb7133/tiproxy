@@ -81,6 +81,32 @@ func TestBridgeOwnsListenerAndCadenceLifecycle(t *testing.T) {
 	require.NoError(t, bridge.Close())
 }
 
+func TestRouteOwnerBridgeConstructsNoRouterAdapter(t *testing.T) {
+	transportConfig := bridgeTransportConfig(t)
+	routeCap := uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_ROUTE_OWNER)
+	transportConfig.LocalHello.Capabilities = []uint64{routeCap}
+	transportConfig.RequiredCapabilities = []uint64{routeCap}
+	bridge, err := NewBridge(BridgeConfig{
+		Transport:  transportConfig,
+		RouteOwner: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, bridge.Close()) })
+	require.Nil(t, bridge.Adapter())
+	status, ok := bridge.RouteOwnerStatus()
+	require.True(t, ok)
+	require.Zero(t, status.RouterAdapterConstructions)
+	require.Zero(t, status.SelectorCalls)
+	require.Zero(t, status.SelectorEffects)
+	require.Zero(t, status.RouteFinishes)
+	require.Zero(t, status.RedirectsIssued)
+	require.Zero(t, status.OrphansRehydrated)
+	require.Zero(t, status.RouteCloses)
+	require.Zero(t, status.ConnectionMappings)
+	require.Zero(t, status.LegacyRouteViolations)
+	require.Equal(t, emptyRouteStateSHA256, status.RouteStateSHA256)
+}
+
 // Concurrent orphan resolution, sender rotations, and reconciles under
 // -race: the single-critical-section compare-and-delete may only
 // remove the obligation while the carrying sender is still current, so

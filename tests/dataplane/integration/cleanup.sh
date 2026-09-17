@@ -145,6 +145,7 @@ stop_owned_process "${FAULT_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
 if [[ -n ${RUST_SOCKET:-} ]]; then
 	stop_owned_process "${RUST_PID:-}" "${RUST_CONTROL_SOCKET:-$RUST_SOCKET}" || cleanup_status=1
 	if [[ -n ${T3_DROP_SOCKET:-} ]]; then
+		stop_owned_process "${T4_REJECT_PID:-}" "$run_dir/controlrejector" || cleanup_status=1
 		t3_drop_stopped=0
 		if stop_owned_process "${T3_DROP_PID:-}" "$run_dir/controldropper"; then
 			t3_drop_stopped=1

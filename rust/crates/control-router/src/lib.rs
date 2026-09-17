@@ -30,9 +30,11 @@ pub mod shadow;
 
 pub use authority::{Candidate, RouteError, Unsupported};
 pub use factors::{BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore};
-pub use ledger::{Accounting, ForceClose, Redirect, Reservation, Session, Settlement};
+pub use ledger::{
+    Accounting, ForceClose, Redirect, Reservation, RouteLedgerEvidence, Session, Settlement,
+};
 pub use namespace::{ResolvedNamespace, RouteCandidateValidator, UserNamespaceResolver};
-pub use plane::{RouteAdmission, RoutePlane, RoutePlaneHandle};
+pub use plane::{RouteAdmission, RouteInputEvidence, RoutePlane, RoutePlaneHandle};
 pub use retry::Selector;
 pub use selector::Router;
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};

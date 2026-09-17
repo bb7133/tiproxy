@@ -768,6 +768,12 @@ pub enum ControlCapability {
     /// fields from its process-local revisioned source. Backends remain on the
     /// legacy bridge until CP-TOPO/CP-ROUTE retire them.
     RustConfigNamespace = 5,
+    /// CP-ROUTE: Rust owns backend topology and every route/session lifecycle.
+    /// This is a compatibility assertion, not a runtime owner switch. A Rust
+    /// dataplane composition requires it during its initial negotiation; once
+    /// negotiated, Go sends no backend or namespace snapshots and route-family
+    /// messages remain wire tombstones until protocol v2.
+    RustRouteOwner = 6,
 }
 impl ControlCapability {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -782,6 +788,7 @@ impl ControlCapability {
             Self::ReconcileSessionRehydration => "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION",
             Self::MeteringAbsoluteSnapshots => "CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS",
             Self::RustConfigNamespace => "CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE",
+            Self::RustRouteOwner => "CONTROL_CAPABILITY_RUST_ROUTE_OWNER",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -793,6 +800,7 @@ impl ControlCapability {
             "CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION" => Some(Self::ReconcileSessionRehydration),
             "CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS" => Some(Self::MeteringAbsoluteSnapshots),
             "CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE" => Some(Self::RustConfigNamespace),
+            "CONTROL_CAPABILITY_RUST_ROUTE_OWNER" => Some(Self::RustRouteOwner),
             _ => None,
         }
     }

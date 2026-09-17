@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/protobuf/proto"
 
@@ -166,10 +167,31 @@ func (issuer *DrainIssuer) RestoreSequence(watermark uint64) {
 // batches, and routes drain results to the issuer. Everything else goes
 // to the RouterAdapter.
 type CompositeControlHandler struct {
-	adapter   *RouterAdapter
-	issuer    *DrainIssuer
-	consumer  *MeteringConsumer
-	publisher *SnapshotPublisher
+	adapter               *RouterAdapter
+	issuer                *DrainIssuer
+	consumer              *MeteringConsumer
+	publisher             *SnapshotPublisher
+	routeOwner            bool
+	legacyRouteViolations atomic.Uint64
+}
+
+const emptyRouteStateSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// RouteOwnerStatus is the auditable post-cutover Go route-state surface. A
+// residual handler owns no route objects, so every route-effect counter and the
+// mapping count are structurally zero; the only mutable value records rejected
+// legacy route-family traffic.
+type RouteOwnerStatus struct {
+	RouterAdapterConstructions uint64
+	SelectorCalls              uint64
+	SelectorEffects            uint64
+	RouteFinishes              uint64
+	RedirectsIssued            uint64
+	OrphansRehydrated          uint64
+	RouteCloses                uint64
+	ConnectionMappings         uint64
+	LegacyRouteViolations      uint64
+	RouteStateSHA256           string
 }
 
 // AttachSnapshotPublisher routes correlated Rust apply/reject answers to the
@@ -191,6 +213,26 @@ func NewCompositeControlHandler(
 	}
 	adapter.AttachMetering(consumer)
 	return &CompositeControlHandler{adapter: adapter, issuer: issuer, consumer: consumer}, nil
+}
+
+// NewRouteOwnerControlHandler installs the post-cutover residual handler. It
+// deliberately has no RouterAdapter and therefore no Go-side route state.
+func NewRouteOwnerControlHandler(
+	issuer *DrainIssuer,
+	consumer *MeteringConsumer,
+) (*CompositeControlHandler, error) {
+	if issuer == nil || consumer == nil {
+		return nil, errors.New("route-owner control handler requires issuer and consumer")
+	}
+	return &CompositeControlHandler{issuer: issuer, consumer: consumer, routeOwner: true}, nil
+}
+
+// RouteOwnerStatus snapshots the residual handler's zero-route proof.
+func (handler *CompositeControlHandler) RouteOwnerStatus() RouteOwnerStatus {
+	return RouteOwnerStatus{
+		LegacyRouteViolations: handler.legacyRouteViolations.Load(),
+		RouteStateSHA256:      emptyRouteStateSHA256,
+	}
 }
 
 // HandleControlMessage implements transport.Handler.
@@ -266,15 +308,84 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 		// drain's observable failure; anything else keeps the
 		// transport's generic (ignore) handling via the adapter.
 		_ = handler.issuer.HandleProtocolFailure(sender.Epoch(), envelope.GetRequestId(), body.Error)
+		if handler.routeOwner {
+			return nil
+		}
 		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
 	case *controlpb.ControlEnvelope_ReconcileRequest:
 		// Restore the issuer-wide drain watermark before the adapter
 		// answers, so drains issued after the reconcile resume from
 		// watermark + 1.
 		handler.issuer.RestoreSequence(body.ReconcileRequest.GetLastDrainCommandSequence())
+		if handler.routeOwner {
+			return handler.handleResidualReconcile(ctx, sender, envelope, body.ReconcileRequest)
+		}
 		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
 	default:
+		if handler.routeOwner && isRetiredRouteBody(envelope.GetBody()) {
+			return handler.rejectRetiredRouteBody(ctx, sender, envelope)
+		}
+		if handler.routeOwner {
+			return nil
+		}
 		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
+	}
+}
+
+func (handler *CompositeControlHandler) handleResidualReconcile(
+	ctx context.Context,
+	sender EnvelopeSender,
+	envelope *controlpb.ControlEnvelope,
+	request *controlpb.ReconcileRequest,
+) error {
+	if request == nil || request.GetLastConnectionEventSequence() != 0 || len(request.GetConnections()) != 0 {
+		return handler.rejectRetiredRouteBody(ctx, sender, envelope)
+	}
+	return sendBodyWithOptions(ctx, sender, envelope.GetRequestId(), envelope.GetGeneration(),
+		controlpb.Priority_PRIORITY_CRITICAL,
+		[]uint64{uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_ROUTE_OWNER)},
+		&controlpb.ControlEnvelope_ReconcileSnapshot{ReconcileSnapshot: &controlpb.ReconcileSnapshot{
+			AppliedGeneration:       request.GetKnownGeneration(),
+			ConnectionEventSequence: 0,
+			MetricsSequence:         request.GetLastMetricsSequence(),
+			MeteringSequence:        handler.consumer.LastApplied(),
+			Connections:             nil,
+		}})
+}
+
+func (handler *CompositeControlHandler) rejectRetiredRouteBody(
+	ctx context.Context,
+	sender EnvelopeSender,
+	envelope *controlpb.ControlEnvelope,
+) error {
+	handler.legacyRouteViolations.Add(1)
+	metrics.ServerErrCounter.WithLabelValues("rust_legacy_route_violation").Inc()
+	return sendBody(ctx, sender, envelope.GetRequestId(), controlpb.Priority_PRIORITY_CRITICAL,
+		&controlpb.ControlEnvelope_Error{Error: &controlpb.ProtocolError{
+			Code:               controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION,
+			OffendingRequestId: envelope.GetRequestId(),
+			Detail:             "retired route-family message under RUST_ROUTE_OWNER",
+			Fatal:              false,
+		}})
+}
+
+func isRetiredRouteBody(body any) bool {
+	switch body.(type) {
+	case *controlpb.ControlEnvelope_HandshakeResponse,
+		*controlpb.ControlEnvelope_HandshakeDecision,
+		*controlpb.ControlEnvelope_HandshakeResult,
+		*controlpb.ControlEnvelope_RouteRequest,
+		*controlpb.ControlEnvelope_RouteAssignment,
+		*controlpb.ControlEnvelope_RouteResult,
+		*controlpb.ControlEnvelope_ConnectionEvent,
+		*controlpb.ControlEnvelope_RedirectCommand,
+		*controlpb.ControlEnvelope_RedirectResult,
+		*controlpb.ControlEnvelope_CloseCommand,
+		*controlpb.ControlEnvelope_CloseResult,
+		*controlpb.ControlEnvelope_ReconcileSnapshot:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -306,6 +417,9 @@ func sendFatalMeteringError(
 
 // ResolveOrphans delegates the maintenance cadence to the adapter.
 func (handler *CompositeControlHandler) ResolveOrphans(ctx context.Context) error {
+	if handler.routeOwner {
+		return nil
+	}
 	return handler.adapter.ResolveOrphans(ctx)
 }
 

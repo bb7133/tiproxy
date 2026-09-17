@@ -181,7 +181,7 @@ mod tests {
 
     use control_config::{
         CandidateValidator, ConfigNamespaceSource, ConfigNamespaceStore, EffectiveConfig,
-        NamespaceConfig, SourceRevision, StoreError,
+        NamespaceConfig, PersistentConfigSnapshot, SourceRevision, StoreError,
     };
 
     use super::{RouteCandidateValidator, RouteError, UserNamespaceResolver};
@@ -238,6 +238,69 @@ mod tests {
         assert_eq!(
             resolver(&store).resolve("unknown").map(|_| ()),
             Err(RouteError::NamespaceMissing)
+        );
+    }
+
+    #[test]
+    fn first_explicit_namespace_replaces_seed_unless_default_is_materialized() {
+        let new_store = || {
+            must(ConfigNamespaceStore::from_toml_with_validator(
+                b"",
+                None,
+                Path::new("/tmp"),
+                Arc::new(RouteCandidateValidator),
+            ))
+        };
+        let default = namespace("default", "root");
+        let alpha = namespace("alpha", "analyst");
+
+        let unmaterialized = new_store();
+        must(
+            unmaterialized.bootstrap_namespaces_if_empty(vec![default.clone()], Path::new("/tmp")),
+        );
+        must(unmaterialized.apply_persistent(
+            PersistentConfigSnapshot {
+                namespaces: vec![alpha.clone()],
+                ..PersistentConfigSnapshot::default()
+            },
+            1,
+            Path::new("/tmp"),
+        ));
+        assert_eq!(
+            resolver(&unmaterialized).resolve("unknown").map(|_| ()),
+            Err(RouteError::NamespaceMissing),
+            "the first explicit /config/ns set is authoritative; the session layer maps this to exact 1105/HY000"
+        );
+        assert_eq!(
+            must(resolver(&unmaterialized).resolve("analyst")).namespace(),
+            "alpha"
+        );
+
+        let materialized = new_store();
+        must(materialized.bootstrap_namespaces_if_empty(vec![default.clone()], Path::new("/tmp")));
+        let seeded_default = must_some(materialized.current().namespace_incarnation("default"));
+        must(materialized.apply_persistent(
+            PersistentConfigSnapshot {
+                namespaces: vec![default, alpha],
+                ..PersistentConfigSnapshot::default()
+            },
+            1,
+            Path::new("/tmp"),
+        ));
+        assert_eq!(
+            must(resolver(&materialized).resolve("unknown")).namespace(),
+            "default"
+        );
+        assert_eq!(
+            must(resolver(&materialized).resolve("analyst")).namespace(),
+            "alpha"
+        );
+        assert!(
+            materialized
+                .current()
+                .namespace_incarnation("default")
+                .is_some_and(|current| current.same_as(&seeded_default)),
+            "materializing identical default preserves its exact incarnation"
         );
     }
 

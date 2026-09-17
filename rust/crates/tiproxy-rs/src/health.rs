@@ -20,11 +20,30 @@
 //! hand-rolled over the runtime's own socket types so the supply
 //! chain gains no HTTP dependency for a health probe.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use control_router::{RouteInputEvidence, RouteLedgerEvidence};
 use dataplane::{DataplaneServingHandle, GenerationStatusSnapshot};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+
+/// Payload-free lineage of the live inputs feeding route ownership.
+///
+/// These numbers are diagnostic stamps only; the control modules continue to
+/// authorize work with exact object identities and generation gates.  Exposing
+/// them here lets the qualification manifest name the source generations that
+/// were actually live without copying configuration or topology payloads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceGenerationEvidence {
+    pub config_generation: u64,
+    pub config_file_revision: u64,
+    pub config_etcd_revision: i64,
+    pub topology_observed_generation: u64,
+    pub topology_applied_generation: u64,
+    pub routing_generation: u64,
+    pub routing_client_epoch: u64,
+}
 
 /// Serves readiness probes until the listener errors or the task is
 /// aborted by the composition's shutdown.
@@ -34,12 +53,24 @@ use tokio::net::TcpListener;
 /// accept: a prober that never sends a byte cannot head-of-line-block
 /// later probes, and the write itself is deadline-bounded so a
 /// non-reading peer cannot either.
-pub async fn serve(listener: TcpListener, serving: DataplaneServingHandle) {
+pub async fn serve(
+    listener: TcpListener,
+    serving: DataplaneServingHandle,
+    route_inputs: Arc<dyn Fn() -> RouteInputEvidence + Send + Sync>,
+    route_ledger: Arc<dyn Fn() -> RouteLedgerEvidence + Send + Sync>,
+    source_generations: Arc<dyn Fn() -> SourceGenerationEvidence + Send + Sync>,
+) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        let response = render(&serving.status(), serving.is_serving().await);
+        let response = render(
+            &serving.status(),
+            serving.is_serving().await,
+            route_inputs(),
+            route_ledger(),
+            source_generations(),
+        );
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
             stream.write_all(response.as_bytes()),
@@ -53,7 +84,13 @@ pub async fn serve(listener: TcpListener, serving: DataplaneServingHandle) {
 /// applied generation AND a live SQL owner still accepting — after a
 /// drain begins or the owner exits, the probe turns not-ready even
 /// though a generation was applied earlier.
-fn render(status: &GenerationStatusSnapshot, serving_live: bool) -> String {
+fn render(
+    status: &GenerationStatusSnapshot,
+    serving_live: bool,
+    routes: RouteInputEvidence,
+    ledger: RouteLedgerEvidence,
+    sources: SourceGenerationEvidence,
+) -> String {
     let ready = status.applied_generation > 0 && serving_live;
     let (code, reason, state) = if ready {
         (200, "OK", "OK")
@@ -61,8 +98,28 @@ fn render(status: &GenerationStatusSnapshot, serving_live: bool) -> String {
         (503, "Service Unavailable", "NOT_READY")
     };
     let body = format!(
-        "{{\"status\":\"{state}\",\"applied_generation\":{}}}",
-        status.applied_generation
+        "{{\"status\":\"{state}\",\"applied_generation\":{},\"source_generations\":{{\"config_generation\":{},\"config_file_revision\":{},\"config_etcd_revision\":{},\"topology_observed_generation\":{},\"topology_applied_generation\":{},\"routing_generation\":{},\"routing_client_epoch\":{}}},\"route_inputs\":{{\"observations\":{},\"health_input_backends\":{},\"healthy_backends\":{},\"cpu_series\":{},\"memory_series\":{}}},\"route_ledger\":{{\"router_incarnations\":{},\"sessions\":{},\"reserved\":{},\"active\":{},\"incoming\":{},\"outgoing\":{},\"unsettled_redirects\":{},\"unsettled_closes\":{}}}}}",
+        status.applied_generation,
+        sources.config_generation,
+        sources.config_file_revision,
+        sources.config_etcd_revision,
+        sources.topology_observed_generation,
+        sources.topology_applied_generation,
+        sources.routing_generation,
+        sources.routing_client_epoch,
+        routes.observations,
+        routes.health_input_backends,
+        routes.healthy_backends,
+        routes.cpu_series,
+        routes.memory_series,
+        ledger.router_incarnations,
+        ledger.sessions,
+        ledger.reserved,
+        ledger.active,
+        ledger.incoming,
+        ledger.outgoing,
+        ledger.unsettled_redirects,
+        ledger.unsettled_closes,
     );
     format!(
         "HTTP/1.0 {code} {reason}\r\nContent-Type: application/json\r\n\
@@ -84,7 +141,13 @@ mod tests {
 
     #[test]
     fn not_ready_before_the_first_applied_generation() {
-        let response = render(&snapshot(0), true);
+        let response = render(
+            &snapshot(0),
+            true,
+            RouteInputEvidence::default(),
+            RouteLedgerEvidence::default(),
+            SourceGenerationEvidence::default(),
+        );
         assert!(response.starts_with("HTTP/1.0 503 "));
         assert!(response.contains("\"status\":\"NOT_READY\""));
         assert!(response.contains("\"applied_generation\":0"));
@@ -94,7 +157,13 @@ mod tests {
     fn not_ready_once_the_sql_owner_is_gone_or_draining() {
         // An applied generation alone is not readiness: after the
         // owner exits or stop-accept begins, the probe must flip back.
-        let response = render(&snapshot(3), false);
+        let response = render(
+            &snapshot(3),
+            false,
+            RouteInputEvidence::default(),
+            RouteLedgerEvidence::default(),
+            SourceGenerationEvidence::default(),
+        );
         assert!(response.starts_with("HTTP/1.0 503 "));
         assert!(response.contains("\"status\":\"NOT_READY\""));
     }
@@ -129,7 +198,13 @@ mod tests {
         let Ok(address) = listener.local_addr() else {
             unreachable!("bound address")
         };
-        let server = tokio::spawn(serve(listener, serving));
+        let server = tokio::spawn(serve(
+            listener,
+            serving,
+            Arc::new(RouteInputEvidence::default),
+            Arc::new(RouteLedgerEvidence::default),
+            Arc::new(SourceGenerationEvidence::default),
+        ));
 
         // Several probers that never send a byte...
         let mut idle = Vec::new();
@@ -164,9 +239,42 @@ mod tests {
 
     #[test]
     fn ready_once_a_generation_is_applied() {
-        let response = render(&snapshot(3), true);
+        let evidence = RouteInputEvidence {
+            observations: 2,
+            health_input_backends: 3,
+            healthy_backends: 2,
+            cpu_series: 3,
+            memory_series: 3,
+        };
+        let ledger = RouteLedgerEvidence {
+            router_incarnations: 2,
+            sessions: 1,
+            active: 1,
+            ..RouteLedgerEvidence::default()
+        };
+        let sources = SourceGenerationEvidence {
+            config_generation: 7,
+            config_file_revision: 5,
+            config_etcd_revision: 11,
+            topology_observed_generation: 7,
+            topology_applied_generation: 6,
+            routing_generation: 9,
+            routing_client_epoch: 4,
+        };
+        let response = render(&snapshot(3), true, evidence, ledger, sources);
         assert!(response.starts_with("HTTP/1.0 200 OK"));
         assert!(response.contains("\"status\":\"OK\""));
         assert!(response.contains("\"applied_generation\":3"));
+        assert!(response.contains("\"config_generation\":7"));
+        assert!(response.contains("\"config_etcd_revision\":11"));
+        assert!(response.contains("\"topology_applied_generation\":6"));
+        assert!(response.contains("\"routing_generation\":9"));
+        assert!(response.contains("\"routing_client_epoch\":4"));
+        assert!(response.contains("\"health_input_backends\":3"));
+        assert!(response.contains("\"cpu_series\":3"));
+        assert!(response.contains("\"memory_series\":3"));
+        assert!(response.contains("\"router_incarnations\":2"));
+        assert!(response.contains("\"sessions\":1"));
+        assert!(response.contains("\"active\":1"));
     }
 }

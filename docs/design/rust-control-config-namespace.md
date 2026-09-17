@@ -156,7 +156,10 @@ modules.spawn(topology_module)?;
 - signal or first module failure moves the shared lifecycle to shutdown; every
   module observes the lifecycle watch and returns;
 - the composition root joins every module before `ControlRuntime::finish`;
-  abort is only the bounded final backstop.
+  abort is only the bounded final backstop. The production binary gives the
+  complete module set ten seconds to join, then aborts and still awaits every
+  join handle. A stuck source therefore cannot leave the process hung or a
+  module task detached.
 
 Feature-specific sources are constructor dependencies, not fields added to
 `ModuleContext`. Startup order is CP-CFG initial snapshot, CP-TOPO initial
@@ -281,6 +284,40 @@ or an invalid effective config rejects the complete candidate and preserves
 last-good. The observed etcd revision still advances for watch recovery, so a
 later corrective revision can be accepted without replay loops.
 
+A malformed persistent namespace is logged as one bounded, payload-free JSON
+record with exactly the stable component/event, source revision, offending
+namespace key, and error class. Namespace values and their raw decode errors
+are never logged. This keeps the operator-visible rejection attributable
+without exposing credentials or customer configuration embedded in a value.
+
+Namespace absence follows the accepted option-A compatibility rule. A
+proxy/log-only watch or relist containing no namespace keys carries no
+namespace mutation: the current name-sorted namespace set, object identities,
+and incarnation checksums are preserved. Only an explicit namespace `PUT` or a
+`DELETE` event observed by the live watch changes that set; deleting the last
+namespace is valid and the one-shot startup seed must not resurrect it.
+
+The implicit startup `default` namespace is a one-shot process-composition
+seed, not a persisted `/config/ns/default` value. Consequently the first
+explicit namespace mutation makes the concrete `/config/ns/*` key set
+authoritative: if that set contains `ns-alpha` but no `default`, the seed is
+replaced and clients which need the ordinary default fallback receive the exact
+namespace-missing 1105/HY000 response. Operationally, before writing the first
+explicit namespace, an installation that intends to retain `default` **must
+first persist `/config/ns/default` in the same authoritative set**. The T4
+runner does this explicitly; the paired regression proves both outcomes
+(unmaterialized default disappears, materialized default coexists and retains
+its incarnation).
+
+This also defines the recovery limitation precisely: if a namespace key is
+deleted while the watcher is disconnected and compaction forces a relist, bare
+absence is not distinguishable from a config-only snapshot. The old namespace
+therefore remains retained after that relist until the explicit delete is
+reissued (or a future persisted tombstone/admin delete protocol supplies that
+intent). Operators must not treat physical key absence during an outage as an
+acknowledged namespace delete. This behavior avoids the more dangerous cliff
+where an unrelated first proxy update empties all namespaces.
+
 ## TLS rotation
 
 TLS paths must be absolute and under configured allowed roots. Certificate and
@@ -298,24 +335,26 @@ connections observe the new certificate generation.
 ## Migration and bridge accounting
 
 CP-CFG first installs the Rust source and uses its accepted snapshot as the
-authoritative config/namespace input. While CP-TOPO is still landing, the
-legacy `StateSnapshot` adapter may continue to provide topology fields, but its
-config and namespace fields are ignored and cannot overwrite Rust-owned state.
-When capability `CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE` is negotiated, Go
-shrinks `StateSnapshot.config` to exactly `advertised_capability` and
-`server_version`, sends no `StateSnapshot.namespaces`, and retains
-`StateSnapshot.backends`. Rust consumes those two protocol/static config facts
-and the backend array; it ignores/replaces all of these former Go inputs:
+authoritative config/namespace input. With
+`CONTROL_CAPABILITY_RUST_ROUTE_OWNER`, CP-TOPO is authoritative too: Go shrinks
+`StateSnapshot.config` to exactly `advertised_capability` and `server_version`
+and sends empty `StateSnapshot.namespaces` **and**
+`StateSnapshot.backends`. Rust rejects a nonempty route field instead of
+silently composing two owners. It consumes only those two protocol/static
+config facts and replaces all former Go routing inputs:
 
 - `max_connections`, `high_memory_reject_threshold`,
   `connection_buffer_bytes`, all three keepalive messages, `proxy_protocol`,
   `require_backend_tls`, both graceful durations, `listeners`, `public_cidrs`,
   `frontend_tls`, `backend_tls`, and `traffic_replay_enabled`;
-- every `NamespaceSnapshot` field (`name`, `users`, `backend_cluster`).
+- every `NamespaceSnapshot` field (`name`, `users`, `backend_cluster`);
+- every `BackendSnapshot` field (identity, address, cluster, keyspace, health,
+  locality, draining, CIDRs, and labels).
 
-The capability is required on the shrunken envelope, so an older Rust peer
-fails negotiation instead of accepting an incomplete snapshot. Without the
-capability, Go preserves the old complete wire shape.
+Capabilities 5 and 6 are required by the bundled production pair, so an older
+peer fails handshake instead of accepting an incomplete snapshot. The cap5
+shape (Rust config/namespace with bridge backends) remains a compatibility-test
+stage only; cap6 is the production ownership fence.
 
 The legacy Go HTTP config/namespace endpoints remain part of CP-ADMIN #150,
 not a second CP-CFG generation authority. Until that slice migrates them, their
@@ -324,10 +363,11 @@ overwrite the Rust source or SQL-serving generation. The Rust
 `ConfigModuleHandle` is the sole owner-fenced persistent mutation surface and
 is intentionally process-local until CP-ADMIN binds the external API to it.
 
-After CP-TOPO rebases, an in-process composer combines CP-CFG and CP-TOPO
-snapshots for the dataplane. There is no shared source generation: the composer
-records `{config_generation, topology_generation}` and publishes exactly once
-per changed pair.
+An in-process composer combines CP-CFG, CP-TOPO routing, and the matching health
+overlay with the residual bridge facts. A wake from config, routing, or health
+re-pulls the complete current inputs, advances one process-local composition
+generation, validates the complete candidate, and atomically swaps the serving
+view. A failed candidate retains last-good.
 
 The `state_snapshot`/`snapshot_result` message pair cannot be deleted while its
 backend or protocol/static fields remain. The catalog therefore records this

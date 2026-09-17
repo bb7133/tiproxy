@@ -379,21 +379,21 @@ impl RouteCommandDispatcher {
 
 pub(crate) struct RejectedCommand {
     production: Option<Box<RouteCommandEnvelope>>,
-    _simulation: Option<Box<MigrationCommand>>,
+    _unarmed: Option<Box<MigrationCommand>>,
 }
 
 impl RejectedCommand {
     fn production(envelope: Box<RouteCommandEnvelope>) -> Self {
         Self {
             production: Some(envelope),
-            _simulation: None,
+            _unarmed: None,
         }
     }
 
-    fn simulation(command: MigrationCommand) -> Self {
+    fn unarmed(command: MigrationCommand) -> Self {
         Self {
             production: None,
-            _simulation: Some(Box::new(command)),
+            _unarmed: Some(Box::new(command)),
         }
     }
 
@@ -422,12 +422,12 @@ impl MigrationCommandSink for RouteCommandDispatcher {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&session_sequence)
             .cloned();
-        let (public_connection_id, fifo) = target.unwrap_or_else(|| {
-            (
-                command_connection_id(&command),
-                Arc::new(RouteCommandFifo::new(0)),
-            )
-        });
+        let Some((public_connection_id, fifo)) = target else {
+            // The session-long lease has already unregistered. Reject before
+            // allocating an envelope/guard or touching any FIFO; the router
+            // still commits its bounded refusal cooldown around this verdict.
+            return Err(RejectedCommand::unarmed(command));
+        };
         let envelope = RouteCommandEnvelope::new(
             Arc::clone(&self.router),
             command,
@@ -435,13 +435,6 @@ impl MigrationCommandSink for RouteCommandDispatcher {
             self.redirect_ttl,
         );
         fifo.try_send(envelope).map_err(RejectedCommand::production)
-    }
-}
-
-fn command_connection_id(command: &MigrationCommand) -> u64 {
-    match command {
-        MigrationCommand::Redirect(redirect) => redirect.to().connection_id,
-        MigrationCommand::ForceClose(close) => close.assignment().connection_id,
     }
 }
 
@@ -474,11 +467,11 @@ impl CommandQueue {
     fn try_send_inner(&self, command: MigrationCommand) -> Result<(), RejectedCommand> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if entries.len() >= self.capacity {
-            return Err(RejectedCommand::simulation(command));
+            return Err(RejectedCommand::unarmed(command));
         }
         #[cfg(test)]
         if self.api_sink.as_ref().is_some_and(|sink| !sink(&command)) {
-            return Err(RejectedCommand::simulation(command));
+            return Err(RejectedCommand::unarmed(command));
         }
         entries.push_back(command);
         Ok(())

@@ -61,29 +61,25 @@ func (srv *Server) startRustDataplane(
 		Initial:              cfg,
 		AdvertisedCapability: handshake.GetCapability().Uint32(),
 		ServerVersion:        handshake.GetServerVersion(),
-		// DPL-07: the wire snapshot carries the live namespace/backend
-		// topology so the Rust dataplane observes the same routing
-		// truth the Go proxy serves from.
-		Topology: func() ([]*controlpb.BackendSnapshot, []*controlpb.NamespaceSnapshot) {
-			return projectControlTopology(srv.namespaceManager)
-		},
+		// RUST_ROUTE_OWNER requires an empty bridge topology. CP-CFG/NS and
+		// CP-TOPO/CP-ROUTE publish their process-local views in Rust.
+		Topology: nil,
 	})
 	if err != nil {
 		return err
 	}
 
 	capabilities := []uint64{
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE),
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE),
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_ROUTE_OWNER),
 	}
 	var meteringSink controlbridge.MeteringSink
 	if srv.meter != nil {
 		meteringSink = srv.meter
 	}
 	bridge, err := controlbridge.NewBridge(controlbridge.BridgeConfig{
+		RouteOwner: true,
 		Transport: transport.ServerConfig{
 			SocketPath: socketPath,
 			AllowedUID: &allowedUID,
@@ -98,14 +94,6 @@ func (srv *Server) startRustDataplane(
 				BuildCommit:              versioninfo.TiProxyGitHash,
 			},
 			RequiredCapabilities: capabilities,
-		},
-		Handshake: handshake,
-		RouterLookup: func(namespace string) (router.Router, error) {
-			ns, ok := srv.namespaceManager.GetNamespace(namespace)
-			if !ok {
-				return nil, fmt.Errorf("namespace %q is unavailable", namespace)
-			}
-			return ns.GetRouter(), nil
 		},
 		Publisher:         publisher,
 		MeteringStatePath: meteringStatePath,

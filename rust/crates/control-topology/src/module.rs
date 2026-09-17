@@ -353,7 +353,44 @@ pub struct TopologyModuleHandle {
     mode_hook: crate::static_source::PublishHook,
 }
 
+/// Pull-on-wakeup observer for serving projections that depend on current
+/// routing and health publications. A wake grants no routing authority; the
+/// consumer must pull and validate the current exact sources again.
+pub struct TopologyUpdateObserver {
+    routing: RoutingSnapshotHandle,
+    health: HealthOverlayHandle,
+}
+
+impl TopologyUpdateObserver {
+    /// Waits until either the routing generation or its paired health overlay
+    /// changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable class when either publisher closes.
+    pub async fn changed(&mut self) -> Result<(), &'static str> {
+        tokio::select! {
+            result = self.routing.changed() => {
+                result.map_err(|_| "routing_source_closed")
+            }
+            result = self.health.changed() => {
+                result.map_err(|_| "health_source_closed")
+            }
+        }
+    }
+}
+
 impl TopologyModuleHandle {
+    /// Creates a wake-only observer for consumers that must rebuild a derived
+    /// serving view after routing or health publication.
+    #[must_use]
+    pub fn updates(&self) -> TopologyUpdateObserver {
+        TopologyUpdateObserver {
+            routing: self.routing.clone(),
+            health: self.health.clone(),
+        }
+    }
+
     /// Replaces only this handle's dynamic observer inputs for API replay.
     /// Config, namespace incarnation, mode and ownership fences remain real.
     /// No production caller enables the `api-replay` feature.

@@ -30,7 +30,12 @@ const DefaultSnapshotSyncInterval = 50 * time.Millisecond
 type BridgeConfig struct {
 	// Transport configures the mode-0600 control UDS owner.
 	Transport transport.ServerConfig
+	// RouteOwner installs the post-cutover residual handler. It is a
+	// compatibility assertion: this process never constructs a RouterAdapter
+	// and never falls back to Go routing after the first negotiation.
+	RouteOwner bool
 	// Handshake is the router adapter's authentication/routing seam.
+	// It is required only for the legacy, non-RouteOwner composition.
 	Handshake backend.HandshakeHandler
 	// RouterLookup resolves a namespace to its router for
 	// rehydration; optional at construction, attachable later through
@@ -117,6 +122,8 @@ type activeDrainState struct {
 type Bridge struct {
 	server           *transport.Server
 	adapter          *RouterAdapter
+	handler          *CompositeControlHandler
+	routeOwner       bool
 	issuer           *DrainIssuer
 	consumer         *MeteringConsumer
 	interval         time.Duration
@@ -131,15 +138,19 @@ type Bridge struct {
 // (fallible incarnation nonce), consumer, composite handler, and the
 // listening control socket. On any error nothing is left bound.
 func NewBridge(config BridgeConfig) (*Bridge, error) {
-	if config.Handshake == nil {
-		return nil, errors.New("bridge requires a handshake handler")
-	}
-	adapter, err := NewRouterAdapter(config.Handshake)
-	if err != nil {
-		return nil, err
-	}
-	if config.RouterLookup != nil {
-		adapter.AttachRouterLookup(config.RouterLookup)
+	var adapter *RouterAdapter
+	var err error
+	if !config.RouteOwner {
+		if config.Handshake == nil {
+			return nil, errors.New("bridge requires a handshake handler")
+		}
+		adapter, err = NewRouterAdapter(config.Handshake)
+		if err != nil {
+			return nil, err
+		}
+		if config.RouterLookup != nil {
+			adapter.AttachRouterLookup(config.RouterLookup)
+		}
 	}
 	issuer, err := NewDrainIssuer()
 	if err != nil {
@@ -152,7 +163,12 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 			return nil, err
 		}
 	}
-	composite, err := NewCompositeControlHandler(adapter, issuer, consumer)
+	var composite *CompositeControlHandler
+	if config.RouteOwner {
+		composite, err = NewRouteOwnerControlHandler(issuer, consumer)
+	} else {
+		composite, err = NewCompositeControlHandler(adapter, issuer, consumer)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +190,8 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	return &Bridge{
 		server:           server,
 		adapter:          adapter,
+		handler:          composite,
+		routeOwner:       config.RouteOwner,
 		issuer:           issuer,
 		consumer:         consumer,
 		interval:         interval,
@@ -186,6 +204,16 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 // router lookup here when it comes up after the bridge).
 func (bridge *Bridge) Adapter() *RouterAdapter {
 	return bridge.adapter
+}
+
+// RouteOwnerStatus exposes the residual handler's zero-route evidence. The
+// boolean is false for legacy compositions, where RouterAdapter intentionally
+// remains live.
+func (bridge *Bridge) RouteOwnerStatus() (RouteOwnerStatus, bool) {
+	if !bridge.routeOwner || bridge.handler == nil {
+		return RouteOwnerStatus{}, false
+	}
+	return bridge.handler.RouteOwnerStatus(), true
 }
 
 // Issuer exposes the drain issuer (operator drain entry).
@@ -360,15 +388,20 @@ func (bridge *Bridge) Run(ctx context.Context) error {
 	defer cancel()
 	var cadence waitgroup.WaitGroup
 	cadence.Run(func() {
-		orphanTicker := time.NewTicker(bridge.interval)
-		defer orphanTicker.Stop()
+		var orphanTicker *time.Ticker
+		var orphanTick <-chan time.Time
+		if bridge.adapter != nil {
+			orphanTicker = time.NewTicker(bridge.interval)
+			orphanTick = orphanTicker.C
+			defer orphanTicker.Stop()
+		}
 		snapshotTicker := time.NewTicker(bridge.snapshotInterval)
 		defer snapshotTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-orphanTicker.C:
+			case <-orphanTick:
 				// Bounded-retry convergence: unresolvable orphans end
 				// in a per-connection close; send errors keep the
 				// obligation for the next tick.

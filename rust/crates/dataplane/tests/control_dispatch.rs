@@ -23,7 +23,7 @@
 //! metering automatically on every `Connected` state transition using
 //! the sender's single checked allocator.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,13 +34,14 @@ use control_proto::v1::{
     ErrorSource, MeteringAck, MeteringDelta, MeteringSourceSnapshot, ProtocolError,
     ReconcileConnection, ReconcileSnapshot, RedirectCommand, RouteAssignment,
 };
+use dataplane::MeteringLedger;
 use dataplane::control_dispatch::{
     CommandKind, CommandToken, ControlCommandHandler, DispatchFatal, DispatchNotice,
     DispatchSender, InboundForwarder, ResponseKind, SessionDirective, TaggedEnvelope,
     run_control_dispatch,
 };
 use dataplane::session::SessionControl;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::Instant;
 
 fn identity(connection_id: u64) -> ConnectionIdentity {
@@ -794,6 +795,91 @@ impl DispatchSender for FakeSender {
     }
 }
 
+/// Sender seam for the reconnect-during-replay race. The first metering wire
+/// copy pauses before it becomes visible; switching `live_serial` models the
+/// transport replacing that session while the dispatch task awaits enqueue.
+/// Every old-serial tail then fails stale instead of entering the successor.
+struct SerialAwareBlockingSender {
+    next: AtomicU64,
+    live_serial: AtomicU64,
+    block_first_metering: AtomicBool,
+    fail_metering: AtomicBool,
+    metering_entered: Notify,
+    release_metering: Notify,
+    sent: Mutex<Vec<(ControlEnvelope, Option<u64>)>>,
+}
+
+impl SerialAwareBlockingSender {
+    fn new(live_serial: u64) -> Arc<Self> {
+        Arc::new(Self {
+            next: AtomicU64::new(0),
+            live_serial: AtomicU64::new(live_serial),
+            block_first_metering: AtomicBool::new(true),
+            fail_metering: AtomicBool::new(false),
+            metering_entered: Notify::new(),
+            release_metering: Notify::new(),
+            sent: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn replace_session(&self, serial: u64) {
+        self.live_serial.store(serial, Ordering::Release);
+    }
+
+    fn release_blocked_metering(&self) {
+        self.release_metering.notify_one();
+    }
+
+    fn fail_metering(&self, fail: bool) {
+        self.fail_metering.store(fail, Ordering::Release);
+    }
+
+    fn sent_with_scope(&self) -> Vec<(ControlEnvelope, Option<u64>)> {
+        let Ok(sent) = self.sent.lock() else {
+            unreachable!("sent lock poisoned")
+        };
+        sent.clone()
+    }
+
+    fn push(&self, envelope: ControlEnvelope, scope: Option<u64>) {
+        let Ok(mut sent) = self.sent.lock() else {
+            unreachable!("sent lock poisoned")
+        };
+        sent.push((envelope, scope));
+    }
+}
+
+impl DispatchSender for SerialAwareBlockingSender {
+    fn allocate_request_id(&self) -> Option<u64> {
+        Some(self.next.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    async fn send_envelope(&self, envelope: ControlEnvelope) -> Result<(), TransportError> {
+        self.push(envelope, None);
+        Ok(())
+    }
+
+    async fn send_session_scoped(
+        &self,
+        envelope: ControlEnvelope,
+        serial: u64,
+    ) -> Result<(), TransportError> {
+        let is_metering = matches!(envelope.body, Some(Body::MeteringBatch(_)));
+        if is_metering && self.block_first_metering.swap(false, Ordering::AcqRel) {
+            self.metering_entered.notify_one();
+            self.release_metering.notified().await;
+        }
+        if self.live_serial.load(Ordering::Acquire) != serial {
+            return Err(TransportError::StaleSessionEpoch);
+        }
+        if is_metering && self.fail_metering.load(Ordering::Acquire) {
+            return Err(TransportError::QueueFull);
+        }
+        self.push(envelope, Some(serial));
+        Ok(())
+    }
+}
+
 struct LoopHarness {
     sender: Arc<FakeSender>,
     state_tx: watch::Sender<ConnectionState>,
@@ -886,6 +972,10 @@ fn full_caps() -> u64 {
 
 fn metering_cap() -> u64 {
     1u64 << (ControlCapability::MeteringAbsoluteSnapshots as u64)
+}
+
+fn route_owner_metering_caps() -> u64 {
+    metering_cap() | (1u64 << (ControlCapability::RustRouteOwner as u64))
 }
 
 /// A Go durable-consumer failure is a dataplane fatal, not a reconnect-only
@@ -997,8 +1087,7 @@ async fn stale_metering_ack_does_not_trim_successor_replay() {
     let Ok(()) = std::fs::create_dir_all(&directory) else {
         unreachable!("create metering WAL directory")
     };
-    let Ok(mut ledger) = dataplane::MeteringLedger::open_persistent(directory.join("metering.wal"))
-    else {
+    let Ok(mut ledger) = MeteringLedger::open_persistent(directory.join("metering.wal")) else {
         unreachable!("open persistent metering ledger")
     };
     let Ok(Some(batch)) = ledger.record_snapshots(vec![MeteringSourceSnapshot {
@@ -1107,6 +1196,34 @@ async fn wait_for_sent(sender: &Arc<FakeSender>, count: usize) -> Vec<ControlEnv
     );
 }
 
+async fn record_absolute_snapshot(
+    harness: &LoopHarness,
+    process_generation: u64,
+    connection_id: u64,
+    response_bytes: u64,
+) {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    harness
+        .notice_tx
+        .send(DispatchNotice::MeteringSnapshots {
+            snapshots: vec![MeteringSourceSnapshot {
+                connection_id,
+                process_generation,
+                backend_generation: 1,
+                backend_id: "tidb-a".to_owned(),
+                keyspace: "ks-ordered-replay".to_owned(),
+                backend_outbound_bytes: response_bytes,
+                ..MeteringSourceSnapshot::default()
+            }],
+            ack: ack_tx,
+        })
+        .await
+        .ok();
+    let Ok(Ok(())) = ack_rx.await else {
+        unreachable!("the absolute snapshot was durably sealed")
+    };
+}
+
 /// Every `Connected` transition automatically reconciles and replays
 /// unacknowledged metering — with allocator-issued request ids and the
 /// epoch's own capability mask deciding the peer mode.
@@ -1176,7 +1293,11 @@ async fn connected_transition_reconciles_and_replays_metering() {
         unreachable!("unacked metering replays after the reconcile")
     };
     assert_eq!(replayed, &batch, "the exact sealed batch replays");
-    assert_eq!(scoped[1].1, None, "metering batches are durable");
+    assert_eq!(
+        scoped[1].1,
+        Some(1),
+        "the WAL is durable; its wire copy is scoped to this session"
+    );
     assert!(
         sent[1].request_id > sent[0].request_id,
         "one checked allocator: ids strictly increase"
@@ -1187,9 +1308,10 @@ async fn connected_transition_reconciles_and_replays_metering() {
 
 /// Without `RECONCILE_CONNECTIONS` no reconcile request is sent — no
 /// ack path can exist, so the ledger's bounded unacked retention is
-/// the explicit backpressure — while durable metering still replays.
+/// the explicit backpressure — while WAL-owned metering still replays
+/// through a session-scoped wire copy.
 #[tokio::test(start_paused = true)]
-async fn no_reconcile_capability_skips_request_and_replays_durably() {
+async fn no_reconcile_capability_skips_request_and_replays_session_scoped() {
     let mut handler = ControlCommandHandler::new();
     assert!(
         handler
@@ -1218,7 +1340,12 @@ async fn no_reconcile_capability_skips_request_and_replays_durably() {
     let sent = wait_for_sent(&harness.sender, 1).await;
     assert!(
         matches!(sent[0].body, Some(Body::MeteringBatch(_))),
-        "only the durable metering replay goes out"
+        "only the WAL-owned metering replay goes out"
+    );
+    assert_eq!(
+        harness.sender.sent_with_scope()[0].1,
+        Some(1),
+        "the wire copy never survives into another session"
     );
     assert!(
         !sent
@@ -1412,6 +1539,102 @@ async fn wrong_direction_bodies_are_violations() {
     assert_eq!(handler.unrouted(), 2);
 }
 
+#[tokio::test(start_paused = true)]
+async fn route_owner_rejects_tombstones_without_route_side_effects() {
+    let mut handler = ControlCommandHandler::with_metering_route_owner(MeteringLedger::new());
+    handler.on_connected(
+        1,
+        1u64 << (ControlCapability::RustRouteOwner as u64),
+        1,
+        Arc::from("go-route-owner"),
+        1_700_000_000_000,
+    );
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+    let retired = vec![
+        Body::HandshakeResponse(control_proto::v1::HandshakeResponseEvent::default()),
+        Body::HandshakeDecision(control_proto::v1::HandshakeDecision::default()),
+        Body::HandshakeResult(control_proto::v1::HandshakeResult::default()),
+        Body::RouteRequest(control_proto::v1::RouteRequest::default()),
+        Body::RouteAssignment(RouteAssignment::default()),
+        Body::RouteResult(control_proto::v1::RouteResult::default()),
+        Body::ConnectionEvent(control_proto::v1::ConnectionEvent::default()),
+        Body::RedirectCommand(RedirectCommand::default()),
+        Body::RedirectResult(control_proto::v1::RedirectResult::default()),
+        Body::CloseCommand(CloseCommand::default()),
+        Body::CloseResult(control_proto::v1::CloseResult::default()),
+    ];
+    let initial_hash = handler.route_state_hash();
+    for (index, body) in retired.into_iter().enumerate() {
+        let before = handler.route_state_hash();
+        let out = handler.handle_envelope(&envelope(index as u64 + 1, 7, body), now, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+        assert_eq!(handler.route_state_hash(), before);
+        assert_eq!(handler.legacy_route_violations(), index as u64 + 1);
+        assert!(session.control.try_recv().is_err(), "no retired body acts");
+    }
+    assert_eq!(handler.route_state_hash(), initial_hash);
+
+    let request = handler.build_reconcile_request(7);
+    assert!(request.connections.is_empty());
+    assert_eq!(request.last_connection_event_sequence, 0);
+
+    let closed = handler.session_closed(
+        1,
+        false,
+        ErrorSource::ClientNetwork,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    assert!(
+        closed.is_empty(),
+        "route owner emits neither ConnectionEvent nor route terminal"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn route_owner_reconcile_rejects_route_state_and_accepts_residual_ack() {
+    let mut handler = ControlCommandHandler::with_metering_route_owner(MeteringLedger::new());
+    handler.on_connected(
+        5,
+        1u64 << (ControlCapability::RustRouteOwner as u64),
+        5,
+        Arc::from("go-route-owner"),
+        1_700_000_000_000,
+    );
+    let now = Instant::now();
+    let bad = envelope(
+        1,
+        7,
+        Body::ReconcileSnapshot(ReconcileSnapshot {
+            connection_event_sequence: 1,
+            connections: vec![ReconcileConnection {
+                connection_id: 9,
+                ..ReconcileConnection::default()
+            }],
+            ..ReconcileSnapshot::default()
+        }),
+    );
+    let before = handler.route_state_hash();
+    let out = handler.handle_envelope(&bad, now, 1);
+    assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+    assert_eq!(handler.route_state_hash(), before);
+    assert_eq!(handler.legacy_route_violations(), 1);
+
+    let residual = envelope(
+        2,
+        7,
+        Body::ReconcileSnapshot(ReconcileSnapshot {
+            applied_generation: 7,
+            metering_sequence: 0,
+            ..ReconcileSnapshot::default()
+        }),
+    );
+    assert!(handler.handle_envelope(&residual, now, 2).is_empty());
+    assert_eq!(handler.route_state_hash(), before);
+    assert_eq!(handler.legacy_route_violations(), 1);
+}
+
 /// Stale-epoch reconcile snapshots are superseded — the current
 /// session\'s automatic request gets a fresh one — while commands from
 /// any epoch still flow through the gate\'s own cross-epoch invariants;
@@ -1482,12 +1705,14 @@ async fn reconcile_snapshot_epoch_and_capability_policy() {
 }
 
 /// The metering production path end to end: session deltas arrive as
-/// notices, the tick seals the batch onto the wire durably, and the
+/// notices, the tick seals the batch into the durable WAL and sends a
+/// session-scoped wire copy, and the
 /// ledger retains it until a reconcile ack.
 #[tokio::test(start_paused = true)]
 async fn metering_notices_seal_and_send_on_tick() {
     let handler = ControlCommandHandler::new();
     let harness = spawn_loop_with_tick(handler, Duration::from_millis(50));
+    connect_go_fixture(&harness, 1);
     let (metering_ack_tx, metering_ack_rx) = tokio::sync::oneshot::channel();
     harness
         .notice_tx
@@ -1515,8 +1740,599 @@ async fn metering_notices_seal_and_send_on_tick() {
     assert_eq!(batch.deltas.len(), 1);
     assert_eq!(batch.deltas[0].response_bytes, 256);
     let scoped = harness.sender.sent_with_scope();
-    assert_eq!(scoped[0].1, None, "metering batches are durable");
+    assert_eq!(
+        scoped[0].1,
+        Some(1),
+        "only the WAL is durable; the wire copy is session-scoped"
+    );
     harness.task.abort();
+}
+
+/// Absolute metering has exactly one cross-session owner: the WAL. A
+/// session's ordered sender opens only after that same session's residual
+/// reconcile snapshot, enqueues the retained WAL head before any newer seal,
+/// and emits session-scoped wire copies. Because producer-qualified ACKs are
+/// the only trim authority, the WAL head is always `<= peer_applied + 1`: lost
+/// ACK duplicates are skipped by Go, while the first unapplied batch is the
+/// contiguous next sequence and can never be overtaken into a fatal gap.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two sessions, a durable ACK, and the ordered replay are one invariant"
+)]
+#[tokio::test(start_paused = true)]
+async fn absolute_metering_wal_is_sole_owner_and_session_sender_never_creates_gap() {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    let directory = std::env::temp_dir().join(format!(
+        "tiproxy-control-dispatch-metering-order-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ));
+    assert!(std::fs::create_dir_all(&directory).is_ok());
+    let Ok(ledger) = MeteringLedger::open_persistent(directory.join("metering.wal")) else {
+        unreachable!("open persistent metering ledger")
+    };
+    let process_generation = ledger.process_generation();
+    let harness = spawn_loop(ControlCommandHandler::with_metering_route_owner(ledger));
+
+    // Two batches seal while disconnected. They exist only in the WAL: no
+    // transport queue acquires a second durable copy.
+    record_absolute_snapshot(&harness, process_generation, 1, 10).await;
+    record_absolute_snapshot(&harness, process_generation, 1, 20).await;
+    assert!(
+        harness.sender.sent().is_empty(),
+        "disconnected seals remain WAL-only"
+    );
+
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 1,
+            capabilities: route_owner_metering_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 1).await;
+    assert!(matches!(sent[0].body, Some(Body::ReconcileRequest(_))));
+    assert_eq!(
+        harness.sender.sent_with_scope()[0].1,
+        Some(1),
+        "the residual reconcile request belongs to session 1"
+    );
+
+    // A newer seal lands after connect but before the session's reconcile
+    // snapshot. It must stay behind batches 1 and 2 in the WAL, with no eager
+    // wire send that could overtake replay.
+    record_absolute_snapshot(&harness, process_generation, 1, 30).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.sender.sent().len(),
+        1,
+        "the current-session reconcile snapshot is the delivery gate"
+    );
+
+    // The peer reports that it applied through 2 but its ACK was lost. A v1
+    // snapshot has no producer id, so it cannot trim this producer-qualified
+    // WAL. Ordered replay [1,2,3] is intentional: Go skips 1/2 and applies 3.
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            ControlEnvelope {
+                request_id: 100,
+                control_epoch: 1,
+                body: Some(Body::ReconcileSnapshot(ReconcileSnapshot {
+                    metering_sequence: 2,
+                    ..ReconcileSnapshot::default()
+                })),
+                ..ControlEnvelope::default()
+            },
+            1,
+            1,
+        ))
+        .await
+        .ok();
+    let _ = wait_for_sent(&harness.sender, 4).await;
+    let first_replay: Vec<_> = harness
+        .sender
+        .sent_with_scope()
+        .into_iter()
+        .filter_map(|(envelope, scope)| match envelope.body {
+            Some(Body::MeteringBatch(batch)) => Some((batch.sequence, batch.producer_id, scope)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        first_replay
+            .iter()
+            .map(|(sequence, _, scope)| (*sequence, *scope))
+            .collect::<Vec<_>>(),
+        vec![(1, Some(1)), (2, Some(1)), (3, Some(1))],
+        "the single session sender drains the WAL head before newer work"
+    );
+    let producer_id = first_replay[0].1.clone();
+    assert!(
+        first_replay
+            .iter()
+            .all(|(_, producer, _)| producer == &producer_id),
+        "one WAL replay keeps one producer lineage"
+    );
+
+    // A producer-qualified ACK is the sole durable trim authority. The
+    // marker is FIFO behind it; observing the marker answer proves ACK 2 was
+    // applied before the next connection transition.
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            ControlEnvelope {
+                request_id: 200,
+                control_epoch: 1,
+                body: Some(Body::MeteringAck(MeteringAck {
+                    producer_id: producer_id.clone(),
+                    sequence: 2,
+                })),
+                ..ControlEnvelope::default()
+            },
+            1,
+            1,
+        ))
+        .await
+        .ok();
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            envelope(
+                201,
+                0,
+                Body::RedirectCommand(redirect(999, "metering-ack-marker", 1)),
+            ),
+            1,
+            1,
+        ))
+        .await
+        .ok();
+    let sent = wait_for_sent(&harness.sender, 5).await;
+    assert!(sent.iter().any(|envelope| envelope.request_id == 201));
+
+    // Session 2 gets its own reconcile gate. Batch 4, sealed while that gate
+    // is closed, stays after retained batch 3. Snapshot watermark 3 again
+    // cannot trim without a producer id, so replay [3,4] is safe and exact.
+    harness.state_tx.send(ConnectionState::Disconnected).ok();
+    harness
+        .state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: route_owner_metering_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    let _ = wait_for_sent(&harness.sender, 6).await;
+    record_absolute_snapshot(&harness, process_generation, 1, 40).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        harness.sender.sent().len(),
+        6,
+        "new seals remain WAL-only until session 2 reconciles"
+    );
+    harness
+        .inbound_tx
+        .send(tagged_on(
+            ControlEnvelope {
+                request_id: 300,
+                control_epoch: 2,
+                body: Some(Body::ReconcileSnapshot(ReconcileSnapshot {
+                    metering_sequence: 3,
+                    ..ReconcileSnapshot::default()
+                })),
+                ..ControlEnvelope::default()
+            },
+            2,
+            2,
+        ))
+        .await
+        .ok();
+    let _ = wait_for_sent(&harness.sender, 8).await;
+    let all_replays: Vec<_> = harness
+        .sender
+        .sent_with_scope()
+        .into_iter()
+        .filter_map(|(envelope, scope)| match envelope.body {
+            Some(Body::MeteringBatch(batch)) => Some((batch.sequence, batch.producer_id, scope)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        all_replays
+            .iter()
+            .map(|(sequence, _, scope)| (*sequence, *scope))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, Some(1)),
+            (2, Some(1)),
+            (3, Some(1)),
+            (3, Some(2)),
+            (4, Some(2)),
+        ],
+        "ACK 2 trims only 1/2; lost ACK 3 permits ordered duplicate 3 before 4"
+    );
+    assert!(
+        all_replays
+            .iter()
+            .all(|(_, producer, _)| producer == &producer_id),
+        "the persistent WAL preserves producer id across reconnects"
+    );
+
+    harness.task.abort();
+    let _ = harness.task.await;
+    assert!(std::fs::remove_dir_all(directory).is_ok());
+}
+
+/// A bridge replacement that lands while an old session's WAL replay is
+/// blocked cannot open two senders. The old serial drops its whole remaining
+/// tail; the successor stays closed until its own snapshot, then regenerates
+/// the complete WAL replay under only the new serial.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the blocked replay and successor replay are one reconnect race"
+)]
+#[tokio::test(start_paused = true)]
+async fn reconnect_during_absolute_replay_never_mixes_session_serials() {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    let directory = std::env::temp_dir().join(format!(
+        "tiproxy-control-dispatch-metering-race-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ));
+    assert!(std::fs::create_dir_all(&directory).is_ok());
+    let Ok(mut ledger) = MeteringLedger::open_persistent(directory.join("metering.wal")) else {
+        unreachable!("open persistent metering ledger")
+    };
+    let process_generation = ledger.process_generation();
+    for response_bytes in [10, 20, 30] {
+        assert!(
+            ledger
+                .record_snapshots(vec![MeteringSourceSnapshot {
+                    connection_id: 1,
+                    process_generation,
+                    backend_generation: 1,
+                    backend_id: "tidb-a".to_owned(),
+                    keyspace: "ks-replay-race".to_owned(),
+                    backend_outbound_bytes: response_bytes,
+                    ..MeteringSourceSnapshot::default()
+                }])
+                .is_ok()
+        );
+    }
+
+    let sender = SerialAwareBlockingSender::new(1);
+    let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+    let (inbound_tx, inbound_rx) = mpsc::channel(16);
+    let (_notice_tx, notice_rx) = mpsc::channel(16);
+    let (snapshot_tx, _snapshot_rx) = mpsc::channel(4);
+    let task = tokio::spawn(run_control_dispatch(
+        ControlCommandHandler::with_metering_route_owner(ledger),
+        Arc::clone(&sender),
+        state_rx,
+        inbound_rx,
+        notice_rx,
+        snapshot_tx,
+        Duration::from_secs(3600),
+        || 1_000_000,
+    ));
+
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 1,
+            capabilities: route_owner_metering_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    for _ in 0..1_000 {
+        if sender.sent_with_scope().iter().any(|(envelope, scope)| {
+            matches!(envelope.body, Some(Body::ReconcileRequest(_))) && *scope == Some(1)
+        }) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(sender.sent_with_scope().iter().any(|(envelope, scope)| {
+        matches!(envelope.body, Some(Body::ReconcileRequest(_))) && *scope == Some(1)
+    }));
+
+    inbound_tx
+        .send(tagged_on(
+            ControlEnvelope {
+                request_id: 400,
+                control_epoch: 1,
+                body: Some(Body::ReconcileSnapshot(ReconcileSnapshot::default())),
+                ..ControlEnvelope::default()
+            },
+            1,
+            1,
+        ))
+        .await
+        .ok();
+    sender.metering_entered.notified().await;
+
+    // The transport installs serial 2 while the first serial-1 batch waits
+    // for queue capacity. Releasing that send makes it (and the remaining
+    // serial-1 replay tail) stale. The dispatch loop then observes the
+    // pending Connected(2) and opens a fresh, closed delivery generation.
+    sender.replace_session(2);
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 2,
+            serial: 2,
+            capabilities: route_owner_metering_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    sender.release_blocked_metering();
+    for _ in 0..10_000 {
+        let reconciles = sender
+            .sent_with_scope()
+            .iter()
+            .filter(|(envelope, _)| matches!(envelope.body, Some(Body::ReconcileRequest(_))))
+            .count();
+        if reconciles >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let before_snapshot = sender.sent_with_scope();
+    assert_eq!(
+        before_snapshot
+            .iter()
+            .filter(|(envelope, _)| matches!(envelope.body, Some(Body::ReconcileRequest(_))))
+            .count(),
+        2,
+        "each serial gets exactly one reconcile request"
+    );
+    assert!(
+        !before_snapshot
+            .iter()
+            .any(|(envelope, _)| matches!(envelope.body, Some(Body::MeteringBatch(_)))),
+        "serial 1's blocked replay tail never mixes into serial 2"
+    );
+
+    inbound_tx
+        .send(tagged_on(
+            ControlEnvelope {
+                request_id: 401,
+                control_epoch: 2,
+                body: Some(Body::ReconcileSnapshot(ReconcileSnapshot::default())),
+                ..ControlEnvelope::default()
+            },
+            2,
+            2,
+        ))
+        .await
+        .ok();
+    for _ in 0..10_000 {
+        if sender
+            .sent_with_scope()
+            .iter()
+            .filter(|(envelope, _)| matches!(envelope.body, Some(Body::MeteringBatch(_))))
+            .count()
+            >= 3
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let replay: Vec<_> = sender
+        .sent_with_scope()
+        .into_iter()
+        .filter_map(|(envelope, scope)| match envelope.body {
+            Some(Body::MeteringBatch(batch)) => Some((batch.sequence, batch.producer_id, scope)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replay
+            .iter()
+            .map(|(sequence, _, scope)| (*sequence, *scope))
+            .collect::<Vec<_>>(),
+        vec![(1, Some(2)), (2, Some(2)), (3, Some(2))],
+        "the successor alone regenerates one complete ordered replay"
+    );
+    assert!(
+        replay
+            .windows(2)
+            .all(|pair| pair[0].1 == pair[1].1 && pair[0].0 + 1 == pair[1].0),
+        "producer lineage and sequence stay contiguous"
+    );
+
+    task.abort();
+    let _ = task.await;
+    assert!(std::fs::remove_dir_all(directory).is_ok());
+}
+
+/// A local send failure closes the current delivery generation. Until a
+/// qualified snapshot explicitly reopens replay, later seals remain WAL-only;
+/// otherwise sequence 2 could jump past failed sequence 1 on the same session.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the failed send, later seal, and same-session retry are one invariant"
+)]
+#[tokio::test(start_paused = true)]
+async fn failed_metering_send_closes_generation_and_new_seal_stays_wal_only() {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    let directory = std::env::temp_dir().join(format!(
+        "tiproxy-control-dispatch-metering-failure-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ));
+    assert!(std::fs::create_dir_all(&directory).is_ok());
+    let Ok(mut ledger) = MeteringLedger::open_persistent(directory.join("metering.wal")) else {
+        unreachable!("open persistent metering ledger")
+    };
+    let process_generation = ledger.process_generation();
+    assert!(
+        ledger
+            .record_snapshots(vec![MeteringSourceSnapshot {
+                connection_id: 1,
+                process_generation,
+                backend_generation: 1,
+                backend_id: "tidb-a".to_owned(),
+                keyspace: "ks-send-failure".to_owned(),
+                backend_outbound_bytes: 10,
+                ..MeteringSourceSnapshot::default()
+            }])
+            .is_ok()
+    );
+    let handler = ControlCommandHandler::with_metering_route_owner(ledger);
+    let stats = handler.stats();
+    let sender = SerialAwareBlockingSender::new(1);
+    let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+    let (inbound_tx, inbound_rx) = mpsc::channel(16);
+    let (notice_tx, notice_rx) = mpsc::channel(16);
+    let (snapshot_tx, _snapshot_rx) = mpsc::channel(4);
+    let task = tokio::spawn(run_control_dispatch(
+        handler,
+        Arc::clone(&sender),
+        state_rx,
+        inbound_rx,
+        notice_rx,
+        snapshot_tx,
+        Duration::from_secs(3600),
+        || 1_000_000,
+    ));
+
+    state_tx
+        .send(ConnectionState::Connected {
+            epoch: 1,
+            serial: 1,
+            capabilities: route_owner_metering_caps(),
+            peer_process_id: Arc::from("go-fixture"),
+            peer_started_unix_millis: 1_700_000_000_000,
+        })
+        .ok();
+    for _ in 0..1_000 {
+        if sender
+            .sent_with_scope()
+            .iter()
+            .any(|(envelope, _)| matches!(envelope.body, Some(Body::ReconcileRequest(_))))
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    inbound_tx
+        .send(tagged_on(
+            ControlEnvelope {
+                request_id: 500,
+                control_epoch: 1,
+                body: Some(Body::ReconcileSnapshot(ReconcileSnapshot::default())),
+                ..ControlEnvelope::default()
+            },
+            1,
+            1,
+        ))
+        .await
+        .ok();
+    sender.metering_entered.notified().await;
+    sender.fail_metering(true);
+    sender.release_blocked_metering();
+    for _ in 0..1_000 {
+        if stats.send_failures.load(Ordering::Relaxed) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stats.send_failures.load(Ordering::Relaxed), 1);
+    assert!(
+        !sender
+            .sent_with_scope()
+            .iter()
+            .any(|(envelope, _)| matches!(envelope.body, Some(Body::MeteringBatch(_)))),
+        "failed sequence 1 never entered the wire"
+    );
+
+    // Make later sends healthy, then seal sequence 2. A still-open gate would
+    // emit it immediately and create a gap; the closed generation keeps it in
+    // the WAL instead.
+    sender.fail_metering(false);
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    notice_tx
+        .send(DispatchNotice::MeteringSnapshots {
+            snapshots: vec![MeteringSourceSnapshot {
+                connection_id: 1,
+                process_generation,
+                backend_generation: 1,
+                backend_id: "tidb-a".to_owned(),
+                keyspace: "ks-send-failure".to_owned(),
+                backend_outbound_bytes: 20,
+                ..MeteringSourceSnapshot::default()
+            }],
+            ack: ack_tx,
+        })
+        .await
+        .ok();
+    assert!(matches!(ack_rx.await, Ok(Ok(()))));
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !sender
+            .sent_with_scope()
+            .iter()
+            .any(|(envelope, _)| matches!(envelope.body, Some(Body::MeteringBatch(_)))),
+        "a later seal cannot jump past the failed WAL head"
+    );
+
+    // A fresh qualified snapshot on the same still-live session is allowed to
+    // reopen the generation and must restart from the WAL head, in order.
+    inbound_tx
+        .send(tagged_on(
+            ControlEnvelope {
+                request_id: 501,
+                control_epoch: 1,
+                body: Some(Body::ReconcileSnapshot(ReconcileSnapshot::default())),
+                ..ControlEnvelope::default()
+            },
+            1,
+            1,
+        ))
+        .await
+        .ok();
+    for _ in 0..1_000 {
+        if sender
+            .sent_with_scope()
+            .iter()
+            .filter(|(envelope, _)| matches!(envelope.body, Some(Body::MeteringBatch(_))))
+            .count()
+            >= 2
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let replay: Vec<_> = sender
+        .sent_with_scope()
+        .into_iter()
+        .filter_map(|(envelope, scope)| match envelope.body {
+            Some(Body::MeteringBatch(batch)) => Some((batch.sequence, scope)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replay, vec![(1, Some(1)), (2, Some(1))]);
+
+    task.abort();
+    let _ = task.await;
+    assert!(std::fs::remove_dir_all(directory).is_ok());
 }
 
 /// `StateSnapshot` bodies forward — awaited — to the mandatory CTL-05

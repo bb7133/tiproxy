@@ -14,6 +14,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+bash -n "$script_dir/run.sh" "$script_dir/qualify-route-owner.sh"
+qualification_plan=$("$script_dir/qualify-route-owner.sh" --print-plan)
+if [[ $(wc -l <<<"$qualification_plan" | tr -d ' ') != 48 ]]; then
+	echo "T4 qualification plan does not contain exactly 48 physical cells" >&2
+	exit 1
+fi
+if [[ $(grep -c $'\tsentinel\ttls-proxy-zstd$' <<<"$qualification_plan") != 3 ]] ||
+	! grep -q $'^M1\tsentinel\ttls-proxy-zstd$' <<<"$qualification_plan" ||
+	! grep -q $'^M7\tsentinel\ttls-proxy-zstd$' <<<"$qualification_plan" ||
+	! grep -q $'^M9\tsentinel\ttls-proxy-zstd$' <<<"$qualification_plan"; then
+	echo "T4 qualification sentinels are not exactly M1/M7/M9" >&2
+	exit 1
+fi
+
 # Framework-only checks must not require a real TiUP installation or database
 # client. These two fakes satisfy preflight discovery but cannot provision or
 # query anything; the tested Rust path must stop before either would be used.
@@ -79,6 +93,7 @@ fi
 
 go test "$repo_root/tests/dataplane/integration/faultproxy"
 go test "$repo_root/tests/dataplane/integration/controldropper"
+go test "$repo_root/tests/dataplane/integration/controlrejector"
 
 "$script_dir/generate-certs.sh" "$temp_dir/certs" >/dev/null
 openssl verify -CAfile "$temp_dir/certs/ca.pem" \

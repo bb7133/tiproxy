@@ -105,7 +105,7 @@ EOF
 	exit 78
 fi
 
-for capability in control-bridge-v1 mysql-listener health-endpoint graceful-shutdown; do
+for capability in control-bridge-v1 rust-route-owner mysql-listener health-endpoint graceful-shutdown; do
 	if [[ ",$capabilities," != *",$capability,"* ]]; then
 		echo "Rust dataplane integration preflight failed: capability '$capability' is absent from '$capabilities'" >&2
 		exit 78

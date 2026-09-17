@@ -51,6 +51,7 @@ use control_proto::v1::{ControlCapability, Hello, Role};
 use control_router::{RouteCandidateValidator, RoutePlane};
 use control_topology::{
     AdvertiseEndpointResolver, InterfaceAdvertiseResolver, MetricCollector, TopologyModule,
+    TopologyModuleHandle,
 };
 use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
 use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
@@ -81,6 +82,7 @@ const CONFIG_FILE_ENV: &str = "TIPROXY_CONFIG";
 /// stops making progress therefore reaches the armed startup rollback seam with
 /// a module-qualified diagnostic instead of freezing process startup forever.
 const CONTROL_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_MODULE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound for `--drain-grace-seconds` (30 days, the drain
 /// subsystem's shared deadline cap): far above any real grace and small
@@ -112,7 +114,7 @@ enum Command {
 /// C) are all wired, so `tls`, `proxy-v2`, `zlib`, and `zstd` are advertised
 /// and the topology preflight admits plain, tls, proxy, and compressed
 /// variants.
-const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
+const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -439,11 +441,9 @@ async fn run(options: Options) -> Result<(), String> {
     );
     let in_process_config = in_process.handle().config().current();
     let capabilities = vec![
-        ControlCapability::PerConnectionClose as u64,
-        ControlCapability::ReconcileConnections as u64,
-        ControlCapability::ReconcileSessionRehydration as u64,
         ControlCapability::MeteringAbsoluteSnapshots as u64,
         ControlCapability::RustConfigNamespace as u64,
+        ControlCapability::RustRouteOwner as u64,
     ];
     let hello = Hello {
         role: Role::RustDataplane as i32,
@@ -461,7 +461,7 @@ async fn run(options: Options) -> Result<(), String> {
         .map_err(|error| format!("open metering WAL: {error}"))?;
     let metering = MeteringSourceRegistry::new(ledger.process_generation())
         .map_err(|error| format!("create metering registry: {error}"))?;
-    let dispatch_handler = ControlCommandHandler::with_metering(ledger);
+    let dispatch_handler = ControlCommandHandler::with_metering_route_owner(ledger);
     let mut client =
         ClientConfig::with_defaults(options.control_socket, options.control_uid, hello);
     client.required_capabilities = capabilities;
@@ -623,8 +623,10 @@ async fn run(options: Options) -> Result<(), String> {
     // retained topology source before any serving snapshot can open listeners.
     // T2 consumes that ready handle for local initial routing; the bridge route
     // path remains available only to compatibility tests.
+    let route_config_source: Arc<dyn ConfigNamespaceSource> =
+        Arc::new(config_owner.handle.source().clone());
     let (route_plane, mut route_plane_handle) = RoutePlane::new(
-        Arc::new(config_owner.handle.source().clone()),
+        Arc::clone(&route_config_source),
         topology_handle.clone(),
         Some(metric_overlay),
     );
@@ -658,27 +660,27 @@ async fn run(options: Options) -> Result<(), String> {
         .with_route_plane(route_plane_handle.clone()),
     );
     let (connection_handler, installer) = DispatchConnectionHandler::new("default", owner);
-    let composer = Arc::new(RustConfigComposer::new(
-        config_owner.handle.source().clone(),
-        options.drain_grace,
-    ));
+    let composer = Arc::new(
+        RustConfigComposer::new(config_owner.handle.source().clone(), options.drain_grace)
+            .with_topology(topology_handle.clone()),
+    );
     let (consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
         Arc::new(SystemMemoryProbe::new()),
         Arc::new(connection_handler),
-        composer,
+        composer.clone(),
     );
     // Forced shutdown lets each session owner finish its bounded terminal work
     // before the abort backstop fires.
     let consumer =
         consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
     if let Err(error) = guard.spawn_module(ConfigServingAdapter::new(
-        config_owner.handle.source().clone(),
         serving.clone(),
         store.clone(),
         Arc::clone(&in_process),
         options.health_port,
         config_owner.tls_roots,
         options.drain_grace,
+        composer,
     )) {
         return Err(guard
             .rollback(format!("start config serving adapter: {error}"))
@@ -728,7 +730,15 @@ async fn run(options: Options) -> Result<(), String> {
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
-    match spawn_health(in_process_config.health_port(), serving.clone()).await {
+    match spawn_health(
+        in_process_config.health_port(),
+        serving.clone(),
+        route_plane_handle,
+        route_config_source,
+        topology_handle,
+    )
+    .await
+    {
         Ok(Some(health_task)) => guard.set_health_task(health_task),
         Ok(None) => {}
         Err(error) => return Err(guard.rollback(error).await),
@@ -879,8 +889,13 @@ async fn run(options: Options) -> Result<(), String> {
     let finish_result = in_process
         .finish()
         .map_err(|error| format!("finish in-process control runtime: {error}"));
-    sampler_result?;
-    control_result?;
+    // When control fails first, stopping/joining sessions deliberately asks
+    // the sampler for one final durable snapshot after its dispatch owner has
+    // already disappeared. Preserve the control failure as the root cause;
+    // the expected secondary DispatchUnavailable must not mask it. When the
+    // sampler fails first, control shutdown is clean and this still returns
+    // the sampler's closed-catalog failure below.
+    prefer_control_failure(control_result, sampler_result)?;
     serving_result?;
     module_result?;
     module_executor_result?;
@@ -888,14 +903,46 @@ async fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+fn prefer_control_failure(
+    control: Result<(), String>,
+    sampler: Result<(), String>,
+) -> Result<(), String> {
+    control?;
+    sampler
+}
+
 async fn join_modules(modules: &mut ControlModuleSet) -> Result<(), String> {
-    let mut result = Ok(());
-    while let Some(exit) = modules.join_next().await {
-        if let Err(error) = exit.result {
-            result = Err(format!("control module {} failed: {error}", exit.module));
+    join_modules_with_timeout(modules, CONTROL_MODULE_SHUTDOWN_TIMEOUT).await
+}
+
+async fn join_modules_with_timeout(
+    modules: &mut ControlModuleSet,
+    timeout: Duration,
+) -> Result<(), String> {
+    if let Ok(result) = tokio::time::timeout(timeout, async {
+        let mut result = Ok(());
+        while let Some(exit) = modules.join_next().await {
+            if let Err(error) = exit.result {
+                result = Err(format!("control module {} failed: {error}", exit.module));
+            }
         }
+        result
+    })
+    .await
+    {
+        return result;
     }
-    result
+
+    // A retained route incarnation normally disappears when the last SQL
+    // session releases its lease before Stopping. This deadline is the final
+    // process-level assertion that a leaked lease or stuck module cannot hang
+    // shutdown indefinitely.
+    modules.abort_all();
+    while modules.join_next().await.is_some() {}
+    Err(format!(
+        "control module shutdown exceeded {}ms",
+        timeout.as_millis()
+    ))
 }
 
 /// Stops admission, lets the existing per-session graceful timers run, then
@@ -934,6 +981,9 @@ async fn stop_drain_and_join_sessions(
 async fn spawn_health(
     port: u16,
     serving: DataplaneServingHandle,
+    routes: control_router::RoutePlaneHandle,
+    config: Arc<dyn ConfigNamespaceSource>,
+    topology: TopologyModuleHandle,
 ) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
@@ -943,7 +993,30 @@ async fn spawn_health(
         // The operator diagnostic names the exact port: a bind conflict
         // must be traceable to the address that caused it.
         .map_err(|error| format!("bind health endpoint 127.0.0.1:{port}: {error}"))?;
-    Ok(Some(tokio::spawn(health::serve(listener, serving))))
+    let ledger_routes = routes.clone();
+    let topology_status = topology.status();
+    let routing = topology.routing_handle();
+    Ok(Some(tokio::spawn(health::serve(
+        listener,
+        serving,
+        Arc::new(move || routes.route_input_evidence()),
+        Arc::new(move || ledger_routes.route_ledger_evidence()),
+        Arc::new(move || {
+            let config = config.current();
+            let revision = config.source_revision();
+            let status = *topology_status.borrow();
+            let routing = routing.current();
+            health::SourceGenerationEvidence {
+                config_generation: config.generation(),
+                config_file_revision: revision.file_revision,
+                config_etcd_revision: revision.etcd_revision,
+                topology_observed_generation: status.observed_generation,
+                topology_applied_generation: status.applied_generation,
+                routing_generation: routing.as_ref().map_or(0, |source| source.generation),
+                routing_client_epoch: routing.as_ref().map_or(0, |source| source.client_epoch),
+            }
+        }),
+    ))))
 }
 
 /// ONE grace lineage: the CLI's validated drain grace IS the
@@ -1266,8 +1339,8 @@ mod tests {
 
     use super::{
         Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options, StartupGuard,
-        config_persistence_client, parse_options, persistence_options, session_loop_config,
-        version_output, wait_module_ready,
+        config_persistence_client, join_modules_with_timeout, parse_options, persistence_options,
+        session_loop_config, version_output, wait_module_ready,
     };
     use crate::config_composition::control_config;
     use crate::startup::{Teardown, TeardownFuture};
@@ -1284,6 +1357,24 @@ mod tests {
     use dataplane::metering::MeteringSamplerError;
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn a_control_failure_is_not_masked_by_the_final_sampler_handoff() {
+        assert_eq!(
+            super::prefer_control_failure(
+                Err("control root cause".to_owned()),
+                Err("metering durable dispatch owner unavailable".to_owned()),
+            ),
+            Err("control root cause".to_owned())
+        );
+        assert_eq!(
+            super::prefer_control_failure(
+                Ok(()),
+                Err("metering durable dispatch rejected snapshots: Persistence".to_owned()),
+            ),
+            Err("metering durable dispatch rejected snapshots: Persistence".to_owned())
+        );
+    }
 
     type TeardownLog = Arc<Mutex<Vec<&'static str>>>;
 
@@ -1369,6 +1460,18 @@ mod tests {
         }
     }
 
+    struct StuckModule;
+
+    impl ControlModule for StuckModule {
+        fn name(&self) -> &'static str {
+            "stuck_shutdown_test_module"
+        }
+
+        fn run(self: Box<Self>, _context: ModuleContext) -> ModuleFuture {
+            Box::pin(std::future::pending())
+        }
+    }
+
     /// A `Starting` owner (never marked ready — the real state at an early
     /// startup failure).
     fn armed_owner() -> Arc<InProcessControlRuntime> {
@@ -1404,6 +1507,25 @@ mod tests {
             })
             .unwrap_or_else(|error| unreachable!("spawn config module: {error}"));
         modules
+    }
+
+    #[tokio::test]
+    async fn module_shutdown_timeout_aborts_and_joins_a_stuck_module() {
+        let in_process = armed_owner();
+        let mut modules = ControlModuleSet::new(&in_process.handle());
+        modules
+            .spawn(StuckModule)
+            .unwrap_or_else(|error| unreachable!("spawn stuck module: {error}"));
+
+        let timeout = Duration::from_millis(20);
+        assert_eq!(
+            join_modules_with_timeout(&mut modules, timeout).await,
+            Err("control module shutdown exceeded 20ms".to_owned())
+        );
+        assert!(
+            modules.is_empty(),
+            "the timeout aborts and joins every module"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1846,10 +1968,10 @@ mod tests {
         };
         assert_eq!(
             INTEGRATION_CAPABILITIES,
-            "in-process-control-runtime,control-bridge-v1,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
-            "only what the binary truthfully provides: the plain slice plus wired TLS, PROXY v2, and compression"
+            "in-process-control-runtime,control-bridge-v1,rust-route-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
+            "only what the binary truthfully provides: Rust route ownership plus the wired plain slice, TLS, PROXY v2, and compression"
         );
-        for wired in ["tls", "proxy-v2", "zlib", "zstd"] {
+        for wired in ["rust-route-owner", "tls", "proxy-v2", "zlib", "zstd"] {
             assert!(
                 INTEGRATION_CAPABILITIES.contains(wired),
                 "{wired:?} is wired (WIRE-activation A1/B/C), so it must be advertised"

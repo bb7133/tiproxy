@@ -1022,6 +1022,27 @@ impl CommandGate {
         }
     }
 
+    /// Builds the post-cutover residual reconcile envelope. Route/session
+    /// fields are forced empty and this method deliberately does not touch any
+    /// connection export marker; only generation, metrics/metering and the
+    /// drain command watermark remain on the bridge.
+    #[must_use]
+    pub const fn build_residual_reconcile_request(
+        &self,
+        known_generation: u64,
+        last_metrics_sequence: u64,
+        last_metering_sequence: u64,
+    ) -> ReconcileRequest {
+        ReconcileRequest {
+            known_generation,
+            last_connection_event_sequence: 0,
+            last_metrics_sequence,
+            last_metering_sequence,
+            connections: Vec::new(),
+            last_drain_command_sequence: self.drain_watermark,
+        }
+    }
+
     /// Applies Go's answering `ReconcileSnapshot` and returns the
     /// repairs this side owes:
     ///
@@ -1461,8 +1482,11 @@ impl MeteringLedger {
     }
 
     /// Sealed batches the peer has not acknowledged, in sequence order:
-    /// replayed verbatim after a reconnect. The peer's
-    /// sequence-greater-than dedup makes the replay idempotent.
+    /// replayed verbatim after a reconnect. The peer skips same-producer
+    /// sequences at or below its applied watermark but rejects a gap. The WAL
+    /// must therefore feed one ordered session-scoped sender; a second
+    /// cross-session transport owner could let a newer seal overtake this
+    /// replay and is forbidden.
     #[must_use]
     pub fn replay(&self) -> Vec<MeteringBatch> {
         self.unacked.iter().cloned().collect()

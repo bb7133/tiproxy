@@ -23,7 +23,7 @@
 // selects a frame by a FIELD-LEVEL bypass scan (protowire tag walk) over the
 // exact wire bytes and forwards those exact bytes onward untouched — it never
 // re-marshals a protobuf, so a forwarded frame is byte-identical to the one it
-// received. Only the Rust->Go direction is inspected; Go->Rust is a raw copy.
+// received. Both directions are audited; only Rust->Go exposes a fault seam.
 //
 // An exact selector (rather than a bare kind filter) is required so that a
 // concurrent, same-kind frame belonging to a different connection/health probe
@@ -34,6 +34,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -66,8 +67,24 @@ const (
 	fieldEnvelopeControlEpoch protowire.Number = 2
 	fieldEnvelopeGeneration   protowire.Number = 3
 	fieldEnvelopeRequestID    protowire.Number = 4
+	fieldStateSnapshot        protowire.Number = 22
+	fieldHandshakeResponse    protowire.Number = 24
+	fieldHandshakeDecision    protowire.Number = 25
+	fieldHandshakeResult      protowire.Number = 26
+	fieldRouteRequest         protowire.Number = 27
+	fieldRouteAssignment      protowire.Number = 28
 	fieldRouteResult          protowire.Number = 29
 	fieldConnectionEvent      protowire.Number = 30
+	fieldRedirectCommand      protowire.Number = 31
+	fieldRedirectResult       protowire.Number = 32
+	fieldDrainCommand         protowire.Number = 33
+	fieldMeteringBatch        protowire.Number = 36
+	fieldReconcileRequest     protowire.Number = 37
+	fieldReconcileSnapshot    protowire.Number = 38
+	fieldProtocolError        protowire.Number = 40
+	fieldCloseCommand         protowire.Number = 41
+	fieldCloseResult          protowire.Number = 42
+	fieldMeteringAck          protowire.Number = 43
 )
 
 // Nested field numbers.
@@ -84,6 +101,88 @@ const (
 
 	connectionEventKindClosed uint64 = 3 // CONNECTION_EVENT_KIND_CLOSED
 )
+
+type frameAudit struct {
+	legacyBody                      string
+	stateBackends                   uint64
+	stateNamespaces                 uint64
+	reconcileRequestConnections     uint64
+	reconcileRequestEventSequence   uint64
+	drainCommandSequence            uint64
+	reconcileRequestDrainSequence   uint64
+	reconcileSnapshotConnections    uint64
+	reconcileSnapshotEventSequence  uint64
+	meteringKind                    string
+	meteringSequence                uint64
+	meteringProducerFingerprint     string
+	protocolErrorCode               uint64
+	protocolErrorOffendingRequestID uint64
+	protocolErrorRetryable          bool
+	protocolErrorFatal              bool
+}
+
+type auditDirection string
+
+const (
+	directionRustToGo auditDirection = "rust_to_go"
+	directionGoToRust auditDirection = "go_to_rust"
+)
+
+// meteringAuditEvent is the deliberately closed projection of one metering or
+// protocol-error control frame. It records no batch payload, raw producer id,
+// or free-form error detail: only ordered watermarks, a one-way producer-id
+// fingerprint, and fields whose values come from the protocol's finite
+// catalog. That keeps the qualification artifact diagnostic without turning
+// the byte-forwarding tap into a data sink.
+type meteringAuditEvent struct {
+	Ordinal             uint64         `json:"ordinal"`
+	Direction           auditDirection `json:"direction"`
+	Kind                string         `json:"kind"`
+	Sequence            uint64         `json:"sequence,omitempty"`
+	ProducerFingerprint string         `json:"producer_fingerprint,omitempty"`
+	ErrorCode           uint64         `json:"error_code,omitempty"`
+	OffendingRequestID  uint64         `json:"offending_request_id,omitempty"`
+	Retryable           bool           `json:"retryable,omitempty"`
+	Fatal               bool           `json:"fatal,omitempty"`
+}
+
+type routeAudit struct {
+	LegacyBodyCounts                 map[string]uint64    `json:"legacy_body_counts"`
+	StateBackends                    uint64               `json:"state_backends"`
+	StateNamespaces                  uint64               `json:"state_namespaces"`
+	ReconcileRequestConnections      uint64               `json:"reconcile_request_connections"`
+	ReconcileRequestEventSequences   uint64               `json:"reconcile_request_event_sequences"`
+	DrainCommands                    uint64               `json:"drain_commands"`
+	MaxDrainCommandSequence          uint64               `json:"max_drain_command_sequence"`
+	MaxReconcileRequestDrainSequence uint64               `json:"max_reconcile_request_drain_sequence"`
+	ReconcileSnapshotConnections     uint64               `json:"reconcile_snapshot_connections"`
+	ReconcileSnapshotEventSequences  uint64               `json:"reconcile_snapshot_event_sequences"`
+	MeteringBatches                  uint64               `json:"metering_batches"`
+	MeteringAcks                     uint64               `json:"metering_acks"`
+	ProtocolErrors                   uint64               `json:"protocol_errors"`
+	FatalProtocolErrors              uint64               `json:"fatal_protocol_errors"`
+	MaxMeteringBatchSequence         uint64               `json:"max_metering_batch_sequence"`
+	MaxMeteringAckSequence           uint64               `json:"max_metering_ack_sequence"`
+	MaxReconcileRequestMetering      uint64               `json:"max_reconcile_request_metering_sequence"`
+	MaxReconcileSnapshotMetering     uint64               `json:"max_reconcile_snapshot_metering_sequence"`
+	MeteringEvents                   []meteringAuditEvent `json:"metering_events"`
+}
+
+func newRouteAudit() routeAudit {
+	return routeAudit{LegacyBodyCounts: map[string]uint64{
+		"handshake_response": 0,
+		"handshake_decision": 0,
+		"handshake_result":   0,
+		"route_request":      0,
+		"route_assignment":   0,
+		"route_result":       0,
+		"connection_event":   0,
+		"redirect_command":   0,
+		"redirect_result":    0,
+		"close_command":      0,
+		"close_result":       0,
+	}}
+}
 
 // dropKind is the class of Rust->Go frame the dropper targets.
 type dropKind int
@@ -171,6 +270,202 @@ func extractFrameFields(body []byte) frameFields {
 		message = message[consumed:]
 	}
 	return fields
+}
+
+func extractFrameAudit(body []byte) frameAudit {
+	var audit frameAudit
+	message := body
+	for len(message) > 0 {
+		number, typ, tagLen := protowire.ConsumeTag(message)
+		if tagLen < 0 {
+			return audit
+		}
+		message = message[tagLen:]
+		if typ == protowire.BytesType {
+			value, consumed := protowire.ConsumeBytes(message)
+			if consumed < 0 {
+				return audit
+			}
+			switch number {
+			case fieldStateSnapshot:
+				audit.stateBackends, audit.stateNamespaces = countNestedBytes(value, 2, 3)
+			case fieldHandshakeResponse:
+				audit.legacyBody = "handshake_response"
+			case fieldHandshakeDecision:
+				audit.legacyBody = "handshake_decision"
+			case fieldHandshakeResult:
+				audit.legacyBody = "handshake_result"
+			case fieldRouteRequest:
+				audit.legacyBody = "route_request"
+			case fieldRouteAssignment:
+				audit.legacyBody = "route_assignment"
+			case fieldRouteResult:
+				audit.legacyBody = "route_result"
+			case fieldConnectionEvent:
+				audit.legacyBody = "connection_event"
+			case fieldRedirectCommand:
+				audit.legacyBody = "redirect_command"
+			case fieldRedirectResult:
+				audit.legacyBody = "redirect_result"
+			case fieldDrainCommand:
+				audit.drainCommandSequence = nestedVarint(value, 6)
+			case fieldMeteringBatch:
+				audit.meteringKind = "batch"
+				audit.meteringSequence = nestedVarint(value, 1)
+				audit.meteringProducerFingerprint = producerFingerprint(nestedBytes(value, 3))
+			case fieldReconcileRequest:
+				audit.reconcileRequestConnections, audit.reconcileRequestEventSequence =
+					countNestedRouteState(value, 5, 2)
+				audit.reconcileRequestDrainSequence = nestedVarint(value, 6)
+				audit.meteringKind = "reconcile_request"
+				audit.meteringSequence = nestedVarint(value, 4)
+			case fieldReconcileSnapshot:
+				audit.reconcileSnapshotConnections, audit.reconcileSnapshotEventSequence =
+					countNestedRouteState(value, 5, 2)
+				audit.meteringKind = "reconcile_snapshot"
+				audit.meteringSequence = nestedVarint(value, 4)
+			case fieldProtocolError:
+				audit.meteringKind = "protocol_error"
+				audit.protocolErrorCode = nestedVarint(value, 1)
+				audit.protocolErrorOffendingRequestID = nestedVarint(value, 2)
+				audit.protocolErrorRetryable = nestedVarint(value, 3) != 0
+				audit.protocolErrorFatal = nestedVarint(value, 5) != 0
+			case fieldCloseCommand:
+				audit.legacyBody = "close_command"
+			case fieldCloseResult:
+				audit.legacyBody = "close_result"
+			case fieldMeteringAck:
+				audit.meteringKind = "ack"
+				audit.meteringSequence = nestedVarint(value, 2)
+				audit.meteringProducerFingerprint = producerFingerprint(nestedBytes(value, 1))
+			}
+			message = message[consumed:]
+			continue
+		}
+		consumed := protowire.ConsumeFieldValue(number, typ, message)
+		if consumed < 0 {
+			return audit
+		}
+		message = message[consumed:]
+	}
+	return audit
+}
+
+func nestedBytes(message []byte, field protowire.Number) []byte {
+	for len(message) > 0 {
+		number, typ, tagLen := protowire.ConsumeTag(message)
+		if tagLen < 0 {
+			return nil
+		}
+		message = message[tagLen:]
+		if number == field && typ == protowire.BytesType {
+			value, consumed := protowire.ConsumeBytes(message)
+			if consumed < 0 {
+				return nil
+			}
+			return value
+		}
+		consumed := protowire.ConsumeFieldValue(number, typ, message)
+		if consumed < 0 {
+			return nil
+		}
+		message = message[consumed:]
+	}
+	return nil
+}
+
+func producerFingerprint(producerID []byte) string {
+	if len(producerID) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(producerID)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func nestedVarint(message []byte, field protowire.Number) uint64 {
+	for len(message) > 0 {
+		number, typ, tagLen := protowire.ConsumeTag(message)
+		if tagLen < 0 {
+			return 0
+		}
+		message = message[tagLen:]
+		if number == field && typ == protowire.VarintType {
+			value, consumed := protowire.ConsumeVarint(message)
+			if consumed < 0 {
+				return 0
+			}
+			return value
+		}
+		consumed := protowire.ConsumeFieldValue(number, typ, message)
+		if consumed < 0 {
+			return 0
+		}
+		message = message[consumed:]
+	}
+	return 0
+}
+
+func countNestedBytes(message []byte, first, second protowire.Number) (uint64, uint64) {
+	var firstCount, secondCount uint64
+	for len(message) > 0 {
+		number, typ, tagLen := protowire.ConsumeTag(message)
+		if tagLen < 0 {
+			return firstCount, secondCount
+		}
+		message = message[tagLen:]
+		if typ == protowire.BytesType {
+			_, consumed := protowire.ConsumeBytes(message)
+			if consumed < 0 {
+				return firstCount, secondCount
+			}
+			if number == first {
+				firstCount++
+			}
+			if number == second {
+				secondCount++
+			}
+			message = message[consumed:]
+			continue
+		}
+		consumed := protowire.ConsumeFieldValue(number, typ, message)
+		if consumed < 0 {
+			return firstCount, secondCount
+		}
+		message = message[consumed:]
+	}
+	return firstCount, secondCount
+}
+
+func countNestedRouteState(message []byte, connectionsField, sequenceField protowire.Number) (uint64, uint64) {
+	var connections, nonzeroSequences uint64
+	for len(message) > 0 {
+		number, typ, tagLen := protowire.ConsumeTag(message)
+		if tagLen < 0 {
+			return connections, nonzeroSequences
+		}
+		message = message[tagLen:]
+		var consumed int
+		switch {
+		case number == connectionsField && typ == protowire.BytesType:
+			_, consumed = protowire.ConsumeBytes(message)
+			if consumed >= 0 {
+				connections++
+			}
+		case number == sequenceField && typ == protowire.VarintType:
+			var value uint64
+			value, consumed = protowire.ConsumeVarint(message)
+			if consumed >= 0 && value != 0 {
+				nonzeroSequences++
+			}
+		default:
+			consumed = protowire.ConsumeFieldValue(number, typ, message)
+		}
+		if consumed < 0 {
+			return connections, nonzeroSequences
+		}
+		message = message[consumed:]
+	}
+	return connections, nonzeroSequences
 }
 
 func fillRouteResult(fields *frameFields, message []byte) {
@@ -392,6 +687,7 @@ type dropper struct {
 	releaseCount   uint64
 	forwarded      uint64
 	held           bool
+	routeAudit     routeAudit
 
 	activeMu sync.Mutex
 	active   map[net.Conn]struct{}
@@ -402,14 +698,78 @@ type dropper struct {
 func newDropper(frontPath, target string, pause bool, logger *log.Logger) *dropper {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &dropper{
-		frontPath: frontPath,
-		target:    target,
-		pause:     pause,
-		logger:    logger,
-		ctx:       ctx,
-		cancel:    cancel,
-		armedKind: dropNone,
-		active:    make(map[net.Conn]struct{}),
+		frontPath:  frontPath,
+		target:     target,
+		pause:      pause,
+		logger:     logger,
+		ctx:        ctx,
+		cancel:     cancel,
+		armedKind:  dropNone,
+		active:     make(map[net.Conn]struct{}),
+		routeAudit: newRouteAudit(),
+	}
+}
+
+func (d *dropper) recordAudit(direction auditDirection, audit frameAudit) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if audit.legacyBody != "" {
+		d.routeAudit.LegacyBodyCounts[audit.legacyBody]++
+	}
+	d.routeAudit.StateBackends += audit.stateBackends
+	d.routeAudit.StateNamespaces += audit.stateNamespaces
+	d.routeAudit.ReconcileRequestConnections += audit.reconcileRequestConnections
+	d.routeAudit.ReconcileRequestEventSequences += audit.reconcileRequestEventSequence
+	if audit.drainCommandSequence != 0 {
+		d.routeAudit.DrainCommands++
+		if audit.drainCommandSequence > d.routeAudit.MaxDrainCommandSequence {
+			d.routeAudit.MaxDrainCommandSequence = audit.drainCommandSequence
+		}
+	}
+	if audit.reconcileRequestDrainSequence > d.routeAudit.MaxReconcileRequestDrainSequence {
+		d.routeAudit.MaxReconcileRequestDrainSequence = audit.reconcileRequestDrainSequence
+	}
+	d.routeAudit.ReconcileSnapshotConnections += audit.reconcileSnapshotConnections
+	d.routeAudit.ReconcileSnapshotEventSequences += audit.reconcileSnapshotEventSequence
+	if audit.meteringKind == "" {
+		return
+	}
+	event := meteringAuditEvent{
+		Ordinal:             uint64(len(d.routeAudit.MeteringEvents)) + 1,
+		Direction:           direction,
+		Kind:                audit.meteringKind,
+		Sequence:            audit.meteringSequence,
+		ProducerFingerprint: audit.meteringProducerFingerprint,
+		ErrorCode:           audit.protocolErrorCode,
+		OffendingRequestID:  audit.protocolErrorOffendingRequestID,
+		Retryable:           audit.protocolErrorRetryable,
+		Fatal:               audit.protocolErrorFatal,
+	}
+	d.routeAudit.MeteringEvents = append(d.routeAudit.MeteringEvents, event)
+	switch audit.meteringKind {
+	case "batch":
+		d.routeAudit.MeteringBatches++
+		if audit.meteringSequence > d.routeAudit.MaxMeteringBatchSequence {
+			d.routeAudit.MaxMeteringBatchSequence = audit.meteringSequence
+		}
+	case "ack":
+		d.routeAudit.MeteringAcks++
+		if audit.meteringSequence > d.routeAudit.MaxMeteringAckSequence {
+			d.routeAudit.MaxMeteringAckSequence = audit.meteringSequence
+		}
+	case "protocol_error":
+		d.routeAudit.ProtocolErrors++
+		if audit.protocolErrorFatal {
+			d.routeAudit.FatalProtocolErrors++
+		}
+	case "reconcile_request":
+		if audit.meteringSequence > d.routeAudit.MaxReconcileRequestMetering {
+			d.routeAudit.MaxReconcileRequestMetering = audit.meteringSequence
+		}
+	case "reconcile_snapshot":
+		if audit.meteringSequence > d.routeAudit.MaxReconcileSnapshotMetering {
+			d.routeAudit.MaxReconcileSnapshotMetering = audit.meteringSequence
+		}
 	}
 }
 
@@ -594,9 +954,9 @@ func (d *dropper) handleConnection(client net.Conn) {
 		}
 		done <- struct{}{}
 	})
-	// Go -> Rust: a raw copy, never inspected.
+	// Go -> Rust: audited and forwarded verbatim, with no fault seam.
 	d.run(func() {
-		_, _ = io.Copy(client, upstream)
+		d.pumpForwarded(upstream, client)
 		if tcpLike, ok := client.(interface{ CloseWrite() error }); ok {
 			_ = tcpLike.CloseWrite()
 		}
@@ -618,6 +978,7 @@ func (d *dropper) pumpInspected(src net.Conn, dst net.Conn) {
 			return
 		}
 		fields := extractFrameFields(body)
+		d.recordAudit(directionRustToGo, extractFrameAudit(body))
 		if dropped, pause := d.tryClaimDrop(fields); dropped {
 			d.logger.Printf("dropped %s frame conn=%d assignment=%q backend=%q (%d bytes)",
 				fields.kind, fields.connectionID, fields.assignmentID, fields.backendID, len(frame))
@@ -631,6 +992,22 @@ func (d *dropper) pumpInspected(src net.Conn, dst net.Conn) {
 			}
 			continue
 		}
+		if _, err := dst.Write(frame); err != nil {
+			return
+		}
+		atomic.AddUint64(&d.forwarded, 1)
+	}
+}
+
+// pumpForwarded audits Go->Rust ownership fields and otherwise forwards the
+// exact length-prefixed bytes without enabling a fault seam in this direction.
+func (d *dropper) pumpForwarded(src net.Conn, dst net.Conn) {
+	for {
+		frame, body, err := readFrame(src)
+		if err != nil {
+			return
+		}
+		d.recordAudit(directionGoToRust, extractFrameAudit(body))
 		if _, err := dst.Write(frame); err != nil {
 			return
 		}
@@ -703,6 +1080,12 @@ func (d *dropper) handleState(writer http.ResponseWriter, request *http.Request)
 	d.activeMu.Unlock()
 
 	d.mu.Lock()
+	audit := d.routeAudit
+	audit.LegacyBodyCounts = make(map[string]uint64, len(d.routeAudit.LegacyBodyCounts))
+	for name, count := range d.routeAudit.LegacyBodyCounts {
+		audit.LegacyBodyCounts[name] = count
+	}
+	audit.MeteringEvents = append([]meteringAuditEvent(nil), d.routeAudit.MeteringEvents...)
 	state := map[string]any{
 		"target":             d.target,
 		"pause_after_drop":   d.pause,
@@ -719,6 +1102,7 @@ func (d *dropper) handleState(writer http.ResponseWriter, request *http.Request)
 		"forwarded":          atomic.LoadUint64(&d.forwarded),
 		"held":               d.held,
 		"active_connections": active,
+		"route_audit":        audit,
 	}
 	d.mu.Unlock()
 

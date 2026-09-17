@@ -15,7 +15,7 @@
 //! Process-local namespace-router incarnation registry and readiness boundary.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceSource, NamespaceIncarnation};
@@ -25,7 +25,9 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::scheduler::{RouteCommandDispatcher, RouteCommandReceiver, RouteCommandRegistration};
-use crate::{ResolvedNamespace, RouteError, Router, Selector, UserNamespaceResolver};
+use crate::{
+    ResolvedNamespace, RouteError, RouteLedgerEvidence, Router, Selector, UserNamespaceResolver,
+};
 
 const MODULE_NAME: &str = "control_router";
 
@@ -47,6 +49,86 @@ impl Drop for RegisteredRouter {
 struct RegistryState {
     current: BTreeMap<String, Arc<RegisteredRouter>>,
     terminal: bool,
+}
+
+/// Payload-free proof that production route selection consumed live health and
+/// metric inputs. These counters are diagnostic only and grant no authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteInputEvidence {
+    /// Successful dynamic-input observations made by a production router.
+    pub observations: u64,
+    /// Backends represented in the exact health-qualified route input set.
+    pub health_input_backends: u64,
+    /// Healthy backends in that set.
+    pub healthy_backends: u64,
+    /// CPU series in the current producer-qualified metric snapshot.
+    pub cpu_series: u64,
+    /// Memory series in the current producer-qualified metric snapshot.
+    pub memory_series: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct RouteInputDiagnostics(Mutex<RouteInputEvidence>);
+
+impl RouteInputDiagnostics {
+    pub(crate) fn record(
+        &self,
+        health_input_backends: usize,
+        healthy_backends: usize,
+        cpu_series: usize,
+        memory_series: usize,
+    ) {
+        let mut evidence = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        evidence.observations = evidence.observations.saturating_add(1);
+        evidence.health_input_backends = usize_to_u64(health_input_backends);
+        evidence.healthy_backends = usize_to_u64(healthy_backends);
+        evidence.cpu_series = usize_to_u64(cpu_series);
+        evidence.memory_series = usize_to_u64(memory_series);
+    }
+
+    fn snapshot(&self) -> RouteInputEvidence {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[derive(Default)]
+struct RouteLedgerDiagnostics(Mutex<Vec<Weak<Router>>>);
+
+impl RouteLedgerDiagnostics {
+    fn register(&self, router: &Arc<Router>) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::downgrade(router));
+    }
+
+    fn snapshot(&self) -> RouteLedgerEvidence {
+        // Upgrade and prune while holding only the weak-list lock. Router locks
+        // are acquired afterwards, so diagnostics cannot invert registry or
+        // route-ledger lock order.
+        let routers = {
+            let mut registered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut live = Vec::with_capacity(registered.len());
+            registered.retain(|weak| {
+                if let Some(router) = weak.upgrade() {
+                    live.push(router);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        let mut evidence = RouteLedgerEvidence::default();
+        for router in routers {
+            evidence.add(router.ledger_evidence());
+        }
+        evidence
+    }
 }
 
 /// A newly admitted connection bound to one exact router incarnation.
@@ -119,6 +201,8 @@ pub struct RoutePlaneHandle {
     source: Arc<dyn ConfigNamespaceSource>,
     resolver: UserNamespaceResolver,
     registry: Arc<Mutex<RegistryState>>,
+    input_diagnostics: Arc<RouteInputDiagnostics>,
+    ledger_diagnostics: Arc<RouteLedgerDiagnostics>,
 }
 
 impl RoutePlaneHandle {
@@ -221,6 +305,21 @@ impl RoutePlaneHandle {
             .filter(|version| !version.is_empty())
     }
 
+    /// Returns payload-free evidence from the latest production selection that
+    /// consumed a current dynamic metric snapshot.
+    #[must_use]
+    pub fn route_input_evidence(&self) -> RouteInputEvidence {
+        self.input_diagnostics.snapshot()
+    }
+
+    /// Returns payload-free totals across current and retained router
+    /// incarnations. Retained old namespaces remain visible until their final
+    /// session lease drops, so replacement cannot hide unsettled accounting.
+    #[must_use]
+    pub fn route_ledger_evidence(&self) -> RouteLedgerEvidence {
+        self.ledger_diagnostics.snapshot()
+    }
+
     #[cfg(test)]
     pub(crate) fn current_incarnations(&self) -> usize {
         self.registry
@@ -239,6 +338,8 @@ pub struct RoutePlane {
     ready: watch::Sender<bool>,
     updates: watch::Sender<u64>,
     registry: Arc<Mutex<RegistryState>>,
+    input_diagnostics: Arc<RouteInputDiagnostics>,
+    ledger_diagnostics: Arc<RouteLedgerDiagnostics>,
     workers: JoinSet<Result<(), RouteError>>,
 }
 
@@ -253,6 +354,8 @@ impl RoutePlane {
         let (ready, ready_rx) = watch::channel(false);
         let (updates, updates_rx) = watch::channel(0);
         let registry = Arc::new(Mutex::new(RegistryState::default()));
+        let input_diagnostics = Arc::new(RouteInputDiagnostics::default());
+        let ledger_diagnostics = Arc::new(RouteLedgerDiagnostics::default());
         let resolver = UserNamespaceResolver::new(Arc::clone(&source));
         (
             Self {
@@ -262,6 +365,8 @@ impl RoutePlane {
                 ready,
                 updates,
                 registry: Arc::clone(&registry),
+                input_diagnostics: Arc::clone(&input_diagnostics),
+                ledger_diagnostics: Arc::clone(&ledger_diagnostics),
                 workers: JoinSet::new(),
             },
             RoutePlaneHandle {
@@ -270,6 +375,8 @@ impl RoutePlane {
                 source,
                 resolver,
                 registry,
+                input_diagnostics,
+                ledger_diagnostics,
             },
         )
     }
@@ -316,7 +423,9 @@ impl RoutePlane {
                 &resolved,
                 max_sessions,
                 self.metrics.clone(),
+                Arc::clone(&self.input_diagnostics),
             )?);
+            self.ledger_diagnostics.register(&router);
             let dispatcher = RouteCommandDispatcher::new(Arc::clone(&router));
             let (stop_worker, stop) = watch::channel(false);
             let (started, started_rx) = oneshot::channel();

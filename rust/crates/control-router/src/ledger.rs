@@ -31,6 +31,47 @@ pub struct Accounting {
     outgoing: u64,
 }
 
+/// Payload-free aggregate of one or more live router-incarnation ledgers.
+///
+/// This is observation only: it contains no session, backend, namespace, or
+/// settlement identity and cannot authorize any routing operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteLedgerEvidence {
+    /// Router incarnations that are still alive, including retained routers.
+    pub router_incarnations: u64,
+    /// Open route sessions across those incarnations, including idle sessions.
+    pub sessions: u64,
+    /// Pending initial backend handshakes.
+    pub reserved: u64,
+    /// Established physical backend owners.
+    pub active: u64,
+    /// Accepted redirects awaiting physical arrival at their target.
+    pub incoming: u64,
+    /// Accepted redirects awaiting physical departure from their source.
+    pub outgoing: u64,
+    /// Exact redirect terminals that remain unsettled.
+    pub unsettled_redirects: u64,
+    /// Exact force-close terminals that remain unsettled.
+    pub unsettled_closes: u64,
+}
+
+impl RouteLedgerEvidence {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.router_incarnations = self
+            .router_incarnations
+            .saturating_add(other.router_incarnations);
+        self.sessions = self.sessions.saturating_add(other.sessions);
+        self.reserved = self.reserved.saturating_add(other.reserved);
+        self.active = self.active.saturating_add(other.active);
+        self.incoming = self.incoming.saturating_add(other.incoming);
+        self.outgoing = self.outgoing.saturating_add(other.outgoing);
+        self.unsettled_redirects = self
+            .unsettled_redirects
+            .saturating_add(other.unsettled_redirects);
+        self.unsettled_closes = self.unsettled_closes.saturating_add(other.unsettled_closes);
+    }
+}
+
 impl Accounting {
     #[cfg(test)]
     pub(crate) const fn for_balance_test(
@@ -293,6 +334,31 @@ impl Ledger {
         // It only rejects new opens until normal closes bring usage below the
         // reloadable bound.
         self.max_sessions = max_sessions;
+    }
+
+    pub(crate) fn evidence(&self) -> RouteLedgerEvidence {
+        let mut evidence = RouteLedgerEvidence {
+            router_incarnations: 1,
+            sessions: u64::try_from(self.sessions.len()).unwrap_or(u64::MAX),
+            ..RouteLedgerEvidence::default()
+        };
+        for account in self.accounts.values() {
+            evidence.reserved = evidence.reserved.saturating_add(account.counts.reserved);
+            evidence.active = evidence.active.saturating_add(account.counts.active);
+            evidence.incoming = evidence.incoming.saturating_add(account.counts.incoming);
+            evidence.outgoing = evidence.outgoing.saturating_add(account.counts.outgoing);
+        }
+        for stage in self.sessions.values() {
+            if let Stage::Active(active) = stage {
+                evidence.unsettled_redirects = evidence
+                    .unsettled_redirects
+                    .saturating_add(u64::from(active.redirect.is_some()));
+                evidence.unsettled_closes = evidence
+                    .unsettled_closes
+                    .saturating_add(u64::from(active.closing.is_some()));
+            }
+        }
+        evidence
     }
 
     pub(crate) fn open(&mut self) -> Result<Session, LedgerError> {
@@ -760,6 +826,44 @@ mod tests {
             backend_id: id.into(),
             ..RouteAssignment::default()
         }
+    }
+
+    #[test]
+    fn route_ledger_evidence_tracks_pending_active_and_terminal_state() {
+        let mut ledger = Ledger::new(4);
+        let source = must(ledger.add_account());
+        let target = must(ledger.add_account());
+        let session = must(ledger.open());
+        assert_eq!(
+            ledger.evidence(),
+            RouteLedgerEvidence {
+                router_incarnations: 1,
+                sessions: 1,
+                ..RouteLedgerEvidence::default()
+            }
+        );
+        let reservation = must(ledger.reserve(&session, &source, assignment("a")));
+        assert_eq!(ledger.evidence().reserved, 1);
+        assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+        assert_eq!(ledger.evidence().active, 1);
+
+        let redirect =
+            must(ledger.prepare_redirect(&session, &target, assignment("b"), Instant::now()));
+        ledger.admit_redirect(redirect.clone(), true, Instant::now());
+        let evidence = ledger.evidence();
+        assert_eq!(
+            (evidence.active, evidence.incoming, evidence.outgoing),
+            (1, 1, 1)
+        );
+        assert_eq!(evidence.unsettled_redirects, 1);
+        assert_eq!(ledger.close(&session), Settlement::Applied);
+        assert_eq!(
+            ledger.evidence(),
+            RouteLedgerEvidence {
+                router_incarnations: 1,
+                ..RouteLedgerEvidence::default()
+            }
+        );
     }
 
     #[test]

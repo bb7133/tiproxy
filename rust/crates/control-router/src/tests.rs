@@ -788,6 +788,12 @@ async fn route_plane_replaces_admission_but_retains_an_existing_selector() -> Te
     assert!(!retained.same_router_incarnation(&replacement));
     assert_eq!(replacement.namespace(), "default");
     assert_eq!(handle.current_incarnations(), 1);
+    assert_eq!(
+        handle.route_ledger_evidence().router_incarnations,
+        2,
+        "the retired router stays observable while its admission lease is alive"
+    );
+    assert_eq!(handle.route_ledger_evidence().sessions, 2);
 
     let reservation = must(retained.selector_mut().next(ClientInfo::default(), ""));
     assert_eq!(
@@ -800,6 +806,16 @@ async fn route_plane_replaces_admission_but_retains_an_existing_selector() -> Te
     );
     drop(retained);
     drop(replacement);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let evidence = handle.route_ledger_evidence();
+            if evidence.router_incarnations == 1 && evidence.sessions == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     plane_task.abort();
     let _ = plane_task.await;
     Ok(())

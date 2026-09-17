@@ -22,6 +22,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 func framed(t *testing.T, envelope *controlpb.ControlEnvelope) []byte {
@@ -76,6 +78,16 @@ func heartbeat() *controlpb.ControlEnvelope {
 	}
 }
 
+func wireBytesField(field protowire.Number, value []byte) []byte {
+	message := protowire.AppendTag(nil, field, protowire.BytesType)
+	return protowire.AppendBytes(message, value)
+}
+
+func wireVarintField(field protowire.Number, value uint64) []byte {
+	message := protowire.AppendTag(nil, field, protowire.VarintType)
+	return protowire.AppendVarint(message, value)
+}
+
 func uint64p(v uint64) *uint64 { return &v }
 func stringp(v string) *string { return &v }
 
@@ -101,6 +113,148 @@ func TestExtractFrameFieldsMatchesWire(t *testing.T) {
 	open := extractFrameFields(framed(t, routeResult(1, 1, 1, 1, "a", false))[4:])
 	if open.kind != dropNone {
 		t.Fatalf("refused route result must not classify as a drop kind: %+v", open)
+	}
+}
+
+func TestExtractFrameAuditCoversEveryRetiredRouteBody(t *testing.T) {
+	legacy := map[protowire.Number]string{
+		fieldHandshakeResponse: "handshake_response",
+		fieldHandshakeDecision: "handshake_decision",
+		fieldHandshakeResult:   "handshake_result",
+		fieldRouteRequest:      "route_request",
+		fieldRouteAssignment:   "route_assignment",
+		fieldRouteResult:       "route_result",
+		fieldConnectionEvent:   "connection_event",
+		fieldRedirectCommand:   "redirect_command",
+		fieldRedirectResult:    "redirect_result",
+		fieldCloseCommand:      "close_command",
+		fieldCloseResult:       "close_result",
+	}
+	for field, want := range legacy {
+		t.Run(want, func(t *testing.T) {
+			got := extractFrameAudit(wireBytesField(field, nil))
+			if got.legacyBody != want {
+				t.Fatalf("legacy body = %q, want %q", got.legacyBody, want)
+			}
+		})
+	}
+
+	state := append(wireBytesField(2, nil), wireBytesField(2, nil)...)
+	state = append(state, wireBytesField(3, nil)...)
+	gotState := extractFrameAudit(wireBytesField(fieldStateSnapshot, state))
+	if gotState.stateBackends != 2 || gotState.stateNamespaces != 1 {
+		t.Fatalf("state counts = backends %d namespaces %d, want 2/1", gotState.stateBackends, gotState.stateNamespaces)
+	}
+
+	reconcile := append(wireVarintField(2, 17), wireBytesField(5, nil)...)
+	reconcile = append(reconcile, wireBytesField(5, nil)...)
+	reconcile = append(reconcile, wireVarintField(6, 23)...)
+	gotRequest := extractFrameAudit(wireBytesField(fieldReconcileRequest, reconcile))
+	if gotRequest.reconcileRequestConnections != 2 || gotRequest.reconcileRequestEventSequence != 1 ||
+		gotRequest.reconcileRequestDrainSequence != 23 {
+		t.Fatalf("reconcile request counts = connections %d event-sequences %d drain-sequence %d, want 2/1/23",
+			gotRequest.reconcileRequestConnections, gotRequest.reconcileRequestEventSequence,
+			gotRequest.reconcileRequestDrainSequence)
+	}
+	gotSnapshot := extractFrameAudit(wireBytesField(fieldReconcileSnapshot, reconcile))
+	if gotSnapshot.reconcileSnapshotConnections != 2 || gotSnapshot.reconcileSnapshotEventSequence != 1 {
+		t.Fatalf("reconcile snapshot counts = connections %d event-sequences %d, want 2/1",
+			gotSnapshot.reconcileSnapshotConnections, gotSnapshot.reconcileSnapshotEventSequence)
+	}
+
+	gotDrain := extractFrameAudit(wireBytesField(fieldDrainCommand, wireVarintField(6, 29)))
+	if gotDrain.drainCommandSequence != 29 {
+		t.Fatalf("drain command sequence = %d, want 29", gotDrain.drainCommandSequence)
+	}
+
+	producerID := []byte("producer-a")
+	wantFingerprint := producerFingerprint(producerID)
+	batchBody := append(wireVarintField(1, 31), wireBytesField(3, producerID)...)
+	gotBatch := extractFrameAudit(wireBytesField(fieldMeteringBatch, batchBody))
+	if gotBatch.meteringKind != "batch" || gotBatch.meteringSequence != 31 ||
+		gotBatch.meteringProducerFingerprint != wantFingerprint {
+		t.Fatalf("metering batch audit = %+v, want batch/31", gotBatch)
+	}
+	ackBody := append(wireBytesField(1, producerID), wireVarintField(2, 31)...)
+	gotAck := extractFrameAudit(wireBytesField(fieldMeteringAck, ackBody))
+	if gotAck.meteringKind != "ack" || gotAck.meteringSequence != 31 ||
+		gotAck.meteringProducerFingerprint != wantFingerprint {
+		t.Fatalf("metering ack audit = %+v, want ack/31", gotAck)
+	}
+	reconcileMetering := append(wireVarintField(4, 27), wireVarintField(6, 29)...)
+	gotRequest = extractFrameAudit(wireBytesField(fieldReconcileRequest, reconcileMetering))
+	if gotRequest.meteringKind != "reconcile_request" || gotRequest.meteringSequence != 27 {
+		t.Fatalf("reconcile request metering audit = %+v, want reconcile_request/27", gotRequest)
+	}
+	gotSnapshot = extractFrameAudit(wireBytesField(fieldReconcileSnapshot, wireVarintField(4, 28)))
+	if gotSnapshot.meteringKind != "reconcile_snapshot" || gotSnapshot.meteringSequence != 28 {
+		t.Fatalf("reconcile snapshot metering audit = %+v, want reconcile_snapshot/28", gotSnapshot)
+	}
+	errorBody := append(wireVarintField(1, 22), wireVarintField(2, 99)...)
+	errorBody = append(errorBody, wireVarintField(3, 1)...)
+	errorBody = append(errorBody, wireVarintField(5, 1)...)
+	gotError := extractFrameAudit(wireBytesField(fieldProtocolError, errorBody))
+	if gotError.meteringKind != "protocol_error" || gotError.protocolErrorCode != 22 ||
+		gotError.protocolErrorOffendingRequestID != 99 || !gotError.protocolErrorRetryable ||
+		!gotError.protocolErrorFatal {
+		t.Fatalf("protocol error audit = %+v, want closed fields 22/99/true/true", gotError)
+	}
+}
+
+func TestStateExposesStableRouteAuditSnapshot(t *testing.T) {
+	drop := newDropper("front", "target", false, log.New(io.Discard, "", 0))
+	fingerprint := producerFingerprint([]byte("producer-a"))
+	drop.recordAudit(directionRustToGo, frameAudit{
+		legacyBody:                     "route_request",
+		stateBackends:                  2,
+		stateNamespaces:                1,
+		reconcileRequestConnections:    3,
+		reconcileRequestEventSequence:  1,
+		drainCommandSequence:           29,
+		reconcileRequestDrainSequence:  23,
+		reconcileSnapshotConnections:   4,
+		reconcileSnapshotEventSequence: 1,
+		meteringKind:                   "batch",
+		meteringSequence:               31,
+		meteringProducerFingerprint:    fingerprint,
+	})
+	drop.recordAudit(directionGoToRust, frameAudit{
+		meteringKind:                "ack",
+		meteringSequence:            31,
+		meteringProducerFingerprint: fingerprint,
+	})
+	drop.recordAudit(directionGoToRust, frameAudit{
+		meteringKind:                    "protocol_error",
+		protocolErrorCode:               22,
+		protocolErrorOffendingRequestID: 99,
+		protocolErrorFatal:              true,
+	})
+
+	recorder := httptest.NewRecorder()
+	drop.handleState(recorder, httptest.NewRequest(http.MethodGet, "/state", nil))
+	var state struct {
+		RouteAudit routeAudit `json:"route_audit"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&state); err != nil {
+		t.Fatalf("decode route audit: %v", err)
+	}
+	got := state.RouteAudit
+	if got.LegacyBodyCounts["route_request"] != 1 || got.StateBackends != 2 || got.StateNamespaces != 1 ||
+		got.ReconcileRequestConnections != 3 || got.ReconcileRequestEventSequences != 1 ||
+		got.DrainCommands != 1 || got.MaxDrainCommandSequence != 29 ||
+		got.MaxReconcileRequestDrainSequence != 23 ||
+		got.ReconcileSnapshotConnections != 4 || got.ReconcileSnapshotEventSequences != 1 ||
+		got.MeteringBatches != 1 || got.MeteringAcks != 1 || got.ProtocolErrors != 1 ||
+		got.FatalProtocolErrors != 1 || got.MaxMeteringBatchSequence != 31 ||
+		got.MaxMeteringAckSequence != 31 || len(got.MeteringEvents) != 3 {
+		t.Fatalf("route audit mismatch: %+v", got)
+	}
+	if got.MeteringEvents[0].Direction != directionRustToGo ||
+		got.MeteringEvents[1].Direction != directionGoToRust ||
+		got.MeteringEvents[0].ProducerFingerprint != fingerprint ||
+		got.MeteringEvents[1].ProducerFingerprint != fingerprint ||
+		!got.MeteringEvents[2].Fatal {
+		t.Fatalf("metering event order mismatch: %+v", got.MeteringEvents)
 	}
 }
 

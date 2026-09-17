@@ -1,12 +1,44 @@
 # Rust dataplane reconciliation runbook (CTL-06)
 
-Operational reference for redirect/drain/close idempotency and
-Go↔Rust restart reconciliation. Protocol authority:
+Operational reference for redirect/drain/close idempotency and the residual
+Go↔Rust restart exchange. Protocol authority:
 `rust-control-protocol-v1.md` §"Last-good state and control loss",
 §"Redirect and drain". Implementations: Rust
 `dataplane::control_commands` (`CommandGate`, `MeteringLedger`), Go
-`pkg/controlbridge` (`RouterAdapter`, `DrainIssuer`,
-`MeteringConsumer`).
+`pkg/controlbridge` (the route-owner residual handler, `DrainIssuer`, and
+`MeteringConsumer`). `RouterAdapter` remains only as Phase-1 legacy source/test
+material; bundled Rust-owner production neither constructs it nor runs
+`ResolveOrphans`.
+
+## Phase-1 route-owner boundary
+
+Capability `RUST_ROUTE_OWNER` is required for every bundled Rust-mode control
+session. It is a compatibility assertion, not a runtime switch. Once the Rust
+process has started in this mode, control loss or a reconnect missing cap6 does
+not transfer route ownership back to Go and does not impose the old 30-second
+admission expiry.
+
+- Rust resolves namespace, selects/reserves backends, owns the session route
+  lease, schedules redirect/failover/force-close, and settles every terminal
+  locally.
+- Go receives no route lifecycle body and constructs no `RouterAdapter`.
+  Injected legacy bodies are nonfatal protocol violations with a counter
+  increment and a provably unchanged route-state hash.
+- Reconcile is residual only: request connections and connection-event sequence
+  are empty/zero; response connections are empty. It may acknowledge snapshot,
+  metrics, metering, and drain lineage but may not create, finish, redirect,
+  rehydrate, orphan-resolve, or close a route.
+- CP-METER continues retaining/replaying its local ledger while disconnected.
+  CP-ADMIN drain is unavailable until reconnect; process-local shutdown still
+  follows the normal bounded drain/force/join chain.
+- A migration command targeting a session whose long-lived route lease has
+  already unregistered is rejected directly, before allocating a command
+  envelope or touching that session FIFO. The router records its bounded
+  refusal cooldown, and no detached redirect/close guard survives the verdict.
+
+The detailed Go route reconciliation text below is retained as the legacy
+capabilities 1–3 oracle for Phase 1. It is not a description of the cap6
+production path and becomes dead-path deletion in Phase 2.
 
 ## Invariants the machines enforce (no operator action)
 
@@ -19,7 +51,7 @@ Go↔Rust restart reconciliation. Protocol authority:
 | Duplicate `DrainCommand` (active id) | Returns current progress; never a second drain. Protocol `drain_id` is an **incarnation-unique wire operation id** (`<operator-label>@<128-bit boot nonce>`): one Go issuer incarnation binds each operator label to exactly one wire id/sequence, including across reconnects/epochs. A fresh Go restart re-requesting the same label is **a new operation by definition** (resuming would require persisting the label→wire mapping, which is deliberately not claimed); a previous incarnation's still-active drain surfaces through the `DRAIN_IN_PROGRESS` answer (`DrainIssuer::ForeignActiveDrain`) for the composition to wait on and retry. |
 | Different drain id while one is active | `DRAIN_IN_PROGRESS` (both sides reject — Go locally before sending, Rust at the gate). |
 | Re-issued completed drain id (idle) | Replays the final result. |
-| Duplicate/reordered `MeteringBatch` | Applies only the contiguous next sequence (`last+1`); duplicates and gaps are refused (the producer replays in order, so gaps converge), and totals never double-count or skip a batch. |
+| Duplicate/reordered `MeteringBatch` | Same-producer sequences `<= last` are idempotently skipped; only `last+1` applies, while a gap (`> last+1`) is fatal. The producer's single WAL-ordered sender therefore prevents both double-count and skips. |
 | Shed `MetricsBatch` | Best effort by design: dropped under bulk-lane pressure with a local counter; nothing depends on a metrics sequence. |
 | Command for an unknown connection id | `RECONCILIATION_REQUIRED`; never acts on another incarnation. |
 
@@ -163,9 +195,16 @@ The gates are on the real message paths on both sides:
   as negotiated) is sent **session-scoped**: the transport queue entry
   is bound to that exact epoch and is dropped (counted) rather than
   written under a later epoch, because the next `Connected` transition
-  regenerates it. Durable work — command results, CLOSED events,
-  metering batches — is never epoch-dropped: it survives reconnects
-  and the peer dedups it by request id / sequence. Without
+  regenerates it. Durable command results and CLOSED events are never
+  epoch-dropped and survive reconnects under their operation identities.
+  Metering deliberately has only one cross-session owner: its application
+  WAL. Every metering wire copy is session-scoped, so the transport drops an
+  old serial instead of retaining a second durable copy that could overtake
+  WAL replay. Producer-qualified absolute metering opens one ordered sender
+  only after the current session's `ReconcileSnapshot` arrives; the snapshot
+  is a readiness gate, not a trim authority, because v1 carries its sequence
+  without a producer id. The WAL is trimmed only by a producer-qualified
+  `MeteringAck`. Without
   `RECONCILE_CONNECTIONS` no request is sent and no ack can arrive:
   the ledger's bounded unacked retention (fail-closed seal at the
   bound) is then the explicit backpressure. Metering has its full
@@ -173,10 +212,15 @@ The gates are on the real message paths on both sides:
   `ControlDispatchHandle::record_metering`, which keeps the original
   delta at the producer and sends a copy — every failure (ledger
   rejection, dispatch gone, ack closed) **returns the original delta**
-  to its owner, which retries (`BacklogFull` clears on a reconcile
-  ack) or declares its stream unhealthy; sequence exhaustion — from a
-  record or from the periodic seal — is a dispatch fatal. The tick seals batches onto the wire, reconnects replay
-  everything unacknowledged, and every counted path is exported
+  to its owner, which retries (`BacklogFull` clears on a qualified
+  metering ACK) or declares its stream unhealthy; sequence exhaustion — from a
+  record or from the periodic seal — is a dispatch fatal. The tick seals
+  batches into the WAL and sends only when the current session's delivery
+  gate is open; reconnect regenerates everything unacknowledged from the WAL
+  head under the successor serial. Because WAL trimming requires an ACK and
+  every ACK is at or below the peer's applied watermark, the WAL head is
+  always `<= applied+1`: duplicates are skipped and the first new batch is
+  necessarily contiguous. Every counted path is exported
   through the shared `DispatchStats`.
 
   **Request-id lineage**: every application-originated envelope takes
@@ -197,21 +241,26 @@ The gates are on the real message paths on both sides:
   only when the send succeeds. Wire drain deadlines are validated
   (force before graceful, or an absurd horizon, is a protocol
   violation) before any clock conversion.
-- **Go** — `pkg/controlbridge.NewBridge` is the single composition
-  entry: it owns the mode-0600 control listener (`transport.Listen` +
-  `Serve`), the `CompositeControlHandler`, and the orphan-resolution
-  cadence, torn down together on context cancellation. The composite
-  (transport handler) composes the `RouterAdapter`, `DrainIssuer`, and
-  `MeteringConsumer`: metering batches apply with contiguous-sequence
-  dedup, drain results route to the issuer, and every
-  `ReconcileRequest` restores the issuer's drain watermark before the
-  adapter answers. `NewDrainIssuer` is **fallible**: the incarnation
+- **Go** — `pkg/controlbridge.NewBridge` owns the mode-0600 control
+  listener (`transport.Listen` + `Serve`) and the route-owner residual
+  handler. In bundled Rust mode its config intentionally has no router,
+  handshake, or topology attachment; it constructs no `RouterAdapter`
+  and has no orphan-resolution cadence. Metering batches apply with
+  contiguous-sequence dedup, drain results route to the issuer, and every
+  empty residual `ReconcileRequest` restores the issuer's drain watermark
+  before the handler answers with an empty route snapshot. `NewDrainIssuer`
+  is **fallible**: the incarnation
   nonce is the safety anchor for drain wire-id lineage, so a
   crypto/rand failure refuses to construct rather than degrade to a
   guessable nonce. An observed foreign drain (a previous incarnation's
   wire id answered `DRAIN_IN_PROGRESS`) clears when its terminal
   result arrives and arms the consume-once `ForeignDrainResolved`
   retry signal.
+
+At executable shutdown, all control-plane modules share one ten-second join
+budget. Expiry aborts the remaining module tasks and then awaits every join
+handle before runtime finish, so a stuck module is observable but cannot hang
+shutdown or escape as a detached task.
 
 **DPL-04 session ownership and drain**: `tiproxy-rs` now runs the
 production session owner: one engine task owns all four socket halves
@@ -284,13 +333,16 @@ incarnation exactly once.
    (never torn down by reconciliation), and any cached terminal
    `RedirectResult` the snapshot still marks pending is replayed
    verbatim (`ReconcileRepairs::replay_redirect_results`).
-5. Rust replays unacknowledged `MeteringBatch`s verbatim under their
-   original sequences; the consumer's greater-than dedup absorbs any
-   the old lineage had applied. The snapshot's `metering_sequence` is
-   the consumer's **applied** sequence, which lets the ledger drop its
-   acknowledged retention.
+5. The current session's residual `ReconcileSnapshot` opens metering delivery;
+   Rust then replays the producer WAL verbatim from its retained head under one
+   session-scoped sender. Same-producer sequences at or below the consumer's
+   applied watermark are skipped, `last+1` applies, and a gap is fatal. The
+   snapshot's bare `metering_sequence` is readiness evidence only — it has no
+   producer id and cannot trim a producer-qualified WAL. Only
+   `MeteringAck { producer_id, sequence }` trims retained batches. A lost ACK
+   therefore permits ordered duplicates but never double-counting or a gap.
 
-#### Rehydration and orphans (Go restart)
+#### Legacy rehydration and orphans (non-cap6 compatibility only)
 
 For each live pair in `ReconcileRequest` unknown to the fresh lineage,
 the adapter rebuilds real state through two production seams:
@@ -323,13 +375,13 @@ after a reconnect rotation does not transfer the obligation into the
 dead lineage — and no rotation-plus-reconcile can land between a
 separate compare and delete, because there is no window between them.
 The orphan is retained and the next cadence re-sends on the live
-sender. `AttachRouterLookup`/`ResolveOrphans` are wired by DPL-03 to the
-namespace manager and the bridge's managed maintenance cadence; the
-no-leak property holds while that cadence is running. A reused
+sender. `AttachRouterLookup`/`ResolveOrphans` remain only in the legacy
+adapter test path during Phase 1. The cap6 bridge does not attach or call them.
+A reused
 connection id arriving under a new generation/identity retires the
 stale incarnation's accounting exactly once before the rebuild.
 
-### Rust restarts (Go and its router survive)
+### Legacy Rust restart reconciliation (non-cap6 compatibility only)
 
 1. The new Rust process sends `ReconcileRequest` with its (initially
    empty) connection list.
@@ -355,10 +407,10 @@ stale incarnation's accounting exactly once before the rebuild.
   **in-memory only**: unacknowledged batches do not survive a Rust
   process crash (crash durability is an explicit non-goal here and a
   candidate follow-up enhancement).
-- **Stuck redirect**: if a redirect never terminates, Go will not issue
-  another for that connection; force the session closed
-  (`CloseCommand`, `force=true`) — close accounting retires the
-  assignment, and the redirect result is suppressed exactly once.
+- **Stuck redirect**: on the legacy path, Go does not issue another redirect
+  until the pending one terminates. In cap6 production the process-local
+  scheduler owns the pending token; its timeout delivers local `ForceClose`,
+  the RAII terminal settles once, and no `CloseCommand` crosses the bridge.
 
 ## Test evidence
 
@@ -372,3 +424,18 @@ stale incarnation's accounting exactly once before the rebuild.
   `router_adapter_test.go::TestRouterAdapterRedirectEvictionAndReconcile`
   — duplicate redirect-result exactly-once, Rust-restart eviction
   exactly-once with idempotent re-apply, duplicate CLOSED exactly-once.
+- Phase-1 cap6: `pkg/controlbridge/route_owner_handler_test.go` injects every
+  retired family and proves violation+1 with an unchanged state hash, plus
+  empty-only residual reconcile and zero handler counters;
+  `crates/dataplane/tests/control_dispatch.rs` proves the symmetric Rust
+  tombstones; `make dataplane-t4-integration` proves compatible startup,
+  rejected missing-cap6 reconnect, and fresh SQL admission beyond 30 seconds.
+
+## Phase 2 deletion constraint
+
+After the exact Phase-1 tree and full live matrix pass, a separate PR may
+delete `RouterAdapter`, correlated handshake/route response machinery,
+redirect/orphan/per-route-close bridge code, and the legacy route journals.
+That PR is dead-path deletion plus residual-handler simplification only: it
+must not repair a Phase-1 matrix failure or add routing behavior. Deprecated v1
+message definitions and numeric tags remain tombstones until protocol v2.

@@ -881,9 +881,10 @@ fn malformed_revision_is_rejected_without_blocking_the_next_revision() {
     )]);
     assert!(matches!(
         malformed,
-        Err(StoreError::Namespace {
+        Err(StoreError::PersistentNamespace {
+            ref key,
             class: "key_value_name_mismatch"
-        })
+        }) if key == "/config/ns/broken"
     ));
     assert_eq!(store.current().generation(), 1);
     assert_eq!(store.observed_source_revision().etcd_revision, 8);

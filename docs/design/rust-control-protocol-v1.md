@@ -13,9 +13,11 @@ The boundary is intentionally narrow:
 - Rust owns SQL listeners, frontend and backend sockets, TLS, compression,
   PROXY protocol, MySQL packet parsing, authentication bytes, command state,
   session migration, and per-connection I/O.
-- Go owns validated configuration, certificate lifecycle, discovery, routing,
-  balancing, namespaces, redirect selection, metering export, public APIs, and
-  VIP management.
+- Rust owns the validated dynamic configuration/namespace view, topology and
+  health inputs, route selection/balancing, redirect/failover scheduling, and
+  session accounting whenever `RUST_ROUTE_OWNER` is negotiated. Go retains the
+  protocol/static snapshot facts, metering/metrics sink, operator drain bridge,
+  public APIs, and VIP management.
 - The IPC stream carries decoded control metadata and lifecycle events. It
   never carries raw MySQL packets, queries, result rows, authentication
   response bytes, TLS key material, or file contents. There is no cgo or FFI.
@@ -96,6 +98,16 @@ The v1 capability registry is append-only:
 | 1 | `PER_CONNECTION_CLOSE` | `CloseCommand` / `CloseResult` |
 | 2 | `RECONCILE_CONNECTIONS` | the `ReconcileRequest.connections` field |
 | 3 | `RECONCILE_SESSION_REHYDRATION` | connection rehydration under `RECONCILE_CONNECTIONS`: the reconcile carries per-connection identity, applied generation, and pending-command watermarks so Rust re-adopts surviving sessions across a control reconnect and Go resumes their redirect/drain/close lifecycle without re-issuing terminals or orphaning in-flight commands |
+| 4 | `METERING_ABSOLUTE_SNAPSHOTS` | producer-qualified absolute metering snapshots and durable acknowledgement |
+| 5 | `RUST_CONFIG_NAMESPACE` | Rust-owned config/namespace fields; Go sends only protocol/static `ConfigSnapshot` facts and no namespaces |
+| 6 | `RUST_ROUTE_OWNER` | process-lifetime assertion that Rust owns topology, route selection, migration, and route lifecycle; Go sends no backends/namespaces and never becomes a fallback owner |
+
+Capabilities 1–3 are retired from the bundled Rust-owner production handshake;
+their enum values and message tags remain append-only v1 tombstones. Capability
+6 is different from an optional per-envelope extension: bundled Rust mode
+requires it during every handshake. A missing capability 6 rejects the
+connection before it becomes an active session. After one compatible startup,
+a disconnect or rejected reconnect cannot demote the process to Go routing.
 
 The mandatory Go `Hello` process lineage (above) is deliberately **not** gated
 on any of these capabilities: it is required whenever a Go control plane speaks
@@ -111,8 +123,9 @@ active-connection inventory.
 sequenceDiagram
     participant G as Go control plane
     participant R as Rust dataplane
-    R->>G: connect UDS + Hello(versions, capabilities, limit)
+    R->>G: connect UDS
     G->>R: Hello(versions, capabilities, limit)
+    R->>G: Hello(versions, capabilities, limit)
     G->>R: HelloAck(v1, epoch, negotiated capabilities)
     R->>G: HelloAck(v1, epoch)
     G->>R: StateSnapshot(generation=N)
@@ -160,6 +173,14 @@ records. A continuously busy lane therefore cannot starve the others. Critical
 redirect, drain, assignment result, connection-close, and reconciliation
 records are never displaced by metrics. Queue accounting includes protobuf
 bytes and fixed per-entry overhead, not only message count.
+
+Absolute metering durability belongs to the producer WAL, not to these
+transport queues. Each `MeteringBatch` wire copy is bound to one Rust-local
+session serial; after reconnect, the current `ReconcileSnapshot` opens one
+ordered replay from the retained WAL head. Its v1 `metering_sequence` is a
+readiness watermark only because it carries no `producer_id`; only a matching
+`MeteringAck { producer_id, sequence }` may trim the WAL. This single-owner
+rule prevents a newer transport-retained batch from overtaking older replay.
 
 ### Metrics batch catalog semantics
 
@@ -215,27 +236,36 @@ the immutable configuration, certificate handles, backend identity, and
 connection-scoped protocol settings captured by that session. It continues
 ordinary command forwarding and reports buffered accounting after reconnect.
 
-The v1 last-good grace for new sessions is 30 seconds from the last valid
-heartbeat. During the grace, Rust may accept a new session only from the last
-successfully applied snapshot and must mark it for reconciliation. After the
-grace, listeners may remain bound but every new connection fails closed before
-session allocation. Redirect and graceful-drain commands pause immediately on
-control loss; a locally configured process-shutdown deadline is still honored.
-No new route lease may outlive the grace deadline.
+For a legacy session without `RUST_ROUTE_OWNER`, the v1 last-good grace for new
+sessions is 30 seconds from the last valid heartbeat. During the grace, Rust
+may accept from the last applied bridge snapshot; after it, admission fails
+closed.
 
-On reconnect, Rust sends applied generation, active connection/backend pairs,
-pending redirect IDs, and last durable event/metric/metering sequences. Go
-rebuilds idempotency/accounting state before issuing new redirects or drain.
-The active pairs are carried in `ReconcileRequest.connections` and require the
-`RECONCILE_CONNECTIONS` capability. Go replies with `ReconcileSnapshot` after
-it has removed absent Rust connections from router accounting and identified
-any Rust connection unknown to the current Go lineage.
+For a process that negotiated `RUST_ROUTE_OWNER`, route authority is local and
+does **not** expire after 30 seconds. New admission, retained-incarnation
+failover/redirect, timeout force-close, topology/health rotation, and ordinary
+SQL continue from CP-CFG/CP-TOPO/CP-ROUTE. A disconnected or cap6-rejected peer
+is never a signal to fall back to Go. Metering remains in the local durable
+ledger for replay. Operator drain is temporarily unavailable until the
+residual CP-ADMIN channel reconnects; process-local shutdown deadlines remain
+honored.
+
+In route-owner mode, reconnect uses a residual `ReconcileRequest` only:
+`connections=[]` and `last_connection_event_sequence=0` are mandatory. The
+reply likewise has `connections=[]`. Generation, metrics/metering watermarks,
+and the drain command watermark remain so CP-METER/CP-ADMIN can converge, but
+reconcile cannot create, finish, redirect, rehydrate, or close a route. The
+older active-pair reconciliation remains a compatibility contract for legacy
+non-route-owner test peers only.
 
 ## Snapshots and generation application
 
-Go validates source configuration before publishing. A state snapshot is a
-complete replacement, not a patch, and its generation covers configuration,
-listeners, TLS policy, backend discovery, and namespace routing together. Rust
+Rust validates local configuration/topology before publishing. In route-owner
+mode the Go state snapshot is a residual carrier: `backends=[]`,
+`namespaces=[]`, and `ConfigSnapshot` contains only the negotiated MySQL
+capability and server-version facts. Rust rejects any nonempty routing field.
+The in-process composer combines that residual source with the current
+CP-CFG/CP-TOPO inputs into one complete serving generation. Rust
 validates into an isolated candidate, including address syntax, limits,
 capability mask, traffic-replay exclusion, certificate/key pairing, CA/policy,
 and listener conflicts. It atomically swaps the candidate only after all checks
@@ -282,7 +312,27 @@ deployment-provided directory allowlist. Diagnostics identify only the policy
 field and failure class; they never include file contents, authentication data,
 or key material.
 
-## Handshake and routing lifecycle
+## Route-owner cutover and v1 tombstones
+
+With capability 6, handshake policy, namespace resolution, route selection,
+reservation settlement, connection lifecycle, redirect, failover, and
+per-route force-close are in-process Rust operations. Production emits no
+`Handshake*`, `Route*`, `ConnectionEvent`, `Redirect*`, or `Close*` body.
+Receiving any one of those retired bodies is a nonfatal protocol violation:
+increment the bounded `rust_legacy_route_violation` observation, produce no
+callback/result/effect, and leave the route-state hash unchanged.
+
+The protobuf oneof tags and message definitions remain exactly where they are.
+They are deprecated non-actionable tombstones until a protocol-v2 change can
+remove them and reserve their numeric tags. Phase 2 may delete dead adapters
+and handlers, but must not delete/reuse the v1 schema numbers or introduce new
+routing semantics.
+
+## Legacy handshake and routing lifecycle
+
+The remainder of this section documents the pre-cap6 compatibility path and
+its retained test oracle. It is not constructed or called by bundled
+Rust-owner production.
 
 Rust sends decoded, bounded handshake metadata only. `AuthData`, salt, auth
 switch packets, queries, attributes outside the configured size limit, and raw
@@ -378,6 +428,7 @@ continues to use `DrainCommand` and must not be overloaded for one connection.
 | v1 only | v1 only | Negotiate v1. |
 | v1 + optional capability X | v1 without X | Negotiate v1; X may be used only when not required. |
 | v1 requiring X | v1 without X | Reject the guarded operation with `MISSING_CAPABILITY`. |
+| v1 Rust-owner process requiring capability 6 | v1 without capability 6 | Reject Hello/session establishment; retain local Rust route authority if this is a reconnect. |
 | v1/v2 | v1 | Select v1 and emit only v1 semantics. |
 | v1 | v2 only | Reject Hello with `UNSUPPORTED_VERSION`. |
 | any | malformed/oversized Hello | Close; do not fall back to an unversioned protocol. |
@@ -452,3 +503,8 @@ the issue remains open.
 Any correction to the frozen failure, ordering, or security semantics requires
 a new ADR and protocol v2. Additive v1 fields still require cross-language
 golden coverage before use.
+
+Protocol-v2 candidate: pair `ReconcileSnapshot.metering_sequence` with the
+metering `producer_id`. That would let a snapshot safely trim the matching WAL
+instead of serving only as a session-readiness gate. It is intentionally not
+added to v1: a bare sequence cannot acknowledge a different producer safely.

@@ -84,6 +84,9 @@ jobs:
       - name: Run local migration and ForceClose regression
         if: steps.changes.outputs.relevant == 'true'
         run: make dataplane-t3-integration
+      - name: Run route-owner capability rejection regression
+        if: steps.changes.outputs.relevant == 'true'
+        run: make dataplane-t4-integration
       - name: Upload redacted diagnostics
         if: always() && steps.changes.outputs.relevant == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

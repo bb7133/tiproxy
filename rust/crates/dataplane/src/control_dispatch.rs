@@ -58,7 +58,9 @@
 //! only when the send **succeeds**: a full session channel retries on
 //! the next tick, a closed one converges through the close path.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -96,6 +98,8 @@ pub struct DispatchStats {
     pub send_failures: AtomicU64,
     /// Fail-closed metering rejections (record and seal).
     pub metering_failures: AtomicU64,
+    /// Retired route-family bodies rejected under `RUST_ROUTE_OWNER`.
+    pub legacy_route_violations: AtomicU64,
 }
 
 /// Longest accepted distance between "now" and a wire drain deadline:
@@ -258,6 +262,9 @@ enum ForwardOutcome {
 /// lost result needs cross-epoch replay.
 pub struct ControlCommandHandler {
     gate: CommandGate,
+    /// The production cutover composition. This is process-fixed: bridge
+    /// reconnects cannot demote routing back to Go.
+    route_owner: bool,
     /// The active control session's atomic `(epoch, capability mask)`
     /// snapshot — `None` whenever the last observed transport state is
     /// not `Connected` (watch coalescing can collapse
@@ -276,6 +283,14 @@ pub struct ControlCommandHandler {
     /// Whether the current session negotiated `RECONCILE_CONNECTIONS`:
     /// gates both sending reconcile requests and accepting snapshots.
     reconcile_capable: bool,
+    /// The exact Rust-local control-session serial allowed to put metering
+    /// batches on the transport. The WAL is the only cross-session owner:
+    /// reconnect clears this gate, and an absolute-capability session opens
+    /// it only after its own reconcile snapshot arrives. Legacy metering (or
+    /// a peer without reconciliation) opens it at `Connected` and still uses
+    /// session-scoped sends, so no transport-queued batch can survive into a
+    /// successor and overtake WAL replay.
+    metering_delivery_serial: Option<u64>,
     metering: MeteringLedger,
     sessions: HashMap<u64, SessionEntry>,
     /// Matched sessions whose force-phase `CloseImmediate` was
@@ -315,9 +330,11 @@ impl ControlCommandHandler {
     pub fn with_metering(metering: MeteringLedger) -> Self {
         Self {
             gate: CommandGate::new(),
+            route_owner: false,
             active_session: None,
             active_lineage: None,
             reconcile_capable: true,
+            metering_delivery_serial: None,
             metering,
             sessions: HashMap::new(),
             force_notified: BTreeSet::new(),
@@ -326,6 +343,16 @@ impl ControlCommandHandler {
             initiating_drain: HashMap::new(),
             stats: Arc::new(DispatchStats::default()),
         }
+    }
+
+    /// Creates the production post-cutover handler. The owner decision is
+    /// process-fixed; capability negotiation only proves peer compatibility.
+    #[must_use]
+    pub fn with_metering_route_owner(metering: MeteringLedger) -> Self {
+        let mut handler = Self::with_metering(metering);
+        handler.route_owner = true;
+        handler.reconcile_capable = false;
+        handler
     }
 
     /// Applies a new control session's negotiation: peer mode follows
@@ -352,6 +379,12 @@ impl ControlCommandHandler {
         peer_process_id: Arc<str>,
         peer_started_unix_millis: u64,
     ) {
+        // Preserve an already-open gate only for an idempotent publication of
+        // the exact same Rust-local session. Every real reconnect gets a new
+        // serial and must establish its own ordered delivery generation.
+        self.metering_delivery_serial = self
+            .metering_delivery_serial
+            .filter(|ready_serial| *ready_serial == serial);
         self.active_session = Some((serial, epoch, capabilities));
         // Scope the gate's applied-generation to this Go lineage: a
         // restarted Go's gate reads back 0, while a same-Go reconnect
@@ -361,11 +394,19 @@ impl ControlCommandHandler {
             peer_started_unix_millis,
         )));
         self.active_lineage = Some((peer_process_id, peer_started_unix_millis));
-        let reconcile = (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
-        let rehydration = reconcile
-            && (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1;
-        self.reconcile_capable = reconcile;
-        self.gate.set_legacy_peer(!rehydration);
+        if self.route_owner {
+            self.reconcile_capable =
+                (capabilities >> (ControlCapability::RustRouteOwner as u64)) & 1 == 1;
+            self.gate.set_legacy_peer(false);
+        } else {
+            let reconcile =
+                (capabilities >> (ControlCapability::ReconcileConnections as u64)) & 1 == 1;
+            let rehydration = reconcile
+                && (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1
+                    == 1;
+            self.reconcile_capable = reconcile;
+            self.gate.set_legacy_peer(!rehydration);
+        }
     }
 
     /// The transport left `Connected`: there is no active session, so
@@ -377,6 +418,7 @@ impl ControlCommandHandler {
     pub fn on_disconnected(&mut self) {
         self.active_session = None;
         self.active_lineage = None;
+        self.metering_delivery_serial = None;
         self.gate.set_active_origin(None);
     }
 
@@ -413,6 +455,45 @@ impl ControlCommandHandler {
     #[must_use]
     pub const fn reconcile_capable(&self) -> bool {
         self.reconcile_capable
+    }
+
+    /// Opens metering delivery for the current session exactly once and
+    /// returns the WAL's retained batches in sequence order. The caller is the
+    /// single dispatch task and enqueues the entire replay before it can
+    /// process a later seal notice, so new batches cannot overtake the replay.
+    fn begin_metering_delivery(&mut self) -> Vec<control_proto::v1::MeteringBatch> {
+        let Some((serial, _, _)) = self.active_session else {
+            return Vec::new();
+        };
+        if self.metering_delivery_serial == Some(serial) {
+            return Vec::new();
+        }
+        self.metering_delivery_serial = Some(serial);
+        self.metering.replay()
+    }
+
+    /// The current session may emit newly sealed metering only after its
+    /// replay generation has opened.
+    fn metering_delivery_serial(&self) -> Option<u64> {
+        let active = self.active_session.map(|(serial, _, _)| serial);
+        self.metering_delivery_serial
+            .filter(|serial| Some(*serial) == active)
+    }
+
+    /// Closes one failed/stale session's delivery generation. A later seal
+    /// must remain WAL-only instead of jumping past the batch whose wire copy
+    /// failed. A successor session (or another qualified snapshot for this
+    /// session) regenerates replay from the retained WAL head.
+    fn close_metering_delivery(&mut self, serial: u64) {
+        if self.metering_delivery_serial == Some(serial) {
+            self.metering_delivery_serial = None;
+        }
+    }
+
+    /// Whether this process was composed as the route owner.
+    #[must_use]
+    pub const fn route_owner(&self) -> bool {
+        self.route_owner
     }
 
     /// The active session's negotiated epoch, if connected.
@@ -525,6 +606,24 @@ impl ControlCommandHandler {
         self.stats.unrouted.load(Ordering::Relaxed)
     }
 
+    /// Retired route-family protocol violations observed after cutover.
+    #[must_use]
+    pub fn legacy_route_violations(&self) -> u64 {
+        self.stats.legacy_route_violations.load(Ordering::Relaxed)
+    }
+
+    /// Stable fingerprint of the route/session gate for zero-side-effect
+    /// protocol tests. Metrics counters are deliberately excluded.
+    #[must_use]
+    pub fn route_state_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        format!("{:?}", self.gate).hash(&mut hasher);
+        let mut sessions: Vec<_> = self.sessions.keys().copied().collect();
+        sessions.sort_unstable();
+        sessions.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Stale-epoch inbound bodies discarded by policy so far.
     #[must_use]
     pub fn stale_dropped(&self) -> u64 {
@@ -533,6 +632,12 @@ impl ControlCommandHandler {
 
     fn count_unrouted(&self) {
         self.stats.unrouted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn count_legacy_route_violation(&self) {
+        self.stats
+            .legacy_route_violations
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records one stale-epoch discard.
@@ -658,7 +763,9 @@ impl ControlCommandHandler {
             .retain(|(id, _), _| *id != connection_id);
 
         let mut outbound = Vec::new();
-        if let Some(identity) = identity {
+        if !self.route_owner
+            && let Some(identity) = identity
+        {
             outbound.push(closed_event_envelope(
                 identity,
                 &backend_id,
@@ -696,6 +803,18 @@ impl ControlCommandHandler {
     ) -> Vec<ControlEnvelope> {
         let request_id = envelope.request_id;
         let generation = envelope.generation;
+        if self.route_owner && is_retired_route_body(envelope.body.as_ref()) {
+            self.count_legacy_route_violation();
+            return vec![result_envelope(
+                OutboundControl::ProtocolError {
+                    code: ErrorCode::ProtocolViolation,
+                    request_id,
+                    detail: "retired route-family message under RUST_ROUTE_OWNER",
+                },
+                generation,
+                request_id,
+            )];
+        }
         match &envelope.body {
             Some(Body::RedirectCommand(command)) => {
                 let command = command.clone();
@@ -742,6 +861,27 @@ impl ControlCommandHandler {
                     }
                 }
                 let snapshot = snapshot.clone();
+                if self.route_owner {
+                    if snapshot.connection_event_sequence != 0 || !snapshot.connections.is_empty() {
+                        self.count_legacy_route_violation();
+                        return vec![result_envelope(
+                            OutboundControl::ProtocolError {
+                                code: ErrorCode::ProtocolViolation,
+                                request_id,
+                                detail: "route-owner reconcile snapshot contains route state",
+                            },
+                            generation,
+                            request_id,
+                        )];
+                    }
+                    self.metering.acked_through(snapshot.metering_sequence);
+                    let absolute = self.absolute_metering_enabled();
+                    return self
+                        .begin_metering_delivery()
+                        .into_iter()
+                        .map(|batch| metering_batch_envelope(batch, absolute))
+                        .collect();
+                }
                 self.dispatch_reconcile_snapshot(&snapshot)
             }
             // Correlated Go answers are delivered to their owning
@@ -1266,8 +1406,16 @@ impl ControlCommandHandler {
     /// plus the metering watermark.
     #[must_use]
     pub fn build_reconcile_request(&mut self, known_generation: u64) -> ReconcileRequest {
-        self.gate
-            .build_reconcile_request(known_generation, 0, self.metering.last_sequence())
+        if self.route_owner {
+            self.gate.build_residual_reconcile_request(
+                known_generation,
+                0,
+                self.metering.last_sequence(),
+            )
+        } else {
+            self.gate
+                .build_reconcile_request(known_generation, 0, self.metering.last_sequence())
+        }
     }
 
     fn dispatch_reconcile_snapshot(
@@ -1316,14 +1464,13 @@ impl ControlCommandHandler {
                 outbound.push(event);
             }
         }
+        let absolute = self.absolute_metering_enabled();
+        outbound.extend(
+            self.begin_metering_delivery()
+                .into_iter()
+                .map(|batch| metering_batch_envelope(batch, absolute)),
+        );
         outbound
-    }
-
-    /// Metering batches the reconnect path must (re)send: everything
-    /// unacknowledged, in order.
-    #[must_use]
-    pub fn metering_replay(&self) -> Vec<control_proto::v1::MeteringBatch> {
-        self.metering.replay()
     }
 
     /// Seals and returns the next metering batch for sending.
@@ -1346,6 +1493,26 @@ impl ControlCommandHandler {
             },
             None => ForwardOutcome::Gone,
         }
+    }
+}
+
+/// Wraps one WAL-owned metering batch for the current session. The dispatch
+/// loop always sends this envelope session-scoped: durability lives solely in
+/// [`MeteringLedger`], never in a second cross-session transport queue.
+fn metering_batch_envelope(
+    batch: control_proto::v1::MeteringBatch,
+    absolute: bool,
+) -> ControlEnvelope {
+    ControlEnvelope {
+        request_id: NEEDS_ALLOCATION,
+        priority: Priority::Bulk.into(),
+        required_capabilities: if absolute {
+            vec![ControlCapability::MeteringAbsoluteSnapshots as u64]
+        } else {
+            Vec::new()
+        },
+        body: Some(Body::MeteringBatch(batch)),
+        ..ControlEnvelope::default()
     }
 }
 
@@ -1387,6 +1554,25 @@ fn result_envelope(outbound: OutboundControl, generation: u64, request_id: u64) 
         required_capabilities,
         body: Some(body),
     }
+}
+
+const fn is_retired_route_body(body: Option<&Body>) -> bool {
+    matches!(
+        body,
+        Some(
+            Body::HandshakeResponse(_)
+                | Body::HandshakeDecision(_)
+                | Body::HandshakeResult(_)
+                | Body::RouteRequest(_)
+                | Body::RouteAssignment(_)
+                | Body::RouteResult(_)
+                | Body::ConnectionEvent(_)
+                | Body::RedirectCommand(_)
+                | Body::RedirectResult(_)
+                | Body::CloseCommand(_)
+                | Body::CloseResult(_)
+        )
+    )
 }
 
 fn closed_event_envelope(
@@ -2157,8 +2343,11 @@ impl DispatchSender for ControlClient {
 /// Delivery policy for one outbound envelope.
 #[derive(Clone, Copy)]
 enum SendScope {
-    /// Cross-reconnect retention: results, lifecycle events, metering
-    /// batches — the peer dedups by request id / sequence.
+    /// Cross-reconnect retention for results and lifecycle events whose
+    /// operation identities let the peer deduplicate them. Metering is
+    /// deliberately excluded: its WAL is the sole durable owner, and a
+    /// second transport-retained copy could overtake the WAL's contiguous
+    /// replay on reconnect.
     Durable,
     /// Valid only under exactly this Rust-local session serial (wire
     /// epoch VALUES can repeat across Go restarts); regenerated by the
@@ -2518,11 +2707,11 @@ async fn apply_state<S: DispatchSender>(
 }
 
 /// One atomic `Connected { epoch, capabilities }` snapshot drives the
-/// peer mode, the capability-gated reconcile request (declaring
-/// `RECONCILE_CONNECTIONS`, plus rehydration when negotiated), and the
+/// peer mode, the capability-gated reconcile request (declaring either
+/// `RUST_ROUTE_OWNER` or the legacy reconciliation capabilities), and the
 /// metering replay — the session-scoped pieces are bound to exactly
 /// this epoch and regenerated on the next transition if the session
-/// dies first. Without `RECONCILE_CONNECTIONS` no request is sent and
+/// dies first. Without the composition's required capability no request is sent and
 /// no ack can ever arrive: the ledger's bounded unacked retention then
 /// IS the backpressure (sealing fails closed at the bound).
 async fn on_connected_transition<S: DispatchSender>(
@@ -2544,26 +2733,33 @@ async fn on_connected_transition<S: DispatchSender>(
     if handler.reconcile_capable() {
         let _ = send_reconcile_request(sender, handler, serial, capabilities).await?;
     }
-    // Unacked metering is durable: delivery matters with or without an
-    // ack path, and the consumer dedups by contiguous sequence.
+    // The peer idempotently skips batches at or below its applied sequence,
+    // but treats a gap as fatal. Therefore the WAL is the ONLY durable owner
+    // and every wire send is bound to this exact session: a transport-queued
+    // high sequence must never survive a reconnect and overtake older WAL
+    // entries. Absolute metering waits for this session's reconcile snapshot
+    // before opening its ordered delivery generation. Legacy/no-reconcile
+    // modes open immediately and still remain session-scoped.
     let absolute = handler.absolute_metering_enabled();
     if absolute && (capabilities >> (ControlCapability::MeteringAbsoluteSnapshots as u64)) & 1 == 0
     {
         return Err(DispatchFatal::MissingMeteringCapability);
     }
-    for batch in handler.metering_replay() {
-        let envelope = ControlEnvelope {
-            request_id: NEEDS_ALLOCATION,
-            priority: Priority::Bulk.into(),
-            required_capabilities: if absolute {
-                vec![ControlCapability::MeteringAbsoluteSnapshots as u64]
-            } else {
-                Vec::new()
-            },
-            body: Some(Body::MeteringBatch(batch)),
-            ..ControlEnvelope::default()
-        };
-        dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+    if absolute && handler.reconcile_capable() {
+        return Ok(());
+    }
+    for batch in handler.begin_metering_delivery() {
+        let outcome = dispatch_send_outcome(
+            sender,
+            handler,
+            metering_batch_envelope(batch, absolute),
+            SendScope::Session(serial),
+        )
+        .await?;
+        if outcome != SendOutcome::Sent {
+            handler.close_metering_delivery(serial);
+            break;
+        }
     }
     Ok(())
 }
@@ -2579,10 +2775,15 @@ async fn send_reconcile_request<S: DispatchSender>(
     capabilities: u64,
 ) -> Result<SendOutcome, DispatchFatal> {
     let request = handler.build_reconcile_request(handler.applied_generation());
-    let mut required = vec![ControlCapability::ReconcileConnections as u64];
-    if (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1 {
-        required.push(ControlCapability::ReconcileSessionRehydration as u64);
-    }
+    let required = if handler.route_owner() {
+        vec![ControlCapability::RustRouteOwner as u64]
+    } else {
+        let mut required = vec![ControlCapability::ReconcileConnections as u64];
+        if (capabilities >> (ControlCapability::ReconcileSessionRehydration as u64)) & 1 == 1 {
+            required.push(ControlCapability::ReconcileSessionRehydration as u64);
+        }
+        required
+    };
     let envelope = ControlEnvelope {
         request_id: NEEDS_ALLOCATION,
         generation: request.known_generation,
@@ -2616,6 +2817,9 @@ async fn repair_stale_export<S: DispatchSender>(
     sender: &Arc<S>,
     handler: &mut ControlCommandHandler,
 ) -> Result<SendOutcome, DispatchFatal> {
+    if handler.route_owner() {
+        return Ok(SendOutcome::StaleEpoch);
+    }
     if !handler.reconcile_capable() {
         return Ok(SendOutcome::StaleEpoch);
     }
@@ -2783,17 +2987,17 @@ async fn apply_notice<S: DispatchSender>(
             if let Some(fatal) = fatal {
                 return Err(fatal);
             }
-            if let Some(batch) = batch {
-                let envelope = ControlEnvelope {
-                    request_id: NEEDS_ALLOCATION,
-                    priority: Priority::Bulk.into(),
-                    required_capabilities: vec![
-                        ControlCapability::MeteringAbsoluteSnapshots as u64,
-                    ],
-                    body: Some(Body::MeteringBatch(batch)),
-                    ..ControlEnvelope::default()
-                };
-                dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+            if let (Some(batch), Some(serial)) = (batch, handler.metering_delivery_serial()) {
+                let outcome = dispatch_send_outcome(
+                    sender,
+                    handler,
+                    metering_batch_envelope(batch, true),
+                    SendScope::Session(serial),
+                )
+                .await?;
+                if outcome != SendOutcome::Sent {
+                    handler.close_metering_delivery(serial);
+                }
             }
         }
         DispatchNotice::SessionClosed {
@@ -2930,13 +3134,21 @@ async fn process_inbound<S: DispatchSender>(
         // to the exact origin session and dropped once it is gone (the
         // current owner retries/reconciles). Terminals (redirect /
         // close / drain results) carry incarnation-qualified operation
-        // ids in their bodies and stay durable.
-        let scope = if matches!(out.body, Some(Body::Error(_))) {
+        // ids in their bodies and stay durable. MeteringBatch is different:
+        // the application WAL is its sole cross-session owner, so every wire
+        // copy is session-scoped and the next session regenerates an ordered
+        // replay only after its reconciliation gate opens.
+        let is_metering = matches!(out.body, Some(Body::MeteringBatch(_)));
+        let scope = if matches!(out.body, Some(Body::Error(_) | Body::MeteringBatch(_))) {
             SendScope::Session(origin_serial)
         } else {
             SendScope::Durable
         };
-        dispatch_send(sender, handler, out, scope).await?;
+        let outcome = dispatch_send_outcome(sender, handler, out, scope).await?;
+        if is_metering && outcome != SendOutcome::Sent {
+            handler.close_metering_delivery(origin_serial);
+            break;
+        }
     }
     Ok(())
 }
@@ -2950,13 +3162,19 @@ async fn run_tick<S: DispatchSender>(
     }
     match handler.seal_metering() {
         Ok(Some(batch)) => {
-            let envelope = ControlEnvelope {
-                request_id: NEEDS_ALLOCATION,
-                priority: Priority::Bulk.into(),
-                body: Some(Body::MeteringBatch(batch)),
-                ..ControlEnvelope::default()
-            };
-            dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+            if let Some(serial) = handler.metering_delivery_serial() {
+                let absolute = handler.absolute_metering_enabled();
+                let outcome = dispatch_send_outcome(
+                    sender,
+                    handler,
+                    metering_batch_envelope(batch, absolute),
+                    SendScope::Session(serial),
+                )
+                .await?;
+                if outcome != SendOutcome::Sent {
+                    handler.close_metering_delivery(serial);
+                }
+            }
         }
         Ok(None) => {}
         Err(MeteringError::SequenceExhausted) => {

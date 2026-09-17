@@ -36,7 +36,7 @@ use proxy_io::counted::ByteCounters;
 use tokio::sync::watch;
 
 use crate::control_commands::{
-    MAX_DELTAS_PER_BATCH, MAX_METERING_KEY_BYTES, MAX_UNACKED_METERING_BATCHES,
+    MAX_DELTAS_PER_BATCH, MAX_METERING_KEY_BYTES, MAX_UNACKED_METERING_BATCHES, MeteringError,
 };
 use crate::control_dispatch::{ControlDispatchHandle, MeteringSnapshotRecordError};
 
@@ -408,9 +408,12 @@ pub enum MeteringSamplerError {
     /// The process or backend generation cannot advance safely.
     #[error("metering source generation is exhausted")]
     GenerationExhausted,
-    /// The durable dispatch owner rejected or disappeared.
-    #[error("metering durable dispatch failed")]
-    Dispatch,
+    /// The durable ledger rejected the snapshot handoff.
+    #[error("metering durable dispatch rejected snapshots: {0:?}")]
+    DispatchRejected(MeteringError),
+    /// The durable dispatch owner disappeared before accepting the handoff.
+    #[error("metering durable dispatch owner unavailable")]
+    DispatchUnavailable,
 }
 
 struct PreparedSample {
@@ -780,9 +783,11 @@ pub async fn run_metering_sampler(
                 .record_metering_snapshots(snapshots)
                 .await
                 .map_err(|error| match error {
-                    MeteringSnapshotRecordError::Rejected { .. }
-                    | MeteringSnapshotRecordError::DispatchUnavailable { .. } => {
-                        MeteringSamplerError::Dispatch
+                    MeteringSnapshotRecordError::Rejected { error, .. } => {
+                        MeteringSamplerError::DispatchRejected(error)
+                    }
+                    MeteringSnapshotRecordError::DispatchUnavailable { .. } => {
+                        MeteringSamplerError::DispatchUnavailable
                     }
                 })?;
             // Commit each chunk independently after its own durable handoff.

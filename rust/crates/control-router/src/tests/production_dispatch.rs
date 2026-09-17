@@ -181,6 +181,36 @@ async fn dispatcher_full_closed_and_duplicate_registration_preserve_cooldown_and
     Ok(())
 }
 
+#[tokio::test]
+async fn unregistered_session_is_rejected_before_fifo_or_envelope_admission() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let candidate = harness.ready().await;
+    let router = Arc::clone(&harness.router);
+    let dispatcher = RouteCommandDispatcher::new(Arc::clone(&router));
+    let session = active_on_a(&router, &candidate);
+
+    let prepared = must(router.prepare_redirect(&session, &candidate, B));
+    assert!(!must(router.offer_redirect(
+        &prepared,
+        dispatcher.as_ref(),
+        Instant::now()
+    )));
+    assert_eq!(counts(&router, A), (1, 1, 0, 0));
+    assert_eq!(counts(&router, B), (0, 0, 0, 0));
+    let cooling = must(router.prepare_redirect(&session, &candidate, B));
+    assert!(matches!(
+        router.offer_redirect(&cooling, dispatcher.as_ref(), Instant::now()),
+        Err(RouteError::CoolingDown)
+    ));
+    assert_eq!(router.close(&session), Settlement::Applied);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn force_close_rejection_records_cooldown_before_later_acceptance() -> TestResult {
     let harness = Harness::with_backends(

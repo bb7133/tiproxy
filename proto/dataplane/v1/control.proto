@@ -81,6 +81,12 @@ enum ControlCapability {
   // fields from its process-local revisioned source. Backends remain on the
   // legacy bridge until CP-TOPO/CP-ROUTE retire them.
   CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE = 5;
+  // CP-ROUTE: Rust owns backend topology and every route/session lifecycle.
+  // This is a compatibility assertion, not a runtime owner switch. A Rust
+  // dataplane composition requires it during its initial negotiation; once
+  // negotiated, Go sends no backend or namespace snapshots and route-family
+  // messages remain wire tombstones until protocol v2.
+  CONTROL_CAPABILITY_RUST_ROUTE_OWNER = 6;
 }
 
 message Hello {

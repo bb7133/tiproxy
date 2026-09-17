@@ -71,6 +71,14 @@ pub enum StoreError {
         /// Stable error class without the persisted payload.
         class: &'static str,
     },
+    /// A bounded persistent namespace key identified the rejected entry.
+    #[error("invalid persistent namespace entry {key}: {class}")]
+    PersistentNamespace {
+        /// Exact validated key; the persisted value is never retained.
+        key: String,
+        /// Stable payload-free rejection class.
+        class: &'static str,
+    },
     /// No generation remains after `u64::MAX`.
     #[error("config/namespace generation exhausted")]
     GenerationExhausted,
@@ -1074,11 +1082,25 @@ where
             break;
         };
         if name.is_empty() {
-            return Err(StoreError::Namespace {
+            return Err(StoreError::PersistentNamespace {
+                key: key.clone(),
                 class: "empty_name",
             });
         }
-        namespaces.push(decode_namespace(name, value)?);
+        let namespace = decode_namespace(name, value).map_err(|error| {
+            let class = match error {
+                StoreError::JsonDecode {
+                    kind: "namespace", ..
+                } => "json_decode_failed",
+                StoreError::Namespace { class } => class,
+                _ => "decode_failed",
+            };
+            StoreError::PersistentNamespace {
+                key: key.clone(),
+                class,
+            }
+        })?;
+        namespaces.push(namespace);
     }
     Ok(PersistentConfigSnapshot {
         proxy,

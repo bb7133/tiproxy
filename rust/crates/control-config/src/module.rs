@@ -30,6 +30,7 @@ use control_plane::{
     ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture, OwnerToken,
 };
 use etcd_client::{EventType, GetOptions, WatchOptions};
+use serde_json::json;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -565,8 +566,12 @@ impl ConfigModule {
             // retry, decode or accidentally adopt that unrelated material.
             entries.retain(|key, _| !is_namespace_key(key));
         }
-        let decoded = decode_persistent_entries(entries)
-            .map_err(|_| module_error("persistent_candidate_decode_rejected"))?;
+        let decoded = decode_persistent_entries(entries).map_err(|error| {
+            if let Some(log) = persistent_candidate_rejection_log(revision, &error) {
+                eprintln!("{log}");
+            }
+            module_error("persistent_candidate_decode_rejected")
+        })?;
         let applied = match namespace_update {
             NamespaceUpdate::Preserve => self.source.apply_persistent_preserving_namespaces(
                 decoded,
@@ -599,6 +604,22 @@ impl ConfigModule {
         }
         Ok(())
     }
+}
+
+fn persistent_candidate_rejection_log(revision: i64, error: &StoreError) -> Option<String> {
+    let StoreError::PersistentNamespace { key, class } = error else {
+        return None;
+    };
+    Some(
+        json!({
+            "component": "control-config",
+            "event": "persistent_candidate_rejected",
+            "revision": revision,
+            "key": key,
+            "error_class": class,
+        })
+        .to_string(),
+    )
 }
 
 fn external_material_fingerprint(source: &ConfigNamespaceStore) -> ExternalMaterialFingerprint {

@@ -619,9 +619,12 @@ impl ControlClient {
     /// owner regenerates such work on every `Connected` transition. The
     /// serial, not the wire epoch, is the binding: a restarted Go can
     /// negotiate the same epoch VALUE, and epoch-bound work from the
-    /// dead session must never reach it. Durable cross-reconnect work
-    /// (results with incarnation-qualified operation ids, lifecycle
-    /// events, metering batches) must use [`ControlClient::send`].
+    /// dead session must never reach it. Durable cross-reconnect results with
+    /// incarnation-qualified operation ids and lifecycle events use
+    /// [`ControlClient::send`]. Metering is deliberately different: its
+    /// application WAL is the sole durable owner, so each wire copy is
+    /// session-scoped and the application regenerates ordered replay after
+    /// the successor session's reconciliation gate opens.
     ///
     /// # Errors
     ///
@@ -1885,8 +1888,8 @@ mod tests {
     /// Fix-2 outbound-binding regression: an envelope enqueued
     /// session-scoped while its session is already dead must NEVER be
     /// written to the replacement session — even one that negotiated
-    /// the SAME wire epoch value — while a durable envelope enqueued
-    /// AFTER it (same priority queue, FIFO) still flows. After the
+    /// the SAME wire epoch value — while a non-metering durable envelope
+    /// enqueued AFTER it (same priority queue, FIFO) still flows. After the
     /// replacement is live, scoping to the dead serial fails fast.
     #[tokio::test]
     async fn session_scoped_queue_never_reaches_the_next_session() -> Result<(), Box<dyn Error>> {
@@ -1938,7 +1941,7 @@ mod tests {
                 .map_err(|_| TransportError::Configuration("state channel closed".to_owned()))?;
         }
 
-        // Dead-session-bound first, durable second — same critical
+        // Dead-session-bound first, non-metering durable second — same critical
         // queue, FIFO: if the durable arrives, the bound one was
         // dropped at dequeue, not merely reordered.
         let scoped = ControlEnvelope {
@@ -1968,7 +1971,7 @@ mod tests {
         }
         assert!(
             delivered.contains(&888),
-            "durable outbound survives: {delivered:?}"
+            "non-metering durable outbound survives: {delivered:?}"
         );
         assert!(
             !delivered.contains(&777),

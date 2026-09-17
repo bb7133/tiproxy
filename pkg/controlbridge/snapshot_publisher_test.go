@@ -43,7 +43,7 @@ func (sender *snapshotSender) HasCapability(capability uint64) bool {
 	return sender.caps != nil && sender.caps[capability]
 }
 
-func TestSnapshotPublisherShrinksOnlyForRustConfigNamespaceCapability(t *testing.T) {
+func TestSnapshotPublisherShrinksForRustOwnershipCapabilities(t *testing.T) {
 	cfg := config.NewConfig()
 	builder, err := NewSnapshotBuilder(cfg, nil)
 	require.NoError(t, err)
@@ -82,6 +82,16 @@ func TestSnapshotPublisherShrinksOnlyForRustConfigNamespaceCapability(t *testing
 	require.Empty(t, ownedSnapshot.GetNamespaces())
 	require.Len(t, ownedSnapshot.GetBackends(), 1, "CP-TOPO still owns bridge retirement")
 	require.Equal(t, []uint64{ownerCap}, ownedEnvelope.GetRequiredCapabilities())
+
+	require.NoError(t, publisher.HandleResult(owned,
+		snapshotResultEnvelope(1, 1, 1, controlpb.ErrorCode_ERROR_CODE_OK)))
+	routeCap := uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_ROUTE_OWNER)
+	routeOwner := &snapshotSender{epoch: 3, caps: map[uint64]bool{ownerCap: true, routeCap: true}}
+	require.NoError(t, publisher.Sync(t.Context(), routeOwner))
+	routeEnvelope := routeOwner.envelopes()[0]
+	require.Empty(t, routeEnvelope.GetStateSnapshot().GetBackends())
+	require.Empty(t, routeEnvelope.GetStateSnapshot().GetNamespaces())
+	require.Equal(t, []uint64{ownerCap, routeCap}, routeEnvelope.GetRequiredCapabilities())
 }
 
 func (sender *snapshotSender) AllocateRequestID() (uint64, error) {
