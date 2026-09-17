@@ -429,6 +429,13 @@ a real topology: it installs the exact TiUP release from `versions.env` only
 after verifying the published archive SHA-256, runs the selected mode/variant,
 and uploads the redacted artifact directory even on failure.
 
+For the formal T4 recording, dispatch that workflow against the exact frozen
+ref with `t4_qualification=true`. The dedicated Linux job disables the ordinary
+single-topology job, allows the complete matrix up to six hours, runs
+`make dataplane-t4-qualification` once, and uploads the whole immutable evidence
+root even on first failure. Qualification dispatches on the same ref do not
+cancel an active recording attempt.
+
 GitHub exposes `workflow_dispatch` only after that workflow file exists on the
 repository's default branch. A fork-only/exact-tree commit cannot be manually
 dispatched by workflow name before merge; that is a CI control-plane

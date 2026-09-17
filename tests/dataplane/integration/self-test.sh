@@ -28,6 +28,20 @@ if [[ $(grep -c $'\tsentinel\ttls-proxy-zstd$' <<<"$qualification_plan") != 3 ]]
 	exit 1
 fi
 
+qualification_workflow="$repo_root/.github/workflows/dataplane-integration.yml"
+for required_fragment in \
+	't4_qualification:' \
+	'cancel-in-progress: ${{ !inputs.t4_qualification }}' \
+	'if: github.event_name == '\''workflow_dispatch'\'' && inputs.t4_qualification' \
+	'timeout-minutes: 360' \
+	'run: make dataplane-t4-qualification' \
+	'path: ${{ env.DATAPLANE_T4_ARTIFACT_ROOT }}'; do
+	if ! grep -Fq "$required_fragment" "$qualification_workflow"; then
+		echo "T4 qualification workflow is missing: $required_fragment" >&2
+		exit 1
+	fi
+done
+
 # Framework-only checks must not require a real TiUP installation or database
 # client. These two fakes satisfy preflight discovery but cannot provision or
 # query anything; the tested Rust path must stop before either would be used.
