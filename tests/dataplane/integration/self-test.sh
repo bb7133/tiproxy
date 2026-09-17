@@ -14,6 +14,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+sha256_file() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	else
+		shasum -a 256 "$1" | awk '{print $1}'
+	fi
+}
+
 bash -n "$script_dir/run.sh" "$script_dir/qualify-route-owner.sh"
 qualification_plan=$("$script_dir/qualify-route-owner.sh" --print-plan)
 if [[ $(wc -l <<<"$qualification_plan" | tr -d ' ') != 48 ]]; then
@@ -28,13 +36,24 @@ if [[ $(grep -c $'\tsentinel\ttls-proxy-zstd$' <<<"$qualification_plan") != 3 ]]
 	exit 1
 fi
 
+qualification_design="$script_dir/tiproxy-223-design-final.md"
+if [[ $(sha256_file "$qualification_design") != eddcc7fb9ece5e82d45ae3b953567197664d4c6633ef3861a5d6a8f677f06f2e ]]; then
+	echo "vendored T4 qualification design is missing or changed" >&2
+	exit 1
+fi
 qualification_workflow="$repo_root/.github/workflows/dataplane-integration.yml"
 for required_fragment in \
 	't4_qualification:' \
 	'cancel-in-progress: ${{ !inputs.t4_qualification }}' \
 	'if: github.event_name == '\''workflow_dispatch'\'' && inputs.t4_qualification' \
 	'timeout-minutes: 360' \
-	'run: make dataplane-t4-qualification' \
+	'DATAPLANE_T4_ARTIFACT_ROOT: ${{ github.workspace }}/../t4-qualification-artifacts' \
+	'mkdir -p "$DATAPLANE_T4_ARTIFACT_ROOT"' \
+	'design_root=$(cd "$GITHUB_WORKSPACE/../.." && pwd)' \
+	'cp tests/dataplane/integration/tiproxy-223-design-final.md \' \
+	'"$design_root/notes/tiproxy-223-design-final.md"' \
+	'make dataplane-t4-qualification 2>&1 | \' \
+	'tee "$DATAPLANE_T4_ARTIFACT_ROOT/qualification.log"' \
 	'path: ${{ env.DATAPLANE_T4_ARTIFACT_ROOT }}'; do
 	if ! grep -Fq "$required_fragment" "$qualification_workflow"; then
 		echo "T4 qualification workflow is missing: $required_fragment" >&2
