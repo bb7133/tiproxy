@@ -47,19 +47,37 @@ for required_fragment in \
 	'cancel-in-progress: ${{ !inputs.t4_qualification }}' \
 	'if: github.event_name == '\''workflow_dispatch'\'' && inputs.t4_qualification' \
 	'timeout-minutes: 360' \
-	'DATAPLANE_T4_ARTIFACT_ROOT: ${{ github.workspace }}/../t4-qualification-artifacts' \
-	'mkdir -p "$DATAPLANE_T4_ARTIFACT_ROOT"' \
+	'- name: Initialize immutable qualification evidence' \
+	'artifact_root="$RUNNER_TEMP/t4-qualification-artifacts"' \
+	'echo "DATAPLANE_T4_ARTIFACT_ROOT=$artifact_root" >>"$GITHUB_ENV"' \
+	'- name: Install protobuf compiler' \
+	'sudo apt-get install --yes protobuf-compiler' \
+	'protoc --version' \
+	'set -o pipefail' \
 	'design_root=$(cd "$GITHUB_WORKSPACE/../.." && pwd)' \
 	'cp tests/dataplane/integration/tiproxy-223-design-final.md \' \
 	'"$design_root/notes/tiproxy-223-design-final.md"' \
 	'make dataplane-t4-qualification 2>&1 | \' \
 	'tee "$DATAPLANE_T4_ARTIFACT_ROOT/qualification.log"' \
-	'path: ${{ env.DATAPLANE_T4_ARTIFACT_ROOT }}'; do
-	if ! grep -Fq "$required_fragment" "$qualification_workflow"; then
+	'path: ${{ runner.temp }}/t4-qualification-artifacts'; do
+	if ! grep -Fq -- "$required_fragment" "$qualification_workflow"; then
 		echo "T4 qualification workflow is missing: $required_fragment" >&2
 		exit 1
 	fi
 done
+
+# The formal recorder is piped through tee so its complete first-failure log
+# survives. Keep pipefail explicit in the workflow so a recorder/build failure
+# cannot be turned into a successful recording step by tee.
+qualification_log="$temp_dir/qualification.log"
+if bash -o pipefail -c 'exit 23' 2>&1 | tee "$qualification_log" >/dev/null; then
+	echo "T4 qualification log pipeline swallowed the recorder failure" >&2
+	exit 1
+fi
+if [[ -s "$qualification_log" ]]; then
+	echo "silent negative qualification probe unexpectedly wrote output" >&2
+	exit 1
+fi
 
 # Framework-only checks must not require a real TiUP installation or database
 # client. These two fakes satisfy preflight discovery but cannot provision or

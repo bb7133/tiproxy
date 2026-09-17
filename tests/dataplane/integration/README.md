@@ -440,10 +440,12 @@ The workflow stages the frozen design snapshot vendored next to the integration
 scripts at the recorder's repository-derived workspace root. The recorder
 rejects it unless its SHA-256 remains
 `eddcc7fb9ece5e82d45ae3b953567197664d4c6633ef3861a5d6a8f677f06f2e`.
-The CI job creates the evidence root as a sibling of `github.workspace`, outside
-the clean Git checkout, before invoking the recorder and tees its full output
-there. Thus even a zero-cell preflight failure uploads the exact ref, platform,
-and failure log instead of producing an evidence-free red job.
+The CI job installs and verifies the protobuf compiler, creates the evidence
+root under `runner.temp` (outside the clean Git checkout) before invoking the
+recorder, and tees its full output there with `pipefail` enabled. The upload
+action therefore receives a canonical path without `..`, and a zero-cell
+preflight or build failure retains both its nonzero status and the exact ref,
+platform, and failure log instead of producing an evidence-free red job.
 
 GitHub exposes `workflow_dispatch` only after that workflow file exists on the
 repository's default branch. A fork-only/exact-tree commit cannot be manually

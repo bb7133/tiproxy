@@ -129,8 +129,6 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.t4_qualification
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    env:
-      DATAPLANE_T4_ARTIFACT_ROOT: ${{ github.workspace }}/../t4-qualification-artifacts
     steps:
       - name: Check out exact qualification ref and history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -142,6 +140,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Initialize immutable qualification evidence
+        run: |
+          artifact_root="$RUNNER_TEMP/t4-qualification-artifacts"
+          mkdir -p "$artifact_root"
+          echo "DATAPLANE_T4_ARTIFACT_ROOT=$artifact_root" >>"$GITHUB_ENV"
+          {
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "github_sha=$GITHUB_SHA"
+            echo "checked_out_sha=$(git rev-parse HEAD)"
+            echo "platform=$(uname -sm)"
+          } >"$artifact_root/ci-context.txt"
       - name: Install checksum-pinned TiUP
         run: |
           source tests/dataplane/integration/versions.env
@@ -162,19 +171,18 @@ jobs:
           command -v mysql
           mysql --version
           openssl version
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
+          protoc --version
       - name: Record the complete 36-logical / 48-physical matrix
         run: |
-          mkdir -p "$DATAPLANE_T4_ARTIFACT_ROOT"
+          set -o pipefail
           design_root=$(cd "$GITHUB_WORKSPACE/../.." && pwd)
           mkdir -p "$design_root/notes"
           cp tests/dataplane/integration/tiproxy-223-design-final.md \
             "$design_root/notes/tiproxy-223-design-final.md"
-          {
-            echo "run_id=$GITHUB_RUN_ID"
-            echo "github_sha=$GITHUB_SHA"
-            echo "checked_out_sha=$(git rev-parse HEAD)"
-            echo "platform=$(uname -sm)"
-          } >"$DATAPLANE_T4_ARTIFACT_ROOT/ci-context.txt"
           make dataplane-t4-qualification 2>&1 | \
             tee "$DATAPLANE_T4_ARTIFACT_ROOT/qualification.log"
       - name: Upload the immutable qualification evidence
@@ -182,6 +190,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dataplane-t4-qualification-${{ github.run_id }}
-          path: ${{ env.DATAPLANE_T4_ARTIFACT_ROOT }}
+          path: ${{ runner.temp }}/t4-qualification-artifacts
           if-no-files-found: error
           retention-days: 14
