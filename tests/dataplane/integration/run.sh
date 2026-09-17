@@ -4065,6 +4065,9 @@ if [[ $no_backend_ok != true ]]; then
 	echo "no-backend parity failed; last client error: $root_err" >&2
 	exit 1
 fi
+if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ]]; then
+	printf '%s\n' "$root_err" >"$run_dir/t4-no-backend.out"
+fi
 if [[ $mode == go ]]; then
 	# Source-branch evidence: ONE fresh record must carry BOTH the
 	# get-backend failure and, in its structured last_err field, the
@@ -4104,6 +4107,16 @@ if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ]]; then
 		"http://127.0.0.1:$T3_DROP_ADMIN_PORT/state" \
 		-o "$run_dir/t4-route-audit-final.json"
 	validate_t4_route_audit "$run_dir/t4-route-audit-final.json"
+	if [[ ${DATAPLANE_T4_ROW:-} != M9 ]]; then
+		# The evidence writer validates the already-completed cell from its
+		# immutable ledgers, route audits, phase receipts, lineage, and the
+		# row-specific observations.  It refuses to create a pass receipt if
+		# any source is missing or inconsistent. M9 retains its richer restart
+		# receipt, which is written by run_t4_m9_probe above.
+		close_t4_process_lineage
+		python3 "$script_dir/write-t4-row-receipt.py" \
+			--run-dir "$run_dir" --row "$DATAPLANE_T4_ROW" --variant "$variant"
+	fi
 fi
 
 if [[ $mode == rust ]]; then

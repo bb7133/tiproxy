@@ -24,6 +24,8 @@ sha256_file() {
 
 bash -n "$script_dir/run.sh" "$script_dir/qualify-route-owner.sh" \
 	"$script_dir/warm-tiup-components.sh"
+PYTHONPYCACHEPREFIX="$temp_dir/pycache" python3 -m py_compile \
+	"$script_dir/write-t4-row-receipt.py"
 qualification_plan=$("$script_dir/qualify-route-owner.sh" --print-plan)
 if [[ $(wc -l <<<"$qualification_plan" | tr -d ' ') != 48 ]]; then
 	echo "T4 qualification plan does not contain exactly 48 physical cells" >&2
@@ -84,6 +86,196 @@ if ! grep -Fq -- 'components=(playground pd tikv tidb ctl)' "$script_dir/warm-ti
 	! grep -Fq -- 'record_t4_phase namespace-bootstrap-complete' "$script_dir/run.sh" ||
 	grep -Fq -- 'find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl"' "$script_dir/run.sh"; then
 	echo "Rust integration must prewarm and resolve the exact frozen ctl component" >&2
+	exit 1
+fi
+if ! grep -Fq -- 'python3 "$script_dir/write-t4-row-receipt.py"' "$script_dir/run.sh" ||
+	! grep -Fq -- 'if [[ ${DATAPLANE_T4_ROW:-} != M9 ]]' "$script_dir/run.sh" ||
+	[[ $(grep -Fc -- '"row": "M9"' "$script_dir/run.sh") != 1 ]]; then
+	echo "T4 row receipt wiring does not preserve the dedicated M9 receipt" >&2
+	exit 1
+fi
+
+# M1-M8 pass receipts are derived from immutable row observations, not from
+# reaching the end of run.sh. Build one complete synthetic evidence directory,
+# exercise every row profile, then prove missing/bad evidence and overwrites are
+# refused without leaving a pass receipt behind.
+receipt_dir="$temp_dir/t4-receipts"
+mkdir -p "$receipt_dir"
+python3 - "$receipt_dir" <<'PYT4RECEIPTFIXTURE'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+
+def write_json(name, value):
+    (root / name).write_text(json.dumps(value, sort_keys=True) + "\n")
+
+ledger = {
+    "status": "OK",
+    "route_ledger": {
+        "router_incarnations": 3,
+        "sessions": 0,
+        "reserved": 0,
+        "active": 0,
+        "incoming": 0,
+        "outgoing": 0,
+        "unsettled_redirects": 0,
+        "unsettled_closes": 0,
+    },
+    "source_generations": {
+        "config_generation": 8,
+        "topology_observed_generation": 8,
+        "topology_applied_generation": 8,
+    },
+    "route_inputs": {
+        "observations": 24,
+        "health_input_backends": 1,
+        "healthy_backends": 1,
+        "cpu_series": 3,
+        "memory_series": 3,
+    },
+}
+write_json("t4-ledger-before.json", ledger)
+write_json("t4-ledger-after.json", ledger)
+events = [
+    {"ordinal": 1, "kind": "reconcile_request", "direction": "rust_to_go"},
+    {"ordinal": 2, "kind": "reconcile_snapshot", "direction": "go_to_rust"},
+    {"ordinal": 3, "kind": "batch", "direction": "rust_to_go", "sequence": 1,
+     "producer_fingerprint": "a" * 64},
+    {"ordinal": 4, "kind": "ack", "direction": "go_to_rust", "sequence": 1,
+     "producer_fingerprint": "a" * 64},
+]
+audit = {
+    "armed": False,
+    "held": False,
+    "connect_count": 1,
+    "forwarded": 4,
+    "route_audit": {
+        "legacy_body_counts": {"route_request": 0, "route_result": 0},
+        "state_backends": 0,
+        "state_namespaces": 0,
+        "reconcile_request_connections": 0,
+        "reconcile_request_event_sequences": 0,
+        "reconcile_snapshot_connections": 0,
+        "reconcile_snapshot_event_sequences": 0,
+        "protocol_errors": 0,
+        "fatal_protocol_errors": 0,
+        "metering_batches": 1,
+        "metering_acks": 1,
+        "metering_events": events,
+    },
+}
+write_json("t4-route-audit-final.json", audit)
+write_json("t4-route-audit-ka-final.json", audit)
+(root / "t4-phase-receipts.tsv").write_text("\n".join(
+    f"2026-01-01T00:00:0{index}Z\t{phase}" for index, phase in enumerate([
+        "harness-start", "etcdctl-resolved", "mtr005-complete",
+        "namespace-bootstrap-start", "namespace-bootstrap-complete",
+    ])
+) + "\n")
+
+roles = [
+    "tiup-main", "tiup-secondary", "control-tap", "rust-main",
+    "ingress-faultproxy", "go-ka", "control-tap-ka", "rust-ka",
+]
+(root / "drop-next.out").write_text("ERROR 2013 (HY000): lost connection\n")
+(root / "auth-matrix.err").write_text("ERROR 1045 (28000): access denied\n")
+for name in [
+    "ns-alpha-etcd.log", "ns-beta-etcd.log", "ns-default-etcd.log",
+    "ka-etcd-mig01-swap.log", "ka-etcd-mig01-reset.log",
+    "ka-etcd-ka-cross-keyspace.log", "ka-etcd-ka-restore.log",
+]:
+    (root / name).write_text("OK\n")
+write_json("ka-proxy-mig01-swap.json", {"fail-backend-list": ["a", "b"]})
+write_json("ka-proxy-mig01-reset.json", {"fail-backend-list": ["a", "c"]})
+write_json("ka-rust-cross-keyspace-health.json", ledger)
+write_json("t4-m5-route-inputs.json", ledger)
+(root / "tiproxy-conflict.out").write_text("bind: address already in use\n")
+(root / "tiproxy-rs-conflict.out").write_text(
+    '{"error_class":"startup_failed"}\nAddress already in use\n'
+)
+(root / "t4-no-backend.out").write_text(
+    "ERROR 1105 (HY000): No available TiDB instances, please make sure TiDB is available\n"
+)
+(root / "mig01-session.out").write_text(
+    "MIGBASE|100|4000|mig01_live|state-live\n"
+    "MIGTRY1|200|4001|mig01_live|state-live\n"
+)
+(root / "ka-session.out").write_text("BASE|300|4000\nCHK|300|4000\n")
+(root / "tiproxy-rs.log").write_text(
+    '{"event":"connection_closed","connection_id":1}\n'
+    '{"event":"connection_closed","connection_id":2}\n'
+)
+(root / "tiproxy-rs-ka.log").write_text(
+    '{"event":"connection_closed","connection_id":1}\n'
+)
+for row_number in range(1, 9):
+    row = f"M{row_number}"
+    write_json("t4-process-lineage.json", {
+        "row": row,
+        "variant": "plain",
+        "platform": "TestOS testarch",
+        "events": [{"event": "start", "role": role} for role in roles],
+    })
+    # The shell invokes the writer immediately before moving to the next row.
+    # Preserve one lineage fixture per row for that loop below.
+    (root / f"lineage-{row}.json").write_text((root / "t4-process-lineage.json").read_text())
+PYT4RECEIPTFIXTURE
+for row in M1 M2 M3 M4 M5 M6 M7 M8; do
+	cp "$receipt_dir/lineage-$row.json" "$receipt_dir/t4-process-lineage.json"
+	python3 "$script_dir/write-t4-row-receipt.py" \
+		--run-dir "$receipt_dir" --row "$row" --variant plain >/dev/null
+	python3 - "$receipt_dir/t4-row-$row.json" "$row" <<'PYT4RECEIPTCHECK'
+import json
+import pathlib
+import sys
+
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if receipt.get("schema") != 1 or receipt.get("row") != sys.argv[2] or receipt.get("result") != "pass":
+    raise SystemExit(f"invalid generated receipt: {receipt}")
+if not receipt.get("assertions", {}).get("row_specific"):
+    raise SystemExit(f"generated receipt has no row-specific proof: {receipt}")
+PYT4RECEIPTCHECK
+done
+
+bad_receipt_dir="$temp_dir/t4-receipts-bad"
+cp -R "$receipt_dir" "$bad_receipt_dir"
+rm -f "$bad_receipt_dir/t4-row-M5.json"
+cp "$bad_receipt_dir/lineage-M5.json" "$bad_receipt_dir/t4-process-lineage.json"
+python3 - "$bad_receipt_dir/t4-m5-route-inputs.json" <<'PYT4BADINPUT'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+state = json.loads(path.read_text())
+state["route_inputs"]["cpu_series"] = 0
+path.write_text(json.dumps(state) + "\n")
+PYT4BADINPUT
+set +e
+python3 "$script_dir/write-t4-row-receipt.py" \
+	--run-dir "$bad_receipt_dir" --row M5 --variant plain \
+	>"$bad_receipt_dir/bad.out" 2>&1
+bad_receipt_status=$?
+set -e
+if ((bad_receipt_status == 0)) || [[ -e $bad_receipt_dir/t4-row-M5.json ]] ||
+	! grep -Fq 'incomplete live route inputs' "$bad_receipt_dir/bad.out"; then
+	echo "T4 receipt writer accepted incomplete M5 production inputs" >&2
+	exit 1
+fi
+
+receipt_before=$(sha256_file "$receipt_dir/t4-row-M1.json")
+set +e
+python3 "$script_dir/write-t4-row-receipt.py" \
+	--run-dir "$receipt_dir" --row M1 --variant plain \
+	>"$receipt_dir/overwrite.out" 2>&1
+overwrite_status=$?
+set -e
+if ((overwrite_status == 0)) ||
+	[[ $(sha256_file "$receipt_dir/t4-row-M1.json") != "$receipt_before" ]] ||
+	! grep -Fq 'refusing to overwrite row receipt' "$receipt_dir/overwrite.out"; then
+	echo "T4 receipt writer did not refuse an existing receipt" >&2
 	exit 1
 fi
 

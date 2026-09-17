@@ -190,7 +190,14 @@ missing = [name for name, path in required.items() if not path.is_file()]
 if missing:
     raise SystemExit(f"cell {row}/{column}/{variant} missing evidence: {missing}")
 receipt = json.loads(required["row_receipt"].read_text())
-if receipt.get("row") != row or receipt.get("result") != "pass":
+if (
+    receipt.get("schema") != 1
+    or receipt.get("row") != row
+    or receipt.get("result") != "pass"
+    or receipt.get("variant") != variant
+    or receipt.get("platform") != platform
+    or not isinstance(receipt.get("evidence"), dict)
+):
     raise SystemExit(f"invalid row receipt: {receipt}")
 lineage = json.loads(required["process_lineage"].read_text())
 if lineage.get("row") != row or lineage.get("variant") != variant or not lineage.get("events"):
