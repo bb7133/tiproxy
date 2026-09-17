@@ -301,7 +301,7 @@ for port in $PORTS; do
 	fi
 done
 
-tiup playground "$TIDB_VERSION" --tag "$tag" --without-monitor \
+tiup "playground:v${TIUP_VERSION}" "$TIDB_VERSION" --tag "$tag" --without-monitor \
 	--host 127.0.0.1 --port-offset "$port_offset" \
 	--pd 1 --kv 1 --db 2 --tiflash 0 --db.config "$run_dir/tidb.toml" \
 	--tiproxy 1 --tiproxy.binpath "$repo_root/bin/tiproxy" \
@@ -326,7 +326,7 @@ fi
 # Second backend cluster: its own playground under its own tag and
 # port window, no tiproxy of its own (the main proxy's explicit
 # backend-clusters reach both PDs).
-tiup playground "$TIDB_VERSION" --tag "$tag_b" --without-monitor \
+tiup "playground:v${TIUP_VERSION}" "$TIDB_VERSION" --tag "$tag_b" --without-monitor \
 	--host 127.0.0.1 --port-offset "$PORT_OFFSET_B" \
 	--pd 1 --kv 1 --db 1 --tiflash 0 --db.config "$run_dir/tidb-b.toml" \
 	--tiproxy 0 \

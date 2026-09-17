@@ -22,7 +22,8 @@ sha256_file() {
 	fi
 }
 
-bash -n "$script_dir/run.sh" "$script_dir/qualify-route-owner.sh"
+bash -n "$script_dir/run.sh" "$script_dir/qualify-route-owner.sh" \
+	"$script_dir/warm-tiup-components.sh"
 qualification_plan=$("$script_dir/qualify-route-owner.sh" --print-plan)
 if [[ $(wc -l <<<"$qualification_plan" | tr -d ' ') != 48 ]]; then
 	echo "T4 qualification plan does not contain exactly 48 physical cells" >&2
@@ -50,6 +51,8 @@ for required_fragment in \
 	'- name: Initialize immutable qualification evidence' \
 	'artifact_root="$RUNNER_TEMP/t4-qualification-artifacts"' \
 	'echo "DATAPLANE_T4_ARTIFACT_ROOT=$artifact_root" >>"$GITHUB_ENV"' \
+	'- name: Preinstall frozen TiUP components serially' \
+	'bash tests/dataplane/integration/warm-tiup-components.sh' \
 	'- name: Install protobuf compiler' \
 	'sudo apt-get install --yes protobuf-compiler' \
 	'protoc --version' \
@@ -65,6 +68,16 @@ for required_fragment in \
 		exit 1
 	fi
 done
+if [[ $(grep -Fc -- '- name: Preinstall frozen TiUP components serially' "$qualification_workflow") != 2 ]] ||
+	[[ $(grep -Fc -- 'run: bash tests/dataplane/integration/warm-tiup-components.sh' "$qualification_workflow") != 2 ]]; then
+	echo "both integration jobs must prewarm the frozen TiUP components exactly once" >&2
+	exit 1
+fi
+if [[ $(grep -Fc -- 'tiup "playground:v${TIUP_VERSION}" "$TIDB_VERSION"' "$script_dir/run.sh") != 2 ]] ||
+	grep -Fq -- 'tiup playground "$TIDB_VERSION"' "$script_dir/run.sh"; then
+	echo "both playgrounds must launch the frozen component version explicitly" >&2
+	exit 1
+fi
 
 if ! grep -Fq -- 'make -C "$repo_root" rust-build cmd_tiproxy' "$script_dir/qualify-route-owner.sh"; then
 	echo "T4 qualification does not build both clean-runner binaries" >&2
@@ -99,12 +112,40 @@ fi
 mkdir -p "$temp_dir/tools"
 cat >"$temp_dir/tools/tiup" <<'FAKE_TIUP'
 #!/usr/bin/env bash
-if [[ ${1:-} == --version ]]; then
-	echo '1.17.0 tiup'
-	exit 0
-fi
-echo 'self-test TiUP must not be invoked beyond --version' >&2
-exit 99
+case ${1:-} in
+	--version)
+		echo '1.17.0 tiup'
+		;;
+	install)
+		if [[ -z ${FAKE_TIUP_COMMAND_LOG:-} || $# != 2 ]]; then
+			echo 'self-test TiUP install received an unexpected invocation' >&2
+			exit 99
+		fi
+		printf 'install %s\n' "$2" >>"$FAKE_TIUP_COMMAND_LOG"
+		;;
+	list)
+		if [[ -z ${FAKE_TIUP_COMMAND_LOG:-} || $# != 3 || ${3:-} != --installed ]]; then
+			echo 'self-test TiUP list received an unexpected invocation' >&2
+			exit 99
+		fi
+		case $2 in
+			playground) version=v1.17.0 ;;
+			pd | tikv | tidb) version=v8.5.1 ;;
+			*) exit 99 ;;
+		esac
+		printf 'list %s --installed\n' "$2" >>"$FAKE_TIUP_COMMAND_LOG"
+		printf 'Version  Installed\n'
+		if [[ ${FAKE_TIUP_MISSING_COMPONENT:-} == "$2" ]]; then
+			printf '%s  NO\n' "$version"
+		else
+			printf '%s  YES\n' "$version"
+		fi
+		;;
+	*)
+		echo 'self-test TiUP received an unexpected invocation' >&2
+		exit 99
+		;;
+esac
 FAKE_TIUP
 cat >"$temp_dir/tools/mysql" <<'FAKE_MYSQL'
 #!/usr/bin/env bash
@@ -115,6 +156,36 @@ case "${1:-}" in
 esac
 FAKE_MYSQL
 chmod 0700 "$temp_dir/tools/tiup" "$temp_dir/tools/mysql"
+
+tiup_command_log="$temp_dir/tiup-command.log"
+PATH="$temp_dir/tools:$PATH" FAKE_TIUP_COMMAND_LOG="$tiup_command_log" \
+	"$script_dir/warm-tiup-components.sh"
+cat >"$temp_dir/expected-tiup-command.log" <<'EXPECTED_TIUP_COMMANDS'
+install playground:v1.17.0
+install pd:v8.5.1
+install tikv:v8.5.1
+install tidb:v8.5.1
+list playground --installed
+list pd --installed
+list tikv --installed
+list tidb --installed
+EXPECTED_TIUP_COMMANDS
+if ! diff -u "$temp_dir/expected-tiup-command.log" "$tiup_command_log"; then
+	echo "TiUP prewarm did not install and verify exact components serially" >&2
+	exit 1
+fi
+set +e
+PATH="$temp_dir/tools:$PATH" FAKE_TIUP_COMMAND_LOG="$tiup_command_log" \
+	FAKE_TIUP_MISSING_COMPONENT=tikv \
+	"$script_dir/warm-tiup-components.sh" >"$temp_dir/tiup-missing.out" 2>&1
+tiup_missing_status=$?
+set -e
+if ((tiup_missing_status == 0)); then
+	echo "TiUP prewarm accepted a missing frozen component" >&2
+	exit 1
+fi
+grep -Fq 'TiUP component tikv:v8.5.1 is not installed after prewarm' \
+	"$temp_dir/tiup-missing.out"
 
 # A required check must report on every pull request while provisioning the
 # real topology only for changes that can affect T2 local routing. Exercise

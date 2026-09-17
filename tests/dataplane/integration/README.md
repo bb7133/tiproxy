@@ -446,6 +446,14 @@ recorder, and tees its full output there with `pipefail` enabled. The upload
 action therefore receives a canonical path without `..`, and a zero-cell
 preflight or build failure retains both its nonzero status and the exact ref,
 platform, and failure log instead of producing an evidence-free red job.
+Before any topology starts, CI also installs the frozen playground version and
+the frozen PD, TiKV, and TiDB versions through four serial TiUP invocations,
+then verifies that each exact version is present. This idempotent prewarm makes
+the shared `TIUP_HOME` manifests and component cache complete before the two
+playgrounds in a cell start concurrently. Each launch also names the frozen
+playground component version explicitly, so TiUP does not run a concurrent
+latest-version metadata check. This does not change the dual-cluster topology
+or the qualification matrix.
 The qualifier builds both binaries on the clean runner: the Rust dataplane
 under test and the residual Go TiProxy bridge used by the real-topology
 harness. It hashes both into the root and per-cell immutable receipts.
