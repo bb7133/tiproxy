@@ -247,6 +247,15 @@ if [[ $mode == rust && $variant == plain && ${DATAPLANE_T3_FOCUSED:-0} == 1 ]]; 
 fi
 # shellcheck disable=SC1090
 source "$run_dir/variant.env"
+# Persistent `/config/proxy` mutations replace the process seed wholesale. Keep
+# the variant's PROXY-protocol mode in every complete dynamic seed: otherwise a
+# proxy cell starts with v2 enabled, the first fail-list mutation silently
+# disables the inbound preamble, and later clients send a valid PROXY header to
+# a MySQL packet reader (surfacing 2013 instead of the intended 1105 refusal).
+dynamic_proxy_protocol=
+if [[ $PROXY_ENABLED == true ]]; then
+	dynamic_proxy_protocol=v2
+fi
 
 PORTS="$PD_PORT $((2380 + port_offset)) $((20160 + port_offset)) $((20180 + port_offset)) $TIDB_PORT_0 $TIDB_PORT_1 $((10080 + port_offset)) $((10081 + port_offset)) $TIPROXY_PORT $TIPROXY_PORT_B $TIPROXY_API_PORT $FAULT_PORT $FAULT_ADMIN_PORT"
 # Second backend cluster's playground window (PORT_OFFSET_B).
@@ -925,6 +934,7 @@ run_t3_local_migration_probe() {
 			current=$(jq -cn \
 				--arg pd_a "127.0.0.1:$PD_PORT" \
 				--arg pd_b "127.0.0.1:$PD_PORT_B" \
+				--arg proxy_protocol "$dynamic_proxy_protocol" \
 				'{
 					"max-connections": 100,
 					"high-memory-usage-reject-threshold": 0.9,
@@ -932,7 +942,7 @@ run_t3_local_migration_probe() {
 					"frontend-keepalive": {"enabled":true,"idle":0,"cnt":0,"intvl":0,"timeout":0},
 					"backend-healthy-keepalive": {"enabled":true,"idle":60000000000,"cnt":5,"intvl":3000000000,"timeout":15000000000},
 					"backend-unhealthy-keepalive": {"enabled":true,"idle":10000000000,"cnt":5,"intvl":1000000000,"timeout":5000000000},
-					"proxy-protocol": "",
+					"proxy-protocol": $proxy_protocol,
 					"graceful-wait-before-shutdown": 0,
 					"graceful-close-conn-timeout": 5,
 					"public-endpoints": [],
@@ -2005,6 +2015,7 @@ ka_set_fail_list() {
 			current=$(jq -cn \
 				--arg pd_a "127.0.0.1:$PD_PORT" \
 				--arg pd_b "127.0.0.1:$PD_PORT_B" \
+				--arg proxy_protocol "$dynamic_proxy_protocol" \
 				'{
 					"max-connections": 100,
 					"high-memory-usage-reject-threshold": 0.9,
@@ -2012,7 +2023,7 @@ ka_set_fail_list() {
 					"frontend-keepalive": {"enabled":true,"idle":0,"cnt":0,"intvl":0,"timeout":0},
 					"backend-healthy-keepalive": {"enabled":true,"idle":60000000000,"cnt":5,"intvl":3000000000,"timeout":15000000000},
 					"backend-unhealthy-keepalive": {"enabled":true,"idle":10000000000,"cnt":5,"intvl":1000000000,"timeout":5000000000},
-					"proxy-protocol": "",
+					"proxy-protocol": $proxy_protocol,
 					"graceful-wait-before-shutdown": 0,
 					"graceful-close-conn-timeout": 5,
 					"public-endpoints": [],

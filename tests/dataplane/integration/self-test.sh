@@ -94,6 +94,13 @@ if ! grep -Fq -- 'python3 "$script_dir/write-t4-row-receipt.py"' "$script_dir/ru
 	echo "T4 row receipt wiring does not preserve the dedicated M9 receipt" >&2
 	exit 1
 fi
+if [[ $(grep -Fc -- '--arg proxy_protocol "$dynamic_proxy_protocol"' "$script_dir/run.sh") != 2 ]] ||
+	[[ $(grep -Fc -- '"proxy-protocol": $proxy_protocol' "$script_dir/run.sh") != 2 ]] ||
+	[[ $(grep -Fc -- 'dynamic_proxy_protocol=v2' "$script_dir/run.sh") != 1 ]] ||
+	grep -Fq -- '"proxy-protocol": ""' "$script_dir/run.sh"; then
+	echo "complete dynamic proxy seeds must preserve each variant's PROXY protocol mode" >&2
+	exit 1
+fi
 
 # M1-M8 pass receipts are derived from immutable row observations, not from
 # reaching the end of run.sh. Build one complete synthetic evidence directory,
@@ -447,6 +454,24 @@ for index in "${!variants[@]}"; do
 	"$script_dir/render-configs.sh" "$output" "${variants[$index]}" "$((10000 + index * 100))" >/dev/null
 	if grep -R -n '@[A-Z_][A-Z_]*@' "$output" --include='*.toml' --include='*.env'; then
 		echo "unrendered config token in ${variants[$index]}" >&2
+		exit 1
+	fi
+	# The two complete dynamic-config seeds in run.sh consume this exact
+	# variant-derived value.  Keep both sides of the contract explicit: PROXY
+	# variants must reseed v2, while plain/TLS/compression-only variants must
+	# continue reseeding the empty mode.
+	# shellcheck disable=SC1090
+	source "$output/variant.env"
+	dynamic_proxy_protocol=
+	if [[ $PROXY_ENABLED == true ]]; then
+		dynamic_proxy_protocol=v2
+	fi
+	case ${variants[$index]} in
+	proxy | tls-proxy-zstd) expected_proxy_protocol=v2 ;;
+	*) expected_proxy_protocol= ;;
+	esac
+	if [[ $dynamic_proxy_protocol != "$expected_proxy_protocol" ]]; then
+		echo "dynamic proxy seed mode mismatch in ${variants[$index]}" >&2
 		exit 1
 	fi
 done
