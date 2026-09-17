@@ -140,6 +140,7 @@ impl RouteLedgerDiagnostics {
 pub struct RouteAdmission {
     entry: Arc<RegisteredRouter>,
     selector: Selector,
+    updates: watch::Receiver<u64>,
 }
 
 impl RouteAdmission {
@@ -159,6 +160,17 @@ impl RouteAdmission {
     #[must_use]
     pub const fn selector_mut(&mut self) -> &mut Selector {
         &mut self.selector
+    }
+
+    /// Subscribes to completed registry reconciliations for this route plane.
+    ///
+    /// Selection can deliberately reject a candidate when config or topology
+    /// changes between capture and the reserve lock.  The session owner uses
+    /// this signal to retry that transient boundary without spinning or
+    /// treating a current backend as a terminal control failure.
+    #[must_use]
+    pub fn subscribe_updates(&self) -> watch::Receiver<u64> {
+        self.updates.clone()
     }
 
     /// Whether two admissions belong to the same router incarnation.
@@ -253,7 +265,16 @@ impl RoutePlaneHandle {
             Arc::clone(entry)
         };
         let selector = entry.router.selector()?;
-        Ok(RouteAdmission { entry, selector })
+        let mut updates = self.updates.clone();
+        // Only reconciliations after this exact admission can unblock a
+        // transient Selector::next boundary.  Do not let an old, unread plane
+        // revision manufacture an immediate retry.
+        updates.borrow_and_update();
+        Ok(RouteAdmission {
+            entry,
+            selector,
+            updates,
+        })
     }
 
     /// Waits across the narrow config-publication/registry-reconcile window.

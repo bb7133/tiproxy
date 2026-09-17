@@ -25,8 +25,13 @@ use control_router::{
 };
 use control_routing::group::ClientInfo;
 use control_routing::{RouteAssignment, RouteCode, RouteResult};
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::time::{Instant, timeout_at};
 
 use crate::{RouteChannel, RouteChannelError};
+
+pub(crate) const LOCAL_ROUTE_TRANSIENT_WAIT: Duration = Duration::from_secs(1);
 
 trait LocalRouteAuthority: Send + Sync {
     fn namespace(&self) -> &str;
@@ -83,6 +88,7 @@ impl LocalRouteAuthority for PlaneRouteAuthority {
 /// A session-long local route lease implementing the dataplane route channel.
 pub struct LocalRouteChannel {
     authority: Box<dyn LocalRouteAuthority>,
+    updates: Option<watch::Receiver<u64>>,
     connection_id: u64,
     client_address: String,
     proxy_address: String,
@@ -114,6 +120,7 @@ impl LocalRouteChannel {
     ) -> Result<(Self, RouteCommandReceiver), RouteError> {
         const COMMAND_CAPACITY: usize = 8;
 
+        let updates = admission.subscribe_updates();
         let (commands, receiver) = admission.register_commands(connection_id, COMMAND_CAPACITY)?;
         Ok((
             Self::with_authority(
@@ -122,6 +129,7 @@ impl LocalRouteChannel {
                     admission,
                     pending: None,
                 }),
+                Some(updates),
                 connection_id,
                 client_address.into(),
                 proxy_address.into(),
@@ -133,6 +141,7 @@ impl LocalRouteChannel {
 
     fn with_authority(
         authority: Box<dyn LocalRouteAuthority>,
+        updates: Option<watch::Receiver<u64>>,
         connection_id: u64,
         client_address: String,
         proxy_address: String,
@@ -140,6 +149,7 @@ impl LocalRouteChannel {
     ) -> Self {
         Self {
             authority,
+            updates,
             connection_id,
             client_address,
             proxy_address,
@@ -210,13 +220,24 @@ impl RouteChannel for LocalRouteChannel {
         if !self.requested || self.authority.has_pending() {
             return Err(RouteChannelError::Rejected);
         }
-        let client = ClientInfo {
-            client_address: Some(&self.client_address),
-            proxy_address: Some(&self.proxy_address),
-        };
-        let mut assignment = match self.authority.next(client, &self.listener_port) {
-            Ok(assignment) => assignment,
-            Err(error) => return Ok(self.terminal(error)),
+        let deadline = Instant::now() + LOCAL_ROUTE_TRANSIENT_WAIT;
+        let mut assignment = loop {
+            let client = ClientInfo {
+                client_address: Some(&self.client_address),
+                proxy_address: Some(&self.proxy_address),
+            };
+            match self.authority.next(client, &self.listener_port) {
+                Ok(assignment) => break assignment,
+                Err(error @ (RouteError::ControlUnavailable | RouteError::StaleCandidate)) => {
+                    let Some(updates) = &mut self.updates else {
+                        return Ok(self.terminal(error));
+                    };
+                    if !matches!(timeout_at(deadline, updates.changed()).await, Ok(Ok(()))) {
+                        return Ok(self.terminal(error));
+                    }
+                }
+                Err(error) => return Ok(self.terminal(error)),
+            }
         };
         assignment.connection_id = self.connection_id;
         Ok(assignment)
@@ -243,10 +264,11 @@ mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
 
     use control_routing::{RouteAssignment, RouteCode, RouteErrorSource, RouteResult};
+    use tokio::sync::watch;
 
     use super::{
-        ClientInfo, LocalRouteAuthority, LocalRouteChannel, RouteChannel, RouteChannelError,
-        RouteError, Settlement,
+        ClientInfo, LOCAL_ROUTE_TRANSIENT_WAIT, LocalRouteAuthority, LocalRouteChannel,
+        RouteChannel, RouteChannelError, RouteError, Settlement,
     };
 
     #[derive(Default)]
@@ -261,6 +283,8 @@ mod tests {
         namespace: String,
         observed: Arc<Mutex<Observed>>,
         answers: VecDeque<Result<RouteAssignment, RouteError>>,
+        update_on_error: Option<watch::Sender<u64>>,
+        notify_on_error: bool,
         pending: Option<String>,
         active: bool,
     }
@@ -301,7 +325,14 @@ mod tests {
             let answer = self
                 .answers
                 .pop_front()
-                .unwrap_or(Err(RouteError::NoBackend))?;
+                .unwrap_or(Err(RouteError::NoBackend));
+            if answer.is_err()
+                && self.notify_on_error
+                && let Some(updates) = &self.update_on_error
+            {
+                updates.send_modify(|revision| *revision = revision.saturating_add(1));
+            }
+            let answer = answer?;
             self.pending = Some(answer.assignment_id.clone());
             Ok(answer)
         }
@@ -342,12 +373,55 @@ mod tests {
             namespace: "tenant-a".to_owned(),
             observed: Arc::clone(&observed),
             answers: answers.into_iter().collect(),
+            update_on_error: None,
+            notify_on_error: false,
             pending: None,
             active: false,
         };
         (
             LocalRouteChannel::with_authority(
                 Box::new(authority),
+                None,
+                17,
+                "203.0.113.7:5000".to_owned(),
+                "192.0.2.8:6000".to_owned(),
+                "4000".to_owned(),
+            ),
+            observed,
+        )
+    }
+
+    fn channel_with_updates(
+        answers: impl IntoIterator<Item = Result<RouteAssignment, RouteError>>,
+    ) -> (LocalRouteChannel, Arc<Mutex<Observed>>) {
+        channel_with_update_behavior(answers, true)
+    }
+
+    fn channel_with_silent_updates(
+        answers: impl IntoIterator<Item = Result<RouteAssignment, RouteError>>,
+    ) -> (LocalRouteChannel, Arc<Mutex<Observed>>) {
+        channel_with_update_behavior(answers, false)
+    }
+
+    fn channel_with_update_behavior(
+        answers: impl IntoIterator<Item = Result<RouteAssignment, RouteError>>,
+        notify_on_error: bool,
+    ) -> (LocalRouteChannel, Arc<Mutex<Observed>>) {
+        let observed = Arc::new(Mutex::new(Observed::default()));
+        let (updates, updates_rx) = watch::channel(0u64);
+        let authority = FakeAuthority {
+            namespace: "tenant-a".to_owned(),
+            observed: Arc::clone(&observed),
+            answers: answers.into_iter().collect(),
+            update_on_error: Some(updates),
+            notify_on_error,
+            pending: None,
+            active: false,
+        };
+        (
+            LocalRouteChannel::with_authority(
+                Box::new(authority),
+                Some(updates_rx),
                 17,
                 "203.0.113.7:5000".to_owned(),
                 "192.0.2.8:6000".to_owned(),
@@ -452,6 +526,90 @@ mod tests {
         assert_eq!(terminal.connection_id, 17);
         assert_eq!(terminal.code, RouteCode::ControlUnavailable);
         assert_eq!(terminal.detail, "topology_unavailable");
+    }
+
+    #[tokio::test]
+    async fn local_channel_retries_transient_source_drift_after_reconcile() {
+        let (mut channel, observed) = channel_with_updates([
+            Err(RouteError::StaleCandidate),
+            Err(RouteError::ControlUnavailable),
+            Ok(assignment("current")),
+        ]);
+        assert_eq!(channel.request_route(Vec::new()).await, Ok(()));
+        let selected = channel.next_assignment().await;
+        assert!(
+            selected.is_ok(),
+            "expected current assignment: {selected:?}"
+        );
+        let Ok(selected) = selected else {
+            return;
+        };
+        assert_eq!(selected.assignment_id, "current");
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .calls
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_channel_does_not_wait_or_retry_semantic_errors() {
+        let (mut channel, observed) =
+            channel_with_silent_updates([Err(RouteError::NamespaceMissing)]);
+        assert_eq!(channel.request_route(Vec::new()).await, Ok(()));
+        let started = tokio::time::Instant::now();
+        let terminal = channel.next_assignment().await;
+        assert_eq!(tokio::time::Instant::now(), started);
+        assert!(
+            terminal.is_ok(),
+            "expected terminal assignment: {terminal:?}"
+        );
+        let Ok(terminal) = terminal else {
+            return;
+        };
+        assert_eq!(terminal.code, RouteCode::ControlUnavailable);
+        assert_eq!(terminal.detail, "namespace_missing");
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .calls
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_channel_returns_last_transient_when_update_deadline_expires() {
+        let (mut channel, observed) =
+            channel_with_silent_updates([Err(RouteError::StaleCandidate)]);
+        assert_eq!(channel.request_route(Vec::new()).await, Ok(()));
+        let started = tokio::time::Instant::now();
+        let terminal = channel.next_assignment().await;
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            LOCAL_ROUTE_TRANSIENT_WAIT
+        );
+        assert!(
+            terminal.is_ok(),
+            "expected terminal assignment: {terminal:?}"
+        );
+        let Ok(terminal) = terminal else {
+            return;
+        };
+        assert_eq!(terminal.code, RouteCode::ControlUnavailable);
+        assert_eq!(terminal.detail, "stale_candidate");
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .calls
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

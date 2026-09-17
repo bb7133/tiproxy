@@ -147,7 +147,7 @@ use crate::route::{
 use crate::route_control::{
     ClusterTcpDialer, TrafficTotals, route_assignment_from_wire, route_result_to_wire,
 };
-use crate::route_local::release_local_route_lease;
+use crate::route_local::{LOCAL_ROUTE_TRANSIENT_WAIT, release_local_route_lease};
 use crate::server::{AcceptedConnection, ConnectionFuture, SessionSeat};
 use crate::session::{
     EffectHandler, SessionControl, SessionEnd, SessionEventSource, SessionLoop, SessionLoopConfig,
@@ -363,7 +363,6 @@ const ENGINE_CMD_CAPACITY: usize = 16;
 /// Engine → owner report queue depth.
 const ENGINE_REPORT_CAPACITY: usize = 8;
 const BACKEND_HEALTH_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
-const LOCAL_ROUTE_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 /// Server-version bytes advertised in the proxy greeting.
 const SERVER_VERSION: &[u8] = b"8.0.11-TiProxy-rs";
 
@@ -1829,7 +1828,7 @@ impl Engine {
             // body crosses the control bridge on this path.
             let admission_wait = self
                 .handshake_budget_remaining()
-                .min(LOCAL_ROUTE_ADMISSION_WAIT);
+                .min(LOCAL_ROUTE_TRANSIENT_WAIT);
             let admission = match route_plane
                 .admit_within(&metadata.user, admission_wait)
                 .await
