@@ -9,6 +9,20 @@ repo_root=$(cd "$script_dir/../../.." && pwd)
 # shellcheck source=versions.env
 source "$script_dir/versions.env"
 
+resolve_etcdctl() {
+	local exact="${TIUP_HOME:-${HOME}/.tiup}/components/ctl/${TIDB_VERSION}/etcdctl"
+	if [[ -x $exact ]]; then
+		printf '%s\n' "$exact"
+		return 0
+	fi
+	# Formal qualification must use the frozen same-release client installed by
+	# warm-tiup-components.sh.  Developer runs may use an explicit host client.
+	if [[ ${DATAPLANE_T4_QUALIFICATION:-0} != 1 ]]; then
+		command -v etcdctl 2>/dev/null && return 0
+	fi
+	return 1
+}
+
 mode=rust
 variant=plain
 artifact_root=${DATAPLANE_ARTIFACT_ROOT:-$script_dir/artifacts}
@@ -83,6 +97,12 @@ artifact_root=$(cd "$artifact_root" && pwd)
 tag="tiproxy-dp-$mode-$variant-$$"
 run_dir="$artifact_root/$tag"
 mkdir -p "$run_dir"
+
+record_t4_phase() {
+	[[ ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ]] || return 0
+	printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" >>"$run_dir/t4-phase-receipts.tsv"
+}
+record_t4_phase harness-start
 
 T4_PROCESS_LINEAGE_JSONL="$run_dir/t4-process-lineage.jsonl"
 T4_PROCESS_LINEAGE_JSON="$run_dir/t4-process-lineage.json"
@@ -185,9 +205,16 @@ if ((preflight_status != 0)); then
 fi
 
 rust_binary=
+etcdctl_bin=
 if [[ $mode == rust ]]; then
 	# Preflight already verified the binary and its capability contract.
 	rust_binary=${TIPROXY_RS_BIN:-$repo_root/rust/target/debug/tiproxy-rs}
+	if ! etcdctl_bin=$(resolve_etcdctl); then
+		echo "Rust integration needs frozen ctl:${TIDB_VERSION} (missing ${TIUP_HOME:-${HOME}/.tiup}/components/ctl/${TIDB_VERSION}/etcdctl)" >&2
+		exit 1
+	fi
+	"$etcdctl_bin" version >"$run_dir/etcdctl-version.txt"
+	record_t4_phase etcdctl-resolved
 fi
 
 make -C "$repo_root" cmd_tiproxy >"$run_dir/go-build.log" 2>&1
@@ -642,7 +669,8 @@ if [[ $mode == rust ]]; then
 		echo "MTR-005 direct connection did not fall back to the TCP peer: $mtr005_line" >&2
 		exit 1
 	fi
-	echo "MTR-005 lifecycle addresses: peer=$mtr005_peer proxy-client=$mtr005_source"
+echo "MTR-005 lifecycle addresses: peer=$mtr005_peer proxy-client=$mtr005_source"
+	record_t4_phase mtr005-complete
 fi
 
 # M5 qualification evidence must come from the real production route path,
@@ -695,12 +723,6 @@ fi
 # the internal focused switch so this gate stays independent from the later T4
 # namespace matrix, without requiring developers to remember a hidden env var.
 run_t2_namespace_missing_probe() {
-	local etcdctl_bin
-	etcdctl_bin=$(command -v etcdctl || true)
-	if [[ -z $etcdctl_bin ]]; then
-		etcdctl_bin=$(find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl" \
-			-type f -name etcdctl -perm -111 2>/dev/null | sort | tail -1)
-	fi
 	if [[ -z $etcdctl_bin || ! -x $etcdctl_bin ]]; then
 		echo "T2 focused NamespaceMissing probe needs etcdctl" >&2
 		exit 1
@@ -881,12 +903,6 @@ fi
 # Rust process must migrate with database/user-variable state intact, directly
 # force-close through the local FIFO, and admit a fresh session after recovery.
 run_t3_local_migration_probe() {
-	local etcdctl_bin
-	etcdctl_bin=$(command -v etcdctl || true)
-	if [[ -z $etcdctl_bin ]]; then
-		etcdctl_bin=$(find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl" \
-			-type f -name etcdctl -perm -111 2>/dev/null | sort | tail -1)
-	fi
 	if [[ -z $etcdctl_bin || ! -x $etcdctl_bin ]]; then
 		echo "T3 focused migration needs etcdctl" >&2
 		exit 1
@@ -1220,6 +1236,7 @@ mysql_ingress_as() {
 		-h 127.0.0.1 -P "$FAULT_PORT" -u "$user" \
 		"${mysql_tls_args[@]}" ${mysql_compression_arg:+"$mysql_compression_arg"} -e "$query"
 }
+record_t4_phase namespace-bootstrap-start
 mysql_backend_admin "CREATE USER IF NOT EXISTS 'alice'@'%'; CREATE USER IF NOT EXISTS 'bob'@'%';"
 namespace_api="http://127.0.0.1:$TIPROXY_API_PORT/api/admin/namespace"
 ns_alpha_json="{\"namespace\":\"ns-alpha\",\"frontend\":{\"user\":\"alice\"},\"backend\":{\"instances\":[\"127.0.0.1:$TIDB_PORT_0\",\"127.0.0.1:$TIDB_PORT_1\"]}}"
@@ -1229,11 +1246,6 @@ if [[ $mode == rust ]]; then
 	# `/config/ns/*`. The legacy HTTP namespace API is process-local to Go and
 	# deliberately cannot become a hidden second Rust routing owner. Exercise the
 	# actual external source here; later M1/M2 rows mutate these same keys.
-	etcdctl_bin=$(command -v etcdctl || true)
-	if [[ -z $etcdctl_bin ]]; then
-		etcdctl_bin=$(find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl" \
-			-type f -name etcdctl -perm -111 2>/dev/null | sort | tail -1)
-	fi
 	if [[ -z $etcdctl_bin || ! -x $etcdctl_bin ]]; then
 		echo "Rust namespace matrix needs etcdctl" >&2
 		exit 1
@@ -1258,6 +1270,7 @@ else
 	curl --noproxy '*' --fail --silent --show-error -X POST \
 		"$namespace_api/commit?namespace=ns-alpha&namespace=ns-beta" -o /dev/null
 fi
+record_t4_phase namespace-bootstrap-complete
 
 # Absorption gate: the committed namespaces become routable once the
 # proxy rebuilds its user→namespace map and each router observes the
@@ -1974,13 +1987,6 @@ mysql_ka_root() {
 ka_set_fail_list() {
 	local failed=$1 phase=$2 current value toml_failed
 	if [[ $mode == rust ]]; then
-		if [[ -z ${etcdctl_bin:-} || ! -x $etcdctl_bin ]]; then
-			etcdctl_bin=$(command -v etcdctl || true)
-			if [[ -z $etcdctl_bin ]]; then
-				etcdctl_bin=$(find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl" \
-					-type f -name etcdctl -perm -111 2>/dev/null | sort | tail -1)
-			fi
-		fi
 		if [[ -z $etcdctl_bin || ! -x $etcdctl_bin ]]; then
 			echo "keyspace-guard phase: Rust dynamic config needs etcdctl" >&2
 			exit 1

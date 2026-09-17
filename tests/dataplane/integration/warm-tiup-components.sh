@@ -17,8 +17,8 @@ fi
 # every component in separate foreground invocations so signed manifests and
 # the component cache are complete before those processes can read them in
 # parallel. `tiup install` is idempotent for an already installed version.
-components=(playground pd tikv tidb)
-versions=("v${TIUP_VERSION}" "$TIDB_VERSION" "$TIDB_VERSION" "$TIDB_VERSION")
+components=(playground pd tikv tidb ctl)
+versions=("v${TIUP_VERSION}" "$TIDB_VERSION" "$TIDB_VERSION" "$TIDB_VERSION" "$TIDB_VERSION")
 for index in "${!components[@]}"; do
 	tiup install "${components[$index]}:${versions[$index]}"
 done

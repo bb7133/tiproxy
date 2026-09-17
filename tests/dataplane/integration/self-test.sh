@@ -78,6 +78,14 @@ if [[ $(grep -Fc -- 'tiup "playground:v${TIUP_VERSION}" "$TIDB_VERSION"' "$scrip
 	echo "both playgrounds must launch the frozen component version explicitly" >&2
 	exit 1
 fi
+if ! grep -Fq -- 'components=(playground pd tikv tidb ctl)' "$script_dir/warm-tiup-components.sh" ||
+	! grep -Fq -- 'components/ctl/${TIDB_VERSION}/etcdctl' "$script_dir/run.sh" ||
+	! grep -Fq -- 'record_t4_phase namespace-bootstrap-start' "$script_dir/run.sh" ||
+	! grep -Fq -- 'record_t4_phase namespace-bootstrap-complete' "$script_dir/run.sh" ||
+	grep -Fq -- 'find "${TIUP_HOME:-${HOME}/.tiup}/components/ctl"' "$script_dir/run.sh"; then
+	echo "Rust integration must prewarm and resolve the exact frozen ctl component" >&2
+	exit 1
+fi
 
 if ! grep -Fq -- 'make -C "$repo_root" rust-build cmd_tiproxy' "$script_dir/qualify-route-owner.sh"; then
 	echo "T4 qualification does not build both clean-runner binaries" >&2
@@ -130,7 +138,7 @@ case ${1:-} in
 		fi
 		case $2 in
 			playground) version=v1.17.0 ;;
-			pd | tikv | tidb) version=v8.5.1 ;;
+			pd | tikv | tidb | ctl) version=v8.5.1 ;;
 			*) exit 99 ;;
 		esac
 		printf 'list %s --installed\n' "$2" >>"$FAKE_TIUP_COMMAND_LOG"
@@ -165,10 +173,12 @@ install playground:v1.17.0
 install pd:v8.5.1
 install tikv:v8.5.1
 install tidb:v8.5.1
+install ctl:v8.5.1
 list playground --installed
 list pd --installed
 list tikv --installed
 list tidb --installed
+list ctl --installed
 EXPECTED_TIUP_COMMANDS
 if ! diff -u "$temp_dir/expected-tiup-command.log" "$tiup_command_log"; then
 	echo "TiUP prewarm did not install and verify exact components serially" >&2
@@ -176,7 +186,7 @@ if ! diff -u "$temp_dir/expected-tiup-command.log" "$tiup_command_log"; then
 fi
 set +e
 PATH="$temp_dir/tools:$PATH" FAKE_TIUP_COMMAND_LOG="$tiup_command_log" \
-	FAKE_TIUP_MISSING_COMPONENT=tikv \
+	FAKE_TIUP_MISSING_COMPONENT=ctl \
 	"$script_dir/warm-tiup-components.sh" >"$temp_dir/tiup-missing.out" 2>&1
 tiup_missing_status=$?
 set -e
@@ -184,7 +194,7 @@ if ((tiup_missing_status == 0)); then
 	echo "TiUP prewarm accepted a missing frozen component" >&2
 	exit 1
 fi
-grep -Fq 'TiUP component tikv:v8.5.1 is not installed after prewarm' \
+grep -Fq 'TiUP component ctl:v8.5.1 is not installed after prewarm' \
 	"$temp_dir/tiup-missing.out"
 
 # A required check must report on every pull request while provisioning the
