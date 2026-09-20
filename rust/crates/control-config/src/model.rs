@@ -746,6 +746,12 @@ impl EffectiveConfig {
         &self.log.online.level
     }
 
+    /// Returns the `log.encoder` spelling (`tidb` or `json`; restart-required).
+    #[must_use]
+    pub fn log_encoder(&self) -> &str {
+        &self.log.encoder
+    }
+
     /// Returns the canonical effective work directory.
     #[must_use]
     pub fn workdir(&self) -> &str {

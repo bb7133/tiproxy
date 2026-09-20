@@ -324,8 +324,9 @@ async fn ready_gate(State(app): State<Arc<AdminApp>>, request: Request, next: Ne
     next.run(request).await
 }
 
-/// Payload-free access record for non-success responses only; Go logs
-/// successes at debug level, which the Rust process does not emit.
+/// Payload-free access record for non-success responses only, at `WARN`
+/// like gin's error branch; Go logs successes at debug level, which the Rust
+/// process does not emit.
 async fn access_log(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -341,7 +342,7 @@ async fn access_log(request: Request, next: Next) -> Response {
             "status": status,
             "latency_ms": started.elapsed().as_millis(),
         });
-        control_plane::logging::emit_line(&line.to_string());
+        control_plane::logging::emit(control_plane::logging::Level::Warn, &line.to_string());
     }
     response
 }

@@ -471,8 +471,20 @@ async fn run(options: Options) -> Result<(), String> {
         options.log_file.as_deref(),
         config_owner.handle.source().current().as_ref(),
     );
+    {
+        // Line contract (slice 4a): the Go header of the configured encoder
+        // on every line, and the configured level filter. `log.encoder` is
+        // restart-required; `log.level` follows the config reload below.
+        let effective = config_owner.handle.source().current();
+        process_logging::set_encoder(process_logging::Encoder::from_config(
+            effective.effective().log_encoder(),
+        ));
+        process_logging::set_level(process_logging::Level::from_config(
+            effective.effective().log_level(),
+        ));
+    }
     process_logging::configure(initial_log_file.as_ref())?;
-    install_session_log_writer(process_logging::emit_line);
+    install_session_log_writer(session_log_line);
     let routing_shadow_socket = options.routing_shadow_socket.clone().or_else(|| {
         config_owner
             .handle
@@ -1371,6 +1383,11 @@ async fn wait_for_termination_signal() {
     }
 }
 
+/// Dataplane session lifecycle lines are `INFO` records of the process log.
+fn session_log_line(line: &str) {
+    process_logging::emit(process_logging::Level::Info, line);
+}
+
 /// Projects `log.log-file.*` from the committed config into the process log
 /// output settings; an empty file name keeps the standard stream.
 /// Combines the process's own `--log-file` path with the committed
@@ -1402,16 +1419,24 @@ async fn run_log_reload(
     mut current: Option<LogFileSettings>,
 ) {
     while updates.changed().await.is_ok() {
-        let next = log_file_settings(log_file.as_deref(), updates.borrow_and_update().as_ref());
+        let snapshot = updates.borrow_and_update().clone();
+        // `log.level` is reloadable in Go; apply it before the file settings.
+        process_logging::set_level(process_logging::Level::from_config(
+            snapshot.effective().log_level(),
+        ));
+        let next = log_file_settings(log_file.as_deref(), snapshot.as_ref());
         if next == current {
             continue;
         }
         match process_logging::configure(next.as_ref()) {
             Ok(()) => current = next,
-            Err(error) => process_logging::emit_line(&format!(
-                "{{\"component\":\"tiproxy-rs\",\"event\":\"log_file_reload_rejected\",\"error\":\"{}\"}}",
-                error.replace('\\', "\\\\").replace('"', "\\\"")
-            )),
+            Err(error) => process_logging::emit(
+                process_logging::Level::Error,
+                &format!(
+                    "{{\"component\":\"tiproxy-rs\",\"event\":\"log_file_reload_rejected\",\"error\":\"{}\"}}",
+                    error.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+            ),
         }
     }
 }

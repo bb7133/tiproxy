@@ -204,7 +204,22 @@ certificate.
   `CP-FAULT-ADMIN-DRAIN-REPLAY` runner) and 3b (drain wire bodies retired as
   tombstones, Go issuer deleted, `last_drain_command_sequence` kept as a
   Rust diagnostic).
-- **Slice 4** — diagnostics gRPC (`SearchLog` over the B0 log rotation,
+- **Slice 4a (log line contract)** — done: every Rust log line carries the
+  Go `pingcap/log` header, so `sysutil`-style readers parse Rust and Go logs
+  alike. `log.encoder = "tidb"` (default) renders
+  `[2006/01/02 15:04:05.000 -07:00] [LEVEL] <json body>`; `log.encoder =
+  "json"` renders the zap object shape `{"level","ts",...body fields}`.
+  Levels: lifecycle events are `INFO` (`ERROR` when they carry an error
+  class), dataplane session records `INFO`, admin access records for
+  non-success responses `WARN` (gin's error branch), rejected persistent
+  candidates `WARN`, a failed log reload `ERROR`; `log.level` filters like
+  the Go logger and follows the config reload, `log.encoder` is
+  restart-required as in Go. **Declared format difference:** the message
+  part stays the structured JSON object the Rust process always produced;
+  it is not a byte-level reproduction of Go's `[key=value]` field rendering.
+  Rotation, reload and the retention gate are unchanged (the header counts
+  toward `max-size` like any other bytes).
+- **Slice 4 (remaining)** — diagnostics gRPC (`SearchLog` over the B0 log rotation,
   `ServerInfo` with a pinned minimal host-information dependency after listing
   the Go `sysutil` fields) and `tiproxyctl` compatibility.
 - **Slice 5** — `/api/backend/metrics`, `/api/debug/redirect`, retirement

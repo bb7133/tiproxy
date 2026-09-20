@@ -27,7 +27,18 @@
 //! when deciding `max-days` retention.
 //! Reconfiguration is atomic per line: a reload swaps the writer between two
 //! lines and never drops or duplicates one.
+//!
+//! Line contract (CP-ADMIN slice 4a). Every line carries the Go logger's
+//! header so `SearchLog`-style readers (`sysutil`, the `TiDB` dashboard) parse Rust
+//! logs exactly like Go ones. With `log.encoder = "tidb"` a line is
+//! `[2006/01/02 15:04:05.000 -07:00] [LEVEL] <body>` where the body is the
+//! structured JSON object the Rust process always produced (this is a
+//! declared format difference: Go renders `[key=value]` fields there). With
+//! `log.encoder = "json"` the line is the zap object shape:
+//! `{"level":"LEVEL","ts":"<same layout>",...body fields}`. `log.level`
+//! filters lines below the configured level, like the Go logger.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -36,6 +47,135 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local, NaiveDateTime};
+
+/// Go `pingcap/log` timestamp layout (`2006/01/02 15:04:05.000 -07:00`),
+/// rendered in local time like the Go logger.
+const LINE_TIMESTAMP_FORMAT: &str = "%Y/%m/%d %H:%M:%S%.3f %:z";
+
+/// Line level, spelled like the Go logger's level tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    /// Diagnostic detail; suppressed unless `log.level = "debug"`.
+    Debug,
+    /// Normal lifecycle events.
+    Info,
+    /// Recoverable problems and rejected requests.
+    Warn,
+    /// Failures the process could not carry out.
+    Error,
+}
+
+impl Level {
+    /// The Go level tag as written between brackets and in `"level"`.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+
+    /// Parses the `log.level` spelling the Go logger accepts; unknown
+    /// spellings keep `info`, and the fatal/panic levels map to `error`.
+    #[must_use]
+    pub fn from_config(level: &str) -> Self {
+        match level.trim().to_ascii_lowercase().as_str() {
+            "debug" => Self::Debug,
+            "warn" | "warning" => Self::Warn,
+            "error" | "dpanic" | "panic" | "fatal" => Self::Error,
+            _ => Self::Info,
+        }
+    }
+}
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+/// Line encoder mirroring `log.encoder` (`tidb` text header, or zap `json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoder {
+    /// `[ts] [LEVEL] <json body>`.
+    Tidb,
+    /// `{"level":..,"ts":..,<body fields>}`.
+    Json,
+}
+
+impl Encoder {
+    /// Parses the `log.encoder` spelling; anything but `json` is `tidb`,
+    /// like the Go logger's builder.
+    #[must_use]
+    pub fn from_config(encoder: &str) -> Self {
+        if encoder.trim().eq_ignore_ascii_case("json") {
+            Self::Json
+        } else {
+            Self::Tidb
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LineFormat {
+    encoder: Encoder,
+    min_level: Level,
+}
+
+static FORMAT: Mutex<LineFormat> = Mutex::new(LineFormat {
+    encoder: Encoder::Tidb,
+    min_level: Level::Info,
+});
+
+fn format() -> LineFormat {
+    *FORMAT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Selects the line encoder (`log.encoder`, fixed for the process lifetime).
+pub fn set_encoder(encoder: Encoder) {
+    FORMAT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .encoder = encoder;
+}
+
+/// Sets the minimum level a line needs to be written (`log.level`, reloadable).
+pub fn set_level(level: Level) {
+    FORMAT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .min_level = level;
+}
+
+/// Renders one complete line for `body` (a JSON object text) at `level`
+/// under `encoder`, stamped with the local time `at`.
+#[must_use]
+pub fn render_line(encoder: Encoder, level: Level, at: DateTime<Local>, body: &str) -> String {
+    let stamp = at.format(LINE_TIMESTAMP_FORMAT);
+    match encoder {
+        Encoder::Tidb => format!("[{stamp}] [{}] {body}", level.tag()),
+        Encoder::Json => {
+            let body = body.trim();
+            if let Some(rest) = body.strip_prefix('{').filter(|rest| rest.ends_with('}')) {
+                if rest.trim_start() == "}" {
+                    format!("{{\"level\":\"{}\",\"ts\":\"{stamp}\"}}", level.tag())
+                } else {
+                    format!("{{\"level\":\"{}\",\"ts\":\"{stamp}\",{rest}", level.tag())
+                }
+            } else {
+                let msg = serde_json::Value::String(body.to_owned());
+                format!(
+                    "{{\"level\":\"{}\",\"ts\":\"{stamp}\",\"msg\":{msg}}}",
+                    level.tag()
+                )
+            }
+        }
+    }
+}
 
 /// `max-size` used when the configuration leaves it at zero (Go default).
 pub const DEFAULT_MAX_SIZE_MB: u64 = 300;
@@ -69,17 +209,29 @@ fn output() -> &'static Mutex<Output> {
     OUTPUT.get_or_init(|| Mutex::new(Output::Stderr))
 }
 
-/// Writes one log line (a newline is appended) to the configured output. A
-/// file write failure falls back to stderr for that line so the event is
-/// never silently lost; the file stays configured for the next line.
-pub fn emit_line(line: &str) {
+/// Writes one structured log line at `info` level; see [`emit`].
+pub fn emit_line(body: &str) {
+    emit(Level::Info, body);
+}
+
+/// Writes one structured log line (`body` is a JSON object text) at `level`
+/// with the Go header of the configured encoder; a line below `log.level`
+/// is dropped. A file write failure falls back to stderr for that line so
+/// the event is never silently lost; the file stays configured for the next
+/// line.
+pub fn emit(level: Level, body: &str) {
+    let format = format();
+    if level < format.min_level {
+        return;
+    }
+    let line = render_line(format.encoder, level, Local::now(), body);
     let mut guard = output()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match &mut *guard {
         Output::Stderr => eprintln!("{line}"),
         Output::File(file) => {
-            if file.write_line(line).is_err() {
+            if file.write_line(&line).is_err() {
                 eprintln!("{line}");
             }
         }
@@ -508,7 +660,17 @@ mod tests {
         assert!(configure(None).is_ok());
         emit_line("{\"event\":\"two\"}");
         let content = fs::read_to_string(dir.join("tiproxy.log")).unwrap_or_default();
-        assert_eq!(content, "{\"event\":\"one\"}\n");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly the line written while the file was configured"
+        );
+        assert!(
+            lines[0].ends_with("] [INFO] {\"event\":\"one\"}"),
+            "{}",
+            lines[0]
+        );
         assert!(
             configure(Some(&LogFileSettings {
                 filename: dir.clone(),
@@ -520,5 +682,77 @@ mod tests {
             "a directory is not a log file"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The `tidb` header is the Go `pingcap/log` layout: the timestamp parses
+    /// back with the same layout `sysutil` uses, the level tag follows, and
+    /// the JSON body is untouched.
+    #[test]
+    fn tidb_lines_carry_the_go_header_and_the_json_body() {
+        let at = Local::now();
+        let line = render_line(Encoder::Tidb, Level::Warn, at, "{\"event\":\"x\",\"n\":1}");
+        let Some(rest) = line.strip_prefix('[') else {
+            unreachable!("header starts with the timestamp: {line}")
+        };
+        let Some((stamp, rest)) = rest.split_once("] ") else {
+            unreachable!("timestamp is bracketed: {line}")
+        };
+        assert_eq!(
+            stamp.len(),
+            "2006/01/02 15:04:05.000 -07:00".len(),
+            "{stamp}"
+        );
+        let parsed = DateTime::parse_from_str(stamp, LINE_TIMESTAMP_FORMAT)
+            .unwrap_or_else(|error| unreachable!("{stamp}: {error}"));
+        assert_eq!(parsed.timestamp_millis(), at.timestamp_millis());
+        assert_eq!(rest, "[WARN] {\"event\":\"x\",\"n\":1}");
+    }
+
+    /// The `json` encoder produces the zap object shape with `level` and
+    /// `ts` first and the body's fields spliced in; a non-object body becomes
+    /// the `msg` string.
+    #[test]
+    fn json_lines_follow_the_zap_shape() {
+        let at = Local::now();
+        let stamp = at.format(LINE_TIMESTAMP_FORMAT).to_string();
+        assert_eq!(
+            render_line(Encoder::Json, Level::Error, at, "{\"event\":\"x\"}"),
+            format!("{{\"level\":\"ERROR\",\"ts\":\"{stamp}\",\"event\":\"x\"}}")
+        );
+        assert_eq!(
+            render_line(Encoder::Json, Level::Info, at, "{}"),
+            format!("{{\"level\":\"INFO\",\"ts\":\"{stamp}\"}}")
+        );
+        assert_eq!(
+            render_line(Encoder::Json, Level::Debug, at, "plain \"text\""),
+            format!("{{\"level\":\"DEBUG\",\"ts\":\"{stamp}\",\"msg\":\"plain \\\"text\\\"\"}}")
+        );
+        let value: serde_json::Value = serde_json::from_str(&render_line(
+            Encoder::Json,
+            Level::Info,
+            at,
+            "{\"event\":\"x\"}",
+        ))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(value["level"], "INFO");
+        assert_eq!(value["ts"], stamp);
+    }
+
+    /// `log.level` and `log.encoder` spellings follow the Go logger: unknown
+    /// levels keep info, fatal/panic collapse to error, and only `json`
+    /// selects the zap shape.
+    #[test]
+    fn level_and_encoder_spellings_match_the_go_logger() {
+        assert_eq!(Level::from_config("debug"), Level::Debug);
+        assert_eq!(Level::from_config("INFO"), Level::Info);
+        assert_eq!(Level::from_config(" warn "), Level::Warn);
+        assert_eq!(Level::from_config("error"), Level::Error);
+        assert_eq!(Level::from_config("fatal"), Level::Error);
+        assert_eq!(Level::from_config("bogus"), Level::Info);
+        assert!(Level::Debug < Level::Info && Level::Warn < Level::Error);
+        assert_eq!(Encoder::from_config("json"), Encoder::Json);
+        assert_eq!(Encoder::from_config("JSON"), Encoder::Json);
+        assert_eq!(Encoder::from_config("tidb"), Encoder::Tidb);
+        assert_eq!(Encoder::from_config(""), Encoder::Tidb);
     }
 }
