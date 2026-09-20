@@ -768,6 +768,42 @@ impl Router {
         Ok(Some(redirect))
     }
 
+    /// Go `Group.RedirectConnections` for this router: every active session
+    /// without a pending redirect is offered a redirect to its own backend
+    /// (reason `test`). A refused offer (closing session, exhausted counts,
+    /// full queue) counts as not accepted and is not an error, as Go records
+    /// `accepted=false` and returns nil.
+    pub(crate) fn redirect_all_to_self(
+        &self,
+        sender: &dyn crate::scheduler::MigrationCommandSink,
+        now: Instant,
+    ) -> crate::RedirectAllSummary {
+        let mut summary = crate::RedirectAllSummary::default();
+        let mut rejected = Vec::new();
+        {
+            let mut state = self.lock();
+            summary.active = state.ledger.evidence().active;
+            for session in state.ledger.redirectable_sessions() {
+                summary.offered += 1;
+                let Ok(redirect) = state.ledger.prepare_self_redirect(&session, now) else {
+                    continue;
+                };
+                let accepted = match sender.try_send(redirect.clone().into()) {
+                    Ok(()) => true,
+                    Err(mut returned) => {
+                        returned.disarm();
+                        rejected.push(returned);
+                        false
+                    }
+                };
+                state.ledger.admit_redirect(redirect, accepted, now);
+                summary.accepted += u64::from(accepted);
+            }
+        }
+        drop(rejected);
+        summary
+    }
+
     pub(crate) fn finish_redirect(
         &self,
         redirect: &Redirect,

@@ -98,6 +98,7 @@ async fn start(
         drain: None,
         log_file: None,
         backend_metrics: Arc::new(|_| Vec::new()),
+        redirect: Arc::new(|| Ok(())),
     };
     let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
     app.mark_ready();

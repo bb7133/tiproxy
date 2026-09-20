@@ -180,7 +180,6 @@ The differential script marks each of these and fails if one stops differing:
   directly; gin answers `301` to the slash form. Prometheus follows either.
 - `/api/debug/pprof/*` answers `404`. Go serves `net/http/pprof`. Profiling of
   the Rust process is a residual CP-ADMIN item, not closed by this slice.
-- `POST /api/debug/redirect` (slice 5b) answers `404` until its slice lands.
 
 ### Evidence
 
@@ -349,6 +348,35 @@ certificate.
   CP-ADMIN comparator fills the Go reader mock and the Rust hook from the
   same script entry and compares the empty, filled, no-cluster, encoded and
   bad-escape forms; router tests pin the query selection.
-- **Slice 5 (remaining)** — `/api/debug/redirect` (5b), then the Go API
-  retirement and final composition (5c, merged with the native metering
-  owner's startup and shutdown order); the profiling residual stays open.
+- **Slice 5b (`POST /api/debug/redirect`)** — Go `DebugRedirect` calls
+  `NamespaceManager.RedirectConnections()`, which asks every namespace's
+  router; the score-based router (`group.go`) offers every connection that
+  is not already in `phaseRedirectNotify` a redirect **to the backend it is
+  on** (reason `test`, a test/management reconnect that exercises the
+  migration machinery without moving score), sets the phase whether or not
+  `Redirect` accepted, records `accepted=false` for a refused offer (a
+  closing connection) and never applies the balancer's cooldown; the
+  routers return nil, so the handler answers `200 ""` and `500 "redirect
+  connections error"` only for a router-level error. Other methods are
+  gin's `404`. The Rust route plane sweeps every current router
+  (`RoutePlaneHandle::redirect_connections`): each active session without
+  a pending redirect gets a `Redirect` prepared by
+  `Ledger::prepare_self_redirect` (same account allowed, no cooldown,
+  closing sessions refused like Go's `Redirect` returning false, ordinary
+  redirect accounting with source and target being one account: the
+  session leaves and re-enters the same physical order, no score moves),
+  offered through the production migration queue; a refused offer counts
+  as not accepted, and the only error is a terminated route plane. The
+  ordinary balancer path keeps its same-backend refusal and cooldown. The
+  sweep summary (active, offered, accepted) is logged. The Go boundary is
+  pinned by `pkg/balance/router.TestRedirectConnectionsDebugBoundary`
+  (pending skipped, refused offer without error, no cooldown, score
+  unchanged) and mirrored by the ledger test. Evidence: the CP-ADMIN
+  comparator compares the sweep answer, the mocked router-level error and
+  `HEAD`; a real-process row that drives the sweep on a live Rust process
+  (every session self-migrates on its own backend with SQL uninterrupted)
+  together with the admin-versus-owner `backend/metrics` byte comparison
+  is still to be added to the integration harness.
+- **Slice 5 (remaining)** — the Go API retirement and final composition
+  (5c, merged with the native metering owner's startup and shutdown
+  order); the real-process 5a/5b row; the profiling residual stays open.

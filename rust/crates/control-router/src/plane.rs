@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use control_config::{ConfigNamespaceSnapshot, ConfigNamespaceSource, NamespaceIncarnation};
 use control_plane::{ControlModule, LifecyclePhase, ModuleContext, ModuleError, ModuleFuture};
@@ -24,6 +24,7 @@ use control_topology::{MetricOverlayHandle, TopologyModuleHandle};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 
+use crate::RedirectAllSummary;
 use crate::scheduler::{RouteCommandDispatcher, RouteCommandReceiver, RouteCommandRegistration};
 use crate::{
     ResolvedNamespace, RouteError, RouteLedgerEvidence, Router, Selector, UserNamespaceResolver,
@@ -339,6 +340,34 @@ impl RoutePlaneHandle {
     #[must_use]
     pub fn route_ledger_evidence(&self) -> RouteLedgerEvidence {
         self.ledger_diagnostics.snapshot()
+    }
+
+    /// Go `namespaceManager.RedirectConnections`: every current router offers
+    /// each of its non-pending active sessions a redirect to its own backend
+    /// through the production migration queue. Refused offers are not
+    /// errors; only an unavailable (terminal) route plane is.
+    ///
+    /// # Errors
+    ///
+    /// `ControlUnavailable` when the route plane has terminated.
+    pub fn redirect_connections(&self) -> Result<RedirectAllSummary, RouteError> {
+        let routers: Vec<Arc<RegisteredRouter>> = {
+            let registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+            if registry.terminal {
+                return Err(RouteError::ControlUnavailable);
+            }
+            registry.current.values().cloned().collect()
+        };
+        let now = Instant::now();
+        let mut summary = RedirectAllSummary::default();
+        for entry in routers {
+            summary.add(
+                entry
+                    .router
+                    .redirect_all_to_self(entry.dispatcher.as_ref(), now),
+            );
+        }
+        Ok(summary)
     }
 
     #[cfg(test)]

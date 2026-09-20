@@ -713,6 +713,8 @@ async fn run(options: Options) -> Result<(), String> {
         topology_handle.clone(),
         Some(metric_overlay),
     );
+    // CP-ADMIN's debug redirect sweeps every current router.
+    let redirect_plane = route_plane_handle.clone();
     if let Err(error) = guard.spawn_module(route_plane) {
         return Err(guard
             .rollback(format!("start route-plane module: {error}"))
@@ -853,7 +855,10 @@ async fn run(options: Options) -> Result<(), String> {
             &metrics_registry,
             admin_dispatch,
             options.log_file.clone(),
-            backend_metrics,
+            AdminPlaneSeams {
+                backend_metrics,
+                route_plane: redirect_plane,
+            },
         ),
         admin_tls_source(config_owner.handle.source().clone()),
     )
@@ -1696,6 +1701,12 @@ impl control_admin::DrainAdmin for DispatchDrainAdmin {
 
 /// Process-state accessors behind the admin handlers. Every closure reads
 /// live state on each request; none retains a payload.
+/// The route/metric plane seams the management plane reads from.
+struct AdminPlaneSeams {
+    backend_metrics: control_topology::BackendMetricsReader,
+    route_plane: control_router::RoutePlaneHandle,
+}
+
 fn admin_hooks(
     in_process: &Arc<InProcessControlRuntime>,
     config: &ConfigModuleHandle,
@@ -1703,8 +1714,12 @@ fn admin_hooks(
     registry: &Arc<MetricsRegistry>,
     dispatch: dataplane::control_dispatch::ControlDispatchHandle,
     log_file: Option<PathBuf>,
-    backend_metrics: control_topology::BackendMetricsReader,
+    seams: AdminPlaneSeams,
 ) -> control_admin::AdminHooks {
+    let AdminPlaneSeams {
+        backend_metrics,
+        route_plane,
+    } = seams;
     let lifecycle = in_process.handle();
     let health_config = config.clone();
     let health_serving = serving.clone();
@@ -1732,6 +1747,18 @@ fn admin_hooks(
         log_file,
         backend_metrics: Arc::new(move |cluster| {
             backend_metrics(cluster).map_or_else(Vec::new, |bytes| bytes.to_vec())
+        }),
+        redirect: Arc::new(move || {
+            route_plane
+                .redirect_connections()
+                .map(|summary| {
+                    let line = format!(
+                        "{{\"component\":\"control-admin\",\"event\":\"redirect_connections\",\"active\":{},\"offered\":{},\"accepted\":{}}}",
+                        summary.active, summary.offered, summary.accepted
+                    );
+                    process_logging::emit(process_logging::Level::Info, &line);
+                })
+                .map_err(|error| format!("{error:?}"))
         }),
     }
 }

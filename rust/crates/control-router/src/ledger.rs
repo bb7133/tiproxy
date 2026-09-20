@@ -588,6 +588,73 @@ impl Ledger {
         })
     }
 
+    /// Go `Group.RedirectConnections` candidates: every active session that
+    /// has no redirect pending (Go skips only `phaseRedirectNotify`; closing
+    /// and cooling-down sessions are still offered).
+    pub(crate) fn redirectable_sessions(&self) -> Vec<Session> {
+        self.sessions
+            .iter()
+            .filter_map(|(sequence, stage)| match stage {
+                Stage::Active(active) if active.redirect.is_none() => Some(Session {
+                    ledger: Arc::clone(&self.identity),
+                    sequence: *sequence,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Go's management/test reconnect: a redirect of the session to the
+    /// backend it already owns. Unlike `prepare_redirect` it allows the same
+    /// account and ignores the failure cooldown; a closing session is refused
+    /// like Go's `Redirect` returning false, and a pending redirect is
+    /// skipped by the caller. Accounting is the ordinary redirect accounting
+    /// with source and target being one account.
+    pub(crate) fn prepare_self_redirect(
+        &self,
+        session: &Session,
+        now: Instant,
+    ) -> Result<Redirect, LedgerError> {
+        let Stage::Active(active) = self.stage(session)? else {
+            return Err(LedgerError::NotActive);
+        };
+        if active.closing.is_some() {
+            return Err(LedgerError::ForceClosing);
+        }
+        if active.redirect.is_some() {
+            return Err(LedgerError::RedirectPending);
+        }
+        let account = self
+            .account(&active.account)
+            .ok_or(LedgerError::ForeignAccount)?;
+        account
+            .counts
+            .outgoing
+            .checked_add(1)
+            .filter(|out| *out <= account.counts.active)
+            .ok_or(LedgerError::Exhausted)?;
+        account
+            .counts
+            .capacity_used()
+            .checked_add(1)
+            .ok_or(LedgerError::Exhausted)?;
+        self.next_redirect
+            .checked_add(1)
+            .ok_or(LedgerError::Exhausted)?;
+        let mut assignment = active.assignment.clone();
+        assignment.connection_id = session.sequence;
+        assignment.assignment_id = self.next_redirect.to_string();
+        Ok(Redirect {
+            session: session.clone(),
+            sequence: self.next_redirect,
+            source: Arc::clone(&active.account),
+            target: Arc::clone(&active.account),
+            from: active.assignment.clone(),
+            to: assignment,
+            issued_at: now,
+        })
+    }
+
     pub(crate) fn admit_redirect(&mut self, redirect: Redirect, admitted: bool, now: Instant) {
         // Only called immediately after prepare_redirect under the same lock.
         if admitted {
@@ -863,6 +930,95 @@ mod tests {
                 router_incarnations: 1,
                 ..RouteLedgerEvidence::default()
             }
+        );
+    }
+
+    #[test]
+    fn self_redirect_keeps_the_account_and_rotates_physical_order() {
+        let mut ledger = Ledger::new(4);
+        let account = must(ledger.add_account());
+        let first = must(ledger.open());
+        let second = must(ledger.open());
+        for session in [&first, &second] {
+            let reservation = must(ledger.reserve(session, &account, assignment("a")));
+            assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+        }
+        assert_eq!(
+            ledger
+                .physical_sessions(&account)
+                .iter()
+                .map(|s| s.sequence)
+                .collect::<Vec<_>>(),
+            vec![first.sequence, second.sequence]
+        );
+        // Both are candidates; a pending redirect removes a session from the list.
+        assert_eq!(ledger.redirectable_sessions().len(), 2);
+        let redirect = must(ledger.prepare_self_redirect(&first, Instant::now()));
+        assert!(Arc::ptr_eq(&redirect.source, &redirect.target));
+        assert_eq!(redirect.from.backend_id, redirect.to.backend_id);
+        assert_eq!(redirect.to.connection_id, first.sequence);
+        ledger.admit_redirect(redirect.clone(), true, Instant::now());
+        assert_eq!(
+            ledger.redirectable_sessions().len(),
+            1,
+            "pending is skipped"
+        );
+        assert_eq!(
+            ledger.prepare_self_redirect(&first, Instant::now()).err(),
+            Some(LedgerError::RedirectPending)
+        );
+        let evidence = ledger.evidence();
+        assert_eq!(
+            (evidence.active, evidence.incoming, evidence.outgoing),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            ledger.finish_redirect(&redirect, true, Instant::now()),
+            Settlement::Applied
+        );
+        let evidence = ledger.evidence();
+        assert_eq!(
+            (evidence.active, evidence.incoming, evidence.outgoing),
+            (2, 0, 0)
+        );
+        assert_eq!(
+            ledger
+                .physical_sessions(&account)
+                .iter()
+                .map(|s| s.sequence)
+                .collect::<Vec<_>>(),
+            vec![second.sequence, first.sequence],
+            "Go removes and re-appends the connection in the same account"
+        );
+        // A failed self-redirect leaves the account and order untouched, and
+        // the cooldown does not block the next management reconnect.
+        let redirect = must(ledger.prepare_self_redirect(&second, Instant::now()));
+        ledger.admit_redirect(redirect.clone(), true, Instant::now());
+        assert_eq!(
+            ledger.finish_redirect(&redirect, false, Instant::now()),
+            Settlement::Applied
+        );
+        assert!(
+            ledger
+                .prepare_self_redirect(&second, Instant::now())
+                .is_ok()
+        );
+        assert_eq!(
+            ledger
+                .prepare_redirect(&second, &account, assignment("a"), Instant::now())
+                .err(),
+            Some(LedgerError::CoolingDown),
+            "the ordinary path keeps its cooldown and same-account refusal"
+        );
+        // A closing session is refused like Go's Redirect returning false.
+        let third = must(ledger.open());
+        let reservation = must(ledger.reserve(&third, &account, assignment("a")));
+        assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+        let close = must(ledger.prepare_close(&third, Instant::now()));
+        ledger.admit_close(close);
+        assert_eq!(
+            ledger.prepare_self_redirect(&third, Instant::now()).err(),
+            Some(LedgerError::ForceClosing)
         );
     }
 

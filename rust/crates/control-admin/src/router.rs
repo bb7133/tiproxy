@@ -123,7 +123,14 @@ pub struct AdminHooks {
     /// for the empty name when there is not exactly one cluster, or when
     /// this process is not serving the owner endpoint).
     pub backend_metrics: BackendMetricsHook,
+    /// Go `NamespaceManager.RedirectConnections`: offers every connection a
+    /// redirect to its own backend; `Err` is a router-level failure (Go's
+    /// `[]error`), refused offers are not errors.
+    pub redirect: RedirectHook,
 }
+
+/// The `AdminHooks::redirect` entry: Go's management redirect sweep.
+pub type RedirectHook = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 /// The `AdminHooks::backend_metrics` reader: history bytes for a cluster name.
 pub type BackendMetricsHook = Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
@@ -302,7 +309,8 @@ pub fn full_router(app: Arc<AdminApp>) -> Router {
         .route("/api/traffic/replay", post(traffic_disabled("replay")))
         .route("/api/traffic/cancel", post(traffic_disabled("cancel")))
         .route("/api/traffic/show", get(traffic_disabled("show")))
-        .route("/api/backend/metrics", get(backend_metrics).head(not_found));
+        .route("/api/backend/metrics", get(backend_metrics).head(not_found))
+        .route("/api/debug/redirect", post(debug_redirect).head(not_found));
     with_middleware(router, app)
 }
 
@@ -495,6 +503,28 @@ async fn metrics(State(app): State<Arc<AdminApp>>) -> Response {
 
 async fn dataplane_status(State(app): State<Arc<AdminApp>>) -> Response {
     json(StatusCode::OK, &(app.hooks.dataplane_status)().to_json())
+}
+
+// ---- debug redirect (Go pkg/server/api/debug.go) ----
+
+/// Go `DebugRedirect`: `NsMgr.RedirectConnections()`; any router-level
+/// error answers `500 "redirect connections error"`, otherwise `200 ""`.
+async fn debug_redirect(State(app): State<Arc<AdminApp>>) -> Response {
+    match (app.hooks.redirect)() {
+        Ok(()) => json(StatusCode::OK, "\"\""),
+        Err(error) => {
+            let line = serde_json::json!({
+                "component": "control-admin",
+                "event": "redirect_connections_error",
+                "error": error,
+            });
+            control_plane::logging::emit(control_plane::logging::Level::Warn, &line.to_string());
+            json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "\"redirect connections error\"",
+            )
+        }
+    }
 }
 
 // ---- backend metrics (Go pkg/server/api/backend.go) ----
@@ -882,6 +912,7 @@ impl AdminHooks {
             drain: None,
             log_file: None,
             backend_metrics: Arc::new(|_| Vec::new()),
+            redirect: Arc::new(|| Ok(())),
         }
     }
 }
@@ -1620,6 +1651,66 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let (status, _, body) = oneshot(full_router(app), request).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::NOT_FOUND, "404 page not found")
+        );
+    }
+
+    /// Go `DebugRedirect`: `200 ""` when every router's sweep returns nil,
+    /// `500 "redirect connections error"` on a router-level error; GET is 404.
+    #[tokio::test]
+    async fn debug_redirect_follows_go_debug_handler() {
+        let fail = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fail);
+        let mut hooks = AdminHooks::fixed(
+            HealthInputs {
+                closing: false,
+                namespaces_ready: true,
+                applied_generation: 1,
+                config_checksum: 7,
+            },
+            String::new(),
+            DataplaneStatus::default(),
+            Arc::new(crate::config::MemoryConfigAdmin::default()),
+        );
+        hooks.redirect = Arc::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                Err("route plane terminated".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
+        app.mark_ready();
+        let post = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/debug/redirect")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (status, content_type, body) = oneshot(full_router(Arc::clone(&app)), post()).await;
+        assert_eq!(
+            (status, content_type.as_str(), body.as_str()),
+            (StatusCode::OK, JSON_CONTENT_TYPE, "\"\"")
+        );
+        fail.store(true, Ordering::SeqCst);
+        let (status, content_type, body) = oneshot(full_router(Arc::clone(&app)), post()).await;
+        assert_eq!(
+            (status, content_type.as_str(), body.as_str()),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JSON_CONTENT_TYPE,
+                "\"redirect connections error\""
+            )
+        );
+        let get = Request::builder()
+            .method("GET")
+            .uri("/api/debug/redirect")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = oneshot(full_router(app), get).await;
         assert_eq!(
             (status, body.as_str()),
             (StatusCode::NOT_FOUND, "404 page not found")

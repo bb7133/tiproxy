@@ -91,6 +91,7 @@ async fn main() {
     let drain_enabled = Arc::new(AtomicBool::new(false));
     let backend_metrics = Arc::new(Mutex::new(Vec::<u8>::new()));
     let backend_metrics_source = Arc::clone(&backend_metrics);
+    let redirect_health = Arc::clone(&shared);
     let hooks = {
         let health = Arc::clone(&shared);
         let status = Arc::clone(&shared);
@@ -115,6 +116,15 @@ async fn main() {
             drain: None,
             log_file: None,
             backend_metrics: Arc::new(move |_| backend_metrics_source.lock().unwrap().clone()),
+            redirect: Arc::new(move || {
+                // The Go capture's namespace-manager mock fails the sweep when
+                // its namespaces are not ready.
+                if redirect_health.namespaces_ready.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err("mock error".to_owned())
+                }
+            }),
         }
     };
     let hooks_with_drain = AdminHooks {
