@@ -30,6 +30,10 @@
       "reason": "The optional restart-pinned observer socket and joined task ownership require real configuration and process lifecycle; validated by the control-config/tiproxy-rs tests and controlplane-cproute-recorder-evidence, outside a MySQL byte trace."
     },
     {
+      "parity_id": "CFG-004",
+      "reason": "The restart-pinned metrics-owner port (zero selects an ephemeral port; an explicit port must fit uint16 and differ from every SQL listener and the API port; a Rust reload cannot replace it) is configuration validation and process startup behavior with no MySQL packet representation; validated by lib/config/proxy_test.go:TestMetricsOwnerPortIsExplicitRestartPinnedAndCollisionFree and rust/crates/control-config/tests/source.rs:metrics_owner_port_is_explicit_restart_pinned_and_collision_free."
+    },
+    {
       "parity_id": "CMP-001",
       "reason": "The v1 oracle stores uncompressed MySQL frames; zlib negotiation and framing use Go golden vectors and compressed session tests."
     },
