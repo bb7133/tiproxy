@@ -7860,3 +7860,65 @@ async fn send_proxy_owned_query_opens_at_fresh_compressed_sequence_zero() {
         "send_proxy_owned_query opens the exchange at a fresh compressed sequence 0"
     );
 }
+
+/// COMMIT's OK permits the client to send immediately, including while the
+/// following redirect handshake is still queued or in flight.
+#[tokio::test]
+async fn query_immediately_after_commit_survives_redirect() {
+    let stack = spawn_stack().await;
+    let (target_port, target_transcript, _) = spawn_fake_backend_server(SnapshotReply::Valid).await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = MysqlClient::connect(stack.sql_port).await else {
+        unreachable!("session established")
+    };
+    assert!(client.query_ok("BEGIN").await);
+    let redirect = command_envelope(
+        7010,
+        Body::RedirectCommand(RedirectCommand {
+            connection_id: 1,
+            redirect_id: "commit-next-command".to_owned(),
+            backend_id: "tidb-target".to_owned(),
+            backend_address: format!("127.0.0.1:{target_port}"),
+            cluster_name: String::new(),
+            keyspace: String::new(),
+            backend_unhealthy: false,
+            backend_local: false,
+            deadline_unix_millis: 0,
+            command_sequence: 1,
+        }),
+    );
+    let _ = stack.forwarder.handle(redirect).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(client.query_ok("COMMIT").await);
+    assert!(
+        matches!(
+            timeout(
+                Duration::from_secs(2),
+                client.query_ok("SELECT next_after_commit")
+            )
+            .await,
+            Ok(true)
+        ),
+        "next query lost its forwarding ACK while redirect was pending"
+    );
+    let result = wait_sent(&stack.sender, |envelope| {
+        matches!(&envelope.body, Some(Body::RedirectResult(result)) if result.redirect_id == "commit-next-command" && result.succeeded)
+    }).await;
+    assert!(result.is_some());
+    assert_eq!(
+        target_transcript.lock().map_or(0, |commands| commands
+            .iter()
+            .filter(|p| p.as_slice() == b"\x03SELECT next_after_commit")
+            .count()),
+        1
+    );
+    assert!(stack.backend_transcript.lock().is_ok_and(|commands| {
+        commands
+            .iter()
+            .all(|p| p.as_slice() != b"\x03SELECT next_after_commit")
+    }));
+    drop(client);
+    let _ = stack.shutdown_tx.send(true);
+    let _ = timeout(Duration::from_secs(5), stack.server_task).await;
+    stack.dispatch_task.abort();
+}
