@@ -336,31 +336,55 @@ struct LocalDrainIssuer {
 struct LocalDrainRecord {
     wire_id: String,
     command_sequence: u64,
-    /// The synthetic `DUPLICATE_REQUEST` terminal when the gate judged the
-    /// replay obsolete (its tombstone was evicted).
-    synthetic: Option<DrainResult>,
+    /// Latest observed result for this label (Go `operation.latest`): the
+    /// gate's admission answer, progress from a re-issuance, or the
+    /// terminal. Retained for the incarnation's lifetime, so a status query
+    /// never depends on the gate's bounded tombstone ring.
+    latest: Option<DrainResult>,
+    /// Whether `latest` is the terminal (Go `operation.completed`). A
+    /// terminal is absolute: nothing observed later overwrites it.
+    completed: bool,
+}
+
+impl LocalDrainRecord {
+    fn observe(&mut self, result: DrainResult) {
+        if self.completed {
+            return;
+        }
+        self.completed = result.complete;
+        self.latest = Some(result);
+    }
 }
 
 impl LocalDrainIssuer {
-    fn new() -> Self {
+    /// Mirrors Go `NewDrainIssuer`: the incarnation nonce is the safety
+    /// anchor for drain wire ids, so a failed entropy read refuses the
+    /// issuer instead of degrading to a guessable or collision-prone nonce
+    /// that could alias two incarnations.
+    fn new() -> Result<Self, String> {
+        Self::from_entropy(|nonce| {
+            getrandom::getrandom(nonce).map_err(|error| std::io::Error::other(error.to_string()))
+        })
+    }
+
+    fn from_entropy(fill: impl FnOnce(&mut [u8]) -> std::io::Result<()>) -> Result<Self, String> {
         let mut nonce = [0_u8; 16];
-        // A failed entropy read degrades to a process-unique but weaker
-        // nonce; wire ids still never collide within one process.
-        if getrandom::getrandom(&mut nonce).is_err() {
-            nonce[..4].copy_from_slice(&std::process::id().to_be_bytes());
-        }
+        fill(&mut nonce).map_err(|error| format!("drain issuer incarnation nonce: {error}"))?;
         let incarnation = nonce
             .iter()
             .fold(String::with_capacity(32), |mut out, byte| {
                 let _ = write!(out, "{byte:02x}");
                 out
             });
-        Self {
+        Ok(Self {
             incarnation,
             callers: HashMap::new(),
-        }
+        })
     }
 }
+
+/// Bounded refusal detail when the local drain issuer never came up.
+const LOCAL_DRAIN_ISSUER_UNAVAILABLE: &str = "local drain issuer unavailable: boot entropy failed";
 
 /// The long-lived production owner of the command gate, metering
 /// ledger, session channels, and initiating-request-id records.
@@ -370,8 +394,10 @@ impl LocalDrainIssuer {
 /// lost result needs cross-epoch replay.
 pub struct ControlCommandHandler {
     gate: CommandGate,
-    /// Locally issued drains (CP-ADMIN), sharing the gate lineage.
-    local_drains: LocalDrainIssuer,
+    /// Locally issued drains (CP-ADMIN), sharing the gate lineage. `Err`
+    /// retains the boot entropy failure: every local drain is refused and
+    /// the production owner refuses to start (Go `NewDrainIssuer`).
+    local_drains: Result<LocalDrainIssuer, String>,
     /// The production cutover composition. This is process-fixed: bridge
     /// reconnects cannot demote routing back to Go.
     route_owner: bool,
@@ -454,6 +480,29 @@ impl ControlCommandHandler {
             stats: Arc::new(DispatchStats::default()),
             local_drains: LocalDrainIssuer::new(),
         }
+    }
+
+    /// Whether the local drain issuer came up. Go `NewDrainIssuer` fails
+    /// the bridge when its incarnation nonce cannot be read; the production
+    /// owner checks this before serving and refuses to start on `Err`, so a
+    /// process never runs with a guessable or aliasing drain lineage.
+    ///
+    /// # Errors
+    ///
+    /// The bounded boot entropy failure.
+    pub fn local_drain_issuer_ready(&self) -> Result<(), String> {
+        self.local_drains.as_ref().map(|_| ()).map_err(Clone::clone)
+    }
+
+    /// Rebuilds the local drain issuer from the given entropy source
+    /// (tests inject a failing source to verify the fail-closed path).
+    #[must_use]
+    pub fn with_local_drain_entropy(
+        mut self,
+        fill: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+    ) -> Self {
+        self.local_drains = LocalDrainIssuer::from_entropy(fill);
+        self
     }
 
     /// Creates the production post-cutover handler. The owner decision is
@@ -894,12 +943,15 @@ impl ControlCommandHandler {
                 .remove(&terminal.drain_id)
                 .unwrap_or(NEEDS_ALLOCATION);
             // A locally issued drain has no wire requester: its terminal
-            // stays in the gate for the local status query.
-            let local = self
-                .local_drains
-                .callers
-                .values()
-                .any(|record| record.wire_id == terminal.drain_id);
+            // is retained by the issuer's record for the local status query.
+            let local = self.local_drains.as_mut().is_ok_and(|issuer| {
+                issuer
+                    .callers
+                    .values_mut()
+                    .find(|record| record.wire_id == terminal.drain_id)
+                    .map(|record| record.observe(terminal.clone()))
+                    .is_some()
+            });
             if !local {
                 outbound.push(result_envelope(
                     OutboundControl::DrainResult(terminal),
@@ -1452,6 +1504,41 @@ impl ControlCommandHandler {
         }
     }
 
+    /// Resolves the wire id and sequence bound to an operator label, or the
+    /// outcome that ends the issuance before any effect: the issuer never
+    /// came up, the label already completed (Go replays a completed label
+    /// without re-arming it and ignores whatever answers; the gate's answer
+    /// for a finished id is its tombstone or, once evicted, a synthetic
+    /// `DUPLICATE_REQUEST`, and neither may touch the retained terminal), or
+    /// the sequence space is exhausted.
+    fn local_drain_binding(&self, caller_id: &str) -> Result<(String, u64), LocalDrainOutcome> {
+        let issuer = self
+            .local_drains
+            .as_ref()
+            .map_err(|_| LocalDrainOutcome::Rejected {
+                code: ErrorCode::Internal,
+                detail: LOCAL_DRAIN_ISSUER_UNAVAILABLE,
+            })?;
+        if let Some(record) = issuer.callers.get(caller_id) {
+            if record.completed {
+                return Err(LocalDrainOutcome::Accepted {
+                    wire_id: record.wire_id.clone(),
+                    command_sequence: record.command_sequence,
+                });
+            }
+            return Ok((record.wire_id.clone(), record.command_sequence));
+        }
+        let sequence =
+            self.gate
+                .drain_watermark()
+                .checked_add(1)
+                .ok_or(LocalDrainOutcome::Rejected {
+                    code: ErrorCode::ProtocolViolation,
+                    detail: "drain sequence space exhausted",
+                })?;
+        Ok((format!("{caller_id}@{}", issuer.incarnation), sequence))
+    }
+
     /// Issues (or idempotently re-issues) one operator drain from inside the
     /// process. Mirrors `Bridge.StartDrain` + `DrainIssuer.StartDrain`: the
     /// label binds once to `<label>@<incarnation>` and to the next sequence
@@ -1469,24 +1556,10 @@ impl ControlCommandHandler {
         if generation == 0 {
             return (LocalDrainOutcome::SnapshotNotReady, Vec::new());
         }
-        let (wire_id, command_sequence) =
-            if let Some(record) = self.local_drains.callers.get(&request.caller_id) {
-                (record.wire_id.clone(), record.command_sequence)
-            } else {
-                let Some(sequence) = self.gate.drain_watermark().checked_add(1) else {
-                    return (
-                        LocalDrainOutcome::Rejected {
-                            code: ErrorCode::ProtocolViolation,
-                            detail: "drain sequence space exhausted",
-                        },
-                        Vec::new(),
-                    );
-                };
-                (
-                    format!("{}@{}", request.caller_id, self.local_drains.incarnation),
-                    sequence,
-                )
-            };
+        let (wire_id, command_sequence) = match self.local_drain_binding(&request.caller_id) {
+            Ok(binding) => binding,
+            Err(outcome) => return (outcome, Vec::new()),
+        };
         let graceful = now_unix_millis
             .saturating_add(u64::try_from(request.graceful_wait.as_millis()).unwrap_or(u64::MAX));
         let force = graceful
@@ -1516,44 +1589,56 @@ impl ControlCommandHandler {
             },
             DrainVerdict::Result(result) if result.code() == ErrorCode::DrainInProgress => {
                 let active = result.drain_id;
-                if self
-                    .local_drains
-                    .callers
-                    .values()
-                    .any(|record| record.wire_id == active)
-                {
+                if self.local_drains.as_ref().is_ok_and(|issuer| {
+                    issuer
+                        .callers
+                        .values()
+                        .any(|record| record.wire_id == active)
+                }) {
                     LocalDrainOutcome::DrainInProgress { active }
                 } else {
                     LocalDrainOutcome::ForeignDrainActive { active }
                 }
             }
-            DrainVerdict::Result(result) => {
-                let record = self
-                    .local_drains
-                    .callers
-                    .entry(request.caller_id.clone())
-                    .or_insert(LocalDrainRecord {
-                        wire_id,
-                        command_sequence,
-                        synthetic: None,
-                    });
-                if result.code() == ErrorCode::DuplicateRequest {
-                    record.synthetic = Some(result);
+            DrainVerdict::Result(result) => match &mut self.local_drains {
+                Ok(issuer) => {
+                    let record = issuer.callers.entry(request.caller_id.clone()).or_insert(
+                        LocalDrainRecord {
+                            wire_id,
+                            command_sequence,
+                            latest: None,
+                            completed: false,
+                        },
+                    );
+                    record.observe(result);
+                    LocalDrainOutcome::Accepted {
+                        wire_id: record.wire_id.clone(),
+                        command_sequence: record.command_sequence,
+                    }
                 }
-                LocalDrainOutcome::Accepted {
-                    wire_id: record.wire_id.clone(),
-                    command_sequence: record.command_sequence,
-                }
-            }
+                // Unreachable after the admission guard above; stays
+                // fail-closed rather than fabricating a record.
+                Err(_) => LocalDrainOutcome::Rejected {
+                    code: ErrorCode::Internal,
+                    detail: LOCAL_DRAIN_ISSUER_UNAVAILABLE,
+                },
+            },
         };
         (outcome, outbound)
     }
 
-    /// Latest progress or terminal for a local drain label, from the gate's
-    /// live state, its tombstone ring, or the retained synthetic terminal.
+    /// Latest progress or terminal for a local drain label: the retained
+    /// terminal once the drain completed, otherwise the gate's live
+    /// progress, then its tombstone ring, then the last retained answer.
     #[must_use]
     pub fn local_drain_status(&self, caller_id: &str) -> Option<LocalDrainStatus> {
-        let record = self.local_drains.callers.get(caller_id)?;
+        let record = self.local_drains.as_ref().ok()?.callers.get(caller_id)?;
+        if record.completed {
+            return record.latest.clone().map(|result| LocalDrainStatus {
+                complete: true,
+                result,
+            });
+        }
         if let Some(progress) = self
             .gate
             .drain_progress()
@@ -1570,8 +1655,8 @@ impl ControlCommandHandler {
                 result: done,
             });
         }
-        record.synthetic.clone().map(|result| LocalDrainStatus {
-            complete: true,
+        record.latest.clone().map(|result| LocalDrainStatus {
+            complete: result.complete,
             result,
         })
     }

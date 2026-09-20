@@ -524,6 +524,9 @@ async fn run(options: Options) -> Result<(), String> {
     let metering = MeteringSourceRegistry::new(ledger.process_generation())
         .map_err(|error| format!("create metering registry: {error}"))?;
     let dispatch_handler = ControlCommandHandler::with_metering_route_owner(ledger);
+    // Go `NewDrainIssuer` fails the bridge when the incarnation nonce cannot
+    // be read; the Rust owner refuses to start the same way.
+    dispatch_handler.local_drain_issuer_ready()?;
     let mut client =
         ClientConfig::with_defaults(options.control_socket, options.control_uid, hello);
     client.required_capabilities = capabilities;
@@ -727,9 +730,6 @@ async fn run(options: Options) -> Result<(), String> {
         RustConfigComposer::new(config_owner.handle.source().clone(), options.drain_grace)
             .with_topology(topology_handle.clone()),
     );
-    // The namespace-commit barrier maps serving's installed composition back
-    // to the CP-CFG lineage through this composer.
-    let admin_composer = Arc::clone(&composer);
     let (consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
         Arc::new(SystemMemoryProbe::new()),
         Arc::new(connection_handler),
@@ -833,7 +833,6 @@ async fn run(options: Options) -> Result<(), String> {
             &config_owner.handle,
             &serving,
             &metrics_registry,
-            admin_composer,
             admin_dispatch,
         ),
         admin_tls_source(config_owner.handle.source().clone()),
@@ -1479,11 +1478,11 @@ async fn spawn_admin(
 /// serving side has composed the current config generation.
 struct OwnerConfigAdmin {
     handle: ConfigModuleHandle,
-    /// Composition generations the SQL serving side actually installed
-    /// (initial bind, bridge apply, recomposition), mapped back to the
-    /// CP-CFG lineage through the composer.
-    applied_composition: watch::Receiver<u64>,
-    composer: Arc<RustConfigComposer>,
+    /// CP-CFG generations the SQL serving side actually installed (initial
+    /// bind, bridge apply, recomposition). Each value is read from the
+    /// validated view that was installed, so nothing composed, staged,
+    /// skipped, or rejected can confirm a generation.
+    applied_config: watch::Receiver<u64>,
 }
 
 /// Longest a namespace commit waits for the serving side to catch up.
@@ -1539,11 +1538,10 @@ impl control_admin::ConfigAdmin for OwnerConfigAdmin {
             // Namespaces become serving through the config watch; "commit"
             // is complete once serving has applied this CP-CFG generation.
             let target = snapshot.generation();
-            let mut applied = self.applied_composition.clone();
+            let mut applied = self.applied_config.clone();
             let barrier = async {
                 loop {
-                    let composition = *applied.borrow_and_update();
-                    if self.composer.config_generation_of(composition) >= target {
+                    if *applied.borrow_and_update() >= target {
                         return Ok(());
                     }
                     if applied.changed().await.is_err() {
@@ -1653,7 +1651,6 @@ fn admin_hooks(
     config: &ConfigModuleHandle,
     serving: &DataplaneServingHandle,
     registry: &Arc<MetricsRegistry>,
-    composer: Arc<RustConfigComposer>,
     dispatch: dataplane::control_dispatch::ControlDispatchHandle,
 ) -> control_admin::AdminHooks {
     let lifecycle = in_process.handle();
@@ -1663,8 +1660,7 @@ fn admin_hooks(
     let registry = Arc::clone(registry);
     let config_admin: control_admin::SharedConfigAdmin = Arc::new(OwnerConfigAdmin {
         handle: config.clone(),
-        applied_composition: serving.applied_composition_generation(),
-        composer,
+        applied_config: serving.applied_config_generation(),
     });
     control_admin::AdminHooks {
         health_inputs: Arc::new(move || control_admin::HealthInputs {

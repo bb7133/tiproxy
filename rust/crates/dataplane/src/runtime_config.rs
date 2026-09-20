@@ -24,7 +24,9 @@
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant};
 
-use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime, ValidatedSnapshot};
+use control_proto::snapshot::{
+    CompositionGenerations, SnapshotError, SnapshotStore, UnixTime, ValidatedSnapshot,
+};
 use control_proto::v1::StateSnapshot;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -76,30 +78,33 @@ struct GenerationStatusInner {
 #[derive(Debug, Clone)]
 pub struct GenerationStatus {
     inner: Arc<StdMutex<GenerationStatusInner>>,
-    /// Latest composition generation actually installed by a successful
-    /// serving apply (bridge bind/apply or recomposition). CP-ADMIN maps it
-    /// back to the CP-CFG generation it was composed from.
-    applied_composition: tokio::sync::watch::Sender<u64>,
+    /// Latest Rust-owned config source generation actually installed by a
+    /// successful serving apply (bridge bind/apply or recomposition). The
+    /// value travels inside the validated view, so it is published only in
+    /// the apply path that installed that exact view; CP-ADMIN's
+    /// namespace-commit barrier waits on it directly.
+    applied_config: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for GenerationStatus {
     fn default() -> Self {
         Self {
             inner: Arc::default(),
-            applied_composition: tokio::sync::watch::channel(0).0,
+            applied_config: tokio::sync::watch::channel(0).0,
         }
     }
 }
 
 impl GenerationStatus {
-    /// Observes every composition generation a successful apply installed.
+    /// Observes every Rust-owned config generation a successful apply
+    /// installed.
     #[must_use]
-    pub fn applied_composition_generation(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.applied_composition.subscribe()
+    pub fn applied_config_generation(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.applied_config.subscribe()
     }
 
-    fn record_applied_composition(&self, generation: u64) {
-        self.applied_composition.send_if_modified(|current| {
+    fn record_applied_config(&self, generation: u64) {
+        self.applied_config.send_if_modified(|current| {
             if generation > *current {
                 *current = generation;
                 true
@@ -126,16 +131,16 @@ impl GenerationStatus {
         }
     }
 
-    fn applied(&self, generation: u64, composition_generation: u64) {
+    fn applied(&self, generation: u64, composition_generation: u64, config_generation: u64) {
         let mut inner = lock_std(&self.inner);
         inner.applied_generation = generation;
         inner.applied_total = inner.applied_total.saturating_add(1);
         inner.last_good_at = Some(Instant::now());
         if composition_generation != 0 {
             inner.composition_generation = composition_generation;
-            drop(inner);
-            self.record_applied_composition(composition_generation);
         }
+        drop(inner);
+        self.record_applied_config(config_generation);
     }
 
     fn rejected(&self, generation: u64) {
@@ -144,13 +149,13 @@ impl GenerationStatus {
         inner.rejected_total = inner.rejected_total.saturating_add(1);
     }
 
-    fn composition_applied(&self, generation: u64) {
+    fn composition_applied(&self, generation: u64, config_generation: u64) {
         let mut inner = lock_std(&self.inner);
         inner.composition_generation = generation;
         inner.composition_applied_total = inner.composition_applied_total.saturating_add(1);
         inner.last_good_at = Some(Instant::now());
         drop(inner);
-        self.record_applied_composition(generation);
+        self.record_applied_config(config_generation);
     }
 
     fn composition_rejected(&self, generation: u64) {
@@ -274,6 +279,7 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
             None => Ok(SnapshotComposition {
                 snapshot: source.clone(),
                 generation: 0,
+                config_generation: 0,
             }),
         }
     }
@@ -305,6 +311,7 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
 
             let bridge_source = snapshot.source_raw().clone();
             let composition_generation = snapshot.composition_generation();
+            let config_generation = snapshot.config_generation();
             let result = if let Some(handle) = &serving.handle {
                 // Lineage check immediately before the serving swap,
                 // inside the serving lock with no await between: a
@@ -345,7 +352,7 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
             match result {
                 Ok(()) => {
                     serving.last_bridge_source = Some(bridge_source);
-                    status.applied(generation, composition_generation);
+                    status.applied(generation, composition_generation, config_generation);
                     Ok(())
                 }
                 Err(error) => {
@@ -358,11 +365,14 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
 }
 
 impl DataplaneServingHandle {
-    /// Observes every composition generation a successful serving apply
-    /// installed (initial bind, bridge apply, and recomposition alike).
+    /// Observes every Rust-owned config generation a successful serving
+    /// apply installed (initial bind, bridge apply, and recomposition alike).
+    /// The generation is read from the validated view that was installed, so
+    /// a rejected apply, a skipped recomposition, or a composition prepared
+    /// but never applied can never confirm a config generation.
     #[must_use]
-    pub fn applied_composition_generation(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.status.applied_composition_generation()
+    pub fn applied_config_generation(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.status.applied_config_generation()
     }
 
     /// Returns the current serving-generation status.
@@ -408,9 +418,13 @@ impl DataplaneServingHandle {
         }
         let bridge_generation = self.status.snapshot().applied_generation;
         let generation = composition.generation;
+        let config_generation = composition.config_generation;
         let snapshot = match validator.validate_composed(
             bridge_generation,
-            generation,
+            CompositionGenerations {
+                composition: generation,
+                config: config_generation,
+            },
             composition.snapshot,
             now,
         ) {
@@ -422,7 +436,8 @@ impl DataplaneServingHandle {
         };
         match handle.update_snapshot(snapshot) {
             Ok(()) => {
-                self.status.composition_applied(generation);
+                self.status
+                    .composition_applied(generation, config_generation);
                 Ok(true)
             }
             Err(error) => {
@@ -503,27 +518,28 @@ mod tests {
     use super::GenerationStatus;
 
     /// Every successful apply path (bridge bind/apply with a composition,
-    /// and recomposition) publishes the installed composition generation
-    /// monotonically; a bridge apply without a composition leaves it.
+    /// and recomposition) publishes the config generation carried by the
+    /// installed view monotonically; a bridge apply without a composition
+    /// carries none, and rejections never confirm anything.
     #[test]
-    fn applied_composition_watch_follows_every_successful_apply() {
+    fn applied_config_watch_follows_every_successful_apply() {
         let status = GenerationStatus::default();
-        let watch = status.applied_composition_generation();
+        let watch = status.applied_config_generation();
         assert_eq!(*watch.borrow(), 0);
-        status.applied(1, 0);
+        status.applied(1, 0, 0);
         assert_eq!(
             *watch.borrow(),
             0,
-            "legacy one-source apply carries no composition"
+            "legacy one-source apply carries no config generation"
         );
-        status.applied(2, 1);
-        assert_eq!(*watch.borrow(), 1, "initial bind records its composition");
-        status.composition_applied(2);
-        assert_eq!(*watch.borrow(), 2, "recomposition records its composition");
-        status.composition_applied(1);
-        assert_eq!(*watch.borrow(), 2, "never moves backwards");
+        status.applied(2, 1, 1);
+        assert_eq!(*watch.borrow(), 1, "initial bind records its config");
+        status.composition_applied(2, 3);
+        assert_eq!(*watch.borrow(), 3, "recomposition records its config");
+        status.composition_applied(3, 2);
+        assert_eq!(*watch.borrow(), 3, "never moves backwards");
         status.rejected(5);
         status.composition_rejected(9);
-        assert_eq!(*watch.borrow(), 2, "rejections never confirm");
+        assert_eq!(*watch.borrow(), 3, "rejections never confirm");
     }
 }

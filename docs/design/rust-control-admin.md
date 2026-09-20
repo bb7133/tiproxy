@@ -69,7 +69,7 @@ bodies (`namespace.go`, `config.go`) over the owner-fenced config module:
 | `GET /api/admin/namespace/{name}` | the namespace, or `500 "can not get namespace"` (Go reports not-found through the same 500). |
 | `PUT /api/admin/namespace/{name}`, `PUT /api/admin/namespace/` | body decoded with `json.Decoder` semantics against the Go `config.Namespace` field schema (one value, trailing bytes ignored, `null` = empty value, case-insensitive keys, unknown members ignored whatever their shape, `null` leaves a scalar or struct unchanged but clears a slice, duplicate struct members merge field by field, later scalars and arrays win, a known member of the wrong kind is `400 "bad namespace json"`); the path only pre-fills the name and the body's `namespace` wins and is the stored key, exactly as Go's `SetNamespace(nsc.Namespace)`; an empty name is `500 "can not update config"`; persisted below `/config/ns/<name>` through `ConfigModuleHandle::set_namespace`; `200 ""` or `500 "can not update config"`. |
 | `DELETE /api/admin/namespace/{name}` | `ConfigModuleHandle::delete_namespace`; deleting an absent name succeeds like Go's B-tree; `200 ""` / `500`. |
-| `POST /api/admin/namespace/commit?namespace=a&namespace=b` | query values decoded like `url.ParseQuery` (a pair with a malformed escape is dropped); every named namespace must exist (`500 "failed to get namespace"`); the call returns once the SQL serving side has applied the current CP-CFG generation, within 5 s (`500 "failed to reload namespaces"` otherwise). The barrier follows the config lineage that serving actually installed: every successful serving apply (initial bind, bridge apply, recomposition) publishes the composition generation it installed, and the composer maps that composition back to the CP-CFG generation it was composed from. The composer's own counter is never compared with a config generation (it also advances on topology wakes), and a composition composed before a later configuration never reports that configuration. Namespaces reach serving through the config watch, so the commit is a barrier, not a second write. |
+| `POST /api/admin/namespace/commit?namespace=a&namespace=b` | query values decoded like `url.ParseQuery` (a pair with a malformed escape is dropped); every named namespace must exist (`500 "failed to get namespace"`); the call returns once the SQL serving side has applied the current CP-CFG generation, within 5 s (`500 "failed to reload namespaces"` otherwise). The barrier follows the config lineage that serving actually installed: the composer stamps every composition with the CP-CFG generation it was composed from, that value travels inside the validated view, and every successful serving apply (initial bind, bridge apply, recomposition) publishes the value carried by the view it installed. Nothing else publishes it: composing, staging, a skipped recomposition, or a rejected apply cannot confirm a generation, and there is no composer-side history that a later compose at an unchanged composition counter could overwrite. The composer's own counter is never compared with a config generation (it also advances on topology wakes). Namespaces reach serving through the config watch, so the commit is a barrier, not a second write. |
 | `GET /api/admin/config/` | TOML (`application/toml; charset=utf-8`), or JSON with `?format=json` (case-insensitive, first value only like gin's `c.Query`) or an exact `Accept: application/json`. |
 | `PUT /api/admin/config/` | Go `SetTOMLConfig` through the config owner (`ConfigModuleHandle::apply_local_toml`): the partial document is merged onto this process's file base, validated as a whole, and published only when the encoded bytes change, so the health checksum moves exactly as Go's does. The mutation is instance-scoped like the Go API (labels and other per-instance fields stay per instance) and works without etcd; the persistent `/config` overlay still applies on top. |
 
@@ -94,25 +94,34 @@ label.
 
 Behind the seam the drain is issued **inside the dispatch owner**: a local
 issuer equivalent to Go's `DrainIssuer` lives next to the `CommandGate`. One
-boot nonce qualifies every wire id (`<label>@<incarnation>`), each operator
-label binds once to a wire id and to `gate watermark + 1`, so bridge and
-local drains share one monotonic sequence lineage; the same admission core
-(deadline validation, scope matching, single-flight, tombstone replay,
-obsolete → synthetic `DUPLICATE_REQUEST`) serves both paths, with the only
-difference that a local drain has no wire requester, so its terminal stays
-in the gate for the status query instead of being pushed to Go. A running
-bridge drain (or a previous incarnation's) is a foreign conflict for the
-local issuer; a running local drain is an in-progress conflict for another
-label; a completed label replays its terminal. Without an applied generation
-the drain is refused before any effect (Go `ErrSnapshotNotReady`); the gate's
-applied generation still comes from the Go snapshot notices in the
-two-process phase and moves to the Rust lineage at cutover (#153).
+boot nonce qualifies every wire id (`<label>@<incarnation>`); like Go's
+`NewDrainIssuer`, a failed entropy read refuses the issuer and the owner
+refuses to start rather than degrade to a guessable nonce that could alias
+two incarnations. Each operator label binds once to a wire id and to `gate
+watermark + 1`, so bridge and local drains share one monotonic sequence
+lineage; the same admission core (deadline validation, scope matching,
+single-flight, tombstone replay, obsolete → synthetic `DUPLICATE_REQUEST`)
+serves both paths, with the only difference that a local drain has no wire
+requester, so its terminal is not pushed to Go. The issuer's record keeps
+the latest answer and the terminal for the incarnation's lifetime (Go
+`operation.latest/completed`), observed from the admission answer and from
+the `session_closed` completion, so a status query never depends on the
+gate's bounded tombstone ring, and a repeated POST for a completed label
+answers its original binding without re-admitting (a terminal is absolute;
+an evicted tombstone's synthetic `DUPLICATE_REQUEST` can never relabel it).
+A running bridge drain (or a previous incarnation's) is a foreign conflict
+for the local issuer; a running local drain is an in-progress conflict for
+another label. Without an applied generation the drain is refused before any
+effect (Go `ErrSnapshotNotReady`); the gate's applied generation still comes
+from the Go snapshot notices in the two-process phase and moves to the Rust
+lineage at cutover (#153).
 
 Evidence: dispatcher tests cover the graceful → force lifecycle with status
 reporting, idempotent replay, local/bridge lineage sharing (a bridge command
 at a consumed sequence is obsolete; a running bridge drain is foreign), a
-restarted incarnation re-issuing the same label under a new wire id, and the
-notice plumbing; the differential compares the HTTP mapping against Go's
+restarted incarnation re-issuing the same label under a new wire id, the
+fail-closed issuer under an injected entropy failure, terminal retention
+across tombstone eviction on both completion paths, and the notice plumbing; the differential compares the HTTP mapping against Go's
 handler over scripted drainer outcomes. Still open in slice 3: the M9
 integration harness on the Rust admin port and the executable
 `CP-FAULT-ADMIN-DRAIN-REPLAY` runner (3a), then the retirement of

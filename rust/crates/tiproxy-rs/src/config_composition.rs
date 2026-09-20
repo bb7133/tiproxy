@@ -28,7 +28,7 @@ use control_plane::{
     ConfigSource, ControlConfig, ControlModule, ControlRuntime as InProcessControlRuntime,
     LifecyclePhase, LogLevel, MetricsPolicy, ModuleContext, ModuleError, ModuleFuture, TlsPolicy,
 };
-use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime};
+use control_proto::snapshot::{CompositionGenerations, SnapshotError, SnapshotStore, UnixTime};
 use control_proto::v1::{
     BackendSnapshot, ConfigSnapshot, KeepalivePolicy, Listener, NamespaceSnapshot,
     ProxyProtocolMode, StateSnapshot, TlsPolicy as WireTlsPolicy,
@@ -44,12 +44,6 @@ pub struct RustConfigComposer {
     topology: Option<TopologyModuleHandle>,
     generation: AtomicU64,
     drain_grace_override: Option<Duration>,
-    /// CP-CFG source generation each composition was composed from, keyed by
-    /// the composer's own counter. Serving reports the composition it
-    /// installed; CP-ADMIN maps that back to the config lineage for the
-    /// namespace-commit barrier. Bounded: entries below the last lookup are
-    /// pruned.
-    compositions: std::sync::Mutex<std::collections::BTreeMap<u64, u64>>,
 }
 
 impl RustConfigComposer {
@@ -60,44 +54,6 @@ impl RustConfigComposer {
             topology: None,
             generation: AtomicU64::new(1),
             drain_grace_override,
-            compositions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-        }
-    }
-
-    /// The CP-CFG generation the given (or the latest earlier) composition
-    /// was composed from; `0` before any composition.
-    pub fn config_generation_of(&self, composition_generation: u64) -> u64 {
-        let mut map = self
-            .compositions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let found = map
-            .range(..=composition_generation)
-            .next_back()
-            .map_or(0, |(_, config)| *config);
-        // Compositions below the one serving installed are never asked for
-        // again; keep the map bounded by the pending window.
-        let stale: Vec<u64> = map
-            .range(..composition_generation)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in stale {
-            map.remove(&key);
-        }
-        found
-    }
-
-    fn record_composition(&self, composition_generation: u64, config_generation: u64) {
-        let mut map = self
-            .compositions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(composition_generation, config_generation);
-        while map.len() > 1024 {
-            let Some(oldest) = map.keys().next().copied() else {
-                break;
-            };
-            map.remove(&oldest);
         }
     }
 
@@ -128,15 +84,16 @@ impl RustConfigComposer {
     ) -> Result<SnapshotComposition, SnapshotError> {
         let owned = self.source.current();
         let composition_generation = self.generation.load(Ordering::Acquire);
-        let composition = compose_snapshot(
+        // The CP-CFG generation travels inside the composition: the
+        // namespace-commit barrier only learns it from the serving apply
+        // that installed this exact view, never from the act of composing.
+        compose_snapshot(
             &owned,
             bridge,
             self.topology.as_ref(),
             composition_generation,
             self.drain_grace_override,
-        )?;
-        self.record_composition(composition_generation, owned.generation());
-        Ok(composition)
+        )
     }
 }
 
@@ -341,7 +298,15 @@ impl CandidateValidator for ServingCandidateValidator {
         };
         let now = unix_time_now();
         self.snapshots
-            .validate_composed(1, 1, candidate, unix_time_now())
+            .validate_composed(
+                1,
+                CompositionGenerations {
+                    composition: 1,
+                    config: 1,
+                },
+                candidate,
+                unix_time_now(),
+            )
             .map_err(|_| "serving_validation")?;
         let server_http_policy = wire_tls(&effective.server_http_tls().material_policy());
         let server_http_tls = self
@@ -458,6 +423,7 @@ fn compose_snapshot(
             namespaces: wire_namespaces(owned.namespaces()),
         },
         generation: composition_generation,
+        config_generation: owned.generation(),
     })
 }
 
@@ -680,14 +646,16 @@ mod tests {
         Ok(())
     }
 
-    /// The namespace-commit barrier maps serving's installed composition
-    /// back to the CP-CFG generation it was composed from: the initial bind
-    /// composition carries generation 1, a configuration accepted before the
-    /// next composition is carried by that composition, a topology-only wake
-    /// advances the composer but not the config lineage, and a composition
-    /// composed before a later configuration never reports it.
+    /// Every composition carries the CP-CFG generation it was composed from
+    /// as a value of its own: the initial bind composition carries
+    /// generation 1, a topology-only wake advances the composer counter but
+    /// keeps the config lineage, and a bridge re-compose at an unchanged
+    /// composition counter after a newer configuration carries that newer
+    /// generation without touching any earlier composition's value (there
+    /// is no composer-side history to overwrite; only the serving apply
+    /// that installs a view publishes its generation).
     #[test]
-    fn compositions_map_back_to_the_config_generation_they_used()
+    fn compositions_carry_the_config_generation_they_were_composed_from()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir();
         let owned =
@@ -701,12 +669,14 @@ mod tests {
             }),
             ..StateSnapshot::default()
         };
-        assert_eq!(composer.config_generation_of(1), 0, "nothing composed yet");
-        composer.compose_current(&bridge)?;
+        let initial = composer.compose_current(&bridge)?;
+        assert_eq!((initial.generation, initial.config_generation), (1, 1));
+        composer.advance_generation()?;
+        let topology_wake = composer.compose_current(&bridge)?;
         assert_eq!(
-            composer.config_generation_of(1),
-            1,
-            "initial bind composition"
+            (topology_wake.generation, topology_wake.config_generation),
+            (2, 1),
+            "topology-only wake keeps the config lineage"
         );
         owned.apply_toml(
             b"[proxy]\naddr = \"127.0.0.1:7001\"\nmax-connections = 5\n",
@@ -715,34 +685,25 @@ mod tests {
             &dir,
         )?;
         assert_eq!(owned.current().generation(), 2);
-        composer.advance_generation()?;
-        composer.compose_current(&bridge)?;
+        let bridge_recompose = composer.compose_current(&bridge)?;
         assert_eq!(
-            composer.config_generation_of(2),
-            2,
-            "update before the next composition"
+            (
+                bridge_recompose.generation,
+                bridge_recompose.config_generation
+            ),
+            (2, 2),
+            "a bridge re-compose before the adapter wake carries the new config"
+        );
+        assert_eq!(
+            topology_wake.config_generation, 1,
+            "the earlier composition still reports the generation it used"
         );
         composer.advance_generation()?;
-        composer.compose_current(&bridge)?;
+        let adapter_wake = composer.compose_current(&bridge)?;
         assert_eq!(
-            composer.config_generation_of(3),
-            2,
-            "topology-only wake keeps the lineage"
+            (adapter_wake.generation, adapter_wake.config_generation),
+            (3, 2)
         );
-        owned.apply_toml(
-            b"[proxy]\naddr = \"127.0.0.1:7001\"\nmax-connections = 6\n",
-            None,
-            3,
-            &dir,
-        )?;
-        assert_eq!(
-            composer.config_generation_of(3),
-            2,
-            "an installed composition never reports a generation it did not use"
-        );
-        composer.advance_generation()?;
-        composer.compose_current(&bridge)?;
-        assert_eq!(composer.config_generation_of(4), 3);
         Ok(())
     }
 

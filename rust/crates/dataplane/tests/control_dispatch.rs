@@ -4741,6 +4741,50 @@ async fn restarted_issuer_uses_a_new_wire_id_for_the_same_label() {
     assert!(a.starts_with("op-1@") && b.starts_with("op-1@"));
 }
 
+/// Go `NewDrainIssuer` refuses to start when the incarnation nonce cannot
+/// be read, because a weaker nonce could alias two incarnations' wire ids.
+/// The Rust issuer keeps that fail-closed: with a failing entropy source the
+/// readiness check reports the failure for the owner to refuse startup, and
+/// even a handler kept alive refuses every local drain without binding a
+/// label or touching the gate, while status queries see nothing.
+#[tokio::test(start_paused = true)]
+async fn review_local_drain_issuer_refuses_without_boot_entropy() {
+    let mut handler = ControlCommandHandler::new()
+        .with_local_drain_entropy(|_| Err(std::io::Error::other("entropy source unavailable")));
+    let Err(reason) = handler.local_drain_issuer_ready() else {
+        unreachable!("a failed entropy read must not produce an issuer")
+    };
+    assert_eq!(
+        reason,
+        "drain issuer incarnation nonce: entropy source unavailable"
+    );
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let (outcome, outbound) =
+        handler.start_local_drain(&local_request("op-1", &[], 0, 0), Instant::now(), 1_000_000);
+    assert_eq!(
+        outcome,
+        LocalDrainOutcome::Rejected {
+            code: ErrorCode::Internal,
+            detail: "local drain issuer unavailable: boot entropy failed",
+        }
+    );
+    assert!(outbound.is_empty());
+    assert!(session.control.try_recv().is_err());
+    assert!(handler.local_drain_status("op-1").is_none());
+
+    let healthy = ControlCommandHandler::new().with_local_drain_entropy(|nonce| {
+        nonce.fill(0xab);
+        Ok(())
+    });
+    assert_eq!(healthy.local_drain_issuer_ready(), Ok(()));
+    assert_eq!(
+        ControlCommandHandler::new().local_drain_issuer_ready(),
+        Ok(())
+    );
+}
+
 /// The dispatch task answers local drain notices in order with every
 /// other notice, so the HTTP layer sees a consistent view.
 #[tokio::test(start_paused = true)]
@@ -4794,4 +4838,139 @@ async fn dispatch_task_serves_local_drain_notices() {
         }
     }
     harness.task.abort();
+}
+
+/// Review reproduction: Go `DrainIssuer` keeps `operation.latest/completed`
+/// for the incarnation's lifetime and a terminal is never overwritten by a
+/// replay. The local issuer must not depend on the gate's bounded
+/// tombstone ring: after `MAX_COMPLETED_DRAINS` later drains complete, the
+/// first label's status still answers its original terminal, and a repeated
+/// POST returns the original binding without relabeling the terminal as a
+/// synthetic `DUPLICATE_REQUEST`. Immediate completion (empty drain) path.
+#[tokio::test(start_paused = true)]
+async fn review_local_terminal_survives_gate_tombstone_eviction() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7, None);
+    let now = Instant::now();
+    let (first, _) = handler.start_local_drain(&local_request("first", &[], 0, 0), now, 1_000_000);
+    let LocalDrainOutcome::Accepted {
+        wire_id,
+        command_sequence,
+    } = first
+    else {
+        unreachable!("first is accepted: {first:?}")
+    };
+    let original = handler
+        .local_drain_status("first")
+        .unwrap_or_else(|| unreachable!());
+    assert!(original.complete);
+    assert_eq!(original.result.code(), ErrorCode::Ok);
+    for n in 0..dataplane::control_commands::MAX_COMPLETED_DRAINS {
+        let (outcome, _) = handler.start_local_drain(
+            &local_request(&format!("next-{n}"), &[], 0, 0),
+            now,
+            1_000_000,
+        );
+        assert!(matches!(outcome, LocalDrainOutcome::Accepted { .. }));
+    }
+    let retained = handler
+        .local_drain_status("first")
+        .unwrap_or_else(|| unreachable!("gate eviction must not turn GET into 404"));
+    assert_eq!(retained, original);
+    let (replay, outbound) =
+        handler.start_local_drain(&local_request("first", &[], 0, 0), now, 1_000_000);
+    assert_eq!(
+        replay,
+        LocalDrainOutcome::Accepted {
+            wire_id,
+            command_sequence,
+        }
+    );
+    assert!(outbound.is_empty());
+    assert_eq!(
+        handler
+            .local_drain_status("first")
+            .unwrap_or_else(|| unreachable!()),
+        original,
+        "a replay never relabels the terminal"
+    );
+}
+
+/// Same retention through the `session_closed` completion path: the
+/// terminal produced when the last matched session closes is kept by the
+/// issuer, survives tombstone eviction, and is not overwritten by a replay.
+#[tokio::test(start_paused = true)]
+async fn review_local_terminal_from_session_close_survives_eviction() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut a = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+    let (first, _) = handler.start_local_drain(
+        &local_request("first", &["sql-a"], 10_000, 10_000),
+        now,
+        1_000_000,
+    );
+    let LocalDrainOutcome::Accepted {
+        wire_id,
+        command_sequence,
+    } = first
+    else {
+        unreachable!("first is accepted: {first:?}")
+    };
+    assert_eq!(
+        a.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
+    assert!(
+        !handler
+            .local_drain_status("first")
+            .unwrap_or_else(|| unreachable!())
+            .complete
+    );
+    let _ = handler.session_closed(
+        1,
+        false,
+        ErrorSource::ClientNetwork,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    let original = handler
+        .local_drain_status("first")
+        .unwrap_or_else(|| unreachable!());
+    assert!(original.complete);
+    assert_eq!(original.result.gracefully_closed, 1);
+    assert_eq!(original.result.active_connections, 1);
+    for n in 0..dataplane::control_commands::MAX_COMPLETED_DRAINS {
+        let (outcome, _) = handler.start_local_drain(
+            &local_request(&format!("next-{n}"), &[], 0, 0),
+            now,
+            1_000_001,
+        );
+        assert!(matches!(outcome, LocalDrainOutcome::Accepted { .. }));
+    }
+    assert_eq!(
+        handler
+            .local_drain_status("first")
+            .unwrap_or_else(|| unreachable!("gate eviction must not turn GET into 404")),
+        original
+    );
+    let (replay, _) = handler.start_local_drain(
+        &local_request("first", &["sql-a"], 10_000, 10_000),
+        now,
+        1_000_002,
+    );
+    assert_eq!(
+        replay,
+        LocalDrainOutcome::Accepted {
+            wire_id,
+            command_sequence,
+        }
+    );
+    assert_eq!(
+        handler
+            .local_drain_status("first")
+            .unwrap_or_else(|| unreachable!()),
+        original,
+        "a replay never relabels the terminal"
+    );
 }

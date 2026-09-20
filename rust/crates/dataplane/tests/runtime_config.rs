@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use control_proto::control_transport::{ClientConfig, ControlClient};
 use control_proto::snapshot::{
-    SnapshotErrorKind, SnapshotLineage, SnapshotStore, UnixTime, ValidatedSnapshot,
+    CompositionGenerations, SnapshotErrorKind, SnapshotLineage, SnapshotStore, UnixTime,
+    ValidatedSnapshot,
 };
 use control_proto::v1::{
     ConfigSnapshot, Hello, KeepalivePolicy, Listener, ProxyProtocolMode, Role, StateSnapshot,
@@ -117,16 +118,45 @@ fn raw_snapshot(port: u16) -> StateSnapshot {
 
 #[derive(Clone)]
 struct MutableComposer {
-    state: Arc<Mutex<(u64, u64, Option<u16>)>>,
+    state: Arc<Mutex<ComposerState>>,
+}
+
+#[derive(Clone, Copy)]
+struct ComposerState {
+    generation: u64,
+    config_generation: u64,
+    max_connections: u64,
+    listener_port: Option<u16>,
 }
 
 impl MutableComposer {
-    fn set(&self, generation: u64, max_connections: u64, listener_port: Option<u16>) {
+    fn with(generation: u64, config_generation: u64, max_connections: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ComposerState {
+                generation,
+                config_generation,
+                max_connections,
+                listener_port: None,
+            })),
+        }
+    }
+
+    fn set(
+        &self,
+        generation: u64,
+        config_generation: u64,
+        max_connections: u64,
+        listener_port: Option<u16>,
+    ) {
         *self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            (generation, max_connections, listener_port);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ComposerState {
+            generation,
+            config_generation,
+            max_connections,
+            listener_port,
+        };
     }
 }
 
@@ -135,7 +165,12 @@ impl ServingSnapshotComposer for MutableComposer {
         &self,
         source: &StateSnapshot,
     ) -> Result<SnapshotComposition, control_proto::snapshot::SnapshotError> {
-        let (generation, max_connections, listener_port) = *self
+        let ComposerState {
+            generation,
+            config_generation,
+            max_connections,
+            listener_port,
+        } = *self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -151,6 +186,7 @@ impl ServingSnapshotComposer for MutableComposer {
         Ok(SnapshotComposition {
             snapshot,
             generation,
+            config_generation,
         })
     }
 }
@@ -216,9 +252,7 @@ async fn local_composition_advances_independently_and_rejects_atomically()
 -> Result<(), Box<dyn Error>> {
     let port = free_port()?;
     let other_port = free_port()?;
-    let composer = MutableComposer {
-        state: Arc::new(Mutex::new((1, 11, None))),
-    };
+    let composer = MutableComposer::with(1, 1, 11);
     let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
     let handler: Arc<dyn ConnectionHandler> = Arc::new(move |connection: AcceptedConnection| {
         let seen_tx = seen_tx.clone();
@@ -245,7 +279,10 @@ async fn local_composition_advances_independently_and_rejects_atomically()
         7,
         source,
         composition.snapshot,
-        composition.generation,
+        CompositionGenerations {
+            composition: composition.generation,
+            config: composition.config_generation,
+        },
         UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
         SnapshotLineage::for_tests("go-fixture"),
     )?;
@@ -258,7 +295,7 @@ async fn local_composition_advances_independently_and_rejects_atomically()
         Some((7, 1, 11))
     );
 
-    composer.set(2, 22, None);
+    composer.set(2, 2, 22, None);
     assert!(
         serving
             .reload_composed(
@@ -278,7 +315,7 @@ async fn local_composition_advances_independently_and_rejects_atomically()
     assert_eq!(status.composition_generation, 2);
     assert_eq!(status.composition_applied_total, 1);
 
-    composer.set(3, 33, Some(other_port));
+    composer.set(3, 3, 33, Some(other_port));
     let Err(error) = serving
         .reload_composed(
             &store,
@@ -302,6 +339,118 @@ async fn local_composition_advances_independently_and_rejects_atomically()
     assert_eq!(status.composition_rejected_total, 1);
 
     drop((first, second, third));
+    serving.shutdown().await?;
+    Ok(())
+}
+
+/// Review reproduction (CP-ADMIN namespace-commit barrier): a config
+/// generation published before the adapter advanced the composition counter
+/// is carried by the next bridge re-compose at the unchanged counter. If that
+/// apply is rejected, or the equivalent recomposition is skipped as
+/// same-counter, the barrier watch must keep the last installed generation;
+/// only the apply that actually installs the new view confirms it.
+#[tokio::test]
+async fn config_generation_is_confirmed_only_by_the_apply_that_installs_it()
+-> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let other_port = free_port()?;
+    let composer = MutableComposer::with(1, 1, 11);
+    let handler: Arc<dyn ConnectionHandler> = Arc::new(|_connection: AcceptedConnection| async {
+        std::future::pending::<()>().await;
+    });
+    let (mut consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
+        Arc::new(FixedMemory),
+        handler,
+        Arc::new(composer.clone()),
+    );
+    let applied = serving.applied_config_generation();
+    let store = SnapshotStore::new([])?;
+    let source = raw_snapshot(port);
+    let composition = consumer.compose(&source)?;
+    let staged = store.stage_composed(
+        7,
+        source.clone(),
+        composition.snapshot,
+        CompositionGenerations {
+            composition: composition.generation,
+            config: composition.config_generation,
+        },
+        UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+        SnapshotLineage::for_tests("go-fixture"),
+    )?;
+    consumer.apply(staged.snapshot(), &|| true).await?;
+    store.commit(staged)?;
+    assert_eq!(*applied.borrow(), 1, "initial bind installs config 1");
+
+    // Config generation 2 is published; the adapter has not advanced the
+    // composition counter. A bridge re-compose at counter 1 carries config 2
+    // but is rejected (listener mutation): nothing may confirm generation 2.
+    composer.set(1, 2, 22, Some(other_port));
+    let composition = consumer.compose(&source)?;
+    assert_eq!(
+        (composition.generation, composition.config_generation),
+        (1, 2)
+    );
+    let staged = store.stage_composed(
+        8,
+        source.clone(),
+        composition.snapshot,
+        CompositionGenerations {
+            composition: composition.generation,
+            config: composition.config_generation,
+        },
+        UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_001)),
+        SnapshotLineage::for_tests("go-fixture"),
+    )?;
+    let Err(error) = consumer.apply(staged.snapshot(), &|| true).await else {
+        return Err("listener mutation was not rejected".into());
+    };
+    assert_eq!(error.kind(), SnapshotErrorKind::Unsupported);
+    drop(staged);
+    assert_eq!(
+        *applied.borrow(),
+        1,
+        "a rejected bridge apply carrying config 2 must not confirm it"
+    );
+
+    // The same composition counter with a valid config 2 is skipped by the
+    // recomposition path (same counter as the installed view) and still
+    // confirms nothing.
+    composer.set(1, 2, 22, None);
+    assert!(
+        !serving
+            .reload_composed(
+                &store,
+                UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_002)),
+            )
+            .await?
+    );
+    assert_eq!(
+        *applied.borrow(),
+        1,
+        "a skipped recomposition confirms nothing"
+    );
+
+    // Only the adapter wake that installs config 2 confirms it.
+    composer.set(2, 2, 22, None);
+    assert!(
+        serving
+            .reload_composed(
+                &store,
+                UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_003)),
+            )
+            .await?
+    );
+    assert_eq!(
+        *applied.borrow(),
+        2,
+        "the installing apply confirms config 2"
+    );
+    let status = serving.status();
+    assert_eq!(status.applied_generation, 7);
+    assert_eq!(status.rejected_generation, 8);
+    assert_eq!(status.composition_generation, 2);
+
     serving.shutdown().await?;
     Ok(())
 }
