@@ -100,11 +100,37 @@ JSON decoding and two-retrieval cache behavior. Empty Go request methods are
 normalized to the HTTP default GET. A native regression checks token rotation,
 refresh while the original token still has 60 seconds remaining, and no env
 fallback after the selected file disappears. The probe disables retries to
-isolate selection/cache behavior; HTTP retry policy remains separate work.
+isolate selection/cache behavior. Container retries are covered separately below.
 Regenerate with:
 
 ```sh
 go run rust/crates/control-meter/testdata/aws-container-go.go
+```
+
+Container HTTP operations now use three attempts with the pinned endpointcreds
+retry rules: 429/500/502/503/504, Go retryable/throttling error codes, and transport
+failures. Exact `application/json` error decoding happens before retry selection;
+a malformed error body is terminal even for 503. The authorization file is read
+once for the entire retrieval, so retries preserve the same request identity.
+The provider-local 500-token quota survives refreshes, with Go failure costs and
+success refunds. `AWS_NEW_RETRIES_2026=true` selects the pinned core's 50ms versus
+throttling 1s base delay and revised quota costs; the legacy policy uses a 1s
+base. Both use cryptographic jitter, exponential backoff and a 20s cap. Cancellation
+drops the pending delay/operation. The retry flag is captured at construction;
+changing environment variables in a running process is unsupported.
+
+`aws-container-retry-go.go/json` contains 54 real Go request cases plus two
+67-operation quota traces. Rust compares 52 request cases and both full quota
+traces under a paused clock; two Go NXDOMAIN cases document a transport
+limitation: reqwest does not expose a portable typed NXDOMAIN distinction, so
+Rust may make three attempts where Go makes one. HTTP send errors carry only a
+sanitized timeout/connection classification, never a request URL or raw error.
+A loopback connection-refusal test verifies the real adapter and redaction.
+No AWS service is contacted by these probes. The Go quota probe substitutes only
+zero backoff; request cases retain the real default retryer. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-container-retry-go.go
 ```
 
 EC2 IMDS now uses a native adapter with the pinned Go client defaults: IPv4/IPv6

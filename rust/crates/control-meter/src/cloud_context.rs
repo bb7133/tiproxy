@@ -41,6 +41,45 @@ fn failed() -> reqsign_core::Error {
     reqsign_core::Error::unexpected("cloud credential I/O failed")
 }
 
+// Retain only a sanitized classification; never attach a URL-bearing HTTP
+// error to a credential error that could later be logged.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HttpFailure {
+    #[error("cloud HTTP timeout")]
+    Timeout,
+    #[error("cloud HTTP connection failure")]
+    Connection,
+}
+fn http_failed(error: &reqwest::Error, sending: bool) -> reqsign_core::Error {
+    use std::error::Error as _;
+    if error.is_timeout() {
+        return failed().with_source(HttpFailure::Timeout);
+    }
+    // Smithy wraps send errors as ConnectionError, except a typed DNS
+    // NXDOMAIN override. reqwest does not expose a portable NXDOMAIN type;
+    // that case may incur the same bounded retries as other send failures.
+    if sending && !error.is_builder() {
+        return failed().with_source(HttpFailure::Connection);
+    }
+    let mut source = error.source();
+    while let Some(value) = source {
+        if let Some(io) = value.downcast_ref::<io::Error>()
+            && matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            )
+        {
+            return failed().with_source(HttpFailure::Connection);
+        }
+        source = value.source();
+    }
+    failed()
+}
+
 async fn read_bounded(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>, io::Error> {
     let mut bytes = Vec::new();
     reader
@@ -108,13 +147,17 @@ impl HttpSend for CloudIo {
             .body(body)
             .send()
             .await
-            .map_err(|_| failed())?;
+            .map_err(|error| http_failed(&error, true))?;
         let mut result = http::Response::builder().status(response.status());
         if let Some(headers) = result.headers_mut() {
             *headers = response.headers().clone();
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| failed())? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| http_failed(&error, false))?
+        {
             if body.len().saturating_add(chunk.len()) as u64 > MAX_CREDENTIAL_BYTES {
                 return Err(failed());
             }
@@ -130,4 +173,36 @@ pub(crate) fn not_found(error: &reqsign_core::Error) -> bool {
         .source()
         .and_then(|source| source.downcast_ref::<io::Error>())
         .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn refused_connection_is_retryable_without_retaining_the_request_url() {
+        use std::error::Error as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        drop(listener);
+        let request = http::Request::get(format!("http://{addr}/private-credential-path"))
+            .body(Bytes::new())
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        let result = CloudIo(client).http_send(request).await;
+        let error = result
+            .err()
+            .unwrap_or_else(|| unreachable!("closed port succeeded"));
+        assert!(matches!(
+            error.source().and_then(|v| v.downcast_ref::<HttpFailure>()),
+            Some(HttpFailure::Connection)
+        ));
+        assert!(!format!("{error:?}").contains("private-credential-path"));
+    }
 }

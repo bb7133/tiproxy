@@ -14,6 +14,7 @@
 
 //! Go container credential selection, authorization and five-minute cache window.
 
+use super::cloud_aws_retry::{Failure, Retry};
 use bytes::Bytes;
 use http::Request;
 use reqsign_aws_v4::Credential;
@@ -29,6 +30,7 @@ pub(crate) struct Container {
     endpoint: String,
     token: String,
     token_file: Option<String>,
+    retry: Retry,
 }
 impl Container {
     pub(crate) async fn new(ctx: &Context) -> reqsign_core::Result<Self> {
@@ -67,6 +69,7 @@ impl Container {
         };
         Ok(Self {
             endpoint,
+            retry: Retry::new(ctx),
             token: env("AWS_CONTAINER_AUTHORIZATION_TOKEN").unwrap_or_default(),
             token_file: env("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"),
         })
@@ -91,21 +94,76 @@ impl Container {
             request = request.header("authorization", token);
         }
         let request = request.body(Bytes::new()).map_err(|_| failed())?;
-        let response = ctx.http_send(request).await.map_err(|_| failed())?;
-        if !response.status().is_success() {
-            return Err(failed());
+        self.retry
+            .run(|| async {
+                let response = ctx
+                    .http_send(request.clone())
+                    .await
+                    .map_err(Failure::transport)?;
+                if !response.status().is_success() {
+                    // Go only exposes the status to its retryer after successful
+                    // error decoding. Malformed application/json is terminal even
+                    // for a normally retryable status. Content-Type is exact.
+                    let code = if response
+                        .headers()
+                        .get("content-type")
+                        .is_some_and(|v| v == "application/json")
+                    {
+                        ErrorBody::deserialize(&mut serde_json::Deserializer::from_slice(
+                            response.body(),
+                        ))
+                        .map_err(|_| Failure::terminal(failed()))?
+                        .0
+                    } else {
+                        String::new()
+                    };
+                    return Err(Failure::container(response.status().as_u16(), &code));
+                }
+                decode(response.body()).map_err(Failure::terminal)
+            })
+            .await
+    }
+}
+fn decode(body: &[u8]) -> reqsign_core::Result<Credential> {
+    // endpointcreds uses Decoder.Decode, accepting the first JSON value;
+    // processcreds instead uses Unmarshal and rejects a trailing value.
+    let mut decoder = serde_json::Deserializer::from_slice(body);
+    let value = Output::deserialize(&mut decoder).map_err(|_| failed())?;
+    let expires_in = value.expiration.map(|time| time - Duration::from_secs(300));
+    Ok(Credential {
+        access_key_id: value.key,
+        secret_access_key: value.secret,
+        session_token: (!value.token.is_empty()).then_some(value.token),
+        expires_in,
+    })
+}
+
+struct ErrorBody(String);
+impl<'de> Deserialize<'de> for ErrorBody {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> Visitor<'de> for Fields {
+            type Value = ErrorBody;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("endpoint error object")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut code = String::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key.eq_ignore_ascii_case("code") || key.eq_ignore_ascii_case("message") {
+                        if let Some(text) = map.next_value::<Option<String>>()?
+                            && key.eq_ignore_ascii_case("code")
+                        {
+                            code = text;
+                        }
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(ErrorBody(code))
+            }
         }
-        // endpointcreds uses Decoder.Decode, accepting the first JSON value;
-        // processcreds instead uses Unmarshal and rejects a trailing value.
-        let mut decoder = serde_json::Deserializer::from_slice(response.body());
-        let value = Output::deserialize(&mut decoder).map_err(|_| failed())?;
-        let expires_in = value.expiration.map(|time| time - Duration::from_secs(300));
-        Ok(Credential {
-            access_key_id: value.key,
-            secret_access_key: value.secret,
-            session_token: (!value.token.is_empty()).then_some(value.token),
-            expires_in,
-        })
+        deserializer.deserialize_map(Fields)
     }
 }
 fn allowed(ip: IpAddr) -> bool {
@@ -386,5 +444,175 @@ mod tests {
                 .iter()
                 .all(|v| v.url == "http://169.254.170.2/original")
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::cloud_context::HttpFailure;
+    use serde::Deserialize as DeriveDeserialize;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    #[derive(Clone, Debug, DeriveDeserialize)]
+    struct Row {
+        name: String,
+        new: bool,
+        status: u16,
+        body: String,
+        content_type: String,
+        transport: String,
+        recover: bool,
+        attempts: usize,
+        error: bool,
+    }
+    #[derive(Clone, Debug)]
+    struct Io {
+        row: Row,
+        count: Arc<AtomicUsize>,
+        success: Arc<AtomicBool>,
+    }
+    impl reqsign_core::HttpSend for Io {
+        async fn http_send(
+            &self,
+            request: Request<Bytes>,
+        ) -> reqsign_core::Result<http::Response<Bytes>> {
+            assert_eq!(request.method(), "GET");
+            assert_eq!(request.headers()["accept"], "application/json");
+            let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.success.load(Ordering::Relaxed) || (self.row.recover && count > 1) {
+                return Ok(http::Response::new(Bytes::from_static(
+                    br#"{"AccessKeyId":"key","SecretAccessKey":"secret"}"#,
+                )));
+            }
+            match self.row.transport.as_str() {
+                "timeout" => return Err(failed().with_source(HttpFailure::Timeout)),
+                "connection-reset" | "plain" => {
+                    return Err(failed().with_source(HttpFailure::Connection));
+                }
+                _ => {}
+            }
+            http::Response::builder()
+                .status(self.row.status)
+                .header("content-type", &self.row.content_type)
+                .body(Bytes::copy_from_slice(self.row.body.as_bytes()))
+                .map_err(|_| failed())
+        }
+    }
+    fn setup(row: Row) -> (Context, Io) {
+        let envs = std::collections::HashMap::from([
+            (
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI".into(),
+                "/credentials".into(),
+            ),
+            ("AWS_NEW_RETRIES_2026".into(), row.new.to_string()),
+        ]);
+        let io = Io {
+            row,
+            count: Arc::default(),
+            success: Arc::default(),
+        };
+        (
+            Context::new()
+                .with_env(reqsign_core::StaticEnv {
+                    home_dir: None,
+                    envs,
+                })
+                .with_http_send(io.clone()),
+            io,
+        )
+    }
+    #[derive(DeriveDeserialize)]
+    struct Quota {
+        new: bool,
+        attempts: Vec<usize>,
+    }
+    #[derive(DeriveDeserialize)]
+    struct Fixture {
+        rows: Vec<Row>,
+        quotas: Vec<Quota>,
+    }
+    #[tokio::test(start_paused = true)]
+    async fn container_retries_and_persistent_quota_match_actual_go() {
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../testdata/aws-container-retry-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(fixture.rows.len(), 54);
+        for row in fixture.rows {
+            // Go's typed DNS NXDOMAIN is not portable through reqwest's
+            // resolver errors. This transport difference is documented.
+            if row.transport == "nxdomain" {
+                assert_eq!(row.attempts, 1);
+                continue;
+            }
+            let (ctx, io) = setup(row.clone());
+            let provider = Container::new(&ctx)
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let result = provider.retrieve(&ctx).await;
+            assert_eq!(result.is_err(), row.error, "{} new={}", row.name, row.new);
+            assert_eq!(
+                io.count.load(Ordering::Relaxed),
+                row.attempts,
+                "{} new={}",
+                row.name,
+                row.new
+            );
+        }
+        for quota in fixture.quotas {
+            let row = Row {
+                name: "quota".into(),
+                new: quota.new,
+                status: 503,
+                body: "busy".into(),
+                content_type: "text/plain".into(),
+                transport: String::new(),
+                recover: false,
+                attempts: 0,
+                error: true,
+            };
+            let (ctx, io) = setup(row);
+            let provider = Container::new(&ctx)
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            for (i, expected) in quota.attempts.into_iter().enumerate() {
+                io.success.store((52..66).contains(&i), Ordering::Relaxed);
+                let before = io.count.load(Ordering::Relaxed);
+                let _ = provider.retrieve(&ctx).await;
+                assert_eq!(
+                    io.count.load(Ordering::Relaxed) - before,
+                    expected,
+                    "quota operation {i} new={}",
+                    quota.new
+                );
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn canceled_backoff_does_not_send_another_attempt() {
+        let row = Row {
+            name: "cancel".into(),
+            new: false,
+            status: 503,
+            body: "busy".into(),
+            content_type: "text/plain".into(),
+            transport: String::new(),
+            recover: false,
+            attempts: 0,
+            error: true,
+        };
+        let (ctx, io) = setup(row);
+        let provider = Container::new(&ctx)
+            .await
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        let task = tokio::spawn(async move { provider.retrieve(&ctx).await });
+        tokio::task::yield_now().await;
+        assert_eq!(io.count.load(Ordering::Relaxed), 1);
+        task.abort();
+        assert!(task.await.is_err());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(io.count.load(Ordering::Relaxed), 1);
     }
 }
