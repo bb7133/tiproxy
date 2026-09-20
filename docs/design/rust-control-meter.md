@@ -67,6 +67,22 @@ changes and token rotation. Regenerate with:
 go run rust/crates/control-meter/testdata/aws-default-go.go
 ```
 
+STS AssumeRole (explicit and profile role chains) and WebIdentity now retain
+client-local retry quotas across retrievals. HTTP 500/502/503/504 remain
+retryable even if XML error decoding fails; status 429 alone does not retry.
+Wrapped XML error codes select standard retries; only WebIdentity adds the
+modeled InvalidIdentityToken retry. Each signed AssumeRole attempt is signed
+again; session names, request bodies and the once-read web token stay fixed
+within one retrieval. The existing success validation is retained. Fifty-six
+actual Go credential-provider observations cover both operations and retry
+modes, terminal errors, throttle/timeout codes, malformed/empty bodies,
+exhaustion and 2026 retry-after. Native default WebIdentity and AssumeRole tests
+compare those attempts/outcomes. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-sts-retry-go.go
+```
+
 AWS SSO uses a native adapter for both legacy cached-token profiles and modern
 `sso-session` profiles. It validates the same required fields and session/profile
 consistency at construction, hashes the start URL or session name for the cache
@@ -330,8 +346,9 @@ go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 
 Full default-credential/endpoint edge parity and binary ownership handoff remain
 in progress. Provider retry-policy and default-chain edge comparisons remain
-open; the AWS STS adapter currently makes one bounded attempt and export failure
-retains the pending window for the next metering attempt.
+open, including nondefault AWS retry configuration and STS clock-skew
+correction. Export failure retains the pending window for the next metering
+attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would

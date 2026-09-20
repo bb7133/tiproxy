@@ -92,6 +92,30 @@ impl Failure {
         failure.retry_after = retry_after(response);
         failure
     }
+    pub(crate) fn sts(response: &http::Response<bytes::Bytes>, web: bool) -> Self {
+        #[derive(Default, Deserialize)]
+        struct Envelope {
+            #[serde(rename = "Error", default)]
+            error: ErrorCode,
+        }
+        #[derive(Default, Deserialize)]
+        struct ErrorCode {
+            #[serde(rename = "Code", default)]
+            code: String,
+        }
+        let code = std::str::from_utf8(response.body())
+            .ok()
+            .and_then(|body| quick_xml::de::from_str::<Envelope>(body).ok())
+            .map(|v| v.error.code)
+            .unwrap_or_default();
+        let mut failure = Self::container(0, &code);
+        failure.error = reqsign_core::Error::credential_invalid("AWS STS request failed");
+        failure.status = Some(response.status().as_u16());
+        failure.retryable |= matches!(response.status().as_u16(), 500 | 502 | 503 | 504)
+            || (web && code.eq_ignore_ascii_case("InvalidIdentityToken"));
+        failure.retry_after = retry_after(response);
+        failure
+    }
     pub(crate) fn status(&self) -> Option<u16> {
         self.status
     }

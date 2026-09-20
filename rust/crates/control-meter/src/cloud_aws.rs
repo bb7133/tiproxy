@@ -16,6 +16,7 @@
 
 use std::fmt;
 
+use crate::cloud_aws_retry::{Failure, Retry};
 use bytes::Bytes;
 use control_config::AwsMeteringConfig;
 use http::{Request, request::Parts};
@@ -36,6 +37,7 @@ pub(crate) struct AwsSigner {
     role: String,
     endpoint: Option<Url>,
     state: Mutex<State>,
+    retry: Retry,
 }
 
 #[derive(Default)]
@@ -72,6 +74,7 @@ impl AwsSigner {
             ProvideCredentialChain::new().push(provider)
         };
         Ok(Self {
+            retry: Retry::new(&context),
             context,
             base,
             region,
@@ -138,6 +141,7 @@ impl AwsSigner {
             self.endpoint.as_ref(),
             &role,
             base,
+            &self.retry,
         )
         .await?;
         state.role = Some(credential.clone());
@@ -158,6 +162,7 @@ pub(crate) async fn assume_role(
     endpoint: Option<&Url>,
     role: &RoleOptions<'_>,
     mut source: Credential,
+    retry: &Retry,
 ) -> reqsign_core::Result<Credential> {
     let mut grant = AssumeRoleGrant::new(role.arn, role.session);
     if let Some(external_id) = role.external_id {
@@ -168,16 +173,73 @@ pub(crate) async fn assume_role(
         Some(endpoint) => endpoint.clone(),
         None => Url::parse(&format!("https://{authority}/")).map_err(|_| failed())?,
     };
-    let operation = AssumeRoleOperation::new(authority, &grant, Some(role.duration))?;
+    let _operation = AssumeRoleOperation::new(authority, &grant, Some(role.duration))?;
     source.expires_in = None;
-    let request = role_request(&endpoint, role)?;
-    let (mut parts, body) = request.into_parts();
-    RequestSigner::new("sts", region)
-        .sign_request(context, &mut parts, Some(&source), None)
-        .await?;
-    operation
-        .send(context, Request::from_parts(parts, body))
+    retry
+        .run(|| async {
+            // Sign each attempt anew, keeping the session/body fixed per Retrieve.
+            let request = role_request(&endpoint, role).map_err(Failure::terminal)?;
+            let (mut parts, body) = request.into_parts();
+            RequestSigner::new("sts", region)
+                .sign_request(context, &mut parts, Some(&source), None)
+                .await
+                .map_err(Failure::terminal)?;
+            let response = context
+                .http_send(Request::from_parts(parts, body))
+                .await
+                .map_err(Failure::transport)?;
+            if response.status() != http::StatusCode::OK {
+                return Err(Failure::sts(&response, false));
+            }
+            decode_role(response.body()).map_err(Failure::terminal)
+        })
         .await
+}
+
+fn decode_role(body: &[u8]) -> reqsign_core::Result<Credential> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        #[serde(rename = "AssumeRoleResult")]
+        result: ResultBody,
+    }
+    #[derive(serde::Deserialize)]
+    struct ResultBody {
+        #[serde(rename = "Credentials")]
+        credentials: RoleCredential,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct RoleCredential {
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: String,
+        expiration: String,
+    }
+    let body = std::str::from_utf8(body).map_err(|_| failed())?;
+    let response: Envelope = quick_xml::de::from_str(body).map_err(|_| failed())?;
+    let value = response.result.credentials;
+    // Retain the existing reqsign adapter's success validation.
+    if !(16..=128).contains(&value.access_key_id.chars().count())
+        || !value
+            .access_key_id
+            .bytes()
+            .all(|v| v.is_ascii_alphanumeric() || v == b'_')
+        || value.secret_access_key.is_empty()
+        || value.session_token.trim().is_empty()
+        || http::HeaderValue::try_from(value.session_token.as_str()).is_err()
+    {
+        return Err(failed());
+    }
+    let credential = Credential {
+        access_key_id: value.access_key_id,
+        secret_access_key: value.secret_access_key,
+        session_token: Some(value.session_token),
+        expires_in: Some(value.expiration.parse().map_err(|_| failed())?),
+    };
+    if !credential.is_valid_at(Timestamp::now()) {
+        return Err(failed());
+    }
+    Ok(credential)
 }
 
 fn role_request(endpoint: &Url, role: &RoleOptions<'_>) -> reqsign_core::Result<Request<Bytes>> {
@@ -387,5 +449,163 @@ mod tests {
             requests[2].body(),
             "the generated session name survives refresh"
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(Clone, Debug, Deserialize)]
+    #[allow(clippy::struct_excessive_bools)] // Actual Go observation schema.
+    struct Row {
+        name: String,
+        web: bool,
+        new: bool,
+        status: u16,
+        body: String,
+        after: String,
+        exhaust: bool,
+        calls: usize,
+        error: bool,
+    }
+    #[derive(Clone, Debug)]
+    struct Io {
+        row: Row,
+        calls: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+    }
+    impl reqsign_core::FileRead for Io {
+        async fn file_read(&self, path: &str) -> reqsign_core::Result<Vec<u8>> {
+            if path != "/web-token" {
+                return Err(failed());
+            }
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(b"web-token\n".to_vec())
+        }
+    }
+    impl reqsign_core::HttpSend for Io {
+        async fn http_send(
+            &self,
+            request: Request<Bytes>,
+        ) -> reqsign_core::Result<http::Response<Bytes>> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            assert_eq!(request.method(), "POST");
+            let body = std::str::from_utf8(request.body()).unwrap_or_else(|e| unreachable!("{e}"));
+            assert!(body.contains("RoleSessionName=session"));
+            if self.row.web {
+                assert!(body.contains("Action=AssumeRoleWithWebIdentity"));
+                assert!(body.contains("WebIdentityToken=web-token%0A"));
+            } else {
+                assert!(body.contains("Action=AssumeRole&"));
+                assert!(request.headers().contains_key("authorization"));
+            }
+            let (status, body) = if call > 1 && !self.row.exhaust {
+                let operation = if self.row.web {
+                    "AssumeRoleWithWebIdentity"
+                } else {
+                    "AssumeRole"
+                };
+                (
+                    200,
+                    format!(
+                        "<{operation}Response><{operation}Result><Credentials><AccessKeyId>ASIA1234567890123456</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></{operation}Result></{operation}Response>"
+                    ),
+                )
+            } else {
+                (self.row.status, self.row.body.clone())
+            };
+            http::Response::builder()
+                .status(status)
+                .header("x-amz-retry-after", &self.row.after)
+                .body(Bytes::from(body))
+                .map_err(|_| failed())
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn assume_role_and_web_identity_retries_match_actual_go() {
+        let rows: Vec<Row> =
+            serde_json::from_str(include_str!("../testdata/aws-sts-retry-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(rows.len(), 56);
+        for row in rows {
+            let io = Io {
+                row: row.clone(),
+                calls: Arc::default(),
+                reads: Arc::default(),
+            };
+            let mut envs = std::collections::HashMap::from([
+                ("AWS_NEW_RETRIES_2026".into(), row.new.to_string()),
+                ("AWS_ROLE_SESSION_NAME".into(), "session".into()),
+            ]);
+            if row.web {
+                envs.extend([
+                    (
+                        "AWS_ROLE_ARN".into(),
+                        "arn:aws:iam::123456789012:role/test".into(),
+                    ),
+                    ("AWS_WEB_IDENTITY_TOKEN_FILE".into(), "/web-token".into()),
+                ]);
+            }
+            let ctx = Context::new()
+                .with_env(reqsign_core::StaticEnv {
+                    home_dir: None,
+                    envs,
+                })
+                .with_http_send(io.clone())
+                .with_file_read(io.clone());
+            let start = tokio::time::Instant::now();
+            let error = if row.web {
+                crate::cloud_aws_identity::GoDefaultProvider::new("us-east-1")
+                    .provide_credential(&ctx)
+                    .await
+                    .is_err()
+            } else {
+                let retry = Retry::new(&ctx);
+                assume_role(
+                    &ctx,
+                    "us-east-1",
+                    None,
+                    &RoleOptions {
+                        arn: "arn:aws:iam::123456789012:role/test",
+                        session: "session",
+                        duration: 900,
+                        external_id: None,
+                    },
+                    Credential {
+                        access_key_id: "key".into(),
+                        secret_access_key: "secret".into(),
+                        session_token: None,
+                        expires_in: None,
+                    },
+                    &retry,
+                )
+                .await
+                .is_err()
+            };
+            assert_eq!(
+                error, row.error,
+                "{} web={} new={}",
+                row.name, row.web, row.new
+            );
+            assert_eq!(
+                io.calls.load(Ordering::Relaxed),
+                row.calls,
+                "{} web={} new={}",
+                row.name,
+                row.web,
+                row.new
+            );
+            if row.web {
+                assert_eq!(io.reads.load(Ordering::Relaxed), 1);
+            }
+            if row.new && row.after == "2000" && row.calls == 2 {
+                assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+            }
+        }
     }
 }

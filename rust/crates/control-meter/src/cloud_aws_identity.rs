@@ -73,6 +73,7 @@ impl GoDefaultProvider {
         if let Some(file) = env(ctx, "AWS_WEB_IDENTITY_TOKEN_FILE") {
             let arn = env(ctx, "AWS_ROLE_ARN").ok_or_else(failed)?;
             return Ok(web_identity(
+                ctx,
                 &self.region,
                 &arn,
                 &file,
@@ -116,6 +117,7 @@ impl GoDefaultProvider {
             }
         } else if let Some(file) = get("web_identity_token_file") {
             return Ok(web_identity(
+                ctx,
                 &self.region,
                 arn.ok_or_else(failed)?,
                 file,
@@ -170,6 +172,7 @@ impl GoDefaultProvider {
                     duration,
                     external_id: get("external_id").map(str::to_owned),
                     region: self.region.clone(),
+                    retry: crate::cloud_aws_retry::Retry::new(ctx),
                 },
                 cached: Mutex::new(None),
             })
@@ -205,6 +208,7 @@ enum Kind {
         duration: u32,
         external_id: Option<String>,
         region: String,
+        retry: crate::cloud_aws_retry::Retry,
     },
 }
 impl Source {
@@ -248,6 +252,7 @@ impl Source {
                 duration,
                 external_id,
                 region,
+                retry,
             } => {
                 let source = Box::pin(source.get(ctx)).await?;
                 assume_role(
@@ -261,6 +266,7 @@ impl Source {
                         external_id: external_id.as_deref(),
                     },
                     source,
+                    retry,
                 )
                 .await?
             }
@@ -278,15 +284,23 @@ struct WebIdentity {
     arn: String,
     file: String,
     session: Option<String>,
+    retry: crate::cloud_aws_retry::Retry,
 }
 
-fn web_identity(region: &str, arn: &str, file: &str, session: Option<String>) -> Source {
+fn web_identity(
+    ctx: &Context,
+    region: &str,
+    arn: &str,
+    file: &str,
+    session: Option<String>,
+) -> Source {
     Source {
         kind: Kind::Web(WebIdentity {
             region: region.to_owned(),
             arn: arn.to_owned(),
             file: file.to_owned(),
             session,
+            retry: crate::cloud_aws_retry::Retry::new(ctx),
         }),
         cached: Mutex::new(None),
     }
@@ -323,29 +337,41 @@ impl WebIdentity {
                 encoded.query().ok_or_else(failed)?.to_owned(),
             ))
             .map_err(|_| failed())?;
-        let response = ctx.http_send(request).await?;
-        if response.status() != http::StatusCode::OK {
-            return Err(failed());
-        }
-        let body = std::str::from_utf8(response.body()).map_err(|_| failed())?;
-        let response: WebResponse = quick_xml::de::from_str(body).map_err(|_| failed())?;
-        let value = response.result.credentials;
-        let credential = Credential {
-            access_key_id: value.access_key_id,
-            secret_access_key: value.secret_access_key,
-            session_token: Some(value.session_token),
-            expires_in: Some(value.expiration.parse().map_err(|_| failed())?),
-        };
-        if !credential.is_valid_at(Timestamp::now())
-            || credential
-                .session_token
-                .as_ref()
-                .is_none_or(String::is_empty)
-        {
-            return Err(failed());
-        }
-        Ok(credential)
+        self.retry
+            .run(|| async {
+                use crate::cloud_aws_retry::Failure;
+                let response = ctx
+                    .http_send(request.clone())
+                    .await
+                    .map_err(Failure::transport)?;
+                if response.status() != http::StatusCode::OK {
+                    return Err(Failure::sts(&response, true));
+                }
+                decode_web(response.body()).map_err(Failure::terminal)
+            })
+            .await
     }
+}
+
+fn decode_web(raw: &[u8]) -> reqsign_core::Result<Credential> {
+    let body = std::str::from_utf8(raw).map_err(|_| failed())?;
+    let response: WebResponse = quick_xml::de::from_str(body).map_err(|_| failed())?;
+    let value = response.result.credentials;
+    let credential = Credential {
+        access_key_id: value.access_key_id,
+        secret_access_key: value.secret_access_key,
+        session_token: Some(value.session_token),
+        expires_in: Some(value.expiration.parse().map_err(|_| failed())?),
+    };
+    if !credential.is_valid_at(Timestamp::now())
+        || credential
+            .session_token
+            .as_ref()
+            .is_none_or(String::is_empty)
+    {
+        return Err(failed());
+    }
+    Ok(credential)
 }
 
 #[derive(serde::Deserialize)]
