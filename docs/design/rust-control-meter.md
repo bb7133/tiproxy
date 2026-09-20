@@ -505,7 +505,7 @@ metadata date, boolean, integer and base64 decoding errors fail after the retry
 policy, without retrying a successful HTTP response. These checks decode the
 server CRC header; the SDK default does not compare its CRC to the payload.
 
-Ninety-five actual production-provider loopback HTTP cases compare full request
+The original 95 production-provider loopback HTTP cases compare full request
 trajectories, block identity/order, commit XML, payload lengths/hashes, headers,
 SAS preservation and Exists/Upload results. Only the public retry delay option is
 shortened to 1ns; status classification, retry counts and SDK source are unchanged.
@@ -517,10 +517,10 @@ HEAD 503→404 and PUT 503→201. Regenerate with:
 bash rust/crates/control-meter/testdata/azure-object-go.sh
 ```
 
-Five fixed-time Azure SharedKey signatures match actual HEAD, direct PUT,
+Seven fixed-time Azure SharedKey signatures match actual HEAD, direct PUT,
 StageBlock and CommitBlockList requests from the pinned Go azblob SDK. This
 proves signature canonicalization, including the stage/commit query parameters
-and headers. SharedKey takes precedence over SAS; SAS query strings survive
+and headers; two additional HEAD signatures use keys with nonzero base64 pad bits. SharedKey takes precedence over SAS; SAS query strings survive
 container/prefix/key assembly. A metering-specific transport and bounded command
 executor serve the official Azure identity SDK. Environment secret, encrypted
 PEM/PFX certificate, username/password, workload assertion, managed identity, CLI,
@@ -577,6 +577,21 @@ Access Evaluation (CAE) claims take priority across all challenge header values.
 Resource challenges may be followed by one CAE replay; a CAE replay does not
 recursively process another challenge. HTTP retry attempts may each enter this
 challenge flow, and each replay preserves the body.
+
+Typed Azure response dates now validate Go RFC1123 acceptance instead of strict
+RFC7231 acceptance. This preserves syntactic (not calendar-matched) weekdays,
+case-insensitive day/month names, repeated spaces, optional fractional seconds,
+valid leap dates and Go's named/signed-hour zone grammar. Only parse success is
+needed for this metadata; no zone offset is inferred. MD5/CRC64 metadata, SharedKey
+configuration and CAE claims share Go-compatible non-strict padded base64 decoding.
+
+The object fixture now has 235 actual production-provider cases: the original 95
+plus 108 date and 32 base64 metadata cases. Its 54 date inputs run through both
+HEAD and PUT, including accepted named zones and rejected date/time ranges. Old
+RFC7231 validation and strict base64 both fail the expanded fixture; corrected
+validation passes. Two extra fixed-time SharedKey signatures cover nonzero pad
+bits, bringing that fixture to seven byte-equal signatures. HTTP Retry-After
+clock interpretation remains separate from metadata acceptance.
 
 Managed identity caches are keyed by resource. Nonempty CAE claims bypass the
 cached token and replace it on success; claims are not sent to the metadata
@@ -638,8 +653,8 @@ increment and remain open. The regex and permissive base64 dependencies reuse
 package versions already in Cargo.lock; this OAuth increment adds no dependency.
 
 Full default-credential/endpoint edge parity remains in progress, including
-unusual RFC1123 named-zone metadata dates and the declared general HTTP date,
-endpoint and platform transport edges. Export failure retains the pending
+general HTTP date/Retry-After clock interpretation, endpoint and platform
+transport edges. Export failure retains the pending
 window for the next metering attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,

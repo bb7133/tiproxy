@@ -100,6 +100,34 @@ func main() {
 		for _, h := range []string{"Date", "Last-Modified", "Content-MD5", "x-ms-content-crc64", "x-ms-request-server-encrypted", "x-ms-server-encrypted", "x-ms-blob-committed-block-count"} {
 			add("invalid-"+h, reply{Headers: map[string]string{h: "invalid"}})
 		}
+
+		dates := []string{
+			"Mon, 02 Jan 2006 15:04:05 GMT", "Tue, 02 Jan 2006 15:04:05 GMT",
+			"mon, 02 jan 2006 15:04:05 GMT", "Mon,  02  Jan  2006  15:04:05  GMT",
+			"Mon, 2 Jan 2006 15:04:05 GMT", "Mon, 02 Jan 06 15:04:05 GMT",
+			"Mon, 02 Jan 2006 5:04:05 GMT", "Mon, 02 Jan 2006 15:4:05 GMT",
+			"Mon, 02 Jan 2006 15:04:5 GMT", "Mon, 02 Jan 2006 15:04:05.123456789123 GMT",
+			"Mon, 02 Jan 2006 15:04:05,1 GMT", "Mon, 02 Jan 2006 15:04:05. GMT",
+			"Mon, 29 Feb 2000 15:04:05 GMT", "Mon, 29 Feb 1900 15:04:05 GMT",
+			"Mon, 29 Feb 0000 15:04:05 GMT", "Mon, 31 Apr 2006 15:04:05 GMT",
+			"Mon, 00 Jan 2006 15:04:05 GMT", "Mon, 02 Jan 2006 24:04:05 GMT",
+			"Mon, 02 Jan 2006 15:60:05 GMT", "Mon, 02 Jan 2006 15:04:60 GMT",
+			"Monday, 02 Jan 2006 15:04:05 GMT", "Mon, 02 January 2006 15:04:05 GMT",
+			"Sun Nov  6 08:49:37 1994", "Sunday, 06-Nov-94 08:49:37 GMT",
+			"Mon,02 Jan 2006 15:04:05 GMT", "Mon, 02Jan 2006 15:04:05 GMT",
+		}
+		for _, zone := range []string{"UTC", "PST", "CST", "FOO", "WITA", "ChST", "MeST", "CEST", "ABCET", "ABCD", "ABCDE", "ABCDEF", "UT", "Z", "gmt", "GMT+1", "GMT-23", "GMT+24", "GMT+0", "GMT+00001", "+01", "-00", "+1", "-24", "+0000", "+000000000000000000000001", "+999999999999999999999999999", "GMT+01:00"} {
+			dates = append(dates, "Mon, 02 Jan 2006 15:04:05 "+zone)
+		}
+		for i, date := range dates {
+			add(fmt.Sprintf("metadata-date-%d", i), reply{Headers: map[string]string{"Last-Modified": date}})
+		}
+
+		for _, header := range []string{"Content-MD5", "x-ms-content-crc64"} {
+			for i, value := range []string{"Zg==", "Zh==", "Zm8=", "Zm9=", "Zg", "Zg=", "Z===", ""} {
+				add(fmt.Sprintf("metadata-base64-%s-%d", header, i), reply{Headers: map[string]string{header: value}})
+			}
+		}
 		add("sas-retry", reply{Status: 503}, reply{})
 		cases[len(cases)-1].SAS = true
 	}

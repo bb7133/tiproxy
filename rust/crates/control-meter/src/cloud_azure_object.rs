@@ -21,6 +21,9 @@ use reqsign_core::{Context, hash::base64_encode};
 use reqwest::Url;
 use std::time::Duration;
 
+#[path = "cloud_azure_date.rs"]
+mod metadata_date;
+
 const BLOCK_SIZE: usize = 1024 * 1024;
 fn failed() -> Error {
     Error::Export("Azure object request failed")
@@ -247,7 +250,7 @@ fn validate_metadata(headers: &http::HeaderMap, head: bool, stage: bool) -> Resu
         if value.is_empty() {
             continue;
         }
-        if date && azure_core::time::parse_rfc7231(value).is_err() {
+        if date && !metadata_date::valid(value) {
             return Err(failed());
         }
         if boolean
@@ -269,7 +272,7 @@ fn validate_metadata(headers: &http::HeaderMap, head: bool, stage: bool) -> Resu
             return Err(failed());
         }
         if encoded {
-            reqsign_core::hash::base64_decode(value).map_err(|_| failed())?;
+            super::decode_base64(value).map_err(|_| failed())?;
         }
         if integer64 {
             value.parse::<i64>().map_err(|_| failed())?;
@@ -461,7 +464,7 @@ mod tests {
     async fn retry_stream_blocks_and_results_match_real_go_provider() {
         let rows: Vec<Row> = serde_json::from_str(include_str!("../testdata/azure-object-go.json"))
             .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 95);
+        assert_eq!(rows.len(), 235);
         for row in rows {
             let io = Io::default();
             {

@@ -18,10 +18,6 @@ use crate::{
     cloud_azure_identity::{AzureDefault, SCOPE},
 };
 use azure_core::credentials::AccessToken;
-use base64::{
-    Engine as _,
-    engine::{GeneralPurpose, GeneralPurposeConfig},
-};
 use http::HeaderMap;
 use regex::Regex;
 use std::{collections::BTreeMap, sync::OnceLock};
@@ -165,13 +161,7 @@ fn parse_cae(headers: &HeaderMap) -> Result<Option<Vec<u8>>, Error> {
                 continue;
             }
             if let Some(value) = fields.get("claims").filter(|v| !v.is_empty()) {
-                // Go's non-Strict StdEncoding accepts nonzero trailing bits.
-                let decoder = GeneralPurpose::new(
-                    &base64::alphabet::STANDARD,
-                    GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
-                );
-                let value = value.replace(['\r', '\n'], "");
-                return decoder.decode(value).map(Some).map_err(|_| failed());
+                return super::decode_base64(value).map(Some).map_err(|_| failed());
             }
         }
     }
