@@ -1857,7 +1857,9 @@ mod tests {
         };
         // This is the same ownership sequence as the admin_exit select branch:
         // observe completion, then pass the retained AdminTask to final cleanup.
-        (&mut admin.task).await.expect("admin completed normally");
+        (&mut admin.task)
+            .await
+            .unwrap_or_else(|error| unreachable!("admin completed normally: {error}"));
         let cleanup = tokio::spawn(admin.teardown()).await;
         assert!(cleanup.is_ok(), "cleanup must not panic: {cleanup:?}");
     }
