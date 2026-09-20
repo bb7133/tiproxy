@@ -779,7 +779,11 @@ async fn run_listener(
     // Drain mode: sessions keep running until they finish on their own
     // (the composition injects graceful closes and per-session drain
     // deadlines); the shutdown signal remains the force phase that
-    // aborts whatever is left.
+    // aborts whatever is left. The owner itself stays alive until that
+    // force phase even when every session has already finished: the
+    // server loop treats a listener owner that returns before shutdown
+    // as a failed listener, so an early return here would turn a clean
+    // drain into "SQL listener task stopped before shutdown".
     if !*shutdown.borrow() {
         loop {
             tokio::select! {
@@ -790,18 +794,10 @@ async fn run_listener(
                     }
                 }
                 joined = sessions.join_next(), if !sessions.is_empty() => {
-                    match joined {
-                        Some(result) => {
-                            if result.is_err_and(|error| error.is_panic()) {
-                                counters.handler_panics.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        None => break,
+                    if joined.is_some_and(|result| result.is_err_and(|error| error.is_panic())) {
+                        counters.handler_panics.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-            }
-            if sessions.is_empty() {
-                break;
             }
         }
     }
@@ -1074,6 +1070,45 @@ mod tests {
         let metrics = handle.metrics();
         assert_eq!(metrics.active_connections, 0);
         assert_eq!(metrics.connection_buffer_bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_finishing_during_stop_accept_keeps_owner_until_shutdown()
+    -> Result<(), Box<dyn Error>> {
+        let snap = snapshot(1, 0, 0.0, one_listener())?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let (mut stream, _seat) = connection.into_session_io();
+                let _ = tx.send(());
+                let mut byte = [0_u8; 1];
+                while matches!(stream.read(&mut byte).await, Ok(read) if read > 0) {}
+            }
+        }));
+        let client = TcpStream::connect(actual).await?;
+        timeout(TokioDuration::from_secs(2), rx.recv())
+            .await?
+            .ok_or("handler did not report")?;
+
+        handle.stop_accepting();
+        assert!(TcpStream::connect(actual).await.is_err());
+        // The only session finishes on its own inside the drain window.
+        drop(client);
+        assert!(
+            timeout(TokioDuration::from_millis(500), &mut owner)
+                .await
+                .is_err(),
+            "listener owner must stay alive until the force phase"
+        );
+        assert!(handle.registry().is_empty());
+
+        handle.shutdown();
+        timeout(TokioDuration::from_secs(2), &mut owner).await???;
         Ok(())
     }
 
