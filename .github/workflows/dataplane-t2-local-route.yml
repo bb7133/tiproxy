@@ -75,6 +75,12 @@ jobs:
           command -v mysql
           mysql --version
           openssl version
+      - name: Install protobuf compiler
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
+          protoc --version
       - name: Build the Rust executable
         if: steps.changes.outputs.relevant == 'true'
         run: make rust-build
