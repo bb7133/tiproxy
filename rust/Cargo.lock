@@ -369,6 +369,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "control-meter"
+version = "0.1.0"
+dependencies = [
+ "control-plane",
+ "getrandom 0.2.17",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "control-plane"
 version = "0.1.0"
 dependencies = [
