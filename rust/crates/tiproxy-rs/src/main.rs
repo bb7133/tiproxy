@@ -813,64 +813,12 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback("install control dispatch handle exactly once".to_owned())
             .await);
     }
-    if let Err(error) = wait_module_ready(
-        "native meter peer",
-        CONTROL_STARTUP_READY_TIMEOUT,
-        native_meter::wait_peer(shared_client.subscribe_state()),
-    )
-    .await
-    {
-        meter_ready.send_replace(Some(false));
-        return Err(guard.rollback(error).await);
-    }
-    // A legacy Go peer cannot reach this point: negotiation requires native
-    // ownership before either consumer or outbox is opened. SQL stays gated.
-    let native_meter = match control_meter::service::Service::open(
-        meter_config.effective().metering(),
-        meter_paths.join("rust-metering-consumer.json"),
-        meter_paths.join("metering-outbox.json"),
-        in_process.handle().module_context().owner().clone(),
-    )
-    .await
-    {
-        Ok(meter) => meter,
-        Err(error) => {
-            meter_ready.send_replace(Some(false));
-            return Err(guard.rollback(format!("open native meter: {error}")).await);
-        }
-    };
-    let ledger =
-        match dataplane::metering::recover_native_metering(ledger, Arc::clone(&native_meter)).await
-        {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                meter_ready.send_replace(Some(false));
-                return Err(guard
-                    .rollback(format!("recover native meter WAL: {error}"))
-                    .await);
-            }
-        };
-    guard.set_metrics_exporter(spawn_metrics_exporter(
-        Arc::clone(&shared_client),
-        serving.clone(),
-        Arc::clone(&runtime_stats),
-        &metrics,
-        observations,
-        Duration::from_secs(1),
-        Arc::clone(&metrics_registry),
-    ));
-    let native_shutdown = metering_shutdown_tx.clone();
-    guard.set_metering_sampler(MeteringSampler {
-        task: tokio::spawn(native_meter::run(
-            metering,
-            ledger,
-            Arc::clone(&native_meter),
-            native_shutdown,
-            Duration::from_secs(1),
-        )),
-        shutdown: metering_shutdown_tx.clone(),
-    });
-
+    // Operator-facing listeners (health, metrics, management plane) bind
+    // before the control peer is awaited: a bad address fails fast and rolls
+    // back, and the health probe stays reachable while native metering
+    // recovers (it answers not-ready until the SQL gate opens).
+    let meter_slot: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>> =
+        Arc::new(std::sync::OnceLock::new());
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
@@ -881,7 +829,7 @@ async fn run(options: Options) -> Result<(), String> {
         route_config_source,
         topology_handle,
         Arc::clone(&runtime_stats),
-        native_meter,
+        Arc::clone(&meter_slot),
     )
     .await
     {
@@ -897,7 +845,10 @@ async fn run(options: Options) -> Result<(), String> {
     match spawn_metrics_http(options.metrics_addr, Arc::clone(&metrics_registry)).await {
         Ok(Some(task)) => guard.set_metrics_http_task(task),
         Ok(None) => {}
-        Err(error) => return Err(guard.rollback(error).await),
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(error).await);
+        }
     }
     guard.set_log_reload_task(tokio::spawn(run_log_reload(
         options.log_file.clone(),
@@ -930,8 +881,70 @@ async fn run(options: Options) -> Result<(), String> {
             Some(app)
         }
         Ok(None) => None,
-        Err(error) => return Err(guard.rollback(error).await),
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(error).await);
+        }
     };
+    if let Err(error) = wait_module_ready(
+        "native meter peer",
+        CONTROL_STARTUP_READY_TIMEOUT,
+        native_meter::wait_peer(shared_client.subscribe_state()),
+    )
+    .await
+    {
+        meter_ready.send_replace(Some(false));
+        return Err(guard.rollback(error).await);
+    }
+    // A legacy Go peer cannot reach this point: negotiation requires native
+    // ownership before either consumer or outbox is opened. SQL stays gated.
+    let native_meter = match control_meter::service::Service::open(
+        meter_config.effective().metering(),
+        meter_paths.join("rust-metering-consumer.json"),
+        meter_paths.join("metering-outbox.json"),
+        in_process.handle().module_context().owner().clone(),
+    )
+    .await
+    {
+        Ok(meter) => meter,
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(format!("open native meter: {error}")).await);
+        }
+    };
+    let _ = meter_slot.set(Arc::clone(&native_meter));
+    let ledger =
+        match dataplane::metering::recover_native_metering(ledger, Arc::clone(&native_meter)).await
+        {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                meter_ready.send_replace(Some(false));
+                return Err(guard
+                    .rollback(format!("recover native meter WAL: {error}"))
+                    .await);
+            }
+        };
+    guard.set_metrics_exporter(spawn_metrics_exporter(
+        Arc::clone(&shared_client),
+        serving.clone(),
+        Arc::clone(&runtime_stats),
+        &metrics,
+        observations,
+        Duration::from_secs(1),
+        Arc::clone(&metrics_registry),
+    ));
+    let native_shutdown = metering_shutdown_tx.clone();
+    guard.set_metering_sampler(MeteringSampler {
+        task: tokio::spawn(native_meter::run(
+            metering,
+            ledger,
+            Arc::clone(&native_meter),
+            native_shutdown,
+            Duration::from_secs(1),
+        )),
+        shutdown: metering_shutdown_tx.clone(),
+    });
+
     if let Err(error) = in_process.mark_ready() {
         meter_ready.send_replace(Some(false));
         return Err(guard
@@ -1233,7 +1246,7 @@ async fn spawn_health(
     config: Arc<dyn ConfigNamespaceSource>,
     topology: TopologyModuleHandle,
     dispatch_stats: Arc<dataplane::control_dispatch::DispatchStats>,
-    meter: Arc<control_meter::service::Service>,
+    meter: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>>,
 ) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
@@ -1249,7 +1262,8 @@ async fn spawn_health(
     Ok(Some(tokio::spawn(health::serve(
         listener,
         serving,
-        Arc::new(move || meter.healthy()),
+        // Before the native meter opens the SQL gate is closed anyway.
+        Arc::new(move || meter.get().is_none_or(|meter| meter.healthy())),
         Arc::new(move || routes.route_input_evidence()),
         Arc::new(move || ledger_routes.route_ledger_evidence()),
         Arc::new(move || {
