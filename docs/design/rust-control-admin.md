@@ -8,11 +8,13 @@ records the exact residual surface after every slice.
 
 ## Slice 1: listener, middleware, health, metrics, status
 
-The Rust executable binds `--admin-addr <host:port>` before it marks itself
-ready and serves the table below on that listener. During the two-process
-phase Go keeps `api.addr`; the Rust admin port must be distinct from it, from
-`rust-dataplane.metrics-owner-port` and from every SQL port. The final cutover
-(#153) moves the Rust listener onto `api.addr`.
+The Rust executable binds its management listener before it marks itself
+ready and serves the table below on it. Since slice 5c (`RUST_API_OWNER`)
+that listener is the configured `api.addr`: Go starts no API server beside
+the Rust dataplane. `--admin-addr <host:port>` overrides the address for
+harnesses that run a Go oracle on `api.addr` next to the Rust process
+(slices 1–5b were developed that way). The address must be distinct from
+`rust-dataplane.metrics-owner-port` and from every SQL port.
 
 Middleware runs in the Go order: a global blocking rate limit (uber-go
 `ratelimit` semantics, 100/s with ten slots of slack, never `429`), the
@@ -383,6 +385,33 @@ certificate.
   and requires the admin `backend/metrics` answer (`200`,
   `application/json`) to be byte-identical to the metric-owner endpoint's
   for both cluster names and the empty name.
-- **Slice 5 (remaining)** — the Go API retirement and final composition
-  (5c, merged with the native metering owner's startup and shutdown
-  order); the profiling residual stays open.
+- **Slice 5c (Go API retirement, final composition)** — capability 8
+  (`RUST_API_OWNER`) is advertised and required by both processes like
+  capabilities 6 and 7. Under it the Go process starts no `api.Server`
+  (`pkg/server.NewServer` skips it when `rust-dataplane.enabled`, logging the
+  address it left to Rust) and the Rust process binds the configured
+  `api.addr` itself as its management listener (`--admin-addr` remains an
+  override for harnesses that run a Go oracle beside it); the readiness
+  gate, TLS branch, rate limit and route table are the slice 1–5b ones.
+  `MetricsBatch` (tag 35) is a retired wire body: Rust's exporter keeps
+  aggregating into the native registry every second and drops the per-tick
+  deltas instead of sending them, and Go answers a batch with
+  `PROTOCOL_VIOLATION` ("retired metrics message under RUST_API_OWNER"),
+  counting it in `tiproxy_server_err{type="rust_legacy_metrics_violation"}`
+  (`CompositeControlHandler.legacyMetricsViolations`; the control tap
+  catalogs the body as legacy `metrics_batch`). `NativeAPIOwner` requires
+  `RouteOwner` in `BridgeConfig`. The Rust binary advertises
+  `rust-api-owner` in `--integration-capabilities`; the integration harness
+  therefore drives every management call (namespace, config, metrics,
+  dataplane status/drain, backend metrics, debug redirect) at the API port
+  of the Rust process and no longer passes `--admin-addr`. Startup keeps
+  the native metering owner's order (capability negotiation, `Service::open`,
+  WAL replay with the SQL gate closed) with the operator listeners
+  (health, metrics owner, management) bound before the control peer wait,
+  so a bind conflict still fails fast; shutdown marks the process closing
+  first and keeps the management plane readable through the session drain,
+  sampler stop and final export. The Go-only Prometheus series (balance,
+  backend, monitor, maxprocs, owner, replay and the Go runtime collectors;
+  inventory in `tests/controlplane/cpadmin/go-series-probe`) are no longer
+  exposed by the composed pair; their disposition is a separate decision.
+  The profiling residual (`pprof`) stays open.

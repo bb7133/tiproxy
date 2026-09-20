@@ -189,6 +189,39 @@ func TestNativeMeterOwnerHasNoConsumerAndRejectsRetiredMetering(t *testing.T) {
 	require.Zero(t, peer.sent()[2].GetReconcileSnapshot().GetMeteringSequence())
 }
 
+func TestNativeAPIOwnerRejectsRetiredMetricsBatch(t *testing.T) {
+	handler, err := NewNativeMeterOwnerControlHandler()
+	require.NoError(t, err)
+	handler.nativeAPIOwner = true
+	peer := &recordingSender{}
+	require.NoError(t, handler.HandleEnvelope(t.Context(), peer, &controlpb.ControlEnvelope{
+		RequestId: 7,
+		Body:      &controlpb.ControlEnvelope_MetricsBatch{MetricsBatch: &controlpb.MetricsBatch{Sequence: 1}},
+	}))
+	require.EqualValues(t, 1, handler.legacyMetricsViolations.Load())
+	require.Len(t, peer.sent(), 1)
+	rejection := peer.sent()[0].GetError()
+	require.NotNil(t, rejection)
+	require.Equal(t, controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, rejection.GetCode())
+	require.EqualValues(t, 7, rejection.GetOffendingRequestId())
+	require.Equal(t, "retired metrics message under RUST_API_OWNER", rejection.GetDetail())
+
+	// Without API ownership the batch keeps its legacy handling.
+	legacy, err := NewNativeMeterOwnerControlHandler()
+	require.NoError(t, err)
+	require.NoError(t, legacy.HandleEnvelope(t.Context(), peer, &controlpb.ControlEnvelope{
+		RequestId: 8,
+		Body:      &controlpb.ControlEnvelope_MetricsBatch{MetricsBatch: &controlpb.MetricsBatch{Sequence: 1}},
+	}))
+	require.Zero(t, legacy.legacyMetricsViolations.Load())
+	require.Len(t, peer.sent(), 1)
+}
+
+func TestNativeAPIOwnerRequiresRouteOwner(t *testing.T) {
+	_, err := NewBridge(BridgeConfig{NativeAPIOwner: true})
+	require.ErrorContains(t, err, "native API ownership requires route owner")
+}
+
 func TestNativeMeterOwnerRejectsGoStateOrLegacyComposition(t *testing.T) {
 	for _, config := range []BridgeConfig{
 		{NativeMeterOwner: true},

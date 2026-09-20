@@ -778,6 +778,11 @@ pub enum ControlCapability {
     /// metering export outbox. This process-fixed assertion rejects mixed owner
     /// binaries during negotiation; metering batch/ACK bodies are retired.
     RustMeterOwner = 7,
+    /// CP-ADMIN: Rust exclusively owns the management API (`api.addr`): Go
+    /// starts no API server in this composition and metrics_batch is a retired
+    /// wire body. This process-fixed assertion rejects mixed binaries during
+    /// negotiation.
+    RustApiOwner = 8,
 }
 impl ControlCapability {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -794,6 +799,7 @@ impl ControlCapability {
             Self::RustConfigNamespace => "CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE",
             Self::RustRouteOwner => "CONTROL_CAPABILITY_RUST_ROUTE_OWNER",
             Self::RustMeterOwner => "CONTROL_CAPABILITY_RUST_METER_OWNER",
+            Self::RustApiOwner => "CONTROL_CAPABILITY_RUST_API_OWNER",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -807,6 +813,7 @@ impl ControlCapability {
             "CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE" => Some(Self::RustConfigNamespace),
             "CONTROL_CAPABILITY_RUST_ROUTE_OWNER" => Some(Self::RustRouteOwner),
             "CONTROL_CAPABILITY_RUST_METER_OWNER" => Some(Self::RustMeterOwner),
+            "CONTROL_CAPABILITY_RUST_API_OWNER" => Some(Self::RustApiOwner),
             _ => None,
         }
     }

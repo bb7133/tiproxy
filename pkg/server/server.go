@@ -224,7 +224,11 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 		// Rust admin API (CP-ADMIN slice 3), so `/api/dataplane/drain` answers
 		// 404 {"enabled": false} here.
 	}
-	if srv.apiServer, err = api.NewServer(cfg.API, lg.Named("api"), mgrs, handler, ready); err != nil {
+	// CP-ADMIN slice 5c: with the Rust dataplane the management API (`api.addr`)
+	// is served by the Rust process; this process starts no API server.
+	if cfg.RustDataplane.Enabled {
+		lg.Info("management API is owned by the Rust dataplane; no Go API server", zap.String("addr", cfg.API.Addr))
+	} else if srv.apiServer, err = api.NewServer(cfg.API, lg.Named("api"), mgrs, handler, ready); err != nil {
 		return
 	}
 

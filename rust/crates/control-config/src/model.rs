@@ -772,6 +772,13 @@ impl EffectiveConfig {
         &self.workdir
     }
 
+    /// Returns the management API listen address (`api.addr`). Under
+    /// `RUST_API_OWNER` the Rust process binds it itself.
+    #[must_use]
+    pub fn api_addr(&self) -> &str {
+        &self.api.addr
+    }
+
     /// Returns whether traffic replay is enabled.
     #[must_use]
     pub const fn traffic_replay_enabled(&self) -> bool {

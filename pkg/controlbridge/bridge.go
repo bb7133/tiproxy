@@ -32,6 +32,10 @@ type BridgeConfig struct {
 	RouteOwner bool
 	// NativeMeterOwner leaves durable metering entirely in Rust. Requires RouteOwner.
 	NativeMeterOwner bool
+	// NativeAPIOwner leaves the management API entirely in Rust: this process
+	// starts no API server and metrics batches are retired wire bodies.
+	// Requires RouteOwner.
+	NativeAPIOwner bool
 	// Handshake is the router adapter's authentication/routing seam.
 	// It is required only for the legacy, non-RouteOwner composition.
 	Handshake backend.HandshakeHandler
@@ -137,6 +141,9 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	if config.NativeMeterOwner && (!config.RouteOwner || config.MeteringStatePath != "" || config.MeteringSink != nil) {
 		return nil, errors.New("native metering requires route owner and no Go metering state or sink")
 	}
+	if config.NativeAPIOwner && !config.RouteOwner {
+		return nil, errors.New("native API ownership requires route owner")
+	}
 	var adapter *RouterAdapter
 	var err error
 	if !config.RouteOwner {
@@ -172,6 +179,7 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
+	composite.nativeAPIOwner = config.NativeAPIOwner
 	if config.Publisher != nil {
 		composite.AttachSnapshotPublisher(config.Publisher)
 	}

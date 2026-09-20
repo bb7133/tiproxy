@@ -39,9 +39,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use control_proto::control_transport::{ControlClient, TransportError};
-use control_proto::v1::control_envelope::Body;
-use control_proto::v1::{ControlEnvelope, MetricDelta, MetricsBatch, Priority};
+use control_proto::control_transport::ControlClient;
+#[cfg(test)]
+use control_proto::v1::MetricDelta;
 use session_core::command::Command;
 pub use session_core::error_source::ErrorSource as QuitSource;
 use tokio::sync::{mpsc, watch};
@@ -685,6 +685,7 @@ impl MetricKey {
         Self { name, labels }
     }
 
+    #[cfg(test)]
     fn wire_labels(&self) -> BTreeMap<String, String> {
         self.labels
             .iter()
@@ -922,6 +923,7 @@ impl Aggregator {
         }
     }
 
+    #[cfg(test)]
     fn wire_metrics(&self, gauges: &[(&'static str, f64)]) -> Vec<MetricDelta> {
         let mut metrics = Vec::with_capacity(self.pending.len() + gauges.len());
         for (key, pending) in &self.pending {
@@ -1176,7 +1178,6 @@ async fn run_exporter(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut aggregator = Aggregator::with_registry(Arc::clone(&registry));
     let mut previous = ExportTotals::default();
-    let mut sequence = 1_u64;
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -1206,30 +1207,13 @@ async fn run_exporter(
                 current.accumulate_delta(previous, &mut aggregator);
                 previous = current;
                 registry.set_gauge("tiproxy_server_connections", active_connections);
-                let metrics = aggregator.wire_metrics(&[(
-                    "tiproxy_server_connections",
-                    active_connections,
-                )]);
-                let Some(request_id) = client.allocate_request_id() else {
+                // CP-ADMIN slice 5c: the native registry is the only
+                // exposition (`RUST_API_OWNER`); `MetricsBatch` is a retired
+                // wire body, so the per-tick deltas are dropped once the
+                // registry has absorbed them instead of being sent to Go.
+                aggregator.clear_sent();
+                if client.is_shutdown() {
                     return;
-                };
-                let envelope = ControlEnvelope {
-                    request_id,
-                    priority: Priority::Bulk.into(),
-                    body: Some(Body::MetricsBatch(MetricsBatch { sequence, metrics })),
-                    ..ControlEnvelope::default()
-                };
-                match client.send(envelope).await {
-                    Ok(()) => {
-                        aggregator.clear_sent();
-                        let Some(next) = sequence.checked_add(1) else {
-                            return;
-                        };
-                        sequence = next;
-                    }
-                    Err(TransportError::MetricsDropped) => {}
-                    Err(_) if client.is_shutdown() => return,
-                    Err(_) => {}
                 }
             }
         }

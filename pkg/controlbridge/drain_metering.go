@@ -32,13 +32,15 @@ import (
 // CP-ADMIN slice 3, both drain bodies). Everything else goes to the
 // RouterAdapter in the legacy composition.
 type CompositeControlHandler struct {
-	adapter               *RouterAdapter
-	consumer              *MeteringConsumer
-	publisher             *SnapshotPublisher
-	routeOwner            bool
-	nativeMeterOwner      bool
-	legacyMeterViolations atomic.Uint64
-	legacyRouteViolations atomic.Uint64
+	adapter                 *RouterAdapter
+	consumer                *MeteringConsumer
+	publisher               *SnapshotPublisher
+	routeOwner              bool
+	nativeMeterOwner        bool
+	nativeAPIOwner          bool
+	legacyMeterViolations   atomic.Uint64
+	legacyMetricsViolations atomic.Uint64
+	legacyRouteViolations   atomic.Uint64
 }
 
 const emptyRouteStateSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -126,6 +128,20 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 ) error {
 	if envelope == nil {
 		return errors.New("control envelope is required")
+	}
+	if handler.nativeAPIOwner {
+		// CP-ADMIN slice 5c: the Go exposition is gone with the API server, so
+		// Rust metric batches are retired wire bodies (route/drain precedent).
+		if _, ok := envelope.GetBody().(*controlpb.ControlEnvelope_MetricsBatch); ok {
+			handler.legacyMetricsViolations.Add(1)
+			metrics.ServerErrCounter.WithLabelValues("rust_legacy_metrics_violation").Inc()
+			return sendBody(ctx, sender, envelope.GetRequestId(), controlpb.Priority_PRIORITY_CRITICAL,
+				&controlpb.ControlEnvelope_Error{Error: &controlpb.ProtocolError{
+					Code:               controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION,
+					OffendingRequestId: envelope.GetRequestId(),
+					Detail:             "retired metrics message under RUST_API_OWNER",
+				}})
+		}
 	}
 	if handler.nativeMeterOwner {
 		switch envelope.GetBody().(type) {

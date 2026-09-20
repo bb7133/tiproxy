@@ -123,7 +123,7 @@ enum Command {
 /// C) are all wired, so `tls`, `proxy-v2`, `zlib`, and `zstd` are advertised
 /// and the topology preflight admits plain, tls, proxy, and compressed
 /// variants.
-const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
+const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -519,6 +519,7 @@ async fn run(options: Options) -> Result<(), String> {
     );
     let in_process_config = in_process.handle().config().current();
     let capabilities = vec![
+        ControlCapability::RustApiOwner as u64,
         ControlCapability::RustMeterOwner as u64,
         ControlCapability::RustConfigNamespace as u64,
         ControlCapability::RustRouteOwner as u64,
@@ -857,9 +858,23 @@ async fn run(options: Options) -> Result<(), String> {
     )));
     // Management plane (CP-ADMIN): bound before ready so a bad address fails
     // fast; its readiness gate opens together with the process, like Go's
-    // `ready` toggle at the end of `NewServer`.
+    // `ready` toggle at the end of `NewServer`. Under `RUST_API_OWNER` the
+    // Rust process is the only API server, so it binds the configured
+    // `api.addr` unless `--admin-addr` overrides it.
+    let admin_address = options.admin_addr.map_or_else(
+        || {
+            config_owner
+                .handle
+                .source()
+                .current()
+                .effective()
+                .api_addr()
+                .to_owned()
+        },
+        |address| address.to_string(),
+    );
     let admin_app = match spawn_admin(
-        options.admin_addr,
+        admin_address,
         admin_hooks(
             &in_process,
             &config_owner.handle,
@@ -1580,14 +1595,11 @@ impl startup::Teardown for AdminTask {
 const ADMIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
 async fn spawn_admin(
-    address: Option<SocketAddr>,
+    address: String,
     hooks: control_admin::AdminHooks,
     tls: control_admin::TlsConfigSource,
 ) -> Result<Option<(Arc<control_admin::AdminApp>, AdminTask)>, String> {
-    let Some(address) = address else {
-        return Ok(None);
-    };
-    let listener = tokio::net::TcpListener::bind(address)
+    let listener = tokio::net::TcpListener::bind(&address)
         .await
         .map_err(|error| format!("bind admin endpoint {address}: {error}"))?;
     let app = Arc::new(control_admin::AdminApp::new(
@@ -2727,12 +2739,13 @@ mod tests {
         };
         assert_eq!(
             INTEGRATION_CAPABILITIES,
-            "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
+            "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
             "only what the binary truthfully provides: Rust route ownership plus the wired plain slice, TLS, PROXY v2, and compression"
         );
         for wired in [
             "rust-route-owner",
             "rust-meter-owner",
+            "rust-api-owner",
             "tls",
             "proxy-v2",
             "zlib",

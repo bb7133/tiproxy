@@ -1825,9 +1825,11 @@ if [[ $mode == rust && ($variant == plain || ${DATAPLANE_T4_QUALIFICATION:-0} ==
 fi
 KA_DROP_SOCKET="${TMPDIR:-/tmp}/$tag-ka-drop.sock"
 ka_drop_admin_port=$((8100 + port_offset))
-# CP-ADMIN: the Rust process serves the management API itself. M9 drives its
-# operator drains through this port, so they never cross the bridge.
-ka_admin_port=$((8101 + port_offset))
+# CP-ADMIN 5c: the Rust process is the only management API server and binds
+# the configured api.addr itself (RUST_API_OWNER), so the admin port is the
+# API port. M9 drives its operator drains through it; they never cross the
+# bridge.
+ka_admin_port=$ka_api_port
 # CP-ADMIN 5a: the Rust metric-owner endpoint gets a fixed port so the
 # management plane's backend/metrics answer can be compared with it.
 ka_metrics_owner_port=$((8102 + port_offset))
@@ -1887,25 +1889,33 @@ if [[ $mode == rust ]]; then
 	fi
 	printf 'KA_SOCKET=%q\n' "$KA_SOCKET" >>"$run_dir/state.env"
 fi
+# "Go control plane up" for the keyspace-guard instance. In Go mode that is
+# its management API. Under RUST_API_OWNER (CP-ADMIN 5c) the Go process
+# serves no HTTP at all: its readiness is the control socket it listens on,
+# and the management API is checked on the Rust process once that is ready.
+ka_wait_go_control_up() {
+	local pid=$1
+	for _ in {1..100}; do
+		if ! kill -0 "$pid" 2>/dev/null; then
+			return 1
+		fi
+		if [[ $mode == rust ]]; then
+			[[ -S $KA_SOCKET ]] && return 0
+		elif curl --noproxy '*' --fail --silent \
+			"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+			return 0
+		fi
+		sleep 0.2
+	done
+	return 1
+}
 "$repo_root/bin/tiproxy" --config "$run_dir/tiproxy-ka.toml" \
 	>"$run_dir/tiproxy-ka.out" 2>&1 &
 KA_PID=$!
 record_t4_process go-ka start "$KA_PID" 0
 printf 'KA_PID=%q\n' "$KA_PID" >>"$run_dir/state.env"
-ka_api_up=false
-for _ in {1..100}; do
-	if ! kill -0 "$KA_PID" 2>/dev/null; then
-		break
-	fi
-	if curl --noproxy '*' --fail --silent \
-		"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
-		ka_api_up=true
-		break
-	fi
-	sleep 0.2
-done
-if [[ $ka_api_up != true ]]; then
-	echo "keyspace-guard instance API never came up" >&2
+if ! ka_wait_go_control_up "$KA_PID"; then
+	echo "keyspace-guard instance never came up" >&2
 	tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
 	exit 1
 fi
@@ -1964,7 +1974,6 @@ if [[ $mode == rust ]]; then
 	"$rust_binary" --config "$run_dir/tiproxy-ka.toml" \
 		--control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 		--health-port "$ka_health_port" \
-		--admin-addr "127.0.0.1:$ka_admin_port" \
 		${ka_rust_tls_args[@]+"${ka_rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
 	KA_RUST_PID=$!
@@ -1984,6 +1993,15 @@ if [[ $mode == rust ]]; then
 	done
 	if [[ $ka_ready != true ]]; then
 		echo "keyspace-guard rust dataplane never became ready" >&2
+		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
+		exit 1
+	fi
+	# CP-ADMIN 5c: the management API of this pair is the Rust process
+	# on api.addr (no --admin-addr); every later management call in this
+	# phase goes there.
+	if ! curl --noproxy '*' --fail --silent --max-time 5 \
+		"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+		echo "keyspace-guard management API (Rust, api.addr) did not answer" >&2
 		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
 		exit 1
 	fi
@@ -3072,18 +3090,8 @@ if [[ $ka_use_dropper == true && ${DATAPLANE_LEGACY_ROUTE_CHAOS:-0} == 1 ]]; the
 		exit 1
 	fi
 	echo "chain-c: Go restarted pid $cc_old_pid -> $KA_PID"
-	cc_api_up=false
-	for _ in {1..100}; do
-		if ! kill -0 "$KA_PID" 2>/dev/null; then break; fi
-		if curl --noproxy '*' --fail --silent \
-			"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
-			cc_api_up=true
-			break
-		fi
-		sleep 0.2
-	done
-	if [[ $cc_api_up != true ]]; then
-		echo "chain-c: restarted Go API never came up" >&2
+	if ! ka_wait_go_control_up "$KA_PID"; then
+		echo "chain-c: restarted Go control plane never came up" >&2
 		tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
 		exit 1
 	fi
@@ -3382,9 +3390,9 @@ if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 && $ka_use_dropper 
 		m9_wait_go() {
 			local ready=false
 			for _ in {1..150}; do
-				if kill -0 "$KA_PID" 2>/dev/null && [[ -S $KA_SOCKET ]] &&
-					curl --noproxy '*' --fail --silent --max-time 5 \
-						"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+				# Under RUST_API_OWNER the Go process serves no HTTP; its
+				# readiness is the control socket.
+				if kill -0 "$KA_PID" 2>/dev/null && [[ -S $KA_SOCKET ]]; then
 					ready=true
 					break
 				fi
@@ -3482,7 +3490,6 @@ if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 && $ka_use_dropper 
 			"$rust_binary" --config "$run_dir/tiproxy-ka.toml" \
 				--control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 				--health-port "$ka_health_port" \
-				--admin-addr "127.0.0.1:$ka_admin_port" \
 				${ka_rust_tls_args[@]+"${ka_rust_tls_args[@]}"} \
 				>>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
 			KA_RUST_PID=$!

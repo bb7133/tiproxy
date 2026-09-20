@@ -159,6 +159,11 @@ const (
 	// metering export outbox. This process-fixed assertion rejects mixed owner
 	// binaries during negotiation; metering batch/ACK bodies are retired.
 	ControlCapability_CONTROL_CAPABILITY_RUST_METER_OWNER ControlCapability = 7
+	// CP-ADMIN: Rust exclusively owns the management API (`api.addr`): Go
+	// starts no API server in this composition and metrics_batch is a retired
+	// wire body. This process-fixed assertion rejects mixed binaries during
+	// negotiation.
+	ControlCapability_CONTROL_CAPABILITY_RUST_API_OWNER ControlCapability = 8
 )
 
 // Enum value maps for ControlCapability.
@@ -172,6 +177,7 @@ var (
 		5: "CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE",
 		6: "CONTROL_CAPABILITY_RUST_ROUTE_OWNER",
 		7: "CONTROL_CAPABILITY_RUST_METER_OWNER",
+		8: "CONTROL_CAPABILITY_RUST_API_OWNER",
 	}
 	ControlCapability_value = map[string]int32{
 		"CONTROL_CAPABILITY_UNSPECIFIED":                   0,
@@ -182,6 +188,7 @@ var (
 		"CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE":         5,
 		"CONTROL_CAPABILITY_RUST_ROUTE_OWNER":              6,
 		"CONTROL_CAPABILITY_RUST_METER_OWNER":              7,
+		"CONTROL_CAPABILITY_RUST_API_OWNER":                8,
 	}
 )
 
@@ -4488,7 +4495,7 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fROLE_GO_CONTROL\x10\x01\x12\x17\n" +
-	"\x13ROLE_RUST_DATAPLANE\x10\x02*\xfc\x02\n" +
+	"\x13ROLE_RUST_DATAPLANE\x10\x02*\xa3\x03\n" +
 	"\x11ControlCapability\x12\"\n" +
 	"\x1eCONTROL_CAPABILITY_UNSPECIFIED\x10\x00\x12+\n" +
 	"'CONTROL_CAPABILITY_PER_CONNECTION_CLOSE\x10\x01\x12,\n" +
@@ -4497,7 +4504,8 @@ const file_dataplane_v1_control_proto_rawDesc = "" +
 	".CONTROL_CAPABILITY_METERING_ABSOLUTE_SNAPSHOTS\x10\x04\x12,\n" +
 	"(CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE\x10\x05\x12'\n" +
 	"#CONTROL_CAPABILITY_RUST_ROUTE_OWNER\x10\x06\x12'\n" +
-	"#CONTROL_CAPABILITY_RUST_METER_OWNER\x10\a*v\n" +
+	"#CONTROL_CAPABILITY_RUST_METER_OWNER\x10\a\x12%\n" +
+	"!CONTROL_CAPABILITY_RUST_API_OWNER\x10\b*v\n" +
 	"\x11ProxyProtocolMode\x12#\n" +
 	"\x1fPROXY_PROTOCOL_MODE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cPROXY_PROTOCOL_MODE_DISABLED\x10\x01\x12\x1a\n" +

@@ -62,6 +62,7 @@ func (srv *Server) startRustDataplane(
 	}
 
 	capabilities := []uint64{
+		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_API_OWNER),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_METER_OWNER),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_CONFIG_NAMESPACE),
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_ROUTE_OWNER),
@@ -69,6 +70,7 @@ func (srv *Server) startRustDataplane(
 	bridge, err := controlbridge.NewBridge(controlbridge.BridgeConfig{
 		RouteOwner:       true,
 		NativeMeterOwner: true,
+		NativeAPIOwner:   true,
 		Transport: transport.ServerConfig{
 			SocketPath: socketPath,
 			AllowedUID: &allowedUID,

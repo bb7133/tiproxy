@@ -40,7 +40,7 @@ tests/dataplane/integration/run.sh --mode rust --variant tls-proxy-zstd
 
 `preflight.sh` demands the capability contract from
 `tiproxy-rs --integration-capabilities` — currently
-`in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd`.
+`in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd`.
 The launcher refuses any variant whose required capability is absent; it never
 substitutes a raw TCP relay or the Go dataplane for a Rust success.
 The launcher enables the Go config's `rust-dataplane` gate (the Go

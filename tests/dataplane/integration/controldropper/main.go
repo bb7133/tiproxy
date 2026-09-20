@@ -79,6 +79,7 @@ const (
 	fieldRedirectResult       protowire.Number = 32
 	fieldDrainCommand         protowire.Number = 33
 	fieldDrainResult          protowire.Number = 34
+	fieldMetricsBatch         protowire.Number = 35
 	fieldMeteringBatch        protowire.Number = 36
 	fieldReconcileRequest     protowire.Number = 37
 	fieldReconcileSnapshot    protowire.Number = 38
@@ -318,6 +319,8 @@ func extractFrameAudit(body []byte) frameAudit {
 				audit.drainCommandSequence = nestedVarint(value, 6)
 			case fieldDrainResult:
 				audit.legacyBody = "drain_result"
+			case fieldMetricsBatch:
+				audit.legacyBody = "metrics_batch"
 			case fieldMeteringBatch:
 				audit.meteringKind = "batch"
 				audit.meteringSequence = nestedVarint(value, 1)
