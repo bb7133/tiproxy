@@ -15,7 +15,8 @@ CASES = [
     ("rate-ceil", "scheduler.rs", "(TICK.as_nanos() - 1)", "TICK.as_nanos()", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("rate-twenty-ms", "scheduler.rs", "interval < TICK * 2", "interval <= TICK * 2", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("rate-equal-deadline", "scheduler.rs", "since(last) >= interval", "since(last) > interval", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
-    ("queue-extra-slot", "scheduler.rs", "entries.len() >= self.capacity", "entries.len() > self.capacity", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
+    # The shared-clock harness uses CommandQueue, not the production session FIFO.
+    ("queue-extra-slot", "scheduler.rs", "if entries.len() >= self.capacity {", "if entries.len() > self.capacity {", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("refusal-record-boundary", "scheduler.rs", "since(last) >= Duration::from_secs(10)", "since(last) > Duration::from_secs(10)", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("rejected-offer-advances-watermark", "selector/scheduler.rs", "Ok(false)\n                                        | Err(", "Ok(false) => { state.schedules.entry(*group).or_default().accepted(now); }, Err(", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("close-uses-old-balance-clock", "selector/scheduler.rs", "let now = clock.close_now();", "let now = clock.balance_now();", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
