@@ -89,13 +89,16 @@ pub fn emit_line(line: &str) {
 ///
 /// Returns a diagnostic when the log directory or file cannot be opened.
 pub fn configure(settings: Option<&LogFileSettings>) -> Result<(), String> {
+    // Open, rotate, and prune under the same lock that serializes writes, so
+    // the previous writer can never append to a file this call has just
+    // renamed or removed.
+    let mut guard = output()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let next = match settings {
         None => Output::Stderr,
         Some(settings) => Output::File(RotatingFile::open(settings)?),
     };
-    let mut guard = output()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = next;
     Ok(())
 }
@@ -132,9 +135,7 @@ impl RotatingFile {
             settings.max_size_mb
         };
         let mut file = Self {
-            dir: path
-                .parent()
-                .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+            dir: parent_dir(&path),
             path,
             prefix,
             ext,
@@ -285,6 +286,16 @@ impl RotatingFile {
     }
 }
 
+/// The directory that holds `path`; a bare relative file name lives in the
+/// current directory, which `Path::parent` reports as an empty path that
+/// `read_dir` would reject.
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 /// Renders `2006-01-02T15-04-05.000` (UTC) for a backup file name.
 #[must_use]
 pub fn format_backup_timestamp(at: SystemTime) -> String {
@@ -416,6 +427,19 @@ mod tests {
             .unwrap_or_default();
         names.sort();
         names
+    }
+
+    #[test]
+    fn a_bare_file_name_prunes_in_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("tiproxy.log")), PathBuf::from("."));
+        assert_eq!(
+            parent_dir(Path::new("logs/tiproxy.log")),
+            PathBuf::from("logs")
+        );
+        assert_eq!(
+            parent_dir(Path::new("/var/log/tiproxy.log")),
+            PathBuf::from("/var/log")
+        );
     }
 
     #[test]

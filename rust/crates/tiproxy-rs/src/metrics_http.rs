@@ -121,7 +121,7 @@ fn respond(request: &RequestHead, registry: &MetricsRegistry) -> String {
     else {
         return simple(400, "Bad Request", "malformed request line\n");
     };
-    if !version.starts_with("HTTP/1.") {
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
         return simple(400, "Bad Request", "unsupported HTTP version\n");
     }
     let path = target.split('?').next().unwrap_or(target);
@@ -181,6 +181,8 @@ mod tests {
             ("garbage\r\n\r\n", "HTTP/1.0 400"),
             ("GET /metrics\r\n\r\n", "HTTP/1.0 400"),
             ("GET /metrics HTTP/2\r\n\r\n", "HTTP/1.0 400"),
+            ("GET /metrics HTTP/1.bad\r\n\r\n", "HTTP/1.0 400"),
+            ("GET /metrics HTTP/1.10\r\n\r\n", "HTTP/1.0 400"),
             ("GET  /metrics HTTP/1.1\r\n\r\n", "HTTP/1.0 400"),
             ("GET /metrics HTTP/1.1 extra\r\n\r\n", "HTTP/1.0 400"),
         ] {
