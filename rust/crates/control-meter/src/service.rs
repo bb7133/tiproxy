@@ -23,7 +23,7 @@ use control_plane::ownership::OwnerToken;
 use tokio::sync::watch;
 
 use crate::cloud_store::CloudStore;
-use crate::export::{ObjectStore, UploadFuture};
+use crate::export::{MaintenanceFuture, ObjectStore, UploadFuture};
 use crate::runtime::Meter;
 use crate::{Batch, Checkpoint, Consumer, DisabledSink, Error, Intake, LocalStore, Outbox};
 
@@ -63,6 +63,13 @@ impl Store {
 }
 
 impl ObjectStore for Store {
+    fn maintain(&self) -> MaintenanceFuture<'_> {
+        match self {
+            Self::Local(store) => store.maintain(),
+            Self::Cloud(store) => store.maintain(),
+        }
+    }
+
     fn put_new<'a>(&'a self, key: &'a str, body: Vec<u8>) -> UploadFuture<'a> {
         match self {
             Self::Local(store) => store.put_new(key, body),

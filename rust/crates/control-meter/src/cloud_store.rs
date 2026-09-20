@@ -19,12 +19,12 @@ use std::time::Duration;
 
 use control_config::MeteringConfig;
 use http::{Method, Request, StatusCode, request::Parts};
-use reqsign_core::{Context, ProvideCredentialChain, Signer};
+use reqsign_core::Context;
 use reqwest::{Client, Url};
 
 use crate::Error;
 use crate::cloud_context;
-use crate::export::{ObjectStore, UploadFuture};
+use crate::export::{MaintenanceFuture, ObjectStore, UploadFuture};
 
 /// Signed cloud storage transport. No credentials are included in debug output.
 pub struct CloudStore {
@@ -35,8 +35,8 @@ pub struct CloudStore {
 }
 
 enum CloudSigner {
-    S3(Signer<reqsign_aws_v4::Credential>),
-    Oss(Signer<reqsign_aliyun_oss::Credential>),
+    S3(crate::cloud_aws::AwsSigner),
+    Oss(crate::cloud_oss::OssSigner),
     Cos(crate::cloud_cos::CosSigner),
     Azure(crate::cloud_azure::AzureSigner),
 }
@@ -143,8 +143,8 @@ impl CloudStore {
             return self.send(parts, body).await;
         }
         match &self.signer {
-            CloudSigner::S3(signer) => signer.sign(&mut parts, None).await,
-            CloudSigner::Oss(signer) => signer.sign(&mut parts, None).await,
+            CloudSigner::S3(signer) => signer.sign(&mut parts).await,
+            CloudSigner::Oss(signer) => signer.sign(&mut parts).await,
             CloudSigner::Cos(signer) => signer.sign(&mut parts).await,
             CloudSigner::Azure(_) => return Err(Error::Export("invalid Azure signer dispatch")),
         }
@@ -165,6 +165,13 @@ impl CloudStore {
 }
 
 impl ObjectStore for CloudStore {
+    fn maintain(&self) -> MaintenanceFuture<'_> {
+        match &self.signer {
+            CloudSigner::Oss(signer) => Box::pin(signer.maintain()),
+            _ => Box::pin(std::future::pending()),
+        }
+    }
+
     fn put_new<'a>(&'a self, key: &'a str, body: Vec<u8>) -> UploadFuture<'a> {
         Box::pin(async move {
             let url = self.object_url(key)?;
@@ -210,10 +217,6 @@ fn bucket_host(url: &mut Url, bucket: &str) -> Result<(), Error> {
 }
 
 async fn s3(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSigner), Error> {
-    use reqsign_aws_v4::{
-        AssumeRoleCredentialProvider, DefaultCredentialProvider, RequestSigner,
-        StaticCredentialProvider,
-    };
     let region = aws_region(config, &context).await?;
     let domain = if region.starts_with("cn-") {
         "amazonaws.com.cn"
@@ -241,24 +244,12 @@ async fn s3(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSign
     } else {
         bucket_host(&mut url, &config.bucket)?;
     }
-    let base = if !cfg.access_key.is_empty() && !cfg.secret_access_key.is_empty() {
-        let mut provider = StaticCredentialProvider::new(&cfg.access_key, &cfg.secret_access_key);
-        if !cfg.session_token.is_empty() {
-            provider = provider.with_session_token(&cfg.session_token);
-        }
-        ProvideCredentialChain::new().push(provider)
+    let sts_endpoint = if config.endpoint.is_empty() {
+        None
     } else {
-        ProvideCredentialChain::new().push(DefaultCredentialProvider::new())
+        Some(endpoint(&config.endpoint)?)
     };
-    let signer = if cfg.assume_role_arn.is_empty() {
-        Signer::new(context, base, RequestSigner::new("s3", &region))
-    } else {
-        let sts = Signer::new(context.clone(), base, RequestSigner::new("sts", &region));
-        let role = AssumeRoleCredentialProvider::new(cfg.assume_role_arn, sts)
-            .with_region(region.clone())
-            .with_regional_sts_endpoint();
-        Signer::new(context, role, RequestSigner::new("s3", &region))
-    };
+    let signer = crate::cloud_aws::AwsSigner::new(&cfg, region, sts_endpoint, context);
     Ok((url, CloudSigner::S3(signer)))
 }
 
@@ -316,10 +307,6 @@ async fn aws_region(config: &MeteringConfig, ctx: &Context) -> Result<String, Er
 }
 
 fn oss(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSigner), Error> {
-    use reqsign_aliyun_oss::{
-        AssumeRoleCredentialProvider, DefaultCredentialProvider, RequestSigner, SigningVersion,
-        StaticCredentialProvider,
-    };
     if config.region.is_empty() {
         return Err(Error::Invalid("OSS region is required"));
     }
@@ -333,30 +320,7 @@ fn oss(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSigner), 
     let mut url = endpoint(&raw)?;
     bucket_host(&mut url, &config.bucket)?;
     let cfg = config.oss.clone().unwrap_or_default();
-    let base = if !cfg.access_key.is_empty() && !cfg.secret_access_key.is_empty() {
-        let mut provider = StaticCredentialProvider::new(&cfg.access_key, &cfg.secret_access_key);
-        if !cfg.session_token.is_empty() {
-            provider = provider.with_security_token(&cfg.session_token);
-        }
-        ProvideCredentialChain::new().push(provider)
-    } else {
-        ProvideCredentialChain::new().push(DefaultCredentialProvider::new())
-    };
-    let signer = RequestSigner::new(&config.bucket)
-        .with_region(&config.region)
-        .with_signing_version(SigningVersion::V4);
-    let signer = if cfg.assume_role_arn.is_empty() {
-        Signer::new(context, base, signer)
-    } else {
-        Signer::new(
-            context,
-            AssumeRoleCredentialProvider::new()
-                .with_base_provider(base)
-                .with_role_arn(cfg.assume_role_arn)
-                .with_role_session_name("metering-writer"),
-            signer,
-        )
-    };
+    let signer = crate::cloud_oss::OssSigner::new(&cfg, &config.region, &config.bucket, context);
     Ok((url, CloudSigner::Oss(signer)))
 }
 
@@ -686,8 +650,8 @@ mod tests {
                     .into_parts()
                     .0;
                 match &signer {
-                    CloudSigner::S3(signer) => signer.sign(&mut parts, None).await,
-                    CloudSigner::Oss(signer) => signer.sign(&mut parts, None).await,
+                    CloudSigner::S3(signer) => signer.sign(&mut parts).await,
+                    CloudSigner::Oss(signer) => signer.sign(&mut parts).await,
                     CloudSigner::Cos(_) | CloudSigner::Azure(_) => unreachable!(),
                 }
                 .unwrap_or_else(|e| unreachable!("{e}"));

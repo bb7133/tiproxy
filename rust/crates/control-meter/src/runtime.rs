@@ -146,10 +146,19 @@ impl<S: ObjectStore> Meter<S> {
     ///
     /// # Errors
     /// Returns on duplicate start, invalid wall time or final export failure.
-    pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), Error> {
+    pub async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<(), Error> {
         if self.started.swap(true, Ordering::AcqRel) {
             return Err(Error::Invalid("meter export worker already started"));
         }
+        // Keep polling maintenance while an export awaits the same credential
+        // lock. Selecting it only between exports would suspend its lock holder.
+        tokio::select! {
+            never = self.store.maintain() => match never {},
+            result = self.run_exports(shutdown) => result,
+        }
+    }
+
+    async fn run_exports(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), Error> {
         let current = unix_seconds()?;
         let _ = self.attempt(current / INTERVAL * INTERVAL).await;
         let mut next = current / INTERVAL * INTERVAL + INTERVAL;

@@ -15,8 +15,29 @@ only to the metering client; other clients' explicit CA trust stays unchanged.
 Errors expose fixed classes, not service URLs, headers, response bodies or keys.
 Credential file, HTTP response and command output reads have a 4 MiB bound.
 
-AWS and OSS use maintained reqsign credential providers, including static keys,
-default sources and explicit AssumeRole. COS adapts the pinned Go SDK's source
+AWS and OSS use maintained reqsign source providers and signing primitives with
+native role/cache adapters. AWS uses the Go 900-second POST request and a stable
+`aws-go-sdk-{UnixNano}` session name, applies custom BaseEndpoint to STS, and caches
+until actual expiration (no additional reqsign freshness margin). OSS uses the
+pinned regional STS endpoint map, POST/query HMAC-SHA1, a 3600-second request and
+`oss-sdk-session-{UnixSeconds}`. Its role cache refreshes 15 minutes before expiry;
+refresh errors are returned even while the old credentials remain unexpired.
+Configured OSS static keys use access_key semantics for STS, which ignore the
+configured SessionToken; direct OSS writes retain it. A five-minute OSS background
+refresh starts only after a first token exists and ignores its own refresh errors,
+as Go does. The maintenance future is polled alongside all exports and dropped
+with the Meter worker, bounding cancellation without an orphaned task.
+
+Actual Go SDK captures verify three AWS endpoint/body cases and two OSS signed
+requests (including complete HMACs). AWS's generated session is normalized in
+its fixture; OSS timestamp/nonce are captured and reused by the comparison, so
+regenerating that fixture changes the recorded signature. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/assume-role-go.go
+```
+
+COS adapts the pinned Go SDK's source
 precedence (env, TKE, profile, CVM), caches the selected source, and provides its
 missing AssumeRole flow. The two-hour role refresh starts before expiration;
 a failed refresh may reuse an unexpired credential, never an expired one.
@@ -25,7 +46,7 @@ temporary credential validity. Malformed configured COS credentials stop the
 chain rather than silently changing identity. The pinned Go env provider ignores
 the token environment variable; explicit configured session tokens still work.
 
-Seven focused cloud tests exercise real local HTTP HEAD/PUT, key escaping,
+Focused cloud tests exercise real local HTTP HEAD/PUT, key escaping,
 session tokens, existing/denied objects, AWS/OSS role replacement and caching,
 COS profile/CVM/TKE sources, and role refresh failure/expiration. S3 endpoint/bucket addressing also matches nine
 actual Go SDK requests (default/custom/path style/IP/dotted/non-DNS names).
@@ -59,9 +80,10 @@ Service, Azure ML, Cloud Shell, Service Fabric and Azure Arc. Nine actual Go SDK
 request captures cover these sources, user identity selection, and the IMDS probe
 used only when DefaultAzureCredential selects more than the managed credential.
 The adapter preserves source-specific methods, query names/versions and secret
-headers. Arc validates its platform token directory, `.key` extension and 4096-byte
-limit before using the challenge key in a sensitive Basic header; unsupported
-platforms reject the challenge as Go does. This is local protocol coverage, not
+headers. Arc supports the Linux token directory, `.key` extension and 4096-byte
+limit before using the challenge key in a sensitive Basic header. Windows Arc
+(the other Go platform) is outside this Linux dataplane target; other platforms
+reject the challenge as Go does. This is local protocol coverage, not
 live cloud acceptance.
 
 Only unavailable managed identity permits trying a later default-chain source:
@@ -72,17 +94,26 @@ Go's unavailable error reporters are. The first successful source stays selected
 The five-minute MSAL cache validity margin, server `refresh_in` refresh/fallback,
 retry status sets, jittered backoff and Retry-After precedence/cap are retained.
 The synthetic half-life returned by Go MSAL is assigned after `cache.Write`, so
-it does not itself trigger that credential's cache refresh. Outer credential I/O
+the outer BearerPolicy calls the credential at half-life, but MSAL returns the
+same cached token without metadata HTTP and with zero `RefreshOn`. Subsequent
+outer refresh uses the five-minute rule. The actual Go end-to-end probe below
+forces only the outer timestamp and verifies two credential calls, one metadata
+HTTP call and unchanged token/expiration (it waits for azcore's 30-second refresh
+backoff). Empty or already expired tokens are rejected more strictly than Go
+MSAL; malformed IMDS replies are classified unavailable. Outer credential I/O
 and metering upload deadlines still bound all work.
 
 Regenerate managed identity request fixtures with:
 
 ```sh
 go run rust/crates/control-meter/testdata/azure-managed-go.go
+go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
 Full default-credential/endpoint edge parity and binary ownership handoff remain
-in progress. AWS/OSS role refresh/fallback still needs complete Go comparisons.
+in progress. Provider retry-policy and default-chain edge comparisons remain
+open; the AWS STS adapter currently makes one bounded attempt and export failure
+retains the pending window for the next metering attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would

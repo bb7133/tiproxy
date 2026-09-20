@@ -500,6 +500,7 @@ dependencies = [
  "http",
  "openssl",
  "reqsign-aliyun-oss",
+ "reqsign-aws-core",
  "reqsign-aws-v4",
  "reqsign-core",
  "reqsign-tencent-cos",

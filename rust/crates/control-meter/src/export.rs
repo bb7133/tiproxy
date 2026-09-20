@@ -27,6 +27,10 @@ use crate::{Error, ExportWindow, Outbox};
 /// Async upload result. Implementations must not include credentials in errors.
 pub type UploadFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 
+/// Credential maintenance lives exactly as long as the export worker.
+pub type MaintenanceFuture<'a> =
+    Pin<Box<dyn Future<Output = std::convert::Infallible> + Send + 'a>>;
+
 /// Storage seam for one immutable, compressed metering object.
 pub trait ObjectStore: Send + Sync {
     /// Refuses an existing object, matching the Go SDK default overwrite policy.
@@ -34,6 +38,12 @@ pub trait ObjectStore: Send + Sync {
     /// # Errors
     /// Returns an error if existence checking or upload fails, or the key exists.
     fn put_new<'a>(&'a self, key: &'a str, body: Vec<u8>) -> UploadFuture<'a>;
+
+    /// Refreshes cached credentials in the background, if the provider needs it.
+    /// Dropping this future cancels in-flight refresh work at shutdown.
+    fn maintain(&self) -> MaintenanceFuture<'_> {
+        Box::pin(std::future::pending())
+    }
 }
 
 /// One Go SDK-compatible object (`TiProxy` uses the SDK's unpaginated default).

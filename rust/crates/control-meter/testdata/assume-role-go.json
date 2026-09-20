@@ -1,0 +1,40 @@
+[
+  {
+    "name": "aws-regional",
+    "method": "POST",
+    "url": "https://sts.us-east-1.amazonaws.com/",
+    "body": "Action=AssumeRole\u0026DurationSeconds=900\u0026RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fmetering\u0026RoleSessionName=aws-go-sdk-1789891200000000000\u0026Version=2011-06-15",
+    "content_type": "application/x-www-form-urlencoded",
+    "security_token": "base-token"
+  },
+  {
+    "name": "aws-china",
+    "method": "POST",
+    "url": "https://sts.cn-north-1.amazonaws.com.cn/",
+    "body": "Action=AssumeRole\u0026DurationSeconds=900\u0026RoleArn=arn%3Aaws-cn%3Aiam%3A%3A123456789012%3Arole%2Fmetering\u0026RoleSessionName=aws-go-sdk-1789891200000000000\u0026Version=2011-06-15",
+    "content_type": "application/x-www-form-urlencoded",
+    "security_token": "base-token"
+  },
+  {
+    "name": "aws-custom",
+    "method": "POST",
+    "url": "http://sts.fixture.invalid:9000/prefix",
+    "body": "Action=AssumeRole\u0026DurationSeconds=900\u0026RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fmetering\u0026RoleSessionName=aws-go-sdk-1789891200000000000\u0026Version=2011-06-15",
+    "content_type": "application/x-www-form-urlencoded",
+    "security_token": "base-token"
+  },
+  {
+    "name": "oss-access_key",
+    "method": "POST",
+    "url": "https://sts.cn-hangzhou.aliyuncs.com/?AccessKeyId=base-id\u0026Action=AssumeRole\u0026DurationSeconds=3600\u0026Format=json\u0026RoleArn=acs%3Aram%3A%3A123456789012%3Arole%2Fmetering\u0026RoleSessionName=oss-sdk-session-1789908461\u0026Signature=D3ncZXBqFk3yMYJmifPZ8w9R5zc%3D\u0026SignatureMethod=HMAC-SHA1\u0026SignatureNonce=5d5e52cc6c3a85085ad9129373189220\u0026SignatureVersion=1.0\u0026Timestamp=2026-09-20T12%3A47%3A41Z\u0026Version=2015-04-01",
+    "body": "",
+    "content_type": ""
+  },
+  {
+    "name": "oss-sts",
+    "method": "POST",
+    "url": "https://sts.cn-hangzhou.aliyuncs.com/?AccessKeyId=base-id\u0026Action=AssumeRole\u0026DurationSeconds=3600\u0026Format=json\u0026RoleArn=acs%3Aram%3A%3A123456789012%3Arole%2Fmetering\u0026RoleSessionName=oss-sdk-session-1789908461\u0026SecurityToken=base-token\u0026Signature=PU3XT2iXld3w9gPcGQoKY6hgXwE%3D\u0026SignatureMethod=HMAC-SHA1\u0026SignatureNonce=c3fd9b553607ee7a3c570017181ee8fb\u0026SignatureVersion=1.0\u0026Timestamp=2026-09-20T12%3A47%3A41Z\u0026Version=2015-04-01",
+    "body": "",
+    "content_type": ""
+  }
+]

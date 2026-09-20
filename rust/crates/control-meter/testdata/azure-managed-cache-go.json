@@ -1,0 +1,9 @@
+{
+  "credential_calls": 2,
+  "first_refresh_on_nonzero": true,
+  "managed_http_calls": 1,
+  "outer_refresh_forced": true,
+  "same_expiration": true,
+  "same_token": true,
+  "second_refresh_on_zero": true
+}

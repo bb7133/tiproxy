@@ -17,11 +17,13 @@
 //! This module owns no wire protocol. Its persistence remains compatible with
 //! the Go consumer and outbox during the staged ownership handoff.
 
+mod cloud_aws;
 mod cloud_azure;
 mod cloud_azure_identity;
 mod cloud_azure_managed;
 mod cloud_context;
 mod cloud_cos;
+mod cloud_oss;
 pub mod cloud_store;
 mod consumer;
 pub mod export;

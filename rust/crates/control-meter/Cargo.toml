@@ -21,6 +21,7 @@ reqwest.workspace = true
 rustls-native-certs.workspace = true
 rust-ini.workspace = true
 reqsign-core.workspace = true
+reqsign-aws-core.workspace = true
 reqsign-aws-v4.workspace = true
 reqsign-aliyun-oss.workspace = true
 reqsign-tencent-cos.workspace = true

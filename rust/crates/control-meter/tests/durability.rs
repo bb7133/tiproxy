@@ -772,3 +772,62 @@ async fn disabled_service_still_rejects_corruption_and_retired_owner() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn credential_maintenance_progresses_during_export_and_is_cancelled_on_exit() {
+    use control_meter::export::{MaintenanceFuture, ObjectStore, UploadFuture};
+    use control_meter::runtime::Meter;
+    use std::sync::{Arc, atomic::AtomicBool};
+    use std::time::Duration;
+
+    struct Store {
+        lock: tokio::sync::Mutex<()>,
+        started: tokio::sync::Semaphore,
+        resume: tokio::sync::Notify,
+        exited: Arc<AtomicBool>,
+    }
+    struct ExitFlag(Arc<AtomicBool>);
+    impl Drop for ExitFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    impl ObjectStore for Store {
+        fn maintain(&self) -> MaintenanceFuture<'_> {
+            Box::pin(async move {
+                let _exit = ExitFlag(self.exited.clone());
+                let guard = self.lock.lock().await;
+                self.started.add_permits(1);
+                self.resume.notified().await;
+                drop(guard);
+                std::future::pending().await
+            })
+        }
+        fn put_new<'a>(&'a self, _: &'a str, _: Vec<u8>) -> UploadFuture<'a> {
+            Box::pin(async move {
+                self.started.acquire().await.unwrap().forget();
+                self.resume.notify_one();
+                // Maintenance must still be polled while this export waits.
+                let _guard = self.lock.lock().await;
+                Ok(())
+            })
+        }
+    }
+    let f = Fixture::new();
+    let exited = Arc::new(AtomicBool::new(false));
+    let store = Store {
+        lock: tokio::sync::Mutex::new(()),
+        started: tokio::sync::Semaphore::new(0),
+        resume: tokio::sync::Notify::new(),
+        exited: exited.clone(),
+    };
+    let meter = Meter::new(f.consumer(), store, String::new());
+    meter.apply(&batch(1, 10, 5)).unwrap();
+    let (_, shutdown) = tokio::sync::watch::channel(true);
+    tokio::time::timeout(Duration::from_secs(2), meter.run(shutdown))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(exited.load(Ordering::SeqCst));
+    assert!(f.outbox().pending().is_none());
+}
