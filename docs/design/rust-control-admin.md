@@ -278,10 +278,23 @@ certificate.
   literal quoting and `\C` are not supported here, a pattern over the crate's
   compiled-size limit is rejected here while Go compiles it, and Go's `(?U)`
   ungreedy flag and `[[:word:]]` classes behave the same.
+- **Slice 4d (`tiproxyctl` compatibility)** — the real `tiproxyctl` binary is
+  the third oracle client: `make controlplane-cpctl-evidence` builds it and
+  runs `tests/controlplane/cpctl/script.json` against the production Go API
+  server (plaintext, and the cmux TLS branch with auto certificates driven
+  with `--insecure`; `pkg/server/api.TestCPCtlCapture`) and against the Rust
+  listener in the same two modes (`examples/cpctl_replay.rs`), comparing
+  every command's exit code and stdout: `health`, `config get`/`config set
+  --input`, `namespace list`/`put`/`get`/`import`/`commit`/`del` including
+  missing namespaces, and `traffic show`/`capture`/`replay`/`cancel`, which
+  both sides refuse with the disabled message while traffic replay is off.
+  `config get` and `health` are compared semantically (the TOML renderers
+  differ in layout and omitted zero fields); every other observation,
+  including the CLI's `namespace list` failure on an empty set (the Go server
+  answers `""`, which the CLI cannot decode as a namespace list, and the Rust
+  server answers the same), matches byte for byte. No declared differences.
 - **Slice 4 (remaining)** — `ServerInfo` (4c: fix the Go `sysutil` item
   inventory first, then implement natively or evaluate a pinned
-  host-information dependency) and the `tiproxyctl` compatibility step (4d: the
-  real `tiproxyctl` binary against the Go and Rust ports in the CP-ADMIN
-  harness).
+  host-information dependency).
 - **Slice 5** — `/api/backend/metrics`, `/api/debug/redirect`, retirement
   bookkeeping for `metrics_batch`, and the profiling residual.

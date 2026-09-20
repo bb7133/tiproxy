@@ -1,0 +1,170 @@
+{
+  "files": {
+    "config.toml": "[proxy]\nmax-connections = 5\n",
+    "ns-a.toml": "namespace = \"ns-a\"\n\n[frontend]\nuser = \"user-a\"\n\n[backend]\ninstances = [\"127.0.0.1:4000\"]\n",
+    "nsdir/ns-b.toml": "namespace = \"ns-b\"\n\n[frontend]\nuser = \"user-b\"\n\n[backend]\ninstances = [\"127.0.0.1:4001\"]\n",
+    "nsdir/ns-c.toml": "namespace = \"ns-c\"\n\n[frontend]\nuser = \"user-c\"\n\n[backend]\ninstances = [\"127.0.0.1:4002\"]\n",
+    "nsdir/ignored.txt": "not a namespace\n"
+  },
+  "commands": [
+    {
+      "name": "health",
+      "args": [
+        "health"
+      ],
+      "compare": "json_semantic"
+    },
+    {
+      "name": "config-get",
+      "args": [
+        "config",
+        "get"
+      ],
+      "compare": "toml_semantic"
+    },
+    {
+      "name": "config-set",
+      "args": [
+        "config",
+        "set",
+        "--input",
+        "@config.toml"
+      ]
+    },
+    {
+      "name": "config-get-after-set",
+      "args": [
+        "config",
+        "get"
+      ],
+      "compare": "toml_semantic"
+    },
+    {
+      "name": "namespace-list-empty",
+      "args": [
+        "namespace",
+        "list"
+      ]
+    },
+    {
+      "name": "namespace-put-a",
+      "args": [
+        "namespace",
+        "put",
+        "--ns",
+        "@ns-a.toml"
+      ]
+    },
+    {
+      "name": "namespace-get-a",
+      "args": [
+        "namespace",
+        "get",
+        "ns-a"
+      ]
+    },
+    {
+      "name": "namespace-import",
+      "args": [
+        "namespace",
+        "import",
+        "@nsdir"
+      ]
+    },
+    {
+      "name": "namespace-list",
+      "args": [
+        "namespace",
+        "list"
+      ]
+    },
+    {
+      "name": "namespace-commit-a",
+      "args": [
+        "namespace",
+        "commit",
+        "ns-a"
+      ]
+    },
+    {
+      "name": "namespace-commit-two",
+      "args": [
+        "namespace",
+        "commit",
+        "ns-b",
+        "ns-c"
+      ]
+    },
+    {
+      "name": "namespace-commit-missing",
+      "args": [
+        "namespace",
+        "commit",
+        "ns-zzz"
+      ]
+    },
+    {
+      "name": "namespace-del-a",
+      "args": [
+        "namespace",
+        "del",
+        "ns-a"
+      ]
+    },
+    {
+      "name": "namespace-get-missing",
+      "args": [
+        "namespace",
+        "get",
+        "ns-a"
+      ]
+    },
+    {
+      "name": "namespace-del-missing",
+      "args": [
+        "namespace",
+        "del",
+        "ns-zzz"
+      ]
+    },
+    {
+      "name": "traffic-show",
+      "args": [
+        "traffic",
+        "show"
+      ]
+    },
+    {
+      "name": "traffic-capture",
+      "args": [
+        "traffic",
+        "capture",
+        "--output",
+        "/tmp/cpctl-capture",
+        "--duration",
+        "1m"
+      ]
+    },
+    {
+      "name": "traffic-replay",
+      "args": [
+        "traffic",
+        "replay",
+        "--input",
+        "/tmp/cpctl-capture",
+        "--username",
+        "root",
+        "--password",
+        ""
+      ]
+    },
+    {
+      "name": "traffic-cancel",
+      "args": [
+        "traffic",
+        "cancel"
+      ]
+    }
+  ],
+  "declared": {}
+}

@@ -114,6 +114,8 @@ jobs:
         run: make controlplane-cpadmin-evidence
       - name: Check the diagnostics gRPC service against the Go server
         run: make controlplane-cpdiag-evidence
+      - name: Check tiproxyctl against the Go and Rust management planes
+        run: make controlplane-cpctl-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests
