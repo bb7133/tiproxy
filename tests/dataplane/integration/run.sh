@@ -1786,12 +1786,15 @@ ka_drop_admin_port=$((8100 + port_offset))
 # CP-ADMIN: the Rust process serves the management API itself. M9 drives its
 # operator drains through this port, so they never cross the bridge.
 ka_admin_port=$((8101 + port_offset))
+# CP-ADMIN 5a: the Rust metric-owner endpoint gets a fixed port so the
+# management plane's backend/metrics answer can be compared with it.
+ka_metrics_owner_port=$((8102 + port_offset))
 ka_phase_ports=("$ka_sql_port" "$ka_api_port" "$ka_health_port")
 if [[ $ka_use_dropper == true ]]; then
 	ka_phase_ports+=("$ka_drop_admin_port")
 fi
 if [[ $mode == rust ]]; then
-	ka_phase_ports+=("$ka_admin_port")
+	ka_phase_ports+=("$ka_admin_port" "$ka_metrics_owner_port")
 fi
 for port in "${ka_phase_ports[@]}"; do
 	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
@@ -1832,8 +1835,8 @@ text = re.sub(r'(?m)^graceful-wait-before-shutdown = 0$',
 open(path, 'w').write(text)
 PYKA
 if [[ $mode == rust ]]; then
-	printf '\n[rust-dataplane]\nenabled = true\ncontrol-socket = "%s"\n' \
-		"$KA_SOCKET" >>"$run_dir/tiproxy-ka.toml"
+	printf '\n[rust-dataplane]\nenabled = true\ncontrol-socket = "%s"\nmetrics-owner-port = %s\n' \
+		"$KA_SOCKET" "$ka_metrics_owner_port" >>"$run_dir/tiproxy-ka.toml"
 	if [[ $TLS_ENABLED == true ]]; then
 		# The keyspace-guard config strips the whole [rust-dataplane] block
 		# (and its tls-allowed-roots) when it is regenerated, so re-admit the
@@ -2228,6 +2231,85 @@ if [[ $mode == rust ]]; then
 		exit 1
 	fi
 	echo "MIG-01 live migration: proxy_conn_id=$mig_proxy_conn_id A0=$TIDB_PORT_0 -> A1=$TIDB_PORT_1; database+user-variable restored ($mig_result)"
+
+	# CP-ADMIN 5a/5b real-process row. 5b: the management redirect sweep
+	# (Go debug/redirect) must self-migrate the persistent session on the
+	# backend it is on (A1): a new backend connection, database and user
+	# variable restored, the route ledger settled with the same active count.
+	# 5a: the admin backend/metrics answer must be the metric-owner
+	# endpoint's bytes, for a named cluster and for the empty name.
+	adm_ledger() {
+		curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_health_port/health" |
+			python3 -c 'import json,sys; l=json.load(sys.stdin)["route_ledger"]; print(l["active"], l["incoming"], l["outgoing"], l["unsettled_redirects"])'
+	}
+	read -r adm_active_before _ _ _ <<<"$(adm_ledger)" || exit 1
+	adm_log_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log")
+	adm_conn_before=$(cut -d'|' -f2 <<<"$mig_result")
+	adm_code=$(curl --noproxy '*' --silent --show-error -X POST \
+		"http://127.0.0.1:$ka_admin_port/api/debug/redirect" \
+		-o "$run_dir/cp-admin-redirect.json" -w '%{http_code}')
+	if [[ $adm_code != 200 || $(cat "$run_dir/cp-admin-redirect.json") != '""' ]]; then
+		echo "CP-ADMIN debug/redirect answered $adm_code: $(cat "$run_dir/cp-admin-redirect.json" 2>/dev/null)" >&2
+		exit 1
+	fi
+	adm_summary=
+	for _ in {1..40}; do
+		adm_summary=$(tail -n "+$((adm_log_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"redirect_connections"' | head -1 || true)
+		[[ -n $adm_summary ]] && break
+		sleep 0.25
+	done
+	if [[ -z $adm_summary ]]; then
+		echo "CP-ADMIN redirect sweep logged no summary" >&2
+		exit 1
+	fi
+	adm_accepted=$(sed -n 's/.*"accepted":\([0-9]*\).*/\1/p' <<<"$adm_summary")
+	adm_offered=$(sed -n 's/.*"offered":\([0-9]*\).*/\1/p' <<<"$adm_summary")
+	if [[ -z $adm_accepted || $adm_accepted -lt 1 ]]; then
+		echo "CP-ADMIN redirect sweep accepted nothing: $adm_summary" >&2
+		exit 1
+	fi
+	adm_settled=false
+	for _ in {1..100}; do
+		read -r adm_active adm_incoming adm_outgoing adm_unsettled <<<"$(adm_ledger)" || exit 1
+		if [[ $adm_incoming == 0 && $adm_outgoing == 0 && $adm_unsettled == 0 ]]; then
+			adm_settled=true
+			break
+		fi
+		sleep 0.1
+	done
+	if [[ $adm_settled != true || $adm_active != "$adm_active_before" ]]; then
+		echo "CP-ADMIN redirect sweep did not settle (active $adm_active_before -> $adm_active, incoming $adm_incoming, outgoing $adm_outgoing, unsettled $adm_unsettled)" >&2
+		exit 1
+	fi
+	adm_row=$(migration_query MIGADM \
+		"SELECT CONCAT('MIGADM|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(), 'NULL'), '|', COALESCE(@mig01_marker, 'NULL'));") || exit 1
+	adm_conn_after=$(cut -d'|' -f2 <<<"$adm_row")
+	if [[ $(cut -d'|' -f3 <<<"$adm_row") != "$TIDB_PORT_1" || $(cut -d'|' -f4 <<<"$adm_row") != mig01_live ||
+		$(cut -d'|' -f5 <<<"$adm_row") != state-live || $adm_conn_after == "$adm_conn_before" ]]; then
+		echo "CP-ADMIN self-migration lost state or stayed on the old backend connection: before conn $adm_conn_before, after $adm_row" >&2
+		exit 1
+	fi
+	for adm_cluster in cluster-a cluster-b ""; do
+		adm_admin_headers="$run_dir/cp-admin-backend-metrics-${adm_cluster:-primary}.headers"
+		if ! curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			-D "$adm_admin_headers" -o "$run_dir/cp-admin-backend-metrics-${adm_cluster:-primary}.json" \
+			"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=$adm_cluster" ||
+			! curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+				-o "$run_dir/cp-owner-backend-metrics-${adm_cluster:-primary}.json" \
+				"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=$adm_cluster"; then
+			echo "CP-ADMIN backend/metrics request failed for cluster '$adm_cluster'" >&2
+			exit 1
+		fi
+		if ! grep -qi '^content-type: application/json' "$adm_admin_headers" ||
+			! cmp -s "$run_dir/cp-admin-backend-metrics-${adm_cluster:-primary}.json" \
+				"$run_dir/cp-owner-backend-metrics-${adm_cluster:-primary}.json"; then
+			echo "CP-ADMIN backend/metrics for cluster '$adm_cluster' differs from the metric-owner endpoint" >&2
+			exit 1
+		fi
+	done
+	echo "CP-ADMIN: debug/redirect sweep offered=$adm_offered accepted=$adm_accepted settled with $adm_active active; persistent session self-migrated on A1 (backend conn $adm_conn_before -> $adm_conn_after, database+user-variable restored); backend/metrics admin == metric-owner bytes (cluster-a $(wc -c <"$run_dir/cp-admin-backend-metrics-cluster-a.json") B, cluster-b $(wc -c <"$run_dir/cp-admin-backend-metrics-cluster-b.json") B, primary $(wc -c <"$run_dir/cp-admin-backend-metrics-primary.json") B)"
 
 	# Close the migrated client, then restore the initial A0 pin before the
 	# separate cross-keyspace refusal phase establishes its own old session.

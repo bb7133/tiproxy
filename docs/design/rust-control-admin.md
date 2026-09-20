@@ -373,10 +373,16 @@ certificate.
   (pending skipped, refused offer without error, no cooldown, score
   unchanged) and mirrored by the ledger test. Evidence: the CP-ADMIN
   comparator compares the sweep answer, the mocked router-level error and
-  `HEAD`; a real-process row that drives the sweep on a live Rust process
-  (every session self-migrates on its own backend with SQL uninterrupted)
-  together with the admin-versus-owner `backend/metrics` byte comparison
-  is still to be added to the integration harness.
+  `HEAD`. The plain Rust integration run (`tests/dataplane/integration`,
+  after the MIG-01 live migration) drives the sweep on the live Rust
+  process through its admin port: the answer is `200 ""`, the logged
+  summary accepts the persistent session, the route ledger settles with
+  the same active count, and the session is still on A1 on a **new**
+  backend connection with its database and user variable restored; the
+  same row fixes the metric-owner port (`rust-dataplane.metrics-owner-port`)
+  and requires the admin `backend/metrics` answer (`200`,
+  `application/json`) to be byte-identical to the metric-owner endpoint's
+  for both cluster names and the empty name.
 - **Slice 5 (remaining)** — the Go API retirement and final composition
   (5c, merged with the native metering owner's startup and shutdown
-  order); the real-process 5a/5b row; the profiling residual stays open.
+  order); the profiling residual stays open.
