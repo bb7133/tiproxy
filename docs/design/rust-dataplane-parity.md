@@ -240,9 +240,9 @@ the exact bridge inventory:
 | Family | Production count/effect | Retained reason |
 | --- | --- | --- |
 | `StateSnapshot` / `SnapshotResult` | Residual only: backends/namespaces empty; config carries static MySQL capability/version facts. Nonempty route state is rejected. | Snapshot/static acknowledgement until an owner-specific protocol v2. |
-| `Handshake*`, `Route*`, `ConnectionEvent`, `Redirect*`, `Close*` | Zero. An injected body increments `rust_legacy_route_violation` and leaves the route-state hash unchanged. | Numeric v1 tags/types are non-actionable tombstones. |
-| `ReconcileRequest` / `ReconcileSnapshot` | Connections empty, connection-event sequence zero, response connections empty; no route callback/effect. | Snapshot, metrics/metering and CP-ADMIN drain watermarks. |
-| `Drain*`, `MetricsBatch`, `MeteringBatch` / `MeteringAck` | Retained on their dedicated owner paths. | CP-ADMIN, observability, and durable CP-METER are not route ownership. |
+| `Handshake*`, `Route*`, `ConnectionEvent`, `Redirect*`, `Close*`, `Drain*` | Zero. An injected body increments `rust_legacy_route_violation` (the count includes retired drain bodies) and leaves the route-state hash unchanged. | Numeric v1 tags/types are non-actionable tombstones; operator drains are issued inside the Rust process (CP-ADMIN slice 3). |
+| `ReconcileRequest` / `ReconcileSnapshot` | Connections empty, connection-event sequence zero, response connections empty; no route callback/effect. | Snapshot, metrics/metering watermarks; the drain watermark is Rust's own diagnostic value. |
+| `MetricsBatch`, `MeteringBatch` / `MeteringAck` | Retained on their dedicated owner paths. | Observability and durable CP-METER are not route ownership. |
 
 Production Go constructs the residual handler without `RouterAdapter`, does
 not attach a handshake/router/topology fallback, and does not call

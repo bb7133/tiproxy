@@ -30,9 +30,9 @@ use std::time::Duration;
 use control_proto::control_transport::{ConnectionState, Handler, SessionMeta, TransportError};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
-    CloseCommand, ConnectionIdentity, ControlCapability, ControlEnvelope, DrainCommand, ErrorCode,
-    ErrorSource, MeteringAck, MeteringDelta, MeteringSourceSnapshot, ProtocolError,
-    ReconcileConnection, ReconcileSnapshot, RedirectCommand, RouteAssignment,
+    CloseCommand, ConnectionIdentity, ControlCapability, ControlEnvelope, DrainCommand,
+    DrainResult, ErrorCode, ErrorSource, MeteringAck, MeteringDelta, MeteringSourceSnapshot,
+    ProtocolError, ReconcileConnection, ReconcileSnapshot, RedirectCommand, RouteAssignment,
 };
 use dataplane::MeteringLedger;
 use dataplane::control_dispatch::{
@@ -215,11 +215,14 @@ async fn close_dispatch_end_to_end() {
     assert!(handler.close_completed(1, "c-1").is_none());
 }
 
-/// Drain dispatch: matched sessions get graceful closes at admission,
-/// per-id accounting flows through `session_closed`, the force deadline
-/// closes the remainder via `tick`, and the **completion transition
-/// itself** produces the terminal `DrainResult` proactively with the
-/// initiating request id — no command replay required.
+/// Drain dispatch (legacy composition; under `RUST_ROUTE_OWNER` the wire
+/// bodies are retired tombstones and operator drains are local, see
+/// `route_owner_rejects_retired_drain_bodies_without_effect`): matched
+/// sessions get graceful closes at admission, per-id accounting flows
+/// through `session_closed`, the force deadline closes the remainder via
+/// `tick`, and the **completion transition itself** produces the terminal
+/// `DrainResult` proactively with the initiating request id — no command
+/// replay required.
 #[tokio::test(start_paused = true)]
 async fn drain_dispatch_runs_graceful_then_force() {
     let mut handler = ControlCommandHandler::new();
@@ -5008,5 +5011,63 @@ async fn review_local_immediate_drain_of_gone_session_emits_no_wire_terminal() {
         handler
             .local_drain_status("local-gone")
             .is_some_and(|s| s.complete && s.result.force_closed == 1)
+    );
+}
+
+/// CP-ADMIN slice 3b: operator drains are issued inside the Rust process,
+/// so under `RUST_ROUTE_OWNER` both drain bodies are retired tombstones.
+/// Each is answered with a nonfatal `PROTOCOL_VIOLATION`, counted on the one
+/// legacy-violation counter, and has no effect: no session directive, no
+/// gate watermark movement, and the local issuer still takes sequence 1.
+#[tokio::test(start_paused = true)]
+async fn route_owner_rejects_retired_drain_bodies_without_effect() {
+    let mut handler = ControlCommandHandler::with_metering_route_owner(MeteringLedger::new());
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+    let before = handler.legacy_route_violations();
+    let bodies = vec![
+        Body::DrainCommand(DrainCommand {
+            drain_id: "go@retired".to_owned(),
+            listener_names: vec!["sql-a".to_owned()],
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: 1_010_000,
+            force_deadline_unix_millis: 1_020_000,
+            command_sequence: 1,
+        }),
+        Body::DrainResult(DrainResult {
+            drain_id: "go@retired".to_owned(),
+            active_connections: 0,
+            gracefully_closed: 0,
+            force_closed: 0,
+            complete: true,
+            code: ErrorCode::Ok.into(),
+            detail: String::new(),
+        }),
+    ];
+    for (index, body) in bodies.into_iter().enumerate() {
+        let request_id = 60 + index as u64;
+        let out = handler.handle_envelope(&envelope(request_id, 7, body), now, 1_000_000);
+        assert_eq!(out.len(), 1, "one inline answer per retired body");
+        assert_eq!(out[0].request_id, request_id);
+        assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+        assert!(session.control.try_recv().is_err(), "no retired body acts");
+    }
+    assert_eq!(handler.legacy_route_violations(), before + 2);
+    let (local, _) = handler.start_local_drain(
+        &local_request("op-1", &["no-such-listener"], 0, 0),
+        now,
+        1_000_001,
+    );
+    assert!(
+        matches!(
+            local,
+            LocalDrainOutcome::Accepted {
+                command_sequence: 1,
+                ..
+            }
+        ),
+        "a retired drain command never consumed a sequence: {local:?}"
     );
 }

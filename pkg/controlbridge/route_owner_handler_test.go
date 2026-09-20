@@ -14,7 +14,7 @@ import (
 func TestRouteOwnerResidualReconcileIsEmptyAndPreservesWatermarks(t *testing.T) {
 	consumer := NewMeteringConsumer()
 	require.True(t, consumer.Apply(&controlpb.MeteringBatch{Sequence: 1}))
-	handler, err := NewRouteOwnerControlHandler(mustDrainIssuer(t), consumer)
+	handler, err := NewRouteOwnerControlHandler(consumer)
 	require.NoError(t, err)
 	peer := &recordingSender{}
 
@@ -44,7 +44,7 @@ func TestRouteOwnerResidualReconcileIsEmptyAndPreservesWatermarks(t *testing.T) 
 }
 
 func TestRouteOwnerRejectsEveryRetiredRouteFamilyWithoutState(t *testing.T) {
-	handler, err := NewRouteOwnerControlHandler(mustDrainIssuer(t), NewMeteringConsumer())
+	handler, err := NewRouteOwnerControlHandler(NewMeteringConsumer())
 	require.NoError(t, err)
 	peer := &recordingSender{}
 	bodies := []any{
@@ -107,7 +107,7 @@ func TestRouteOwnerRejectsEveryRetiredRouteFamilyWithoutState(t *testing.T) {
 }
 
 func TestRouteOwnerRejectsNonemptyResidualReconcile(t *testing.T) {
-	handler, err := NewRouteOwnerControlHandler(mustDrainIssuer(t), NewMeteringConsumer())
+	handler, err := NewRouteOwnerControlHandler(NewMeteringConsumer())
 	require.NoError(t, err)
 	peer := &recordingSender{}
 	for _, request := range []*controlpb.ReconcileRequest{
@@ -123,4 +123,47 @@ func TestRouteOwnerRejectsNonemptyResidualReconcile(t *testing.T) {
 		require.EqualValues(t, before.LegacyRouteViolations+1, after.LegacyRouteViolations)
 		require.Equal(t, before.RouteStateSHA256, after.RouteStateSHA256)
 	}
+}
+
+// CP-ADMIN slice 3b: operator drains are issued inside the Rust process, so
+// both drain bodies are retired tombstones for the route owner. Each is
+// answered with a nonfatal PROTOCOL_VIOLATION on the one legacy-violation
+// counter and leaves the route state hash (and everything else) untouched;
+// the reconcile watermark they used to feed is diagnostic only.
+func TestRouteOwnerRejectsRetiredDrainBodiesWithoutState(t *testing.T) {
+	handler, err := NewRouteOwnerControlHandler(NewMeteringConsumer())
+	require.NoError(t, err)
+	peer := &recordingSender{}
+	initial := handler.RouteOwnerStatus()
+	bodies := []any{
+		&controlpb.ControlEnvelope_DrainCommand{DrainCommand: &controlpb.DrainCommand{DrainId: "op@retired", CommandSequence: 1}},
+		&controlpb.ControlEnvelope_DrainResult{DrainResult: &controlpb.DrainResult{DrainId: "op@retired", Complete: true}},
+	}
+	for index, body := range bodies {
+		envelope := &controlpb.ControlEnvelope{RequestId: uint64(index + 1)}
+		switch typed := body.(type) {
+		case *controlpb.ControlEnvelope_DrainCommand:
+			envelope.Body = typed
+		case *controlpb.ControlEnvelope_DrainResult:
+			envelope.Body = typed
+		}
+		require.NoError(t, handler.HandleEnvelope(t.Context(), peer, envelope))
+		answer := peer.sent()[index]
+		require.EqualValues(t, index+1, answer.GetError().GetOffendingRequestId())
+		require.Equal(t, controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION, answer.GetError().GetCode())
+		require.False(t, answer.GetError().GetFatal())
+	}
+	final := handler.RouteOwnerStatus()
+	require.EqualValues(t, len(bodies), final.LegacyRouteViolations-initial.LegacyRouteViolations)
+	require.Equal(t, initial.RouteStateSHA256, final.RouteStateSHA256)
+
+	// The reconcile watermark is still answered, never restored into an issuer.
+	require.NoError(t, handler.HandleEnvelope(t.Context(), peer, &controlpb.ControlEnvelope{
+		RequestId: 9,
+		Body: &controlpb.ControlEnvelope_ReconcileRequest{ReconcileRequest: &controlpb.ReconcileRequest{
+			KnownGeneration: 3, LastDrainCommandSequence: 4,
+		}},
+	}))
+	require.NotNil(t, peer.sent()[len(bodies)].GetReconcileSnapshot())
+	require.EqualValues(t, final.LegacyRouteViolations, handler.RouteOwnerStatus().LegacyRouteViolations)
 }

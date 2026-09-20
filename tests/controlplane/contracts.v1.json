@@ -24,7 +24,7 @@
       "anchors": [
         {"path": "pkg/server/api/config_test.go", "contains": "func TestConfig"},
         {"path": "pkg/server/api/dataplane_test.go", "contains": "func TestDataplaneStatusAPI"},
-        {"path": "pkg/controlbridge/drain_metering_test.go", "contains": "func TestDrainCommandRoundTripContract"}
+        {"path": "pkg/controlbridge/route_owner_handler_test.go", "contains": "func TestRouteOwnerRejectsRetiredDrainBodiesWithoutState"}
       ],
       "observed_fields": ["http_status", "response_code", "drain_id", "command_sequence", "applied_generation"],
       "fault_scenarios": ["CP-FAULT-ADMIN-DRAIN-REPLAY", "CP-FAULT-CONTROL-UNAVAILABLE"],

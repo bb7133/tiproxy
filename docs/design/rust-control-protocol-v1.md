@@ -317,10 +317,15 @@ or key material.
 With capability 6, handshake policy, namespace resolution, route selection,
 reservation settlement, connection lifecycle, redirect, failover, and
 per-route force-close are in-process Rust operations. Production emits no
-`Handshake*`, `Route*`, `ConnectionEvent`, `Redirect*`, or `Close*` body.
-Receiving any one of those retired bodies is a nonfatal protocol violation:
-increment the bounded `rust_legacy_route_violation` observation, produce no
-callback/result/effect, and leave the route-state hash unchanged.
+`Handshake*`, `Route*`, `ConnectionEvent`, `Redirect*`, or `Close*` body, and
+since CP-ADMIN slice 3 (operator drains issued inside the Rust process) no
+`DrainCommand` or `DrainResult` body either. Receiving any one of those
+retired bodies is a nonfatal protocol violation: increment the bounded
+`rust_legacy_route_violation` observation (its count therefore includes
+retired drain bodies), produce no callback/result/effect, and leave the
+route-state hash unchanged. `ReconcileRequest.last_drain_command_sequence`
+remains Rust's own gate watermark, reported for diagnostics; Go restores
+nothing from it.
 
 The protobuf oneof tags and message definitions remain exactly where they are.
 They are deprecated non-actionable tombstones until a protocol-v2 change can
@@ -400,8 +405,11 @@ requires `PER_CONNECTION_CLOSE`. Rust replies once with `CloseResult` and then
 emits the ordinary terminal `ConnectionEvent(CLOSED)`. A duplicate close ID
 replays the cached result; a different close ID for an already-closing session
 returns its current state without scheduling a second close. `force=true`
-maps `RedirectableConn.ForceClose`; listener/backend-wide graceful shutdown
-continues to use `DrainCommand` and must not be overloaded for one connection.
+maps `RedirectableConn.ForceClose`; listener/backend-wide graceful shutdown is
+a drain, never a per-connection close. Under `RUST_ROUTE_OWNER` the drain is
+issued inside the Rust process through its admin API (`docs/design/
+rust-control-admin.md`) and `DrainCommand`/`DrainResult` are retired v1
+tombstones; the wire semantics above describe the legacy composition.
 
 ## Error codes
 

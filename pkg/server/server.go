@@ -219,7 +219,9 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 	}
 	if srv.controlBridge != nil {
 		mgrs.DataplaneStatus = srv.controlBridge
-		mgrs.DataplaneDrainer = srv.controlBridge
+		// DataplaneDrainer stays nil: operator drains are issued through the
+		// Rust admin API (CP-ADMIN slice 3), so `/api/dataplane/drain` answers
+		// 404 {"enabled": false} here.
 	}
 	if srv.apiServer, err = api.NewServer(cfg.API, lg.Named("api"), mgrs, handler, ready); err != nil {
 		return

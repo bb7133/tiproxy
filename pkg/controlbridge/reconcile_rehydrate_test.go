@@ -273,13 +273,6 @@ func TestRehydratedWatermarkResumesSequences(t *testing.T) {
 	require.EqualValues(t, 38, command.GetCommandSequence(), "next = watermark + 1")
 	require.EqualValues(t, 7, lastEnvelope(t, peer).GetGeneration(), "stamped with the session generation")
 
-	// The drain issuer's watermark restores the same way.
-	issuer := mustDrainIssuer(t)
-	issuer.RestoreSequence(9)
-	sender := &recordingSender{}
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, &controlpb.DrainCommand{DrainId: "d-next"}))
-	sent := sender.sent()
-	require.EqualValues(t, 10, sent[len(sent)-1].GetDrainCommand().GetCommandSequence())
 }
 
 // A legacy peer (no REHYDRATION capability) keeps the original
@@ -368,15 +361,18 @@ func TestSameGenerationNewEpochLineage(t *testing.T) {
 	require.Equal(t, "10.0.0.3:34567", snapshot.GetConnections()[0].GetIdentity().GetClientAddress())
 }
 
-// The composite production handler restores the drain watermark from a
-// real reconcile request: the next StartDrain issues watermark + 1.
-func TestCompositeHandlerRestoresDrainWatermark(t *testing.T) {
+// The composite production handler wires the consumer's applied metering
+// sequence into the reconcile acknowledgement. The reconcile request's
+// `last_drain_command_sequence` is Rust's own diagnostic watermark: nothing
+// in Go restores or acts on it since operator drains moved into the Rust
+// process (CP-ADMIN slice 3), and an inbound drain result is ignored by
+// the legacy composition.
+func TestCompositeHandlerAcksMeteringThroughReconcile(t *testing.T) {
 	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
 	handler := &recordingHandler{rt: rt}
 	adapter := newTestAdapter(t, handler)
-	issuer := mustDrainIssuer(t)
 	consumer := NewMeteringConsumer()
-	composite, err := NewCompositeControlHandler(adapter, issuer, consumer)
+	composite, err := NewCompositeControlHandler(adapter, consumer)
 	require.NoError(t, err)
 	peer := newFakeSender(50,
 		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
@@ -392,7 +388,8 @@ func TestCompositeHandlerRestoresDrainWatermark(t *testing.T) {
 	}))
 	require.EqualValues(t, 1, consumer.LastApplied())
 
-	// The real reconcile request carries the drain watermark.
+	// The real reconcile request carries the drain watermark; it is
+	// answered without any drain side effect.
 	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
 		RequestId:  2,
 		Generation: 7,
@@ -405,51 +402,19 @@ func TestCompositeHandlerRestoresDrainWatermark(t *testing.T) {
 	require.NotNil(t, snapshot)
 	require.EqualValues(t, 1, snapshot.GetMeteringSequence(), "composite wires the consumer's ack")
 
-	require.NoError(t, issuer.StartDrain(context.Background(), peer, 3, 12, &controlpb.DrainCommand{DrainId: "d-after"}))
-	command := lastEnvelope(t, peer).GetDrainCommand()
-	require.NotNil(t, command)
-	require.EqualValues(t, 10, command.GetCommandSequence(), "next = restored watermark + 1")
-	require.NotEqual(t, "d-after", command.GetDrainId(), "incarnation-qualified wire id")
-
-	// Drain results (carrying the wire id) route through the composite
-	// to the issuer.
+	// A drain result (a retired body) is ignored by the legacy composition.
+	peer.mu.Lock()
+	before := len(peer.messages)
+	peer.mu.Unlock()
 	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, &controlpb.ControlEnvelope{
 		RequestId: 4,
 		Body: &controlpb.ControlEnvelope_DrainResult{DrainResult: &controlpb.DrainResult{
-			DrainId: command.GetDrainId(), ActiveConnections: 0, Complete: true,
-			Code: controlpb.ErrorCode_ERROR_CODE_OK,
+			DrainId: "op@retired", Complete: true, Code: controlpb.ErrorCode_ERROR_CODE_OK,
 		}},
 	}))
-	_, done := issuer.Progress("d-after")
-	require.True(t, done)
-}
-
-// A drain id is bound to one issuance for the issuer's lifetime: after
-// d1 and d2 both completed, re-issuing d1 re-sends its ORIGINAL
-// sequence (never a new one), and the sequence space fails closed at
-// exhaustion.
-func TestDrainIdBindingAndSequenceExhaustion(t *testing.T) {
-	issuer := mustDrainIssuer(t)
-	sender := &recordingSender{}
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 1, 12, &controlpb.DrainCommand{DrainId: "d1"}))
-	d1Wire := sender.sent()[0].GetDrainCommand().GetDrainId()
-	require.NoError(t, issuer.HandleDrainResult(drainResult(d1Wire, 0, 0, 0, true)))
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 2, 12, &controlpb.DrainCommand{DrainId: "d2"}))
-	d2Wire := sender.sent()[1].GetDrainCommand().GetDrainId()
-	require.NoError(t, issuer.HandleDrainResult(drainResult(d2Wire, 0, 0, 0, true)))
-
-	// Re-issue long-completed d1: the same wire id and sequence 1.
-	require.NoError(t, issuer.StartDrain(context.Background(), sender, 3, 12, &controlpb.DrainCommand{DrainId: "d1"}))
-	sent := sender.sent()
-	last := sent[len(sent)-1].GetDrainCommand()
-	require.Equal(t, d1Wire, last.GetDrainId())
-	require.EqualValues(t, 1, last.GetCommandSequence(), "the original binding, never a new sequence")
-
-	// Sequence exhaustion fails closed.
-	exhausted := mustDrainIssuer(t)
-	exhausted.RestoreSequence(^uint64(0))
-	err := exhausted.StartDrain(context.Background(), sender, 4, 12, &controlpb.DrainCommand{DrainId: "d-max"})
-	require.ErrorIs(t, err, ErrDrainSequenceExhausted)
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	require.Len(t, peer.messages, before, "no answer and no effect for a retired drain result")
 }
 
 // Fix the interleaving that the concurrent stress test can only hit by chance:

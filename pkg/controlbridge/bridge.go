@@ -5,17 +5,13 @@ package controlbridge
 
 import (
 	"context"
-	"fmt"
-	"sync"
 	"time"
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
-	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
-	"google.golang.org/protobuf/proto"
 )
 
 // DefaultOrphanResolveInterval paces the rehydration/orphan cadence
@@ -81,10 +77,19 @@ type DrainRequest struct {
 	ForceTimeout time.Duration
 }
 
+// The drain request/error vocabulary below is the HTTP API contract of
+// `/api/dataplane/drain` (pkg/server/api). Since CP-ADMIN slice 3 operator
+// drains are issued inside the Rust process; no Go composition implements
+// the API's DataplaneDrainer, and these values remain only for the
+// handler and its Go oracle in the CP-ADMIN differential harness.
+
 // ErrForeignDrainActive reports that a previous incarnation's drain is
 // still running on the dataplane; the operator retries after it
 // resolves.
 var ErrForeignDrainActive = errors.New("a previous incarnation's drain is still active on the dataplane")
+
+// ErrDrainInProgress rejects a second concurrent drain locally.
+var ErrDrainInProgress = errors.New("a different drain is already in progress")
 
 // ErrNoDataplaneSession reports that no negotiated control session
 // exists to carry the drain.
@@ -106,17 +111,9 @@ var ErrInvalidDrainBudget = errors.New("drain budget is negative or exceeds the 
 // modern peer would be judged stale by the Rust gate.
 var ErrSnapshotNotReady = errors.New("no applied configuration generation yet")
 
-// activeDrainState retains the wire-independent request so reconnects
-// re-send the same operation idempotently.
-type activeDrainState struct {
-	request       DrainRequest
-	command       *controlpb.DrainCommand
-	lastSyncEpoch uint64
-}
-
 // Bridge is the single Go composition entry for the control plane
 // (CTL-06): it owns the transport listener, the composite handler
-// (router adapter + drain issuer + metering consumer), and the
+// (router adapter + metering consumer), and the
 // orphan-resolution and snapshot cadences. DPL-03's proxy bootstrap
 // starts it behind the explicit Rust dataplane config gate.
 type Bridge struct {
@@ -124,19 +121,16 @@ type Bridge struct {
 	adapter          *RouterAdapter
 	handler          *CompositeControlHandler
 	routeOwner       bool
-	issuer           *DrainIssuer
 	consumer         *MeteringConsumer
 	interval         time.Duration
 	publisher        *SnapshotPublisher
 	snapshotInterval time.Duration
-
-	drainMu     sync.Mutex
-	activeDrain *activeDrainState
 }
 
-// NewBridge builds and binds the whole composition: adapter, issuer
-// (fallible incarnation nonce), consumer, composite handler, and the
-// listening control socket. On any error nothing is left bound.
+// NewBridge builds and binds the whole composition: adapter, consumer,
+// composite handler, and the listening control socket. On any error
+// nothing is left bound. Operator drains are not part of it: they are
+// issued inside the Rust process (CP-ADMIN slice 3).
 func NewBridge(config BridgeConfig) (*Bridge, error) {
 	var adapter *RouterAdapter
 	var err error
@@ -152,10 +146,6 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 			adapter.AttachRouterLookup(config.RouterLookup)
 		}
 	}
-	issuer, err := NewDrainIssuer()
-	if err != nil {
-		return nil, err
-	}
 	consumer := NewMeteringConsumer()
 	if config.MeteringStatePath != "" {
 		consumer, err = OpenMeteringConsumer(config.MeteringStatePath, config.MeteringSink)
@@ -165,9 +155,9 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	}
 	var composite *CompositeControlHandler
 	if config.RouteOwner {
-		composite, err = NewRouteOwnerControlHandler(issuer, consumer)
+		composite, err = NewRouteOwnerControlHandler(consumer)
 	} else {
-		composite, err = NewCompositeControlHandler(adapter, issuer, consumer)
+		composite, err = NewCompositeControlHandler(adapter, consumer)
 	}
 	if err != nil {
 		return nil, err
@@ -192,7 +182,6 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 		adapter:          adapter,
 		handler:          composite,
 		routeOwner:       config.RouteOwner,
-		issuer:           issuer,
 		consumer:         consumer,
 		interval:         interval,
 		publisher:        config.Publisher,
@@ -214,11 +203,6 @@ func (bridge *Bridge) RouteOwnerStatus() (RouteOwnerStatus, bool) {
 		return RouteOwnerStatus{}, false
 	}
 	return bridge.handler.RouteOwnerStatus(), true
-}
-
-// Issuer exposes the drain issuer (operator drain entry).
-func (bridge *Bridge) Issuer() *DrainIssuer {
-	return bridge.issuer
 }
 
 // Consumer exposes the metering consumer (billing export reads its
@@ -244,140 +228,6 @@ func (bridge *Bridge) Status() SnapshotStatus {
 		status.AppliedGeneration = 0
 	}
 	return status
-}
-
-// StartDrain issues (or idempotently re-issues) one operator drain.
-// The wire command carries absolute deadlines computed from one budget
-// at first issuance, the issuer's single-flight and sequence binding
-// apply, and a send failure keeps the responsibility with the
-// operator's next retry (the reservation is released, never the
-// binding). A still-active foreign drain (a previous incarnation's)
-// is reported for retry; its resolution signal is consumed here.
-func (bridge *Bridge) StartDrain(ctx context.Context, request DrainRequest) error {
-	if request.DrainID == "" {
-		return errors.New("drain id is required")
-	}
-	// Fail before any reservation: a budget the Rust gate would reject
-	// (negative waits, deadlines past the shared cap) or a command it
-	// would judge stale (no applied generation yet) must never consume
-	// the single-flight slot. Each bound is checked individually first,
-	// so the sum cannot overflow.
-	if request.GracefulWait < 0 || request.ForceTimeout < 0 ||
-		request.GracefulWait > MaxDrainDeadlineAhead ||
-		request.ForceTimeout > MaxDrainDeadlineAhead ||
-		request.GracefulWait+request.ForceTimeout > MaxDrainDeadlineAhead {
-		return ErrInvalidDrainBudget
-	}
-	if bridge.publisher != nil && bridge.publisher.Status().AppliedGeneration == 0 {
-		return ErrSnapshotNotReady
-	}
-	sender := bridge.server.Active()
-	if sender == nil {
-		return ErrNoDataplaneSession
-	}
-	// Consume a resolved foreign drain first: after resolution the
-	// operator's own drain may proceed.
-	_ = bridge.issuer.ForeignDrainResolved()
-	if foreign := bridge.issuer.ForeignActiveDrain(); foreign != nil {
-		return fmt.Errorf("%w: %s", ErrForeignDrainActive, foreign.GetDrainId())
-	}
-
-	bridge.drainMu.Lock()
-	state := bridge.activeDrain
-	if state == nil || state.request.DrainID != request.DrainID {
-		now := time.Now()
-		graceful := now.Add(request.GracefulWait)
-		force := graceful.Add(request.ForceTimeout)
-		state = &activeDrainState{
-			request: request,
-			command: &controlpb.DrainCommand{
-				DrainId:                    request.DrainID,
-				ListenerNames:              request.Scope.ListenerNames,
-				BackendIds:                 request.Scope.BackendIDs,
-				GracefulDeadlineUnixMillis: uint64(graceful.UnixMilli()),
-				ForceDeadlineUnixMillis:    uint64(force.UnixMilli()),
-			},
-		}
-	}
-	command, ok := proto.Clone(state.command).(*controlpb.DrainCommand)
-	if !ok {
-		bridge.drainMu.Unlock()
-		return errors.New("clone drain command")
-	}
-	bridge.drainMu.Unlock()
-
-	requestID, err := sender.AllocateRequestID()
-	if err != nil {
-		return err
-	}
-	generation := uint64(0)
-	if bridge.publisher != nil {
-		generation = bridge.publisher.Status().AppliedGeneration
-	}
-	if err := bridge.issuer.StartDrain(ctx, sender, requestID, generation, command); err != nil {
-		return err
-	}
-	bridge.drainMu.Lock()
-	state.lastSyncEpoch = sender.Epoch()
-	bridge.activeDrain = state
-	bridge.drainMu.Unlock()
-	return nil
-}
-
-// DrainStatus reports the latest observed result for the operator's
-// drain id plus whether that drain completed. A nil result means the
-// id is unknown to this incarnation.
-func (bridge *Bridge) DrainStatus(drainID string) (*controlpb.DrainResult, bool) {
-	result, completed := bridge.issuer.Progress(drainID)
-	return result, completed
-}
-
-// syncDrain re-issues the active drain after a control reconnect (a
-// restarted Rust lineage lost the gate state; the reconcile watermark
-// plus this idempotent replay converge it) and clears the record once
-// its terminal result arrived.
-func (bridge *Bridge) syncDrain(ctx context.Context) {
-	sender := bridge.server.Active()
-	if sender == nil {
-		return
-	}
-	bridge.drainMu.Lock()
-	state := bridge.activeDrain
-	if state == nil {
-		bridge.drainMu.Unlock()
-		return
-	}
-	if result, completed := bridge.issuer.Progress(state.request.DrainID); completed &&
-		result != nil {
-		bridge.activeDrain = nil
-		bridge.drainMu.Unlock()
-		return
-	}
-	epoch := sender.Epoch()
-	if state.lastSyncEpoch == epoch {
-		bridge.drainMu.Unlock()
-		return
-	}
-	command, ok := proto.Clone(state.command).(*controlpb.DrainCommand)
-	bridge.drainMu.Unlock()
-	if !ok {
-		return
-	}
-	requestID, err := sender.AllocateRequestID()
-	if err != nil {
-		return
-	}
-	generation := uint64(0)
-	if bridge.publisher != nil {
-		generation = bridge.publisher.Status().AppliedGeneration
-	}
-	if bridge.issuer.StartDrain(ctx, sender, requestID, generation, command) == nil {
-		bridge.drainMu.Lock()
-		if bridge.activeDrain != nil {
-			bridge.activeDrain.lastSyncEpoch = epoch
-		}
-		bridge.drainMu.Unlock()
-	}
 }
 
 // Run serves the control socket and drives the orphan-resolution
@@ -422,7 +272,6 @@ func (bridge *Bridge) Run(ctx context.Context) error {
 						_ = bridge.publisher.Sync(ctx, sender)
 					}
 				}
-				bridge.syncDrain(ctx)
 			}
 		}
 	})

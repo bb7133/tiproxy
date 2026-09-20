@@ -99,7 +99,10 @@ pub struct DispatchStats {
     pub send_failures: AtomicU64,
     /// Fail-closed metering rejections (record and seal).
     pub metering_failures: AtomicU64,
-    /// Retired route-family bodies rejected under `RUST_ROUTE_OWNER`.
+    /// Retired v1 tombstone bodies rejected under `RUST_ROUTE_OWNER`: the
+    /// route family retired at cutover and, since CP-ADMIN slice 3, both
+    /// drain bodies (`drain_command`/`drain_result`). One counter, one
+    /// meaning: "a peer sent a body this owner no longer acts on".
     pub legacy_route_violations: AtomicU64,
     /// Highest drain command sequence the gate has consumed (bridge or
     /// local issuer alike): the value the next reconcile reports as
@@ -1923,11 +1926,17 @@ fn result_envelope(outbound: OutboundControl, generation: u64, request_id: u64) 
     }
 }
 
+/// The v1 tombstones the route owner rejects without effect: the route
+/// family, and both drain bodies now that operator drains are issued inside
+/// this process (CP-ADMIN slice 3). The legacy composition keeps acting on
+/// them so the pre-cutover contract stays testable.
 const fn is_retired_route_body(body: Option<&Body>) -> bool {
     matches!(
         body,
         Some(
-            Body::HandshakeResponse(_)
+            Body::DrainCommand(_)
+                | Body::DrainResult(_)
+                | Body::HandshakeResponse(_)
                 | Body::HandshakeDecision(_)
                 | Body::HandshakeResult(_)
                 | Body::RouteRequest(_)

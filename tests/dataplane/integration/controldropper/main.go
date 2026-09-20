@@ -78,6 +78,7 @@ const (
 	fieldRedirectCommand      protowire.Number = 31
 	fieldRedirectResult       protowire.Number = 32
 	fieldDrainCommand         protowire.Number = 33
+	fieldDrainResult          protowire.Number = 34
 	fieldMeteringBatch        protowire.Number = 36
 	fieldReconcileRequest     protowire.Number = 37
 	fieldReconcileSnapshot    protowire.Number = 38
@@ -181,6 +182,8 @@ func newRouteAudit() routeAudit {
 		"redirect_result":    0,
 		"close_command":      0,
 		"close_result":       0,
+		"drain_command":      0,
+		"drain_result":       0,
 	}}
 }
 
@@ -308,7 +311,13 @@ func extractFrameAudit(body []byte) frameAudit {
 			case fieldRedirectResult:
 				audit.legacyBody = "redirect_result"
 			case fieldDrainCommand:
+				// Retired since CP-ADMIN slice 3: operator drains are issued
+				// inside the Rust process. The sequence is still extracted so
+				// the M9 row can assert it never appears.
+				audit.legacyBody = "drain_command"
 				audit.drainCommandSequence = nestedVarint(value, 6)
+			case fieldDrainResult:
+				audit.legacyBody = "drain_result"
 			case fieldMeteringBatch:
 				audit.meteringKind = "batch"
 				audit.meteringSequence = nestedVarint(value, 1)

@@ -140,9 +140,19 @@ query returns the byte-identical retained terminal, the watermark stays at 2
 and the targeted session is closed exactly once (observed fields `drain_id`,
 `command_sequence` via the watermark, `terminal_count` via the connection log,
 `http_status`). The row receipt records `admin_drain.issuer = rust-admin`,
-`bridge_drain_commands = 0` and the replay outcome. Still open in slice 3: the
-retirement of `drain_command`/`drain_result` from the protocol, catalog and
-Go issuer (3b).
+`bridge_drain_commands = 0` and the replay outcome. Slice 3b retires the wire path:
+`drain_command`/`drain_result` keep their v1 tags as non-actionable
+tombstones (the route-family precedent); under `RUST_ROUTE_OWNER` the Rust
+dispatcher and the Go residual handler answer either body with a nonfatal
+`PROTOCOL_VIOLATION` on the one legacy-violation counter (whose count now
+includes retired drain bodies) and act on nothing; the Go `DrainIssuer`, the
+bridge's drain re-sync and the API's `DataplaneDrainer` injection are
+deleted, so Go's `/api/dataplane/drain*` answers `404 {"enabled":false}`
+(the handler and interface stay as the HTTP contract and the differential
+oracle); `ReconcileRequest.last_drain_command_sequence` is still filled from
+the Rust gate watermark for diagnostics and Go restores nothing from it; the
+control tap catalogs both bodies as retired so every T4 row proves zero
+drain traffic on the bridge.
 
 ### Declared divergences after slice 2
 
@@ -190,10 +200,10 @@ certificate.
 
 ## Remaining slices
 
-- **Slice 3 (remaining)** — retiring `drain_command`/`drain_result` (proto,
-  catalog and Go issuer in one change, with the `last_drain_command_sequence`
-  reconcile field decided alongside) (3b); 3a (local issuer, M9 on the Rust
-  port, the `CP-FAULT-ADMIN-DRAIN-REPLAY` runner) is complete.
+- **Slice 3** — complete: 3a (local issuer, M9 on the Rust port, the
+  `CP-FAULT-ADMIN-DRAIN-REPLAY` runner) and 3b (drain wire bodies retired as
+  tombstones, Go issuer deleted, `last_drain_command_sequence` kept as a
+  Rust diagnostic).
 - **Slice 4** — diagnostics gRPC (`SearchLog` over the B0 log rotation,
   `ServerInfo` with a pinned minimal host-information dependency after listing
   the Go `sysutil` fields) and `tiproxyctl` compatibility.
