@@ -78,11 +78,30 @@ path/payload on retry. Regenerate the Go observations with:
 rust/crates/control-meter/testdata/aws-s3-retry-go.sh
 ```
 
-The S3 retry probe injects a CustomConfig with checksum calculation unset;
-production LoadDefaultConfig enables WhenSupported. S3's default HTTPS PUT then
-uses aws-chunked encoding with a CRC32 trailer. That automatic request-checksum
-encoding remains a declared follow-up; the retry/clock observations do not
-claim complete request-header equivalence.
+The retry probe's CustomConfig disables optional checksums. A separate probe
+constructs the actual metering provider through LoadDefaultConfig and sends
+requests to real local HTTP/TLS servers, preserving the production middleware.
+The default WhenSupported policy adds CRC32: nonempty HTTPS PUT uses one
+aws-chunked body with a CRC32 trailer; HTTP and empty uploads use a checksum
+header. HTTP signs the actual payload SHA256, HTTPS PUT uses unsigned payload
+(or the streaming trailer sentinel), and HEAD signs the empty payload SHA256.
+Retries replay identical encoded bytes, with checksum headers present before
+signing. CRC32 reuses the existing compression dependency.
+
+`AWS_REQUEST_CHECKSUM_CALCULATION` overrides the active config profile's
+`request_checksum_calculation`; values are case-insensitive WhenSupported or
+WhenRequired. WhenRequired disables optional PUT checksums. Invalid selected
+profile values fail construction even when overridden by the environment;
+the shared credentials file does not supply this service option. Twenty-six
+actual provider cases compare checksum/payload-hash headers, their signed
+header membership, full body bytes, encoded length, retry attempts and load
+errors, including empty/binary/65537-byte bodies. This closes the automatic
+checksum encoding gap; it does not assert equality of unrelated SDK telemetry
+headers. Regenerate with:
+
+```sh
+rust/crates/control-meter/testdata/aws-s3-checksum-go.sh
+```
 
 COS HEAD and metering's seekable PUT payloads use the SDK's three immediate
 attempts: all HTTP statuses at or above 500 and transport/signing failures may

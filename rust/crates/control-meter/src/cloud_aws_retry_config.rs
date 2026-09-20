@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared AWS service retry settings (credential endpoint/IMDS use their own defaults).
+//! Shared AWS service defaults (credential endpoint/IMDS use their own retries).
 use reqsign_core::Context;
 use std::collections::BTreeMap;
 
@@ -20,12 +20,14 @@ use std::collections::BTreeMap;
 pub(crate) struct Settings {
     pub(crate) max_attempts: i64,
     pub(crate) adaptive: bool,
+    pub(crate) checksum_supported: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             max_attempts: 3,
             adaptive: false,
+            checksum_supported: true,
         }
     }
 }
@@ -36,6 +38,9 @@ impl Settings {
         }
         if let Some(value) = props.get("retry_mode") {
             mode(value)?;
+        }
+        if let Some(value) = props.get("request_checksum_calculation") {
+            checksum(value)?;
         }
         Ok(())
     }
@@ -63,9 +68,20 @@ impl Settings {
             .map(mode)
             .transpose()?
             .unwrap_or(false);
+        let checksum_supported = ctx
+            .env_var("AWS_REQUEST_CHECKSUM_CALCULATION")
+            .filter(|v| !v.is_empty())
+            .as_deref()
+            .or(props
+                .get("request_checksum_calculation")
+                .map(String::as_str))
+            .map(checksum)
+            .transpose()?
+            .unwrap_or(true);
         Ok(Self {
             max_attempts: max,
             adaptive,
+            checksum_supported,
         })
     }
 }
@@ -82,5 +98,12 @@ fn mode(value: &str) -> reqsign_core::Result<bool> {
     }
 }
 fn invalid() -> reqsign_core::Error {
-    reqsign_core::Error::credential_invalid("AWS retry configuration invalid")
+    reqsign_core::Error::credential_invalid("AWS service configuration invalid")
+}
+fn checksum(value: &str) -> reqsign_core::Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "when_supported" => Ok(true),
+        "when_required" => Ok(false),
+        _ => Err(invalid()),
+    }
 }

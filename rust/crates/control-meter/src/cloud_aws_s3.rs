@@ -23,6 +23,9 @@ use reqwest::Url;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "cloud_aws_s3_checksum.rs"]
+mod checksum;
+
 impl AwsSigner {
     pub(crate) async fn request(
         &self,
@@ -37,12 +40,9 @@ impl AwsSigner {
             .run(|| async {
                 let skew = clock.take();
                 missing.store(false, Ordering::Relaxed);
-                let request = Request::builder()
-                    .method(method.clone())
-                    .uri(url.as_str())
-                    .header(http::header::CONTENT_LENGTH, body.len())
-                    .body(body.clone())
-                    .map_err(|_| Failure::terminal(super::failed()))?;
+                let request =
+                    checksum::request(&method, url, body.clone(), self.checksum_supported)
+                        .map_err(Failure::terminal)?;
                 let (mut parts, body) = request.into_parts();
                 let mut credential = self.credential().await.map_err(Failure::terminal)?;
                 credential.expires_in = None;
@@ -245,10 +245,16 @@ mod tests {
                 .with_file_read(io.clone())
                 .with_env(StaticEnv {
                     home_dir: None,
-                    envs: std::collections::HashMap::from([(
-                        "AWS_NEW_RETRIES_2026".into(),
-                        row.new.to_string(),
-                    )]),
+                    envs: std::collections::HashMap::from([
+                        ("AWS_NEW_RETRIES_2026".into(), row.new.to_string()),
+                        (
+                            // The retry fixture's CustomConfig disables optional
+                            // checksums; the default production path is separately
+                            // compared by the real HTTP/TLS checksum fixture.
+                            "AWS_REQUEST_CHECKSUM_CALCULATION".into(),
+                            "when_required".into(),
+                        ),
+                    ]),
                 });
             let signer = AwsSigner::new(
                 &control_config::AwsMeteringConfig {
