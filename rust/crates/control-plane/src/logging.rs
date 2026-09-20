@@ -21,8 +21,8 @@
 //! `max-size` megabytes first renames the current file to
 //! `<name>-<timestamp><ext>` and starts a new one, then prunes backups beyond
 //! `max-backups` and older than `max-days`. The backup timestamp uses the same
-//! `2006-01-02T15-04-05.000` layout; it is rendered in UTC because the
-//! workspace forbids the `unsafe` call needed to read the local zone.
+//! `2006-01-02T15-04-05.000` layout in local time (`LocalTime: true` in the
+//! Go configuration), read through `chrono::Local`.
 //! Reconfiguration is atomic per line: a reload swaps the writer between two
 //! lines and never drops or duplicates one.
 
@@ -33,10 +33,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+
 /// `max-size` used when the configuration leaves it at zero (Go default).
 pub const DEFAULT_MAX_SIZE_MB: u64 = 300;
 const MEGABYTE: u64 = 1024 * 1024;
 const BACKUP_TIMESTAMP_LEN: usize = "2006-01-02T15-04-05.000".len();
+const BACKUP_TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H-%M-%S%.3f";
 
 /// Log file settings mirroring `log.log-file.*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,97 +299,26 @@ fn parent_dir(path: &Path) -> PathBuf {
     }
 }
 
-/// Renders `2006-01-02T15-04-05.000` (UTC) for a backup file name.
+/// Renders `2006-01-02T15-04-05.000` in local time for a backup file name,
+/// like lumberjack with `LocalTime: true`.
 #[must_use]
 pub fn format_backup_timestamp(at: SystemTime) -> String {
-    let millis = at
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis());
-    let seconds = millis / 1000;
-    let (year, month, day) = civil_from_days(i64::try_from(seconds / 86_400).unwrap_or(0));
-    let rem = seconds % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}-{:02}-{:02}.{:03}",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60,
-        millis % 1000
-    )
+    DateTime::<Local>::from(at)
+        .format(BACKUP_TIMESTAMP_FORMAT)
+        .to_string()
 }
 
-/// Parses the backup timestamp layout back into milliseconds since the epoch.
+/// Parses the backup timestamp layout as local time (Go's
+/// `time.ParseInLocation(..., time.Local)`) into milliseconds since the
+/// epoch; an ambiguous wall-clock time takes its earlier instant.
 #[must_use]
 pub fn parse_backup_timestamp(stamp: &str) -> Option<u128> {
     if stamp.len() != BACKUP_TIMESTAMP_LEN || !stamp.is_ascii() {
         return None;
     }
-    let bytes = stamp.as_bytes();
-    for (index, expected) in [
-        (4, b'-'),
-        (7, b'-'),
-        (10, b'T'),
-        (13, b'-'),
-        (16, b'-'),
-        (19, b'.'),
-    ] {
-        if bytes[index] != expected {
-            return None;
-        }
-    }
-    let number = |range: std::ops::Range<usize>| stamp[range].parse::<u64>().ok();
-    let year = number(0..4)?;
-    let month = number(5..7)?;
-    let day = number(8..10)?;
-    let hour = number(11..13)?;
-    let minute = number(14..16)?;
-    let second = number(17..19)?;
-    let milli = number(20..23)?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    let days = days_from_civil(i64::try_from(year).ok()?, month, day);
-    let seconds =
-        days.checked_mul(86_400)? + i64::try_from(hour * 3600 + minute * 60 + second).ok()?;
-    let millis = u128::try_from(seconds).ok()?.checked_mul(1000)? + u128::from(milli);
-    Some(millis)
-}
-
-/// Days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
-/// `civil_from_days`).
-fn civil_from_days(days: i64) -> (i64, u64, u64) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let yoe = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let y = yoe + era * 400;
-    let day_of_year = day_of_era - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * day_of_year + 2) / 153;
-    let d = day_of_year - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (
-        year,
-        u64::try_from(m).unwrap_or(1),
-        u64::try_from(d).unwrap_or(1),
-    )
-}
-
-/// Proleptic Gregorian date to days since 1970-01-01 (`days_from_civil`).
-fn days_from_civil(year: i64, month: u64, day: u64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m = i64::try_from(month).unwrap_or(1);
-    let d = i64::try_from(day).unwrap_or(1);
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let day_of_year = (153 * mp + 2) / 5 + d - 1;
-    let day_of_era = yoe * 365 + yoe / 4 - yoe / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    let naive = NaiveDateTime::parse_from_str(stamp, BACKUP_TIMESTAMP_FORMAT).ok()?;
+    let local = Local.from_local_datetime(&naive).earliest()?;
+    u128::try_from(local.timestamp_millis()).ok()
 }
 
 #[cfg(test)]
@@ -443,16 +375,21 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_round_trip_through_the_lumberjack_layout() {
-        for (millis, text) in [
-            (0_u128, "1970-01-01T00-00-00.000"),
-            (1_700_000_000_123, "2023-11-14T22-13-20.123"),
-            (951_782_400_000, "2000-02-29T00-00-00.000"),
-            (4_107_542_399_999, "2100-02-28T23-59-59.999"),
+    fn timestamps_round_trip_through_the_lumberjack_layout_in_local_time() {
+        for millis in [
+            0_u128,
+            1_700_000_000_123,
+            951_782_400_000,
+            4_107_542_399_999,
         ] {
             let at = UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).unwrap_or(0));
-            assert_eq!(format_backup_timestamp(at), text);
-            assert_eq!(parse_backup_timestamp(text), Some(millis));
+            let text = format_backup_timestamp(at);
+            assert_eq!(text.len(), BACKUP_TIMESTAMP_LEN, "{text}");
+            assert_eq!(&text[10..11], "T");
+            assert_eq!(parse_backup_timestamp(&text), Some(millis), "{text}");
+            // The rendered wall clock is the local one, not UTC.
+            let expected = DateTime::<Local>::from(at);
+            assert_eq!(text, expected.format("%Y-%m-%dT%H-%M-%S%.3f").to_string());
         }
         assert_eq!(parse_backup_timestamp("2023-11-14T22-13-20"), None);
         assert_eq!(parse_backup_timestamp("2023-13-14T22-13-20.123"), None);
