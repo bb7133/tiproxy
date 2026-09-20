@@ -19,7 +19,7 @@ use azure_core::credentials::{AccessToken, TokenCredential};
 use azure_core::http::{ClientOptions, Transport};
 use azure_identity::{
     AzureCliCredential, AzureDeveloperCliCredential, ClientSecretCredential,
-    ClientSecretCredentialOptions, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
+    ClientSecretCredentialOptions,
 };
 use reqsign_core::{Context, HttpSend};
 use std::sync::Arc;
@@ -78,20 +78,10 @@ impl AzureDefault {
         {
             credentials.push((credential, true));
         }
-        if selected("ManagedIdentityCredential", false) {
-            let options = ManagedIdentityCredentialOptions {
-                client_options: options,
-                user_assigned_id: ctx
-                    .env_var("AZURE_CLIENT_ID")
-                    .map(azure_identity::UserAssignedId::ClientId),
-            };
-            if let Ok(credential) = ManagedIdentityCredential::new(Some(options)) {
-                credentials.push((credential, false));
-            } else {
-                // Do not silently authenticate a different identity when this SDK
-                // cannot support the configured managed-identity environment.
-                credentials.push((Arc::new(UnsupportedManaged), true));
-            }
+        if selected("ManagedIdentityCredential", false)
+            && let Ok(credential) = crate::cloud_azure_managed::Managed::new(ctx.clone()).await
+        {
+            credentials.push((Arc::new(credential), true));
         }
         if selected("AzureCLICredential", true)
             && let Ok(credential) =
@@ -140,7 +130,7 @@ impl AzureDefault {
                     *selected = Some(index);
                     return Ok(token);
                 }
-                Err(_) if *fatal => {
+                Err(error) if *fatal && !crate::cloud_azure_managed::unavailable(&error) => {
                     return Err(Error::Export(
                         "Azure configured identity authentication failed",
                     ));
@@ -198,19 +188,6 @@ async fn environment(ctx: &Context, options: ClientOptions) -> Option<Arc<dyn To
     AuxiliaryCredential::password(ctx.clone(), &tenant, client, username, password)
         .ok()
         .map(|v| Arc::new(v) as Arc<dyn TokenCredential>)
-}
-
-#[derive(Debug)]
-struct UnsupportedManaged;
-#[async_trait::async_trait]
-impl TokenCredential for UnsupportedManaged {
-    async fn get_token(
-        &self,
-        _scopes: &[&str],
-        _options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
-    ) -> azure_core::Result<AccessToken> {
-        Err(identity_error())
-    }
 }
 
 fn token(result: azure_core::Result<AccessToken>) -> Result<String, Error> {
@@ -630,6 +607,59 @@ mod tests {
         };
         assert!(chain.token().await.is_err());
         assert_eq!(later.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Debug)]
+    struct ManagedReply(u16);
+    impl HttpSend for ManagedReply {
+        async fn http_send(
+            &self,
+            _request: http::Request<bytes::Bytes>,
+        ) -> reqsign_core::Result<http::Response<bytes::Bytes>> {
+            http::Response::builder()
+                .status(self.0)
+                .body(bytes::Bytes::from_static(b"denied"))
+                .map_err(|_| reqsign_core::Error::unexpected("test response"))
+        }
+    }
+    #[tokio::test]
+    async fn managed_chain_falls_through_only_for_unavailable_identity() {
+        for (user, app_service, fallback) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let mut envs = std::collections::HashMap::from([(
+                "AZURE_TOKEN_CREDENTIALS".into(),
+                "ManagedIdentityCredential".into(),
+            )]);
+            if user {
+                envs.insert("AZURE_CLIENT_ID".into(), "client".into());
+            }
+            if app_service {
+                envs.insert(
+                    "IDENTITY_ENDPOINT".into(),
+                    "http://identity.test/token".into(),
+                );
+                envs.insert("IDENTITY_HEADER".into(), "fake-secret".into());
+            }
+            let ctx = Context::new()
+                .with_env(reqsign_core::StaticEnv {
+                    envs,
+                    ..Default::default()
+                })
+                .with_http_send(ManagedReply(400));
+            let managed = crate::cloud_azure_managed::Managed::new(ctx)
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let later = credential(false);
+            let chain = AzureDefault {
+                credentials: vec![(Arc::new(managed), true), (later.clone(), false)],
+                selected: Mutex::new(None),
+            };
+            assert_eq!(chain.token().await.is_ok(), fallback);
+            assert_eq!(later.calls.load(Ordering::SeqCst), usize::from(fallback));
+        }
     }
 
     #[derive(Debug, Clone)]

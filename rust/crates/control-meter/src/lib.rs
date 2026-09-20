@@ -19,6 +19,7 @@
 
 mod cloud_azure;
 mod cloud_azure_identity;
+mod cloud_azure_managed;
 mod cloud_context;
 mod cloud_cos;
 pub mod cloud_store;

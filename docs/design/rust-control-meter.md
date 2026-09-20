@@ -42,8 +42,8 @@ URL escaped blob separators and Rust literal separators as the same blob.
 SharedKey takes precedence over SAS; SAS query strings survive
 container/prefix/key assembly. A metering-specific transport and bounded command
 executor serve the official Azure identity SDK. Environment secret, encrypted
-PEM/PFX certificate, username/password, workload assertion, VM/App Service managed
-identity, CLI, Developer CLI and PowerShell sources compose the default chain.
+PEM/PFX certificate, username/password, workload assertion, managed identity, CLI,
+Developer CLI and PowerShell sources compose the default chain.
 `AZURE_TOKEN_CREDENTIALS` selects the chain, configured environment/workload
 failure stops it, and the first successful source remains selected. Workload
 assertion files use the bounded credential reader. Tests cover SharedKey/SAS HTTP
@@ -54,13 +54,35 @@ Regenerate the Azure request fixture with:
 go run rust/crates/control-meter/testdata/azure-shared-key-go.go
 ```
 
-These are local protocol/authentication tests, not live cloud acceptance.
-Full default-credential/endpoint parity and binary ownership handoff remain in progress. In particular, the pinned Rust identity
-SDK does not implement Azure Arc, Azure ML, Cloud Shell or Service Fabric managed
-identity. Unsupported managed-identity construction stops authentication instead
-of falling through to a different identity. Those sources, managed-identity
-error classification and token refresh behavior must be reconciled with Go
-before selecting the native owner. AWS/OSS role refresh/fallback still needs complete Go comparisons.
+Managed identity now implements the pinned Go source selection for IMDS, App
+Service, Azure ML, Cloud Shell, Service Fabric and Azure Arc. Nine actual Go SDK
+request captures cover these sources, user identity selection, and the IMDS probe
+used only when DefaultAzureCredential selects more than the managed credential.
+The adapter preserves source-specific methods, query names/versions and secret
+headers. Arc validates its platform token directory, `.key` extension and 4096-byte
+limit before using the challenge key in a sensitive Basic header; unsupported
+platforms reject the challenge as Go does. This is local protocol coverage, not
+live cloud acceptance.
+
+Only unavailable managed identity permits trying a later default-chain source:
+IMDS probe failure, malformed IMDS token JSON, system-assigned IMDS 400, and
+403 containing `unreachable`. User-assigned 400 and other authentication failures
+stop the chain. Unsupported user-assigned source constructors are skipped, as
+Go's unavailable error reporters are. The first successful source stays selected.
+The five-minute MSAL cache validity margin, server `refresh_in` refresh/fallback,
+retry status sets, jittered backoff and Retry-After precedence/cap are retained.
+The synthetic half-life returned by Go MSAL is assigned after `cache.Write`, so
+it does not itself trigger that credential's cache refresh. Outer credential I/O
+and metering upload deadlines still bound all work.
+
+Regenerate managed identity request fixtures with:
+
+```sh
+go run rust/crates/control-meter/testdata/azure-managed-go.go
+```
+
+Full default-credential/endpoint edge parity and binary ownership handoff remain
+in progress. AWS/OSS role refresh/fallback still needs complete Go comparisons.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would
