@@ -15,6 +15,7 @@
 //! AWS endpoint credential retry policy, including its provider-local quota.
 
 use reqsign_core::Context;
+use serde::Deserialize;
 use std::{
     future::Future,
     sync::atomic::{AtomicU32, Ordering},
@@ -69,15 +70,7 @@ impl Failure {
         let retry_after = if metadata && status == 401 {
             None
         } else {
-            response
-                .headers()
-                .get("x-amz-retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<i64>().ok())
-                .filter(|v| *v >= 0)
-                .map(|v| v.wrapping_mul(1_000_000))
-                .and_then(|v| u64::try_from(v).ok())
-                .map(Duration::from_nanos)
+            retry_after(response)
         };
         Self {
             error: reqsign_core::Error::credential_invalid("AWS IMDS request failed"),
@@ -87,6 +80,17 @@ impl Failure {
             status: Some(status),
             retry_after,
         }
+    }
+    pub(crate) fn rest_json(response: &http::Response<bytes::Bytes>, sso: bool) -> Self {
+        // Service clients retain HTTP status even when deserialization fails;
+        // endpointcreds has a different error wrapper (see container).
+        let code = rest_error_code(response, sso).unwrap_or_default();
+        let mut failure = Self::container(0, &code);
+        failure.status = Some(response.status().as_u16());
+        failure.retryable |= matches!(response.status().as_u16(), 500 | 502 | 503 | 504);
+        failure.error = reqsign_core::Error::credential_invalid("AWS SSO request failed");
+        failure.retry_after = retry_after(response);
+        failure
     }
     pub(crate) fn status(&self) -> Option<u16> {
         self.status
@@ -145,6 +149,25 @@ impl Retry {
             ..Self::new(ctx)
         }
     }
+    pub(crate) async fn json<T>(
+        &self,
+        ctx: &Context,
+        request: http::Request<bytes::Bytes>,
+        sso: bool,
+        decode: impl Fn(&[u8]) -> reqsign_core::Result<T>,
+    ) -> reqsign_core::Result<T> {
+        self.run(|| async {
+            let response = ctx
+                .http_send(request.clone())
+                .await
+                .map_err(Failure::transport)?;
+            if !response.status().is_success() {
+                return Err(Failure::rest_json(&response, sso));
+            }
+            decode(response.body()).map_err(Failure::terminal)
+        })
+        .await
+    }
     pub(crate) fn attempts(&self) -> Attempts<'_> {
         Attempts {
             policy: self,
@@ -202,6 +225,93 @@ impl Retry {
             Duration::from_secs_f64(fraction * 2_f64.powi(i32::from(index)))
         }
     }
+}
+
+fn retry_after(response: &http::Response<bytes::Bytes>) -> Option<Duration> {
+    response
+        .headers()
+        .get("x-amz-retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .map(|v| v.wrapping_mul(1_000_000))
+        .and_then(|v| u64::try_from(v).ok())
+        .map(Duration::from_nanos)
+}
+
+// Go REST JSON GetErrorInfo decodes the first value into a struct: folded
+// fields, duplicates last-wins, null preserves strings, Code before __type.
+#[derive(Default)]
+struct RestError {
+    code: String,
+    kind: String,
+}
+impl<'de> Deserialize<'de> for RestError {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = RestError;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("REST JSON error")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<RestError, E> {
+                Ok(RestError::default())
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<RestError, M::Error> {
+                let mut value = RestError::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.to_ascii_lowercase().as_str() {
+                        "code" | "__type" | "message" => {
+                            if let Some(text) = map.next_value::<Option<String>>()? {
+                                match key.to_ascii_lowercase().as_str() {
+                                    "code" => value.code = text,
+                                    "__type" => value.kind = text,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(value)
+            }
+        }
+        d.deserialize_any(Fields)
+    }
+}
+fn rest_error_code(response: &http::Response<bytes::Bytes>, sso: bool) -> Option<String> {
+    let body = response.body();
+    let error = if body.iter().all(u8::is_ascii_whitespace) {
+        RestError::default()
+    } else {
+        RestError::deserialize(&mut serde_json::Deserializer::from_slice(body)).ok()?
+    };
+    let header = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty());
+    let raw = header.unwrap_or(if error.code.is_empty() {
+        &error.kind
+    } else {
+        &error.code
+    });
+    let code = raw.split_once(':').map_or(raw, |v| v.0);
+    let code = code.split_once('#').map_or(code, |v| v.1);
+    // SSO's modeled exception uses its canonical ErrorCode even if the wire
+    // spelling differs in case. OIDC has no modeled TooManyRequestsException.
+    Some(
+        if sso && code.eq_ignore_ascii_case("TooManyRequestsException") {
+            "TooManyRequestsException".into()
+        } else {
+            code.to_owned()
+        },
+    )
 }
 
 // Mutable metadata negotiation can drive attempts directly while using the

@@ -86,6 +86,23 @@ partitions are not yet supported. Regenerate with:
 go run rust/crates/control-meter/testdata/aws-sso-go.go
 ```
 
+SSO GetRoleCredentials and OIDC CreateToken now use separate persistent retry
+quotas and the shared legacy/2026 backoff engine. The service REST-JSON error
+wrapper preserves HTTP 500/502/503/504 even when JSON decoding fails; unlike
+container credentials, HTTP 429 alone is not retryable. Decoded retryable error
+codes apply at other statuses, with Go header precedence, Code-before-__type,
+namespace stripping, folded fields and typed SSO exception canonicalization.
+The 2026 retry-after header applies even to a malformed HTTP error body. Failed
+OIDC refresh never replaces the token cache. Eighty actual default-retryer Go
+observations cover both services and retry modes, including malformed/empty/null
+bodies, throttling spellings, header precedence, exhaustion and retry-after;
+native tests compare attempt counts and outcomes through the provider methods.
+Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-sso-retry-go.go
+```
+
 Container credentials now freeze the Go-selected endpoint and token-file path
 at construction: relative URI takes precedence over full URI; HTTP full-URI
 hosts must resolve exclusively to loopback or the known ECS/EKS addresses. DNS

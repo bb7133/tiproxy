@@ -34,6 +34,8 @@ pub(crate) struct Sso {
     account: String,
     role: String,
     refresh: bool,
+    role_retry: crate::cloud_aws_retry::Retry,
+    token_retry: crate::cloud_aws_retry::Retry,
 }
 
 impl Sso {
@@ -95,6 +97,8 @@ impl Sso {
             account: get("sso_account_id").unwrap_or_default().to_owned(),
             role: get("sso_role_name").unwrap_or_default().to_owned(),
             refresh,
+            role_retry: crate::cloud_aws_retry::Retry::new(ctx),
+            token_retry: crate::cloud_aws_retry::Retry::new(ctx),
         })
     }
 
@@ -163,34 +167,34 @@ impl Sso {
             .header("x-amz-sso_bearer_token", access)
             .body(Bytes::new())
             .map_err(|_| failed())?;
-        let response = ctx.http_send(request).await?;
-        if !response.status().is_success() {
-            return Err(failed());
-        }
-        let body: Value = serde_json::from_slice(response.body()).map_err(|_| failed())?;
-        let value = body.get("roleCredentials").ok_or_else(failed)?;
-        Ok(Credential {
-            access_key_id: value
-                .get("accessKeyId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            secret_access_key: value
-                .get("secretAccessKey")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            session_token: value
-                .get("sessionToken")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            expires_in: Some(Timestamp::from_millisecond(
-                value
-                    .get("expiration")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default(),
-            )?),
-        })
+        self.role_retry
+            .json(ctx, request, true, |raw| {
+                let body: Value = serde_json::from_slice(raw).map_err(|_| failed())?;
+                let value = body.get("roleCredentials").ok_or_else(failed)?;
+                Ok(Credential {
+                    access_key_id: value
+                        .get("accessKeyId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    secret_access_key: value
+                        .get("secretAccessKey")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    session_token: value
+                        .get("sessionToken")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    expires_in: Some(Timestamp::from_millisecond(
+                        value
+                            .get("expiration")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default(),
+                    )?),
+                })
+            })
+            .await
     }
 
     async fn refresh_token(
@@ -210,12 +214,12 @@ impl Sso {
                 serde_json::to_vec(&body).map_err(|_| failed())?,
             ))
             .map_err(|_| failed())?;
-        let response = ctx.http_send(request).await?;
-        if !response.status().is_success() {
-            return Err(failed());
-        }
-        let value: RefreshedToken =
-            serde_json::from_slice(response.body()).map_err(|_| failed())?;
+        let value: RefreshedToken = self
+            .token_retry
+            .json(ctx, request, false, |raw| {
+                serde_json::from_slice(raw).map_err(|_| failed())
+            })
+            .await?;
         let access = value.access_token.unwrap_or_default();
         // Go clears a missing replacement refreshToken instead of retaining it.
         for (key, text) in [
@@ -532,6 +536,143 @@ mod tests {
             tokio::fs::remove_dir_all(root)
                 .await
                 .unwrap_or_else(|e| unreachable!("{e}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(Clone, Debug, Deserialize)]
+    struct Row {
+        name: String,
+        service: String,
+        new: bool,
+        status: u16,
+        body: String,
+        header: String,
+        after: String,
+        exhaust: bool,
+        calls: usize,
+        error: bool,
+    }
+    #[derive(Clone, Debug)]
+    struct Io {
+        row: Row,
+        calls: Arc<AtomicUsize>,
+    }
+    impl reqsign_core::HttpSend for Io {
+        async fn http_send(
+            &self,
+            request: Request<Bytes>,
+        ) -> reqsign_core::Result<http::Response<Bytes>> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.row.service == "sso" {
+                assert_eq!(request.method(), "GET");
+                assert_eq!(request.headers()["x-amz-sso_bearer_token"], "token");
+            } else {
+                assert_eq!(request.method(), "POST");
+                let body: Value =
+                    serde_json::from_slice(request.body()).unwrap_or_else(|e| unreachable!("{e}"));
+                assert_eq!(body["refreshToken"], "refresh");
+            }
+            let (status, body) = if call > 1 && !self.row.exhaust {
+                (
+                    200,
+                    r#"{"accessToken":"token","expiresIn":3600,"roleCredentials":{"accessKeyId":"key","secretAccessKey":"secret","sessionToken":"token","expiration":4070908800000}}"#,
+                )
+            } else {
+                (self.row.status, self.row.body.as_str())
+            };
+            http::Response::builder()
+                .status(status)
+                .header("x-amzn-errortype", &self.row.header)
+                .header("x-amz-retry-after", &self.row.after)
+                .body(Bytes::copy_from_slice(body.as_bytes()))
+                .map_err(|_| failed())
+        }
+    }
+    impl reqsign_core::FileRead for Io {
+        async fn file_read(&self, _: &str) -> reqsign_core::Result<Vec<u8>> {
+            Ok(br#"{"accessToken":"token","expiresAt":"2099-01-01T00:00:00Z"}"#.to_vec())
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn service_retries_match_actual_go_and_preserve_failed_token_cache() {
+        let rows: Vec<Row> =
+            serde_json::from_str(include_str!("../testdata/aws-sso-retry-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(rows.len(), 80);
+        for (index, row) in rows.into_iter().enumerate() {
+            let io = Io {
+                row: row.clone(),
+                calls: Arc::default(),
+            };
+            let ctx = Context::new()
+                .with_http_send(io.clone())
+                .with_file_read(io.clone())
+                .with_env(reqsign_core::StaticEnv {
+                    home_dir: None,
+                    envs: std::collections::HashMap::from([(
+                        "AWS_NEW_RETRIES_2026".into(),
+                        row.new.to_string(),
+                    )]),
+                });
+            let root =
+                std::env::temp_dir().join(format!("cp-sso-retry-{}-{index}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap_or_else(|e| unreachable!("{e}"));
+            let path = root.join("cache.json");
+            std::fs::write(&path, b"original").unwrap_or_else(|e| unreachable!("{e}"));
+            let provider = Sso {
+                path: Some(path.clone()),
+                key: String::new(),
+                region: "us-east-1".into(),
+                account: "123456789012".into(),
+                role: "role".into(),
+                refresh: true,
+                role_retry: crate::cloud_aws_retry::Retry::new(&ctx),
+                token_retry: crate::cloud_aws_retry::Retry::new(&ctx),
+            };
+            let start = tokio::time::Instant::now();
+            let error = if row.service == "sso" {
+                provider.retrieve(&ctx).await.is_err()
+            } else {
+                let mut token = Map::from_iter([
+                    ("clientId".into(), Value::String("client".into())),
+                    ("clientSecret".into(), Value::String("secret".into())),
+                    ("refreshToken".into(), Value::String("refresh".into())),
+                ]);
+                provider.refresh_token(&ctx, &mut token).await.is_err()
+            };
+            assert_eq!(
+                error, row.error,
+                "{} {} new={}",
+                row.service, row.name, row.new
+            );
+            assert_eq!(
+                io.calls.load(Ordering::Relaxed),
+                row.calls,
+                "{} {} new={}",
+                row.service,
+                row.name,
+                row.new
+            );
+            // Tokio's blocking-file completion may auto-advance a paused clock,
+            // so measure delay only on role retrieval (all HTTP is in memory).
+            if row.service == "sso" && row.new && row.after == "2000" && row.calls == 2 {
+                assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+            }
+            if row.service == "oidc" && error {
+                assert_eq!(
+                    std::fs::read(&path).unwrap_or_else(|e| unreachable!("{e}")),
+                    b"original"
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap_or_else(|e| unreachable!("{e}"));
         }
     }
 }
