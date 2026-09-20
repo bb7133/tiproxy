@@ -36,7 +36,9 @@ struct State {
 ///
 /// The sampler may persist batches while an immutable window is uploading.
 /// After an export error intake returns `Unhealthy` without changing consumer
-/// state, so a successful retry can restore service without resetting deduplication.
+/// state. A successful export retry can restore this handle before the next intake,
+/// but the native sampler treats any rejected batch as fatal, matching the Go
+/// owner. It preserves the WAL for process restart; it does not pause and resume.
 /// Stop and join the sampler before signaling the export worker to shut down.
 pub struct Meter<S> {
     state: Mutex<State>,

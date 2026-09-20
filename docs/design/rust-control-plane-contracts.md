@@ -118,3 +118,18 @@ run mutates `owner_generation`; CI passes only when the comparator rejects it.
 When Go behavior changes intentionally, update its test first, then the contract
 and fault row in the same PR. When a Rust slice takes ownership, keep the row and
 attach real paired evidence; do not mark parity from the synthetic fixtures.
+
+## Native CP-METER failure boundary
+
+The native sampler keeps the Go owner's fail-closed behavior: any rejected
+batch, including an unhealthy exporter, terminates the sampler. Its process
+supervisor must stop serving and join the sampler before stopping the exporter.
+The unacknowledged WAL batch and immutable pending export window remain on disk
+for restart. No transient-error classification or same-process sampler restart
+is introduced by this migration.
+
+The export worker may retry a pending upload while it is still running, including
+the bounded final shutdown attempt. A successful retry can restore the meter
+handle's health before another batch arrives, but cannot revive a sampler that
+has already returned an error. Library-level export recovery tests establish
+durable window/deduplication behavior, not a production pause/resume guarantee.
