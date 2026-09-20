@@ -43,6 +43,13 @@ on:
         required: true
         default: false
         type: boolean
+      t4_cells:
+        description: >-
+          Optional comma-separated T4 cells (ROW-COLUMN, for example M4-X) to
+          record instead of the full matrix; only used with t4_qualification
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -181,6 +188,8 @@ jobs:
           sudo apt-get install --yes protobuf-compiler
           protoc --version
       - name: Record the complete 36-logical / 48-physical matrix
+        env:
+          DATAPLANE_T4_CELLS: ${{ inputs.t4_cells }}
         run: |
           set -o pipefail
           design_root=$(cd "$GITHUB_WORKSPACE/../.." && pwd)

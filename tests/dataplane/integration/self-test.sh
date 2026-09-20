@@ -43,6 +43,17 @@ if [[ $(grep -c $'\tsentinel\ttls-proxy-zstd$' <<<"$qualification_plan") != 3 ]]
 	echo "T4 qualification sentinels are not exactly M1/M7/M9" >&2
 	exit 1
 fi
+# A cell selection only narrows the fixed plan (default stays the full 48
+# cells above); unknown cells and sentinels outside M1/M7/M9 fail closed.
+if [[ $("$script_dir/qualify-route-owner.sh" --print-plan --cells M4-X) != $'M4\tX\tproxy' ]] ||
+	[[ $(DATAPLANE_T4_CELLS=M4-X "$script_dir/qualify-route-owner.sh" --print-plan) != $'M4\tX\tproxy' ]] ||
+	[[ $("$script_dir/qualify-route-owner.sh" --print-plan --cells M1-sentinel,M4-X | wc -l | tr -d ' ') != 2 ]] ||
+	"$script_dir/qualify-route-owner.sh" --print-plan --cells M4-Q >/dev/null 2>&1 ||
+	"$script_dir/qualify-route-owner.sh" --print-plan --cells M4-sentinel >/dev/null 2>&1 ||
+	"$script_dir/qualify-route-owner.sh" --print-plan --cells M4X >/dev/null 2>&1; then
+	echo "T4 cell selection must narrow the fixed plan and reject unknown cells" >&2
+	exit 1
+fi
 
 qualification_design="$script_dir/tiproxy-223-design-final.md"
 if [[ $(sha256_file "$qualification_design") != eddcc7fb9ece5e82d45ae3b953567197664d4c6633ef3861a5d6a8f677f06f2e ]]; then
@@ -69,6 +80,7 @@ for required_fragment in \
 	'"$design_root/notes/tiproxy-223-design-final.md"' \
 	'make dataplane-t4-qualification 2>&1 | \' \
 	'tee "$DATAPLANE_T4_ARTIFACT_ROOT/qualification.log"' \
+	'DATAPLANE_T4_CELLS: ${{ inputs.t4_cells }}' \
 	'- name: Deduplicate test-tool binaries in the qualification evidence' \
 	'python3 tests/dataplane/integration/dedup-evidence-binaries.py --self-test' \
 	'python3 tests/dataplane/integration/dedup-evidence-binaries.py \' \

@@ -5,9 +5,9 @@
 """Deduplicate test-tool binaries inside a recorded qualification evidence tree.
 
 The T4 qualification harness builds ``controldropper`` and ``faultproxy`` once per
-physical cell (see run.sh) and the diagnostics collector copies them again, so a
-48-cell artifact carried ~96 byte-identical copies of each (~830 MB uncompressed)
-while every other evidence file is under 1 MB. This is a packaging step only: it
+physical cell (see run.sh), so a 48-cell artifact carried 96 tool files in total
+(48 byte-identical copies of each, ~830 MB uncompressed) while every other
+evidence file is under 1 MB. This is a packaging step only: it
 runs after the matrix has been recorded and before the artifact is uploaded, and it
 never changes how the harness builds or runs those tools.
 
@@ -96,21 +96,50 @@ def dedup(root):
 
 
 def verify(root):
-    """Return the number of sidecars checked; raise if any deduplicated binary mismatches."""
+    """Return the number of sidecars checked against the manifest's expected set.
+
+    ``bins-manifest.json`` is the source of truth: every path it recorded as
+    replaced must still carry a sidecar naming the right binary, each distinct
+    binary is hashed once and must match its name, and no sidecar may exist that
+    the manifest does not know about. A tree that was never deduplicated (no
+    manifest and no sidecars) verifies trivially.
+    """
     root = os.path.abspath(root)
-    checked = 0
-    for dirpath, _, filenames in os.walk(os.path.join(root, "cells")):
+    cells = os.path.join(root, "cells")
+    present = set()
+    for dirpath, _, filenames in os.walk(cells):
         for name in filenames:
-            if not name.endswith(".sha256") or name[: -len(".sha256")] not in TOOL_NAMES:
-                continue
-            with open(os.path.join(dirpath, name)) as handle:
-                digest, _, target_rel = handle.read().strip().partition("  ")
-            target = os.path.join(root, target_rel)
-            if not os.path.isfile(target):
-                raise SystemExit("%s references missing %s" % (name, target_rel))
-            if sha256_file(target) != digest:
-                raise SystemExit("%s content does not match sidecar %s" % (target_rel, name))
+            if name.endswith(".sha256") and name[: -len(".sha256")] in TOOL_NAMES:
+                present.add(os.path.relpath(os.path.join(dirpath, name), root))
+    manifest_path = os.path.join(root, MANIFEST)
+    if not os.path.exists(manifest_path):
+        if present:
+            raise SystemExit("%d sidecars exist but %s is missing" % (len(present), MANIFEST))
+        return 0
+    with open(manifest_path) as handle:
+        manifest = json.load(handle)
+    expected = set()
+    checked = 0
+    for target_rel, entry in sorted(manifest["binaries"].items()):
+        target = os.path.join(root, target_rel)
+        if not os.path.isfile(target):
+            raise SystemExit("manifest references missing %s" % target_rel)
+        if sha256_file(target) != entry["sha256"] or not target_rel.endswith(entry["sha256"]):
+            raise SystemExit("%s content does not match its manifest sha256" % target_rel)
+        for replaced_rel in entry["replaced"]:
+            sidecar_rel = replaced_rel + ".sha256"
+            expected.add(sidecar_rel)
+            sidecar = os.path.join(root, sidecar_rel)
+            if not os.path.isfile(sidecar):
+                raise SystemExit("missing sidecar %s recorded in %s" % (sidecar_rel, MANIFEST))
+            with open(sidecar) as handle:
+                line = handle.read().strip()
+            if line != "%s  %s" % (entry["sha256"], target_rel):
+                raise SystemExit("%s content does not match sidecar %s" % (target_rel, sidecar_rel))
             checked += 1
+    unknown = present - expected
+    if unknown:
+        raise SystemExit("sidecars not recorded in %s: %s" % (MANIFEST, sorted(unknown)))
     return checked
 
 
@@ -161,14 +190,26 @@ def self_test():
         assert dedup(root)[0] == 0
         with open(os.path.join(root, MANIFEST)) as handle:
             assert handle.read() == before
+        # negative: a sidecar the manifest still records must not silently vanish
+        removed = os.path.join(cell_b, "controldropper.sha256")
+        os.remove(removed)
+        try:
+            verify(root)
+        except SystemExit as exc:
+            assert "missing sidecar" in str(exc), exc
+        else:
+            raise AssertionError("missing sidecar was not detected")
+        with open(removed, "w") as handle:
+            handle.write("%s  %s/controldropper-%s\n" % (hashlib.sha256(blob_dropper).hexdigest(), BINS_DIR, hashlib.sha256(blob_dropper).hexdigest()))
+        assert verify(root) == 6
         # negative: a tampered deduplicated binary must fail verification
-        tampered = os.path.join(root, BINS_DIR, os.listdir(os.path.join(root, BINS_DIR))[0])
+        tampered = os.path.join(root, BINS_DIR, sorted(os.listdir(os.path.join(root, BINS_DIR)))[0])
         with open(tampered, "ab") as handle:
             handle.write(b"x")
         try:
             verify(root)
         except SystemExit as exc:
-            assert "does not match sidecar" in str(exc), exc
+            assert "does not match its manifest sha256" in str(exc), exc
         else:
             raise AssertionError("tampered binary was not detected")
     print("dedup-evidence-binaries self-test: PASS")

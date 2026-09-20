@@ -14,6 +14,10 @@ repo_root=$(cd "$script_dir/../../.." && pwd)
 workspace_root=$(cd "$repo_root/../.." && pwd)
 artifact_root=${DATAPLANE_T4_ARTIFACT_ROOT:-$repo_root/artifacts/tiproxy/223/t4-qualification}
 rows_csv=M1,M2,M3,M4,M5,M6,M7,M8,M9
+# Optional ROW-COLUMN selection (for example M4-X) that only narrows which
+# physical cells of the fixed plan are recorded; every selected cell still runs
+# the full T4 route-owner path with its conservation evidence. Empty = all.
+cells_csv=${DATAPLANE_T4_CELLS:-}
 port_offset=${DATAPLANE_PORT_OFFSET:-12000}
 print_plan=false
 
@@ -25,6 +29,10 @@ while (($# > 0)); do
 			;;
 		--rows)
 			rows_csv=${2:?missing value for --rows}
+			shift 2
+			;;
+		--cells)
+			cells_csv=${2:?missing value for --cells}
 			shift 2
 			;;
 		--port-offset)
@@ -61,15 +69,58 @@ if ((${#rows[@]} == 0)); then
 	echo "at least one row is required" >&2
 	exit 2
 fi
+# Validate the optional cell selection against the fixed plan: every token
+# must be ROW-COLUMN with the row requested and the column defined for that
+# row (sentinel exists only on M1/M7/M9). Unknown cells fail closed.
+selected_cells=""
+if [[ -n $cells_csv ]]; then
+	IFS=, read -r -a requested_cells <<<"$cells_csv"
+	for cell in "${requested_cells[@]}"; do
+		cell_row=${cell%%-*}
+		cell_column=${cell#*-}
+		if [[ -z $cell_row || -z $cell_column || $cell != "$cell_row-$cell_column" ]] ||
+			[[ " $seen_rows " != *" $cell_row "* ]]; then
+			echo "unknown T4 cell selection: $cell (expected ROW-COLUMN within --rows)" >&2
+			exit 2
+		fi
+		case "$cell_column" in
+			P | T | X | C-zlib | C-zstd) ;;
+			sentinel)
+				case "$cell_row" in
+					M1 | M7 | M9) ;;
+					*)
+						echo "unknown T4 cell selection: $cell (sentinel exists only on M1/M7/M9)" >&2
+						exit 2
+						;;
+				esac
+				;;
+			*)
+				echo "unknown T4 cell selection: $cell (unknown logical column)" >&2
+				exit 2
+				;;
+		esac
+		if [[ " $selected_cells " != *" $cell "* ]]; then
+			selected_cells="$selected_cells $cell"
+		fi
+	done
+fi
+cell_selected() {
+	[[ -z $selected_cells || " $selected_cells " == *" $1-$2 "* ]]
+}
 if [[ $print_plan == true ]]; then
+	plan_cell() {
+		if cell_selected "$1" "$2"; then
+			printf '%s\t%s\t%s\n' "$1" "$2" "$3"
+		fi
+	}
 	for row in "${rows[@]}"; do
-		printf '%s\tP\tplain\n' "$row"
-		printf '%s\tT\ttls\n' "$row"
-		printf '%s\tX\tproxy\n' "$row"
-		printf '%s\tC-zlib\tcompress-zlib\n' "$row"
-		printf '%s\tC-zstd\tcompress-zstd\n' "$row"
+		plan_cell "$row" P plain
+		plan_cell "$row" T tls
+		plan_cell "$row" X proxy
+		plan_cell "$row" C-zlib compress-zlib
+		plan_cell "$row" C-zstd compress-zstd
 		case "$row" in
-			M1 | M7 | M9) printf '%s\tsentinel\ttls-proxy-zstd\n' "$row" ;;
+			M1 | M7 | M9) plan_cell "$row" sentinel tls-proxy-zstd ;;
 		esac
 	done
 	exit 0
@@ -140,7 +191,7 @@ done
 rust_sha=$(sha256_file "$rust_binary")
 go_sha=$(sha256_file "$go_binary")
 
-python3 - "$root_manifest" "$commit" "$tree" "$parent" "$design_sha" "$platform" "$rust_sha" "$go_sha" "$rows_csv" <<'PYROOT'
+python3 - "$root_manifest" "$commit" "$tree" "$parent" "$design_sha" "$platform" "$rust_sha" "$go_sha" "$rows_csv" "$selected_cells" <<'PYROOT'
 import json
 import pathlib
 import sys
@@ -157,6 +208,9 @@ path.write_text(json.dumps({
     "rust_binary_sha256": sys.argv[7],
     "go_binary_sha256": sys.argv[8],
     "requested_rows": sys.argv[9].split(","),
+    # Empty means the full fixed plan; a non-empty list marks a narrowed
+    # recording that must never be presented as a complete matrix.
+    "requested_cells": sys.argv[10].split(),
     "completed_physical_cells": [],
 }, sort_keys=True, indent=2) + "\n")
 PYROOT
@@ -262,6 +316,9 @@ PYCELL
 
 run_cell() {
 	local row=$1 column=$2 variant=$3
+	if ! cell_selected "$row" "$column"; then
+		return 0
+	fi
 	local cell="$row-$column-$variant"
 	local cell_root="$artifact_root/cells/$cell"
 	if [[ -e $cell_root ]]; then
@@ -293,14 +350,20 @@ for row in "${rows[@]}"; do
 	esac
 done
 
-python3 - "$root_manifest" <<'PYDONE'
+python3 - "$root_manifest" "$selected_cells" <<'PYDONE'
 import json
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 manifest = json.loads(path.read_text())
-manifest["status"] = "pass"
+# A narrowed recording is closed as "pass-selected-cells" so its manifest can
+# never be read as a complete 48-cell qualification.
+manifest["status"] = "pass" if not sys.argv[2].split() else "pass-selected-cells"
 path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
 PYDONE
-echo "PASS: immutable T4 qualification matrix recorded at $artifact_root"
+if [[ -n $selected_cells ]]; then
+	echo "PASS: selected T4 cells recorded at $artifact_root (not a complete matrix):$selected_cells"
+else
+	echo "PASS: immutable T4 qualification matrix recorded at $artifact_root"
+fi
