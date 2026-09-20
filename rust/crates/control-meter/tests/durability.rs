@@ -371,3 +371,185 @@ async fn export_failure_and_timeout_keep_pending_until_success() {
     assert!(c.healthy());
     assert!(c.sink().pending().is_none());
 }
+
+struct GateStore {
+    requests: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl GateStore {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+    async fn started(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
+}
+
+struct SharedGateStore(std::sync::Arc<GateStore>);
+
+impl control_meter::export::ObjectStore for SharedGateStore {
+    fn put_new<'a>(
+        &'a self,
+        key: &'a str,
+        body: Vec<u8>,
+    ) -> control_meter::export::UploadFuture<'a> {
+        Box::pin(async move {
+            self.0.requests.lock().unwrap().push((key.to_owned(), body));
+            self.0.started.add_permits(1);
+            self.0.release.acquire().await.unwrap().forget();
+            if self.0.fail.load(Ordering::SeqCst) {
+                Err(Error::Export("injected"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn runtime_ingests_during_upload_and_shutdown_flushes_the_final_delta() {
+    use control_meter::runtime::Meter;
+    let f = Fixture::new();
+    let store = GateStore::new();
+    let meter = Meter::new(f.consumer(), SharedGateStore(store.clone()), String::new());
+    meter.apply(&batch(1, 10, 5)).unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = {
+        let meter = meter.clone();
+        tokio::spawn(async move { meter.run(shutdown_rx).await })
+    };
+    store.started().await;
+    // A slow network must not block the second batch's durable ACK.
+    meter.apply(&batch(2, 15, 8)).unwrap();
+    assert_eq!(meter.checkpoint().unwrap().sequence, 2);
+    let disk: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.dir.join("outbox.json")).unwrap()).unwrap();
+    assert_eq!(disk["pending"]["data"][0]["private_response_bytes"], 10);
+    assert_eq!(disk["data"][0]["private_response_bytes"], 5);
+    shutdown_tx.send_replace(true);
+    store.release.add_permits(1);
+    store.started().await;
+    assert!(
+        !meter.healthy(),
+        "shutdown must close intake before the final upload"
+    );
+    assert!(meter.apply(&batch(3, 20, 10)).is_err());
+    store.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let requests = store.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(
+        requests[0].0, requests[1].0,
+        "the final delta needs a separate minute key"
+    );
+    for ((_, compressed), expected) in requests.iter().zip([10, 5]) {
+        let payload: serde_json::Value =
+            serde_json::from_reader(flate2::read::GzDecoder::new(compressed.as_slice())).unwrap();
+        assert_eq!(
+            payload["data"][0]["private_outBound_bytes"]["value"],
+            expected
+        );
+    }
+    let disk: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.dir.join("outbox.json")).unwrap()).unwrap();
+    assert!(disk.get("pending").is_none());
+    assert_eq!(disk["data"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn runtime_upload_failure_pauses_intake_without_poisoning_the_consumer() {
+    use control_meter::runtime::Meter;
+    use std::time::Duration;
+    let f = Fixture::new();
+    let store = GateStore::new();
+    store.fail.store(true, Ordering::SeqCst);
+    store.release.add_permits(2);
+    let meter = Meter::new(f.consumer(), SharedGateStore(store.clone()), String::new());
+    meter.apply(&batch(1, 10, 5)).unwrap();
+    assert!(meter.flush(60, Duration::from_secs(1)).await.is_err());
+    assert!(!meter.healthy());
+    let before = fs::read(f.dir.join("consumer.json")).unwrap();
+    assert!(meter.apply(&batch(2, 15, 8)).is_err());
+    assert_eq!(fs::read(f.dir.join("consumer.json")).unwrap(), before);
+    store.fail.store(false, Ordering::SeqCst);
+    assert!(meter.flush(180, Duration::from_secs(1)).await.unwrap());
+    assert!(meter.healthy());
+    meter.apply(&batch(2, 15, 8)).unwrap();
+    let requests = store.requests.lock().unwrap();
+    assert_eq!(
+        requests[0], requests[1],
+        "retry must keep the pending identity and bytes"
+    );
+}
+
+#[tokio::test]
+async fn runtime_cancelled_upload_keeps_pending_and_serializes_retry() {
+    use control_meter::runtime::Meter;
+    use std::time::Duration;
+    let f = Fixture::new();
+    let store = GateStore::new();
+    let meter = Meter::new(f.consumer(), SharedGateStore(store.clone()), String::new());
+    meter.apply(&batch(1, 10, 5)).unwrap();
+    let upload = {
+        let meter = meter.clone();
+        tokio::spawn(async move { meter.flush(60, Duration::from_secs(5)).await })
+    };
+    store.started().await;
+    let retry = {
+        let meter = meter.clone();
+        tokio::spawn(async move { meter.flush(120, Duration::from_secs(5)).await })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(store.requests.lock().unwrap().len(), 1);
+    upload.abort();
+    assert!(upload.await.unwrap_err().is_cancelled());
+    store.started().await;
+    store.release.add_permits(1);
+    assert!(retry.await.unwrap().unwrap());
+    let requests = store.requests.lock().unwrap();
+    assert_eq!(requests[0], requests[1]);
+    assert!(f.outbox().pending().is_none());
+}
+
+#[tokio::test]
+async fn runtime_failed_final_export_is_reported_and_remains_durable() {
+    use control_meter::runtime::Meter;
+    let f = Fixture::new();
+    let store = GateStore::new();
+    store.fail.store(true, Ordering::SeqCst);
+    store.release.add_permits(2);
+    let meter = Meter::new(f.consumer(), SharedGateStore(store.clone()), String::new());
+    meter.apply(&batch(1, 10, 5)).unwrap();
+    let failures = meter.export_failures();
+    let (_, shutdown) = tokio::sync::watch::channel(true);
+    assert!(meter.run(shutdown).await.is_err());
+    assert_eq!(
+        *failures.borrow(),
+        2,
+        "startup and final failure are both observable"
+    );
+    assert!(!meter.healthy());
+    assert!(meter.apply(&batch(2, 15, 8)).is_err());
+    let restored = f.outbox();
+    assert_eq!(
+        restored.pending().unwrap().data[0].private_response_bytes,
+        10
+    );
+    assert_eq!(restored.checkpoint().sequence, 1);
+}

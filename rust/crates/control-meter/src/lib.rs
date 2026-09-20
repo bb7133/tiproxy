@@ -22,6 +22,7 @@ pub mod export;
 mod local_store;
 mod outbox;
 mod persistence;
+pub mod runtime;
 mod types;
 
 pub use consumer::Consumer;
