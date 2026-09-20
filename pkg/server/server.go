@@ -183,7 +183,8 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 		srv.replay = mgrrp.NewJobManager(lg.Named("replay"), srv.configManager.GetConfig(), srv.certManager, idMgr, hsHandler, false)
 	}
 
-	{
+	// Rust owns metering state and exports when its dataplane is selected.
+	if !cfg.RustDataplane.Enabled {
 		srv.meter, err = meter.NewMeter(cfg, lg.Named("meter"))
 		if err != nil {
 			return

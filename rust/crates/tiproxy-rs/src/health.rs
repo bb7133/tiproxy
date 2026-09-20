@@ -56,6 +56,7 @@ pub struct SourceGenerationEvidence {
 pub async fn serve(
     listener: TcpListener,
     serving: DataplaneServingHandle,
+    meter_healthy: Arc<dyn Fn() -> bool + Send + Sync>,
     route_inputs: Arc<dyn Fn() -> RouteInputEvidence + Send + Sync>,
     route_ledger: Arc<dyn Fn() -> RouteLedgerEvidence + Send + Sync>,
     source_generations: Arc<dyn Fn() -> SourceGenerationEvidence + Send + Sync>,
@@ -66,7 +67,7 @@ pub async fn serve(
         };
         let response = render(
             &serving.status(),
-            serving.is_serving().await,
+            serving.is_serving().await && meter_healthy(),
             route_inputs(),
             route_ledger(),
             source_generations(),
@@ -201,6 +202,7 @@ mod tests {
         let server = tokio::spawn(serve(
             listener,
             serving,
+            Arc::new(|| true),
             Arc::new(RouteInputEvidence::default),
             Arc::new(RouteLedgerEvidence::default),
             Arc::new(SourceGenerationEvidence::default),

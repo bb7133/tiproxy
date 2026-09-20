@@ -33,7 +33,21 @@ key, default shared pool, existing-object refusal, durable seal/commit, and
 LocalFS provider options. Go TiProxy uses the SDK default with pagination off.
 
 Cloud adapters, the periodic exporter, native WAL sampler, and typed storage
-factory are implemented. Complete cloud identity/endpoint parity, binary owner
-selection and removal of the Go sink remain follow-up work.
-`CP-METER-001.rust_status` therefore remains pending and the existing production
-bridge is unchanged. Only one runtime may open these state files during handoff.
+factory are implemented. Rust mode now owns the complete metering lifecycle and
+requires `RUST_METER_OWNER`; Go mode retains its original implementation.
+Complete cloud identity/endpoint parity and independent qualification remain
+pending. Stop legacy processes before handing over their state files.
+
+For a focused real-process check with TiDB and the live control tap, run:
+
+```sh
+DATAPLANE_NATIVE_METER=1 TIPROXY_RS_BIN=/path/to/tiproxy-rs \
+  tests/dataplane/integration/run.sh --mode rust --variant plain
+```
+
+This runs SQL and connection recovery, then requires successful coordinated Rust
+shutdown. `verify-native.py` independently reads the producer WAL, consumer,
+outbox and exported gzip objects: producer/consumer/outbox sequences must agree,
+final sources and retained WAL must be empty, and exported tenant byte totals
+must exactly match the consumer. The attached live bridge must carry zero
+metering batch/ACK frames. Receipts stay in the integration artifact directory.

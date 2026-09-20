@@ -124,3 +124,34 @@ func TestRouteOwnerRejectsNonemptyResidualReconcile(t *testing.T) {
 		require.Equal(t, before.RouteStateSHA256, after.RouteStateSHA256)
 	}
 }
+
+func TestNativeMeterOwnerHasNoConsumerAndRejectsRetiredMetering(t *testing.T) {
+	handler, err := NewNativeMeterOwnerControlHandler(mustDrainIssuer(t))
+	require.NoError(t, err)
+	require.Nil(t, handler.consumer)
+	peer := &recordingSender{}
+	for _, envelope := range []*controlpb.ControlEnvelope{
+		{RequestId: 1, Body: &controlpb.ControlEnvelope_MeteringBatch{MeteringBatch: &controlpb.MeteringBatch{ProducerId: "producer", Sequence: 1}}},
+		{RequestId: 2, Body: &controlpb.ControlEnvelope_MeteringAck{MeteringAck: &controlpb.MeteringAck{ProducerId: "producer", Sequence: 1}}},
+	} {
+		require.NoError(t, handler.HandleEnvelope(t.Context(), peer, envelope))
+	}
+	require.EqualValues(t, 2, handler.legacyMeterViolations.Load())
+	for _, sent := range peer.sent() {
+		require.NotNil(t, sent.GetError())
+		require.Nil(t, sent.GetMeteringAck())
+		require.Nil(t, sent.GetMeteringBatch())
+	}
+	require.NoError(t, handler.HandleEnvelope(t.Context(), peer, &controlpb.ControlEnvelope{RequestId: 3, Body: &controlpb.ControlEnvelope_ReconcileRequest{ReconcileRequest: &controlpb.ReconcileRequest{LastMeteringSequence: 99}}}))
+	require.Zero(t, peer.sent()[2].GetReconcileSnapshot().GetMeteringSequence())
+}
+
+func TestNativeMeterOwnerRejectsGoStateOrLegacyComposition(t *testing.T) {
+	for _, config := range []BridgeConfig{
+		{NativeMeterOwner: true},
+		{NativeMeterOwner: true, RouteOwner: true, MeteringStatePath: "must-not-open"},
+	} {
+		_, err := NewBridge(config)
+		require.ErrorContains(t, err, "native metering requires route owner and no Go metering state or sink")
+	}
+}

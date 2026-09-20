@@ -172,6 +172,8 @@ type CompositeControlHandler struct {
 	consumer              *MeteringConsumer
 	publisher             *SnapshotPublisher
 	routeOwner            bool
+	nativeMeterOwner      bool
+	legacyMeterViolations atomic.Uint64
 	legacyRouteViolations atomic.Uint64
 }
 
@@ -227,6 +229,15 @@ func NewRouteOwnerControlHandler(
 	return &CompositeControlHandler{issuer: issuer, consumer: consumer, routeOwner: true}, nil
 }
 
+// NewNativeMeterOwnerControlHandler owns neither route state nor a metering
+// consumer. Metering batches/ACKs are retired in this process-fixed composition.
+func NewNativeMeterOwnerControlHandler(issuer *DrainIssuer) (*CompositeControlHandler, error) {
+	if issuer == nil {
+		return nil, errors.New("native meter owner handler requires issuer")
+	}
+	return &CompositeControlHandler{issuer: issuer, routeOwner: true, nativeMeterOwner: true}, nil
+}
+
 // RouteOwnerStatus snapshots the residual handler's zero-route proof.
 func (handler *CompositeControlHandler) RouteOwnerStatus() RouteOwnerStatus {
 	return RouteOwnerStatus{
@@ -253,6 +264,19 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 ) error {
 	if envelope == nil {
 		return errors.New("control envelope is required")
+	}
+	if handler.nativeMeterOwner {
+		switch envelope.GetBody().(type) {
+		case *controlpb.ControlEnvelope_MeteringBatch, *controlpb.ControlEnvelope_MeteringAck:
+			handler.legacyMeterViolations.Add(1)
+			metrics.ServerErrCounter.WithLabelValues("rust_legacy_metering_violation").Inc()
+			return sendBody(ctx, sender, envelope.GetRequestId(), controlpb.Priority_PRIORITY_CRITICAL,
+				&controlpb.ControlEnvelope_Error{Error: &controlpb.ProtocolError{
+					Code:               controlpb.ErrorCode_ERROR_CODE_PROTOCOL_VIOLATION,
+					OffendingRequestId: envelope.GetRequestId(),
+					Detail:             "retired metering message under RUST_METER_OWNER",
+				}})
+		}
 	}
 	switch body := envelope.GetBody().(type) {
 	case *controlpb.ControlEnvelope_SnapshotResult:
@@ -341,6 +365,10 @@ func (handler *CompositeControlHandler) handleResidualReconcile(
 	if request == nil || request.GetLastConnectionEventSequence() != 0 || len(request.GetConnections()) != 0 {
 		return handler.rejectRetiredRouteBody(ctx, sender, envelope)
 	}
+	var meteringSequence uint64
+	if handler.consumer != nil {
+		meteringSequence = handler.consumer.LastApplied()
+	}
 	return sendBodyWithOptions(ctx, sender, envelope.GetRequestId(), envelope.GetGeneration(),
 		controlpb.Priority_PRIORITY_CRITICAL,
 		[]uint64{uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RUST_ROUTE_OWNER)},
@@ -348,7 +376,7 @@ func (handler *CompositeControlHandler) handleResidualReconcile(
 			AppliedGeneration:       request.GetKnownGeneration(),
 			ConnectionEventSequence: 0,
 			MetricsSequence:         request.GetLastMetricsSequence(),
-			MeteringSequence:        handler.consumer.LastApplied(),
+			MeteringSequence:        meteringSequence,
 			Connections:             nil,
 		}})
 }

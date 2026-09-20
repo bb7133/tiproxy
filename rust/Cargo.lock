@@ -2843,6 +2843,7 @@ dependencies = [
  "control-config",
  "control-etcd",
  "control-external",
+ "control-meter",
  "control-plane",
  "control-proto",
  "control-router",

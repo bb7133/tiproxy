@@ -857,6 +857,34 @@ pub async fn run_native_metering_sampler<S: control_meter::Intake + 'static>(
     }
 }
 
+/// Replays the retained producer WAL before the process opens SQL admission.
+/// The returned ledger remains exclusively owned by the caller; failed recovery
+/// leaves every unacknowledged batch on disk.
+///
+/// # Errors
+/// Returns a consumer, durable ACK, or blocking worker failure.
+pub async fn recover_native_metering<S: control_meter::Intake + 'static>(
+    mut ledger: crate::control_commands::MeteringLedger,
+    meter: Arc<S>,
+) -> Result<crate::control_commands::MeteringLedger, MeteringSamplerError> {
+    tokio::task::spawn_blocking(move || {
+        native_replay(&mut ledger, meter.as_ref())?;
+        Ok(ledger)
+    })
+    .await
+    .map_err(|_| MeteringSamplerError::DispatchUnavailable)?
+}
+
+fn native_replay<S: control_meter::Intake>(
+    ledger: &mut crate::control_commands::MeteringLedger,
+    meter: &S,
+) -> Result<(), MeteringSamplerError> {
+    for batch in ledger.replay() {
+        native_deliver(ledger, meter, batch)?;
+    }
+    Ok(())
+}
+
 fn native_sample<S: control_meter::Intake>(
     registry: &MeteringSourceRegistry,
     ledger: &mut crate::control_commands::MeteringLedger,
@@ -865,9 +893,7 @@ fn native_sample<S: control_meter::Intake>(
     if registry.failed.load(Ordering::Acquire) {
         return Err(MeteringSamplerError::SourceInvariant);
     }
-    for batch in ledger.replay() {
-        native_deliver(ledger, meter, batch)?;
-    }
+    native_replay(ledger, meter)?;
     let sample = registry.prepare()?;
     for snapshots in sample.snapshots.chunks(MAX_DELTAS_PER_BATCH) {
         let finals = snapshots
@@ -1091,8 +1117,8 @@ mod tests {
         assert!(!meter.healthy());
     }
 
-    #[test]
-    fn native_consumer_failure_keeps_wal_and_replays_final_only_once() {
+    #[tokio::test]
+    async fn native_consumer_failure_keeps_wal_and_replays_final_only_once() {
         let mut f = NativeFixture::new();
         let mut ledger =
             MeteringLedger::open_persistent(f.dir.join("producer.wal")).expect("ledger");
@@ -1111,6 +1137,15 @@ mod tests {
             0,
             "final moved durably to WAL"
         );
+        let path = f.dir.join("producer.wal");
+        let before = fs::read(&path).expect("retained WAL");
+        assert!(
+            super::recover_native_metering(ledger, Arc::clone(&old))
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).expect("failed recovery WAL"), before);
+        let ledger = MeteringLedger::open_persistent(path).expect("restart WAL");
         f.lease = Some(
             f.owners
                 .claim(
@@ -1119,7 +1154,9 @@ mod tests {
                 )
                 .expect("replacement owner"),
         );
-        super::native_sample(&registry, &mut ledger, f.meter().as_ref()).expect("replay");
+        let ledger = super::recover_native_metering(ledger, f.meter())
+            .await
+            .expect("startup replay");
         assert_eq!(
             ledger.last_sequence(),
             1,

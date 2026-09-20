@@ -4433,3 +4433,51 @@ async fn state_arm_reconcile_does_not_inherit_a_generation() {
     );
     harness.task.abort();
 }
+
+#[tokio::test]
+async fn native_meter_owner_rejects_bridge_intake_and_ignores_retired_acks() {
+    let mut handler = ControlCommandHandler::native_meter_owner();
+    assert!(matches!(
+        handler.record_metering(MeteringDelta::default()),
+        Err(dataplane::MeteringError::NativeOwner)
+    ));
+    assert!(matches!(
+        handler.record_metering_snapshots(Vec::new()),
+        Err(dataplane::MeteringError::NativeOwner)
+    ));
+    assert!(matches!(
+        handler.acknowledge_metering("producer", 99),
+        Err(dataplane::MeteringError::NativeOwner)
+    ));
+    assert!(matches!(handler.seal_metering(), Ok(None)));
+    let harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
+    for body in [
+        Body::MeteringAck(MeteringAck {
+            producer_id: "native-producer".into(),
+            sequence: 99,
+        }),
+        Body::MeteringBatch(control_proto::v1::MeteringBatch::default()),
+    ] {
+        assert!(
+            harness
+                .inbound_tx
+                .send(tagged_on(envelope(901, 0, body), 1, 1))
+                .await
+                .is_ok()
+        );
+    }
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        while harness.stats.unrouted.load(Ordering::Relaxed) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(observed.is_ok(), "both retired wire bodies were consumed");
+    assert!(harness.sender.sent().iter().all(|frame| !matches!(
+        frame.body,
+        Some(Body::MeteringBatch(_) | Body::MeteringAck(_))
+    )));
+    harness.task.abort();
+    let _ = harness.task.await;
+}

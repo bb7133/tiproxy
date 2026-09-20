@@ -1,9 +1,50 @@
 # Native metering implementation checkpoint
 
 The native consumer/outbox, gzip envelope, LocalFS exporter, export worker, and
-WAL sampler and configured storage factory are implemented. The binary still selects the existing Go owner.
+WAL sampler and configured storage factory are implemented. Rust mode now selects
+the native owner; Go mode retains the Go implementation.
 CP-METER qualification remains pending until all storage/configuration and
 process-lifecycle paths have completed integration and independent review.
+
+## Process ownership
+
+Both processes require capability 7 (`RUST_METER_OWNER`) in addition to the
+existing config and route-owner capabilities. Ownership is process-fixed.
+Rust mode skips Go `NewMeter` and the bridge consumer entirely; metering batch
+and ACK bodies are retired on that bridge, with no durable effects. Compatibility
+constructors and protobuf tags remain for old fixtures and explicit Go mode.
+
+Rust retains `<control-socket>.metering.wal`,
+`<workdir>/run/rust-metering-consumer.json`, and
+`<workdir>/run/metering-outbox.json`. It holds exclusive native locks for the
+state directory and WAL path, including when distinct workdirs share a WAL.
+Consumer/outbox recovery and retained WAL replay occur only after compatible
+peer negotiation; the snapshot consumer gates initial SQL installation until
+recovery and startup succeed.
+Startup failure releases the gate as failed before joined rollback. An older
+binary does not participate in the native file locks: stop both old processes
+before migrating existing state. Capability negotiation cannot make concurrent
+legacy file access safe.
+
+Normal shutdown joins SQL sessions, takes the sampler's final durable sample,
+ACKs successful native intake, then joins the export worker's final flush before
+retiring process ownership. Sampler and exporter are locally owned futures;
+startup rollback leaves no detached worker. Failed final export returns an error
+and retains the pending outbox; rejected intake retains the WAL. The health
+endpoint includes native intake/export health.
+
+The focused real-process probe starts the actual Go bridge, Rust binary and TiDB
+clusters, runs SQL and disconnect recovery, then joins Rust shutdown. Its live
+control tap must see zero metering batch/ACK frames. An independent Python reader
+checks WAL checksum and sequence, consumer/outbox checkpoint agreement, zero
+remaining sources/unacked batches, and exact aggregate byte equality with the
+final LocalFS gzip objects. This is a directed ownership check, not the full
+transport/fault matrix:
+
+```sh
+DATAPLANE_NATIVE_METER=1 TIPROXY_RS_BIN=/path/to/tiproxy-rs \
+  tests/dataplane/integration/run.sh --mode rust --variant plain
+```
 
 ## Cloud storage increment
 
@@ -344,8 +385,7 @@ go run rust/crates/control-meter/testdata/azure-managed-go.go
 go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
-Full default-credential/endpoint edge parity and binary ownership handoff remain
-in progress. Provider retry-policy and default-chain edge comparisons remain
+Full default-credential/endpoint edge parity remains in progress. Provider retry-policy and default-chain edge comparisons remain
 open, including nondefault AWS retry configuration and STS clock-skew
 correction. Export failure retains the pending window for the next metering
 attempt.

@@ -265,6 +265,7 @@ pub struct ControlCommandHandler {
     /// The production cutover composition. This is process-fixed: bridge
     /// reconnects cannot demote routing back to Go.
     route_owner: bool,
+    native_meter_owner: bool,
     /// The active control session's atomic `(epoch, capability mask)`
     /// snapshot — `None` whenever the last observed transport state is
     /// not `Connected` (watch coalescing can collapse
@@ -331,6 +332,7 @@ impl ControlCommandHandler {
         Self {
             gate: CommandGate::new(),
             route_owner: false,
+            native_meter_owner: false,
             active_session: None,
             active_lineage: None,
             reconcile_capable: true,
@@ -352,6 +354,15 @@ impl ControlCommandHandler {
         let mut handler = Self::with_metering(metering);
         handler.route_owner = true;
         handler.reconcile_capable = false;
+        handler
+    }
+
+    /// Production composition with metering entirely in the native process.
+    /// The bridge holds no persistent ledger and cannot acknowledge its WAL.
+    #[must_use]
+    pub fn native_meter_owner() -> Self {
+        let mut handler = Self::with_metering_route_owner(MeteringLedger::new());
+        handler.native_meter_owner = true;
         handler
     }
 
@@ -462,6 +473,9 @@ impl ControlCommandHandler {
     /// single dispatch task and enqueues the entire replay before it can
     /// process a later seal notice, so new batches cannot overtake the replay.
     fn begin_metering_delivery(&mut self) -> Vec<control_proto::v1::MeteringBatch> {
+        if self.native_meter_owner {
+            return Vec::new();
+        }
         let Some((serial, _, _)) = self.active_session else {
             return Vec::new();
         };
@@ -661,6 +675,9 @@ impl ControlCommandHandler {
         &mut self,
         delta: control_proto::v1::MeteringDelta,
     ) -> Result<(), MeteringError> {
+        if self.native_meter_owner {
+            return Err(MeteringError::NativeOwner);
+        }
         let result = self.metering.record(delta);
         if result.is_err() {
             self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
@@ -679,6 +696,9 @@ impl ControlCommandHandler {
         &mut self,
         snapshots: Vec<MeteringSourceSnapshot>,
     ) -> Result<Option<control_proto::v1::MeteringBatch>, MeteringError> {
+        if self.native_meter_owner {
+            return Err(MeteringError::NativeOwner);
+        }
         let result = self.metering.record_snapshots(snapshots);
         if result.is_err() {
             self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
@@ -697,6 +717,9 @@ impl ControlCommandHandler {
         producer_id: &str,
         sequence: u64,
     ) -> Result<bool, MeteringError> {
+        if self.native_meter_owner {
+            return Err(MeteringError::NativeOwner);
+        }
         let result = self.metering.acknowledge(producer_id, sequence);
         if result.is_err() {
             self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
@@ -1481,6 +1504,9 @@ impl ControlCommandHandler {
     pub fn seal_metering(
         &mut self,
     ) -> Result<Option<control_proto::v1::MeteringBatch>, MeteringError> {
+        if self.native_meter_owner {
+            return Ok(None);
+        }
         self.metering.seal()
     }
 
@@ -3084,6 +3110,15 @@ async fn process_inbound<S: DispatchSender>(
             .send(tagged)
             .await
             .map_err(|_| DispatchFatal::SnapshotOwnerGone);
+    }
+    if handler.native_meter_owner
+        && matches!(
+            tagged.envelope.body,
+            Some(Body::MeteringAck(_) | Body::MeteringBatch(_))
+        )
+    {
+        handler.count_unrouted();
+        return Ok(());
     }
     if let Some(Body::MeteringAck(ack)) = &tagged.envelope.body {
         // ACKs are session-bound and capability-gated: a delayed ACK from a

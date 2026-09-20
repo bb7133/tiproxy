@@ -1141,6 +1141,8 @@ pub struct MeteringLedger {
 /// the control stream unhealthy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeteringError {
+    /// The process owns native metering; bridge intake is retired.
+    NativeOwner,
     /// The sealed-but-unacknowledged retention bound was hit.
     BacklogFull {
         /// Retained sealed batches.
