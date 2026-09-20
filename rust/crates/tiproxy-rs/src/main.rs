@@ -103,6 +103,7 @@ struct Options {
     drain_grace: Option<Duration>,
     health_port: u16,
     metrics_addr: Option<SocketAddr>,
+    log_file: Option<PathBuf>,
 }
 
 enum Command {
@@ -449,7 +450,10 @@ async fn run(options: Options) -> Result<(), String> {
     // Process log output (B0): honour `log.log-file.*` before the first
     // lifecycle event, and route the dataplane's session logs through the
     // same writer so a rotating file receives every line.
-    let initial_log_file = log_file_settings(config_owner.handle.source().current().as_ref());
+    let initial_log_file = log_file_settings(
+        options.log_file.as_deref(),
+        config_owner.handle.source().current().as_ref(),
+    );
     process_logging::configure(initial_log_file.as_ref())?;
     install_session_log_writer(process_logging::emit_line);
     let routing_shadow_socket = options.routing_shadow_socket.clone().or_else(|| {
@@ -794,6 +798,7 @@ async fn run(options: Options) -> Result<(), String> {
         Err(error) => return Err(guard.rollback(error).await),
     }
     guard.set_log_reload_task(tokio::spawn(run_log_reload(
+        options.log_file.clone(),
         config_owner.handle.source().subscribe(),
         initial_log_file,
     )));
@@ -1270,31 +1275,36 @@ async fn wait_for_termination_signal() {
 
 /// Projects `log.log-file.*` from the committed config into the process log
 /// output settings; an empty file name keeps the standard stream.
+/// Combines the process's own `--log-file` path with the committed
+/// `log.log-file.*` rotation limits. While the Go control process still owns
+/// `log.log-file.filename`, the Rust process must never share that file (two
+/// rotating writers on one path), so the Rust file name comes only from the
+/// CLI; without it the process keeps its standard stream.
 fn log_file_settings(
+    log_file: Option<&Path>,
     snapshot: &control_config::ConfigNamespaceSnapshot,
 ) -> Option<LogFileSettings> {
+    let filename = log_file?;
     let log = snapshot.effective().log_online();
-    let filename = log.log_file_name();
-    if filename.is_empty() {
-        return None;
-    }
     Some(LogFileSettings {
-        filename: PathBuf::from(filename),
+        filename: filename.to_path_buf(),
         max_size_mb: log.log_file_max_size_mb(),
         max_days: log.log_file_max_days(),
         max_backups: log.log_file_max_backups(),
     })
 }
 
-/// Applies every committed `log.log-file.*` change to the process log output.
-/// A file that cannot be opened is reported on the current output and the
-/// previous output stays in place, exactly like the Go logger's rebuild.
+/// Applies every committed `log.log-file.*` rotation-limit change to the
+/// process log output. A file that cannot be reopened is reported on the
+/// current output and the previous output stays in place, exactly like the
+/// Go logger's rebuild.
 async fn run_log_reload(
+    log_file: Option<PathBuf>,
     mut updates: watch::Receiver<Arc<control_config::ConfigNamespaceSnapshot>>,
     mut current: Option<LogFileSettings>,
 ) {
     while updates.changed().await.is_ok() {
-        let next = log_file_settings(updates.borrow_and_update().as_ref());
+        let next = log_file_settings(log_file.as_deref(), updates.borrow_and_update().as_ref());
         if next == current {
             continue;
         }
@@ -1337,6 +1347,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let mut drain_grace = None;
     let mut health_port: u16 = 0;
     let mut metrics_addr: Option<SocketAddr> = None;
+    let mut log_file: Option<PathBuf> = None;
     let mut routing_shadow_socket = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -1391,6 +1402,13 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                         format!("metrics address must be host:port, got {value:?}")
                     })?);
             }
+            "--log-file" => {
+                log_file = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--log-file requires a path".to_owned())?,
+                ));
+            }
             "--drain-grace-seconds" => {
                 let value = arguments
                     .next()
@@ -1423,6 +1441,9 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     if tls_roots.iter().any(|root| !root.is_absolute()) {
         return Err("TLS allowlist roots must be absolute".to_owned());
     }
+    if log_file.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err("log file path must be absolute".to_owned());
+    }
     Ok(Command::Run(Options {
         config_file: config_file
             .ok_or_else(|| format!("--config or {CONFIG_FILE_ENV} is required"))?,
@@ -1434,6 +1455,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         drain_grace,
         health_port,
         metrics_addr,
+        log_file,
     }))
 }
 
@@ -1453,7 +1475,7 @@ impl startup::Teardown for legacy_router_shadow::consumer::Task {
 
 fn usage() -> &'static str {
     "Usage: tiproxy-rs --config <path> --control-socket <absolute-path> --control-uid <uid> \
-     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--metrics-addr <host:port>] [--routing-shadow-socket <absolute-path>]\n\
+     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--metrics-addr <host:port>] [--log-file <absolute-path>] [--routing-shadow-socket <absolute-path>]\n\
      Environment: TIPROXY_CONFIG, TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 
@@ -2066,6 +2088,7 @@ mod tests {
                 drain_grace: None,
                 health_port: 0,
                 metrics_addr: None,
+                log_file: None,
             }
         );
     }
@@ -2124,6 +2147,7 @@ mod tests {
             drain_grace: Some(Duration::from_secs(45)),
             health_port: 8081,
             metrics_addr: None,
+            log_file: None,
         };
         let source = ConfigNamespaceStore::from_toml(
             b"enable-traffic-replay = false\n",
@@ -2305,6 +2329,40 @@ pd-addrs = "routing-pd:2379"
             ])
             .is_err(),
             "a bare port is not a socket address"
+        );
+    }
+
+    #[test]
+    fn parses_log_file_and_requires_an_absolute_path() {
+        let Ok(Command::Run(options)) = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--log-file".to_owned(),
+            "/var/log/tiproxy-rs.log".to_owned(),
+        ]) else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(
+            options.log_file,
+            Some(PathBuf::from("/var/log/tiproxy-rs.log"))
+        );
+        assert!(
+            parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
+                "--control-socket".to_owned(),
+                "/tmp/control.sock".to_owned(),
+                "--control-uid".to_owned(),
+                "42".to_owned(),
+                "--log-file".to_owned(),
+                "tiproxy-rs.log".to_owned(),
+            ])
+            .is_err(),
+            "a relative log file would depend on the working directory"
         );
     }
     #[test]

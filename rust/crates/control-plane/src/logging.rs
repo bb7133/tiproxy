@@ -15,9 +15,10 @@
 //! Process log output with Go-compatible file rotation (CP-ADMIN B0).
 //!
 //! Every structured log line in the Rust process goes through [`emit_line`].
-//! Without a configured file the line is written to stderr, as before. With
-//! `log.log-file.filename` set, lines go to that file and rotate exactly like
-//! the Go `lumberjack` writer `TiProxy` uses: a write that would exceed
+//! Without a configured file the line is written to stderr, as before. With a
+//! file configured (the binary's `--log-file` path plus the `log.log-file.*`
+//! limits), lines go to that file and rotate exactly like the Go `lumberjack`
+//! writer `TiProxy` uses: a write that would exceed
 //! `max-size` megabytes first renames the current file to
 //! `<name>-<timestamp><ext>` and starts a new one, then prunes backups beyond
 //! `max-backups` and older than `max-days`. The backup timestamp uses the same
