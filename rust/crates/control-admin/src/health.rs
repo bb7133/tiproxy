@@ -116,6 +116,20 @@ fn natural_reason(inputs: &HealthInputs) -> Option<&'static str> {
     }
 }
 
+/// Encodes a string the way Go's `encoding/json` does with HTML escaping on
+/// (gin's `c.JSON`): `<`, `>`, `&` become `\u003c`, `\u003e`, `\u0026`, and
+/// U+2028/U+2029 become `\u2028`/`\u2029`.
+#[must_use]
+pub fn go_json_string(value: &str) -> String {
+    serde_json::Value::String(value.to_owned())
+        .to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 /// Renders the Go `config.HealthInfo` JSON. `unhealthy_reason` carries the
 /// `omitempty` tag, so an unhealthy override with an empty reason still
 /// answers `502` with the checksum alone.
@@ -124,7 +138,7 @@ fn render(checksum: u32, reason: Option<String>) -> HealthResponse {
     let body = match reason.filter(|reason| !reason.is_empty()) {
         Some(reason) => format!(
             "{{\"config_checksum\":{checksum},\"unhealthy_reason\":{}}}",
-            serde_json::Value::String(reason)
+            go_json_string(&reason)
         ),
         None => format!("{{\"config_checksum\":{checksum}}}"),
     };
@@ -196,6 +210,18 @@ mod tests {
         assert_eq!(response.body, "{\"config_checksum\":3405691582}");
         state.clear_override();
         assert_eq!(state.evaluate(&ready()).status, 200);
+    }
+
+    #[test]
+    fn reason_uses_go_html_safe_json_escaping() {
+        assert_eq!(go_json_string("<a>&"), "\"\\u003ca\\u003e\\u0026\"");
+        assert_eq!(go_json_string("x\u{2028}y"), "\"x\\u2028y\"");
+        let state = HealthState::new();
+        state.set_override(false, "<a>&");
+        assert_eq!(
+            state.evaluate(&ready()).body,
+            "{\"config_checksum\":3405691582,\"unhealthy_reason\":\"\\u003ca\\u003e\\u0026\"}"
+        );
     }
 
     #[test]

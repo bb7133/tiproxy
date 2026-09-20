@@ -24,15 +24,20 @@
 //! connection task is tracked, and shutdown stops accepting, lets in-flight
 //! requests finish within a grace period, then drops the rest.
 
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use axum::Router;
-use hyper::rt::{Read, Write};
+use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use hyper_util::service::TowerToHyperService;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
@@ -46,8 +51,9 @@ pub type TlsConfigSource = Arc<dyn Fn() -> Option<Arc<rustls::ServerConfig>> + S
 /// Listener tunables; defaults follow the Go server.
 #[derive(Clone, Copy, Debug)]
 pub struct ServeOptions {
-    /// Go `DefConnTimeout`: request-head read timeout, idle timeout, and the
-    /// `cmux` sniff timeout.
+    /// Go `DefConnTimeout`: HTTP/1 request-head read timeout, the
+    /// activity-based idle timeout applied to HTTP/1 and HTTP/2 connections,
+    /// and the `cmux` sniff timeout.
     pub connection_timeout: Duration,
     /// Concurrent connections admitted; further accepts are closed at once.
     pub max_connections: usize,
@@ -138,7 +144,7 @@ struct Connection {
 impl Connection {
     async fn run(self, stream: TcpStream) {
         let Some(config) = self.tls else {
-            serve_io(TokioIo::new(stream), self.full, &self.builder, self.watcher).await;
+            serve_io(stream, self.full, &self.builder, self.watcher, self.timeout).await;
             return;
         };
         // cmux: the first byte decides the branch; a silent peer is dropped
@@ -149,10 +155,11 @@ impl Connection {
         };
         if first[0] != 0x16 {
             serve_io(
-                TokioIo::new(stream),
+                stream,
                 self.plaintext,
                 &self.builder,
                 self.watcher,
+                self.timeout,
             )
             .await;
             return;
@@ -162,18 +169,121 @@ impl Connection {
         else {
             return;
         };
-        serve_io(TokioIo::new(stream), self.full, &self.builder, self.watcher).await;
+        serve_io(stream, self.full, &self.builder, self.watcher, self.timeout).await;
     }
 }
 
-async fn serve_io<I>(io: I, router: Router, builder: &Builder<TokioExecutor>, watcher: Watcher)
-where
-    I: Read + Write + Unpin + Send + 'static,
+/// Serves one connection until hyper finishes, the graceful watcher ends it,
+/// or the idle watchdog fires: no successful read or write for
+/// `idle_timeout` closes the connection, the behaviour Go's `IdleTimeout`
+/// gives HTTP/1 keep-alive and that hyper has no built-in equivalent for
+/// on HTTP/2. Dropping the connection future closes the socket.
+async fn serve_io<I>(
+    io: I,
+    router: Router,
+    builder: &Builder<TokioExecutor>,
+    watcher: Watcher,
+    idle_timeout: Duration,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let started = Instant::now();
+    let last_activity = Arc::new(AtomicU64::new(0));
+    let io = IdleIo {
+        inner: TokioIo::new(io),
+        last_activity: Arc::clone(&last_activity),
+        started,
+    };
     let connection = builder
         .serve_connection(io, TowerToHyperService::new(router))
         .into_owned();
-    let _ = watcher.watch(connection).await;
+    let guarded = watcher.watch(connection);
+    tokio::pin!(guarded);
+    let watchdog = async {
+        loop {
+            let last = Duration::from_millis(last_activity.load(Ordering::Acquire));
+            tokio::time::sleep_until((started + last + idle_timeout).into()).await;
+            let idle = started
+                .elapsed()
+                .saturating_sub(Duration::from_millis(last_activity.load(Ordering::Acquire)));
+            if idle >= idle_timeout {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        _ = &mut guarded => {}
+        () = watchdog => {}
+    }
+}
+
+/// hyper I/O wrapper that stamps the last successful read or write.
+struct IdleIo<I> {
+    inner: TokioIo<I>,
+    last_activity: Arc<AtomicU64>,
+    started: Instant,
+}
+
+impl<I> IdleIo<I> {
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_activity.store(elapsed, Ordering::Release);
+    }
+}
+
+impl<I: AsyncRead + Unpin> Read for IdleIo<I> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(()))) {
+            this.touch();
+        }
+        poll
+    }
+}
+
+impl<I: AsyncWrite + Unpin> Write for IdleIo<I> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(_))) {
+            this.touch();
+        }
+        poll
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        if matches!(poll, Poll::Ready(Ok(_))) {
+            this.touch();
+        }
+        poll
+    }
 }
 
 #[cfg(test)]
@@ -352,7 +462,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         shutdown.send_replace(true);
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -368,6 +478,37 @@ mod tests {
         assert!(matches!(closed, Ok(Ok(0) | Err(_))), "{closed:?}");
         let closed = tokio::time::timeout(Duration::from_secs(1), partial.read(&mut buffer)).await;
         assert!(matches!(closed, Ok(Ok(0) | Err(_))), "{closed:?}");
+    }
+
+    #[tokio::test]
+    async fn idle_keep_alive_connection_is_closed_after_the_timeout() {
+        let (address, shutdown, task) = start(None).await;
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /debug/health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buffer = vec![0_u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..n]).starts_with("HTTP/1.1 200 OK"));
+        // Keep-alive: the connection stays open, then the 2 s idle watchdog
+        // (connection_timeout in these tests) closes it without a request.
+        let started = Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer)).await;
+        assert!(matches!(closed, Ok(Ok(0) | Err(_))), "{closed:?}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -81,7 +81,10 @@ func TestCPAdminCapture(t *testing.T) {
 	srv, _, _ := createServerWithConfig(t, "enable-traffic-replay = false\n")
 	addr := srv.listener.Addr().String()
 	client := &http.Client{
-		// Capture gin's trailing-slash 301 instead of following it.
+		// Only the local listener is under test: never route through an
+		// inherited HTTP proxy. Capture gin's trailing-slash 301 instead of
+		// following it.
+		Transport:     &http.Transport{Proxy: nil},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	observations := make([]cpadminObservation, 0, len(steps))

@@ -20,7 +20,8 @@ readiness gate (`500 "service not ready"` as JSON until the process is ready),
 the handler, and an access log that records only method, path, status and
 latency for non-2xx responses (Go logs successes at debug level, which the
 Rust process does not emit). Unknown paths and unregistered methods answer
-gin's `404 page not found` with `text/plain`. Request bodies are bounded at
+gin's `404 page not found` with `text/plain`; that includes `HEAD` on every
+route, which gin never registers. Request bodies are bounded at
 1 MiB; Go reads them unbounded.
 
 TLS follows `security.server-http-tls` from the current accepted configuration
@@ -29,7 +30,11 @@ rebinding. With TLS configured the first byte is sniffed like Go's `cmux`: a
 TLS record reaches the full table, anything else reaches only `GET
 /api/debug/health` and `GET /debug/health`. Without TLS every connection reaches
 the full table over HTTP/1.1 or cleartext HTTP/2 (Go `UseH2C`). The
-request-head and idle timeout is 30 s (Go `DefConnTimeout`); connections are
+HTTP/1 request-head read timeout is 30 s (Go `DefConnTimeout`), and the same
+30 s applies as an activity-based idle timeout to HTTP/1 and HTTP/2
+connections (Go's `IdleTimeout`; hyper has no HTTP/2 equivalent, so the
+listener stamps every successful read or write and closes a connection that
+stays silent that long); connections are
 bounded to 1024 and every connection task is tracked in a `JoinSet`, so
 shutdown stops accepting, lets in-flight requests finish within 5 s, then
 aborts and joins every remaining task, including peers still being sniffed,
@@ -41,7 +46,7 @@ drains instead of continuing without an operator surface (Go only logs the
 | Endpoint | Behaviour |
 | --- | --- |
 | `GET /api/debug/health`, `GET /debug/health` | `{"config_checksum":N}` with `unhealthy_reason` only when set; `502` in the Go order: manual override, closing, namespace owner not ready, no applied dataplane generation. `config_checksum` is the CRC32 of the Go-encoded TOML and is numerically identical to Go's. |
-| `PUT /api/debug/health` | `{"healthy":bool,"reason":string}`; gin binding semantics (unknown keys ignored, missing keys zero, wrong types `400 "bad health override json"`); reason trimmed; `200 ""`. |
+| `PUT /api/debug/health` | `{"healthy":bool,"reason":string}` decoded with `json.Decoder.Decode` semantics as gin's `ShouldBindJSON` applies them: one JSON value is read and trailing bytes are ignored, `null` is the zero value, keys match exactly or case-insensitively, unknown keys are ignored, every occurrence of a key is decoded so a wrong type anywhere is `400 "bad health override json"` and the last well-typed value wins; reason trimmed; `200 ""`. Strings in every JSON answer use Go's HTML-safe escaping (`\u003c`, `\u003e`, `\u0026`, `\u2028`, `\u2029`). |
 | `DELETE /api/debug/health` | clears the override, `200 ""`. |
 | `GET /metrics`, `/metrics/`, `/api/metrics`, `/api/metrics/` | the B0 native exposition, `text/plain; version=0.0.4; charset=utf-8; escaping=underscores`. |
 | `GET /api/dataplane/status` | the Go key set in gin's sorted-map order; `desired_generation` and `sent_generation` are the latest composed generation (there is no transport hop in-process), `applied_generation`/`rejected_generation` come from SQL serving, `last_result_code` is `ERROR_CODE_INVALID_SNAPSHOT` when the latest rejection is newer than the latest apply, `ERROR_CODE_OK` after the first apply, `ERROR_CODE_UNSPECIFIED` before it. |

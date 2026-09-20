@@ -34,7 +34,7 @@ use http::header::CONTENT_TYPE;
 use http::{HeaderValue, StatusCode};
 use http_body_util::BodyExt;
 
-use crate::health::{HealthInputs, HealthState};
+use crate::health::{HealthInputs, HealthState, go_json_string};
 
 /// Go `DefAPILimit`: requests per second admitted by the global limiter.
 pub const DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 100;
@@ -86,9 +86,9 @@ impl DataplaneStatus {
             "{{\"applied_generation\":{},\"desired_generation\":{},\"detail\":{},\"enabled\":true,\"last_good_age_ms\":{},\"last_result_code\":{},\"rejected_generation\":{},\"sent_generation\":{}}}",
             self.applied_generation,
             self.desired_generation,
-            serde_json::Value::String(self.detail.clone()),
+            go_json_string(&self.detail),
             self.last_good_age_ms,
-            serde_json::Value::String(self.last_result_code.clone()),
+            go_json_string(&self.last_result_code),
             self.rejected_generation,
             self.sent_generation,
         )
@@ -222,15 +222,23 @@ impl AdminApp {
 
 /// Builds the complete route table served on the API listener.
 pub fn full_router(app: Arc<AdminApp>) -> Router {
-    let health = get(health_get).put(health_put).delete(health_delete);
+    // gin registers only the listed methods; axum would otherwise answer
+    // HEAD through the GET handler, so HEAD is pinned to the 404 body.
+    let health = get(health_get)
+        .put(health_put)
+        .delete(health_delete)
+        .head(not_found);
     let router = Router::new()
         .route("/api/debug/health", health.clone())
         .route("/debug/health", health)
-        .route("/metrics", get(metrics))
-        .route("/metrics/", get(metrics))
-        .route("/api/metrics", get(metrics))
-        .route("/api/metrics/", get(metrics))
-        .route("/api/dataplane/status", get(dataplane_status))
+        .route("/metrics", get(metrics).head(not_found))
+        .route("/metrics/", get(metrics).head(not_found))
+        .route("/api/metrics", get(metrics).head(not_found))
+        .route("/api/metrics/", get(metrics).head(not_found))
+        .route(
+            "/api/dataplane/status",
+            get(dataplane_status).head(not_found),
+        )
         .route(
             "/api/traffic/capture",
             axum::routing::post(traffic_disabled("capture")),
@@ -251,8 +259,8 @@ pub fn full_router(app: Arc<AdminApp>) -> Router {
 /// readiness probe, only `GET` (Go `server.go` cmux `HTTP1Fast` branch).
 pub fn plaintext_router(app: Arc<AdminApp>) -> Router {
     let router = Router::new()
-        .route("/api/debug/health", get(health_get))
-        .route("/debug/health", get(health_get));
+        .route("/api/debug/health", get(health_get).head(not_found))
+        .route("/debug/health", get(health_get).head(not_found));
     with_middleware(router, app)
 }
 
@@ -323,24 +331,86 @@ async fn health_put(State(app): State<Arc<AdminApp>>, request: Request) -> Respo
     let Some(body) = read_body(request).await else {
         return json(StatusCode::BAD_REQUEST, "\"bad health override json\"");
     };
-    // gin ShouldBindJSON: unknown keys ignored, missing keys zero-valued,
-    // wrong types rejected.
-    let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice::<serde_json::Value>(&body)
-    else {
+    let Ok(body) = OverrideBody::decode(&body) else {
         return json(StatusCode::BAD_REQUEST, "\"bad health override json\"");
     };
-    let healthy = match fields.get("healthy") {
-        None | Some(serde_json::Value::Null) => false,
-        Some(serde_json::Value::Bool(value)) => *value,
-        Some(_) => return json(StatusCode::BAD_REQUEST, "\"bad health override json\""),
-    };
-    let reason = match fields.get("reason") {
-        None | Some(serde_json::Value::Null) => "",
-        Some(serde_json::Value::String(value)) => value.as_str(),
-        Some(_) => return json(StatusCode::BAD_REQUEST, "\"bad health override json\""),
-    };
-    app.health.set_override(healthy, reason);
+    app.health.set_override(body.healthy, &body.reason);
     json(StatusCode::OK, "\"\"")
+}
+
+/// The Go `manualHealthOverrideRequest` decoded with `encoding/json`
+/// semantics as gin's `ShouldBindJSON` applies them: exactly one JSON value
+/// is read and trailing bytes are ignored; `null` yields the zero value;
+/// keys match a field exactly or, failing that, case-insensitively; unknown
+/// keys are skipped; every occurrence of a key is decoded in order, so a
+/// wrong type anywhere is an error and the last well-typed value wins; a
+/// JSON `null` leaves the field unchanged; a non-object value is an error.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OverrideBody {
+    healthy: bool,
+    reason: String,
+}
+
+impl OverrideBody {
+    fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        // No `end()` call: `json.Decoder.Decode` reads one value only.
+        serde::Deserializer::deserialize_any(&mut deserializer, OverrideVisitor)
+    }
+}
+
+struct OverrideVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OverrideVisitor {
+    type Value = OverrideBody;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object or null")
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(OverrideBody::default())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut body = OverrideBody::default();
+        while let Some(key) = map.next_key::<String>()? {
+            let field = if key == "healthy" || key == "reason" {
+                key.as_str()
+            } else if key.eq_ignore_ascii_case("healthy") {
+                "healthy"
+            } else if key.eq_ignore_ascii_case("reason") {
+                "reason"
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            };
+            let value = map.next_value::<serde_json::Value>()?;
+            match (field, value) {
+                (_, serde_json::Value::Null) => {}
+                ("healthy", serde_json::Value::Bool(value)) => body.healthy = value,
+                ("reason", serde_json::Value::String(value)) => body.reason = value,
+                (field, other) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "cannot unmarshal {} into field {field}",
+                        json_kind(&other)
+                    )));
+                }
+            }
+        }
+        Ok(body)
+    }
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 async fn health_delete(State(app): State<Arc<AdminApp>>) -> Response {
@@ -521,6 +591,12 @@ mod tests {
         )
         .await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, "\"\""));
+        let (status, content_type, body) =
+            oneshot(router.clone(), request("HEAD", "/api/debug/health", "")).await;
+        assert_eq!(
+            (status, content_type.as_str(), body.as_str()),
+            (StatusCode::NOT_FOUND, NOT_FOUND_CONTENT_TYPE, "")
+        );
         let (status, _, body) = oneshot(router.clone(), request("GET", "/debug/health", "")).await;
         assert_eq!(
             (status, body.as_str()),
@@ -549,7 +625,10 @@ mod tests {
             assert_eq!(body, "# HELP x y\n");
         }
         let (status, _, body) = oneshot(router.clone(), request("HEAD", "/metrics", "")).await;
-        assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
+        assert_eq!((status, body.as_str()), (StatusCode::NOT_FOUND, ""));
+        let (status, _, _) =
+            oneshot(router.clone(), request("HEAD", "/api/dataplane/status", "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, content_type, body) =
             oneshot(router.clone(), request("GET", "/api/dataplane/status", "")).await;
         assert_eq!(status, StatusCode::OK);
@@ -578,6 +657,38 @@ mod tests {
         );
         let (status, _, _) = oneshot(router, request("POST", "/metrics", "")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn override_body_follows_go_decoder_semantics() {
+        let ok = |text: &str| OverrideBody::decode(text.as_bytes()).unwrap();
+        assert_eq!(ok("null"), OverrideBody::default());
+        assert!(ok("{\"healthy\":true} garbage").healthy);
+        assert_eq!(
+            ok("{\"Healthy\":true,\"Reason\":\"maint\"}"),
+            OverrideBody {
+                healthy: true,
+                reason: "maint".to_owned()
+            }
+        );
+        assert!(ok("{\"healthy\":false,\"healthy\":true}").healthy);
+        assert!(!ok("{\"healthy\":true,\"HEALTHY\":false}").healthy);
+        assert_eq!(
+            ok("{\"healthy\":null,\"reason\":null,\"x\":[1,{}]}"),
+            OverrideBody::default()
+        );
+        for bad in [
+            "",
+            "{\"healthy\":\"bad\",\"healthy\":true}",
+            "{\"healthy\":1}",
+            "{\"reason\":5}",
+            "[]",
+            "\"text\"",
+            "{\"healthy\":true",
+            "{healthy:true}",
+        ] {
+            assert!(OverrideBody::decode(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]
