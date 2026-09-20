@@ -24,6 +24,7 @@ use std::{
 pub(crate) struct Retry {
     new_2026: bool,
     tokens: AtomicU32,
+    imds: bool,
 }
 
 pub(crate) struct Failure {
@@ -31,6 +32,8 @@ pub(crate) struct Failure {
     retryable: bool,
     timeout: bool,
     throttle: bool,
+    status: Option<u16>,
+    retry_after: Option<Duration>,
 }
 impl Failure {
     pub(crate) fn terminal(error: reqsign_core::Error) -> Self {
@@ -39,6 +42,8 @@ impl Failure {
             retryable: false,
             timeout: false,
             throttle: false,
+            status: None,
+            retry_after: None,
         }
     }
     pub(crate) fn transport(error: reqsign_core::Error) -> Self {
@@ -53,7 +58,47 @@ impl Failure {
             retryable,
             timeout,
             throttle: false,
+            status: None,
+            retry_after: None,
         }
+    }
+    pub(crate) fn imds(response: &http::Response<bytes::Bytes>, metadata: bool) -> Self {
+        let status = response.status().as_u16();
+        // Go's metadata-401 retryableError does not unwrap ResponseError;
+        // only other HTTP failures expose this header to the middleware.
+        let retry_after = if metadata && status == 401 {
+            None
+        } else {
+            response
+                .headers()
+                .get("x-amz-retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| *v >= 0)
+                .map(|v| v.wrapping_mul(1_000_000))
+                .and_then(|v| u64::try_from(v).ok())
+                .map(Duration::from_nanos)
+        };
+        Self {
+            error: reqsign_core::Error::credential_invalid("AWS IMDS request failed"),
+            retryable: matches!(status, 500 | 502 | 503 | 504) || (metadata && status == 401),
+            timeout: false,
+            throttle: false,
+            status: Some(status),
+            retry_after,
+        }
+    }
+    pub(crate) fn status(&self) -> Option<u16> {
+        self.status
+    }
+    pub(crate) fn is_transport(&self) -> bool {
+        use std::error::Error as _;
+        self.error
+            .source()
+            .is_some_and(<dyn std::error::Error>::is::<crate::cloud_context::HttpFailure>)
+    }
+    pub(crate) fn into_error(self) -> reqsign_core::Error {
+        self.error
     }
     pub(crate) fn container(status: u16, code: &str) -> Self {
         let throttle = matches!(
@@ -81,6 +126,8 @@ impl Failure {
             retryable,
             timeout: false,
             throttle,
+            status: Some(status),
+            retry_after: None,
         }
     }
 }
@@ -89,74 +136,137 @@ impl Retry {
         Self {
             new_2026: ctx.env_var("AWS_NEW_RETRIES_2026").as_deref() == Some("true"),
             tokens: AtomicU32::new(500),
+            imds: false,
         }
     }
-    pub(crate) async fn run<T, F, Fut>(&self, mut operation: F) -> reqsign_core::Result<T>
+    pub(crate) fn imds(ctx: &Context) -> Self {
+        Self {
+            imds: true,
+            ..Self::new(ctx)
+        }
+    }
+    pub(crate) fn attempts(&self) -> Attempts<'_> {
+        Attempts {
+            policy: self,
+            number: 1,
+            previous_cost: 0,
+        }
+    }
+    pub(crate) async fn run<T, F, Fut>(&self, operation: F) -> reqsign_core::Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, Failure>>,
     {
-        let mut previous_cost = 0;
-        for attempt in 1..=3 {
-            let failure = match operation().await {
+        self.run_outcome(operation)
+            .await
+            .map_err(Failure::into_error)
+    }
+    pub(crate) async fn run_outcome<T, F, Fut>(&self, mut operation: F) -> Result<T, Failure>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, Failure>>,
+    {
+        let mut attempts = self.attempts();
+        loop {
+            match operation().await {
                 Ok(value) => {
-                    // Legacy SDK refunds the successful retry's cost plus one;
-                    // the 2026 policy only adds one on first-attempt success.
-                    let refund = previous_cost + u32::from(!self.new_2026 || attempt == 1);
-                    let _ = self
-                        .tokens
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_add(refund).min(500))
-                        });
+                    attempts.success();
                     return Ok(value);
                 }
-                Err(failure) => failure,
-            };
-            if attempt == 3 || !failure.retryable {
-                return Err(failure.error);
+                Err(failure) => attempts.failure(failure).await?,
             }
-            let cost = if self.new_2026 {
-                if failure.throttle { 5 } else { 14 }
-            } else if failure.timeout {
-                10
-            } else {
-                5
-            };
-            if self
-                .tokens
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    v.checked_sub(cost)
-                })
-                .is_err()
-            {
-                return Err(reqsign_core::Error::credential_invalid(
-                    "AWS credential retry quota exhausted",
-                ));
-            }
-            previous_cost = cost;
-            let mut random = [0; 8];
-            getrandom::getrandom(&mut random)
-                .map_err(|_| reqsign_core::Error::unexpected("AWS retry delay unavailable"))?;
-            // Same 53-bit [0,1) distribution as the Go crypto-random helper.
-            let low = u32::from_le_bytes([random[0], random[1], random[2], random[3]]);
-            let high = u32::from_le_bytes([random[4], random[5], random[6], random[7]]) & 0x1f_ffff;
-            let fraction =
-                (f64::from(high) * 4_294_967_296.0 + f64::from(low)) / 9_007_199_254_740_992.0;
-            tokio::time::sleep(self.delay(attempt, failure.throttle, fraction)).await;
         }
-        unreachable!("three-attempt loop always returns")
+    }
+    fn backoff_index(&self, attempt: u8) -> u8 {
+        attempt - u8::from(self.new_2026)
     }
     fn delay(&self, attempt: u8, throttle: bool, fraction: f64) -> Duration {
-        if self.new_2026 {
+        // SDK middleware uses zero-based backoff indices in 2026 mode.
+        let index = self.backoff_index(attempt);
+        if self.imds {
+            // IMDS replaces the backoff with the legacy 1s-cap helper, even
+            // in 2026 mode. Index0 gets jitter; indices1+ get the fixed cap.
+            if index == 0 {
+                Duration::from_secs_f64(fraction)
+            } else {
+                Duration::from_secs(1)
+            }
+        } else if self.new_2026 {
             let base = if throttle { 1.0 } else { 0.05 };
-            Duration::from_secs_f64(fraction * (base * 2_f64.powi(i32::from(attempt))).min(20.0))
+            Duration::from_secs_f64(fraction * (base * 2_f64.powi(i32::from(index))).min(20.0))
         } else if attempt > 4 {
             // The pinned legacy implementation caps before drawing jitter once
             // attempt exceeds floor(log2(maxBackoffSeconds)).
             Duration::from_secs(20)
         } else {
-            Duration::from_secs_f64(fraction * 2_f64.powi(i32::from(attempt)))
+            Duration::from_secs_f64(fraction * 2_f64.powi(i32::from(index)))
         }
+    }
+}
+
+// Mutable metadata negotiation can drive attempts directly while using the
+// same quota and cancellation logic as the closure-based container path.
+pub(crate) struct Attempts<'a> {
+    policy: &'a Retry,
+    number: u8,
+    previous_cost: u32,
+}
+impl Attempts<'_> {
+    pub(crate) fn success(&self) {
+        let refund = self.previous_cost + u32::from(!self.policy.new_2026 || self.number == 1);
+        let _ = self
+            .policy
+            .tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(refund).min(500))
+            });
+    }
+    pub(crate) async fn failure(&mut self, failure: Failure) -> Result<(), Failure> {
+        if self.number == 3 || !failure.retryable {
+            return Err(failure);
+        }
+        let cost = if self.policy.new_2026 {
+            if failure.throttle { 5 } else { 14 }
+        } else if failure.timeout {
+            10
+        } else {
+            5
+        };
+        if self
+            .policy
+            .tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.checked_sub(cost)
+            })
+            .is_err()
+        {
+            return Err(Failure::terminal(reqsign_core::Error::credential_invalid(
+                "AWS credential retry quota exhausted",
+            )));
+        }
+        self.previous_cost = cost;
+        let fraction = if self.policy.imds && (!self.policy.new_2026 || self.number > 1) {
+            0.0
+        } else {
+            let mut random = [0; 8];
+            getrandom::getrandom(&mut random).map_err(|_| {
+                Failure::terminal(reqsign_core::Error::unexpected(
+                    "AWS retry delay unavailable",
+                ))
+            })?;
+            let low = u32::from_le_bytes([random[0], random[1], random[2], random[3]]);
+            let high = u32::from_le_bytes([random[4], random[5], random[6], random[7]]) & 0x1f_ffff;
+            (f64::from(high) * 4_294_967_296.0 + f64::from(low)) / 9_007_199_254_740_992.0
+        };
+        let mut delay = self.policy.delay(self.number, failure.throttle, fraction);
+        if self.policy.new_2026
+            && let Some(after) = failure.retry_after
+        {
+            delay = after.clamp(delay, delay + Duration::from_secs(5));
+        }
+        tokio::time::sleep(delay).await;
+        self.number += 1;
+        Ok(())
     }
 }
 
@@ -165,23 +275,45 @@ mod tests {
     use super::*;
     #[test]
     fn pinned_legacy_and_2026_delay_formulas() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/aws-container-retry-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        for row in fixture["backoffs"]
+            .as_array()
+            .unwrap_or_else(|| unreachable!())
+        {
+            let retry = Retry {
+                new_2026: row["new"].as_bool().unwrap_or_default(),
+                tokens: AtomicU32::new(500),
+                imds: false,
+            };
+            assert_eq!(
+                serde_json::json!([retry.backoff_index(1), retry.backoff_index(2)]),
+                row["indices"],
+                "actual SDK middleware arguments"
+            );
+        }
         for new in [false, true] {
             let retry = Retry {
                 new_2026: new,
                 tokens: AtomicU32::new(500),
+                imds: false,
             };
             assert_eq!(
                 retry.delay(1, false, 0.5),
-                Duration::from_secs_f64(if new { 0.05 } else { 1.0 })
+                Duration::from_secs_f64(if new { 0.025 } else { 1.0 })
             );
             assert_eq!(
                 retry.delay(2, false, 0.5),
-                Duration::from_secs_f64(if new { 0.1 } else { 2.0 })
+                Duration::from_secs_f64(if new { 0.05 } else { 2.0 })
             );
-            assert_eq!(retry.delay(1, true, 0.5), Duration::from_secs(1));
+            assert_eq!(
+                retry.delay(1, true, 0.5),
+                Duration::from_secs_f64(if new { 0.5 } else { 1.0 })
+            );
             assert_eq!(
                 retry.delay(5, true, 0.5),
-                Duration::from_secs(if new { 10 } else { 20 })
+                Duration::from_secs(if new { 8 } else { 20 })
             );
         }
     }

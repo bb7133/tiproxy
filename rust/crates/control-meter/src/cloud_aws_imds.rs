@@ -14,6 +14,7 @@
 
 //! Go EC2 metadata token negotiation, role selection and credential cache policy.
 
+use super::cloud_aws_retry::{Failure, Retry};
 use bytes::Bytes;
 use http::{Request, Response};
 use reqsign_aws_v4::Credential;
@@ -30,6 +31,7 @@ pub(crate) struct Imds {
     endpoint: String,
     disabled: bool,
     fallback: bool,
+    retry: Retry,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -95,6 +97,7 @@ impl Imds {
             disabled: env(ctx, "AWS_EC2_METADATA_DISABLED")
                 .is_some_and(|v| v.eq_ignore_ascii_case("true")),
             fallback,
+            retry: Retry::imds(ctx),
             state: Mutex::default(),
         })
     }
@@ -164,20 +167,44 @@ impl Imds {
         state: &mut State,
         path: &str,
     ) -> reqsign_core::Result<Bytes> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let token = self.token(ctx, state).await?;
-            let response = self.request(ctx, "GET", path, token.as_deref()).await?;
-            if response.status() == http::StatusCode::UNAUTHORIZED {
-                state.token = None;
-                state.token_disabled = false;
+        let mut acquiring_token = false;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut attempts = self.retry.attempts();
+            loop {
+                // getToken is nested inside each metadata attempt, as in Go.
+                // Its errors are terminal here after its own retries, avoiding
+                // multiplication of attempts when v1 fallback is disabled.
+                acquiring_token = true;
+                let token = self.token(ctx, state).await?;
+                acquiring_token = false;
+                let response = self.request(ctx, "GET", path, token.as_deref()).await;
+                let failure = match response {
+                    Ok(response) if response.status().is_success() => {
+                        attempts.success();
+                        return Ok(response.into_body());
+                    }
+                    Ok(response) => {
+                        if response.status() == http::StatusCode::UNAUTHORIZED {
+                            state.token = None;
+                            state.token_disabled = false;
+                        }
+                        Failure::imds(&response, true)
+                    }
+                    Err(error) => Failure::transport(error),
+                };
+                attempts
+                    .failure(failure)
+                    .await
+                    .map_err(Failure::into_error)?;
             }
-            if !response.status().is_success() {
-                return Err(failed());
-            }
-            Ok(response.into_body())
         })
-        .await
-        .map_err(|_| failed())?
+        .await;
+        if result.is_err() && acquiring_token {
+            // Go disables token negotiation after a canceled token operation;
+            // retain that state even though timeout drops the Rust future.
+            state.token_disabled = true;
+        }
+        result.map_err(|_| failed())?
     }
     async fn token(
         &self,
@@ -188,14 +215,21 @@ impl Imds {
             return Ok(None);
         }
         if let Some((token, expires)) = &state.token
-            && *expires > Timestamp::now()
+            && *expires >= Timestamp::now()
         {
             return Ok(Some(token.clone()));
         }
-        let response = self.request(ctx, "PUT", "/latest/api/token", None).await;
-        match response {
-            Ok(response) if response.status().is_success() => {
-                let decoded = (|| {
+        let result = self
+            .retry
+            .run_outcome(|| async {
+                let response = self
+                    .request(ctx, "PUT", "/latest/api/token", None)
+                    .await
+                    .map_err(Failure::transport)?;
+                if !response.status().is_success() {
+                    return Err(Failure::imds(&response, false));
+                }
+                let value = (|| {
                     let ttl = response
                         .headers()
                         .get(TTL_HEADER)?
@@ -203,31 +237,43 @@ impl Imds {
                         .ok()?
                         .parse::<i64>()
                         .ok()?;
-                    let expires =
-                        Timestamp::from_second(Timestamp::now().as_second().checked_add(ttl)?)
-                            .ok()?;
+                    // Go time.Duration(tokenTTL)*time.Second wraps at int64 and
+                    // retains the response instant's fractional second.
+                    let nanos = ttl.wrapping_mul(1_000_000_000);
+                    let now = Timestamp::now();
+                    let duration = Duration::from_nanos(nanos.unsigned_abs());
+                    let expires = if nanos >= 0 {
+                        now + duration
+                    } else {
+                        now - duration
+                    };
                     let token = std::str::from_utf8(response.body()).ok()?.to_owned();
                     Some((token, expires))
-                })();
-                if let Some((token, expires)) = decoded {
-                    state.token = Some((token.clone(), expires));
-                    return Ok(Some(token));
-                }
+                })()
+                .ok_or_else(|| Failure::terminal(failed()))?;
+                Ok(value)
+            })
+            .await;
+        match result {
+            Ok((token, expires)) => {
+                state.token = Some((token.clone(), expires));
+                Ok(Some(token))
             }
-            Ok(response) => {
-                if response.status() == http::StatusCode::BAD_REQUEST {
-                    return Err(failed());
+            Err(error) => {
+                if error.status() == Some(400) {
+                    return Err(error.into_error());
                 }
-                if matches!(response.status().as_u16(), 403..=405) && self.fallback {
+                if (matches!(error.status(), Some(403..=405)) && self.fallback)
+                    || error.is_transport()
+                {
                     state.token_disabled = true;
                 }
+                if self.fallback {
+                    Ok(None)
+                } else {
+                    Err(error.into_error())
+                }
             }
-            Err(_) => state.token_disabled = true,
-        }
-        if self.fallback {
-            Ok(None)
-        } else {
-            Err(failed())
         }
     }
     async fn request(
@@ -249,7 +295,6 @@ impl Imds {
         }
         ctx.http_send(request.body(Bytes::new()).map_err(|_| failed())?)
             .await
-            .map_err(|_| failed())
     }
 }
 fn clean_path(path: &str, trailing: bool) -> String {
@@ -436,7 +481,7 @@ mod tests {
             _ => assert_eq!(value.to_string(), expected, "{name}"),
         }
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn imds_token_role_requests_and_cache_match_actual_go() {
         let cases: Vec<Case> = serde_json::from_str(include_str!("../testdata/aws-imds-go.json"))
             .unwrap_or_else(|e| unreachable!("{e}"));
@@ -492,6 +537,169 @@ mod tests {
                 row.requests.unwrap_or_default(),
                 "{} requests",
                 row.name
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use serde::Deserialize as DeriveDeserialize;
+    use std::sync::{Arc, Mutex as StdMutex};
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveDeserialize)]
+    struct Observed {
+        method: String,
+        token: String,
+        ttl: String,
+    }
+    #[derive(Clone, Debug, DeriveDeserialize)]
+    #[allow(clippy::struct_excessive_bools)] // Schema of the actual Go observation.
+    struct Row {
+        name: String,
+        new: bool,
+        token_statuses: Option<Vec<u16>>,
+        statuses: Option<Vec<u16>>,
+        ttl: String,
+        v1_disabled: bool,
+        after: String,
+        hang: bool,
+        error: bool,
+        second_error: bool,
+        backoffs: Option<Vec<u8>>,
+        requests: Vec<Observed>,
+    }
+    #[derive(Clone, Debug)]
+    struct Io {
+        row: Row,
+        requests: Arc<StdMutex<Vec<Observed>>>,
+    }
+    fn status(values: Option<&[u16]>, count: usize) -> u16 {
+        let values = values.unwrap_or_default();
+        values
+            .get(count - 1)
+            .or_else(|| values.last())
+            .copied()
+            .unwrap_or(200)
+    }
+    impl reqsign_core::HttpSend for Io {
+        async fn http_send(
+            &self,
+            request: Request<Bytes>,
+        ) -> reqsign_core::Result<Response<Bytes>> {
+            let method = request.method().to_string();
+            let token = request
+                .headers()
+                .get(TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let ttl = request
+                .headers()
+                .get(TTL_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let count = {
+                let mut requests = self.requests.lock().unwrap_or_else(|e| unreachable!("{e}"));
+                requests.push(Observed {
+                    method: method.clone(),
+                    token,
+                    ttl,
+                });
+                requests.iter().filter(|r| r.method == method).count()
+            };
+            let mut response = Response::builder().header("x-amz-retry-after", &self.row.after);
+            let body;
+            if method == "PUT" {
+                assert_eq!(request.uri().path(), "/latest/api/token");
+                if self.row.hang {
+                    return std::future::pending().await;
+                }
+                response = response.status(status(self.row.token_statuses.as_deref(), count));
+                if self.row.ttl != "MISSING" {
+                    response = response.header(TTL_HEADER, &self.row.ttl);
+                }
+                body = format!("token-{count}");
+            } else {
+                assert_eq!(request.uri().path(), "/latest/meta-data/probe");
+                response = response.status(status(self.row.statuses.as_deref(), count));
+                body = "metadata".into();
+            }
+            response.body(Bytes::from(body)).map_err(|_| failed())
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn nested_retries_token_renewal_and_deadline_match_actual_go() {
+        let rows: Vec<Row> =
+            serde_json::from_str(include_str!("../testdata/aws-imds-retry-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(rows.len(), 40);
+        for row in rows {
+            let io = Io {
+                row: row.clone(),
+                requests: Arc::default(),
+            };
+            let ctx = Context::new()
+                .with_env(reqsign_core::StaticEnv {
+                    home_dir: None,
+                    envs: std::collections::HashMap::from([
+                        (
+                            "AWS_EC2_METADATA_SERVICE_ENDPOINT".into(),
+                            "http://127.0.0.1".into(),
+                        ),
+                        (
+                            "AWS_EC2_METADATA_V1_DISABLED".into(),
+                            row.v1_disabled.to_string(),
+                        ),
+                        ("AWS_NEW_RETRIES_2026".into(), row.new.to_string()),
+                    ]),
+                })
+                .with_http_send(io.clone());
+            let provider =
+                Imds::new(&ctx, &BTreeMap::new()).unwrap_or_else(|e| unreachable!("{e}"));
+            let mut state = State::default();
+            let start = tokio::time::Instant::now();
+            let result = provider
+                .metadata(&ctx, &mut state, "/latest/meta-data/probe")
+                .await;
+            assert_eq!(result.is_err(), row.error, "{} new={}", row.name, row.new);
+            if row.hang {
+                assert_eq!(start.elapsed(), Duration::from_secs(5));
+            } else if row.new && row.after == "2000" && !row.name.contains("401") {
+                assert_eq!(start.elapsed(), Duration::from_secs(2));
+            } else {
+                let backoffs = row.backoffs.as_deref().unwrap_or_default();
+                let fixed = backoffs.iter().filter(|v| **v > 0).count();
+                let lower = Duration::from_secs(u64::try_from(fixed).unwrap_or_default());
+                let upper = Duration::from_secs(u64::try_from(backoffs.len()).unwrap_or_default())
+                    + Duration::from_millis(3);
+                assert!(
+                    (lower..=upper).contains(&start.elapsed()),
+                    "{} new={} elapsed={:?}, Go indices={backoffs:?}",
+                    row.name,
+                    row.new,
+                    start.elapsed()
+                );
+            }
+            if row.hang {
+                let result = provider
+                    .metadata(&ctx, &mut state, "/latest/meta-data/probe")
+                    .await;
+                assert_eq!(
+                    result.is_err(),
+                    row.second_error,
+                    "second {} new={}",
+                    row.name,
+                    row.new
+                );
+            }
+            assert_eq!(
+                *io.requests.lock().unwrap_or_else(|e| unreachable!("{e}")),
+                row.requests,
+                "{} new={}",
+                row.name,
+                row.new
             );
         }
     }

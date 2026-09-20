@@ -107,6 +107,23 @@ func exhaustion(newMode bool) quota {
 	}
 	return q
 }
+
+type backoff struct {
+	New     bool  `json:"new"`
+	Indices []int `json:"indices"`
+}
+
+func backoffIndices(mode bool) backoff {
+	b := backoff{New: mode}
+	p := endpointcreds.New("http://127.0.0.1/credentials", func(o *endpointcreds.Options) {
+		o.Retryer = retry.NewStandard(func(v *retry.StandardOptions) {
+			v.Backoff = retry.BackoffDelayerFunc(func(index int, _ error) (time.Duration, error) { b.Indices = append(b.Indices, index); return 0, nil })
+		})
+		o.HTTPClient = client(func(req *http.Request) (*http.Response, error) { return reply(req, 503, "text/plain", "busy") })
+	})
+	_, _ = p.Retrieve(context.Background())
+	return b
+}
 func main() {
 	templates := []row{
 		{Name: "plain-429", Status: 429}, {Name: "plain-500", Status: 500}, {Name: "plain-502", Status: 502}, {Name: "plain-503", Status: 503}, {Name: "plain-504", Status: 504},
@@ -128,6 +145,7 @@ func main() {
 	}
 	rows := []row{}
 	quotas := []quota{}
+	backoffs := []backoff{}
 	for _, newMode := range []bool{false, true} {
 		if newMode {
 			_ = os.Setenv("AWS_NEW_RETRIES_2026", "true")
@@ -146,13 +164,15 @@ func main() {
 		}
 		wg.Wait()
 		quotas = append(quotas, exhaustion(newMode))
+		backoffs = append(backoffs, backoffIndices(newMode))
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(struct {
-		Rows   []row   `json:"rows"`
-		Quotas []quota `json:"quotas"`
-	}{rows, quotas}); err != nil {
+		Rows     []row     `json:"rows"`
+		Quotas   []quota   `json:"quotas"`
+		Backoffs []backoff `json:"backoffs"`
+	}{rows, quotas, backoffs}); err != nil {
 		panic(err)
 	}
 }

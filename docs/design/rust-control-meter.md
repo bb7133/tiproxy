@@ -115,7 +115,9 @@ once for the entire retrieval, so retries preserve the same request identity.
 The provider-local 500-token quota survives refreshes, with Go failure costs and
 success refunds. `AWS_NEW_RETRIES_2026=true` selects the pinned core's 50ms versus
 throttling 1s base delay and revised quota costs; the legacy policy uses a 1s
-base. Both use cryptographic jitter, exponential backoff and a 20s cap. Cancellation
+base. The SDK middleware passes retry indices starting at one in legacy mode
+and zero in 2026 mode; actual Go captures pin both argument sequences. Both use
+cryptographic jitter, exponential backoff and a 20s cap. Cancellation
 drops the pending delay/operation. The retry flag is captured at construction;
 changing environment variables in a running process is unsupported.
 
@@ -144,11 +146,34 @@ hour. On refresh failure the same previously acquired identity is retained and,
 when needed, its expiry is extended by a random five to fifteen minutes, as in
 Go ec2rolecreds; no alternate credential source is selected. Thirty-one real Go
 captures compare requests, constructor failures, role paths, token fallback,
-cache calls and expiry ranges. The probe uses NopRetryer; HTTP retry/backoff
-policy is still a separate remaining increment. Regenerate with:
+cache calls and expiry ranges. The probe now uses the production default
+retryer, including three token requests before fallback on a persistent 500. Regenerate with:
 
 ```sh
 go run rust/crates/control-meter/testdata/aws-imds-go.go
+```
+
+IMDS token requests and metadata operations now share the native retry quota.
+Each has three attempts; metadata retries negotiate a fresh token after 401,
+while exhausted token requests are terminal to the outer operation when v1 is
+disabled (no multiplication to nine attempts). The five-second metadata deadline
+includes token requests and all backoff. A token timeout disables negotiation for
+a later v1 fallback; a metadata 401 re-enables it. Token expiry retains fractional
+seconds and the Go duration conversion.
+
+The pinned IMDS client overrides backoff with the legacy one-second-cap helper:
+legacy retries wait one second each; in 2026 mode its first retry uses [0,1s)
+jitter and later retries wait one second. 2026 `x-amz-retry-after` milliseconds
+are clamped between the calculated delay and five seconds above it; the metadata
+401 wrapper does not expose that header in Go, so it is ignored there. Forty
+actual Go captures compare full PUT/GET/token sequences, terminal errors, nested
+retry limits, captured backoff arguments, the operation deadline and the next
+call after timeout. The Go probe wraps the default retryer only to observe its
+arguments and validates its delay ranges; the fake HTTP client honors context
+cancellation before a wire attempt. Rust uses a paused clock. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-imds-retry-go.go
 ```
 
 For a profile's `credential_source`, missing Environment keys fail during

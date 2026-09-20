@@ -162,7 +162,7 @@ func main() {
 			}
 			return &http.Response{StatusCode: status, Header: h, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 		})
-		cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion("us-east-1"), config.WithHTTPClient(transport), config.WithRetryer(func() aws.Retryer { return aws.NopRetryer{} }))
+		cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion("us-east-1"), config.WithHTTPClient(transport))
 		r.LoadError = err != nil
 		if err == nil {
 			var c aws.Credentials
