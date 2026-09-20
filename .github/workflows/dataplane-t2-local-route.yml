@@ -69,6 +69,9 @@ jobs:
           "$install_root/bin/tiup" --version
           echo "$install_root/bin" >>"$GITHUB_PATH"
           echo "TIUP_HOME=$install_root" >>"$GITHUB_ENV"
+      - name: Preinstall frozen TiUP components serially
+        if: steps.changes.outputs.relevant == 'true'
+        run: bash tests/dataplane/integration/warm-tiup-components.sh
       - name: Verify host prerequisites
         if: steps.changes.outputs.relevant == 'true'
         run: |
