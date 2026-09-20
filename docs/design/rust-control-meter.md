@@ -570,9 +570,39 @@ go run rust/crates/control-meter/testdata/azure-managed-go.go
 go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
-Full default-credential/endpoint edge parity remains in progress. Azure bearer
-401 challenge handling and unusual RFC1123 named-zone metadata dates are not
-qualified by the SharedKey/SAS object fixtures. The declared general HTTP date,
+Azure storage bearer challenges now preserve the challenged resource scope across
+operations. The pinned parser accepts the same space-delimited resource fields
+and appends `/.default` when absent; its tenant field is unused. Continuous
+Access Evaluation (CAE) claims take priority across all challenge header values.
+Resource challenges may be followed by one CAE replay; a CAE replay does not
+recursively process another challenge. HTTP retry attempts may each enter this
+challenge flow, and each replay preserves the body.
+
+Managed identity caches are keyed by resource. Nonempty CAE claims bypass the
+cached token and replace it on success; claims are not sent to the metadata
+endpoint, matching MSAL. Sixty actual production-provider cases use
+DefaultAzureCredential, local TLS and a synthetic App Service metadata endpoint.
+They compare every metadata resource and object authorization/body trajectory,
+including scope persistence/reversion, CAE refresh, malformed challenges and
+ordinary retries before/after challenges. The public Go x509 fallback-root API
+trusts only the synthetic local certificate in the probe; SDK source is unchanged.
+Regenerate with:
+
+```sh
+bash rust/crates/control-meter/testdata/azure-bearer-go.sh
+```
+
+This increment qualifies managed identity challenges. The pinned Rust identity
+SDK has no claims option: environment, workload and Developer CLI CAE forwarding
+still require source adapters and currently fail without replaying an
+unchallenged cached token. CLI/PowerShell claims rejection matches Go, but their
+outer bearer-cache and changed-resource coverage remain separate follow-ups.
+The added regex and permissive base64 decoding dependencies reuse package
+versions already in Cargo.lock; only control-meter dependency edges are added.
+
+Full default-credential/endpoint edge parity remains in progress. Azure non-managed
+CAE forwarding, developer credential bearer-cache behavior and unusual RFC1123
+named-zone metadata dates remain open. The declared general HTTP date,
 endpoint and platform transport edges remain open. Export failure retains the
 pending window for the next metering attempt.
 

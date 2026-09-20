@@ -78,6 +78,41 @@ impl AzureSigner {
             .await
     }
 
+    async fn send_authorized(
+        &self,
+        context: &Context,
+        mut request: Request<Bytes>,
+    ) -> Result<reqsign_core::Result<Response<Bytes>>, Error> {
+        let mut response = context.http_send(request.clone()).await;
+        if let Self::Bearer(bearer) = self {
+            for round in 0..2 {
+                let Ok(reply) = &response else {
+                    break;
+                };
+                if reply.status() != StatusCode::UNAUTHORIZED {
+                    break;
+                }
+                let Some((token, cae)) = bearer.challenge(reply.headers(), round == 0).await?
+                else {
+                    break;
+                };
+                let mut authorization: http::HeaderValue =
+                    format!("Bearer {token}").parse().map_err(|_| failed())?;
+                authorization.set_sensitive(true);
+                request
+                    .headers_mut()
+                    .insert(http::header::AUTHORIZATION, authorization);
+                response = context.http_send(request.clone()).await;
+                // A storage challenge can be followed by one CAE challenge;
+                // a CAE replay is terminal for this pass through the pipeline.
+                if cae {
+                    break;
+                }
+            }
+        }
+        Ok(response)
+    }
+
     async fn send_object(
         &self,
         context: &Context,
@@ -107,7 +142,9 @@ impl AzureSigner {
                 .map_err(|_| failed())?
                 .into_parts();
             self.sign(&mut parts).await?;
-            let response = context.http_send(Request::from_parts(parts, payload)).await;
+            let response = self
+                .send_authorized(context, Request::from_parts(parts, payload))
+                .await?;
             if let Ok(response) = &response {
                 let status = response.status();
                 if !matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) || attempt == 3 {

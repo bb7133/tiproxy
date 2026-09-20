@@ -26,13 +26,15 @@ use reqwest::{Client, Url};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+#[path = "cloud_azure_bearer.rs"]
+mod bearer;
 #[path = "cloud_azure_object.rs"]
 mod object;
 
 pub(crate) enum AzureSigner {
     SharedKey { account: String, key: Vec<u8> },
     Sas,
-    Bearer(AzureDefault),
+    Bearer(bearer::Bearer),
 }
 
 pub(crate) async fn build(
@@ -88,7 +90,9 @@ pub(crate) async fn build(
         if url.scheme() != "https" {
             return Err(Error::Invalid("Azure bearer authentication requires HTTPS"));
         }
-        AzureSigner::Bearer(AzureDefault::new(client, context).await?)
+        AzureSigner::Bearer(bearer::Bearer::new(
+            AzureDefault::new(client, context).await?,
+        ))
     };
     Ok((url, signer))
 }

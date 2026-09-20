@@ -11,6 +11,8 @@ repository.workspace = true
 default = []
 
 [dependencies]
+base64.workspace = true
+regex.workspace = true
 openssl.workspace = true
 azure_core.workspace = true
 azure_identity.workspace = true

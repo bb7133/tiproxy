@@ -25,7 +25,7 @@ use reqsign_core::{Context, HttpSend};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const SCOPE: &str = "https://storage.azure.com/.default";
+pub(crate) const SCOPE: &str = "https://storage.azure.com/.default";
 type CredentialSlot = (Arc<dyn TokenCredential>, bool);
 
 pub(crate) struct AzureDefault {
@@ -54,7 +54,7 @@ impl AzureDefault {
         if selected("EnvironmentCredential", false)
             && let Some(credential) = environment(&ctx, options.clone()).await
         {
-            credentials.push((credential, true));
+            credentials.push((Arc::new(NoClaims(credential)), true));
         }
         if selected("WorkloadIdentityCredential", false)
             && let (Some(tenant), Some(client), Some(path)) = (
@@ -76,7 +76,7 @@ impl AzureDefault {
                 }),
             )
         {
-            credentials.push((credential, true));
+            credentials.push((Arc::new(NoClaims(credential)), true));
         }
         if selected("ManagedIdentityCredential", false)
             && let Ok(credential) = crate::cloud_azure_managed::Managed::new(ctx.clone()).await
@@ -90,7 +90,7 @@ impl AzureDefault {
                     ..Default::default()
                 }))
         {
-            credentials.push((credential, false));
+            credentials.push((Arc::new(NoClaims(credential)), false));
         }
         if selected("AzureDeveloperCLICredential", true)
             && let Ok(credential) = AzureDeveloperCliCredential::new(Some(
@@ -100,7 +100,7 @@ impl AzureDefault {
                 },
             ))
         {
-            credentials.push((credential, false));
+            credentials.push((Arc::new(NoClaims(credential)), false));
         }
         if selected("AzurePowerShellCredential", true) {
             credentials.push((
@@ -119,12 +119,26 @@ impl AzureDefault {
     }
 
     pub(crate) async fn token(&self) -> Result<String, Error> {
+        self.token_for(SCOPE, Vec::new()).await
+    }
+
+    pub(crate) async fn token_for(&self, scope: &str, claims: Vec<u8>) -> Result<String, Error> {
+        let options = azure_core::credentials::TokenRequestOptions {
+            method_options: azure_core::http::ClientMethodOptions {
+                context: azure_core::http::Context::default().with_value(ChallengeClaims(claims)),
+            },
+        };
         let mut selected = self.selected.lock().await;
         if let Some(index) = *selected {
-            return token(self.credentials[index].0.get_token(&[SCOPE], None).await);
+            return token(
+                self.credentials[index]
+                    .0
+                    .get_token(&[scope], Some(options))
+                    .await,
+            );
         }
         for (index, (credential, fatal)) in self.credentials.iter().enumerate() {
-            match credential.get_token(&[SCOPE], None).await {
+            match credential.get_token(&[scope], Some(options.clone())).await {
                 Ok(value) => {
                     let token = token(Ok(value))?;
                     *selected = Some(index);
@@ -139,6 +153,36 @@ impl AzureDefault {
             }
         }
         Err(Error::Export("Azure default identity unavailable"))
+    }
+}
+
+#[derive(Clone)]
+struct ChallengeClaims(Vec<u8>);
+
+pub(crate) fn has_claims(
+    options: Option<&azure_core::credentials::TokenRequestOptions<'_>>,
+) -> bool {
+    options
+        .and_then(|o| o.method_options.context.value::<ChallengeClaims>())
+        .is_some_and(|v| !v.0.is_empty())
+}
+
+// The pinned Rust identity API has no claims option. Until those source
+// adapters forward claims, fail instead of replaying a cached unchallenged
+// token. Managed identity handles claims through the typed context below.
+#[derive(Debug)]
+struct NoClaims(Arc<dyn TokenCredential>);
+#[async_trait::async_trait]
+impl TokenCredential for NoClaims {
+    async fn get_token(
+        &self,
+        scopes: &[&str],
+        options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        if has_claims(options.as_ref()) {
+            return Err(identity_error());
+        }
+        self.0.get_token(scopes, options).await
     }
 }
 
@@ -527,9 +571,9 @@ impl TokenCredential for AuxiliaryCredential {
     async fn get_token(
         &self,
         scopes: &[&str],
-        _options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
+        options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
-        if scopes != [SCOPE] {
+        if scopes != [SCOPE] || has_claims(options.as_ref()) {
             return Err(identity_error());
         }
         let mut cached = self.cached.lock().await;

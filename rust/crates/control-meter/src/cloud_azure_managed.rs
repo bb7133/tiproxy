@@ -29,7 +29,9 @@ use http::{Method, Request, Response, StatusCode};
 use reqsign_core::Context;
 use tokio::sync::Mutex;
 
+#[cfg(test)]
 const SCOPE: &str = "https://storage.azure.com/.default";
+#[cfg(test)]
 const RESOURCE: &str = "https://storage.azure.com";
 const IMDS: &str = "http://169.254.169.254/metadata/identity/oauth2/token";
 
@@ -77,7 +79,7 @@ pub(crate) struct Managed {
     client_id: Option<String>,
     ml_default_client_id: String,
     probe: AtomicBool,
-    cached: Mutex<Option<Cached>>,
+    cached: Mutex<BTreeMap<String, Cached>>,
 }
 
 impl fmt::Debug for Managed {
@@ -148,11 +150,11 @@ impl Managed {
             client_id,
             ml_default_client_id,
             probe: AtomicBool::new(probe),
-            cached: Mutex::new(None),
+            cached: Mutex::new(BTreeMap::new()),
         })
     }
 
-    fn request(&self, arc_key: Option<&str>) -> azure_core::Result<Request<Bytes>> {
+    fn request(&self, resource: &str, arc_key: Option<&str>) -> azure_core::Result<Request<Bytes>> {
         let mut url = reqwest::Url::parse(&self.endpoint).map_err(|_| failure())?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
@@ -172,7 +174,9 @@ impl Managed {
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static("application/x-www-form-urlencoded"),
             );
-            body = Bytes::from("resource=https%3A%2F%2Fstorage.azure.com");
+            let mut form = reqwest::Url::parse("http://form.invalid").map_err(|_| failure())?;
+            form.query_pairs_mut().append_pair("resource", resource);
+            body = Bytes::from(form.query().ok_or_else(failure)?.to_owned());
         } else {
             let mut query: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for (key, value) in url.query_pairs() {
@@ -190,7 +194,7 @@ impl Managed {
                 Source::CloudShell => return Err(failure()),
             };
             query.insert("api-version".into(), vec![version.into()]);
-            query.insert("resource".into(), vec![RESOURCE.into()]);
+            query.insert("resource".into(), vec![resource.into()]);
             if self.source == Source::MachineLearning {
                 query.insert(
                     "clientid".into(),
@@ -243,7 +247,7 @@ impl Managed {
         Ok(request)
     }
 
-    async fn acquire(&self) -> azure_core::Result<Cached> {
+    async fn acquire(&self, resource: &str) -> azure_core::Result<Cached> {
         if self.probe.load(Ordering::Acquire) {
             // DefaultAzureCredential probes IMDS once without Metadata, with no retry.
             let request = Request::builder()
@@ -256,7 +260,7 @@ impl Managed {
                 .map_err(|_| missing())?;
             self.probe.store(false, Ordering::Release);
         }
-        let mut request = self.request(None)?;
+        let mut request = self.request(resource, None)?;
         if self.source == Source::Arc {
             let challenge = self.send(request).await?;
             if challenge.status() != StatusCode::UNAUTHORIZED {
@@ -268,7 +272,7 @@ impl Managed {
                 None
             };
             let key = arc_secret(&self.context, &challenge, root).await?;
-            request = self.request(Some(&key))?;
+            request = self.request(resource, Some(&key))?;
         }
         let response = self.send(request).await?;
         if !matches!(response.status(), StatusCode::OK | StatusCode::ACCEPTED) {
@@ -335,32 +339,35 @@ impl TokenCredential for Managed {
     async fn get_token(
         &self,
         scopes: &[&str],
-        _options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
+        options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
-        if scopes != [SCOPE] {
+        let [scope] = scopes else {
             return Err(failure());
-        }
+        };
+        let resource = scope.strip_suffix("/.default").unwrap_or(scope);
+        let claims = crate::cloud_azure_identity::has_claims(options.as_ref());
         let mut cached = self.cached.lock().await;
         let now = OffsetDateTime::now_utc();
-        if let Some(value) = cached.as_ref()
+        if let Some(value) = cached.get(resource)
+            && !claims
             && value.token.expires_on >= now + azure_core::time::Duration::minutes(5)
         {
             if value.refresh_on.is_none_or(|refresh| refresh > now) {
                 return Ok(value.token.clone());
             }
             // MSAL refresh_in failures fall back only while cache validation still succeeds.
-            match self.acquire().await {
+            match self.acquire(resource).await {
                 Ok(value) => {
                     let token = value.token.clone();
-                    *cached = Some(value);
+                    cached.insert(resource.to_owned(), value);
                     return Ok(token);
                 }
                 Err(_) => return Ok(value.token.clone()),
             }
         }
-        let value = self.acquire().await?;
+        let value = self.acquire(resource).await?;
         let token = value.token.clone();
-        *cached = Some(value);
+        cached.insert(resource.to_owned(), value);
         Ok(token)
     }
 }
@@ -632,8 +639,13 @@ mod tests {
             first.token.secret()
         );
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
-        managed.cached.lock().await.as_mut().unwrap().refresh_on =
-            Some(OffsetDateTime::now_utc() - azure_core::time::Duration::seconds(1));
+        managed
+            .cached
+            .lock()
+            .await
+            .get_mut(RESOURCE)
+            .unwrap()
+            .refresh_on = Some(OffsetDateTime::now_utc() - azure_core::time::Duration::seconds(1));
         transport
             .replies
             .lock()
@@ -652,7 +664,7 @@ mod tests {
             .cached
             .lock()
             .await
-            .as_mut()
+            .get_mut(RESOURCE)
             .unwrap()
             .token
             .expires_on = OffsetDateTime::now_utc() + azure_core::time::Duration::minutes(1);
@@ -754,7 +766,7 @@ mod tests {
         assert!(arc_secret(&ctx, &valid, None).await.is_err());
         let secret = arc_secret(&ctx, &valid, root).await.unwrap();
         let managed = Managed::new(ctx.clone()).await.unwrap();
-        let request = managed.request(Some(&secret)).unwrap();
+        let request = managed.request(RESOURCE, Some(&secret)).unwrap();
         assert_eq!(request.headers()["authorization"], "Basic fake-arc-key");
         assert!(request.headers()["authorization"].is_sensitive());
         let too_big = ctx.with_file_read(KeyFile {

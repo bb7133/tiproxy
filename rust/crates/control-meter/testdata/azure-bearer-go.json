@@ -1,0 +1,3198 @@
+[
+  {
+    "name": "HEAD-scope",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-same-scope",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://storage.azure.com\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-already-default",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid/.default\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-scope-only",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-basic-resource",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Basic resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-lowercase",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "bearer resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-empty-resource",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer resource_id=\"\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-no-resource",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-empty-header",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              ""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-malformed",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "invalid"
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-no-space",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake\",resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-duplicate-resource",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer resource_id=\"https://first.invalid\" resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-cae",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-cae-invalid",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"invalid!\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-cae-empty",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-cae-trailing-bits",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"Zh==\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-non-cae-claims",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"other\", claims=\"e30=\" resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-no-header",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": null
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-second-scope",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://third.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-scope-then-cae",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-3",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-cae-then-scope",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-cae-twice",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-challenge-repeat-after-retry",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 503,
+            "challenge": null
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://third.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://third.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-3",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-retry-before-scope",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 503,
+            "challenge": null
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-retry-after-scope",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 503,
+            "challenge": null
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-cae-second-value",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\"",
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-basic-then-cae",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Basic realm=\"fake\", Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-scope-persists",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      },
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-scope-reverts",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      },
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://storage.azure.com\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "HEAD-cae-persists",
+    "ops": [
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      },
+      {
+        "method": "HEAD",
+        "replies": [
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": true
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "HEAD",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  {
+    "name": "PUT-scope",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-same-scope",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://storage.azure.com\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-already-default",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid/.default\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-scope-only",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-basic-resource",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Basic resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-lowercase",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "bearer resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-empty-resource",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer resource_id=\"\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-no-resource",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-empty-header",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              ""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-malformed",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "invalid"
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-no-space",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake\",resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-duplicate-resource",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer resource_id=\"https://first.invalid\" resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-cae",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-cae-invalid",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"invalid!\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-cae-empty",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-cae-trailing-bits",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"Zh==\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-non-cae-claims",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"other\", claims=\"e30=\" resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-no-header",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": null
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-second-scope",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://third.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-scope-then-cae",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-3",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-cae-then-scope",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-cae-twice",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": true,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-challenge-repeat-after-retry",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 503,
+            "challenge": null
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://third.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://third.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-3",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-retry-before-scope",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 503,
+            "challenge": null
+          },
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-retry-after-scope",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 503,
+            "challenge": null
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-cae-second-value",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\"",
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-basic-then-cae",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Basic realm=\"fake\", Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-scope-persists",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      },
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-scope-reverts",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://other.invalid\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      },
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer authorization_uri=\"https://login.microsoftonline.com/fake-tenant\", resource_id=\"https://storage.azure.com\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://other.invalid",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  },
+  {
+    "name": "PUT-cae-persists",
+    "ops": [
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 401,
+            "challenge": [
+              "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\""
+            ]
+          },
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      },
+      {
+        "method": "PUT",
+        "replies": [
+          {
+            "status": 0,
+            "challenge": null
+          }
+        ],
+        "error": false,
+        "exists": false
+      }
+    ],
+    "seen": [
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-1",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "metadata",
+        "value": "https://storage.azure.com",
+        "method": "GET",
+        "size": 0,
+        "sha256": ""
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      },
+      {
+        "kind": "object",
+        "value": "Bearer fake-2",
+        "method": "PUT",
+        "size": 7,
+        "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+      }
+    ]
+  }
+]
