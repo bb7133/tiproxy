@@ -126,7 +126,7 @@ pub(crate) fn sign_service_at(
 
 /// Smithy's HTTP date layouts: IMF-fixdate (one/two digit day and two/four
 /// digit year), RFC850 and ANSIC. The weekday is syntactic, as in Go time.Parse.
-fn parse_http_date(value: &str) -> Option<Timestamp> {
+pub(crate) fn parse_http_date(value: &str) -> Option<Timestamp> {
     if value.trim() != value || value.contains(['\t', '\r', '\n']) {
         return None;
     }

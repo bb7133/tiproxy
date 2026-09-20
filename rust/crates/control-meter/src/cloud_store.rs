@@ -113,6 +113,22 @@ impl CloudStore {
             )
         };
         let mut url = self.endpoint.clone();
+        if matches!(self.signer, CloudSigner::Oss(_)) {
+            let mut encoded = Vec::new();
+            for segment in key.split('/') {
+                if matches!(segment, "." | "..") {
+                    return Err(Error::Invalid("cloud object contains dot path segment"));
+                }
+                encoded.push(crate::cloud_oss::percent(segment));
+            }
+            // Go preserves leading/repeated separators in the object key.
+            url.set_path(&format!(
+                "{}/{}",
+                self.endpoint.path().trim_end_matches('/'),
+                encoded.join("/")
+            ));
+            return Ok(url);
+        }
         let mut segments = url
             .path_segments_mut()
             .map_err(|()| Error::Invalid("invalid cloud endpoint"))?;
@@ -142,6 +158,12 @@ impl CloudStore {
                 .await
                 .map_err(|_| Error::Export("COS object request failed"));
         }
+        if let CloudSigner::Oss(signer) = &self.signer {
+            return signer
+                .request(method, url, body.into())
+                .await
+                .map_err(|_| Error::Export("OSS object request failed"));
+        }
         let mut parts = Request::builder()
             .method(method)
             .uri(url.as_str())
@@ -154,14 +176,7 @@ impl CloudStore {
             signer.sign(&mut parts).await?;
             return self.send(parts, body).await;
         }
-        match &self.signer {
-            CloudSigner::S3(_) => return Err(Error::Export("invalid S3 signer dispatch")),
-            CloudSigner::Oss(signer) => signer.sign(&mut parts).await,
-            CloudSigner::Cos(_) => return Err(Error::Export("invalid COS signer dispatch")),
-            CloudSigner::Azure(_) => return Err(Error::Export("invalid Azure signer dispatch")),
-        }
-        .map_err(|_| Error::Export("cloud credential or signing failure"))?;
-        self.send(parts, body).await
+        Err(Error::Export("invalid cloud signer dispatch"))
     }
 
     async fn send(&self, parts: Parts, body: Vec<u8>) -> Result<StatusCode, Error> {
@@ -332,7 +347,22 @@ fn oss(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSigner), 
         format!("https://{}", config.endpoint)
     };
     let mut url = endpoint(&raw)?;
-    bucket_host(&mut url, &config.bucket)?;
+    // The OSS SDK ignores endpoint paths and auto-selects path style for IPs.
+    url.set_path("/");
+    if url.host_str().is_some_and(|host| {
+        host.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok()
+    }) {
+        url.path_segments_mut()
+            .map_err(|()| Error::Invalid("invalid OSS endpoint"))?
+            .pop_if_empty()
+            .push(&config.bucket);
+    } else {
+        let host = format!("{}.{}", config.bucket, url.host_str().unwrap_or_default());
+        url.set_host(Some(&host))
+            .map_err(|_| Error::Invalid("invalid OSS endpoint"))?;
+    }
     let cfg = config.oss.clone().unwrap_or_default();
     let signer = crate::cloud_oss::OssSigner::new(&cfg, &config.region, &config.bucket, context);
     Ok((url, CloudSigner::Oss(signer)))
@@ -506,8 +536,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oss_paths_match_provider_for_ip_endpoints_and_literal_keys() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/oss-object-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        for row in fixture["rows"].as_array().unwrap_or_else(|| unreachable!()) {
+            let real_http = row["real_http"].as_bool().unwrap_or_default();
+            let config = MeteringConfig {
+                provider_type: "oss".into(),
+                bucket: "bucket".into(),
+                region: "cn-hangzhou".into(),
+                endpoint: if real_http {
+                    "http://127.0.0.1:12345/ignored-base".into()
+                } else {
+                    String::new()
+                },
+                oss: Some(CloudMeteringConfig {
+                    access_key: "key".into(),
+                    secret_access_key: "secret".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let store = CloudStore::with_context(
+                &config,
+                Client::new(),
+                Context::new().with_env(StaticEnv::default()),
+            )
+            .await
+            .unwrap_or_else(|e| unreachable!("{e}"));
+            let url = store
+                .object_url(row["key"].as_str().unwrap_or_default())
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            assert_eq!(
+                url.path(),
+                row["operations"][0]["attempts"][0]["path"],
+                "{}",
+                row["name"]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn object_retries_do_not_repeat_the_existence_check() {
-        for provider in ["s3", "cos"] {
+        for provider in ["s3", "cos", "oss"] {
             let (store, server) = fixture(provider, vec![503, 404, 503, 200]).await;
             store
                 .put_new("object", vec![1, 2, 3])

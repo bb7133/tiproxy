@@ -21,15 +21,18 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use control_config::CloudMeteringConfig;
-use http::{Request, request::Parts};
-use reqsign_aliyun_oss::{Credential, RequestSigner, SigningVersion, StaticCredentialProvider};
+use http::Request;
+use reqsign_aliyun_oss::{Credential, StaticCredentialProvider};
 use reqsign_core::hash::base64_hmac_sha1;
 use reqsign_core::time::Timestamp;
-use reqsign_core::{
-    Context, ProvideCredential, ProvideCredentialChain, SignRequest, SigningCredential,
-};
+use reqsign_core::{Context, ProvideCredential, ProvideCredentialChain, SigningCredential};
 use serde::Deserialize;
 use tokio::sync::Mutex;
+
+#[path = "cloud_oss_object.rs"]
+mod object;
+#[path = "cloud_oss_sign.rs"]
+mod signing;
 
 const REFRESH_WINDOW: Duration = Duration::from_secs(15 * 60);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -37,7 +40,10 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub(crate) struct OssSigner {
     context: Context,
     base: ProvideCredentialChain<Credential>,
-    signer: RequestSigner,
+    region: String,
+    bucket: String,
+    object_skew: std::sync::atomic::AtomicI64,
+    gzip_content_type: String,
     role: String,
     endpoint: String,
     cached: Mutex<Option<Credential>>,
@@ -72,23 +78,26 @@ impl OssSigner {
         Self {
             context,
             base,
-            signer: RequestSigner::new(bucket)
-                .with_region(region)
-                .with_signing_version(SigningVersion::V4),
+            region: region.to_owned(),
+            bucket: bucket.to_owned(),
+            object_skew: std::sync::atomic::AtomicI64::new(0),
+            gzip_content_type: object::gzip_content_type(),
             role: config.assume_role_arn.clone(),
             endpoint: sts_endpoint(region),
             cached: Mutex::new(None),
         }
     }
 
-    pub(crate) async fn sign(&self, parts: &mut Parts) -> reqsign_core::Result<()> {
-        let mut credential = self.credential(false).await?.ok_or_else(failed)?;
-        // The role cache owns freshness. Do not let reqsign impose another
-        // cache window or retain an expiration-free credential across requests.
-        credential.expires_in = None;
-        self.signer
-            .sign_request(&self.context, parts, Some(&credential), None)
-            .await
+    #[cfg(test)]
+    pub(crate) async fn sign(&self, parts: &mut http::request::Parts) -> reqsign_core::Result<()> {
+        let credential = self.credential(false).await?.ok_or_else(failed)?;
+        signing::sign_at(
+            parts,
+            &credential,
+            &self.region,
+            &self.bucket,
+            Timestamp::now(),
+        )
     }
 
     async fn credential(&self, background: bool) -> reqsign_core::Result<Option<Credential>> {

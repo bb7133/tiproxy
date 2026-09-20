@@ -49,17 +49,13 @@ pub(crate) enum HttpFailure {
     Timeout,
     #[error("cloud HTTP connection failure")]
     Connection,
+    #[error("cloud HTTP send failure")]
+    OtherSend,
 }
 fn http_failed(error: &reqwest::Error, sending: bool) -> reqsign_core::Error {
     use std::error::Error as _;
     if error.is_timeout() {
         return failed().with_source(HttpFailure::Timeout);
-    }
-    // Smithy wraps send errors as ConnectionError, except a typed DNS
-    // NXDOMAIN override. reqwest does not expose a portable NXDOMAIN type;
-    // that case may incur the same bounded retries as other send failures.
-    if sending && !error.is_builder() {
-        return failed().with_source(HttpFailure::Connection);
     }
     let mut source = error.source();
     while let Some(value) = source {
@@ -71,11 +67,33 @@ fn http_failed(error: &reqwest::Error, sending: bool) -> reqsign_core::Error {
                     | io::ErrorKind::ConnectionAborted
                     | io::ErrorKind::BrokenPipe
                     | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
             )
         {
             return failed().with_source(HttpFailure::Connection);
         }
+        // Match equivalent transport diagnoses without retaining raw errors.
+        let text = value.to_string();
+        if [
+            "connection reset",
+            "connection refused",
+            "closed network connection",
+            "broken pipe",
+            "connection closed before message completed",
+            "unexpected EOF",
+            "bad record MAC",
+            "stream error:",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
+        {
+            return failed().with_source(HttpFailure::Connection);
+        }
         source = value.source();
+    }
+    // Smithy retries other send errors too; OSS does not.
+    if sending && !error.is_builder() {
+        return failed().with_source(HttpFailure::OtherSend);
     }
     failed()
 }

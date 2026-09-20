@@ -120,6 +120,42 @@ production adapter. Regenerate with:
 go run rust/crates/control-meter/testdata/cos-object-go.go
 ```
 
+OSS HEAD and seekable PUT use three attempts, with full-jitter delays below
+800ms and 1600ms before the second and third attempts. Statuses >=500,
+401/408/429, exact BadRequest/RequestTimeTooSkewed codes, recognized connection
+failures and CRC mismatches retry. Other service/transport errors are terminal.
+Each attempt reacquires credentials and signs the same body. CRC64 checks
+include empty uploads: a missing header is accepted, while a nonempty value
+must equal the decimal checksum exactly. Exists maps the final service error's
+404 status or NoSuchKey code only after the retry policy finishes.
+
+OSS RequestTimeTooSkewed subtracts the previous signing time from the error's
+server Date; malformed/missing Date uses current time. Repeated corrections
+therefore can alternate, matching SDK v1.2.3 rather than applying a different
+healing policy. Only a successful operation saves a changed offset for the next
+operation. An explicit-time native V4 signer uses the existing reqsign hashing
+primitives and matches six fixed-time actual Go signatures, including Unicode,
+percent escapes and repeated leading separators. No dependencies were added.
+
+One hundred actual metering OSS provider cases compare attempts, body/key,
+Exists/Upload outcomes and persistent clock trajectories. Scripted cases use
+LoadDefaultConfig with the default retry classifier and zero delay; four cases
+use the unmodified production constructor and real HTTP servers. No SDK source
+is patched. Corrected-time trajectories are recorded to the nearest ten seconds
+and compared within two seconds; all request counts and outcomes are exact.
+Malformed XML after a completed Code field and x-oss-err fallback are covered.
+The adapter preserves literal key separators, ignores OSS endpoint path prefixes,
+and selects path-style addressing for IP endpoints. Metering .json.gz MIME uses
+the same Unix MIME-file priority as Go, with the SDK application/x-gzip fallback;
+other arbitrary file extensions are outside the metering writer's key contract.
+The fixture records macOS MIME, while the native test uses the local MIME
+selection on Linux. Real HTTP retry checks cover the actual CloudStore adapter.
+Regenerate with:
+
+```sh
+bash rust/crates/control-meter/testdata/oss-object-go.sh
+```
+
 AWS and OSS use maintained reqsign source providers and signing primitives with
 native role/cache adapters. AWS uses the Go 900-second POST request and a stable
 `aws-go-sdk-{UnixNano}` session name, applies custom BaseEndpoint to STS, and caches
@@ -506,7 +542,7 @@ go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
 Full default-credential/endpoint edge parity remains in progress. Provider retry-policy and default-chain edge comparisons remain
-open, including OSS/Azure object HEAD/PUT retries and the declared HTTP date
+open, including Azure object HEAD/PUT retries and the declared HTTP date
 local-zone edge. Export failure retains the pending window for the next metering
 attempt.
 
