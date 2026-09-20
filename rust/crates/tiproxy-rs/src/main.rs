@@ -875,6 +875,16 @@ async fn run(options: Options) -> Result<(), String> {
     let mut control_runtime = tokio::spawn(runtime.join());
     let mut metering_sampler = metering_sampler;
     let mut termination = Box::pin(wait_for_termination_signal());
+    // The management plane is supervised too: a listener failure must not
+    // silently leave the process without its operator surface (Go only logs
+    // that; the Rust owner fails closed and drains).
+    let mut admin_task = admin_task;
+    let mut admin_exit = Box::pin(async {
+        match admin_task.as_mut() {
+            Some(admin) => (&mut admin.task).await,
+            None => std::future::pending().await,
+        }
+    });
     let (control_result, sampler_result, serving_result, module_result) = tokio::select! {
         control = &mut control_runtime => {
             let control = match control {
@@ -952,6 +962,30 @@ async fn run(options: Options) -> Result<(), String> {
             };
             (control, sampler, serving_result, Ok(()))
         }
+        admin = &mut admin_exit => {
+            let failure = match admin {
+                Ok(()) => "control admin server exited unexpectedly".to_owned(),
+                Err(_) => "control admin server panicked".to_owned(),
+            };
+            in_process.fail("control_admin", "runtime_failure");
+            let serving_result = stop_drain_and_join_sessions(
+                &in_process,
+                &serving,
+                &drain_tx,
+                &session_shutdown_tx,
+            ).await;
+            metering_shutdown_tx.send_replace(true);
+            shared_client.shutdown();
+            let sampler = match metering_sampler.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("metering sampler panicked".to_owned()),
+            };
+            let control = match control_runtime.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("control runtime supervisor panicked".to_owned()),
+            };
+            (control, sampler, serving_result, Err(failure))
+        }
         module = modules.join_next() => {
             let failure = match module {
                 Some(exit) => match exit.result {
@@ -996,6 +1030,7 @@ async fn run(options: Options) -> Result<(), String> {
         task.abort();
         let _ = task.await;
     }
+    drop(admin_exit);
     if let Some(admin) = admin_task {
         startup::Teardown::teardown(admin).await;
     }

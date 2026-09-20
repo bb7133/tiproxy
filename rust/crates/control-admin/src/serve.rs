@@ -35,6 +35,7 @@ use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use hyper_util::service::TowerToHyperService;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 /// Reads the current `security.server-http-tls` server configuration for one
@@ -74,6 +75,7 @@ pub async fn serve(
     options: ServeOptions,
 ) {
     let graceful = GracefulShutdown::new();
+    let mut tasks = JoinSet::new();
     let permits = Arc::new(Semaphore::new(options.max_connections.max(1)));
     let mut builder = Builder::new(TokioExecutor::new());
     builder
@@ -90,6 +92,8 @@ pub async fn serve(
                 continue;
             }
             accepted = listener.accept() => accepted,
+            // Reap finished connection tasks so the set never grows unbounded.
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
         };
         let Ok((stream, _)) = accepted else {
             // A failing listener is fatal for the server task; the owner
@@ -108,13 +112,18 @@ pub async fn serve(
             watcher: graceful.watcher(),
             timeout: options.connection_timeout,
         };
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = permit;
             connection.run(stream).await;
         });
     }
     drop(listener);
+    // Bounded stop: in-flight hyper connections get the grace period; every
+    // task still alive after it (sniffing, handshaking, slow bodies) is
+    // aborted and joined, so nothing outlives this future.
     let _ = tokio::time::timeout(options.shutdown_grace, graceful.shutdown()).await;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 struct Connection {
@@ -225,6 +234,7 @@ mod tests {
                 shutdown_rx,
                 ServeOptions {
                     connection_timeout: Duration::from_secs(2),
+                    shutdown_grace: Duration::from_millis(200),
                     ..ServeOptions::default()
                 },
             )
@@ -328,6 +338,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_reclaims_connections_still_sniffing_or_mid_request() {
+        let (config, _cert) = certificate();
+        let (address, shutdown, task) = start(Some(config)).await;
+        // A peer that never sends a byte would otherwise hold its task until
+        // the 2 s sniff timeout; shutdown must reclaim it within the grace.
+        let mut silent = TcpStream::connect(address).await.unwrap();
+        // A plaintext peer that sent a partial request head is inside hyper
+        // and gets the grace period, then is dropped.
+        let mut partial = TcpStream::connect(address).await.unwrap();
+        partial
+            .write_all(b"GET /debug/health HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+        let mut buffer = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(1), silent.read(&mut buffer)).await;
+        assert!(matches!(closed, Ok(Ok(0) | Err(_))), "{closed:?}");
+        let closed = tokio::time::timeout(Duration::from_secs(1), partial.read(&mut buffer)).await;
+        assert!(matches!(closed, Ok(Ok(0) | Err(_))), "{closed:?}");
+    }
+
+    #[tokio::test]
     async fn silent_peer_is_dropped_after_the_sniff_timeout() {
         let (config, _cert) = certificate();
         let (address, shutdown, task) = start(Some(config)).await;
@@ -340,5 +383,53 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+    /// Reviewer regression (`CodexM5`, `e30148d9`): a peer still inside the TLS
+    /// sniff when shutdown begins must be closed once `serve` completes.
+    #[tokio::test]
+    async fn review_shutdown_reclaims_silent_tls_sniff_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, stop) = watch::channel(false);
+        let app = app();
+        let (certificate, _) = certificate();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&accepted);
+        let tls: TlsConfigSource = Arc::new(move || {
+            observed.store(true, Ordering::Release);
+            Some(Arc::clone(&certificate))
+        });
+        let task = tokio::spawn(serve(
+            listener,
+            full_router(Arc::clone(&app)),
+            plaintext_router(app),
+            tls,
+            stop,
+            ServeOptions {
+                connection_timeout: Duration::from_secs(10),
+                shutdown_grace: Duration::from_millis(20),
+                ..ServeOptions::default()
+            },
+        ));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !accepted.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_millis(100), client.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0) | Err(_))),
+            "socket must be closed when serve completes: {closed:?}"
+        );
     }
 }

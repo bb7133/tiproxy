@@ -108,18 +108,25 @@ pub struct AdminHooks {
 
 /// uber-go/ratelimit "leaky bucket with slack", the algorithm behind the Go
 /// API's `ratelimit.New(DefAPILimit)`. `take` never rejects; it delays.
+///
+/// The port keeps uber's signed `sleepFor` accumulator: every reservation
+/// adds one slot and subtracts the time elapsed since the previous
+/// reservation, the accumulator is floored at minus the slack so idle time
+/// cannot bank more than ten slots, and a positive accumulator becomes the
+/// caller's delay while `last` moves to that future instant so later
+/// callers queue behind it.
 #[derive(Debug)]
 pub struct RateLimiter {
-    per_request: Duration,
-    max_slack: Duration,
+    per_request_nanos: i128,
+    max_slack_nanos: i128,
     state: Mutex<LimiterState>,
 }
 
 #[derive(Debug, Default)]
 struct LimiterState {
     last: Option<Instant>,
-    sleep_for: Duration,
-    owed: Duration,
+    /// Signed debt (positive) or banked slack (negative) in nanoseconds.
+    sleep_for_nanos: i128,
 }
 
 impl RateLimiter {
@@ -127,9 +134,10 @@ impl RateLimiter {
     #[must_use]
     pub fn new(per_second: u32) -> Self {
         let per_request = Duration::from_secs(1) / per_second.max(1);
+        let per_request_nanos = nanos(per_request);
         Self {
-            per_request,
-            max_slack: per_request * RATE_LIMIT_SLACK,
+            per_request_nanos,
+            max_slack_nanos: per_request_nanos * i128::from(RATE_LIMIT_SLACK),
             state: Mutex::new(LimiterState::default()),
         }
     }
@@ -144,22 +152,26 @@ impl RateLimiter {
             state.last = Some(now);
             return Duration::ZERO;
         };
-        // Debt grows by one slot per request and shrinks by elapsed time,
-        // bounded below by the slack so idle periods cannot bank credit.
-        let elapsed = now.saturating_duration_since(last);
-        let credit = state.owed + elapsed;
-        let debt = state.sleep_for + self.per_request;
-        if credit >= debt {
-            state.owed = (credit - debt).min(self.max_slack);
-            state.sleep_for = Duration::ZERO;
-            state.last = Some(now);
-            return Duration::ZERO;
+        // `last` may be in the future when the previous caller is still
+        // sleeping; the signed difference then adds that caller's wait.
+        let since_last = if now >= last {
+            nanos(now - last)
+        } else {
+            -nanos(last - now)
+        };
+        state.sleep_for_nanos += self.per_request_nanos - since_last;
+        if state.sleep_for_nanos < -self.max_slack_nanos {
+            state.sleep_for_nanos = -self.max_slack_nanos;
         }
-        let sleep = debt - credit;
-        state.owed = Duration::ZERO;
-        state.sleep_for = Duration::ZERO;
-        state.last = Some(now + sleep);
-        sleep
+        if state.sleep_for_nanos > 0 {
+            let sleep =
+                Duration::from_nanos(u64::try_from(state.sleep_for_nanos).unwrap_or(u64::MAX));
+            state.last = Some(now + sleep);
+            state.sleep_for_nanos = 0;
+            return sleep;
+        }
+        state.last = Some(now);
+        Duration::ZERO
     }
 
     /// Waits for the caller's slot.
@@ -169,6 +181,11 @@ impl RateLimiter {
             tokio::time::sleep(delay).await;
         }
     }
+}
+
+/// Signed nanoseconds of a duration (saturating; durations here are tiny).
+fn nanos(duration: Duration) -> i128 {
+    i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX)
 }
 
 /// Shared handler state.
@@ -581,30 +598,37 @@ mod tests {
     }
 
     #[test]
-    fn rate_limiter_spaces_requests_after_the_slack() {
+    fn rate_limiter_queues_same_instant_callers_and_caps_slack() {
         let limiter = RateLimiter::new(100);
         let start = Instant::now();
-        // The first request and the slack window pass without delay.
+        // The very first reservation never waits.
         assert_eq!(limiter.reserve(start), Duration::ZERO);
-        let mut total = Duration::ZERO;
-        for _ in 0..30 {
-            total += limiter.reserve(start);
-        }
-        // 30 back-to-back requests owe 30 slots minus 10 slots of slack.
-        assert!(
-            total >= Duration::from_millis(190) && total <= Duration::from_millis(310),
-            "{total:?}"
+        // Same instant: the second caller waits one slot, the third waits
+        // behind it (uber keeps the queued debt when `last` is in the future).
+        assert_eq!(limiter.reserve(start), Duration::from_millis(10));
+        assert_eq!(limiter.reserve(start), Duration::from_millis(20));
+        assert_eq!(limiter.reserve(start), Duration::from_millis(30));
+        // A caller arriving exactly when the queue drains proceeds at once.
+        assert_eq!(
+            limiter.reserve(start + Duration::from_millis(40)),
+            Duration::ZERO
         );
-        // After idling well past the debt, credit is capped at the slack.
+        // Idling for long banks at most the slack (ten slots): eleven
+        // back-to-back callers pass, the twelfth waits one slot.
         let later = start + Duration::from_secs(5);
-        assert_eq!(limiter.reserve(later), Duration::ZERO);
-        let mut burst = Duration::ZERO;
         for _ in 0..11 {
-            burst += limiter.reserve(later);
+            assert_eq!(limiter.reserve(later), Duration::ZERO);
         }
-        assert!(
-            burst > Duration::ZERO && burst <= Duration::from_millis(20),
-            "{burst:?}"
-        );
+        assert_eq!(limiter.reserve(later), Duration::from_millis(10));
+    }
+    /// Reviewer regression (`CodexM5`, `e30148d9`): queued debt must survive a
+    /// `last` that already sits in the future.
+    #[test]
+    fn review_concurrent_rate_reservations_keep_future_debt() {
+        let limiter = RateLimiter::new(100);
+        let now = Instant::now();
+        assert_eq!(limiter.reserve(now), Duration::ZERO);
+        assert_eq!(limiter.reserve(now), Duration::from_millis(10));
+        assert_eq!(limiter.reserve(now), Duration::from_millis(20));
     }
 }

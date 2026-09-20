@@ -30,8 +30,13 @@ TLS record reaches the full table, anything else reaches only `GET
 /api/debug/health` and `GET /debug/health`. Without TLS every connection reaches
 the full table over HTTP/1.1 or cleartext HTTP/2 (Go `UseH2C`). The
 request-head and idle timeout is 30 s (Go `DefConnTimeout`); connections are
-bounded to 1024 and every connection task is tracked, so shutdown stops
-accepting, lets in-flight requests finish within 5 s, then drops the rest.
+bounded to 1024 and every connection task is tracked in a `JoinSet`, so
+shutdown stops accepting, lets in-flight requests finish within 5 s, then
+aborts and joins every remaining task, including peers still being sniffed,
+handshaking or sending a slow body. The executable supervises the server task
+like its other owners: if the listener fails, the process fails closed and
+drains instead of continuing without an operator surface (Go only logs the
+`Serve` error).
 
 | Endpoint | Behaviour |
 | --- | --- |
