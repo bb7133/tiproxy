@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use reqsign_aws_v4::{Credential, ECSCredentialProvider, IMDSv2CredentialProvider};
+use reqsign_aws_v4::{Credential, IMDSv2CredentialProvider};
 use reqsign_core::time::Timestamp;
 use reqsign_core::{Context, ProvideCredential, ProvideCredentialDyn, SigningCredential};
 use tokio::sync::{Mutex, OnceCell};
@@ -79,10 +79,14 @@ impl GoDefaultProvider {
                 env(ctx, "AWS_ROLE_SESSION_NAME"),
             ));
         }
-        self.resolve_profile(ctx, &profile)
+        self.resolve_profile(ctx, &profile).await
     }
 
-    fn resolve_profile(&self, ctx: &Context, profile: &Profile) -> reqsign_core::Result<Source> {
+    async fn resolve_profile(
+        &self,
+        ctx: &Context,
+        profile: &Profile,
+    ) -> reqsign_core::Result<Source> {
         let get = |key: &str| property(&profile.props, key);
         let arn = get("role_arn");
         let static_keys = match (get("aws_access_key_id"), get("aws_secret_access_key")) {
@@ -95,7 +99,7 @@ impl GoDefaultProvider {
             _ => None,
         };
         let source = if let Some(parent) = &profile.source {
-            self.resolve_profile(ctx, parent)?
+            Box::pin(self.resolve_profile(ctx, parent)).await?
         } else if let Some(keys) = static_keys {
             Source::static_keys(keys)
         } else if let Some(source) = get("credential_source") {
@@ -107,14 +111,7 @@ impl GoDefaultProvider {
                     expires_in: None,
                 })),
                 "Ec2InstanceMetadata" => Source::sdk(IMDSv2CredentialProvider::new()),
-                "EcsContainer" => {
-                    if env(ctx, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_none()
-                        && env(ctx, "AWS_CONTAINER_CREDENTIALS_FULL_URI").is_none()
-                    {
-                        return Err(failed());
-                    }
-                    Source::sdk(ECSCredentialProvider::new())
-                }
+                "EcsContainer" => Source::container(ctx).await?,
                 _ => return Err(failed()),
             }
         } else if let Some(file) = get("web_identity_token_file") {
@@ -150,7 +147,7 @@ impl GoDefaultProvider {
         } else if env(ctx, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_some()
             || env(ctx, "AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some()
         {
-            Source::sdk(ECSCredentialProvider::new())
+            Source::container(ctx).await?
         } else {
             Source::sdk(IMDSv2CredentialProvider::new())
         };
@@ -197,6 +194,7 @@ struct Source {
 enum Kind {
     Static(Credential),
     Process(String),
+    Container(crate::cloud_aws_container::Container),
     Sso(crate::cloud_aws_sso::Sso),
     Sdk(Box<dyn ProvideCredentialDyn<Credential = Credential>>),
     Web(WebIdentity),
@@ -210,6 +208,12 @@ enum Kind {
     },
 }
 impl Source {
+    async fn container(ctx: &Context) -> reqsign_core::Result<Self> {
+        Ok(Self {
+            kind: Kind::Container(crate::cloud_aws_container::Container::new(ctx).await?),
+            cached: Mutex::new(None),
+        })
+    }
     fn static_keys(value: Credential) -> Self {
         Self {
             kind: Kind::Static(value),
@@ -233,6 +237,7 @@ impl Source {
         let value = match &self.kind {
             Kind::Static(value) => value.clone(),
             Kind::Process(command) => crate::cloud_aws_process::retrieve(ctx, command).await?,
+            Kind::Container(provider) => provider.retrieve(ctx).await?,
             Kind::Sso(provider) => provider.retrieve(ctx).await?,
             Kind::Web(web) => web.retrieve(ctx).await?,
             Kind::Sdk(provider) => provider

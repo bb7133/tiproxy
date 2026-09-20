@@ -46,6 +46,20 @@ pub(crate) async fn retrieve(ctx: &Context, command: &str) -> reqsign_core::Resu
     })
 }
 
+// Go time.Time JSON accepts RFC3339, while jiff also accepts a space/lowercase
+// separator. Keep these broader representations from silently becoming valid.
+pub(super) fn parse_expiration(text: &str) -> reqsign_core::Result<Timestamp> {
+    let bytes = text.as_bytes();
+    let offset = bytes.len().checked_sub(6).map(|i| &bytes[i..]);
+    if bytes.get(10) != Some(&b'T')
+        || !(text.ends_with('Z')
+            || offset.is_some_and(|v| matches!(v[0], b'+' | b'-') && v[3] == b':'))
+    {
+        return Err(failed());
+    }
+    text.parse().map_err(|_| failed())
+}
+
 #[derive(Default)]
 struct Output {
     version: i64,
@@ -88,7 +102,9 @@ impl<'de> Deserialize<'de> for Output {
                         "expiration" => {
                             value.expiration = map
                                 .next_value::<Option<String>>()?
-                                .map(|text| text.parse().map_err(serde::de::Error::custom))
+                                .map(|text| {
+                                    parse_expiration(&text).map_err(serde::de::Error::custom)
+                                })
                                 .transpose()?;
                         }
                         _ => {
@@ -161,7 +177,7 @@ mod tests {
     async fn command_and_output_match_actual_go() {
         let rows: Vec<Case> = serde_json::from_str(include_str!("../testdata/aws-process-go.json"))
             .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 16);
+        assert_eq!(rows.len(), 20);
         for row in rows {
             let io = Io {
                 output: row.output.as_bytes().to_vec(),

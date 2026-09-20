@@ -50,6 +50,10 @@ func main() {
 		{Name: "already-expired-returned", Output: strings.TrimSuffix(valid, "}") + `,"Expiration":"2000-01-01T00:00:00Z"}`},
 		{Name: "invalid-expiration", Output: strings.TrimSuffix(valid, "}") + `,"Expiration":"not-a-time"}`},
 		{Name: "empty-expiration", Output: strings.TrimSuffix(valid, "}") + `,"Expiration":""}`},
+		{Name: "space-expiration-rejected", Output: strings.TrimSuffix(valid, "}") + `,"Expiration":"2099-01-01 00:00:00Z"}`},
+		{Name: "lowercase-expiration-rejected", Output: strings.TrimSuffix(valid, "}") + `,"Expiration":"2099-01-01t00:00:00z"}`},
+		{Name: "offset-expiration", Output: strings.TrimSuffix(valid, "}") + `,"Expiration":"2099-01-01T08:00:00+08:00"}`},
+		{Name: "fractional-expiration", Output: strings.TrimSuffix(valid, "}") + `,"Expiration":"2099-01-01T00:00:00.5Z"}`},
 		{Name: "null-expiration", Output: strings.TrimSuffix(valid, "}") + `,"Expiration":null}`},
 		{Name: "case-insensitive-fields", Output: `{"VERSION":1,"accesskeyid":"case-id","secretaccesskey":"case-secret"}`},
 		{Name: "duplicates-in-order-null-keeps", Output: `{"Version":0,"version":1,"AccessKeyId":"first","ACCESSKEYID":"last","AccessKeyId":null,"SecretAccessKey":"secret"}`},
@@ -97,7 +101,7 @@ func main() {
 			r.Key = value.AccessKeyID
 			r.Token = value.SessionToken
 			if value.CanExpire {
-				r.Expiration = value.Expires.UTC().Format(time.RFC3339)
+				r.Expiration = value.Expires.UTC().Format(time.RFC3339Nano)
 			}
 		}
 	}

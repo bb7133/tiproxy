@@ -86,6 +86,25 @@ partitions are not yet supported. Regenerate with:
 go run rust/crates/control-meter/testdata/aws-sso-go.go
 ```
 
+Container credentials now freeze the Go-selected endpoint and token-file path
+at construction: relative URI takes precedence over full URI; HTTP full-URI
+hosts must resolve exclusively to loopback or the known ECS/EKS addresses. The
+file overrides the environment token, including an empty file, is read again at
+refresh, and is never trimmed; newline tokens fail before a request. Successful
+responses may omit token/expiration for static credentials. The Go five-minute
+expiry adjustment is retained through both native cache layers. Twenty-six
+actual Go cases compare construction failures, GET/Accept/Authorization, typed
+JSON decoding and two-retrieval cache behavior. Empty Go request methods are
+normalized to the HTTP default GET. A native regression checks token rotation,
+refresh while the original token still has 60 seconds remaining, and no env
+fallback after the selected file disappears. The probe disables retries to
+isolate selection/cache behavior; HTTP retry policy remains separate work.
+Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-container-go.go
+```
+
 For a profile's `credential_source`, missing Environment keys fail during
 retrieval; EcsContainer without either container URI fails during construction.
 Both timings match the Go resolver, including explicit-static overrides.
@@ -93,7 +112,7 @@ Both timings match the Go resolver, including explicit-static overrides.
 shell, preserving quoted arguments. Strict decoding follows Go's known field
 types, case-insensitive names, duplicate order and null handling. Invalid expiry
 fails; a provider response with an already elapsed expiry is returned once and
-retrieved again on the next call, as in Go's credential cache. Sixteen actual Go
+retrieved again on the next call, as in Go's credential cache. Twenty actual Go
 process cases compare command arguments, credentials, failures and cache calls;
 a real bounded-shell test verifies the quoted command path. Regenerate with:
 

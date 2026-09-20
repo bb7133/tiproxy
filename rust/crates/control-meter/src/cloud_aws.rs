@@ -83,8 +83,9 @@ impl AwsSigner {
 
     pub(crate) async fn sign(&self, parts: &mut Parts) -> reqsign_core::Result<()> {
         let mut credential = self.credential().await?;
-        // The Go CredentialsCache has no early-expiry window. This clone is
-        // never put into our cache; only the signer sees expiration removed.
+        // Provider-specific Go refresh windows are already reflected in the
+        // cached expiration. The signer gets a clone with expiry removed so
+        // reqsign does not impose an additional early-expiry window.
         credential.expires_in = None;
         RequestSigner::new("s3", &self.region)
             .sign_request(&self.context, parts, Some(&credential), None)
