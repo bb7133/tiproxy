@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -27,6 +28,7 @@ type source struct {
 	Final bool `json:"final_sample"`
 }
 type event struct {
+	Export bool `json:"export"`
 	Reopen bool `json:"reopen"`
 	Batch  struct {
 		Producer  string   `json:"producer_id"`
@@ -57,12 +59,22 @@ func run() error {
 	cfg.Metering.Bucket = "parity-test"
 	consumerPath := filepath.Join(dir, "consumer.json")
 	outboxPath := filepath.Join(dir, "run", "metering-outbox.json")
+	var previousSink *meter.Meter
+	defer func() {
+		if previousSink != nil {
+			_ = previousSink.Close()
+		}
+	}()
 	open := func() (*controlbridge.MeteringConsumer, error) {
+		if previousSink != nil {
+			_ = previousSink.Close()
+		}
 		sink, err := meter.NewMeter(cfg, zap.NewNop())
 		if err != nil {
 			return nil, err
 		}
-		// Do not Start/Close: Close flushes; this observer only exercises durable ingestion.
+		// Never Start: no export loop is created. Closing an unstarted writer only releases resources.
+		previousSink = sink
 		return controlbridge.OpenMeteringConsumer(consumerPath, sink)
 	}
 	consumer, err := open()
@@ -73,7 +85,12 @@ func run() error {
 	for _, e := range events {
 		var applied any
 		var applyErr error
-		if e.Reopen {
+		if e.Export {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			previousSink.Start(ctx)
+			applyErr = previousSink.Close()
+		} else if e.Reopen {
 			consumer, err = open()
 			if err != nil {
 				return err

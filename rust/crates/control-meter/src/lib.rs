@@ -18,11 +18,14 @@
 //! the Go consumer and outbox during the staged ownership handoff.
 
 mod consumer;
+pub mod export;
+mod local_store;
 mod outbox;
 mod persistence;
 mod types;
 
 pub use consumer::Consumer;
+pub use local_store::LocalStore;
 pub use outbox::{ExportRecord, ExportWindow, Outbox};
 pub use types::{
     Batch, Checkpoint, Delta, DurableSink, Error, Snapshot, SourceBaseline, SourceKey,

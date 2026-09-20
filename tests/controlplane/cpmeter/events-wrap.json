@@ -1,0 +1,116 @@
+[
+  {
+    "batch": {
+      "producer_id": "0123456789abcdef0123456789abcdef",
+      "sequence": 1,
+      "snapshots": [
+        {
+          "key": {
+            "ConnectionID": 1,
+            "ProcessGeneration": 1,
+            "BackendGeneration": 1
+          },
+          "baseline": {
+            "BackendID": "backend-a",
+            "ClusterName": "cluster",
+            "Keyspace": "ks",
+            "Local": true,
+            "PublicEndpoint": false,
+            "InboundBytes": 18446744073709551613,
+            "OutboundBytes": 0,
+            "InboundWrapEpoch": 0,
+            "OutboundWrapEpoch": 0
+          },
+          "final_sample": false
+        }
+      ]
+    }
+  },
+  {
+    "export": true
+  },
+  {
+    "batch": {
+      "producer_id": "0123456789abcdef0123456789abcdef",
+      "sequence": 2,
+      "snapshots": [
+        {
+          "key": {
+            "ConnectionID": 1,
+            "ProcessGeneration": 1,
+            "BackendGeneration": 1
+          },
+          "baseline": {
+            "BackendID": "backend-a",
+            "ClusterName": "cluster",
+            "Keyspace": "ks",
+            "Local": true,
+            "PublicEndpoint": false,
+            "InboundBytes": 4,
+            "OutboundBytes": 0,
+            "InboundWrapEpoch": 1,
+            "OutboundWrapEpoch": 0
+          },
+          "final_sample": false
+        }
+      ]
+    }
+  },
+  {
+    "batch": {
+      "producer_id": "0123456789abcdef0123456789abcdef",
+      "sequence": 3,
+      "snapshots": [
+        {
+          "key": {
+            "ConnectionID": 1,
+            "ProcessGeneration": 1,
+            "BackendGeneration": 1
+          },
+          "baseline": {
+            "BackendID": "backend-a",
+            "ClusterName": "cluster",
+            "Keyspace": "ks",
+            "Local": true,
+            "PublicEndpoint": false,
+            "InboundBytes": 18446744073709551614,
+            "OutboundBytes": 0,
+            "InboundWrapEpoch": 1,
+            "OutboundWrapEpoch": 0
+          },
+          "final_sample": false
+        }
+      ]
+    }
+  },
+  {
+    "reopen": true
+  },
+  {
+    "batch": {
+      "producer_id": "0123456789abcdef0123456789abcdef",
+      "sequence": 3,
+      "snapshots": [
+        {
+          "key": {
+            "ConnectionID": 1,
+            "ProcessGeneration": 1,
+            "BackendGeneration": 1
+          },
+          "baseline": {
+            "BackendID": "backend-a",
+            "ClusterName": "cluster",
+            "Keyspace": "ks",
+            "Local": true,
+            "PublicEndpoint": false,
+            "InboundBytes": 18446744073709551614,
+            "OutboundBytes": 0,
+            "InboundWrapEpoch": 1,
+            "OutboundWrapEpoch": 0
+          },
+          "final_sample": false
+        }
+      ]
+    }
+  }
+]

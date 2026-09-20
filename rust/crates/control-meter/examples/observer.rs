@@ -27,10 +27,13 @@ use serde_json::{Value, json};
 struct Event {
     #[serde(default)]
     reopen: bool,
+    #[serde(default)]
+    export: bool,
     batch: Option<Batch>,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 3 {
         return Err("usage: observer STATE_DIR EVENTS_JSON".into());
@@ -51,7 +54,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut consumer = open()?;
     let mut observations = Vec::new();
     for event in events {
-        let (applied, error) = if event.reopen {
+        let (applied, error) = if event.export {
+            let store = control_meter::LocalStore::new(&dir.join("objects"), "", true, "")?;
+            let result = control_meter::export::flush(
+                consumer.sink_mut(),
+                &store,
+                "",
+                60,
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+            (None, result.is_err())
+        } else if event.reopen {
             consumer = open()?;
             (None, false)
         } else {

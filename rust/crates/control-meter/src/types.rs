@@ -27,6 +27,9 @@ pub enum Error {
     /// Persistence or export previously failed and must recover before use.
     #[error("metering persistence or exporter is unhealthy")]
     Unhealthy,
+    /// Sanitized object-storage export failure.
+    #[error("metering export: {0}")]
+    Export(&'static str),
     /// Durable file I/O failed.
     #[error("metering persistence: {0}")]
     Io(#[from] std::io::Error),

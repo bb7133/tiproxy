@@ -294,3 +294,80 @@ fn persistence_failure_and_owner_retirement_prevent_ack() {
     assert!(matches!(c.apply(&batch(1, 10, 5)), Err(Error::Retired)));
     assert!(!c.healthy());
 }
+
+#[tokio::test]
+async fn local_export_matches_sdk_fields_and_refuses_existing_object() {
+    use control_meter::LocalStore;
+    use control_meter::export::{ObjectStore, encode_window, flush};
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use std::time::Duration;
+    let f = Fixture::new();
+    let store = LocalStore::new(&f.dir.join("objects"), "prefix/", true, "0750").unwrap();
+    let mut c = f.consumer();
+    c.apply(&batch(1, 10, 5)).unwrap();
+    let window = c.sink_mut().seal(60).unwrap().unwrap();
+    let object = encode_window(c.sink().self_id(), "", &window).unwrap();
+    let path = f.dir.join("objects/prefix").join(&object.key);
+    assert!(
+        flush(c.sink_mut(), &store, "", 120, Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+    assert!(c.sink().pending().is_none());
+    let bytes = fs::read(&path).unwrap();
+    let mut decoded = String::new();
+    GzDecoder::new(bytes.as_slice())
+        .read_to_string(&mut decoded)
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+    assert_eq!(value["timestamp"], 60);
+    assert_eq!(value["part"], 0);
+    assert_eq!(value["shared_pool_id"], "default-shared-pool");
+    assert_eq!(value["data"][0]["private_outBound_bytes"]["value"], 10);
+    assert_eq!(value["data"][0]["crossZone_bytes"]["value"], 15);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+    assert!(store.put_new(&object.key, object.body).await.is_err());
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn export_failure_and_timeout_keep_pending_until_success() {
+    use control_meter::LocalStore;
+    use control_meter::export::{ObjectStore, UploadFuture, flush};
+    use std::time::Duration;
+    struct Never;
+    impl ObjectStore for Never {
+        fn put_new<'a>(&'a self, _key: &'a str, _body: Vec<u8>) -> UploadFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+    let f = Fixture::new();
+    let mut c = f.consumer();
+    c.apply(&batch(1, 10, 5)).unwrap();
+    let store = LocalStore::new(&f.dir.join("absent"), "", false, "").unwrap();
+    assert!(
+        flush(c.sink_mut(), &store, "pool", 60, Duration::from_secs(2))
+            .await
+            .is_err()
+    );
+    let window = c.sink().pending().unwrap().clone();
+    assert!(!c.healthy());
+    assert!(
+        flush(c.sink_mut(), &Never, "pool", 120, Duration::from_millis(1))
+            .await
+            .is_err()
+    );
+    assert_eq!(c.sink().pending().unwrap(), &window);
+    let store = LocalStore::new(&f.dir.join("objects"), "", true, "").unwrap();
+    assert!(
+        flush(c.sink_mut(), &store, "pool", 180, Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+    assert!(c.healthy());
+    assert!(c.sink().pending().is_none());
+}
