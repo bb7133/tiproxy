@@ -580,11 +580,22 @@ challenge flow, and each replay preserves the body.
 
 Managed identity caches are keyed by resource. Nonempty CAE claims bypass the
 cached token and replace it on success; claims are not sent to the metadata
-endpoint, matching MSAL. Sixty actual production-provider cases use
-DefaultAzureCredential, local TLS and a synthetic App Service metadata endpoint.
-They compare every metadata resource and object authorization/body trajectory,
-including scope persistence/reversion, CAE refresh, malformed challenges and
-ordinary retries before/after challenges. The public Go x509 fallback-root API
+endpoint, matching MSAL. Developer credentials cache tokens in the outer bearer
+policy, which expires the cache on 401 even without a usable challenge. Refresh
+uses the five-minute window and 30-second retry backoff; a failed eager refresh
+retains the still-valid token. PowerShell has no inner token cache and accepts
+the challenged resource after validating the SDK's safe scope character set.
+CLI/PowerShell reject claims, while Developer CLI sends base64 `--claims` to azd.
+
+The 241 actual production-provider cases use DefaultAzureCredential, local TLS,
+a synthetic App Service metadata endpoint and fake az/azd/pwsh executables.
+Sixty cases per source compare every metadata or normalized tool scope/claims
+and object authorization/body trajectory, including scope persistence/reversion,
+CAE refresh, malformed challenges and ordinary retries before/after challenges.
+A further CLI case waits 31 seconds to verify eager refresh failure fallback,
+30-second backoff and forced renewal after 401. The native replay advances its
+Tokio timer for this wait. Tool executable templates and platform process
+launchers are not compared byte-for-byte; their scope, claims and call counts are. The public Go x509 fallback-root API
 trusts only the synthetic local certificate in the probe; SDK source is unchanged.
 Regenerate with:
 
@@ -592,17 +603,16 @@ Regenerate with:
 bash rust/crates/control-meter/testdata/azure-bearer-go.sh
 ```
 
-This increment qualifies managed identity challenges. The pinned Rust identity
-SDK has no claims option: environment, workload and Developer CLI CAE forwarding
-still require source adapters and currently fail without replaying an
-unchallenged cached token. CLI/PowerShell claims rejection matches Go, but their
-outer bearer-cache and changed-resource coverage remain separate follow-ups.
+These increments qualify managed and developer credential challenges. The pinned
+Rust identity SDK has no claims option: environment/workload CAE forwarding and
+the password adapter's changed-resource support still require source adapters
+and currently fail without replaying an unchallenged cached token.
 The added regex and permissive base64 decoding dependencies reuse package
 versions already in Cargo.lock; only control-meter dependency edges are added.
 
-Full default-credential/endpoint edge parity remains in progress. Azure non-managed
-CAE forwarding, developer credential bearer-cache behavior and unusual RFC1123
-named-zone metadata dates remain open. The declared general HTTP date,
+Full default-credential/endpoint edge parity remains in progress. Azure environment/
+workload CAE forwarding, password scope handling and unusual RFC1123 named-zone
+metadata dates remain open. The declared general HTTP date,
 endpoint and platform transport edges remain open. Export failure retains the
 pending window for the next metering attempt.
 

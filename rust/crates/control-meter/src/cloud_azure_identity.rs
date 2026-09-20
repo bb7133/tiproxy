@@ -17,10 +17,7 @@
 use crate::{Error, cloud_context::CloudIo};
 use azure_core::credentials::{AccessToken, TokenCredential};
 use azure_core::http::{ClientOptions, Transport};
-use azure_identity::{
-    AzureCliCredential, AzureDeveloperCliCredential, ClientSecretCredential,
-    ClientSecretCredentialOptions,
-};
+use azure_identity::{AzureCliCredential, ClientSecretCredential, ClientSecretCredentialOptions};
 use reqsign_core::{Context, HttpSend};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -92,15 +89,15 @@ impl AzureDefault {
         {
             credentials.push((Arc::new(NoClaims(credential)), false));
         }
-        if selected("AzureDeveloperCLICredential", true)
-            && let Ok(credential) = AzureDeveloperCliCredential::new(Some(
-                azure_identity::AzureDeveloperCliCredentialOptions {
-                    executor: Some(executor),
-                    ..Default::default()
-                },
-            ))
-        {
-            credentials.push((Arc::new(NoClaims(credential)), false));
+        if selected("AzureDeveloperCLICredential", true) {
+            credentials.push((
+                Arc::new(AuxiliaryCredential {
+                    context: ctx.clone(),
+                    source: AuxiliarySource::DeveloperCli,
+                    cached: Mutex::new(None),
+                }),
+                false,
+            ));
         }
         if selected("AzurePowerShellCredential", true) {
             credentials.push((
@@ -118,11 +115,23 @@ impl AzureDefault {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn token(&self) -> Result<String, Error> {
         self.token_for(SCOPE, Vec::new()).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn token_for(&self, scope: &str, claims: Vec<u8>) -> Result<String, Error> {
+        self.access_token_for(scope, claims)
+            .await
+            .map(|(v, _)| v.token.secret().to_owned())
+    }
+
+    pub(crate) async fn access_token_for(
+        &self,
+        scope: &str,
+        claims: Vec<u8>,
+    ) -> Result<(AccessToken, bool), Error> {
         let options = azure_core::credentials::TokenRequestOptions {
             method_options: azure_core::http::ClientMethodOptions {
                 context: azure_core::http::Context::default().with_value(ChallengeClaims(claims)),
@@ -130,19 +139,20 @@ impl AzureDefault {
         };
         let mut selected = self.selected.lock().await;
         if let Some(index) = *selected {
-            return token(
+            return checked_token(
                 self.credentials[index]
                     .0
                     .get_token(&[scope], Some(options))
                     .await,
-            );
+            )
+            .map(|v| (v, !self.credentials[index].1));
         }
         for (index, (credential, fatal)) in self.credentials.iter().enumerate() {
             match credential.get_token(&[scope], Some(options.clone())).await {
                 Ok(value) => {
-                    let token = token(Ok(value))?;
+                    let token = checked_token(Ok(value))?;
                     *selected = Some(index);
-                    return Ok(token);
+                    return Ok((token, !fatal));
                 }
                 Err(error) if *fatal && !crate::cloud_azure_managed::unavailable(&error) => {
                     return Err(Error::Export(
@@ -234,14 +244,14 @@ async fn environment(ctx: &Context, options: ClientOptions) -> Option<Arc<dyn To
         .map(|v| Arc::new(v) as Arc<dyn TokenCredential>)
 }
 
-fn token(result: azure_core::Result<AccessToken>) -> Result<String, Error> {
+fn checked_token(result: azure_core::Result<AccessToken>) -> Result<AccessToken, Error> {
     let value = result.map_err(|_| Error::Export("Azure identity authentication failed"))?;
     if value.expires_on <= azure_core::time::OffsetDateTime::now_utc()
         || value.token.secret().is_empty()
     {
         return Err(Error::Export("Azure identity token expired or empty"));
     }
-    Ok(value.token.secret().to_owned())
+    Ok(value)
 }
 
 #[derive(Debug)]
@@ -436,6 +446,7 @@ enum AuxiliarySource {
         password: String,
     },
     PowerShell,
+    DeveloperCli,
 }
 struct AuxiliaryCredential {
     context: Context,
@@ -485,9 +496,9 @@ impl AuxiliaryCredential {
             cached: Mutex::new(None),
         })
     }
-    async fn acquire(&self) -> azure_core::Result<AccessToken> {
+    async fn acquire(&self, scope: &str, claims: &[u8]) -> azure_core::Result<AccessToken> {
         let now = azure_core::time::OffsetDateTime::now_utc();
-        let (body, powershell) = match &self.source {
+        let body = match &self.source {
             AuxiliarySource::Password {
                 endpoint,
                 client,
@@ -501,7 +512,7 @@ impl AuxiliaryCredential {
                     ("client_id", client),
                     ("username", username),
                     ("password", password),
-                    ("scope", SCOPE),
+                    ("scope", scope),
                 ]);
                 let body = bytes::Bytes::from(form.query().ok_or_else(identity_error)?.to_owned());
                 let request = http::Request::post(endpoint.as_str())
@@ -516,10 +527,15 @@ impl AuxiliaryCredential {
                 if !response.status().is_success() {
                     return Err(identity_error());
                 }
-                (response.into_body().to_vec(), false)
+                response.into_body().to_vec()
             }
             AuxiliarySource::PowerShell => {
+                if !claims.is_empty() || !valid_developer_scope(scope) {
+                    return Err(identity_error());
+                }
+                let resource = scope.strip_suffix("/.default").unwrap_or(scope);
                 let script = "$ErrorActionPreference='Stop'; Import-Module Az.Accounts; $t=Get-AzAccessToken -ResourceUrl 'https://storage.azure.com'; if ($t.Token -is [System.Security.SecureString]) { $p=[System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($t.Token); try { $v=[System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($p) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) } } else { $v=$t.Token }; @{Token=$v;ExpiresOn=$t.ExpiresOn.ToUnixTimeSeconds()} | ConvertTo-Json";
+                let script = script.replace("https://storage.azure.com", resource);
                 let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
                 let encoded = reqsign_core::hash::base64_encode(&utf16);
                 let output = self
@@ -540,32 +556,78 @@ impl AuxiliaryCredential {
                 if !output.success() {
                     return Err(identity_error());
                 }
-                (output.stdout, true)
+                output.stdout
+            }
+            AuxiliarySource::DeveloperCli => {
+                if !valid_developer_scope(scope) {
+                    return Err(identity_error());
+                }
+                let mut args = vec![
+                    "auth",
+                    "token",
+                    "-o",
+                    "json",
+                    "--no-prompt",
+                    "--scope",
+                    scope,
+                ];
+                let encoded = reqsign_core::hash::base64_encode(claims);
+                if !claims.is_empty() {
+                    args.extend(["--claims", &encoded]);
+                }
+                let output = self
+                    .context
+                    .command_execute("azd", &args)
+                    .await
+                    .map_err(|_| identity_error())?;
+                if !output.success() {
+                    return Err(identity_error());
+                }
+                output.stdout
             }
         };
-        let value: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| identity_error())?;
-        let token = value[if powershell { "Token" } else { "access_token" }]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(identity_error)?;
-        let expires = if powershell {
-            azure_core::time::OffsetDateTime::from_unix_timestamp(
-                value["ExpiresOn"].as_i64().ok_or_else(identity_error)?,
-            )
-            .map_err(|_| identity_error())?
-        } else {
-            now.checked_add(azure_core::time::Duration::seconds(
-                value["expires_in"].as_i64().ok_or_else(identity_error)?,
-            ))
-            .ok_or_else(identity_error)?
-        };
-        if expires <= now {
-            return Err(identity_error());
-        }
-        Ok(AccessToken::new(token.to_owned(), expires))
+        parse_auxiliary_token(&body, &self.source, now)
     }
 }
+fn parse_auxiliary_token(
+    body: &[u8],
+    source: &AuxiliarySource,
+    now: azure_core::time::OffsetDateTime,
+) -> azure_core::Result<AccessToken> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| identity_error())?;
+    let token = value[match source {
+        AuxiliarySource::PowerShell => "Token",
+        AuxiliarySource::DeveloperCli => "token",
+        AuxiliarySource::Password { .. } => "access_token",
+    }]
+    .as_str()
+    .filter(|value| !value.is_empty())
+    .ok_or_else(identity_error)?;
+    let expires = if matches!(source, AuxiliarySource::DeveloperCli) {
+        azure_core::time::parse_rfc3339(value["expiresOn"].as_str().ok_or_else(identity_error)?)?
+    } else if matches!(source, AuxiliarySource::PowerShell) {
+        azure_core::time::OffsetDateTime::from_unix_timestamp(
+            value["ExpiresOn"].as_i64().ok_or_else(identity_error)?,
+        )
+        .map_err(|_| identity_error())?
+    } else {
+        now.checked_add(azure_core::time::Duration::seconds(
+            value["expires_in"].as_i64().ok_or_else(identity_error)?,
+        ))
+        .ok_or_else(identity_error)?
+    };
+    if expires <= now {
+        return Err(identity_error());
+    }
+    Ok(AccessToken::new(token.to_owned(), expires))
+}
+
+fn valid_developer_scope(scope: &str) -> bool {
+    scope
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':'))
+}
+
 #[async_trait::async_trait]
 impl TokenCredential for AuxiliaryCredential {
     async fn get_token(
@@ -573,7 +635,19 @@ impl TokenCredential for AuxiliaryCredential {
         scopes: &[&str],
         options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
-        if scopes != [SCOPE] || has_claims(options.as_ref()) {
+        let [scope] = scopes else {
+            return Err(identity_error());
+        };
+        let claims = options
+            .as_ref()
+            .and_then(|o| o.method_options.context.value::<ChallengeClaims>())
+            .map_or(&[][..], |v| v.0.as_slice());
+        if !matches!(self.source, AuxiliarySource::Password { .. }) {
+            return self.acquire(scope, claims).await;
+        }
+        // Password caching remains limited to the original configured scope
+        // until its claims-aware OAuth adapter is qualified.
+        if *scope != SCOPE || !claims.is_empty() {
             return Err(identity_error());
         }
         let mut cached = self.cached.lock().await;
@@ -584,7 +658,7 @@ impl TokenCredential for AuxiliaryCredential {
         {
             return Ok(token.clone());
         }
-        let token = self.acquire().await?;
+        let token = self.acquire(scope, claims).await?;
         *cached = Some(token.clone());
         Ok(token)
     }
@@ -725,7 +799,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn powershell_mode_uses_bounded_executor_and_caches() {
+    async fn powershell_mode_uses_bounded_executor_and_outer_bearer_cache() {
         let shell = Shell(Arc::new(AtomicUsize::new(0)));
         let ctx = Context::new()
             .with_env(reqsign_core::StaticEnv {
@@ -739,9 +813,10 @@ mod tests {
         let chain = AzureDefault::new(reqwest::Client::new(), ctx)
             .await
             .unwrap_or_else(|e| unreachable!("{e}"));
+        let bearer = crate::cloud_azure::bearer::Bearer::new(chain);
         for _ in 0..2 {
             assert_eq!(
-                chain.token().await.unwrap_or_else(|e| unreachable!("{e}")),
+                bearer.token().await.unwrap_or_else(|e| unreachable!("{e}")),
                 "powershell-test-token"
             );
         }

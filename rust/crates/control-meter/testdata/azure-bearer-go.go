@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,8 +29,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/pingcap/metering_sdk/storage/provider"
@@ -40,6 +45,7 @@ type reply struct {
 	Challenge []string `json:"challenge"`
 }
 type operation struct {
+	WaitMS  int     `json:"wait_ms,omitempty"`
 	Method  string  `json:"method"`
 	Replies []reply `json:"replies"`
 	Error   bool    `json:"error"`
@@ -53,12 +59,38 @@ type observed struct {
 	SHA256 string `json:"sha256"`
 }
 type row struct {
-	Name string      `json:"name"`
-	Ops  []operation `json:"ops"`
-	Seen []observed  `json:"seen"`
+	TTL         int         `json:"ttl,omitempty"`
+	FailCommand int         `json:"fail_command,omitempty"`
+	Source      string      `json:"source"`
+	Name        string      `json:"name"`
+	Ops         []operation `json:"ops"`
+	Seen        []observed  `json:"seen"`
 }
 
 func main() {
+	if len(os.Args) > 2 && os.Args[1] == "--stub" {
+		stub(os.Args[2], os.Args[3:])
+		return
+	}
+	stubDir, err := os.MkdirTemp("", "azure-bearer-cli-")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(stubDir)
+	executable, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	for _, tool := range []string{"az", "azd", "pwsh"} {
+		script := "#!/bin/sh\nexec '" + strings.ReplaceAll(executable, "'", "'\"'\"'") + "' --stub " + tool + " \"$@\"\n"
+		if err := os.WriteFile(filepath.Join(stubDir, tool), []byte(script), 0700); err != nil {
+			panic(err)
+		}
+	}
+	_ = os.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stubLog := filepath.Join(stubDir, "calls.jsonl")
+	_ = os.Setenv("AZURE_BEARER_STUB_LOG", stubLog)
+
 	for _, name := range []string{"AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_USERNAME", "AZURE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "MSI_ENDPOINT", "MSI_SECRET", "IMDS_ENDPOINT", "IDENTITY_SERVER_THUMBPRINT"} {
 		_ = os.Unsetenv(name)
 	}
@@ -100,8 +132,49 @@ func main() {
 		rows = append(rows, row{Name: method + "-scope-reverts", Ops: []operation{{Method: method, Replies: []reply{{401, []string{challenge("https://other.invalid")}}, {}}}, {Method: method, Replies: []reply{{401, []string{challenge("https://storage.azure.com")}}, {}}}}})
 		rows = append(rows, row{Name: method + "-cae-persists", Ops: []operation{{Method: method, Replies: []reply{{401, []string{claims}}, {}}}, {Method: method, Replies: []reply{{}}}}})
 	}
+	base, _ := json.Marshal(rows)
+	rows = nil
+	for _, source := range []string{"ManagedIdentityCredential", "AzureCLICredential", "AzureDeveloperCLICredential", "AzurePowerShellCredential"} {
+		var copyRows []row
+		if err := json.Unmarshal(base, &copyRows); err != nil {
+			panic(err)
+		}
+		for i := range copyRows {
+			copyRows[i].Source = source
+		}
+		rows = append(rows, copyRows...)
+	}
+	rows = append(rows, row{Source: "AzureCLICredential", Name: "HEAD-refresh-failure-fallback-and-401", TTL: 120, FailCommand: 2, Ops: []operation{
+		{Method: "HEAD", Replies: []reply{{}}},
+		{Method: "HEAD", WaitMS: 31000, Replies: []reply{{}}},
+		{Method: "HEAD", Replies: []reply{{}}},
+		{Method: "HEAD", Replies: []reply{{401, []string{challenge("https://storage.azure.com")}}, {}}},
+	}})
 	for n := range rows {
 		r := &rows[n]
+		_ = os.Setenv("AZURE_TOKEN_CREDENTIALS", r.Source)
+		_ = os.Setenv("AZURE_BEARER_STUB_TTL", fmt.Sprint(r.TTL))
+		_ = os.Setenv("AZURE_BEARER_STUB_FAIL", fmt.Sprint(r.FailCommand))
+		if err := os.WriteFile(stubLog, nil, 0600); err != nil {
+			panic(err)
+		}
+		stubOffset := 0
+		flushStub := func() {
+			data, err := os.ReadFile(stubLog)
+			if err != nil {
+				panic(err)
+			}
+			for _, line := range bytes.Split(data[stubOffset:], []byte("\n")) {
+				if len(line) > 0 {
+					var event observed
+					if err := json.Unmarshal(line, &event); err != nil {
+						panic(err)
+					}
+					r.Seen = append(r.Seen, event)
+				}
+			}
+			stubOffset = len(data)
+		}
 		var mu sync.Mutex
 		tokenNum, opIndex, responseIndex := 0, 0, 0
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -119,6 +192,7 @@ func main() {
 				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": fmt.Sprintf("fake-%d", tokenNum), "expires_on": fmt.Sprint(time.Now().Add(time.Hour).Unix()), "token_type": "Bearer", "resource": resource})
 				return
 			}
+			flushStub()
 			sum := sha256.Sum256(b)
 			r.Seen = append(r.Seen, observed{Kind: "object", Value: req.Header.Get("Authorization"), Method: req.Method, Size: len(b), SHA256: hex.EncodeToString(sum[:])})
 			op := r.Ops[opIndex]
@@ -160,18 +234,98 @@ func main() {
 			mu.Unlock()
 			ctx := policy.WithRetryOptions(context.Background(), policy.RetryOptions{RetryDelay: 1})
 			op := &r.Ops[j]
+			if op.WaitMS > 0 {
+				time.Sleep(time.Duration(op.WaitMS) * time.Millisecond)
+			}
 			if op.Method == "HEAD" {
 				op.Exists, e = p.Exists(ctx, "key.json.gz")
 			} else {
 				e = p.Upload(ctx, "key.json.gz", bytes.NewBufferString("payload"))
 			}
 			op.Error = e != nil
+			mu.Lock()
+			flushStub()
+			mu.Unlock()
 		}
 		srv.Close()
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if e := enc.Encode(rows); e != nil {
+		panic(e)
+	}
+}
+
+// Fake executable used by the unmodified SDK command runner. It records only
+// synthetic scope/claims and returns a token; no Azure CLI is contacted.
+func stub(tool string, args []string) {
+	scope, claims := "", ""
+	for i, a := range args {
+		if i+1 < len(args) {
+			switch strings.ToLower(a) {
+			case "--scope":
+				scope = args[i+1]
+			case "--resource":
+				scope = args[i+1] + "/.default"
+			case "--claims":
+				claims = args[i+1]
+			case "-encodedcommand":
+				b, e := base64.StdEncoding.DecodeString(args[i+1])
+				if e != nil {
+					panic(e)
+				}
+				units := make([]uint16, len(b)/2)
+				for j := range units {
+					units[j] = binary.LittleEndian.Uint16(b[2*j:])
+				}
+				script := string(utf16.Decode(units))
+				m := regexp.MustCompile(`ResourceUrl\s*=\s*'([^']*)'`).FindStringSubmatch(script)
+				if len(m) != 2 {
+					panic("missing PowerShell resource")
+				}
+				scope = m[1] + "/.default"
+			}
+		}
+	}
+	if scope == "" {
+		panic("missing synthetic scope")
+	}
+	log := os.Getenv("AZURE_BEARER_STUB_LOG")
+	data, e := os.ReadFile(log)
+	if e != nil {
+		panic(e)
+	}
+	count := bytes.Count(data, []byte("\n")) + 1
+	event := observed{Kind: tool, Value: scope + "|" + claims}
+	f, e := os.OpenFile(log, os.O_APPEND|os.O_WRONLY, 0600)
+	if e != nil {
+		panic(e)
+	}
+	if e = json.NewEncoder(f).Encode(event); e != nil {
+		panic(e)
+	}
+	_ = f.Close()
+	if os.Getenv("AZURE_BEARER_STUB_FAIL") == fmt.Sprint(count) {
+		fmt.Fprintln(os.Stderr, "synthetic refresh failure")
+		os.Exit(1)
+	}
+	expiry := int64(4070908800)
+	var ttl int
+	_, _ = fmt.Sscan(os.Getenv("AZURE_BEARER_STUB_TTL"), &ttl)
+	if ttl > 0 {
+		expiry = time.Now().Add(time.Duration(ttl) * time.Second).Unix()
+	}
+	token := fmt.Sprintf("fake-%d", count)
+	var response any
+	switch tool {
+	case "az":
+		response = map[string]any{"accessToken": token, "expires_on": expiry, "tokenType": "Bearer"}
+	case "azd":
+		response = map[string]any{"token": token, "expiresOn": "2099-01-01T00:00:00Z"}
+	case "pwsh":
+		response = map[string]any{"Token": token, "ExpiresOn": expiry}
+	}
+	if e := json.NewEncoder(os.Stdout).Encode(response); e != nil {
 		panic(e)
 	}
 }

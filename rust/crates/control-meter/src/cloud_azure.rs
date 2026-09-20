@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 #[path = "cloud_azure_bearer.rs"]
-mod bearer;
+pub(crate) mod bearer;
 #[path = "cloud_azure_object.rs"]
 mod object;
 

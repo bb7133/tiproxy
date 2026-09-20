@@ -17,6 +17,7 @@ use crate::{
     Error,
     cloud_azure_identity::{AzureDefault, SCOPE},
 };
+use azure_core::credentials::AccessToken;
 use base64::{
     Engine as _,
     engine::{GeneralPurpose, GeneralPurposeConfig},
@@ -28,21 +29,60 @@ use tokio::sync::Mutex;
 
 pub(crate) struct Bearer {
     source: AzureDefault,
-    scope: Mutex<String>,
+    state: Mutex<TokenState>,
+}
+struct TokenState {
+    scope: String,
+    cached: Option<AccessToken>,
+    refreshed: Option<tokio::time::Instant>,
 }
 impl Bearer {
     pub(crate) fn new(source: AzureDefault) -> Self {
         Self {
             source,
-            scope: Mutex::new(SCOPE.into()),
+            state: Mutex::new(TokenState {
+                scope: SCOPE.into(),
+                cached: None,
+                refreshed: None,
+            }),
         }
     }
     pub(crate) async fn token(&self) -> Result<String, Error> {
-        let scope = self.scope.lock().await;
-        if scope.as_str() == SCOPE {
-            self.source.token().await
-        } else {
-            self.source.token_for(&scope, Vec::new()).await
+        let mut state = self.state.lock().await;
+        let now = azure_core::time::OffsetDateTime::now_utc();
+        if let Some(token) = &state.cached
+            && token.expires_on > now
+            && (token.expires_on >= now + azure_core::time::Duration::minutes(5)
+                || state
+                    .refreshed
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(30)))
+        {
+            return Ok(token.token.secret().to_owned());
+        }
+        self.acquire(&mut state, Vec::new(), true).await
+    }
+    async fn acquire(
+        &self,
+        state: &mut TokenState,
+        claims: Vec<u8>,
+        allow_fallback: bool,
+    ) -> Result<String, Error> {
+        state.refreshed = Some(tokio::time::Instant::now());
+        match self.source.access_token_for(&state.scope, claims).await {
+            Ok((value, developer)) => {
+                let token = value.token.secret().to_owned();
+                state.cached = developer.then_some(value);
+                Ok(token)
+            }
+            Err(error) => {
+                if allow_fallback
+                    && let Some(value) = &state.cached
+                    && value.expires_on > azure_core::time::OffsetDateTime::now_utc()
+                {
+                    return Ok(value.token.secret().to_owned());
+                }
+                Err(error)
+            }
         }
     }
     pub(crate) async fn challenge(
@@ -50,6 +90,10 @@ impl Bearer {
         headers: &HeaderMap,
         allow_resource: bool,
     ) -> Result<Option<(String, bool)>, Error> {
+        let mut state = self.state.lock().await;
+        // Even a 401 without a usable challenge expires the outer token.
+        state.cached = None;
+        state.refreshed = None;
         let first = headers
             .get("www-authenticate")
             .and_then(|h| h.to_str().ok())
@@ -60,10 +104,8 @@ impl Bearer {
         // CAE takes precedence over the storage resource challenge and may
         // appear in any WWW-Authenticate header, not just the first value.
         if let Some(claims) = parse_cae(headers)? {
-            let scope = self.scope.lock().await;
             return self
-                .source
-                .token_for(&scope, claims)
+                .acquire(&mut state, claims, false)
                 .await
                 .map(|token| Some((token, true)));
         }
@@ -85,10 +127,8 @@ impl Bearer {
         if !resource.ends_with("/.default") {
             resource.push_str("/.default");
         }
-        let mut scope = self.scope.lock().await;
-        *scope = resource;
-        self.source
-            .token_for(&scope, Vec::new())
+        state.scope = resource;
+        self.acquire(&mut state, Vec::new(), false)
             .await
             .map(|token| Some((token, false)))
     }
@@ -156,6 +196,8 @@ mod tests {
     }
     #[derive(Deserialize)]
     struct Operation {
+        #[serde(default)]
+        wait_ms: u64,
         method: String,
         replies: Vec<Reply>,
         error: bool,
@@ -171,12 +213,19 @@ mod tests {
     }
     #[derive(Deserialize)]
     struct Row {
+        #[serde(default)]
+        ttl: i64,
+        #[serde(default)]
+        fail_command: usize,
+        source: String,
         name: String,
         ops: Vec<Operation>,
         seen: Vec<Observed>,
     }
     #[derive(Default)]
     struct State {
+        ttl: i64,
+        fail_command: usize,
         replies: Vec<Reply>,
         next: usize,
         token: usize,
@@ -249,21 +298,101 @@ mod tests {
                 .map_err(|_| reqsign_core::Error::unexpected("fixture response"))
         }
     }
+    impl reqsign_core::CommandExecute for Io {
+        async fn command_execute(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> reqsign_core::Result<reqsign_core::CommandOutput> {
+            let (tool, scope, claims) = if program == "pwsh" {
+                let bytes = reqsign_core::hash::base64_decode(args[5])
+                    .unwrap_or_else(|e| unreachable!("{e}"));
+                let units: Vec<_> = bytes
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                let script = String::from_utf16(&units).unwrap_or_else(|e| unreachable!("{e}"));
+                let resource = script
+                    .split("-ResourceUrl '")
+                    .nth(1)
+                    .and_then(|s| s.split('\'').next())
+                    .unwrap_or_default();
+                ("pwsh", format!("{resource}/.default"), String::new())
+            } else {
+                let text = args.join(" ");
+                let args: Vec<_> = text.split_whitespace().collect();
+                let field = |name| {
+                    args.windows(2)
+                        .find(|v| v[0] == name)
+                        .map(|v| v[1])
+                        .unwrap_or_default()
+                };
+                let scope = if field("--scope").is_empty() {
+                    format!("{}/.default", field("--resource"))
+                } else {
+                    field("--scope").to_owned()
+                };
+                (
+                    if program == "azd" { "azd" } else { "az" },
+                    scope,
+                    field("--claims").to_owned(),
+                )
+            };
+            let mut state = self.0.lock().unwrap_or_else(|e| unreachable!("{e}"));
+            state.token += 1;
+            state.seen.push(Observed {
+                kind: tool.into(),
+                value: format!("{scope}|{claims}"),
+                method: String::new(),
+                size: 0,
+                sha256: String::new(),
+            });
+            if state.token == state.fail_command {
+                return Ok(reqsign_core::CommandOutput {
+                    status: 1,
+                    stdout: Vec::new(),
+                    stderr: b"synthetic refresh failure".to_vec(),
+                });
+            }
+            let expiry = if state.ttl > 0 {
+                azure_core::time::OffsetDateTime::now_utc().unix_timestamp() + state.ttl
+            } else {
+                4_070_908_800_i64
+            };
+            let token = format!("fake-{}", state.token);
+            let value = match tool {
+                "azd" => serde_json::json!({"token":token,"expiresOn":"2099-01-01T00:00:00Z"}),
+                "pwsh" => serde_json::json!({"Token":token,"ExpiresOn":expiry}),
+                _ => {
+                    serde_json::json!({"accessToken":token,"expires_on":expiry,"tokenType":"Bearer"})
+                }
+            };
+            Ok(reqsign_core::CommandOutput {
+                status: 0,
+                stdout: value.to_string().into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+    }
     #[tokio::test(start_paused = true)]
-    async fn managed_bearer_challenges_match_actual_go_default_credential() {
+    async fn bearer_challenges_match_actual_go_default_credentials() {
         let rows: Vec<Row> = serde_json::from_str(include_str!("../testdata/azure-bearer-go.json"))
             .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 60);
+        assert_eq!(rows.len(), 241);
         for row in rows {
+            let label = format!("{} {}", row.source, row.name);
             let io = Io::default();
+            {
+                let mut state = io.0.lock().unwrap_or_else(|e| unreachable!("{e}"));
+                state.ttl = row.ttl;
+                state.fail_command = row.fail_command;
+            }
             let context = Context::new()
                 .with_http_send(io.clone())
+                .with_command_execute(io.clone())
                 .with_env(StaticEnv {
                     envs: HashMap::from([
-                        (
-                            "AZURE_TOKEN_CREDENTIALS".into(),
-                            "ManagedIdentityCredential".into(),
-                        ),
+                        ("AZURE_TOKEN_CREDENTIALS".into(), row.source.clone()),
                         ("AZURE_CLIENT_ID".into(), "fake-client".into()),
                         (
                             "IDENTITY_ENDPOINT".into(),
@@ -280,6 +409,7 @@ mod tests {
             let url = reqwest::Url::parse("https://fixture.invalid/bucket/prefix%2Fkey.json.gz")
                 .unwrap_or_else(|e| unreachable!("{e}"));
             for op in row.ops {
+                tokio::time::sleep(std::time::Duration::from_millis(op.wait_ms)).await;
                 {
                     let mut state = io.0.lock().unwrap_or_else(|e| unreachable!("{e}"));
                     state.replies = op.replies;
@@ -292,21 +422,15 @@ mod tests {
                     Bytes::new()
                 };
                 let result = signer.request(&context, method.clone(), &url, body).await;
-                assert_eq!(result.is_err(), op.error, "{}", row.name);
+                assert_eq!(result.is_err(), op.error, "{label}");
                 if method == Method::HEAD {
-                    assert_eq!(
-                        result.is_ok_and(|s| s.is_success()),
-                        op.exists,
-                        "{}",
-                        row.name
-                    );
+                    assert_eq!(result.is_ok_and(|s| s.is_success()), op.exists, "{label}");
                 }
             }
             assert_eq!(
                 io.0.lock().unwrap_or_else(|e| unreachable!("{e}")).seen,
                 row.seen,
-                "{}",
-                row.name
+                "{label}"
             );
         }
     }
