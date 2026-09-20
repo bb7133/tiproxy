@@ -365,7 +365,7 @@ impl TokenCredential for Managed {
     }
 }
 
-fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
     for (name, milliseconds) in [
         ("retry-after-ms", true),
         ("x-ms-retry-after-ms", true),

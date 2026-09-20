@@ -1,0 +1,4272 @@
+[
+  {
+    "name": "status200",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 200,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "status201",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 201,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status202",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 202,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status204",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 204,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status400",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 400,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status401",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 401,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status403",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status404",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 404,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "status408",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 408,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "status409",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 409,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status429",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 429,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "status500",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 500,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "status501",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 501,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status502",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 502,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "status503",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "status504",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 504,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "status599",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 599,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "exhausted503",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "codeBlobNotFound",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "BlobNotFound",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "codeResourceNotFound",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "ResourceNotFound",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "codeContainerNotFound",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "ContainerNotFound",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "codeblobnotfound",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "blobnotfound",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "codeDenied",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "Denied",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "header-before-xml",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "Denied",
+        "body": "\u003cError\u003e\u003cCode\u003eBlobNotFound\u003c/Code\u003e\u003c/Error\u003e",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "xml-code",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "",
+        "body": "\u003cError\u003e\u003cCode\u003eBlobNotFound\u003c/Code\u003e\u003c/Error\u003e",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "json-code",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "",
+        "body": "{\"error\":{\"code\":\"BlobNotFound\"}}",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "transport-retry",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": true
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "retry-ms",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after": "61",
+          "retry-after-ms": "1",
+          "x-ms-retry-after-ms": "60001"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "retry-cap",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after-ms": "60001"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "retry-fallback-cap",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after-ms": "0",
+          "x-ms-retry-after-ms": "60001"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "retry-seconds-cap",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after": "61"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "retry-invalid",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after": "nonsense"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "opaque-utf8-metadata",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "etag": "étiquette",
+          "x-ms-meta-label": "café"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "retry-cap-absent",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "BlobNotFound",
+        "body": "",
+        "headers": {
+          "retry-after": "61"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "invalid-Date",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Date": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-Last-Modified",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-Content-MD5",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Content-MD5": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-x-ms-content-crc64",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "x-ms-content-crc64": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "invalid-x-ms-request-server-encrypted",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "x-ms-request-server-encrypted": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "invalid-x-ms-server-encrypted",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "x-ms-server-encrypted": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-x-ms-blob-committed-block-count",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "x-ms-blob-committed-block-count": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "sas-retry",
+    "method": "HEAD",
+    "size": 0,
+    "sas": true,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": false,
+        "request_id": -1,
+        "sas": true
+      },
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": false,
+        "request_id": -1,
+        "sas": true
+      }
+    ],
+    "error": false,
+    "exists": true
+  },
+  {
+    "name": "status200",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 200,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status201",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 201,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "status202",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 202,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status204",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 204,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status400",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 400,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status401",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 401,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status403",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status404",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 404,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status408",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 408,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "status409",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 409,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status429",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 429,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "status500",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 500,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "status501",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 501,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "status502",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 502,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "status503",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "status504",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 504,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "status599",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 599,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "exhausted503",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "codeBlobNotFound",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "BlobNotFound",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "codeResourceNotFound",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "ResourceNotFound",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "codeContainerNotFound",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "ContainerNotFound",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "codeblobnotfound",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "blobnotfound",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "codeDenied",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "Denied",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "header-before-xml",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "Denied",
+        "body": "\u003cError\u003e\u003cCode\u003eBlobNotFound\u003c/Code\u003e\u003c/Error\u003e",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "xml-code",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "",
+        "body": "\u003cError\u003e\u003cCode\u003eBlobNotFound\u003c/Code\u003e\u003c/Error\u003e",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "json-code",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 403,
+        "code": "",
+        "body": "{\"error\":{\"code\":\"BlobNotFound\"}}",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "transport-retry",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": true
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "retry-ms",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after": "61",
+          "retry-after-ms": "1",
+          "x-ms-retry-after-ms": "60001"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "retry-cap",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after-ms": "60001"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "retry-fallback-cap",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after-ms": "0",
+          "x-ms-retry-after-ms": "60001"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "retry-seconds-cap",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after": "61"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "retry-invalid",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "headers": {
+          "retry-after": "nonsense"
+        },
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "opaque-utf8-metadata",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "etag": "étiquette",
+          "x-ms-meta-label": "café"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "retry-cap-absent",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "BlobNotFound",
+        "body": "",
+        "headers": {
+          "retry-after": "61"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-Date",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Date": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-Last-Modified",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-Content-MD5",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Content-MD5": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-x-ms-content-crc64",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "x-ms-content-crc64": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-x-ms-request-server-encrypted",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "x-ms-request-server-encrypted": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "invalid-x-ms-server-encrypted",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "x-ms-server-encrypted": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "invalid-x-ms-blob-committed-block-count",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "x-ms-blob-committed-block-count": "invalid"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "sas-retry",
+    "method": "PUT",
+    "size": 7,
+    "sas": true,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": false,
+        "request_id": -1,
+        "sas": true
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": false,
+        "request_id": -1,
+        "sas": true
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "size0",
+    "method": "PUT",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "size1",
+    "method": "PUT",
+    "size": 1,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 1,
+        "sha256": "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "size1048575",
+    "method": "PUT",
+    "size": 1048575,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 1048575,
+        "sha256": "853128861f54bbdeb53b0e9375b7995e4464e1677dc3a150a9c182deda6ba05c",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "size1048576",
+    "method": "PUT",
+    "size": 1048576,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 167,
+        "sha256": "blocklist",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "size1048577",
+    "method": "PUT",
+    "size": 1048577,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1,
+        "sha256": "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940",
+        "blocks": [
+          1
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "size2097152",
+    "method": "PUT",
+    "size": 2097152,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          1
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "size2097153",
+    "method": "PUT",
+    "size": 2097153,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          1
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1,
+        "sha256": "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940",
+        "blocks": [
+          2
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 377,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1,
+          2
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "block-exhaustfalse",
+    "method": "PUT",
+    "size": 1048577,
+    "sas": false,
+    "failure_comp": "block",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1,
+        "sha256": "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940",
+        "blocks": [
+          1
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "block-exhausttrue",
+    "method": "PUT",
+    "size": 1048577,
+    "sas": false,
+    "failure_comp": "block",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "blocklist-exhaustfalse",
+    "method": "PUT",
+    "size": 1048577,
+    "sas": false,
+    "failure_comp": "blocklist",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      },
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1,
+        "sha256": "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940",
+        "blocks": [
+          1
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": false,
+    "exists": false
+  },
+  {
+    "name": "blocklist-exhausttrue",
+    "method": "PUT",
+    "size": 1048577,
+    "sas": false,
+    "failure_comp": "blocklist",
+    "responses": [
+      {
+        "status": 503,
+        "code": "",
+        "body": "",
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1048576,
+        "sha256": "bdcb28a9deb6343e0134eb10449314c675ec8a384e8c556af3c551266966969b",
+        "blocks": [
+          0
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "block",
+        "length": 1,
+        "sha256": "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940",
+        "blocks": [
+          1
+        ],
+        "content_type": "application/octet-stream",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      },
+      {
+        "commit_body": "\u003c?xml version=\"1.0\" encoding=\"UTF-8\"?\u003e\n\u003cBlockList\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003cLatest\u003eAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\u003c/Latest\u003e\u003c/BlockList\u003e",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "blocklist",
+        "length": 272,
+        "sha256": "blocklist",
+        "blocks": [
+          0,
+          1
+        ],
+        "content_type": "application/xml",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  }
+]

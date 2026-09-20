@@ -26,6 +26,9 @@ use reqwest::{Client, Url};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+#[path = "cloud_azure_object.rs"]
+mod object;
+
 pub(crate) enum AzureSigner {
     SharedKey { account: String, key: Vec<u8> },
     Sas,
@@ -95,7 +98,12 @@ impl AzureSigner {
         parts
             .headers
             .insert("x-ms-version", HeaderValue::from_static("2025-11-05"));
-        if parts.method == Method::PUT {
+        if parts.method == Method::PUT
+            && !parts.uri.query().is_some_and(|q| {
+                q.split('&')
+                    .any(|v| matches!(v, "comp=block" | "comp=blocklist"))
+            })
+        {
             parts
                 .headers
                 .insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
@@ -125,6 +133,25 @@ impl AzureSigner {
         }
         Ok(())
     }
+}
+
+// The Go blob client applies url.PathEscape to the entire blob name, including
+// '/' separators, before joining it below the container endpoint.
+pub(crate) fn escape_key(key: &str) -> String {
+    let mut out = String::new();
+    for b in key.bytes() {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b':' | b'=' | b'@'
+            )
+        {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 fn canonical(parts: &Parts, account: &str) -> Result<String, Error> {
@@ -209,7 +236,7 @@ mod tests {
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(include_str!("../testdata/azure-shared-key-go.json"))
                 .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 5);
         for row in rows {
             let mut request = http::Request::builder()
                 .method(row["method"].as_str().unwrap_or_default())
