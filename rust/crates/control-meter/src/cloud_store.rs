@@ -38,6 +38,7 @@ enum CloudSigner {
     S3(Signer<reqsign_aws_v4::Credential>),
     Oss(Signer<reqsign_aliyun_oss::Credential>),
     Cos(crate::cloud_cos::CosSigner),
+    Azure(crate::cloud_azure::AzureSigner),
 }
 
 impl fmt::Debug for CloudStore {
@@ -86,6 +87,11 @@ impl CloudStore {
             "s3" => s3(config, context).await?,
             "oss" => oss(config, context)?,
             "cos" => cos(config, context)?,
+            "azure" => {
+                let (endpoint, signer) =
+                    crate::cloud_azure::build(config, client.clone(), context).await?;
+                (endpoint, CloudSigner::Azure(signer))
+            }
             _ => return Err(Error::Invalid("unsupported cloud provider")),
         };
         Ok(Self {
@@ -132,10 +138,15 @@ impl CloudStore {
             .map_err(|_| Error::Export("invalid cloud request"))?
             .into_parts()
             .0;
+        if let CloudSigner::Azure(signer) = &self.signer {
+            signer.sign(&mut parts).await?;
+            return self.send(parts, body).await;
+        }
         match &self.signer {
             CloudSigner::S3(signer) => signer.sign(&mut parts, None).await,
             CloudSigner::Oss(signer) => signer.sign(&mut parts, None).await,
             CloudSigner::Cos(signer) => signer.sign(&mut parts).await,
+            CloudSigner::Azure(_) => return Err(Error::Export("invalid Azure signer dispatch")),
         }
         .map_err(|_| Error::Export("cloud credential or signing failure"))?;
         self.send(parts, body).await
@@ -375,7 +386,7 @@ fn cos(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSigner), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control_config::{AwsMeteringConfig, CloudMeteringConfig};
+    use control_config::{AwsMeteringConfig, AzureMeteringConfig, CloudMeteringConfig};
     use reqsign_core::StaticEnv;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -519,6 +530,60 @@ mod tests {
             assert!(requests[0].0.starts_with("HEAD "));
         }
     }
+    #[tokio::test]
+    async fn azure_shared_key_and_sas_write_real_requests() {
+        for sas in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let addr = listener
+                .local_addr()
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let client = Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let config = MeteringConfig {
+                provider_type: "azure".into(),
+                endpoint: format!("http://{addr}/account"),
+                bucket: "bucket".into(),
+                prefix: "prefix space/%text".into(),
+                azure: Some(AzureMeteringConfig {
+                    account_name: "account".into(),
+                    account_key: if sas {
+                        String::new()
+                    } else {
+                        reqsign_core::hash::base64_encode(b"fake-account-key")
+                    },
+                    sas_token: "?sv=2025-11-05&sig=fake%2Bsignature".into(),
+                }),
+                ..Default::default()
+            };
+            let ctx = cloud_context::context(client.clone()).with_env(StaticEnv::default());
+            let store = CloudStore::with_context(&config, client, ctx)
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let server = tokio::spawn(serve(listener, vec![404, 201]));
+            store
+                .put_new("metering/ru/60/key.json.gz", vec![1, 2, 3])
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let rows = server.await.unwrap_or_else(|e| unreachable!("{e}"));
+            for (i, (head, body)) in rows.iter().enumerate() {
+                assert!(
+                    head.contains(
+                        "/account/bucket/prefix%20space/%25text/metering/ru/60/key.json.gz"
+                    )
+                );
+                assert!(head.contains("x-ms-version: 2025-11-05"));
+                assert_eq!(head.contains("authorization: SharedKey account:"), !sas);
+                assert_eq!(head.contains("?sv=2025-11-05&sig=fake%2Bsignature"), sas);
+                assert_eq!(head.contains("x-ms-blob-type: BlockBlob"), i == 1);
+                assert_eq!(body.as_slice(), if i == 0 { &[] } else { &[1, 2, 3][..] });
+            }
+        }
+    }
+
     #[derive(Clone, Debug, Default)]
     struct RoleFixture(std::sync::Arc<std::sync::Mutex<Vec<Request<bytes::Bytes>>>>);
     impl reqsign_core::HttpSend for RoleFixture {
@@ -587,7 +652,7 @@ mod tests {
                 match &signer {
                     CloudSigner::S3(signer) => signer.sign(&mut parts, None).await,
                     CloudSigner::Oss(signer) => signer.sign(&mut parts, None).await,
-                    CloudSigner::Cos(_) => unreachable!(),
+                    CloudSigner::Cos(_) | CloudSigner::Azure(_) => unreachable!(),
                 }
                 .unwrap_or_else(|e| unreachable!("{e}"));
                 assert!(

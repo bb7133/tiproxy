@@ -7,7 +7,7 @@ process-lifecycle paths have completed integration and independent review.
 
 ## Cloud storage increment
 
-`control-meter::cloud_store::CloudStore` signs S3, OSS V4 and COS HEAD/PUT
+`control-meter::cloud_store::CloudStore` signs S3, OSS V4, COS and Azure Blob HEAD/PUT
 requests. An existing object, failed HEAD, rejected PUT, timeout or ambiguous
 upload retains the outbox window. Object prefixes and gzip bodies remain intact.
 Temporary session tokens are passed with the request. OS TLS roots are added
@@ -35,12 +35,36 @@ fixture from the repository root with:
 go run rust/crates/control-meter/testdata/cos-sts-go.go
 ```
 
+Azure SharedKey signatures match actual HEAD/PUT requests from the pinned Go
+azblob SDK. SharedKey takes precedence over SAS; SAS query strings survive
+container/prefix/key assembly. A metering-specific transport and bounded command
+executor serve the official Azure identity SDK. Environment secret, encrypted
+PEM/PFX certificate, username/password, workload assertion, VM/App Service managed
+identity, CLI, Developer CLI and PowerShell sources compose the default chain.
+`AZURE_TOKEN_CREDENTIALS` selects the chain, configured environment/workload
+failure stops it, and the first successful source remains selected. Workload
+assertion files use the bounded credential reader. Tests cover SharedKey/SAS HTTP
+writes, identity selection/failure/cache, and certificate format/password handling.
+Regenerate the Azure request fixture with:
+
+```sh
+go run rust/crates/control-meter/testdata/azure-shared-key-go.go
+```
+
 These are local protocol/authentication tests, not live cloud acceptance.
-Azure, full default-credential/endpoint parity, storage factory selection and
-binary ownership handoff remain in progress. This checkpoint rejects endpoints
-with userinfo/query/fragment and object keys with dot path segments, because the
-HTTP URL implementation would normalize their identity. Those configuration
-edges must be reconciled with Go before declaring the provider contract complete.
+Full default-credential/endpoint parity, storage factory selection and binary
+ownership handoff remain in progress. In particular, the pinned Rust identity
+SDK does not implement Azure Arc, Azure ML, Cloud Shell or Service Fabric managed
+identity. Unsupported managed-identity construction stops authentication instead
+of falling through to a different identity. Those sources, managed-identity
+error classification and token refresh behavior must be reconciled with Go
+before selecting the native owner. AWS/OSS role refresh/fallback and S3 custom
+endpoint addressing also need complete Go comparisons.
+
+This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
+and object keys with dot path segments because the HTTP URL implementation would
+normalize their identity. Azure endpoint/SAS queries are preserved. These edges
+must be reconciled with Go before declaring the provider contract complete.
 
 ## Dependency policy
 
@@ -51,3 +75,12 @@ The reviewed signing libraries require exact duplicate exceptions for
 `tiny-keccak 2.0.2` receives a CC0-1.0 license allowance for the profile parser's
 build dependency. These are package/version-scoped, not whole-tree exceptions.
 Cargo deny bans/licenses and cargo audit pass for this dependency graph.
+
+The Azure identity SDK also requires exact duplicate exceptions for
+`getrandom 0.3.4`, `getrandom 0.4.3`, `rand 0.9.5` and `rand_core 0.9.5`:
+its typespec transport uses rand 0.9/getrandom 0.3, while its current UUID library
+uses getrandom 0.4; existing TLS and signers use getrandom 0.2/rand 0.10.
+OpenSSL is used for Azure certificate parsing/signing and built from the locked
+vendored source. A C compiler, make and Perl are build prerequisites; no host
+libssl/libcrypto runtime ABI is introduced. Cloud HTTP still uses the dedicated
+rustls client and metering OS roots, with no global reqwest TLS feature changes.
