@@ -4974,3 +4974,39 @@ async fn review_local_terminal_from_session_close_survives_eviction() {
         "a replay never relabels the terminal"
     );
 }
+
+/// Review reproduction: a 0/0 local drain whose matched session already lost
+/// its control receiver completes inline, inside the admission's own force
+/// phase, before the caller record exists. The terminal must still be
+/// classified as local (no `DrainResult` on the wire; the CLOSED lifecycle
+/// event is still owed) and must reach the label's retained status.
+#[tokio::test(start_paused = true)]
+async fn review_local_immediate_drain_of_gone_session_emits_no_wire_terminal() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7, None);
+    let session = register(&mut handler, 1, "sql-a", "tidb-a");
+    drop(session);
+    let (outcome, outbound) = handler.start_local_drain(
+        &local_request("local-gone", &[], 0, 0),
+        Instant::now(),
+        1_000_000,
+    );
+    assert!(matches!(outcome, LocalDrainOutcome::Accepted { .. }));
+    assert!(
+        !outbound
+            .iter()
+            .any(|e| matches!(e.body, Some(Body::DrainResult(_)))),
+        "a local operation has no bridge issuer; even an inline terminal stays local"
+    );
+    assert!(
+        outbound
+            .iter()
+            .any(|e| matches!(e.body, Some(Body::ConnectionEvent(_)))),
+        "the CLOSED lifecycle event is still owed to the wire"
+    );
+    assert!(
+        handler
+            .local_drain_status("local-gone")
+            .is_some_and(|s| s.complete && s.result.force_closed == 1)
+    );
+}

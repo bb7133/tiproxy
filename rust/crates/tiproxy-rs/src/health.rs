@@ -59,6 +59,7 @@ pub async fn serve(
     route_inputs: Arc<dyn Fn() -> RouteInputEvidence + Send + Sync>,
     route_ledger: Arc<dyn Fn() -> RouteLedgerEvidence + Send + Sync>,
     source_generations: Arc<dyn Fn() -> SourceGenerationEvidence + Send + Sync>,
+    drain_watermark: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -70,6 +71,7 @@ pub async fn serve(
             route_inputs(),
             route_ledger(),
             source_generations(),
+            drain_watermark(),
         );
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
@@ -90,6 +92,7 @@ fn render(
     routes: RouteInputEvidence,
     ledger: RouteLedgerEvidence,
     sources: SourceGenerationEvidence,
+    drain_watermark: u64,
 ) -> String {
     let ready = status.applied_generation > 0 && serving_live;
     let (code, reason, state) = if ready {
@@ -98,7 +101,7 @@ fn render(
         (503, "Service Unavailable", "NOT_READY")
     };
     let body = format!(
-        "{{\"status\":\"{state}\",\"applied_generation\":{},\"source_generations\":{{\"config_generation\":{},\"config_file_revision\":{},\"config_etcd_revision\":{},\"topology_observed_generation\":{},\"topology_applied_generation\":{},\"routing_generation\":{},\"routing_client_epoch\":{}}},\"route_inputs\":{{\"observations\":{},\"health_input_backends\":{},\"healthy_backends\":{},\"cpu_series\":{},\"memory_series\":{}}},\"route_ledger\":{{\"router_incarnations\":{},\"sessions\":{},\"reserved\":{},\"active\":{},\"incoming\":{},\"outgoing\":{},\"unsettled_redirects\":{},\"unsettled_closes\":{}}}}}",
+        "{{\"status\":\"{state}\",\"applied_generation\":{},\"drain_watermark\":{drain_watermark},\"source_generations\":{{\"config_generation\":{},\"config_file_revision\":{},\"config_etcd_revision\":{},\"topology_observed_generation\":{},\"topology_applied_generation\":{},\"routing_generation\":{},\"routing_client_epoch\":{}}},\"route_inputs\":{{\"observations\":{},\"health_input_backends\":{},\"healthy_backends\":{},\"cpu_series\":{},\"memory_series\":{}}},\"route_ledger\":{{\"router_incarnations\":{},\"sessions\":{},\"reserved\":{},\"active\":{},\"incoming\":{},\"outgoing\":{},\"unsettled_redirects\":{},\"unsettled_closes\":{}}}}}",
         status.applied_generation,
         sources.config_generation,
         sources.config_file_revision,
@@ -147,10 +150,28 @@ mod tests {
             RouteInputEvidence::default(),
             RouteLedgerEvidence::default(),
             SourceGenerationEvidence::default(),
+            0,
         );
         assert!(response.starts_with("HTTP/1.0 503 "));
         assert!(response.contains("\"status\":\"NOT_READY\""));
         assert!(response.contains("\"applied_generation\":0"));
+        assert!(response.contains("\"drain_watermark\":0"));
+    }
+
+    /// The gate's drain watermark is reported verbatim, so an integration
+    /// harness can prove which sequence a Rust-admin drain consumed.
+    #[test]
+    fn reports_the_drain_watermark() {
+        let response = render(
+            &snapshot(3),
+            true,
+            RouteInputEvidence::default(),
+            RouteLedgerEvidence::default(),
+            SourceGenerationEvidence::default(),
+            2,
+        );
+        assert!(response.starts_with("HTTP/1.0 200 "));
+        assert!(response.contains("\"applied_generation\":3,\"drain_watermark\":2,"));
     }
 
     #[test]
@@ -163,6 +184,7 @@ mod tests {
             RouteInputEvidence::default(),
             RouteLedgerEvidence::default(),
             SourceGenerationEvidence::default(),
+            0,
         );
         assert!(response.starts_with("HTTP/1.0 503 "));
         assert!(response.contains("\"status\":\"NOT_READY\""));
@@ -204,6 +226,7 @@ mod tests {
             Arc::new(RouteInputEvidence::default),
             Arc::new(RouteLedgerEvidence::default),
             Arc::new(SourceGenerationEvidence::default),
+            Arc::new(|| 0),
         ));
 
         // Several probers that never send a byte...
@@ -261,7 +284,7 @@ mod tests {
             routing_generation: 9,
             routing_client_epoch: 4,
         };
-        let response = render(&snapshot(3), true, evidence, ledger, sources);
+        let response = render(&snapshot(3), true, evidence, ledger, sources, 0);
         assert!(response.starts_with("HTTP/1.0 200 OK"));
         assert!(response.contains("\"status\":\"OK\""));
         assert!(response.contains("\"applied_generation\":3"));

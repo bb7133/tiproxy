@@ -776,7 +776,7 @@ async fn run(options: Options) -> Result<(), String> {
     guard.set_metrics_exporter(spawn_metrics_exporter(
         Arc::clone(&shared_client),
         serving.clone(),
-        runtime_stats,
+        Arc::clone(&runtime_stats),
         &metrics,
         observations,
         Duration::from_secs(1),
@@ -804,6 +804,7 @@ async fn run(options: Options) -> Result<(), String> {
         route_plane_handle,
         route_config_source,
         topology_handle,
+        Arc::clone(&runtime_stats),
     )
     .await
     {
@@ -1144,6 +1145,7 @@ async fn spawn_health(
     routes: control_router::RoutePlaneHandle,
     config: Arc<dyn ConfigNamespaceSource>,
     topology: TopologyModuleHandle,
+    dispatch_stats: Arc<dataplane::control_dispatch::DispatchStats>,
 ) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
@@ -1175,6 +1177,11 @@ async fn spawn_health(
                 routing_generation: routing.as_ref().map_or(0, |source| source.generation),
                 routing_client_epoch: routing.as_ref().map_or(0, |source| source.client_epoch),
             }
+        }),
+        Arc::new(move || {
+            dispatch_stats
+                .drain_watermark
+                .load(std::sync::atomic::Ordering::Relaxed)
         }),
     ))))
 }
@@ -1888,7 +1895,7 @@ impl startup::Teardown for legacy_router_shadow::consumer::Task {
 
 fn usage() -> &'static str {
     "Usage: tiproxy-rs --config <path> --control-socket <absolute-path> --control-uid <uid> \
-     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--metrics-addr <host:port>] [--log-file <absolute-path>] [--routing-shadow-socket <absolute-path>]\n\
+     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--metrics-addr <host:port>] [--admin-addr <host:port>] [--log-file <absolute-path>] [--routing-shadow-socket <absolute-path>]\n\
      Environment: TIPROXY_CONFIG, TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 

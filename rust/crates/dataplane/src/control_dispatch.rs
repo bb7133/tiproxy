@@ -101,6 +101,10 @@ pub struct DispatchStats {
     pub metering_failures: AtomicU64,
     /// Retired route-family bodies rejected under `RUST_ROUTE_OWNER`.
     pub legacy_route_violations: AtomicU64,
+    /// Highest drain command sequence the gate has consumed (bridge or
+    /// local issuer alike): the value the next reconcile reports as
+    /// `last_drain_command_sequence`, exposed for readiness diagnostics.
+    pub drain_watermark: AtomicU64,
 }
 
 /// Longest accepted distance between "now" and a wire drain deadline:
@@ -398,6 +402,11 @@ pub struct ControlCommandHandler {
     /// retains the boot entropy failure: every local drain is refused and
     /// the production owner refuses to start (Go `NewDrainIssuer`).
     local_drains: Result<LocalDrainIssuer, String>,
+    /// Wire id of the local drain currently inside admission. The admission's
+    /// own force phase can close a gone session and finish the drain inline,
+    /// before the caller record exists; this marks that terminal as local so
+    /// it is never pushed to the wire as a bridge result.
+    admitting_local: Option<String>,
     /// The production cutover composition. This is process-fixed: bridge
     /// reconnects cannot demote routing back to Go.
     route_owner: bool,
@@ -479,6 +488,7 @@ impl ControlCommandHandler {
             initiating_drain: HashMap::new(),
             stats: Arc::new(DispatchStats::default()),
             local_drains: LocalDrainIssuer::new(),
+            admitting_local: None,
         }
     }
 
@@ -944,14 +954,18 @@ impl ControlCommandHandler {
                 .unwrap_or(NEEDS_ALLOCATION);
             // A locally issued drain has no wire requester: its terminal
             // is retained by the issuer's record for the local status query.
-            let local = self.local_drains.as_mut().is_ok_and(|issuer| {
-                issuer
-                    .callers
-                    .values_mut()
-                    .find(|record| record.wire_id == terminal.drain_id)
-                    .map(|record| record.observe(terminal.clone()))
-                    .is_some()
-            });
+            // A terminal produced inline by the local admission itself is
+            // local before its record exists; the admission answer then
+            // carries that terminal into the record.
+            let local = self.admitting_local.as_deref() == Some(terminal.drain_id.as_str())
+                || self.local_drains.as_mut().is_ok_and(|issuer| {
+                    issuer
+                        .callers
+                        .values_mut()
+                        .find(|record| record.wire_id == terminal.drain_id)
+                        .map(|record| record.observe(terminal.clone()))
+                        .is_some()
+                });
             if !local {
                 outbound.push(result_envelope(
                     OutboundControl::DrainResult(terminal),
@@ -1453,6 +1467,9 @@ impl ControlCommandHandler {
             matched.clone(),
         ) {
             DrainAdmission::Start => {
+                self.stats
+                    .drain_watermark
+                    .store(self.gate.drain_watermark(), Ordering::Relaxed);
                 if let Some(request_id) = initiating {
                     self.initiating_drain
                         .insert(command.drain_id.clone(), request_id);
@@ -1572,8 +1589,10 @@ impl ControlCommandHandler {
             force_deadline_unix_millis: force,
             command_sequence,
         };
+        self.admitting_local = Some(wire_id.clone());
         let (verdict, outbound) =
             self.admit_drain_core(&command, generation, None, now, now_unix_millis);
+        self.admitting_local = None;
         let outcome = match verdict {
             DrainVerdict::Malformed => LocalDrainOutcome::Rejected {
                 code: ErrorCode::ProtocolViolation,

@@ -1783,9 +1783,15 @@ if [[ $mode == rust && ($variant == plain || ${DATAPLANE_T4_QUALIFICATION:-0} ==
 fi
 KA_DROP_SOCKET="${TMPDIR:-/tmp}/$tag-ka-drop.sock"
 ka_drop_admin_port=$((8100 + port_offset))
+# CP-ADMIN: the Rust process serves the management API itself. M9 drives its
+# operator drains through this port, so they never cross the bridge.
+ka_admin_port=$((8101 + port_offset))
 ka_phase_ports=("$ka_sql_port" "$ka_api_port" "$ka_health_port")
 if [[ $ka_use_dropper == true ]]; then
 	ka_phase_ports+=("$ka_drop_admin_port")
+fi
+if [[ $mode == rust ]]; then
+	ka_phase_ports+=("$ka_admin_port")
 fi
 for port in "${ka_phase_ports[@]}"; do
 	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
@@ -1913,6 +1919,7 @@ if [[ $mode == rust ]]; then
 	"$rust_binary" --config "$run_dir/tiproxy-ka.toml" \
 		--control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 		--health-port "$ka_health_port" \
+		--admin-addr "127.0.0.1:$ka_admin_port" \
 		${ka_rust_tls_args[@]+"${ka_rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
 	KA_RUST_PID=$!
@@ -3351,6 +3358,7 @@ if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 && $ka_use_dropper 
 			"$rust_binary" --config "$run_dir/tiproxy-ka.toml" \
 				--control-socket "$ka_rust_control_socket" --control-uid "$(id -u)" \
 				--health-port "$ka_health_port" \
+				--admin-addr "127.0.0.1:$ka_admin_port" \
 				${ka_rust_tls_args[@]+"${ka_rust_tls_args[@]}"} \
 				>>"$run_dir/tiproxy-rs-ka.log" 2>&1 &
 			KA_RUST_PID=$!
@@ -3406,11 +3414,28 @@ PYM9WATERMARK
 			cat "$evidence" >&2 2>/dev/null || true
 			exit 1
 		}
+		m9_wait_health_watermark() {
+			# The Rust readiness probe reports the gate's drain watermark: the
+			# sequence a Rust-admin drain consumed, and the value the next
+			# reconcile carries to Go.
+			local expected=$1 evidence=$2 observed=
+			for _ in {1..100}; do
+				if curl --noproxy '*' --fail --silent --max-time 5 \
+					"http://127.0.0.1:$ka_health_port/health" -o "$evidence"; then
+					observed=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("drain_watermark", -1))' "$evidence")
+					[[ $observed == "$expected" ]] && return 0
+				fi
+				sleep 0.1
+			done
+			echo "M9 Rust drain watermark is ${observed:-<none>}, want exactly $expected" >&2
+			cat "$evidence" >&2 2>/dev/null || true
+			exit 1
+		}
 		m9_wait_drain() {
 			local drain_id=$1 evidence=$2 expected=$3
 			for _ in {1..100}; do
 				if curl --noproxy '*' --fail --silent --max-time 5 \
-					"http://127.0.0.1:$ka_api_port/api/dataplane/drain/$drain_id" \
+					"http://127.0.0.1:$ka_admin_port/api/dataplane/drain/$drain_id" \
 					-o "$evidence" &&
 					python3 - "$evidence" "$expected" <<'PYM9DRAIN'
 import json
@@ -3555,14 +3580,16 @@ PYM9DRAIN
 			printf 'KA_SESSION_PID=\nKA_FIFO=\n' >>"$run_dir/state.env"
 		}
 
-		# Seed the Rust gate's drain watermark without selecting any live SQL
-		# session. A later Go incarnation must learn this exact sequence from
-		# ReconcileRequest before it may issue sequence 2.
+		# Seed the Rust gate's drain watermark through the Rust admin port
+		# without selecting any live SQL session. The drain is issued inside
+		# the Rust process (sequence 1 on the shared gate lineage); a later
+		# Go incarnation must learn this exact sequence from ReconcileRequest.
 		curl --noproxy '*' --fail --silent --show-error -X POST \
 			-H 'Content-Type: application/json' \
 			-d '{"drain_id":"m9-pre-restart","listener_names":["m9-no-such-listener"],"graceful_wait_ms":0,"force_timeout_ms":1000}' \
-			"http://127.0.0.1:$ka_api_port/api/dataplane/drain" -o "$run_dir/t4-m9-drain-pre-post.json"
+			"http://127.0.0.1:$ka_admin_port/api/dataplane/drain" -o "$run_dir/t4-m9-drain-pre-post.json"
 		m9_wait_drain m9-pre-restart "$m9_pre_status" 0
+		m9_wait_health_watermark 1 "$run_dir/t4-m9-health-watermark-pre.json"
 
 		# Bridge loss lasts beyond the legacy 30-second grace. During that
 		# interval a config-driven A0->A1 redirect and post-grace admission
@@ -3660,14 +3687,39 @@ PYM9DRAIN
 		fi
 		m9_wait_tap_watermark 1 "$run_dir/t4-m9-reconcile-after-go-inflight.json"
 
-		# Sequence 2 targets exactly the one retained session. Its terminal
-		# result must report exactly one close, and the tap proves both restored
-		# watermark and monotonic next command on the actual wire.
+		# Sequence 2 targets exactly the one retained session, issued through
+		# the Rust admin port. Its terminal result must report exactly one
+		# close; the Rust health watermark proves the consumed sequence and the
+		# tap proves the restored reconcile watermark and that no drain command
+		# ever crossed the bridge.
 		curl --noproxy '*' --fail --silent --show-error -X POST \
 			-H 'Content-Type: application/json' \
 			-d '{"drain_id":"m9-post-restart","listener_names":["sql-0"],"graceful_wait_ms":0,"force_timeout_ms":1000}' \
-			"http://127.0.0.1:$ka_api_port/api/dataplane/drain" -o "$run_dir/t4-m9-drain-post-post.json"
+			"http://127.0.0.1:$ka_admin_port/api/dataplane/drain" -o "$run_dir/t4-m9-drain-post-post.json"
 		m9_wait_drain m9-post-restart "$m9_post_status" 1
+		m9_wait_health_watermark 2 "$run_dir/t4-m9-health-watermark-post.json"
+		# CP-FAULT-ADMIN-DRAIN-REPLAY: re-posting the completed label answers
+		# the same 202 binding and the retained terminal, consumes no sequence,
+		# and closes nothing again (the single close for the targeted session
+		# is asserted below on the Rust connection log).
+		local m9_replay_code
+		m9_replay_code=$(curl --noproxy '*' --silent --show-error -X POST \
+			-H 'Content-Type: application/json' \
+			-d '{"drain_id":"m9-post-restart","listener_names":["sql-0"],"graceful_wait_ms":0,"force_timeout_ms":1000}' \
+			"http://127.0.0.1:$ka_admin_port/api/dataplane/drain" \
+			-o "$run_dir/t4-m9-drain-post-replay.json" -w '%{http_code}')
+		if [[ $m9_replay_code != 202 ]] ||
+			! cmp -s "$run_dir/t4-m9-drain-post-post.json" "$run_dir/t4-m9-drain-post-replay.json"; then
+			echo "M9 drain replay answered $m9_replay_code, want 202 with the original binding" >&2
+			cat "$run_dir/t4-m9-drain-post-replay.json" >&2 2>/dev/null || true
+			exit 1
+		fi
+		m9_wait_drain m9-post-restart "$run_dir/t4-m9-drain-post-replay-status.json" 1
+		if ! cmp -s "$m9_post_status" "$run_dir/t4-m9-drain-post-replay-status.json"; then
+			echo "M9 drain replay changed the retained terminal" >&2
+			exit 1
+		fi
+		m9_wait_health_watermark 2 "$run_dir/t4-m9-health-watermark-replay.json"
 		local m9_close_count m9_backend_gone=false
 		for _ in {1..80}; do
 			m9_close_count=$(grep -c "\"event\":\"connection_closed\".*\"connection_id\":$m9_go_proxy," \
@@ -3713,8 +3765,8 @@ import sys
 audit = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("route_audit", {})
 if audit.get("max_reconcile_request_drain_sequence") != 1:
     raise SystemExit(f"reconcile watermark is not exactly 1: {audit}")
-if audit.get("max_drain_command_sequence") != 2:
-    raise SystemExit(f"post-restart drain sequence is not exactly 2: {audit}")
+if audit.get("drain_commands", 0) != 0 or audit.get("max_drain_command_sequence", 0) != 0:
+    raise SystemExit(f"an operator drain crossed the bridge: {audit}")
 PYM9SEQUENCE
 		then
 			exit 1
@@ -3801,19 +3853,24 @@ path.write_text(json.dumps({
     "rust_restart": {"quiet": "pass", "in_flight": "pass", "replacement_ledger_zero": True},
     "whole_restart": {"quiet": "pass", "in_flight": "pass", "same_endpoints_rebound": True},
     "admin_drain": {
+        "issuer": "rust-admin",
         "pre_restart_sequence": 1,
         "restored_reconcile_watermark": 1,
         "post_restart_sequence": 2,
+        "bridge_drain_commands": 0,
         "targeted_sessions_closed_exactly_once": 1,
+        "replay": {"http_status": 202, "same_binding_and_terminal": True, "sequence_consumed": False},
     },
     "evidence": {
         "pre_drain_status": pathlib.Path(sys.argv[4]).name,
         "post_drain_status": pathlib.Path(sys.argv[5]).name,
+        "post_drain_replay_status": "t4-m9-drain-post-replay-status.json",
+        "health_watermarks": ["t4-m9-health-watermark-pre.json", "t4-m9-health-watermark-post.json", "t4-m9-health-watermark-replay.json"],
         "route_audit": pathlib.Path(sys.argv[6]).name,
     },
 }, sort_keys=True, indent=2) + "\n")
 PYM9RECEIPT
-		echo "PASS: T4 M9 bridge loss ${m9_disconnect_seconds}s, Go/Rust/whole quiet+in-flight restarts, drain watermark 1->2"
+		echo "PASS: T4 M9 bridge loss ${m9_disconnect_seconds}s, Go/Rust/whole quiet+in-flight restarts, Rust-admin drains 1->2 with zero bridge drain commands and an idempotent replay"
 	}
 	run_t4_m9_probe
 	if [[ -z ${KA_DROP_PID:-} ]] || ! kill -0 "$KA_DROP_PID" 2>/dev/null; then

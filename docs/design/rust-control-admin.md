@@ -109,9 +109,13 @@ the `session_closed` completion, so a status query never depends on the
 gate's bounded tombstone ring, and a repeated POST for a completed label
 answers its original binding without re-admitting (a terminal is absolute;
 an evicted tombstone's synthetic `DUPLICATE_REQUEST` can never relabel it).
-A running bridge drain (or a previous incarnation's) is a foreign conflict
-for the local issuer; a running local drain is an in-progress conflict for
-another label. Without an applied generation the drain is refused before any
+A local drain is marked as local before its admission runs, so a terminal the
+admission produces inline (its force phase closing a session whose control
+receiver is already gone) is never pushed to the wire as a bridge result; the
+CLOSED lifecycle event is still emitted and the admission answer carries that
+terminal into the label's record. A running bridge drain (or a previous
+incarnation's) is a foreign conflict for the local issuer; a running local
+drain is an in-progress conflict for another label. Without an applied generation the drain is refused before any
 effect (Go `ErrSnapshotNotReady`); the gate's applied generation still comes
 from the Go snapshot notices in the two-process phase and moves to the Rust
 lineage at cutover (#153).
@@ -121,11 +125,24 @@ reporting, idempotent replay, local/bridge lineage sharing (a bridge command
 at a consumed sequence is obsolete; a running bridge drain is foreign), a
 restarted incarnation re-issuing the same label under a new wire id, the
 fail-closed issuer under an injected entropy failure, terminal retention
-across tombstone eviction on both completion paths, and the notice plumbing; the differential compares the HTTP mapping against Go's
-handler over scripted drainer outcomes. Still open in slice 3: the M9
-integration harness on the Rust admin port and the executable
-`CP-FAULT-ADMIN-DRAIN-REPLAY` runner (3a), then the retirement of
-`drain_command`/`drain_result` from the protocol, catalog and Go issuer (3b).
+across tombstone eviction on both completion paths, an inline terminal of a
+gone session staying local, and the notice plumbing; the differential compares the HTTP mapping against Go's
+handler over scripted drainer outcomes. The T4 M9 qualification row
+(`tests/dataplane/integration/run.sh`, `DATAPLANE_T4_ROW=M9`) now issues both
+of its operator drains through the Rust admin port (`--admin-addr`): the Rust
+readiness probe reports the gate's `drain_watermark` (1 after the pre-restart
+drain, 2 after the post-restart drain), the control tap proves the restored
+reconcile watermark of 1 across the Go-only restarts and that zero
+`drain_command` frames crossed the bridge, and the row is the executable
+`CP-FAULT-ADMIN-DRAIN-REPLAY` runner: re-posting the completed
+`m9-post-restart` label answers `202` with the original binding, the status
+query returns the byte-identical retained terminal, the watermark stays at 2
+and the targeted session is closed exactly once (observed fields `drain_id`,
+`command_sequence` via the watermark, `terminal_count` via the connection log,
+`http_status`). The row receipt records `admin_drain.issuer = rust-admin`,
+`bridge_drain_commands = 0` and the replay outcome. Still open in slice 3: the
+retirement of `drain_command`/`drain_result` from the protocol, catalog and
+Go issuer (3b).
 
 ### Declared divergences after slice 2
 
@@ -173,11 +190,10 @@ certificate.
 
 ## Remaining slices
 
-- **Slice 3 (remaining)** — M9 harness on the Rust port and the executable
-  `CP-FAULT-ADMIN-DRAIN-REPLAY` runner (3a), then retiring
-  `drain_command`/`drain_result` (proto, catalog and Go issuer in one change,
-  with the `last_drain_command_sequence` reconcile field decided alongside)
-  (3b).
+- **Slice 3 (remaining)** — retiring `drain_command`/`drain_result` (proto,
+  catalog and Go issuer in one change, with the `last_drain_command_sequence`
+  reconcile field decided alongside) (3b); 3a (local issuer, M9 on the Rust
+  port, the `CP-FAULT-ADMIN-DRAIN-REPLAY` runner) is complete.
 - **Slice 4** — diagnostics gRPC (`SearchLog` over the B0 log rotation,
   `ServerInfo` with a pinned minimal host-information dependency after listing
   the Go `sysutil` fields) and `tiproxyctl` compatibility.
