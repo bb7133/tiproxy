@@ -568,7 +568,7 @@ impl ConfigModule {
         }
         let decoded = decode_persistent_entries(entries).map_err(|error| {
             if let Some(log) = persistent_candidate_rejection_log(revision, &error) {
-                eprintln!("{log}");
+                control_plane::logging::emit_line(&log);
             }
             module_error("persistent_candidate_decode_rejected")
         })?;

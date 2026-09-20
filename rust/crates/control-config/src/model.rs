@@ -1736,6 +1736,38 @@ impl Default for LogFileConfig {
     }
 }
 
+impl LogOnlineConfig {
+    /// Configured log level string (`debug`, `info`, `warn`, `error`, `fatal`).
+    #[must_use]
+    pub fn level(&self) -> &str {
+        &self.level
+    }
+
+    /// Log file name; empty means the process writes to its standard stream.
+    #[must_use]
+    pub fn log_file_name(&self) -> &str {
+        &self.log_file.filename
+    }
+
+    /// `log-file.max-size` in megabytes (non-negative; zero means the default).
+    #[must_use]
+    pub fn log_file_max_size_mb(&self) -> u64 {
+        u64::try_from(self.log_file.max_size).unwrap_or(0)
+    }
+
+    /// `log-file.max-days` (non-negative; zero disables age pruning).
+    #[must_use]
+    pub fn log_file_max_days(&self) -> u64 {
+        u64::try_from(self.log_file.max_days).unwrap_or(0)
+    }
+
+    /// `log-file.max-backups` (non-negative; zero keeps every backup).
+    #[must_use]
+    pub fn log_file_max_backups(&self) -> u64 {
+        u64::try_from(self.log_file.max_backups).unwrap_or(0)
+    }
+}
+
 impl LogFileConfig {
     fn is_zero(&self) -> bool {
         self.filename.is_empty()

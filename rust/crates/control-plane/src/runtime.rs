@@ -167,15 +167,16 @@ pub trait EventSink: Send + Sync + 'static {
     fn record(&self, event: &RuntimeEvent);
 }
 
-/// JSON-lines stderr sink used by the production binary.
+/// JSON-lines sink used by the production binary. Lines go through the
+/// process log output ([`crate::logging::emit_line`]): stderr by default, or
+/// the configured rotating log file.
 #[derive(Debug, Default)]
 pub struct JsonStderrSink;
 
 impl EventSink for JsonStderrSink {
     fn record(&self, event: &RuntimeEvent) {
-        eprintln!(
-            "{}",
-            json!({
+        crate::logging::emit_line(
+            &json!({
                 "component": "control-plane",
                 "event": event.kind.as_str(),
                 "phase": event.snapshot.phase.as_str(),
@@ -187,6 +188,7 @@ impl EventSink for JsonStderrSink {
                 "module": event.module,
                 "error_class": event.error_class,
             })
+            .to_string(),
         );
     }
 }

@@ -41,6 +41,7 @@ use control_config::{
 };
 use control_etcd::ElectionConfig;
 use control_external::{EtcdClientConfig, EtcdTlsConfig};
+use control_plane::logging::{self as process_logging, LogFileSettings};
 use control_plane::{
     ConfigSource, ControlModule, ControlModuleSet, ControlRuntime as InProcessControlRuntime,
     JsonStderrSink, LifecyclePhase, OwnershipRegistry, ShutdownReason,
@@ -63,7 +64,7 @@ use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
     MetricsExporter, MetricsRecorder, MetricsRegistry, ServerError, SystemMemoryProbe,
-    spawn_metrics_exporter,
+    install_session_log_writer, spawn_metrics_exporter,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -231,6 +232,7 @@ struct RunningProcess<R, E, S, H> {
     metering_sampler: S,
     health_task: Option<H>,
     metrics_http_task: Option<JoinHandle<()>>,
+    log_reload_task: Option<JoinHandle<()>>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
@@ -257,6 +259,8 @@ struct StartupGuard<R, E, S, H> {
     health_task: Option<H>,
     /// Native `/metrics` responder; a concrete task because no test fakes it.
     metrics_http_task: Option<JoinHandle<()>>,
+    /// Applies `log.log-file.*` reloads to the process log output.
+    log_reload_task: Option<JoinHandle<()>>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
@@ -279,6 +283,7 @@ where
             metering_sampler: None,
             health_task: None,
             metrics_http_task: None,
+            log_reload_task: None,
             routing_shadow: None,
         }
     }
@@ -320,6 +325,12 @@ where
         }
     }
 
+    fn set_log_reload_task(&mut self, task: JoinHandle<()>) {
+        if self.log_reload_task.replace(task).is_some() {
+            unreachable!("the log reload task was set twice");
+        }
+    }
+
     /// Stops and joins every acquired resource in reverse order and returns the
     /// original error unchanged.
     async fn rollback(mut self, error: String) -> String {
@@ -344,6 +355,9 @@ where
         }
         if let Some(task) = self.metrics_http_task.take() {
             steps.push(("metrics_http_task", startup::Teardown::teardown(task)));
+        }
+        if let Some(task) = self.log_reload_task.take() {
+            steps.push(("log_reload_task", startup::Teardown::teardown(task)));
         }
         let _order = startup::run_teardowns_in_reverse(steps).await;
         // The owner and its modules were acquired first, so they retire last.
@@ -375,6 +389,7 @@ where
             metering_sampler,
             health_task,
             metrics_http_task,
+            log_reload_task,
             routing_shadow,
         } = self;
         let runtime = runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set"));
@@ -390,6 +405,7 @@ where
             metering_sampler,
             health_task,
             metrics_http_task,
+            log_reload_task,
             routing_shadow,
         }
     }
@@ -430,6 +446,12 @@ async fn run(options: Options) -> Result<(), String> {
         .unwrap_or(u64::MAX);
     let process_id = format!("tiproxy-rs-{}", std::process::id());
     let config_owner = load_config_owner(&options, &process_id)?;
+    // Process log output (B0): honour `log.log-file.*` before the first
+    // lifecycle event, and route the dataplane's session logs through the
+    // same writer so a rotating file receives every line.
+    let initial_log_file = log_file_settings(config_owner.handle.source().current().as_ref());
+    process_logging::configure(initial_log_file.as_ref())?;
+    install_session_log_writer(process_logging::emit_line);
     let routing_shadow_socket = options.routing_shadow_socket.clone().or_else(|| {
         config_owner
             .handle
@@ -771,6 +793,10 @@ async fn run(options: Options) -> Result<(), String> {
         Ok(None) => {}
         Err(error) => return Err(guard.rollback(error).await),
     }
+    guard.set_log_reload_task(tokio::spawn(run_log_reload(
+        config_owner.handle.source().subscribe(),
+        initial_log_file,
+    )));
     if let Err(error) = in_process.mark_ready() {
         return Err(guard
             .rollback(format!("mark in-process control runtime ready: {error}"))
@@ -788,6 +814,7 @@ async fn run(options: Options) -> Result<(), String> {
             },
         health_task,
         metrics_http_task,
+        log_reload_task,
         routing_shadow,
     } = guard.commit();
 
@@ -914,6 +941,10 @@ async fn run(options: Options) -> Result<(), String> {
         let _ = task.await;
     }
     if let Some(task) = metrics_http_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = log_reload_task {
         task.abort();
         let _ = task.await;
     }
@@ -1234,6 +1265,46 @@ async fn wait_for_termination_signal() {
     tokio::select! {
         _ = sigterm.recv() => {}
         _ = sigint.recv() => {}
+    }
+}
+
+/// Projects `log.log-file.*` from the committed config into the process log
+/// output settings; an empty file name keeps the standard stream.
+fn log_file_settings(
+    snapshot: &control_config::ConfigNamespaceSnapshot,
+) -> Option<LogFileSettings> {
+    let log = snapshot.effective().log_online();
+    let filename = log.log_file_name();
+    if filename.is_empty() {
+        return None;
+    }
+    Some(LogFileSettings {
+        filename: PathBuf::from(filename),
+        max_size_mb: log.log_file_max_size_mb(),
+        max_days: log.log_file_max_days(),
+        max_backups: log.log_file_max_backups(),
+    })
+}
+
+/// Applies every committed `log.log-file.*` change to the process log output.
+/// A file that cannot be opened is reported on the current output and the
+/// previous output stays in place, exactly like the Go logger's rebuild.
+async fn run_log_reload(
+    mut updates: watch::Receiver<Arc<control_config::ConfigNamespaceSnapshot>>,
+    mut current: Option<LogFileSettings>,
+) {
+    while updates.changed().await.is_ok() {
+        let next = log_file_settings(updates.borrow_and_update().as_ref());
+        if next == current {
+            continue;
+        }
+        match process_logging::configure(next.as_ref()) {
+            Ok(()) => current = next,
+            Err(error) => process_logging::emit_line(&format!(
+                "{{\"component\":\"tiproxy-rs\",\"event\":\"log_file_reload_rejected\",\"error\":\"{}\"}}",
+                error.replace('\\', "\\\\").replace('"', "\\\"")
+            )),
+        }
     }
 }
 
@@ -1772,6 +1843,7 @@ mod tests {
             metering_sampler,
             health_task,
             metrics_http_task: _,
+            log_reload_task: _,
             routing_shadow,
         } = guard.commit();
         // Tearing the transferred handles down proves they were moved out of the

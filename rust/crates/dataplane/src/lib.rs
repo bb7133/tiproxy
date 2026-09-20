@@ -52,7 +52,7 @@ pub use control_dispatch::{ControlCommandHandler, OutboundControl};
 pub use observability::{
     DEFAULT_OBSERVATION_CAPACITY, METRIC_SPECS, MetricKind, MetricSpec, MetricsExporter,
     MetricsRecorder, MetricsRegistry, Observation, QuitSource, SessionLogContext, format_go_float,
-    spawn_metrics_exporter,
+    install_session_log_writer, spawn_metrics_exporter,
 };
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,

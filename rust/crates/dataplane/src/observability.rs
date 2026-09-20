@@ -1191,9 +1191,15 @@ async fn run_exporter(
             }
             _ = ticker.tick() => {
                 let server = serving.metrics().await;
+                // Every shed observation is one external signal: the SQL-path
+                // queue, the per-batch series bound, and the registry's
+                // cumulative series bound all count as dropped observations.
                 let (current, active_connections) = ExportTotals::sample(
                     server,
-                    dropped.load(Ordering::Relaxed).saturating_add(aggregator.overflow_dropped),
+                    dropped
+                        .load(Ordering::Relaxed)
+                        .saturating_add(aggregator.overflow_dropped)
+                        .saturating_add(registry.series_dropped()),
                     &client,
                     &dispatch,
                 );
@@ -1248,6 +1254,15 @@ pub struct SessionLogContext {
     pub generation: u64,
 }
 
+static SESSION_LOG_WRITER: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Installs the process log writer used by [`log_session`]. The binary
+/// installs the shared rotating-file output once at startup; until then (and
+/// in tests) session logs go to stderr. A second install is ignored.
+pub fn install_session_log_writer(writer: fn(&str)) {
+    let _ = SESSION_LOG_WRITER.set(writer);
+}
+
 /// Emits one JSON-line lifecycle log with a closed field set. All string
 /// values are escaped and truncated; callers cannot attach query/auth data.
 #[allow(clippy::too_many_arguments)]
@@ -1260,18 +1275,19 @@ pub fn log_session(
     capabilities: u64,
     source: QuitSource,
 ) {
-    eprintln!(
-        "{}",
-        session_log_line(
-            event,
-            context,
-            backend_id,
-            backend_address,
-            cluster,
-            capabilities,
-            source,
-        )
+    let line = session_log_line(
+        event,
+        context,
+        backend_id,
+        backend_address,
+        cluster,
+        capabilities,
+        source,
     );
+    match SESSION_LOG_WRITER.get() {
+        Some(writer) => writer(&line),
+        None => eprintln!("{line}"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
