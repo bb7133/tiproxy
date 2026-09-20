@@ -19,7 +19,6 @@ use std::fmt;
 
 use reqsign_aws_v4::{
     Credential, ECSCredentialProvider, IMDSv2CredentialProvider, ProcessCredentialProvider,
-    SSOCredentialProvider,
 };
 use reqsign_core::time::Timestamp;
 use reqsign_core::{Context, ProvideCredential, ProvideCredentialDyn, SigningCredential};
@@ -36,8 +35,8 @@ struct ProfileData {
     partial_keys: bool,
 }
 struct Profile {
-    name: String,
     props: Properties,
+    sso_session: Option<Properties>,
     source: Option<Box<Profile>>,
 }
 
@@ -103,9 +102,21 @@ impl GoDefaultProvider {
             Source::static_keys(keys)
         } else if let Some(source) = get("credential_source") {
             match source {
-                "Environment" => Source::static_keys(environment(ctx).ok_or_else(failed)?),
+                "Environment" => Source::static_keys(environment(ctx).unwrap_or(Credential {
+                    access_key_id: String::new(),
+                    secret_access_key: String::new(),
+                    session_token: None,
+                    expires_in: None,
+                })),
                 "Ec2InstanceMetadata" => Source::sdk(IMDSv2CredentialProvider::new()),
-                "EcsContainer" => Source::sdk(ECSCredentialProvider::new()),
+                "EcsContainer" => {
+                    if env(ctx, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_none()
+                        && env(ctx, "AWS_CONTAINER_CREDENTIALS_FULL_URI").is_none()
+                    {
+                        return Err(failed());
+                    }
+                    Source::sdk(ECSCredentialProvider::new())
+                }
                 _ => return Err(failed()),
             }
         } else if let Some(file) = get("web_identity_token_file") {
@@ -115,8 +126,24 @@ impl GoDefaultProvider {
                 file,
                 get("role_session_name").map(str::to_owned),
             ));
-        } else if profile.props.keys().any(|key| key.starts_with("sso_")) {
-            Source::sdk(SSOCredentialProvider::new().with_profile(&profile.name))
+        } else if [
+            "sso_session",
+            "sso_region",
+            "sso_start_url",
+            "sso_account_id",
+            "sso_role_name",
+        ]
+        .iter()
+        .any(|key| get(key).is_some())
+        {
+            Source {
+                kind: Kind::Sso(crate::cloud_aws_sso::Sso::new(
+                    ctx,
+                    &profile.props,
+                    profile.sso_session.as_ref(),
+                )?),
+                cached: Mutex::new(None),
+            }
         } else if let Some(command) = get("credential_process") {
             Source::sdk(ProcessCredentialProvider::new().with_command(command))
         } else if env(ctx, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_some()
@@ -168,6 +195,7 @@ struct Source {
 }
 enum Kind {
     Static(Credential),
+    Sso(crate::cloud_aws_sso::Sso),
     Sdk(Box<dyn ProvideCredentialDyn<Credential = Credential>>),
     Web(WebIdentity),
     Role {
@@ -202,6 +230,7 @@ impl Source {
         }
         let value = match &self.kind {
             Kind::Static(value) => value.clone(),
+            Kind::Sso(provider) => provider.retrieve(ctx).await?,
             Kind::Web(web) => web.retrieve(ctx).await?,
             Kind::Sdk(provider) => provider
                 .provide_credential_dyn(ctx)
@@ -396,7 +425,7 @@ fn normalize_profile(
         return Err(failed());
     }
     let mut profile = Profile {
-        name: name.to_owned(),
+        sso_session: None,
         props: Properties::new(),
         source: None,
     };
@@ -473,10 +502,14 @@ fn normalize_profile(
         }
         profile.source = Some(Box::new(source));
     }
-    if let Some(session) = property(&profile.props, "sso_session")
-        && !profiles.contains_key(&format!("sso-session {}", session.trim()))
-    {
-        return Err(failed());
+    if let Some(session) = property(&profile.props, "sso_session") {
+        profile.sso_session = Some(
+            profiles
+                .get(&format!("sso-session {}", session.trim()))
+                .ok_or_else(failed)?
+                .props
+                .clone(),
+        );
     }
     Ok(profile)
 }
@@ -768,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn default_sources_and_sts_requests_match_actual_go() {
         let rows = fixtures();
-        assert_eq!(rows.len(), 36);
+        assert_eq!(rows.len(), 41);
         for row in rows {
             assert_eq!(row.load_requests, 0, "{}: Go constructor is lazy", row.name);
             let (ctx, io) = context(&row);

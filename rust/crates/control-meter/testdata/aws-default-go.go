@@ -83,6 +83,16 @@ func main() {
 		{Name: "literal-ini-quotes-colon-comments", Files: map[string]string{"config": "[ default ] ; profile comment\nAWS_ACCESS_KEY_ID : 'literal-id' # comment\n  AWS_SECRET_ACCESS_KEY = \"literal-secret\\path\" ; comment\n"}},
 		{Name: "prefixed-default-wins", Files: map[string]string{"config": "[profile default]\naws_access_key_id=prefixed-id\naws_secret_access_key=prefixed-secret\n[default]\naws_access_key_id=plain-id\naws_secret_access_key=plain-secret\n"}},
 	}
+	for _, source := range []string{"Environment", "EcsContainer", "Bogus"} {
+		row := defaultCase{Name: "missing-source-" + source, Files: map[string]string{"config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/source\ncredential_source=" + source + "\n"}}
+		cases = append(cases, row)
+		if source != "Bogus" {
+			row.Name = "static-" + row.Name
+			row.Static = true
+			cases = append(cases, row)
+		}
+	}
+
 	// Explicit keys skip credential-source resolution, but shared config must
 	// still load and validate before the SDK constructs the S3 client.
 	for _, name := range []string{"environment-before-profile", "env-still-validates-profile-conflict", "env-still-requires-named-profile", "credential-source-requires-role", "profile-cycle-rejected", "partial-file-keys-cannot-merge", "missing-web-token-never-falls-back", "failed-process-never-falls-back"} {

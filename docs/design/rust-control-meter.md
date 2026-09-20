@@ -50,13 +50,13 @@ Web Identity uses unsigned POST, preserves the complete token-file bytes and
 regenerates the default numeric session name per retrieval. Go does not apply
 profile `duration_seconds` to Web Identity; regular profile roles use the Go
 integer-minute threshold before overriding the 900-second default. The new
-fixture compares 36 actual Go resolver outcomes and STS requests, including
+fixture compares 41 actual Go resolver outcomes and STS requests, including
 configuration validation even when environment credentials win, source-profile
 signatures, self-links, file precedence and failed process/Web Identity sources.
 Client construction resolves and validates this configuration before the service
 opens the consumer/outbox files. Even explicit static credentials validate the
 shared profile, while skipping default credential-source resolution. STS, token
-file reads and credential processes remain lazy until retrieval; all 36 Go
+file reads and credential processes remain lazy until retrieval; all 41 Go
 constructor captures make zero HTTP requests. The resolved profile is retained
 if its file changes before the first export.
 The Go fixture disables retries to isolate source selection. A separate test
@@ -67,9 +67,27 @@ changes and token rotation. Regenerate with:
 go run rust/crates/control-meter/testdata/aws-default-go.go
 ```
 
-Modern SSO session-token refresh, configured AWS service endpoint overrides,
-and detailed metadata/process retry/cache parity remain open. The current SDK
-SSO source supports legacy cached-token profiles. The extra signed
+AWS SSO uses a native adapter for both legacy cached-token profiles and modern
+`sso-session` profiles. It validates the same required fields and session/profile
+consistency at construction, hashes the start URL or session name for the cache
+filename, and preserves the selected identity. Legacy expired tokens fail;
+modern expired tokens use CreateToken, retain unknown cache fields and replace
+the cache atomically with its original permissions before requesting role
+credentials. A failed refresh or cache write returns an error without identity
+fallback. Nineteen actual Go cases compare configuration failures, request URLs,
+headers and bodies, China endpoints, persisted cache fields, invalid responses
+and cache-write failure. The Rust test also verifies restart reuse of the newly
+persisted token and mode 0600 retention. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-sso-go.go
+```
+
+For a profile's `credential_source`, missing Environment keys fail during
+retrieval; EcsContainer without either container URI fails during construction.
+Both timings match the Go resolver, including explicit-static overrides.
+Configured AWS service endpoint overrides and detailed metadata/process
+retry/cache parity remain open. The extra signed
 `x-amz-content-sha256` header on AWS AssumeRole is accepted SigV4 metadata that
 Go omits. OSS refresh holds the cache lock through STS, matching Go's blocking
 lock scope; Rust rechecks under that lock and coalesces concurrent refreshes

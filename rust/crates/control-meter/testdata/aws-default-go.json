@@ -451,6 +451,81 @@
   },
   {
     "load_requests": 0,
+    "static": false,
+    "load_error": false,
+    "name": "missing-source-Environment",
+    "env": null,
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/source\ncredential_source=Environment\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": false,
+    "name": "static-missing-source-Environment",
+    "env": null,
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/source\ncredential_source=Environment\n"
+    },
+    "denied": false,
+    "credential": "explicit-id",
+    "secret": "explicit-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
+    "name": "missing-source-EcsContainer",
+    "env": null,
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/source\ncredential_source=EcsContainer\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": false,
+    "name": "static-missing-source-EcsContainer",
+    "env": null,
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/source\ncredential_source=EcsContainer\n"
+    },
+    "denied": false,
+    "credential": "explicit-id",
+    "secret": "explicit-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
+    "name": "missing-source-Bogus",
+    "env": null,
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/source\ncredential_source=Bogus\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
     "static": true,
     "load_error": false,
     "name": "static-environment-before-profile",
