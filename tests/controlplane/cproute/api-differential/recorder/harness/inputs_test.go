@@ -61,6 +61,30 @@ func (b subscribedObserver) Subscribe(name string) <-chan observer.HealthResult 
 	return ch
 }
 
+// One permit acknowledges that a refresh has reached the fetcher. Refresh is
+// best effort: receiving the previous publication does not mean the observer
+// has entered its wait yet. Keep retrying until it accepts this fetch, then
+// release exactly one result without introducing extra recorded publications.
+type permittedFetcher struct {
+	observer.BackendFetcher
+	requests chan chan struct{}
+}
+
+func (f permittedFetcher) GetBackendList(ctx context.Context) (map[string]*observer.BackendInfo, error) {
+	release := make(chan struct{})
+	select {
+	case f.requests <- release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-release:
+		return f.BackendFetcher.GetBackendList(ctx)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // This is a synthetic source-driver integration test, not an N/K corpus slot.
 // Keep the actual observer, input forwarder, router, recording wrappers and
 // writer in the path. Only the external inventory and health check are fakes.
@@ -78,9 +102,10 @@ func TestRecordedObserverSourceErrors(t *testing.T) {
 	require.NoError(t, cfg.SetTOMLConfig([]byte("[balance]\npolicy='connection'\nrouting-policy='prefer-idle'\n")))
 	lg := zap.NewNop()
 	fetcher := &FaultFetcher{BackendFetcher: observer.NewStaticFetcher([]string{"127.0.0.1:4000"})}
+	permitted := permittedFetcher{BackendFetcher: fetcher, requests: make(chan chan struct{})}
 	hc := config.NewDefaultHealthCheckConfig()
 	hc.Interval = time.Hour // subsequent publications are driven by Refresh
-	bo := observer.NewDefaultBackendObserver(lg, hc, fetcher, healthyCheck{}, cfg)
+	bo := observer.NewDefaultBackendObserver(lg, hc, permitted, healthyCheck{}, cfg)
 	rt := router.NewScoreBasedRouter(lg)
 	// The forwarder owns the observer subscription. Do not let selector retries
 	// add undeclared source refreshes to this finite integration scenario.
@@ -122,6 +147,21 @@ func TestRecordedObserverSourceErrors(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	bo.Start(ctx)
+	publish := func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case release := <-permitted.requests:
+				close(release)
+				return
+			case <-ticker.C:
+				bo.Refresh()
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+		}
+	}
 	await := func(op, identity string) {
 		select {
 		case e := <-deliveries:
@@ -131,17 +171,18 @@ func TestRecordedObserverSourceErrors(t *testing.T) {
 			t.Fatal(ctx.Err())
 		}
 	}
+	publish()
 	await("health", "")
 	route("ok")
 	for _, identity := range []string{"cancelled", "deadline_exceeded", "topology_unavailable"} {
 		fault, err := FaultError(identity)
 		require.NoError(t, err)
 		fetcher.Set(fault)
-		bo.Refresh()
+		publish()
 		await("source_error", identity)
 		route(identity)
 		fetcher.Set(nil)
-		bo.Refresh()
+		publish()
 		await("health", "")
 		route("ok")
 	}

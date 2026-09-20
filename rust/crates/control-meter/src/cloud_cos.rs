@@ -920,3 +920,6 @@ mod tests {
         );
     }
 }
+
+#[path = "cloud_cos_object.rs"]
+mod object;

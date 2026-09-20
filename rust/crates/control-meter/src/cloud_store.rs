@@ -35,7 +35,7 @@ pub struct CloudStore {
 }
 
 enum CloudSigner {
-    S3(crate::cloud_aws::AwsSigner),
+    S3(Box<crate::cloud_aws::AwsSigner>),
     Oss(crate::cloud_oss::OssSigner),
     Cos(crate::cloud_cos::CosSigner),
     Azure(crate::cloud_azure::AzureSigner),
@@ -130,6 +130,18 @@ impl CloudStore {
     }
 
     async fn request(&self, method: Method, url: &Url, body: Vec<u8>) -> Result<StatusCode, Error> {
+        if let CloudSigner::S3(signer) = &self.signer {
+            return signer
+                .request(method, url, body.into())
+                .await
+                .map_err(|_| Error::Export("S3 object request failed"));
+        }
+        if let CloudSigner::Cos(signer) = &self.signer {
+            return signer
+                .request(method, url, body.into())
+                .await
+                .map_err(|_| Error::Export("COS object request failed"));
+        }
         let mut parts = Request::builder()
             .method(method)
             .uri(url.as_str())
@@ -143,9 +155,9 @@ impl CloudStore {
             return self.send(parts, body).await;
         }
         match &self.signer {
-            CloudSigner::S3(signer) => signer.sign(&mut parts).await,
+            CloudSigner::S3(_) => return Err(Error::Export("invalid S3 signer dispatch")),
             CloudSigner::Oss(signer) => signer.sign(&mut parts).await,
-            CloudSigner::Cos(signer) => signer.sign(&mut parts).await,
+            CloudSigner::Cos(_) => return Err(Error::Export("invalid COS signer dispatch")),
             CloudSigner::Azure(_) => return Err(Error::Export("invalid Azure signer dispatch")),
         }
         .map_err(|_| Error::Export("cloud credential or signing failure"))?;
@@ -252,7 +264,7 @@ async fn s3(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSign
     let signer = crate::cloud_aws::AwsSigner::new(&cfg, region, sts_endpoint, context)
         .await
         .map_err(|_| Error::Invalid("invalid AWS credential configuration"))?;
-    Ok((url, CloudSigner::S3(signer)))
+    Ok((url, CloudSigner::S3(Box::new(signer))))
 }
 
 fn dns_bucket(bucket: &str) -> bool {
@@ -387,11 +399,19 @@ mod tests {
                 .read_exact(&mut body)
                 .await
                 .unwrap_or_else(|e| unreachable!("{e}"));
+            let crc = if head.starts_with("PUT ") {
+                format!(
+                    "x-cos-hash-crc64ecma: {}\r\n",
+                    crate::cloud_crc64::checksum(&body)
+                )
+            } else {
+                String::new()
+            };
             requests.push((head, body));
             stream
                 .write_all(
                     format!(
-                        "HTTP/1.1 {status} Result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 {status} Result\r\n{crc}Content-Length: 0\r\nConnection: close\r\n\r\n"
                     )
                     .as_bytes(),
                 )
@@ -486,14 +506,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_retries_do_not_repeat_the_existence_check() {
+        for provider in ["s3", "cos"] {
+            let (store, server) = fixture(provider, vec![503, 404, 503, 200]).await;
+            store
+                .put_new("object", vec![1, 2, 3])
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let requests = server.await.unwrap_or_else(|e| unreachable!("{e}"));
+            assert_eq!(requests.len(), 4);
+            for (index, (head, body)) in requests.iter().enumerate() {
+                let method = if index < 2 { "HEAD" } else { "PUT" };
+                assert!(
+                    head.starts_with(&format!("{method} /prefix%20space/%25text/object HTTP/1.1"))
+                );
+                assert_eq!(
+                    body.as_slice(),
+                    if index < 2 { &[] } else { &[1, 2, 3][..] }
+                );
+                assert!(head.contains("authorization:"));
+                if provider == "cos" {
+                    assert_eq!(head.contains("x-cos-sdk-retry: true"), index % 2 == 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn existing_or_denied_objects_are_never_uploaded() {
         for status in [200, 403, 500, 307] {
-            let (store, server) = fixture("s3", vec![status]).await;
+            let (store, server) =
+                fixture("s3", vec![status; if status == 500 { 3 } else { 1 }]).await;
             let result = store.put_new("object", vec![1]).await;
             assert!(result.is_err());
             let requests = server.await.unwrap_or_else(|e| unreachable!("{e}"));
-            assert_eq!(requests.len(), 1);
-            assert!(requests[0].0.starts_with("HEAD "));
+            assert_eq!(requests.len(), if status == 500 { 3 } else { 1 });
+            assert!(requests.iter().all(|r| r.0.starts_with("HEAD ")));
         }
     }
     #[tokio::test]

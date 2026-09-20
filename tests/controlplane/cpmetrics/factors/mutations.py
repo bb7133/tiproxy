@@ -71,7 +71,7 @@ def main():
         ("backend-owner-keeps-lineage", COLLECT, "if self.reader.source() == crate::metrics::Source::Backend {", "if false {", "lineage", "", "FACTOR_BACKEND_OWNER_COLD_START"),
         ("ordinary-round-cold-starts", COLLECT, "lineage: Arc::clone(&self.lineage),", "lineage: Arc::new(()),", "lineage", "", "FACTOR_ROUND_NOT_LINEAGE"),
         ("router-cross-lineage-reuse", SELECTOR, "factors.core.clear_cluster(&cluster);", "let _ = &cluster;", "live", "", "FACTOR_CROSS_LINEAGE_NO_CACHE_REUSE"),
-        ("prom-source-aba-keeps-lineage", COLLECT, "if state.reader.source() != crate::metrics::Source::Prometheus {", "if false {", "live", "", "FACTOR_SOURCE_ABA_NEW_LINEAGE"),
+        ("prom-source-aba-keeps-lineage", COLLECT, "if self.reader.source() != crate::metrics::Source::Prometheus {", "if false {", "lineage", "", "FACTOR_SOURCE_ABA_NEW_LINEAGE"),
         ("metric-final-boundary-bypassed", SELECTOR, "metrics\n            .with_current(|| {", "Some((|| {", "live-boundary", "", "FACTOR_OLD_ROUND_REJECTED"),
     ]
     cases.append(("unrelated-cluster-clears-health", FACTORS, "let label = control_topology::metrics::cluster_label(cluster);", "self.history.health_queries.clear(); let label = control_topology::metrics::cluster_label(cluster);", "account", "", "FACTOR_UNCHANGED_CLUSTER_RETAINS_HEALTH"))

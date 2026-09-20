@@ -19,14 +19,18 @@ use std::fmt;
 use crate::cloud_aws_retry::{Failure, Retry};
 use bytes::Bytes;
 use control_config::AwsMeteringConfig;
-use http::{Request, request::Parts};
+use http::Request;
+#[cfg(test)]
+use http::request::Parts;
 use reqsign_aws_core::assume_role::{AssumeRoleOperation, regional_sts_endpoint};
-use reqsign_aws_v4::{AssumeRoleGrant, Credential, RequestSigner, StaticCredentialProvider};
+#[cfg(test)]
+use reqsign_aws_v4::RequestSigner;
+use reqsign_aws_v4::{AssumeRoleGrant, Credential, StaticCredentialProvider};
+#[cfg(test)]
+use reqsign_core::SignRequest;
 use reqsign_core::hash::hex_sha256;
 use reqsign_core::time::Timestamp;
-use reqsign_core::{
-    Context, ProvideCredential, ProvideCredentialChain, SignRequest, SigningCredential,
-};
+use reqsign_core::{Context, ProvideCredential, ProvideCredentialChain, SigningCredential};
 use reqwest::Url;
 use tokio::sync::Mutex;
 
@@ -38,6 +42,8 @@ pub(crate) struct AwsSigner {
     endpoint: Option<Url>,
     state: Mutex<State>,
     retry: Retry,
+    object_retry: Retry,
+    object_skew: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Default)]
@@ -76,6 +82,8 @@ impl AwsSigner {
             };
         Ok(Self {
             retry: Retry::configured(&context, settings),
+            object_retry: Retry::configured(&context, settings),
+            object_skew: std::sync::atomic::AtomicI64::new(0),
             context,
             base,
             region,
@@ -85,6 +93,7 @@ impl AwsSigner {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn sign(&self, parts: &mut Parts) -> reqsign_core::Result<()> {
         let mut credential = self.credential().await?;
         // Provider-specific Go refresh windows are already reflected in the
@@ -617,3 +626,6 @@ mod retry_tests {
         }
     }
 }
+
+#[path = "cloud_aws_s3.rs"]
+mod s3;
