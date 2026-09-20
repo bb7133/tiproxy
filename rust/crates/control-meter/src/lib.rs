@@ -18,11 +18,13 @@
 //! the Go consumer and outbox during the staged ownership handoff.
 
 mod cloud_aws;
+mod cloud_aws_adaptive;
 mod cloud_aws_container;
 mod cloud_aws_identity;
 mod cloud_aws_imds;
 mod cloud_aws_process;
 mod cloud_aws_retry;
+mod cloud_aws_retry_config;
 mod cloud_aws_sso;
 mod cloud_azure;
 mod cloud_azure_identity;

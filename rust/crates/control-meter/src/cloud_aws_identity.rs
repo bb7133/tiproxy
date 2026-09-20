@@ -23,6 +23,7 @@ use reqsign_core::{Context, ProvideCredential, SigningCredential};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::cloud_aws::{RoleOptions, assume_role};
+use crate::cloud_aws_retry_config::Settings;
 
 type Properties = BTreeMap<String, String>;
 type Profiles = BTreeMap<String, ProfileData>;
@@ -40,7 +41,7 @@ struct Profile {
 
 pub(crate) struct GoDefaultProvider {
     region: String,
-    selected: OnceCell<Source>,
+    selected: OnceCell<(Source, Settings)>,
 }
 
 impl fmt::Debug for GoDefaultProvider {
@@ -58,13 +59,25 @@ impl GoDefaultProvider {
     }
 
     /// Resolve config at client construction; credential I/O stays lazy.
-    pub(crate) async fn prepare(&self, ctx: &Context) -> reqsign_core::Result<()> {
-        self.selected.get_or_try_init(|| self.resolve(ctx)).await?;
-        Ok(())
+    pub(crate) async fn prepare(&self, ctx: &Context) -> reqsign_core::Result<Settings> {
+        Ok(self.selected.get_or_try_init(|| self.resolve(ctx)).await?.1)
     }
 
-    async fn resolve(&self, ctx: &Context) -> reqsign_core::Result<Source> {
+    async fn resolve(&self, ctx: &Context) -> reqsign_core::Result<(Source, Settings)> {
         let profile = load_profile(ctx).await?;
+        let settings = Settings::resolve(ctx, &profile.props)?;
+        Ok((
+            self.resolve_source(ctx, &profile, settings).await?,
+            settings,
+        ))
+    }
+
+    async fn resolve_source(
+        &self,
+        ctx: &Context,
+        profile: &Profile,
+        settings: Settings,
+    ) -> reqsign_core::Result<Source> {
         // Complete environment keys, then environment web identity, then the
         // merged active profile. Authentication errors never change identity.
         if let Some(credential) = environment(ctx) {
@@ -78,15 +91,17 @@ impl GoDefaultProvider {
                 &arn,
                 &file,
                 env(ctx, "AWS_ROLE_SESSION_NAME"),
+                settings,
             ));
         }
-        self.resolve_profile(ctx, &profile).await
+        self.resolve_profile(ctx, profile, settings).await
     }
 
     async fn resolve_profile(
         &self,
         ctx: &Context,
         profile: &Profile,
+        settings: Settings,
     ) -> reqsign_core::Result<Source> {
         let get = |key: &str| property(&profile.props, key);
         let arn = get("role_arn");
@@ -100,7 +115,7 @@ impl GoDefaultProvider {
             _ => None,
         };
         let source = if let Some(parent) = &profile.source {
-            Box::pin(self.resolve_profile(ctx, parent)).await?
+            Box::pin(self.resolve_profile(ctx, parent, settings)).await?
         } else if let Some(keys) = static_keys {
             Source::static_keys(keys)
         } else if let Some(source) = get("credential_source") {
@@ -122,6 +137,7 @@ impl GoDefaultProvider {
                 arn.ok_or_else(failed)?,
                 file,
                 get("role_session_name").map(str::to_owned),
+                settings,
             ));
         } else if [
             "sso_session",
@@ -138,6 +154,7 @@ impl GoDefaultProvider {
                     ctx,
                     &profile.props,
                     profile.sso_session.as_ref(),
+                    settings,
                 )?),
                 cached: Mutex::new(None),
             }
@@ -172,7 +189,7 @@ impl GoDefaultProvider {
                     duration,
                     external_id: get("external_id").map(str::to_owned),
                     region: self.region.clone(),
-                    retry: crate::cloud_aws_retry::Retry::new(ctx),
+                    retry: crate::cloud_aws_retry::Retry::configured(ctx, settings),
                 },
                 cached: Mutex::new(None),
             })
@@ -186,7 +203,7 @@ impl ProvideCredential for GoDefaultProvider {
     type Credential = Credential;
     async fn provide_credential(&self, ctx: &Context) -> reqsign_core::Result<Option<Credential>> {
         let source = self.selected.get_or_try_init(|| self.resolve(ctx)).await?;
-        source.get(ctx).await.map(Some)
+        source.0.get(ctx).await.map(Some)
     }
 }
 
@@ -293,6 +310,7 @@ fn web_identity(
     arn: &str,
     file: &str,
     session: Option<String>,
+    settings: Settings,
 ) -> Source {
     Source {
         kind: Kind::Web(WebIdentity {
@@ -300,7 +318,7 @@ fn web_identity(
             arn: arn.to_owned(),
             file: file.to_owned(),
             session,
-            retry: crate::cloud_aws_retry::Retry::new(ctx),
+            retry: crate::cloud_aws_retry::Retry::configured(ctx, settings),
         }),
         cached: Mutex::new(None),
     }
@@ -395,9 +413,8 @@ struct WebCredential {
 
 /// Explicit static credentials still run the Go shared-config validation,
 /// but skip resolution of the profile's credential provider.
-pub(crate) async fn validate_profile(ctx: &Context) -> reqsign_core::Result<()> {
-    load_profile(ctx).await?;
-    Ok(())
+pub(crate) async fn validate_profile(ctx: &Context) -> reqsign_core::Result<Settings> {
+    Settings::resolve(ctx, &load_profile(ctx).await?.props)
 }
 
 async fn load_profile(ctx: &Context) -> reqsign_core::Result<Profile> {
@@ -469,6 +486,7 @@ fn normalize_profile(
     } else if !seen.is_empty() {
         return Err(failed());
     }
+    Settings::validate_profile(&profile.props)?;
     if seen.contains(name) {
         for key in [
             "role_arn",
@@ -830,6 +848,79 @@ mod tests {
             .with_command_execute(io.clone());
         (ctx, io)
     }
+
+    #[tokio::test]
+    async fn service_retry_config_matches_actual_go_load_and_clients() {
+        #[derive(Deserialize)]
+        struct Row {
+            name: String,
+            env_max: String,
+            env_mode: String,
+            profile: String,
+            credentials: String,
+            adaptive: bool,
+            error: bool,
+            max: i64,
+        }
+        let rows: Vec<Row> =
+            serde_json::from_str(include_str!("../testdata/aws-retry-config-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(rows.len(), 44);
+        for row in rows {
+            let fixture = Case {
+                name: row.name.clone(),
+                env: Some(BTreeMap::from([
+                    ("AWS_MAX_ATTEMPTS".into(), row.env_max),
+                    ("AWS_RETRY_MODE".into(), row.env_mode),
+                    ("AWS_ACCESS_KEY_ID".into(), "key".into()),
+                    ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
+                ])),
+                files: BTreeMap::from([
+                    ("config".into(), format!("[default]\n{}", row.profile)),
+                    ("credentials".into(), row.credentials),
+                ]),
+                denied: false,
+                r#static: true,
+                load_error: row.error,
+                load_requests: 0,
+                credential: String::new(),
+                secret: String::new(),
+                error: false,
+                requests: None,
+            };
+            let (ctx, io) = context(&fixture);
+            let settings = validate_profile(&ctx).await;
+            assert_eq!(settings.is_err(), row.error, "{} explicit static", row.name);
+            let provider = GoDefaultProvider::new("us-east-1");
+            let default = provider.prepare(&ctx).await;
+            assert_eq!(default.is_err(), row.error, "{} default source", row.name);
+            if !row.error {
+                let expected = Settings {
+                    max_attempts: row.max,
+                    adaptive: row.adaptive,
+                };
+                assert_eq!(
+                    settings.unwrap_or_else(|e| unreachable!("{e}")),
+                    expected,
+                    "{}",
+                    row.name
+                );
+                assert_eq!(
+                    default.unwrap_or_else(|e| unreachable!("{e}")),
+                    expected,
+                    "{}",
+                    row.name
+                );
+            }
+            assert!(
+                io.0.lock()
+                    .unwrap_or_else(|e| unreachable!("{e}"))
+                    .requests
+                    .is_empty()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn default_sources_and_sts_requests_match_actual_go() {
         let rows = fixtures();
@@ -921,7 +1012,7 @@ mod tests {
             provider.provide_credential(&ctx)
         );
         assert!(one.is_ok() && two.is_ok());
-        let source = provider.selected.get().unwrap_or_else(|| unreachable!());
+        let source = &provider.selected.get().unwrap_or_else(|| unreachable!()).0;
         source
             .cached
             .lock()

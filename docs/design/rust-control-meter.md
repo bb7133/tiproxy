@@ -160,6 +160,40 @@ Regenerate with:
 go run rust/crates/control-meter/testdata/aws-sso-retry-go.go
 ```
 
+Service credential retries honor `AWS_MAX_ATTEMPTS`/`max_attempts` and
+`AWS_RETRY_MODE`/`retry_mode` (`standard` or `adaptive`). Active and linked
+profiles are validated even when environment settings override them or explicit
+static credentials are supplied. Nonzero environment attempts override the
+profile; zero is unset and negative removes the attempt-count limit while
+retaining the quota and cancellation. Root settings apply to explicit/profile
+STS, WebIdentity, SSO and OIDC clients, with independent per-client state.
+Container endpoint credentials and IMDS keep their SDK-specific default retry
+policies rather than inheriting these service options.
+
+Adaptive mode adds the pinned SDK's half-second measured-rate buckets and cubic
+send-rate limiter, activated after a throttled response. Its bucket is separate
+from retry quota. The middleware's 2026 behavior updates the adaptive limiter
+only after the first attempt of each operation; all attempts still acquire a
+send token. Adaptive success does not receive the standard initial-token bonus.
+Dropping the request future cancels its wait. The native timer yields at least
+one millisecond for a positive sub-tick deficit to avoid spinning.
+
+Forty-four actual Go config/client-constructor cases compare validation and
+resolved settings. Twenty persistent real Go middleware traces compare both
+retry modes, legacy/2026 behavior, one/two/four/unlimited attempts, delayed
+throttling, terminal failures, quota exhaustion/refunds and recovery. Attempt
+counts, outcomes and quota must match exactly; cumulative pacing is within
+100ms for Tokio timer quantization. The trace uses SDK testing clock hooks and
+zero backoff to isolate adaptive pacing, without replacing middleware or quota.
+The helper runs in a temporary SDK-namespaced Go module solely to import those
+internal testing hooks; production dependencies and SDK sources are unchanged.
+Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-retry-config-go.go
+rust/crates/control-meter/testdata/aws-adaptive-go.sh
+```
+
 Container credentials now freeze the Go-selected endpoint and token-file path
 at construction: relative URI takes precedence over full URI; HTTP full-URI
 hosts must resolve exclusively to loopback or the known ECS/EKS addresses. DNS
@@ -386,7 +420,7 @@ go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
 Full default-credential/endpoint edge parity remains in progress. Provider retry-policy and default-chain edge comparisons remain
-open, including nondefault AWS retry configuration and STS clock-skew
+open, including cloud object HEAD/PUT retries and STS clock-skew
 correction. Export failure retains the pending window for the next metering
 attempt.
 

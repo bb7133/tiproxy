@@ -26,6 +26,10 @@ pub(crate) struct Retry {
     new_2026: bool,
     tokens: AtomicU32,
     imds: bool,
+    max_attempts: i64,
+    #[cfg(test)]
+    zero_backoff: bool,
+    adaptive: Option<crate::cloud_aws_adaptive::Limiter>,
 }
 
 pub(crate) struct Failure {
@@ -161,7 +165,19 @@ impl Failure {
 }
 impl Retry {
     pub(crate) fn new(ctx: &Context) -> Self {
+        Self::configured(ctx, crate::cloud_aws_retry_config::Settings::default())
+    }
+    pub(crate) fn configured(
+        ctx: &Context,
+        settings: crate::cloud_aws_retry_config::Settings,
+    ) -> Self {
         Self {
+            max_attempts: settings.max_attempts,
+            #[cfg(test)]
+            zero_backoff: false,
+            adaptive: settings
+                .adaptive
+                .then(crate::cloud_aws_adaptive::Limiter::new),
             new_2026: ctx.env_var("AWS_NEW_RETRIES_2026").as_deref() == Some("true"),
             tokens: AtomicU32::new(500),
             imds: false,
@@ -215,6 +231,9 @@ impl Retry {
     {
         let mut attempts = self.attempts();
         loop {
+            if let Some(limiter) = &self.adaptive {
+                limiter.acquire().await;
+            }
             match operation().await {
                 Ok(value) => {
                     attempts.success();
@@ -224,10 +243,14 @@ impl Retry {
             }
         }
     }
-    fn backoff_index(&self, attempt: u8) -> u8 {
-        attempt - u8::from(self.new_2026)
+    fn backoff_index(&self, attempt: u64) -> u64 {
+        attempt - u64::from(self.new_2026)
     }
-    fn delay(&self, attempt: u8, throttle: bool, fraction: f64) -> Duration {
+    fn delay(&self, attempt: u64, throttle: bool, fraction: f64) -> Duration {
+        #[cfg(test)]
+        if self.zero_backoff {
+            return Duration::ZERO;
+        }
         // SDK middleware uses zero-based backoff indices in 2026 mode.
         let index = self.backoff_index(attempt);
         if self.imds {
@@ -240,13 +263,18 @@ impl Retry {
             }
         } else if self.new_2026 {
             let base = if throttle { 1.0 } else { 0.05 };
-            Duration::from_secs_f64(fraction * (base * 2_f64.powi(i32::from(index))).min(20.0))
+            Duration::from_secs_f64(
+                fraction
+                    * (base * 2_f64.powi(i32::try_from(index.min(32)).unwrap_or(32))).min(20.0),
+            )
         } else if attempt > 4 {
             // The pinned legacy implementation caps before drawing jitter once
             // attempt exceeds floor(log2(maxBackoffSeconds)).
             Duration::from_secs(20)
         } else {
-            Duration::from_secs_f64(fraction * 2_f64.powi(i32::from(index)))
+            Duration::from_secs_f64(
+                fraction * 2_f64.powi(i32::try_from(index.min(32)).unwrap_or(32)),
+            )
         }
     }
 }
@@ -342,12 +370,16 @@ fn rest_error_code(response: &http::Response<bytes::Bytes>, sso: bool) -> Option
 // same quota and cancellation logic as the closure-based container path.
 pub(crate) struct Attempts<'a> {
     policy: &'a Retry,
-    number: u8,
+    number: u64,
     previous_cost: u32,
 }
 impl Attempts<'_> {
     pub(crate) fn success(&self) {
-        let refund = self.previous_cost + u32::from(!self.policy.new_2026 || self.number == 1);
+        self.observe(false);
+        let refund = self.previous_cost
+            + u32::from(
+                self.policy.adaptive.is_none() && (!self.policy.new_2026 || self.number == 1),
+            );
         let _ = self
             .policy
             .tokens
@@ -355,8 +387,18 @@ impl Attempts<'_> {
                 Some(v.saturating_add(refund).min(500))
             });
     }
+    fn observe(&self, throttle: bool) {
+        if (!self.policy.new_2026 || self.number == 1)
+            && let Some(limiter) = &self.policy.adaptive
+        {
+            limiter.update(throttle);
+        }
+    }
     pub(crate) async fn failure(&mut self, failure: Failure) -> Result<(), Failure> {
-        if self.number == 3 || !failure.retryable {
+        self.observe(failure.throttle);
+        if (self.policy.max_attempts > 0 && self.number >= self.policy.max_attempts.unsigned_abs())
+            || !failure.retryable
+        {
             return Err(failure);
         }
         let cost = if self.policy.new_2026 {
@@ -407,6 +449,120 @@ impl Attempts<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_attempts_adaptive_pacing_and_quota_match_actual_go_middleware() {
+        #[derive(Deserialize)]
+        struct Row {
+            name: String,
+            new: bool,
+            adaptive: bool,
+            max: i64,
+            operations: Vec<Operation>,
+        }
+        #[derive(Deserialize)]
+        struct Operation {
+            codes: Vec<String>,
+            gap_ms: u64,
+            attempt_ns: Vec<u64>,
+            error: bool,
+            tokens: u32,
+        }
+        let rows: Vec<Row> = serde_json::from_str(include_str!("../testdata/aws-adaptive-go.json"))
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(rows.len(), 20);
+        for row in rows {
+            let base = tokio::time::Instant::now();
+            let retry = Retry {
+                new_2026: row.new,
+                tokens: AtomicU32::new(500),
+                imds: false,
+                max_attempts: row.max,
+                zero_backoff: true,
+                adaptive: row
+                    .adaptive
+                    .then(|| crate::cloud_aws_adaptive::Limiter::at(1_750_000_000.125)),
+            };
+            for (index, op) in row.operations.into_iter().enumerate() {
+                tokio::time::advance(Duration::from_millis(op.gap_ms)).await;
+                let mut observed = Vec::new();
+                let result = retry
+                    .run(|| {
+                        let code = &op.codes[observed.len().min(op.codes.len() - 1)];
+                        observed.push(base.elapsed());
+                        std::future::ready(if code.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(Failure::container(0, code))
+                        })
+                    })
+                    .await;
+                let label = format!(
+                    "{} new={} adaptive={} max={} operation={index}",
+                    row.name, row.new, row.adaptive, row.max
+                );
+                assert_eq!(result.is_err(), op.error, "{label}");
+                assert_eq!(observed.len(), op.attempt_ns.len(), "{label}");
+                assert_eq!(retry.tokens.load(Ordering::Relaxed), op.tokens, "{label}");
+                for (actual, expected) in observed.into_iter().zip(op.attempt_ns) {
+                    let expected = Duration::from_nanos(expected);
+                    let diff = actual.abs_diff(expected);
+                    // Tokio timers round to milliseconds; the SDK probe advances
+                    // nanoseconds. Permit scheduler quantization, not rate changes.
+                    assert!(
+                        diff < Duration::from_millis(100),
+                        "{label}: actual {actual:?}, Go {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_wait_is_cancelable_and_isolated_per_client() {
+        let retry = Retry::configured(
+            &Context::new(),
+            crate::cloud_aws_retry_config::Settings {
+                max_attempts: 1,
+                adaptive: true,
+            },
+        );
+        assert!(
+            retry
+                .run(|| std::future::ready(Err::<(), _>(Failure::container(0, "Throttling"))))
+                .await
+                .is_err()
+        );
+        let called = std::cell::Cell::new(false);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                retry.run(|| {
+                    called.set(true);
+                    std::future::ready(Ok(()))
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert!(!called.get());
+        let other = Retry::configured(
+            &Context::new(),
+            crate::cloud_aws_retry_config::Settings {
+                max_attempts: 1,
+                adaptive: true,
+            },
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                other.run(|| std::future::ready(Ok(())))
+            )
+            .await
+            .is_ok()
+        );
+    }
+
     #[test]
     fn pinned_legacy_and_2026_delay_formulas() {
         let fixture: serde_json::Value =
@@ -420,6 +576,9 @@ mod tests {
                 new_2026: row["new"].as_bool().unwrap_or_default(),
                 tokens: AtomicU32::new(500),
                 imds: false,
+                max_attempts: 3,
+                zero_backoff: false,
+                adaptive: None,
             };
             assert_eq!(
                 serde_json::json!([retry.backoff_index(1), retry.backoff_index(2)]),
@@ -432,6 +591,9 @@ mod tests {
                 new_2026: new,
                 tokens: AtomicU32::new(500),
                 imds: false,
+                max_attempts: 3,
+                zero_backoff: false,
+                adaptive: None,
             };
             assert_eq!(
                 retry.delay(1, false, 0.5),

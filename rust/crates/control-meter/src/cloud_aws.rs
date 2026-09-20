@@ -60,21 +60,22 @@ impl AwsSigner {
         endpoint: Option<Url>,
         context: Context,
     ) -> reqsign_core::Result<Self> {
-        let base = if !config.access_key.is_empty() && !config.secret_access_key.is_empty() {
-            crate::cloud_aws_identity::validate_profile(&context).await?;
-            let mut provider =
-                StaticCredentialProvider::new(&config.access_key, &config.secret_access_key);
-            if !config.session_token.is_empty() {
-                provider = provider.with_session_token(&config.session_token);
-            }
-            ProvideCredentialChain::new().push(provider)
-        } else {
-            let provider = crate::cloud_aws_identity::GoDefaultProvider::new(&region);
-            provider.prepare(&context).await?;
-            ProvideCredentialChain::new().push(provider)
-        };
+        let (base, settings) =
+            if !config.access_key.is_empty() && !config.secret_access_key.is_empty() {
+                let settings = crate::cloud_aws_identity::validate_profile(&context).await?;
+                let mut provider =
+                    StaticCredentialProvider::new(&config.access_key, &config.secret_access_key);
+                if !config.session_token.is_empty() {
+                    provider = provider.with_session_token(&config.session_token);
+                }
+                (ProvideCredentialChain::new().push(provider), settings)
+            } else {
+                let provider = crate::cloud_aws_identity::GoDefaultProvider::new(&region);
+                let settings = provider.prepare(&context).await?;
+                (ProvideCredentialChain::new().push(provider), settings)
+            };
         Ok(Self {
-            retry: Retry::new(&context),
+            retry: Retry::configured(&context, settings),
             context,
             base,
             region,

@@ -43,6 +43,7 @@ impl Sso {
         ctx: &Context,
         profile: &BTreeMap<String, String>,
         session: Option<&BTreeMap<String, String>>,
+        settings: crate::cloud_aws_retry_config::Settings,
     ) -> reqsign_core::Result<Self> {
         let get = |key: &str| {
             profile
@@ -97,8 +98,8 @@ impl Sso {
             account: get("sso_account_id").unwrap_or_default().to_owned(),
             role: get("sso_role_name").unwrap_or_default().to_owned(),
             refresh,
-            role_retry: crate::cloud_aws_retry::Retry::new(ctx),
-            token_retry: crate::cloud_aws_retry::Retry::new(ctx),
+            role_retry: crate::cloud_aws_retry::Retry::configured(ctx, settings),
+            token_retry: crate::cloud_aws_retry::Retry::configured(ctx, settings),
         })
     }
 
