@@ -95,6 +95,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `tests/compatibility/` - Versioned client-driver and MySQL capability contract shared by the Go/Rust dataplane integration tests.
 - `tests/controlplane/cproute/api-differential/` - One test-only external router API input/output runner and its frozen acceptance/retirement inventories; synthetic adapter smoke does not qualify recorded-trace acceptance. Its `metrics/` package shares value-only query packets and decoding between recording and API replay; it owns no factor state. Its `clock/` package supplies the shared public event clock to test-build overlays only.
 - `tests/controlplane/` - Versioned Go control-plane contract and fault catalogs plus the payload-free observation comparator used by every Rust control-plane migration slice.
+- `tests/controlplane/cplog/` - Go lumberjack oracle and TZ-parameterized harness that pins the Rust log-rotation retention (local-time names, UTC age parse) to the Go logger.
 - `tests/dataplane/metrics/` - Recorded Rust metrics batches plus the Go `promhttp` oracle that pins the Rust native `/metrics` exposition to the Go output for the same series.
 - `tests/dataplane/corpus/` - Deterministic, language-neutral Go dataplane protocol corpus.
 - `tests/dataplane/differential/` - Go/Rust corpus comparator, first-divergence report, parity coverage/exclusion gate, mutation self-check, and sharded CI entrypoint.

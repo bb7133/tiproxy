@@ -108,6 +108,8 @@ jobs:
         run: make controlplane-cpmetrics-evidence
       - name: Check the native metrics exposition against the Go oracle
         run: make dataplane-metrics-parity
+      - name: Check log rotation retention against the Go lumberjack writer
+        run: make controlplane-cplog-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests

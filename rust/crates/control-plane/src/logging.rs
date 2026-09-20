@@ -21,8 +21,9 @@
 //! `max-size` megabytes first renames the current file to
 //! `<name>-<timestamp><ext>` and starts a new one, then prunes backups beyond
 //! `max-backups` and older than `max-days`. The backup timestamp uses the same
-//! `2006-01-02T15-04-05.000` layout in local time (`LocalTime: true` in the
-//! Go configuration), read through `chrono::Local`.
+//! `2006-01-02T15-04-05.000` layout rendered in local time (`LocalTime: true`
+//! in the Go configuration) and, exactly like lumberjack, parsed back as UTC
+//! when deciding `max-days` retention.
 //! Reconfiguration is atomic per line: a reload swaps the writer between two
 //! lines and never drops or duplicates one.
 
@@ -33,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+use chrono::{DateTime, Local, NaiveDateTime};
 
 /// `max-size` used when the configuration leaves it at zero (Go default).
 pub const DEFAULT_MAX_SIZE_MB: u64 = 300;
@@ -104,6 +105,22 @@ pub fn configure(settings: Option<&LogFileSettings>) -> Result<(), String> {
     };
     *guard = next;
     Ok(())
+}
+
+/// Forces a rotation of the configured log file (lumberjack `Rotate`): the
+/// current file becomes a backup and pruning runs. A stderr output is a no-op.
+///
+/// # Errors
+///
+/// Returns the rotation error; the output stays configured.
+pub fn rotate_now() -> Result<(), String> {
+    let mut guard = output()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &mut *guard {
+        Output::Stderr => Ok(()),
+        Output::File(file) => file.rotate().map_err(|error| error.to_string()),
+    }
 }
 
 /// Size-rotated log file with lumberjack-compatible naming and pruning.
@@ -308,17 +325,18 @@ pub fn format_backup_timestamp(at: SystemTime) -> String {
         .to_string()
 }
 
-/// Parses the backup timestamp layout as local time (Go's
-/// `time.ParseInLocation(..., time.Local)`) into milliseconds since the
-/// epoch; an ambiguous wall-clock time takes its earlier instant.
+/// Parses the backup timestamp layout into milliseconds since the epoch the
+/// way lumberjack's `timeFromName` does: with `time.Parse`, which reads a
+/// zone-less name as UTC even though the name was rendered in local time.
+/// Age pruning therefore keeps lumberjack's exact retention boundary in
+/// non-UTC zones; this is a deliberate reproduction of the Go behaviour.
 #[must_use]
 pub fn parse_backup_timestamp(stamp: &str) -> Option<u128> {
     if stamp.len() != BACKUP_TIMESTAMP_LEN || !stamp.is_ascii() {
         return None;
     }
     let naive = NaiveDateTime::parse_from_str(stamp, BACKUP_TIMESTAMP_FORMAT).ok()?;
-    let local = Local.from_local_datetime(&naive).earliest()?;
-    u128::try_from(local.timestamp_millis()).ok()
+    u128::try_from(naive.and_utc().timestamp_millis()).ok()
 }
 
 #[cfg(test)]
@@ -375,9 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_round_trip_through_the_lumberjack_layout_in_local_time() {
+    fn backup_names_render_local_time_and_are_parsed_as_utc_like_lumberjack() {
         for millis in [
-            0_u128,
+            86_400_000_u128,
             1_700_000_000_123,
             951_782_400_000,
             4_107_542_399_999,
@@ -385,12 +403,29 @@ mod tests {
             let at = UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).unwrap_or(0));
             let text = format_backup_timestamp(at);
             assert_eq!(text.len(), BACKUP_TIMESTAMP_LEN, "{text}");
-            assert_eq!(&text[10..11], "T");
-            assert_eq!(parse_backup_timestamp(&text), Some(millis), "{text}");
-            // The rendered wall clock is the local one, not UTC.
-            let expected = DateTime::<Local>::from(at);
-            assert_eq!(text, expected.format("%Y-%m-%dT%H-%M-%S%.3f").to_string());
+            assert_eq!(
+                text,
+                DateTime::<Local>::from(at)
+                    .format("%Y-%m-%dT%H-%M-%S%.3f")
+                    .to_string(),
+                "names carry the local wall clock"
+            );
+            // Parsing is zone-less (Go time.Parse): the local wall clock is
+            // read back as if it were UTC, so the round trip differs from the
+            // original instant by exactly the local offset at that time.
+            let offset_millis =
+                i128::from(DateTime::<Local>::from(at).offset().local_minus_utc()) * 1000;
+            let parsed = parse_backup_timestamp(&text).map(i128::try_from);
+            assert_eq!(
+                parsed,
+                Some(Ok(i128::try_from(millis).unwrap_or(0) + offset_millis)),
+                "{text}"
+            );
         }
+        assert_eq!(
+            parse_backup_timestamp("2023-11-14T22-13-20.123"),
+            Some(1_700_000_000_123)
+        );
         assert_eq!(parse_backup_timestamp("2023-11-14T22-13-20"), None);
         assert_eq!(parse_backup_timestamp("2023-13-14T22-13-20.123"), None);
         assert_eq!(parse_backup_timestamp("2023-11-14 22-13-20.123"), None);
