@@ -28,6 +28,7 @@ mod cloud_aws_retry;
 mod cloud_aws_retry_config;
 mod cloud_aws_sso;
 mod cloud_azure;
+mod cloud_azure_date;
 mod cloud_azure_identity;
 mod cloud_azure_managed;
 mod cloud_context;

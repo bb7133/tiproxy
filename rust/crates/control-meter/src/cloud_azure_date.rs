@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Acceptance rules for typed Azure RFC1123 response metadata.
-//! No offset is calculated: metering only needs to know whether parsing succeeds.
+//! Go RFC1123 metadata acceptance and UTC-host retry timestamp interpretation.
 
-pub(super) fn valid(value: &str) -> bool {
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+pub(crate) fn valid(value: &str) -> bool {
     if value.trim() != value || value.contains(['\t', '\r', '\n']) {
         return false;
     }
@@ -33,11 +36,7 @@ pub(super) fn valid(value: &str) -> bool {
     {
         return false;
     }
-    let Some(month) = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ]
-    .iter()
-    .position(|v| v.eq_ignore_ascii_case(month)) else {
+    let Some(month) = MONTHS.iter().position(|v| v.eq_ignore_ascii_case(month)) else {
         return false;
     };
     let number = |value: &str| {
@@ -111,4 +110,29 @@ fn valid_zone(zone: &str) -> bool {
     }
     zone.bytes().all(|b| b.is_ascii_uppercase())
         && (zone.len() == 3 || ((4..=5).contains(&zone.len()) && zone.ends_with('T')))
+}
+
+/// With Go time.Local=UTC, accepted named zones (even GMT+1) preserve the
+/// parsed wall-clock instant. Go only changes the location attached to that
+/// instant for an unknown abbreviation. Resolving known host-local zone names
+/// on non-UTC hosts is a separate, documented platform boundary.
+pub(crate) fn parse_utc(value: &str) -> Option<azure_core::time::OffsetDateTime> {
+    if !valid(value) {
+        return None;
+    }
+    let fields: Vec<_> = value.split(' ').filter(|s| !s.is_empty()).collect();
+    let [_, day, month, year, clock, _] = fields.as_slice() else {
+        return None;
+    };
+    let month = MONTHS.iter().position(|v| v.eq_ignore_ascii_case(month))? + 1;
+    let clock: Vec<_> = clock.split(':').collect();
+    let [hour, minute, second] = clock.as_slice() else {
+        return None;
+    };
+    let (second, fraction) = second.split_once(['.', ',']).unwrap_or((second, "0"));
+    let fraction = &fraction[..fraction.len().min(9)];
+    azure_core::time::parse_rfc3339(&format!(
+        "{year}-{month:02}-{day}T{hour:0>2}:{minute}:{second}.{fraction}Z"
+    ))
+    .ok()
 }

@@ -593,6 +593,27 @@ validation passes. Two extra fixed-time SharedKey signatures cover nonzero pad
 bits, bringing that fixture to seven byte-equal signatures. HTTP Retry-After
 clock interpretation remains separate from metadata acceptance.
 
+Retry-After now shares the RFC1123 grammar and preserves timestamp interpretation
+for Go hosts with `time.Local=UTC`, including unknown abbreviations and Go's
+GMT signed-hour behavior. Fractional seconds truncate to nanoseconds. The native
+parser uses this UTC-host interpretation; Go's lookup of recognized abbreviations
+in a non-UTC host zone remains an explicit platform gap.
+
+Integer retry hints now follow the pinned 64-bit Go behavior: `Atoi` range errors
+still return a saturated positive integer, multiplication into nanosecond durations
+wraps, and a nonpositive wrapped result selects normal backoff without falling
+through to a lower-priority retry header. Positive hints still stop at the same
+60-second cap.
+
+The expanded actual provider fixture contains 519 cases: all previous 243 remain
+unchanged, plus 116 retry dates, 144 integer hints and 16 precedence cases across
+HEAD and PUT. Date rows additionally compare exact parsed epoch seconds and
+nanoseconds. Eight positive wrapped delays are captured from the real SDK's public
+retry logger and checked against the native sleep, allowing only Tokio's 1ms timer
+rounding. Future dates use year2100 so the real SDK rejects delays above its cap
+without waiting; past and malformed values use ordinary shortened backoff. No
+SDK clock or source is patched. This does not qualify non-UTC host zone lookup.
+
 Managed identity caches are keyed by resource. Nonempty CAE claims bypass the
 cached token and replace it on success; claims are not sent to the metadata
 endpoint, matching MSAL. Developer and OAuth credentials cache tokens in the outer bearer
@@ -653,8 +674,8 @@ increment and remain open. The regex and permissive base64 dependencies reuse
 package versions already in Cargo.lock; this OAuth increment adds no dependency.
 
 Full default-credential/endpoint edge parity remains in progress, including
-general HTTP date/Retry-After clock interpretation, endpoint and platform
-transport edges. Export failure retains the pending
+general HTTP date and non-UTC host-zone Retry-After interpretation, endpoint
+and platform transport edges. Export failure retains the pending
 window for the next metering attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,

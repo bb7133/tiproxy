@@ -381,16 +381,21 @@ pub(crate) fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
         let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) else {
             continue;
         };
-        if let Ok(number) = value.parse::<u64>()
-            && number > 0
-        {
-            return Some(if milliseconds {
-                Duration::from_millis(number)
+        if let Some(number) = positive_go_integer(value) {
+            // azcore ignores Atoi's error, then multiplies signed int64
+            // durations with wrapping. Even a nonpositive wrapped result
+            // stops header fallback; the caller uses its normal backoff.
+            let nanos = number.wrapping_mul(if milliseconds {
+                1_000_000
             } else {
-                Duration::from_secs(number)
+                1_000_000_000
             });
+            return u64::try_from(nanos)
+                .ok()
+                .filter(|n| *n > 0)
+                .map(Duration::from_nanos);
         }
-        if !milliseconds && let Ok(date) = azure_core::time::parse_rfc7231(value) {
+        if !milliseconds && let Some(date) = crate::cloud_azure_date::parse_utc(value) {
             let delta = date - OffsetDateTime::now_utc();
             if delta.is_positive() {
                 return Duration::try_from(delta).ok();
@@ -398,6 +403,30 @@ pub(crate) fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
         }
     }
     None
+}
+
+/// The positive result of Go Atoi on our 64-bit targets, including `ErrRange`'s
+/// saturated value. Scan as uint64 first: syntax after signed overflow still
+/// fails, but syntax after unsigned overflow is never reached by Go `ParseUint`.
+fn positive_go_integer(value: &str) -> Option<i64> {
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    if digits.is_empty() {
+        return None;
+    }
+    let mut number = 0_u64;
+    for digit in digits.bytes() {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        let Some(next) = number
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(digit - b'0')))
+        else {
+            return Some(i64::MAX);
+        };
+        number = next;
+    }
+    (number > 0).then(|| i64::try_from(number).unwrap_or(i64::MAX))
 }
 
 fn sensitive(value: &str) -> azure_core::Result<http::HeaderValue> {

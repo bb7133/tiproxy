@@ -21,8 +21,7 @@ use reqsign_core::{Context, hash::base64_encode};
 use reqwest::Url;
 use std::time::Duration;
 
-#[path = "cloud_azure_date.rs"]
-mod metadata_date;
+use crate::cloud_azure_date as metadata_date;
 
 const BLOCK_SIZE: usize = 1024 * 1024;
 fn failed() -> Error {
@@ -328,6 +327,12 @@ mod tests {
         attempts: Vec<Attempt>,
         error: bool,
         exists: bool,
+        #[serde(default)]
+        date_seconds: Option<i64>,
+        #[serde(default)]
+        date_nanos: u32,
+        #[serde(default)]
+        delay_nanos: Option<u64>,
     }
     #[derive(Default)]
     struct State {
@@ -464,8 +469,23 @@ mod tests {
     async fn retry_stream_blocks_and_results_match_real_go_provider() {
         let rows: Vec<Row> = serde_json::from_str(include_str!("../testdata/azure-object-go.json"))
             .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 243);
+        assert_eq!(rows.len(), 519);
         for row in rows {
+            if row.name.starts_with("retry-date-") {
+                let date = metadata_date::parse_utc(&row.responses[0].headers["retry-after"]);
+                assert_eq!(
+                    date.map(azure_core::time::OffsetDateTime::unix_timestamp),
+                    row.date_seconds,
+                    "{}",
+                    row.name
+                );
+                assert_eq!(
+                    date.map_or(0, azure_core::time::OffsetDateTime::nanosecond),
+                    row.date_nanos,
+                    "{}",
+                    row.name
+                );
+            }
             let io = Io::default();
             {
                 let mut state = io.0.lock().unwrap_or_else(|e| unreachable!("{e}"));
@@ -488,10 +508,21 @@ mod tests {
                 url.set_query(Some("sig=fake&sp=rw&sv=2025-11-05"));
             }
             let method: Method = row.method.parse().unwrap_or_else(|e| unreachable!("{e}"));
+            let started = tokio::time::Instant::now();
             let result = signer
                 .request(&context, method.clone(), &url, vec![b'p'; row.size].into())
                 .await;
             let label = format!("{} {}", row.method, row.name);
+            if let Some(nanos) = row.delay_nanos {
+                // Tokio rounds timers to milliseconds; compare its actual
+                // elapsed sleep with the real Go policy's captured delay.
+                let elapsed = started.elapsed();
+                let expected = Duration::from_nanos(nanos);
+                assert!(
+                    elapsed >= expected && elapsed - expected <= Duration::from_millis(1),
+                    "{label}: {elapsed:?} != {expected:?}"
+                );
+            }
             assert_eq!(result.is_err(), row.error, "{label}");
             if method == Method::HEAD {
                 assert_eq!(result.is_ok_and(|s| s.is_success()), row.exists, "{label}");
