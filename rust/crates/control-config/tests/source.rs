@@ -774,6 +774,7 @@ fn debug_output_redacts_metering_credentials() {
         br#"
 [metering]
 type = "s3"
+endpoint = "https://store.invalid/?sig=endpoint-secret"
 [metering.aws]
 access-key = "AKIA-DO-NOT-LOG"
 secret-access-key = "super-secret"
@@ -787,6 +788,7 @@ session-token = "temporary-secret"
     assert!(!debug.contains("AKIA-DO-NOT-LOG"));
     assert!(!debug.contains("super-secret"));
     assert!(!debug.contains("temporary-secret"));
+    assert!(!debug.contains("endpoint-secret"));
 }
 
 #[test]

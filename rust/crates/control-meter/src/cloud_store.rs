@@ -584,6 +584,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn s3_addressing_matches_pinned_go_sdk_requests() {
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../testdata/s3-addressing-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(rows.len(), 9);
+        for row in rows {
+            let config = MeteringConfig {
+                provider_type: "s3".into(),
+                region: "us-east-1".into(),
+                endpoint: row["endpoint"].as_str().unwrap_or_default().into(),
+                bucket: row["bucket"].as_str().unwrap_or_default().into(),
+                prefix: "prefix space/%text".into(),
+                aws: Some(AwsMeteringConfig {
+                    access_key: "fake-id".into(),
+                    secret_access_key: "fake-secret".into(),
+                    s3_force_path_style: row["force"].as_bool().unwrap_or(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let client = Client::new();
+            let ctx = cloud_context::context(client.clone()).with_env(StaticEnv::default());
+            let store = CloudStore::with_context(&config, client, ctx)
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            assert_eq!(
+                store
+                    .object_url("key")
+                    .unwrap_or_else(|e| unreachable!("{e}"))
+                    .as_str(),
+                row["url"].as_str().unwrap_or_default()
+            );
+        }
+    }
+
     #[derive(Clone, Debug, Default)]
     struct RoleFixture(std::sync::Arc<std::sync::Mutex<Vec<Request<bytes::Bytes>>>>);
     impl reqsign_core::HttpSend for RoleFixture {

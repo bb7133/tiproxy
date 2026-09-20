@@ -32,7 +32,9 @@ import (
 type fixedHeaders struct{}
 
 func (fixedHeaders) Do(r *policy.Request) (*http.Response, error) {
-	r.Raw().Header.Set("x-ms-date", "Tue, 14 Nov 2023 22:13:20 GMT")
+	// The pinned SDK checks the raw lowercase map key before adding its date.
+	// Header.Set canonicalizes it and therefore does not pin the signing date.
+	r.Raw().Header["x-ms-date"] = []string{"Tue, 14 Nov 2023 22:13:20 GMT"}
 	r.Raw().Header.Set("x-ms-client-request-id", "fixed-request-id")
 	return r.Next()
 }

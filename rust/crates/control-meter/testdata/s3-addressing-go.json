@@ -1,0 +1,56 @@
+[
+  {
+    "endpoint": "",
+    "bucket": "bucket",
+    "force": false,
+    "url": "https://bucket.s3.us-east-1.amazonaws.com/prefix%20space/%25text/key"
+  },
+  {
+    "endpoint": "https://store.invalid",
+    "bucket": "bucket",
+    "force": false,
+    "url": "https://bucket.store.invalid/prefix%20space/%25text/key"
+  },
+  {
+    "endpoint": "http://store.invalid:9000/base",
+    "bucket": "bucket",
+    "force": true,
+    "url": "http://store.invalid:9000/base/bucket/prefix%20space/%25text/key"
+  },
+  {
+    "endpoint": "http://127.0.0.1:9000/base",
+    "bucket": "bucket",
+    "force": false,
+    "url": "http://127.0.0.1:9000/base/bucket/prefix%20space/%25text/key"
+  },
+  {
+    "endpoint": "https://store.invalid",
+    "bucket": "bucket.dotted",
+    "force": false,
+    "url": "https://store.invalid/bucket.dotted/prefix%20space/%25text/key"
+  },
+  {
+    "endpoint": "http://store.invalid",
+    "bucket": "bucket.dotted",
+    "force": false,
+    "url": "http://bucket.dotted.store.invalid/prefix%20space/%25text/key"
+  },
+  {
+    "endpoint": "https://store.invalid",
+    "bucket": "Bucket_Upper",
+    "force": false,
+    "url": "https://store.invalid/Bucket_Upper/prefix%20space/%25text/key"
+  },
+  {
+    "endpoint": "https://store.invalid",
+    "bucket": "192.168.1.1",
+    "force": false,
+    "url": "https://store.invalid/192.168.1.1/prefix%20space/%25text/key"
+  },
+  {
+    "endpoint": "https://store.invalid",
+    "bucket": "ab",
+    "force": false,
+    "url": "https://store.invalid/ab/prefix%20space/%25text/key"
+  }
+]

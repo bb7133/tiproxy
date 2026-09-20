@@ -1884,7 +1884,7 @@ impl fmt::Debug for MeteringConfig {
             .field("region", &self.region)
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
-            .field("endpoint", &self.endpoint)
+            .field("has_endpoint", &!self.endpoint.is_empty())
             .field("has_aws", &self.aws.is_some())
             .field("has_oss", &self.oss.is_some())
             .field("has_cos", &self.cos.is_some())

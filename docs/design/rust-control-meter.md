@@ -27,8 +27,9 @@ the token environment variable; explicit configured session tokens still work.
 
 Seven focused cloud tests exercise real local HTTP HEAD/PUT, key escaping,
 session tokens, existing/denied objects, AWS/OSS role replacement and caching,
-COS profile/CVM/TKE sources, and role refresh failure/expiration. COS STS TC3
-signatures match a request produced by the pinned Go Tencent SDK. Regenerate its
+COS profile/CVM/TKE sources, and role refresh failure/expiration. S3 endpoint/bucket addressing also matches nine
+actual Go SDK requests (default/custom/path style/IP/dotted/non-DNS names).
+COS STS TC3 signatures match a request produced by the pinned Go Tencent SDK. Regenerate its
 fixture from the repository root with:
 
 ```sh
@@ -36,7 +37,9 @@ go run rust/crates/control-meter/testdata/cos-sts-go.go
 ```
 
 Azure SharedKey signatures match actual HEAD/PUT requests from the pinned Go
-azblob SDK. SharedKey takes precedence over SAS; SAS query strings survive
+azblob SDK. This proves signature canonicalization; Azure treats the Go SDK
+URL escaped blob separators and Rust literal separators as the same blob.
+SharedKey takes precedence over SAS; SAS query strings survive
 container/prefix/key assembly. A metering-specific transport and bounded command
 executor serve the official Azure identity SDK. Environment secret, encrypted
 PEM/PFX certificate, username/password, workload assertion, VM/App Service managed
@@ -58,8 +61,7 @@ SDK does not implement Azure Arc, Azure ML, Cloud Shell or Service Fabric manage
 identity. Unsupported managed-identity construction stops authentication instead
 of falling through to a different identity. Those sources, managed-identity
 error classification and token refresh behavior must be reconciled with Go
-before selecting the native owner. AWS/OSS role refresh/fallback and S3 custom
-endpoint addressing also need complete Go comparisons.
+before selecting the native owner. AWS/OSS role refresh/fallback still needs complete Go comparisons.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would
