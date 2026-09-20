@@ -35,6 +35,9 @@ use http::{HeaderValue, StatusCode};
 use http_body_util::BodyExt;
 
 use crate::config::{CommitError, NAMESPACE_SCHEMA, SharedConfigAdmin, go_json_body};
+use crate::drain::{
+    DRAIN_SCHEMA, DrainRequest, DrainStartError, MAX_DRAIN_BUDGET_MS, SharedDrainAdmin,
+};
 use crate::health::{HealthInputs, HealthState, go_json_document, go_json_string};
 use control_config::NamespaceConfig;
 
@@ -110,6 +113,8 @@ pub struct AdminHooks {
     pub dataplane_status: Arc<dyn Fn() -> DataplaneStatus + Send + Sync>,
     /// Namespace and configuration storage.
     pub config: SharedConfigAdmin,
+    /// Local drain seam; `None` answers Go's `{"enabled":false}`.
+    pub drain: Option<SharedDrainAdmin>,
 }
 
 /// uber-go/ratelimit "leaky bucket with slack", the algorithm behind the Go
@@ -244,6 +249,11 @@ pub fn full_router(app: Arc<AdminApp>) -> Router {
         .route(
             "/api/dataplane/status",
             get(dataplane_status).head(not_found),
+        )
+        .route("/api/dataplane/drain", post(drain_start).head(not_found))
+        .route(
+            "/api/dataplane/drain/{id}",
+            get(drain_status).head(not_found),
         )
         // gin registers the group roots with a trailing slash and redirects
         // the bare path; both forms are served directly here (declared).
@@ -451,6 +461,131 @@ async fn metrics(State(app): State<Arc<AdminApp>>) -> Response {
 
 async fn dataplane_status(State(app): State<Arc<AdminApp>>) -> Response {
     json(StatusCode::OK, &(app.hooks.dataplane_status)().to_json())
+}
+
+// ---- operator drain (Go pkg/server/api/dataplane.go) ----
+
+/// gin's validator message for the required `drain_id`.
+const DRAIN_ID_REQUIRED: &str = "Key: 'drainRequestBody.DrainID' Error:Field validation for 'DrainID' failed on the 'required' tag";
+
+async fn drain_start(State(app): State<Arc<AdminApp>>, request: Request) -> Response {
+    let Some(drain) = app.hooks.drain.as_ref() else {
+        return json(StatusCode::NOT_FOUND, "{\"enabled\":false}");
+    };
+    let Some(body) = read_body(request).await else {
+        return json(
+            StatusCode::BAD_REQUEST,
+            &error_body("request body too large"),
+        );
+    };
+    // gin ShouldBindJSON: decode errors carry the decoder's message; the
+    // `required` tag on drain_id is reported through the validator.
+    let decoded = match go_json_body(&body, DRAIN_SCHEMA) {
+        Ok(Some(value)) => value,
+        Ok(None) => serde_json::json!({}),
+        Err(error) => return json(StatusCode::BAD_REQUEST, &error_body(&error.to_string())),
+    };
+    let field_str = |name: &str| {
+        decoded
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let field_list = |name: &str| -> Vec<String> {
+        decoded
+            .get(name)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let field_int = |name: &str| {
+        decoded
+            .get(name)
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    };
+    let drain_id = field_str("drain_id");
+    if drain_id.is_empty() {
+        return json(StatusCode::BAD_REQUEST, &error_body(DRAIN_ID_REQUIRED));
+    }
+    // Validate the raw millisecond inputs before any conversion, exactly
+    // as Go does: negative is a client error, each value and the sum must
+    // fit the shared 30-day cap so the conversion can never overflow.
+    let (graceful, force) = (field_int("graceful_wait_ms"), field_int("force_timeout_ms"));
+    if graceful < 0
+        || force < 0
+        || graceful > MAX_DRAIN_BUDGET_MS
+        || force > MAX_DRAIN_BUDGET_MS
+        || graceful > MAX_DRAIN_BUDGET_MS - force
+    {
+        return json(
+            StatusCode::BAD_REQUEST,
+            &error_body(&format!(
+                "graceful_wait_ms and force_timeout_ms must be within [0, {MAX_DRAIN_BUDGET_MS}] (30 days)"
+            )),
+        );
+    }
+    let request = DrainRequest {
+        drain_id: drain_id.clone(),
+        listener_names: field_list("listener_names"),
+        backend_ids: field_list("backend_ids"),
+        graceful_wait: Duration::from_millis(graceful.unsigned_abs()),
+        force_timeout: Duration::from_millis(force.unsigned_abs()),
+    };
+    match drain.start(request).await {
+        Ok(()) => json(
+            StatusCode::ACCEPTED,
+            &format!("{{\"drain_id\":{}}}", go_json_string(&drain_id)),
+        ),
+        Err(error @ DrainStartError::InvalidBudget) => {
+            json(StatusCode::BAD_REQUEST, &error_body(&error.message()))
+        }
+        Err(error @ (DrainStartError::NoSession | DrainStartError::SnapshotNotReady)) => json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &error_body(&error.message()),
+        ),
+        Err(error @ (DrainStartError::InProgress | DrainStartError::ForeignActive)) => {
+            json(StatusCode::CONFLICT, &error_body(&error.message()))
+        }
+        Err(error @ DrainStartError::Other(_)) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error_body(&error.message()),
+        ),
+    }
+}
+
+async fn drain_status(State(app): State<Arc<AdminApp>>, Path(id): Path<String>) -> Response {
+    let Some(drain) = app.hooks.drain.as_ref() else {
+        return json(StatusCode::NOT_FOUND, "{\"enabled\":false}");
+    };
+    let Some(progress) = drain.status(id.clone()).await else {
+        return json(StatusCode::NOT_FOUND, "{\"known\":false}");
+    };
+    // gin.H is a map: keys are emitted in sorted order.
+    json(
+        StatusCode::OK,
+        &format!(
+            "{{\"active_connections\":{},\"code\":{},\"complete\":{},\"detail\":{},\"drain_id\":{},\"force_closed\":{},\"gracefully_closed\":{}}}",
+            progress.active_connections,
+            go_json_string(&progress.code),
+            progress.complete,
+            go_json_string(&progress.detail),
+            go_json_string(&id),
+            progress.force_closed,
+            progress.gracefully_closed,
+        ),
+    )
+}
+
+fn error_body(message: &str) -> String {
+    format!("{{\"error\":{}}}", go_json_string(message))
 }
 
 // ---- namespaces (Go pkg/server/api/namespace.go) ----
@@ -690,6 +825,7 @@ impl AdminHooks {
             metrics_text: Arc::new(move || metrics.clone()),
             dataplane_status: Arc::new(move || status.clone()),
             config,
+            drain: None,
         }
     }
 }
@@ -1132,6 +1268,143 @@ mod tests {
         let (_, _, body) =
             oneshot(router, request("GET", "/api/admin/config/?format=json", "")).await;
         assert!(body.contains("\"max-connections\":123"), "{body}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn drain_endpoints_follow_the_go_status_mapping() {
+        use crate::drain::{DrainProgress, DrainStartError, ScriptedDrainAdmin};
+        let router = full_router(app(true));
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request("POST", "/api/dataplane/drain", "{\"drain_id\":\"d\"}"),
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::NOT_FOUND, "{\"enabled\":false}")
+        );
+        let (status, _, body) = oneshot(router, request("GET", "/api/dataplane/drain/d", "")).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::NOT_FOUND, "{\"enabled\":false}")
+        );
+
+        let drain = Arc::new(ScriptedDrainAdmin::default());
+        let mut hooks = AdminHooks::fixed(
+            HealthInputs::default(),
+            String::new(),
+            DataplaneStatus::default(),
+            memory(),
+        );
+        hooks.drain = Some(Arc::clone(&drain) as SharedDrainAdmin);
+        let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
+        app.mark_ready();
+        let router = full_router(app);
+        for (body, expected) in [
+            ("{}", DRAIN_ID_REQUIRED.to_owned()),
+            (
+                "{\"drain_id\":\"d\",\"graceful_wait_ms\":-1}",
+                format!(
+                    "graceful_wait_ms and force_timeout_ms must be within [0, {MAX_DRAIN_BUDGET_MS}] (30 days)"
+                ),
+            ),
+            (
+                "{\"drain_id\":\"d\",\"graceful_wait_ms\":9223372036854775807}",
+                format!(
+                    "graceful_wait_ms and force_timeout_ms must be within [0, {MAX_DRAIN_BUDGET_MS}] (30 days)"
+                ),
+            ),
+            (
+                "{\"drain_id\":\"d\",\"graceful_wait_ms\":1728000000,\"force_timeout_ms\":1728000000}",
+                format!(
+                    "graceful_wait_ms and force_timeout_ms must be within [0, {MAX_DRAIN_BUDGET_MS}] (30 days)"
+                ),
+            ),
+        ] {
+            let (status, content_type, actual) = oneshot(
+                router.clone(),
+                request("POST", "/api/dataplane/drain", body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(content_type, JSON_CONTENT_TYPE);
+            assert_eq!(
+                actual,
+                format!("{{\"error\":{}}}", go_json_string(&expected)),
+                "{body}"
+            );
+        }
+        assert!(
+            drain.requests().is_empty(),
+            "invalid budgets never reach the seam"
+        );
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request(
+                "POST",
+                "/api/dataplane/drain",
+                "{\"drain_id\":\"d\",\"listener_names\":[\"sql-0\"],\"graceful_wait_ms\":2591999000,\"force_timeout_ms\":1000}",
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::ACCEPTED, "{\"drain_id\":\"d\"}")
+        );
+        assert_eq!(
+            drain.requests()[0].graceful_wait,
+            Duration::from_millis(2_591_999_000)
+        );
+        for (outcome, code) in [
+            (DrainStartError::InvalidBudget, StatusCode::BAD_REQUEST),
+            (DrainStartError::NoSession, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                DrainStartError::SnapshotNotReady,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (DrainStartError::InProgress, StatusCode::CONFLICT),
+            (DrainStartError::ForeignActive, StatusCode::CONFLICT),
+            (
+                DrainStartError::Other("boom".to_owned()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            drain.push_start(Err(outcome.clone()));
+            let (status, _, body) = oneshot(
+                router.clone(),
+                request("POST", "/api/dataplane/drain", "{\"drain_id\":\"d\"}"),
+            )
+            .await;
+            assert_eq!(status, code, "{outcome:?}");
+            assert_eq!(
+                body,
+                format!("{{\"error\":{}}}", go_json_string(&outcome.message()))
+            );
+        }
+        let (status, _, body) =
+            oneshot(router.clone(), request("GET", "/api/dataplane/drain/d", "")).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::NOT_FOUND, "{\"known\":false}")
+        );
+        drain.set_status(
+            "d",
+            DrainProgress {
+                active_connections: 2,
+                gracefully_closed: 1,
+                force_closed: 1,
+                complete: true,
+                code: "ERROR_CODE_OK".to_owned(),
+                detail: String::new(),
+            },
+        );
+        let (status, _, body) = oneshot(router, request("GET", "/api/dataplane/drain/d", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            "{\"active_connections\":2,\"code\":\"ERROR_CODE_OK\",\"complete\":true,\"detail\":\"\",\"drain_id\":\"d\",\"force_closed\":1,\"gracefully_closed\":1}"
+        );
     }
 
     #[test]

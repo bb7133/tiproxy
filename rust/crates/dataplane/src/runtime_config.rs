@@ -73,12 +73,42 @@ struct GenerationStatusInner {
 }
 
 /// Cloneable status reader shared with diagnostics/metrics exporters.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GenerationStatus {
     inner: Arc<StdMutex<GenerationStatusInner>>,
+    /// Latest composition generation actually installed by a successful
+    /// serving apply (bridge bind/apply or recomposition). CP-ADMIN maps it
+    /// back to the CP-CFG generation it was composed from.
+    applied_composition: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for GenerationStatus {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            applied_composition: tokio::sync::watch::channel(0).0,
+        }
+    }
 }
 
 impl GenerationStatus {
+    /// Observes every composition generation a successful apply installed.
+    #[must_use]
+    pub fn applied_composition_generation(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.applied_composition.subscribe()
+    }
+
+    fn record_applied_composition(&self, generation: u64) {
+        self.applied_composition.send_if_modified(|current| {
+            if generation > *current {
+                *current = generation;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     /// Returns one coherent observation.
     #[must_use]
     pub fn snapshot(&self) -> GenerationStatusSnapshot {
@@ -103,6 +133,8 @@ impl GenerationStatus {
         inner.last_good_at = Some(Instant::now());
         if composition_generation != 0 {
             inner.composition_generation = composition_generation;
+            drop(inner);
+            self.record_applied_composition(composition_generation);
         }
     }
 
@@ -117,6 +149,8 @@ impl GenerationStatus {
         inner.composition_generation = generation;
         inner.composition_applied_total = inner.composition_applied_total.saturating_add(1);
         inner.last_good_at = Some(Instant::now());
+        drop(inner);
+        self.record_applied_composition(generation);
     }
 
     fn composition_rejected(&self, generation: u64) {
@@ -324,6 +358,13 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
 }
 
 impl DataplaneServingHandle {
+    /// Observes every composition generation a successful serving apply
+    /// installed (initial bind, bridge apply, and recomposition alike).
+    #[must_use]
+    pub fn applied_composition_generation(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.status.applied_composition_generation()
+    }
+
     /// Returns the current serving-generation status.
     #[must_use]
     pub fn status(&self) -> GenerationStatusSnapshot {
@@ -455,4 +496,34 @@ fn lock_std<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GenerationStatus;
+
+    /// Every successful apply path (bridge bind/apply with a composition,
+    /// and recomposition) publishes the installed composition generation
+    /// monotonically; a bridge apply without a composition leaves it.
+    #[test]
+    fn applied_composition_watch_follows_every_successful_apply() {
+        let status = GenerationStatus::default();
+        let watch = status.applied_composition_generation();
+        assert_eq!(*watch.borrow(), 0);
+        status.applied(1, 0);
+        assert_eq!(
+            *watch.borrow(),
+            0,
+            "legacy one-source apply carries no composition"
+        );
+        status.applied(2, 1);
+        assert_eq!(*watch.borrow(), 1, "initial bind records its composition");
+        status.composition_applied(2);
+        assert_eq!(*watch.borrow(), 2, "recomposition records its composition");
+        status.composition_applied(1);
+        assert_eq!(*watch.borrow(), 2, "never moves backwards");
+        status.rejected(5);
+        status.composition_rejected(9);
+        assert_eq!(*watch.borrow(), 2, "rejections never confirm");
+    }
 }

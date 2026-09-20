@@ -20,6 +20,10 @@ Every step compares `status`, `content_type` and `body` unless its entry lists
 owns (`docs/design/rust-control-admin.md`); it is reported, and the comparison
 fails if such a step stops differing, so declarations cannot go stale.
 
+`compare.py` decodes TOML with the standard `tomllib`, so the runner needs a
+Python 3.11+ interpreter (it probes `python3.13`, `python3.12`, `python3.11`,
+`python3`, or honours `PYTHON`).
+
 ```sh
 make controlplane-cpadmin-evidence
 # or

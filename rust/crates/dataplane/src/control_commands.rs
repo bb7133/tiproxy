@@ -863,6 +863,14 @@ impl CommandGate {
         DrainAdmission::Start
     }
 
+    /// Highest drain command sequence ever admitted (the obsolescence
+    /// watermark). A local issuer allocates `watermark + 1` so bridge and
+    /// local drains share one monotonic lineage.
+    #[must_use]
+    pub const fn drain_watermark(&self) -> u64 {
+        self.drain_watermark
+    }
+
     /// Whether a live session (by listener name and current backend) is
     /// inside the active drain's scope. An empty selector list matches
     /// everything (whole-proxy drain).

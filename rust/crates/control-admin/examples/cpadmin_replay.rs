@@ -32,8 +32,8 @@ use axum::body::Body;
 use axum::extract::Request;
 use control_admin::router::oneshot;
 use control_admin::{
-    AdminApp, AdminHooks, DataplaneStatus, HealthInputs, HealthState, MemoryConfigAdmin,
-    full_router,
+    AdminApp, AdminHooks, DataplaneStatus, DrainProgress, DrainStartError, HealthInputs,
+    HealthState, MemoryConfigAdmin, ScriptedDrainAdmin, full_router,
 };
 use control_config::EffectiveConfig;
 use serde_json::{Value, json};
@@ -85,6 +85,10 @@ async fn main() {
         server_config.clone(),
         current_dir.clone(),
     ));
+    // The drain seam is scripted by the same actions the Go capture applies
+    // to its stub drainer, so the HTTP mapping is compared one to one.
+    let drainer = Arc::new(ScriptedDrainAdmin::default());
+    let drain_enabled = Arc::new(AtomicBool::new(false));
     let hooks = {
         let health = Arc::clone(&shared);
         let status = Arc::clone(&shared);
@@ -106,16 +110,67 @@ async fn main() {
                 status.dataplane.lock().unwrap().clone().unwrap_or_default()
             }),
             config: config_admin,
+            drain: None,
         }
     };
-    let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
-    let router = full_router(Arc::clone(&app));
+    let hooks_with_drain = AdminHooks {
+        drain: Some(Arc::clone(&drainer) as control_admin::SharedDrainAdmin),
+        ..hooks.clone()
+    };
+    let health_state = HealthState::new();
+    let app = Arc::new(AdminApp::new(hooks, health_state.clone()));
+    let app_with_drain = Arc::new(AdminApp::new(hooks_with_drain, health_state));
+    let router_without_drain = full_router(Arc::clone(&app));
+    let router_with_drain = full_router(Arc::clone(&app_with_drain));
 
     let mut observations = Vec::with_capacity(steps.len());
     for step in &steps {
         if let Some(action) = step.get("action") {
             if action.get("ready").and_then(Value::as_bool) == Some(true) {
                 app.mark_ready();
+                app_with_drain.mark_ready();
+            }
+            if let Some(drain) = action.get("drainer") {
+                drain_enabled.store(true, Ordering::SeqCst);
+                if let Some(start) = drain.get("start").and_then(Value::as_str) {
+                    drainer.push_start(match start {
+                        "ok" => Ok(()),
+                        "invalid_budget" => Err(DrainStartError::InvalidBudget),
+                        "no_session" => Err(DrainStartError::NoSession),
+                        "snapshot_not_ready" => Err(DrainStartError::SnapshotNotReady),
+                        "in_progress" => Err(DrainStartError::InProgress),
+                        "foreign_active" => Err(DrainStartError::ForeignActive),
+                        other => Err(DrainStartError::Other(other.to_owned())),
+                    });
+                }
+                if let Some(status) = drain.get("status").and_then(Value::as_object) {
+                    let number = |key: &str| status.get(key).and_then(Value::as_u64).unwrap_or(0);
+                    drainer.set_status(
+                        status
+                            .get("drain_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        DrainProgress {
+                            active_connections: number("active_connections"),
+                            gracefully_closed: number("gracefully_closed"),
+                            force_closed: number("force_closed"),
+                            complete: status
+                                .get("complete")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            code: status
+                                .get("code")
+                                .and_then(Value::as_str)
+                                .unwrap_or("ERROR_CODE_OK")
+                                .to_owned(),
+                            detail: status
+                                .get("detail")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        },
+                    );
+                }
             }
             if let Some(ready) = action.get("namespaces_ready").and_then(Value::as_bool) {
                 shared.namespaces_ready.store(ready, Ordering::SeqCst);
@@ -153,7 +208,12 @@ async fn main() {
                 step["body"].as_str().unwrap_or_default().to_owned(),
             ))
             .expect("request");
-        let (status, content_type, body) = oneshot(router.clone(), request).await;
+        let router = if drain_enabled.load(Ordering::SeqCst) {
+            router_with_drain.clone()
+        } else {
+            router_without_drain.clone()
+        };
+        let (status, content_type, body) = oneshot(router, request).await;
         observations.push(json!({
             "name": step["name"],
             "status": status.as_u16(),

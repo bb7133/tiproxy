@@ -37,8 +37,8 @@ use control_proto::v1::{
 use dataplane::MeteringLedger;
 use dataplane::control_dispatch::{
     CommandKind, CommandToken, ControlCommandHandler, DispatchFatal, DispatchNotice,
-    DispatchSender, InboundForwarder, ResponseKind, SessionDirective, TaggedEnvelope,
-    run_control_dispatch,
+    DispatchSender, InboundForwarder, LocalDrainOutcome, LocalDrainRequest, ResponseKind,
+    SessionDirective, TaggedEnvelope, run_control_dispatch,
 };
 use dataplane::session::SessionControl;
 use tokio::sync::{Notify, mpsc, watch};
@@ -4431,5 +4431,367 @@ async fn state_arm_reconcile_does_not_inherit_a_generation() {
         request.known_generation, 0,
         "B's reconcile does not inherit A's applied generation"
     );
+    harness.task.abort();
+}
+
+fn local_request(
+    caller: &str,
+    listeners: &[&str],
+    wait_ms: u64,
+    force_ms: u64,
+) -> LocalDrainRequest {
+    LocalDrainRequest {
+        caller_id: caller.to_owned(),
+        listener_names: listeners.iter().map(|name| (*name).to_owned()).collect(),
+        backend_ids: Vec::new(),
+        graceful_wait: Duration::from_millis(wait_ms),
+        force_timeout: Duration::from_millis(force_ms),
+    }
+}
+
+/// CP-ADMIN slice 3: a locally issued drain runs the same graceful → force
+/// lifecycle as a bridge drain, reports progress and the terminal through
+/// the local status query, and a replay of the same label is idempotent.
+#[tokio::test(start_paused = true)]
+#[allow(clippy::too_many_lines)]
+async fn local_drain_runs_graceful_then_force_and_replays_idempotently() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut a = register(&mut handler, 1, "sql-a", "tidb-a");
+    let mut b = register(&mut handler, 2, "sql-a", "tidb-a");
+    let mut other = register(&mut handler, 3, "sql-b", "tidb-a");
+    let now = Instant::now();
+    let now_ms: u64 = 1_000_000;
+
+    let (outcome, outbound) = handler.start_local_drain(
+        &local_request("op-1", &["sql-a"], 10_000, 10_000),
+        now,
+        now_ms,
+    );
+    assert!(
+        outbound.is_empty(),
+        "graceful start sends nothing to the wire"
+    );
+    let LocalDrainOutcome::Accepted {
+        wire_id,
+        command_sequence,
+    } = outcome
+    else {
+        unreachable!("first local drain is accepted: {outcome:?}")
+    };
+    assert!(wire_id.starts_with("op-1@"), "{wire_id}");
+    assert_eq!(
+        command_sequence, 1,
+        "first sequence above the empty watermark"
+    );
+    assert_eq!(
+        a.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
+    assert_eq!(
+        b.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
+    assert!(other.control.try_recv().is_err(), "out of scope untouched");
+    let status = handler
+        .local_drain_status("op-1")
+        .unwrap_or_else(|| unreachable!());
+    assert!(!status.complete);
+    assert_eq!(status.result.active_connections, 2);
+    assert_eq!(status.result.drain_id, wire_id);
+    assert!(handler.local_drain_status("nobody").is_none());
+
+    // Replaying the same label re-uses the binding and closes nothing twice.
+    let mut c = register(&mut handler, 4, "sql-a", "tidb-a");
+    let (replay, _) = handler.start_local_drain(
+        &local_request("op-1", &["sql-a"], 10_000, 10_000),
+        now,
+        now_ms,
+    );
+    assert_eq!(
+        replay,
+        LocalDrainOutcome::Accepted {
+            wire_id: wire_id.clone(),
+            command_sequence: 1
+        }
+    );
+    assert!(a.control.try_recv().is_err(), "no second GracefulClose");
+    assert!(
+        c.control.try_recv().is_err(),
+        "a later session is not selected by the replay"
+    );
+
+    // A different label while this drain runs is a local conflict.
+    let (conflict, _) =
+        handler.start_local_drain(&local_request("op-2", &[], 1_000, 1_000), now, now_ms);
+    assert_eq!(
+        conflict,
+        LocalDrainOutcome::DrainInProgress {
+            active: wire_id.clone()
+        }
+    );
+    assert!(
+        handler.local_drain_status("op-2").is_none(),
+        "a conflict binds nothing"
+    );
+
+    let _ = handler.session_closed(
+        1,
+        false,
+        ErrorSource::ClientNetwork,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    let force_by = now + Duration::from_secs(20);
+    let _ = handler.tick(force_by + Duration::from_millis(1));
+    assert_eq!(
+        b.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::CloseImmediate)
+    );
+    let closed = handler.session_closed(
+        2,
+        true,
+        ErrorSource::Proxy,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    assert_eq!(
+        closed.len(),
+        1,
+        "a local drain has no wire requester: only the CLOSED event goes out"
+    );
+    let status = handler
+        .local_drain_status("op-1")
+        .unwrap_or_else(|| unreachable!());
+    assert!(status.complete);
+    assert_eq!(status.result.gracefully_closed, 1);
+    assert_eq!(status.result.force_closed, 1);
+
+    // After completion the label still replays its terminal, and a new
+    // label may start (sequence 2 above the shared watermark).
+    let (replay, _) = handler.start_local_drain(
+        &local_request("op-1", &["sql-a"], 10_000, 10_000),
+        force_by,
+        now_ms + 20_002,
+    );
+    assert!(matches!(
+        replay,
+        LocalDrainOutcome::Accepted {
+            command_sequence: 1,
+            ..
+        }
+    ));
+    assert!(
+        handler
+            .local_drain_status("op-1")
+            .is_some_and(|s| s.complete)
+    );
+    let (next, _) = handler.start_local_drain(
+        &local_request("op-2", &["no-such-listener"], 0, 0),
+        force_by,
+        now_ms + 20_003,
+    );
+    assert!(
+        matches!(
+            next,
+            LocalDrainOutcome::Accepted {
+                command_sequence: 2,
+                ..
+            }
+        ),
+        "{next:?}"
+    );
+    assert!(
+        handler
+            .local_drain_status("op-2")
+            .is_some_and(|s| s.complete && s.result.active_connections == 0)
+    );
+}
+
+/// Without an applied generation the drain is refused before any effect
+/// (Go `ErrSnapshotNotReady`).
+#[tokio::test(start_paused = true)]
+async fn local_drain_requires_an_applied_generation() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let (outcome, _) =
+        handler.start_local_drain(&local_request("op-1", &[], 0, 0), Instant::now(), 1_000_000);
+    assert_eq!(outcome, LocalDrainOutcome::SnapshotNotReady);
+    assert!(session.control.try_recv().is_err());
+    assert!(handler.local_drain_status("op-1").is_none());
+}
+
+/// Bridge and local drains share one sequence lineage through the gate
+/// watermark: a local drain takes the next sequence after a bridge drain,
+/// a bridge command at or below that watermark is obsolete, and a bridge
+/// drain still running is a foreign conflict for the local issuer.
+#[tokio::test(start_paused = true)]
+async fn local_and_bridge_drains_share_the_gate_lineage() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut a = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+    let now_ms: u64 = 1_000_000;
+
+    // Bridge drain sequence 1 on sql-a is active.
+    let bridge = DrainCommand {
+        drain_id: "go@inc-1".to_owned(),
+        listener_names: vec!["sql-a".to_owned()],
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: now_ms + 10_000,
+        force_deadline_unix_millis: now_ms + 20_000,
+        command_sequence: 1,
+    };
+    let _ = handler.handle_envelope(&envelope(30, 7, Body::DrainCommand(bridge)), now, now_ms);
+    assert_eq!(
+        a.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
+    let (foreign, _) = handler.start_local_drain(&local_request("op-1", &[], 0, 0), now, now_ms);
+    assert_eq!(
+        foreign,
+        LocalDrainOutcome::ForeignDrainActive {
+            active: "go@inc-1".to_owned()
+        }
+    );
+
+    // The bridge drain completes; the local issuer takes sequence 2.
+    let _ = handler.session_closed(
+        1,
+        false,
+        ErrorSource::ClientNetwork,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    let (local, _) = handler.start_local_drain(
+        &local_request("op-1", &["no-such-listener"], 0, 0),
+        now,
+        now_ms + 1,
+    );
+    assert!(
+        matches!(
+            local,
+            LocalDrainOutcome::Accepted {
+                command_sequence: 2,
+                ..
+            }
+        ),
+        "{local:?}"
+    );
+
+    // A bridge command at the consumed sequence is obsolete; the next one
+    // above the watermark is admitted.
+    let stale = DrainCommand {
+        drain_id: "go@inc-1-b".to_owned(),
+        listener_names: vec!["none".to_owned()],
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: now_ms + 10_000,
+        force_deadline_unix_millis: now_ms + 20_000,
+        command_sequence: 2,
+    };
+    let out = handler.handle_envelope(&envelope(31, 7, Body::DrainCommand(stale)), now, now_ms + 2);
+    let Some(Body::DrainResult(answer)) = &out[0].body else {
+        unreachable!("obsolete answers a result")
+    };
+    assert_eq!(answer.code(), ErrorCode::DuplicateRequest);
+    let fresh = DrainCommand {
+        drain_id: "go@inc-1-c".to_owned(),
+        listener_names: vec!["none".to_owned()],
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: now_ms + 10_000,
+        force_deadline_unix_millis: now_ms + 20_000,
+        command_sequence: 3,
+    };
+    let out = handler.handle_envelope(&envelope(32, 7, Body::DrainCommand(fresh)), now, now_ms + 3);
+    let Some(Body::DrainResult(answer)) = &out[0].body else {
+        unreachable!("fresh sequence is admitted")
+    };
+    assert_eq!(answer.code(), ErrorCode::Ok);
+}
+
+/// A restarted process (new handler, new incarnation) issues the same
+/// operator label under a new wire id, so a label is never confused with a
+/// previous incarnation's tombstone.
+#[tokio::test(start_paused = true)]
+async fn restarted_issuer_uses_a_new_wire_id_for_the_same_label() {
+    let mut first = ControlCommandHandler::new();
+    first.on_session_negotiated(true);
+    first.set_applied_generation(7, None);
+    let (one, _) = first.start_local_drain(
+        &local_request("op-1", &["none"], 0, 0),
+        Instant::now(),
+        1_000_000,
+    );
+    let mut second = ControlCommandHandler::new();
+    second.on_session_negotiated(true);
+    second.set_applied_generation(7, None);
+    let (two, _) = second.start_local_drain(
+        &local_request("op-1", &["none"], 0, 0),
+        Instant::now(),
+        1_000_000,
+    );
+    let (
+        LocalDrainOutcome::Accepted { wire_id: a, .. },
+        LocalDrainOutcome::Accepted { wire_id: b, .. },
+    ) = (one, two)
+    else {
+        unreachable!("both accepted")
+    };
+    assert_ne!(a, b);
+    assert!(a.starts_with("op-1@") && b.starts_with("op-1@"));
+}
+
+/// The dispatch task answers local drain notices in order with every
+/// other notice, so the HTTP layer sees a consistent view.
+#[tokio::test(start_paused = true)]
+async fn dispatch_task_serves_local_drain_notices() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let harness = spawn_loop(handler);
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    assert!(
+        harness
+            .notice_tx
+            .send(DispatchNotice::LocalDrain {
+                request: local_request("op-9", &["none"], 0, 0),
+                reply,
+            })
+            .await
+            .is_ok()
+    );
+    let outcome = outcome
+        .await
+        .unwrap_or_else(|_| unreachable!("dispatch alive"));
+    assert!(
+        matches!(
+            outcome,
+            LocalDrainOutcome::Accepted {
+                command_sequence: 1,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    for (label, known) in [("op-9", true), ("unknown", false)] {
+        let (reply, status) = tokio::sync::oneshot::channel();
+        assert!(
+            harness
+                .notice_tx
+                .send(DispatchNotice::LocalDrainStatus {
+                    caller_id: label.to_owned(),
+                    reply,
+                })
+                .await
+                .is_ok()
+        );
+        let status = status
+            .await
+            .unwrap_or_else(|_| unreachable!("dispatch alive"));
+        assert_eq!(status.is_some(), known, "{label}");
+        if let Some(status) = status {
+            assert!(status.complete && status.result.active_connections == 0);
+        }
+    }
     harness.task.abort();
 }

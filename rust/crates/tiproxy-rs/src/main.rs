@@ -727,8 +727,9 @@ async fn run(options: Options) -> Result<(), String> {
         RustConfigComposer::new(config_owner.handle.source().clone(), options.drain_grace)
             .with_topology(topology_handle.clone()),
     );
-    // The namespace-commit barrier follows the CP-CFG lineage serving applied.
-    let applied_config_generation = composer.applied_config_generation();
+    // The namespace-commit barrier maps serving's installed composition back
+    // to the CP-CFG lineage through this composer.
+    let admin_composer = Arc::clone(&composer);
     let (consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
         Arc::new(SystemMemoryProbe::new()),
         Arc::new(connection_handler),
@@ -764,6 +765,7 @@ async fn run(options: Options) -> Result<(), String> {
     // failure).
     let install_handle = runtime.handle();
     let metering_dispatch = runtime.handle();
+    let admin_dispatch = runtime.handle();
     let runtime_stats = runtime.stats();
     guard.set_runtime(runtime);
     if !installer.install(install_handle) {
@@ -831,7 +833,8 @@ async fn run(options: Options) -> Result<(), String> {
             &config_owner.handle,
             &serving,
             &metrics_registry,
-            applied_config_generation,
+            admin_composer,
+            admin_dispatch,
         ),
         admin_tls_source(config_owner.handle.source().clone()),
     )
@@ -1476,9 +1479,11 @@ async fn spawn_admin(
 /// serving side has composed the current config generation.
 struct OwnerConfigAdmin {
     handle: ConfigModuleHandle,
-    /// CP-CFG generations the SQL serving side has applied (the config
-    /// lineage, not the composer's own counter).
-    applied_config: watch::Receiver<u64>,
+    /// Composition generations the SQL serving side actually installed
+    /// (initial bind, bridge apply, recomposition), mapped back to the
+    /// CP-CFG lineage through the composer.
+    applied_composition: watch::Receiver<u64>,
+    composer: Arc<RustConfigComposer>,
 }
 
 /// Longest a namespace commit waits for the serving side to catch up.
@@ -1534,14 +1539,17 @@ impl control_admin::ConfigAdmin for OwnerConfigAdmin {
             // Namespaces become serving through the config watch; "commit"
             // is complete once serving has applied this CP-CFG generation.
             let target = snapshot.generation();
-            let mut applied = self.applied_config.clone();
+            let mut applied = self.applied_composition.clone();
             let barrier = async {
-                while *applied.borrow_and_update() < target {
+                loop {
+                    let composition = *applied.borrow_and_update();
+                    if self.composer.config_generation_of(composition) >= target {
+                        return Ok(());
+                    }
                     if applied.changed().await.is_err() {
                         return Err(control_admin::CommitError::Reload);
                     }
                 }
-                Ok(())
             };
             tokio::time::timeout(ADMIN_COMMIT_TIMEOUT, barrier)
                 .await
@@ -1575,6 +1583,69 @@ impl control_admin::ConfigAdmin for OwnerConfigAdmin {
     }
 }
 
+/// `control_admin::DrainAdmin` over the dispatch owner: the operator label
+/// is the local issuer's caller id; outcomes keep Go's error classes and
+/// the status projects the gate's progress/terminal.
+struct DispatchDrainAdmin {
+    dispatch: dataplane::control_dispatch::ControlDispatchHandle,
+}
+
+impl control_admin::DrainAdmin for DispatchDrainAdmin {
+    fn start(
+        &self,
+        request: control_admin::DrainRequest,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_admin::DrainStartError>> {
+        Box::pin(async move {
+            let outcome = self
+                .dispatch
+                .local_drain(dataplane::LocalDrainRequest {
+                    caller_id: request.drain_id,
+                    listener_names: request.listener_names,
+                    backend_ids: request.backend_ids,
+                    graceful_wait: request.graceful_wait,
+                    force_timeout: request.force_timeout,
+                })
+                .await
+                .ok_or(control_admin::DrainStartError::NoSession)?;
+            match outcome {
+                dataplane::LocalDrainOutcome::Accepted { .. } => Ok(()),
+                dataplane::LocalDrainOutcome::SnapshotNotReady => {
+                    Err(control_admin::DrainStartError::SnapshotNotReady)
+                }
+                dataplane::LocalDrainOutcome::DrainInProgress { .. } => {
+                    Err(control_admin::DrainStartError::InProgress)
+                }
+                dataplane::LocalDrainOutcome::ForeignDrainActive { .. } => {
+                    Err(control_admin::DrainStartError::ForeignActive)
+                }
+                dataplane::LocalDrainOutcome::Rejected { code, detail } => {
+                    Err(control_admin::DrainStartError::Other(format!(
+                        "{}: {detail}",
+                        code.as_str_name()
+                    )))
+                }
+            }
+        })
+    }
+
+    fn status(
+        &self,
+        drain_id: String,
+    ) -> control_admin::AdminFuture<'_, Option<control_admin::DrainProgress>> {
+        Box::pin(async move {
+            let status = self.dispatch.local_drain_status(drain_id).await.flatten()?;
+            Some(control_admin::DrainProgress {
+                active_connections: status.result.active_connections,
+                gracefully_closed: status.result.gracefully_closed,
+                force_closed: status.result.force_closed,
+                complete: status.result.complete,
+                code: status.result.code().as_str_name().to_owned(),
+                detail: status.result.detail,
+            })
+        })
+    }
+}
+
 /// Process-state accessors behind the admin handlers. Every closure reads
 /// live state on each request; none retains a payload.
 fn admin_hooks(
@@ -1582,7 +1653,8 @@ fn admin_hooks(
     config: &ConfigModuleHandle,
     serving: &DataplaneServingHandle,
     registry: &Arc<MetricsRegistry>,
-    applied_config: watch::Receiver<u64>,
+    composer: Arc<RustConfigComposer>,
+    dispatch: dataplane::control_dispatch::ControlDispatchHandle,
 ) -> control_admin::AdminHooks {
     let lifecycle = in_process.handle();
     let health_config = config.clone();
@@ -1591,7 +1663,8 @@ fn admin_hooks(
     let registry = Arc::clone(registry);
     let config_admin: control_admin::SharedConfigAdmin = Arc::new(OwnerConfigAdmin {
         handle: config.clone(),
-        applied_config,
+        applied_composition: serving.applied_composition_generation(),
+        composer,
     });
     control_admin::AdminHooks {
         health_inputs: Arc::new(move || control_admin::HealthInputs {
@@ -1607,6 +1680,7 @@ fn admin_hooks(
         metrics_text: Arc::new(move || registry.render_prometheus_text()),
         dataplane_status: Arc::new(move || dataplane_status(&status_serving.status())),
         config: config_admin,
+        drain: Some(Arc::new(DispatchDrainAdmin { dispatch })),
     }
 }
 

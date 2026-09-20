@@ -244,7 +244,8 @@ struct Activity {
     last: AtomicU64,
     active_requests: AtomicUsize,
     started: Instant,
-    /// Woken when a request settles so the watchdog re-arms its deadline.
+    /// Woken when a request settles so the watchdog re-arms its deadline
+    /// (`notify_one`: a permit survives until the watchdog waits).
     settled: Notify,
 }
 
@@ -284,7 +285,9 @@ impl Drop for ActiveRequest {
     fn drop(&mut self) {
         self.0.active_requests.fetch_sub(1, Ordering::AcqRel);
         self.0.touch();
-        self.0.settled.notify_waiters();
+        // `notify_one` stores a permit when the single watchdog is not yet
+        // waiting, so a settle between its check and its wait is never lost.
+        self.0.settled.notify_one();
     }
 }
 

@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,7 +34,19 @@ type cpadminStep struct {
 		Ready           *bool `json:"ready"`
 		NamespacesReady *bool `json:"namespaces_ready"`
 		PreClose        bool  `json:"preclose"`
-		Dataplane       *struct {
+		Drainer         *struct {
+			Start  string `json:"start"`
+			Status *struct {
+				DrainID           string `json:"drain_id"`
+				ActiveConnections uint64 `json:"active_connections"`
+				GracefullyClosed  uint64 `json:"gracefully_closed"`
+				ForceClosed       uint64 `json:"force_closed"`
+				Complete          bool   `json:"complete"`
+				Code              string `json:"code"`
+				Detail            string `json:"detail"`
+			} `json:"status"`
+		} `json:"drainer"`
+		Dataplane *struct {
 			DesiredGeneration  uint64 `json:"desired_generation"`
 			SentGeneration     uint64 `json:"sent_generation"`
 			AppliedGeneration  uint64 `json:"applied_generation"`
@@ -43,6 +56,30 @@ type cpadminStep struct {
 			LastGoodAgeMillis  int64  `json:"last_good_age_ms"`
 		} `json:"dataplane"`
 	} `json:"action"`
+}
+
+// scriptedDrainer answers StartDrain from a queue of scripted outcomes and
+// DrainStatus from a map, mirroring the Rust replay's scripted seam.
+type scriptedDrainer struct {
+	starts   []error
+	statuses map[string]*controlpb.DrainResult
+}
+
+func (d *scriptedDrainer) StartDrain(context.Context, controlbridge.DrainRequest) error {
+	if len(d.starts) == 0 {
+		return nil
+	}
+	err := d.starts[0]
+	d.starts = d.starts[1:]
+	return err
+}
+
+func (d *scriptedDrainer) DrainStatus(id string) (*controlpb.DrainResult, bool) {
+	result, ok := d.statuses[id]
+	if !ok {
+		return nil, false
+	}
+	return result, result.GetComplete()
 }
 
 type cpadminObservation struct {
@@ -99,6 +136,43 @@ func TestCPAdminCapture(t *testing.T) {
 			}
 			if step.Action.PreClose {
 				srv.PreClose()
+			}
+			if d := step.Action.Drainer; d != nil {
+				drainer, ok := srv.mgr.DataplaneDrainer.(*scriptedDrainer)
+				if !ok {
+					drainer = &scriptedDrainer{statuses: map[string]*controlpb.DrainResult{}}
+					srv.mgr.DataplaneDrainer = drainer
+				}
+				switch d.Start {
+				case "":
+				case "ok":
+					drainer.starts = append(drainer.starts, nil)
+				case "invalid_budget":
+					drainer.starts = append(drainer.starts, controlbridge.ErrInvalidDrainBudget)
+				case "no_session":
+					drainer.starts = append(drainer.starts, controlbridge.ErrNoDataplaneSession)
+				case "snapshot_not_ready":
+					drainer.starts = append(drainer.starts, controlbridge.ErrSnapshotNotReady)
+				case "in_progress":
+					drainer.starts = append(drainer.starts, controlbridge.ErrDrainInProgress)
+				case "foreign_active":
+					drainer.starts = append(drainer.starts, controlbridge.ErrForeignDrainActive)
+				default:
+					drainer.starts = append(drainer.starts, errors.New(d.Start))
+				}
+				if s := d.Status; s != nil {
+					code, ok := controlpb.ErrorCode_value[s.Code]
+					require.True(t, ok, "unknown error code %q", s.Code)
+					drainer.statuses[s.DrainID] = &controlpb.DrainResult{
+						DrainId:           s.DrainID,
+						ActiveConnections: s.ActiveConnections,
+						GracefullyClosed:  s.GracefullyClosed,
+						ForceClosed:       s.ForceClosed,
+						Complete:          s.Complete,
+						Code:              controlpb.ErrorCode(code),
+						Detail:            s.Detail,
+					}
+				}
 			}
 			if dp := step.Action.Dataplane; dp != nil {
 				code, ok := controlpb.ErrorCode_value[dp.LastResultCode]

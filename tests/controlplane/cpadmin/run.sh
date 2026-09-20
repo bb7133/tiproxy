@@ -25,7 +25,18 @@ trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 # default workdir inside the checksummed configuration.
 (cd "$root/rust" && CPADMIN_SCRIPT="$script" CPADMIN_CURRENT_DIR="$root/pkg/server/api" \
   "$CARGO" run --locked --quiet -p control-admin --example cpadmin_replay >"$tmp_dir/rust.json")
-python3 "$root/tests/controlplane/cpadmin/compare.py" "$script" "$tmp_dir/go.json" "$tmp_dir/rust.json"
+# compare.py needs tomllib (Python >= 3.11); honour PYTHON or pick a modern interpreter.
+python="${PYTHON:-}"
+if [ -z "$python" ]; then
+  for candidate in python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+      python="$candidate"
+      break
+    fi
+  done
+fi
+[ -n "$python" ] || { echo "no Python >= 3.11 with tomllib found (set PYTHON)" >&2; exit 1; }
+"$python" "$root/tests/controlplane/cpadmin/compare.py" "$script" "$tmp_dir/go.json" "$tmp_dir/rust.json"
 if [ -n "${CPADMIN_EVIDENCE_DIR:-}" ]; then
   mkdir -p "$CPADMIN_EVIDENCE_DIR"
   cp "$tmp_dir/go.json" "$tmp_dir/rust.json" "$CPADMIN_EVIDENCE_DIR/"

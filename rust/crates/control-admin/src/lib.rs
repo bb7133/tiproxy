@@ -23,11 +23,15 @@
 //! state and never logs request or response payloads.
 
 pub mod config;
+pub mod drain;
 pub mod health;
 pub mod router;
 pub mod serve;
 
 pub use config::{AdminFuture, CommitError, ConfigAdmin, MemoryConfigAdmin, SharedConfigAdmin};
+pub use drain::{
+    DrainAdmin, DrainProgress, DrainRequest, DrainStartError, ScriptedDrainAdmin, SharedDrainAdmin,
+};
 pub use health::{
     HealthInputs, HealthOverride, HealthResponse, HealthState, go_json_document, go_json_string,
 };
