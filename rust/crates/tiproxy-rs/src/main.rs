@@ -878,14 +878,12 @@ async fn run(options: Options) -> Result<(), String> {
     // The management plane is supervised too: a listener failure must not
     // silently leave the process without its operator surface (Go only logs
     // that; the Rust owner fails closed and drains).
-    // The join handle is awaited at most once: the supervisor branch that
-    // observes its exit records that fact so the exit path does not poll a
-    // completed handle again.
+    // The select borrows the join handle; the exit path hands it back to the
+    // one teardown helper, which never polls a handle that already finished.
     let (mut admin_join, admin_shutdown) = match admin_task {
         Some(AdminTask { task, shutdown }) => (Some(task), Some(shutdown)),
         None => (None, None),
     };
-    let mut admin_finished = false;
     let mut admin_exit = Box::pin(async {
         match admin_join.as_mut() {
             Some(task) => task.await,
@@ -970,7 +968,6 @@ async fn run(options: Options) -> Result<(), String> {
             (control, sampler, serving_result, Ok(()))
         }
         admin = &mut admin_exit => {
-            admin_finished = true;
             let failure = match admin {
                 Ok(()) => "control admin server exited unexpectedly".to_owned(),
                 Err(_) => "control admin server panicked".to_owned(),
@@ -1039,17 +1036,8 @@ async fn run(options: Options) -> Result<(), String> {
         let _ = task.await;
     }
     drop(admin_exit);
-    if let Some(shutdown) = admin_shutdown {
-        shutdown.send_replace(true);
-    }
-    if let Some(task) = admin_join.take()
-        && !admin_finished
-    {
-        startup::Teardown::teardown(AdminTask {
-            task,
-            shutdown: watch::channel(true).0,
-        })
-        .await;
+    if let (Some(task), Some(shutdown)) = (admin_join.take(), admin_shutdown) {
+        startup::Teardown::teardown(AdminTask { task, shutdown }).await;
     }
     metrics_exporter.shutdown();
     metrics_exporter.join().await;
@@ -1424,12 +1412,20 @@ struct AdminTask {
 }
 
 impl startup::Teardown for AdminTask {
+    /// The single stop/cleanup helper for the admin server, used by the
+    /// startup rollback and by the supervisor exit path. It tolerates a join
+    /// handle whose completion was already observed (the supervisor branch
+    /// that noticed the server exiting): a finished handle is never polled
+    /// again.
     fn teardown(self) -> startup::TeardownFuture {
         Box::pin(async move {
             let AdminTask { mut task, shutdown } = self;
             // Stop accepting and let in-flight requests finish within the
             // server's own grace period; abort only if it overruns that.
             shutdown.send_replace(true);
+            if task.is_finished() {
+                return;
+            }
             if tokio::time::timeout(ADMIN_SHUTDOWN_TIMEOUT, &mut task)
                 .await
                 .is_err()
@@ -1848,6 +1844,23 @@ mod tests {
     use dataplane::metering::MeteringSamplerError;
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
+
+    /// Reviewer regression (`CodexM5`, `813b3140`): the supervisor observes the
+    /// admin server's completion, then hands the same handle to the one
+    /// teardown helper; that helper must not poll a completed handle again.
+    #[tokio::test]
+    async fn review_completed_admin_join_must_not_be_polled_again_during_cleanup() {
+        let (shutdown, _stop) = watch::channel(false);
+        let mut admin = super::AdminTask {
+            task: tokio::spawn(async {}),
+            shutdown,
+        };
+        // This is the same ownership sequence as the admin_exit select branch:
+        // observe completion, then pass the retained AdminTask to final cleanup.
+        (&mut admin.task).await.expect("admin completed normally");
+        let cleanup = tokio::spawn(admin.teardown()).await;
+        assert!(cleanup.is_ok(), "cleanup must not panic: {cleanup:?}");
+    }
 
     #[test]
     fn a_control_failure_is_not_masked_by_the_final_sampler_handoff() {

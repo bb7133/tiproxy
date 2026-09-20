@@ -666,6 +666,44 @@ mod tests {
     }
     /// Reviewer regression (`CodexM5`, `e30148d9`): a peer still inside the TLS
     /// sniff when shutdown begins must be closed once `serve` completes.
+    /// Reviewer regression (`CodexM5`, `813b3140`): the between-request idle
+    /// timeout must not cancel a handler that is still producing its answer.
+    #[tokio::test]
+    async fn review_idle_timeout_does_not_cancel_an_active_handler() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, stop) = watch::channel(false);
+        let router = Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                "finished"
+            }),
+        );
+        let task = tokio::spawn(serve(
+            listener,
+            router.clone(),
+            router,
+            Arc::new(|| None),
+            stop,
+            ServeOptions {
+                connection_timeout: Duration::from_millis(50),
+                shutdown_grace: Duration::from_millis(50),
+                ..ServeOptions::default()
+            },
+        ));
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), plain_request(address, "/slow"))
+                .await
+                .unwrap();
+        shutdown.send_replace(true);
+        task.await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200") && response.ends_with("finished"),
+            "an active handler must outlive the between-request idle timeout: {response:?}"
+        );
+    }
+
     #[tokio::test]
     async fn review_shutdown_reclaims_silent_tls_sniff_connection() {
         use std::sync::atomic::{AtomicBool, Ordering};
