@@ -1,0 +1,59 @@
+[
+  {
+    "headers": {
+      "Accept": [
+        "application/xml"
+      ],
+      "Authorization": [
+        "SharedKey account:Ao7GS+PH/XmJ2QGCVGfiRimGb+U2bPHuLQW7gY2lnuM="
+      ],
+      "User-Agent": [
+        "azsdk-go-azblob/v1.6.3 (go1.25.12; darwin)"
+      ],
+      "X-Ms-Client-Request-Id": [
+        "fixed-request-id"
+      ],
+      "x-ms-date": [
+        "Tue, 14 Nov 2023 22:13:20 GMT"
+      ],
+      "x-ms-version": [
+        "2025-11-05"
+      ]
+    },
+    "method": "HEAD",
+    "url": "https://account.blob.core.windows.net/bucket/prefix%20space%2F%25text%2Fkey.json.gz"
+  },
+  {
+    "headers": {
+      "Accept": [
+        "application/xml"
+      ],
+      "Authorization": [
+        "SharedKey account:LXWuayZHUtplFso/0T9FDK3dgv5e7QiSwhAZcWBcocU="
+      ],
+      "Content-Length": [
+        "7"
+      ],
+      "Content-Type": [
+        "application/octet-stream"
+      ],
+      "User-Agent": [
+        "azsdk-go-azblob/v1.6.3 (go1.25.12; darwin)"
+      ],
+      "X-Ms-Client-Request-Id": [
+        "fixed-request-id"
+      ],
+      "x-ms-blob-type": [
+        "BlockBlob"
+      ],
+      "x-ms-date": [
+        "Tue, 14 Nov 2023 22:13:20 GMT"
+      ],
+      "x-ms-version": [
+        "2025-11-05"
+      ]
+    },
+    "method": "PUT",
+    "url": "https://account.blob.core.windows.net/bucket/prefix%20space%2F%25text%2Fkey.json.gz"
+  }
+]

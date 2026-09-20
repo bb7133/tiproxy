@@ -242,6 +242,24 @@ if [[ $mode == rust && ($variant == plain || ${DATAPLANE_T4_QUALIFICATION:-0} ==
 	fi
 fi
 "$script_dir/render-configs.sh" "$run_dir" "$variant" "$port_offset" >"$run_dir/render.log"
+if [[ ${DATAPLANE_NATIVE_METER:-0} == 1 ]]; then
+    if [[ $mode != rust || $variant != plain ]]; then
+        echo "native metering focused probe requires Rust plain" >&2
+        exit 2
+    fi
+    cat >>"$run_dir/tiproxy.toml" <<NATIVEMETERCONFIG
+
+[metering]
+type = "localfs"
+bucket = "native-process-probe"
+shared-pool-id = "native-process-probe"
+[metering.localfs]
+base-path = "$run_dir/meter-objects"
+create-dirs = true
+permissions = "0755"
+NATIVEMETERCONFIG
+fi
+
 # The focused T3 oracle needs all three live backends in one route group: A0
 # and A1 share ks-old while B carries ks-new. This lets the final phase fail
 # both same-keyspace backends without tripping the all-failed safeguard; the
@@ -308,7 +326,7 @@ if [[ $mode == rust ]]; then
 	fi
 	PORTS="$PORTS $RUST_HEALTH_PORT"
 	if [[ ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ||
-		($variant == plain && (${DATAPLANE_T3_FOCUSED:-0} == 1 || ${DATAPLANE_T4_FOCUSED:-0} == 1)) ]]; then
+		($variant == plain && (${DATAPLANE_T3_FOCUSED:-0} == 1 || ${DATAPLANE_T4_FOCUSED:-0} == 1 || ${DATAPLANE_NATIVE_METER:-0} == 1)) ]]; then
 		PORTS="$PORTS $T3_DROP_ADMIN_PORT"
 	fi
 fi
@@ -412,7 +430,7 @@ if [[ $mode == rust ]]; then
 		exit 1
 	fi
 		if [[ ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ||
-			($variant == plain && (${DATAPLANE_T3_FOCUSED:-0} == 1 || ${DATAPLANE_T4_FOCUSED:-0} == 1)) ]]; then
+			($variant == plain && (${DATAPLANE_T3_FOCUSED:-0} == 1 || ${DATAPLANE_T4_FOCUSED:-0} == 1 || ${DATAPLANE_NATIVE_METER:-0} == 1)) ]]; then
 		# The focused route-owner probes interpose a byte-transparent bridge
 		# process from startup. They later remove only this owned process,
 		# creating a real bridge disconnect while Go's API and both TiDB
@@ -921,6 +939,30 @@ PYT4
 	cp "$T4_REJECT_STATE" "$run_dir/t4-control-rejection-final.json"
 	echo "PASS: T4 cap6 compatible start, incompatible reconnect rejection, and Rust-local SQL admission beyond 30s"
 }
+
+if [[ ${DATAPLANE_NATIVE_METER:-0} == 1 ]]; then
+    # Real SQL and recovery above ran through the production process pair.
+    # Join Rust explicitly so a failed final export cannot look like success.
+    kill -s INT "$RUST_PID"
+    for _ in {1..450}; do
+        kill -0 "$RUST_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$RUST_PID" 2>/dev/null; then
+        echo "native meter process did not join within 45 seconds" >&2
+        exit 1
+    fi
+    if ! wait "$RUST_PID"; then
+        echo "native meter process failed its coordinated shutdown" >&2
+        exit 1
+    fi
+    cp "${RUST_CONTROL_SOCKET}.metering.wal" "$run_dir/native-producer-final.wal"
+    curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+        "http://127.0.0.1:$T3_DROP_ADMIN_PORT/state" -o "$run_dir/native-control-final.json"
+    validate_t4_route_audit "$run_dir/native-control-final.json"
+    python3 "$repo_root/tests/controlplane/cpmeter/verify-native.py" "$run_dir"
+    exit 0
+fi
 
 if [[ $mode == rust && $variant == plain && ${DATAPLANE_T4_FOCUSED:-0} == 1 ]]; then
 	run_t4_route_owner_capability_probe

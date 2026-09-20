@@ -19,6 +19,7 @@
 mod config_composition;
 mod health;
 mod metrics_http;
+mod native_meter;
 mod startup;
 mod tls_material;
 mod topology_composition;
@@ -58,7 +59,7 @@ use control_topology::{
 };
 use dataplane::GenerationStatusSnapshot;
 use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
-use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
+use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry};
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
@@ -122,7 +123,7 @@ enum Command {
 /// C) are all wired, so `tls`, `proxy-v2`, `zlib`, and `zstd` are advertised
 /// and the topology preflight admits plain, tls, proxy, and compressed
 /// variants.
-const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
+const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -518,7 +519,7 @@ async fn run(options: Options) -> Result<(), String> {
     );
     let in_process_config = in_process.handle().config().current();
     let capabilities = vec![
-        ControlCapability::MeteringAbsoluteSnapshots as u64,
+        ControlCapability::RustMeterOwner as u64,
         ControlCapability::RustConfigNamespace as u64,
         ControlCapability::RustRouteOwner as u64,
     ];
@@ -534,11 +535,8 @@ async fn run(options: Options) -> Result<(), String> {
     };
     let mut wal_name = options.control_socket.as_os_str().to_os_string();
     wal_name.push(".metering.wal");
-    let ledger = MeteringLedger::open_persistent(PathBuf::from(wal_name))
-        .map_err(|error| format!("open metering WAL: {error}"))?;
-    let metering = MeteringSourceRegistry::new(ledger.process_generation())
-        .map_err(|error| format!("create metering registry: {error}"))?;
-    let dispatch_handler = ControlCommandHandler::with_metering_route_owner(ledger);
+    let wal_path = PathBuf::from(wal_name);
+    let dispatch_handler = ControlCommandHandler::native_meter_owner();
     // Go `NewDrainIssuer` fails the bridge when the incarnation nonce cannot
     // be read; the Rust owner refuses to start the same way.
     dispatch_handler.local_drain_issuer_ready()?;
@@ -553,7 +551,7 @@ async fn run(options: Options) -> Result<(), String> {
     let shared_client = Arc::new(ControlClient::new(client).map_err(|error| error.to_string())?);
     let (drain_tx, drain_rx) = watch::channel(None::<Duration>);
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
-    let (metering_shutdown_tx, metering_shutdown_rx) = watch::channel(false);
+    let (metering_shutdown_tx, _) = watch::channel(false);
     let loop_config = session_loop_config(in_process_config.drain_grace());
     let (metrics, observations) = MetricsRecorder::channel(DEFAULT_OBSERVATION_CAPACITY);
     let metrics_registry = Arc::new(MetricsRegistry::new());
@@ -595,6 +593,28 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("bootstrap default namespace: {error}"))
             .await);
     }
+    let meter_config = config_owner.handle.source().current();
+    let meter_paths = Path::new(meter_config.effective().workdir()).join("run");
+    let _meter_lock = match native_meter::lock_state(&meter_paths) {
+        Ok(lock) => lock,
+        Err(error) => return Err(guard.rollback(error).await),
+    };
+    let _wal_lock = match native_meter::lock_wal(&wal_path) {
+        Ok(lock) => lock,
+        Err(error) => return Err(guard.rollback(error).await),
+    };
+    let ledger = match MeteringLedger::open_persistent(wal_path) {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(guard.rollback(format!("open metering WAL: {error}")).await),
+    };
+    let metering = match MeteringSourceRegistry::new(ledger.process_generation()) {
+        Ok(registry) => registry,
+        Err(error) => {
+            return Err(guard
+                .rollback(format!("create metering registry: {error}"))
+                .await);
+        }
+    };
     // CP-TOPO self-registration and discovery publication come online before any
     // SQL admission: register this instance's SQL topology and publish the
     // initial discovery generation, then wait for both to be installed. "Ready"
@@ -771,6 +791,7 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("start config serving adapter: {error}"))
             .await);
     }
+    let (consumer, meter_ready) = native_meter::ReadyConsumer::new(consumer);
     let runtime = spawn_control_runtime_with_client_and_handler(
         Arc::clone(&shared_client),
         Duration::from_millis(100),
@@ -783,15 +804,52 @@ async fn run(options: Options) -> Result<(), String> {
     // guard; from then on the guard owns it (and tears it down on any later
     // failure).
     let install_handle = runtime.handle();
-    let metering_dispatch = runtime.handle();
     let admin_dispatch = runtime.handle();
     let runtime_stats = runtime.stats();
     guard.set_runtime(runtime);
     if !installer.install(install_handle) {
+        meter_ready.send_replace(Some(false));
         return Err(guard
             .rollback("install control dispatch handle exactly once".to_owned())
             .await);
     }
+    if let Err(error) = wait_module_ready(
+        "native meter peer",
+        CONTROL_STARTUP_READY_TIMEOUT,
+        native_meter::wait_peer(shared_client.subscribe_state()),
+    )
+    .await
+    {
+        meter_ready.send_replace(Some(false));
+        return Err(guard.rollback(error).await);
+    }
+    // A legacy Go peer cannot reach this point: negotiation requires native
+    // ownership before either consumer or outbox is opened. SQL stays gated.
+    let native_meter = match control_meter::service::Service::open(
+        meter_config.effective().metering(),
+        meter_paths.join("rust-metering-consumer.json"),
+        meter_paths.join("metering-outbox.json"),
+        in_process.handle().module_context().owner().clone(),
+    )
+    .await
+    {
+        Ok(meter) => meter,
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(format!("open native meter: {error}")).await);
+        }
+    };
+    let ledger =
+        match dataplane::metering::recover_native_metering(ledger, Arc::clone(&native_meter)).await
+        {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                meter_ready.send_replace(Some(false));
+                return Err(guard
+                    .rollback(format!("recover native meter WAL: {error}"))
+                    .await);
+            }
+        };
     guard.set_metrics_exporter(spawn_metrics_exporter(
         Arc::clone(&shared_client),
         serving.clone(),
@@ -801,16 +859,15 @@ async fn run(options: Options) -> Result<(), String> {
         Duration::from_secs(1),
         Arc::clone(&metrics_registry),
     ));
+    let native_shutdown = metering_shutdown_tx.clone();
     guard.set_metering_sampler(MeteringSampler {
-        task: tokio::spawn(async move {
-            run_metering_sampler(
-                metering,
-                metering_dispatch,
-                metering_shutdown_rx,
-                Duration::from_secs(1),
-            )
-            .await
-        }),
+        task: tokio::spawn(native_meter::run(
+            metering,
+            ledger,
+            Arc::clone(&native_meter),
+            native_shutdown,
+            Duration::from_secs(1),
+        )),
         shutdown: metering_shutdown_tx.clone(),
     });
 
@@ -824,12 +881,16 @@ async fn run(options: Options) -> Result<(), String> {
         route_config_source,
         topology_handle,
         Arc::clone(&runtime_stats),
+        native_meter,
     )
     .await
     {
         Ok(Some(health_task)) => guard.set_health_task(health_task),
         Ok(None) => {}
-        Err(error) => return Err(guard.rollback(error).await),
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(error).await);
+        }
     }
     // Native Prometheus exposition (B0): bound before ready so a bad address
     // fails fast; the task is owned by the guard and aborted at exit.
@@ -872,10 +933,12 @@ async fn run(options: Options) -> Result<(), String> {
         Err(error) => return Err(guard.rollback(error).await),
     };
     if let Err(error) = in_process.mark_ready() {
+        meter_ready.send_replace(Some(false));
         return Err(guard
             .rollback(format!("mark in-process control runtime ready: {error}"))
             .await);
     }
+    meter_ready.send_replace(Some(true));
     if let Some(app) = &admin_app {
         app.mark_ready();
     }
@@ -1170,6 +1233,7 @@ async fn spawn_health(
     config: Arc<dyn ConfigNamespaceSource>,
     topology: TopologyModuleHandle,
     dispatch_stats: Arc<dataplane::control_dispatch::DispatchStats>,
+    meter: Arc<control_meter::service::Service>,
 ) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
@@ -1185,6 +1249,7 @@ async fn spawn_health(
     Ok(Some(tokio::spawn(health::serve(
         listener,
         serving,
+        Arc::new(move || meter.healthy()),
         Arc::new(move || routes.route_input_evidence()),
         Arc::new(move || ledger_routes.route_ledger_evidence()),
         Arc::new(move || {
@@ -2564,10 +2629,15 @@ mod tests {
         );
         assert_eq!(
             region.matches("wait_module_ready(").count(),
-            3,
-            "config, topology, and route-plane readiness are all deadline-bounded"
+            4,
+            "config, topology, route-plane, and native meter peer readiness are deadline-bounded"
         );
-        for module in ["config owner", "topology module", "route-plane module"] {
+        for module in [
+            "config owner",
+            "topology module",
+            "route-plane module",
+            "native meter peer",
+        ] {
             assert!(
                 region.contains(&format!("\"{module}\"")),
                 "the readiness diagnostic names {module}"
@@ -2643,10 +2713,17 @@ mod tests {
         };
         assert_eq!(
             INTEGRATION_CAPABILITIES,
-            "in-process-control-runtime,control-bridge-v1,rust-route-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
+            "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
             "only what the binary truthfully provides: Rust route ownership plus the wired plain slice, TLS, PROXY v2, and compression"
         );
-        for wired in ["rust-route-owner", "tls", "proxy-v2", "zlib", "zstd"] {
+        for wired in [
+            "rust-route-owner",
+            "rust-meter-owner",
+            "tls",
+            "proxy-v2",
+            "zlib",
+            "zstd",
+        ] {
             assert!(
                 INTEGRATION_CAPABILITIES.contains(wired),
                 "{wired:?} is wired (WIRE-activation A1/B/C), so it must be advertised"

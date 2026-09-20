@@ -30,6 +30,8 @@ type BridgeConfig struct {
 	// compatibility assertion: this process never constructs a RouterAdapter
 	// and never falls back to Go routing after the first negotiation.
 	RouteOwner bool
+	// NativeMeterOwner leaves durable metering entirely in Rust. Requires RouteOwner.
+	NativeMeterOwner bool
 	// Handshake is the router adapter's authentication/routing seam.
 	// It is required only for the legacy, non-RouteOwner composition.
 	Handshake backend.HandshakeHandler
@@ -132,6 +134,9 @@ type Bridge struct {
 // nothing is left bound. Operator drains are not part of it: they are
 // issued inside the Rust process (CP-ADMIN slice 3).
 func NewBridge(config BridgeConfig) (*Bridge, error) {
+	if config.NativeMeterOwner && (!config.RouteOwner || config.MeteringStatePath != "" || config.MeteringSink != nil) {
+		return nil, errors.New("native metering requires route owner and no Go metering state or sink")
+	}
 	var adapter *RouterAdapter
 	var err error
 	if !config.RouteOwner {
@@ -146,7 +151,10 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 			adapter.AttachRouterLookup(config.RouterLookup)
 		}
 	}
-	consumer := NewMeteringConsumer()
+	var consumer *MeteringConsumer
+	if !config.NativeMeterOwner {
+		consumer = NewMeteringConsumer()
+	}
 	if config.MeteringStatePath != "" {
 		consumer, err = OpenMeteringConsumer(config.MeteringStatePath, config.MeteringSink)
 		if err != nil {
@@ -154,7 +162,9 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 		}
 	}
 	var composite *CompositeControlHandler
-	if config.RouteOwner {
+	if config.NativeMeterOwner {
+		composite, err = NewNativeMeterOwnerControlHandler()
+	} else if config.RouteOwner {
 		composite, err = NewRouteOwnerControlHandler(consumer)
 	} else {
 		composite, err = NewCompositeControlHandler(adapter, consumer)
@@ -224,7 +234,7 @@ func (bridge *Bridge) Status() SnapshotStatus {
 		return SnapshotStatus{}
 	}
 	status := bridge.publisher.Status()
-	if !bridge.consumer.Healthy() {
+	if bridge.consumer != nil && !bridge.consumer.Healthy() {
 		status.AppliedGeneration = 0
 	}
 	return status

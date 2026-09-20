@@ -5,6 +5,7 @@ members = [
     "crates/control-etcd",
     "crates/control-external",
     "crates/control-plane",
+    "crates/control-meter",
     "crates/control-proto",
     "crates/control-router",
     "crates/control-routing",
@@ -34,6 +35,19 @@ hyper-util = { version = "=0.1.20", default-features = false, features = ["serve
 http-body-util = { version = "=0.1.5", default-features = false }
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+openssl = { version = "=0.10.81", default-features = false, features = ["vendored"] }
+azure_core = { version = "=0.29.1", default-features = false }
+azure_identity = { version = "=0.29.0", default-features = false, features = ["tokio", "client_certificate"] }
+async-trait = { version = "=0.1.89", default-features = false }
+rustls-native-certs = { version = "=0.8.2", default-features = false }
+rust-ini = { version = "=0.21.3", default-features = false }
+bytes = { version = "=1.12.1", default-features = false }
+reqsign-core = { version = "=3.3.1", default-features = false }
+quick-xml = { version = "=0.41.0", default-features = false, features = ["serialize"] }
+reqsign-aws-core = { version = "=3.1.1", default-features = false }
+reqsign-aws-v4 = { version = "=3.3.0", default-features = false }
+reqsign-aliyun-oss = { version = "=3.1.5", default-features = false }
+reqsign-tencent-cos = { version = "=3.0.6", default-features = false }
 crc32fast = { version = "=1.5.1", default-features = false }
 getrandom = "=0.2.17"
 control-admin = { path = "crates/control-admin", version = "0.1.0" }
@@ -41,6 +55,7 @@ control-config = { path = "crates/control-config", version = "0.1.0" }
 control-external = { path = "crates/control-external", version = "0.1.0" }
 control-etcd = { path = "crates/control-etcd", version = "0.1.0" }
 control-plane = { path = "crates/control-plane", version = "0.1.0" }
+control-meter = { path = "crates/control-meter", version = "0.1.0" }
 control-proto = { path = "crates/control-proto", version = "0.1.0" }
 control-router = { path = "crates/control-router", version = "0.1.0" }
 control-routing = { path = "crates/control-routing", version = "0.1.0" }

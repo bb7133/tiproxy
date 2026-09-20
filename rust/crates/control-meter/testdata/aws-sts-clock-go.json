@@ -1,0 +1,3228 @@
+{
+  "requests": [
+    {
+      "name": "RequestExpired",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestInTheFuture",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestInTheFuture",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeTooSkewed",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestTimeTooSkewed",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "InvalidSignatureException",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "InvalidSignatureException",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "InvalidSignatureException",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "SignatureDoesNotMatch",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "SignatureDoesNotMatch",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "SignatureDoesNotMatch",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "AuthFailure",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": -600,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            -600
+          ],
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 239,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            239
+          ],
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 240,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            240
+          ],
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 241,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            241,
+            0
+          ],
+          "calls": 3,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "retry-without-date-resets-attempt-skew",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 503
+            },
+            {
+              "code": "RequestExpired",
+              "date": "",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600,
+            0
+          ],
+          "calls": 3,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "absent-final-date-does-not-persist-client-skew",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "Denied",
+              "date": "",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "malformed-date-ignored",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "bad",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            0
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "negative-skew-signing",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "http",
+              "offset": -600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            -600
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "lowercase-not-clock-error",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "requestexpired",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "http503-sets-next-attempt-skew",
+      "web": false,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600,
+            0
+          ],
+          "calls": 3,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestExpired",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestInTheFuture",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestInTheFuture",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeTooSkewed",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestTimeTooSkewed",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "InvalidSignatureException",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "InvalidSignatureException",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "InvalidSignatureException",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "SignatureDoesNotMatch",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "SignatureDoesNotMatch",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "SignatureDoesNotMatch",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "AuthFailure",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": -600,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 239,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 240,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 241,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 3,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "retry-without-date-resets-attempt-skew",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 503
+            },
+            {
+              "code": "RequestExpired",
+              "date": "",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 3,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "absent-final-date-does-not-persist-client-skew",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "Denied",
+              "date": "",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "malformed-date-ignored",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "bad",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "negative-skew-signing",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "http",
+              "offset": -600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "lowercase-not-clock-error",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "requestexpired",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "http503-sets-next-attempt-skew",
+      "web": true,
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 3,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestExpired",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestInTheFuture",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestInTheFuture",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeTooSkewed",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestTimeTooSkewed",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "InvalidSignatureException",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "InvalidSignatureException",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "InvalidSignatureException",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "SignatureDoesNotMatch",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "SignatureDoesNotMatch",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "SignatureDoesNotMatch",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "AuthFailure",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": -600,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            -600
+          ],
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 239,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            239
+          ],
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 240,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            240
+          ],
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 241,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            241,
+            0
+          ],
+          "calls": 3,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "retry-without-date-resets-attempt-skew",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 503
+            },
+            {
+              "code": "RequestExpired",
+              "date": "",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600,
+            0
+          ],
+          "calls": 3,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "absent-final-date-does-not-persist-client-skew",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "Denied",
+              "date": "",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "malformed-date-ignored",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "bad",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            0
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "negative-skew-signing",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "http",
+              "offset": -600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            -600
+          ],
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "lowercase-not-clock-error",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "requestexpired",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "http503-sets-next-attempt-skew",
+      "web": false,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0,
+            600,
+            0
+          ],
+          "calls": 3,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": [
+            0
+          ],
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestExpired",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestInTheFuture",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestInTheFuture",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeTooSkewed",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestTimeTooSkewed",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "InvalidSignatureException",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "InvalidSignatureException",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "InvalidSignatureException",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "SignatureDoesNotMatch",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "SignatureDoesNotMatch",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "SignatureDoesNotMatch",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "AuthFailure",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": -600,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 239,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 240,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "possible-after-offset",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 241,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 3,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "retry-without-date-resets-attempt-skew",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 503
+            },
+            {
+              "code": "RequestExpired",
+              "date": "",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 3,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "absent-final-date-does-not-persist-client-skew",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "Denied",
+              "date": "",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "malformed-date-ignored",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "bad",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "negative-skew-signing",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "RequestExpired",
+              "date": "http",
+              "offset": -600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 2,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "lowercase-not-clock-error",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "requestexpired",
+              "date": "http",
+              "offset": 600,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "http503-sets-next-attempt-skew",
+      "web": true,
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 600,
+              "status": 503
+            },
+            {
+              "code": "AuthFailure",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            },
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 3,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "code": "",
+              "date": "http",
+              "offset": 0,
+              "status": 0
+            }
+          ],
+          "signed": null,
+          "calls": 1,
+          "error": false
+        }
+      ]
+    }
+  ],
+  "dates": [
+    {
+      "input": "Mon, 15 Jun 2026 12:00:00 GMT",
+      "seconds": 1781524800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Mon, 5 Jun 2026 12:00:00 GMT",
+      "seconds": 1780660800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Mon,  5 Jun 26 12:00:00 GMT",
+      "seconds": 1780660800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Monday, 15-Jun-26 12:00:00 GMT",
+      "seconds": 1781524800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Mon Jun 15 12:00:00 2026",
+      "seconds": 1781524800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Tue, 15 Jun 2026 12:00:00 GMT",
+      "seconds": 1781524800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Mon, 15 Jun 2026 12:00:00.123456789 GMT",
+      "seconds": 1781524800,
+      "nanos": 123456789,
+      "error": false
+    },
+    {
+      "input": "Mon, 15 Jun 2026 12:00:00,123 GMT",
+      "seconds": 1781524800,
+      "nanos": 123000000,
+      "error": false
+    },
+    {
+      "input": "Mon, 15 Jun 2026 12:00:00.12345678912 GMT",
+      "seconds": 1781524800,
+      "nanos": 123456789,
+      "error": false
+    },
+    {
+      "input": "Monday, 15-Jun-69 12:00:00 GMT",
+      "seconds": -17236800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Monday, 15-Jun-26 12:00:00 EST",
+      "seconds": 1781524800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Mon, 15 Jun 2026 12:00:00 UTC",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    },
+    {
+      "input": "Mon, 15 Jun 2026 12:00:00 +0000",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    },
+    {
+      "input": " Mon, 15 Jun 2026 12:00:00 GMT",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    },
+    {
+      "input": "Mon, 15 Jun 2026 12:00:00 GMT ",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    },
+    {
+      "input": "Mon,  15  Jun  2026 12:00:00 GMT",
+      "seconds": 1781524800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Mon, 31 Jun 2026 12:00:00 GMT",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    },
+    {
+      "input": "Bad, 15 Jun 2026 12:00:00 GMT",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    },
+    {
+      "input": "Mon, 15 jun 2026 12:00:00 GMT",
+      "seconds": 1781524800,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Mon, 15 Jun 2026 1:00:00 GMT",
+      "seconds": 1781485200,
+      "nanos": 0,
+      "error": false
+    },
+    {
+      "input": "Mon, 015 Jun 2026 12:00:00 GMT",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    },
+    {
+      "input": "",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    },
+    {
+      "input": "bad",
+      "seconds": 0,
+      "nanos": 0,
+      "error": true
+    }
+  ],
+  "signatures": [
+    {
+      "url": "https://sts.us-east-1.amazonaws.com/",
+      "body": "Action=AssumeRole\u0026Version=2011-06-15",
+      "token": "",
+      "time": "20260615T120000Z",
+      "authorization": "AWS4-HMAC-SHA256 Credential=key/20260615/us-east-1/sts/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-date, Signature=e728ae6b1dfb9b0f858d82e4e421a856f8a05d8a43d82552cd6d8d9c4d071efa"
+    },
+    {
+      "url": "https://custom.example/a/b?x=2\u0026x=1",
+      "body": "Action=AssumeRole\u0026RoleArn=arn%3Aexample",
+      "token": "token",
+      "time": "20260614T235959Z",
+      "authorization": "AWS4-HMAC-SHA256 Credential=key/20260614/us-east-1/sts/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=5827bbaa458437fc0086cadf6f96a8531fdd6b3ba0a8c1f5810ee0e33a117d67"
+    }
+  ]
+}

@@ -87,6 +87,10 @@ enum ControlCapability {
   // negotiated, Go sends no backend or namespace snapshots and route-family
   // messages remain wire tombstones until protocol v2.
   CONTROL_CAPABILITY_RUST_ROUTE_OWNER = 6;
+  // CP-METER: Rust exclusively owns the producer WAL, durable consumer and
+  // metering export outbox. This process-fixed assertion rejects mixed owner
+  // binaries during negotiation; metering batch/ACK bodies are retired.
+  CONTROL_CAPABILITY_RUST_METER_OWNER = 7;
 }
 
 message Hello {

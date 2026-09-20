@@ -1,0 +1,456 @@
+[
+  {
+    "name": "legacy-live",
+    "config": "[default]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "https://example.awsapps.com/start",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "credential": "sso-key",
+    "filename": "e8be5486177c5b5392bd9aa76563515b29358e6e.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "GET",
+        "url": "https://portal.sso.us-east-1.amazonaws.com/federation/credentials?account_id=123456789012\u0026role_name=Dev+%2B+Ops",
+        "body": "",
+        "token": "old-token",
+        "content_type": ""
+      }
+    ]
+  },
+  {
+    "name": "legacy-expired-no-refresh",
+    "config": "[default]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2000-01-01T00:00:00Z\",\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"refreshToken\":\"fake-refresh\",\"registrationExpiresAt\":\"2000-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "https://example.awsapps.com/start",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "e8be5486177c5b5392bd9aa76563515b29358e6e.json",
+    "updated": {
+      "accessToken": "old-token",
+      "clientId": "fake-client",
+      "clientSecret": "fake-secret",
+      "expiresAt": "2000-01-01T00:00:00Z",
+      "refreshToken": "fake-refresh",
+      "registrationExpiresAt": "2000-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": null
+  },
+  {
+    "name": "session-live",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "credential": "sso-key",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "GET",
+        "url": "https://portal.sso.us-east-1.amazonaws.com/federation/credentials?account_id=123456789012\u0026role_name=Dev+%2B+Ops",
+        "body": "",
+        "token": "old-token",
+        "content_type": ""
+      }
+    ]
+  },
+  {
+    "name": "session-refresh",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2000-01-01T00:00:00Z\",\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"refreshToken\":\"fake-refresh\",\"registrationExpiresAt\":\"2000-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "credential": "sso-key",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "new-token",
+      "clientId": "fake-client",
+      "clientSecret": "fake-secret",
+      "expiresAt": "REFRESH_PLUS_3600",
+      "refreshToken": "new-refresh",
+      "registrationExpiresAt": "2000-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://oidc.us-east-1.amazonaws.com/token",
+        "body": "{\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"grantType\":\"refresh_token\",\"refreshToken\":\"fake-refresh\"}",
+        "token": "",
+        "content_type": "application/json"
+      },
+      {
+        "method": "GET",
+        "url": "https://portal.sso.us-east-1.amazonaws.com/federation/credentials?account_id=123456789012\u0026role_name=Dev+%2B+Ops",
+        "body": "",
+        "token": "new-token",
+        "content_type": ""
+      }
+    ]
+  },
+  {
+    "name": "session-zero-time-rejected",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"0001-01-01T00:00:00Z\",\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"refreshToken\":\"fake-refresh\",\"registrationExpiresAt\":\"0001-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "clientId": "fake-client",
+      "clientSecret": "fake-secret",
+      "expiresAt": "0001-01-01T00:00:00Z",
+      "refreshToken": "fake-refresh",
+      "registrationExpiresAt": "0001-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": null
+  },
+  {
+    "name": "session-bad-refresh-response",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2000-01-01T00:00:00Z\",\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"refreshToken\":\"fake-refresh\",\"registrationExpiresAt\":\"2000-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "bad-token-response",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "clientId": "fake-client",
+      "clientSecret": "fake-secret",
+      "expiresAt": "2000-01-01T00:00:00Z",
+      "refreshToken": "fake-refresh",
+      "registrationExpiresAt": "2000-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://oidc.us-east-1.amazonaws.com/token",
+        "body": "{\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"grantType\":\"refresh_token\",\"refreshToken\":\"fake-refresh\"}",
+        "token": "",
+        "content_type": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "session-cache-write-fails",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2000-01-01T00:00:00Z\",\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"refreshToken\":\"fake-refresh\",\"registrationExpiresAt\":\"2000-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "cache-write",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "clientId": "fake-client",
+      "clientSecret": "fake-secret",
+      "expiresAt": "2000-01-01T00:00:00Z",
+      "refreshToken": "fake-refresh",
+      "registrationExpiresAt": "2000-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://oidc.us-east-1.amazonaws.com/token",
+        "body": "{\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"grantType\":\"refresh_token\",\"refreshToken\":\"fake-refresh\"}",
+        "token": "",
+        "content_type": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "session-refresh-denied",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2000-01-01T00:00:00Z\",\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"refreshToken\":\"fake-refresh\",\"registrationExpiresAt\":\"2000-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "token",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "clientId": "fake-client",
+      "clientSecret": "fake-secret",
+      "expiresAt": "2000-01-01T00:00:00Z",
+      "refreshToken": "fake-refresh",
+      "registrationExpiresAt": "2000-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://oidc.us-east-1.amazonaws.com/token",
+        "body": "{\"clientId\":\"fake-client\",\"clientSecret\":\"fake-secret\",\"grantType\":\"refresh_token\",\"refreshToken\":\"fake-refresh\"}",
+        "token": "",
+        "content_type": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "role-denied",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "role",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "GET",
+        "url": "https://portal.sso.us-east-1.amazonaws.com/federation/credentials?account_id=123456789012\u0026role_name=Dev+%2B+Ops",
+        "body": "",
+        "token": "old-token",
+        "content_type": ""
+      }
+    ]
+  },
+  {
+    "name": "session-expired-missing-client",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2000-01-01T00:00:00Z\"}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2000-01-01T00:00:00Z"
+    },
+    "requests": null
+  },
+  {
+    "name": "missing-access-token",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"expiresAt\":\"2099-01-01T00:00:00Z\"}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "expiresAt": "2099-01-01T00:00:00Z"
+    },
+    "requests": null
+  },
+  {
+    "name": "bad-expiration",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"yesterday\"}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "yesterday"
+    },
+    "requests": null
+  },
+  {
+    "name": "legacy-incomplete",
+    "config": "[default]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\nsso_account_id=123456789012\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "https://example.awsapps.com/start",
+    "denied": "",
+    "load_error": true,
+    "error": true,
+    "credential": "",
+    "filename": "e8be5486177c5b5392bd9aa76563515b29358e6e.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": null
+  },
+  {
+    "name": "session-missing-section",
+    "config": "[default]\nsso_session=missing\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "missing",
+    "denied": "",
+    "load_error": true,
+    "error": true,
+    "credential": "",
+    "filename": "5a013c49508291c6816ac388f93a2c11973086ed.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": null
+  },
+  {
+    "name": "session-incomplete",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": true,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": null
+  },
+  {
+    "name": "session-conflicting-region",
+    "config": "[default]\nsso_region=eu-west-1\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": true,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": null
+  },
+  {
+    "name": "session-conflicting-url",
+    "config": "[default]\nsso_start_url=https://other.invalid\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": true,
+    "error": true,
+    "credential": "",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": null
+  },
+  {
+    "name": "session-china",
+    "config": "[default]\nsso_session=fixture-session\nsso_account_id=123456789012\nsso_role_name=Dev + Ops\n[sso-session fixture-session]\nsso_region=cn-north-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "credential": "sso-key",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "GET",
+        "url": "https://portal.sso.cn-north-1.amazonaws.com.cn/federation/credentials?account_id=123456789012\u0026role_name=Dev+%2B+Ops",
+        "body": "",
+        "token": "old-token",
+        "content_type": ""
+      }
+    ]
+  },
+  {
+    "name": "session-empty-account-role",
+    "config": "[default]\nsso_session=fixture-session\n[sso-session fixture-session]\nsso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n",
+    "cache": "{\"accessToken\":\"old-token\",\"expiresAt\":\"2099-01-01T00:00:00Z\",\"unknown\":{\"keep\":true}}",
+    "key": "fixture-session",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "credential": "sso-key",
+    "filename": "3c53de6385a090050ef145199bf0ee89ab0e8976.json",
+    "updated": {
+      "accessToken": "old-token",
+      "expiresAt": "2099-01-01T00:00:00Z",
+      "unknown": {
+        "keep": true
+      }
+    },
+    "requests": [
+      {
+        "method": "GET",
+        "url": "https://portal.sso.us-east-1.amazonaws.com/federation/credentials?account_id=\u0026role_name=",
+        "body": "",
+        "token": "old-token",
+        "content_type": ""
+      }
+    ]
+  }
+]

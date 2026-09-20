@@ -116,6 +116,8 @@ jobs:
         run: make controlplane-cpdiag-evidence
       - name: Check tiproxyctl against the Go and Rust management planes
         run: make controlplane-cpctl-evidence
+      - name: Run CP-METER durable ingestion and state handoff evidence
+        run: make controlplane-cpmeter-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests

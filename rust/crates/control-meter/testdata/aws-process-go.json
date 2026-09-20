@@ -1,0 +1,299 @@
+[
+  {
+    "calls": 1,
+    "name": "quoted-command",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}'"
+    ],
+    "error": false,
+    "key": "process key",
+    "token": "process-token",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "temporary",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}'"
+    ],
+    "error": false,
+    "key": "process key",
+    "token": "process-token",
+    "expiration": "2099-01-01T00:00:00Z"
+  },
+  {
+    "calls": 2,
+    "name": "already-expired-returned",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2000-01-01T00:00:00Z\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2000-01-01T00:00:00Z\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2000-01-01T00:00:00Z\"}'"
+    ],
+    "error": false,
+    "key": "process key",
+    "token": "process-token",
+    "expiration": "2000-01-01T00:00:00Z"
+  },
+  {
+    "calls": 1,
+    "name": "invalid-expiration",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"not-a-time\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"not-a-time\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"not-a-time\"}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "empty-expiration",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"\"}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "space-expiration-rejected",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01 00:00:00Z\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01 00:00:00Z\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01 00:00:00Z\"}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "lowercase-expiration-rejected",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01t00:00:00z\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01t00:00:00z\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01t00:00:00z\"}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "offset-expiration",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T08:00:00+08:00\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T08:00:00+08:00\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T08:00:00+08:00\"}'"
+    ],
+    "error": false,
+    "key": "process key",
+    "token": "process-token",
+    "expiration": "2099-01-01T00:00:00Z"
+  },
+  {
+    "calls": 1,
+    "name": "fractional-expiration",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T00:00:00.5Z\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T00:00:00.5Z\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":\"2099-01-01T00:00:00.5Z\"}'"
+    ],
+    "error": false,
+    "key": "process key",
+    "token": "process-token",
+    "expiration": "2099-01-01T00:00:00.5Z"
+  },
+  {
+    "calls": 1,
+    "name": "null-expiration",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":null}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":null}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"Expiration\":null}'"
+    ],
+    "error": false,
+    "key": "process key",
+    "token": "process-token",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "case-insensitive-fields",
+    "output": "{\"VERSION\":1,\"accesskeyid\":\"case-id\",\"secretaccesskey\":\"case-secret\"}",
+    "command": "printf '%s' '{\"VERSION\":1,\"accesskeyid\":\"case-id\",\"secretaccesskey\":\"case-secret\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"VERSION\":1,\"accesskeyid\":\"case-id\",\"secretaccesskey\":\"case-secret\"}'"
+    ],
+    "error": false,
+    "key": "case-id",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "duplicates-in-order-null-keeps",
+    "output": "{\"Version\":0,\"version\":1,\"AccessKeyId\":\"first\",\"ACCESSKEYID\":\"last\",\"AccessKeyId\":null,\"SecretAccessKey\":\"secret\"}",
+    "command": "printf '%s' '{\"Version\":0,\"version\":1,\"AccessKeyId\":\"first\",\"ACCESSKEYID\":\"last\",\"AccessKeyId\":null,\"SecretAccessKey\":\"secret\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":0,\"version\":1,\"AccessKeyId\":\"first\",\"ACCESSKEYID\":\"last\",\"AccessKeyId\":null,\"SecretAccessKey\":\"secret\"}'"
+    ],
+    "error": false,
+    "key": "last",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "wrong-version",
+    "output": "{\"Version\":2,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}",
+    "command": "printf '%s' '{\"Version\":2,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":2,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "wrong-type",
+    "output": "{\"Version\":\"1\",\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}",
+    "command": "printf '%s' '{\"Version\":\"1\",\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":\"1\",\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "wrong-account-type",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"AccountId\":123}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"AccountId\":123}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\",\"AccountId\":123}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "no-key",
+    "output": "{\"Version\":1,\"SecretAccessKey\":\"secret\"}",
+    "command": "printf '%s' '{\"Version\":1,\"SecretAccessKey\":\"secret\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"SecretAccessKey\":\"secret\"}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "empty-secret",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"id\",\"SecretAccessKey\":\"\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"id\",\"SecretAccessKey\":\"\"}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"id\",\"SecretAccessKey\":\"\"}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "trailing-json",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"} {}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"} {}'",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"} {}'"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 1,
+    "name": "nonzero-exit",
+    "output": "{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}",
+    "command": "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}'; exit 7",
+    "program": "sh",
+    "args": [
+      "-c",
+      "printf '%s' '{\"Version\":1,\"AccessKeyId\":\"process key\",\"SecretAccessKey\":\"process-secret\",\"SessionToken\":\"process-token\"}'; exit 7"
+    ],
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  },
+  {
+    "calls": 0,
+    "name": "empty-command",
+    "output": "",
+    "command": "",
+    "program": "",
+    "args": null,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": ""
+  }
+]

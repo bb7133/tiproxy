@@ -23,6 +23,13 @@ allow = [
 confidence-threshold = 0.8
 unused-allowed-license = "allow"
 
+# Credential profile parsing pulls this public-domain build dependency.
+# Scope the license allowance to the reviewed exact crate/version.
+[[licenses.exceptions]]
+name = "tiny-keccak"
+version = "=2.0.2"
+allow = ["CC0-1.0"]
+
 [licenses.private]
 ignore = false
 
@@ -33,6 +40,19 @@ highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow-workspace = true
+# Maintained cloud signing libraries use base64 0.23, whereas TLS/tonic use 0.22.
+# rust-ini's ordered-multimap still pins hashbrown 0.14; indexmap uses 0.17.
+# Keep global duplicate denial; remove these exact exceptions when they converge.
+skip = [
+    { name = "base64", version = "=0.23.1" },
+    { name = "hashbrown", version = "=0.14.5" },
+    # Azure's typespec transport uses rand 0.9/getrandom 0.3; its UUIDs use
+    # getrandom 0.4. The existing TLS and cloud signers use 0.2 and rand 0.10.
+    { name = "getrandom", version = "=0.3.4" },
+    { name = "getrandom", version = "=0.4.3" },
+    { name = "rand", version = "=0.9.5" },
+    { name = "rand_core", version = "=0.9.5" },
+]
 
 [sources]
 unknown-registry = "deny"

@@ -1,0 +1,42 @@
+[package]
+name = "control-meter"
+description = "Rust-native durable absolute metering consumer and export outbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+openssl.workspace = true
+azure_core.workspace = true
+azure_identity.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+reqwest.workspace = true
+rustls-native-certs.workspace = true
+rust-ini.workspace = true
+reqsign-core.workspace = true
+quick-xml.workspace = true
+reqsign-aws-core.workspace = true
+reqsign-aws-v4.workspace = true
+reqsign-aliyun-oss.workspace = true
+reqsign-tencent-cos.workspace = true
+control-config.workspace = true
+control-plane.workspace = true
+getrandom.workspace = true
+flate2.workspace = true
+tokio = { workspace = true, features = ["process", "fs"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

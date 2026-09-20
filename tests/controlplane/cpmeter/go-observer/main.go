@@ -1,0 +1,139 @@
+// Copyright 2026 PingCAP, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+// Command go-observer drives the production Go consumer and durable meter.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/pingcap/tiproxy/lib/config"
+	"github.com/pingcap/tiproxy/pkg/controlbridge"
+	pb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
+	"github.com/pingcap/tiproxy/pkg/manager/meter"
+	"go.uber.org/zap"
+)
+
+type source struct {
+	Key      struct{ ConnectionID, ProcessGeneration, BackendGeneration uint64 }
+	Baseline struct {
+		BackendID, ClusterName, Keyspace                                 string
+		Local, PublicEndpoint                                            bool
+		InboundBytes, OutboundBytes, InboundWrapEpoch, OutboundWrapEpoch uint64
+	}
+	Final bool `json:"final_sample"`
+}
+type event struct {
+	Export bool `json:"export"`
+	Reopen bool `json:"reopen"`
+	Batch  struct {
+		Producer  string   `json:"producer_id"`
+		Sequence  uint64   `json:"sequence"`
+		Snapshots []source `json:"snapshots"`
+	} `json:"batch"`
+}
+
+func run() error {
+	if len(os.Args) != 3 && (len(os.Args) != 4 || os.Args[3] != "disabled") {
+		return fmt.Errorf("usage: go-observer STATE_DIR EVENTS_JSON [disabled]")
+	}
+	dir, err := filepath.Abs(os.Args[1])
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(os.Args[2])
+	if err != nil {
+		return err
+	}
+	var events []event
+	if err := json.Unmarshal(data, &events); err != nil {
+		return err
+	}
+	cfg := config.NewConfig()
+	cfg.Workdir = dir
+	cfg.Metering.WithLocalFS(filepath.Join(dir, "objects"))
+	cfg.Metering.Bucket = "parity-test"
+	if len(os.Args) == 4 {
+		cfg.Metering.Bucket = ""
+	}
+	consumerPath := filepath.Join(dir, "consumer.json")
+	outboxPath := filepath.Join(dir, "run", "metering-outbox.json")
+	var previousSink *meter.Meter
+	defer func() {
+		if previousSink != nil {
+			_ = previousSink.Close()
+		}
+	}()
+	open := func() (*controlbridge.MeteringConsumer, error) {
+		if previousSink != nil {
+			_ = previousSink.Close()
+		}
+		sink, err := meter.NewMeter(cfg, zap.NewNop())
+		if err != nil {
+			return nil, err
+		}
+		// Never Start: no export loop is created. Closing an unstarted writer only releases resources.
+		previousSink = sink
+		if sink == nil {
+			return controlbridge.OpenMeteringConsumer(consumerPath, nil)
+		}
+		return controlbridge.OpenMeteringConsumer(consumerPath, sink)
+	}
+	consumer, err := open()
+	if err != nil {
+		return err
+	}
+	observations := make([]map[string]any, 0, len(events))
+	for _, e := range events {
+		var applied any
+		var applyErr error
+		if e.Export && previousSink != nil {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			previousSink.Start(ctx)
+			applyErr = previousSink.Close()
+		} else if e.Reopen {
+			consumer, err = open()
+			if err != nil {
+				return err
+			}
+		} else {
+			batch := &pb.MeteringBatch{ProducerId: e.Batch.Producer, Sequence: e.Batch.Sequence}
+			for _, s := range e.Batch.Snapshots {
+				b, k := s.Baseline, s.Key
+				batch.Snapshots = append(batch.Snapshots, &pb.MeteringSourceSnapshot{
+					ConnectionId: k.ConnectionID, ProcessGeneration: k.ProcessGeneration, BackendGeneration: k.BackendGeneration,
+					BackendId: b.BackendID, ClusterName: b.ClusterName, Keyspace: b.Keyspace, Local: b.Local, PublicEndpoint: b.PublicEndpoint,
+					BackendInboundBytes: b.InboundBytes, BackendOutboundBytes: b.OutboundBytes,
+					InboundWrapEpoch: b.InboundWrapEpoch, OutboundWrapEpoch: b.OutboundWrapEpoch, Final: s.Final,
+				})
+			}
+			applied, applyErr = consumer.ApplyAbsolute(batch)
+		}
+		state := map[string]any{"applied": applied, "error": applyErr != nil, "healthy": consumer.Healthy()}
+		for name, path := range map[string]string{"consumer": consumerPath, "outbox": outboxPath} {
+			value, err := os.ReadFile(path)
+			if os.IsNotExist(err) && name == "outbox" && previousSink == nil {
+				state[name] = nil
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			state[name] = json.RawMessage(value)
+		}
+		observations = append(observations, state)
+	}
+	return json.NewEncoder(os.Stdout).Encode(observations)
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}

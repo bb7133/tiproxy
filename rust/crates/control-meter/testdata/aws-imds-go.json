@@ -1,0 +1,1093 @@
+[
+  {
+    "name": "default",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "ipv6-env",
+    "config": "",
+    "env": {
+      "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE": "IPv6"
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://[fd00:ec2::254]/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "ipv6-env-spaces",
+    "config": "",
+    "env": {
+      "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE": " IPv6 "
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://[fd00:ec2::254]/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "mode-env-whitespace-default",
+    "config": "",
+    "env": {
+      "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE": "  "
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "blank-env-mode-uses-profile",
+    "config": "[default]\nec2_metadata_service_endpoint_mode=IPv6\n",
+    "env": {
+      "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE": "  "
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://[fd00:ec2::254]/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "ipv6-profile",
+    "config": "[default]\nec2_metadata_service_endpoint_mode=IPv6\n",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://[fd00:ec2::254]/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "profile-endpoint",
+    "config": "[default]\nec2_metadata_service_endpoint=http://127.0.0.1:8070/prefix\n",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://127.0.0.1:8070/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:8070/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:8070/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "env-overrides-profile",
+    "config": "[default]\nec2_metadata_service_endpoint=http://127.0.0.1:8070/ignored\n",
+    "env": {
+      "AWS_EC2_METADATA_SERVICE_ENDPOINT": "http://127.0.0.1:8071/prefix"
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://127.0.0.1:8071/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:8071/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:8071/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "disabled-case-insensitive",
+    "config": "",
+    "env": {
+      "AWS_EC2_METADATA_DISABLED": "TRUE"
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": null
+  },
+  {
+    "name": "invalid-disabled-ignored",
+    "config": "",
+    "env": {
+      "AWS_EC2_METADATA_DISABLED": "invalid"
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "invalid-mode-env",
+    "config": "",
+    "env": {
+      "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE": "invalid"
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": true,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": null
+  },
+  {
+    "name": "invalid-v1-env",
+    "config": "",
+    "env": {
+      "AWS_EC2_METADATA_V1_DISABLED": "invalid"
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": true,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": null
+  },
+  {
+    "name": "first-role-line",
+    "config": "",
+    "env": null,
+    "roles": "first-role\r\nsecond-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/first-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "role-spaces",
+    "config": "",
+    "env": null,
+    "roles": " role name \n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/%20role%20name%20",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "role-path-clean",
+    "config": "",
+    "env": null,
+    "roles": "nested/../role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "empty-role-list",
+    "config": "",
+    "env": null,
+    "roles": "",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "token-400-terminal",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 400,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "name": "token-403-fallback",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 403,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "token-404-fallback",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 404,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "token-405-fallback",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 405,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "token-500-per-request-fallback",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 500,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "token-missing-ttl",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "MISSING",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "token-zero-ttl",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "0",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "v1-disabled-env",
+    "config": "",
+    "env": {
+      "AWS_EC2_METADATA_V1_DISABLED": "true"
+    },
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 403,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "name": "v1-disabled-profile",
+    "config": "[default]\nec2_metadata_v1_disabled=true\n",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 403,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "name": "role-list-denied",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "list",
+    "load_error": false,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "role-denied",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "role",
+    "load_error": false,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "code-case-insensitive",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"sUcCeSs\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "NOW_PLUS_3600",
+    "second_expiration": "NOW_PLUS_3600",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "code-denied",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"AccessDenied\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": true,
+    "second_error": false,
+    "key": "",
+    "expiration": "",
+    "second_expiration": "",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "expired-returned",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2000-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "2000-01-01T00:00:00Z",
+    "second_expiration": "2000-01-01T00:00:00Z",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "name": "expired-refresh-failure-extends",
+    "config": "",
+    "env": null,
+    "roles": "fixture-role\n",
+    "response": "{\"Code\":\"Success\",\"AccessKeyId\":\"imds-key\",\"SecretAccessKey\":\"imds-secret\",\"Token\":\"imds-token\",\"Expiration\":\"2000-01-01T00:00:00Z\"}",
+    "token_status": 200,
+    "ttl": "300",
+    "denied": "after-first",
+    "load_error": false,
+    "error": false,
+    "second_error": false,
+    "key": "imds-key",
+    "expiration": "2000-01-01T00:00:00Z",
+    "second_expiration": "EXTENDED_5_TO_15_MINUTES",
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://169.254.169.254/latest/api/token",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/fixture-role",
+        "token": "metadata-token",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "token": "metadata-token",
+        "ttl": ""
+      }
+    ]
+  }
+]

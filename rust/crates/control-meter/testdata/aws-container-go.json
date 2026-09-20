@@ -1,0 +1,555 @@
+[
+  {
+    "name": "relative",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "relative-beats-full",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://192.0.2.1/ignored",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "full-loopback",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:8080/path?arg=1"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:8080/path?arg=1",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "full-ecs",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.170.2/path"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/path",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "full-eks-v4",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.170.23/path"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.23/path",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "full-eks-v6",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://[fd00:ec2::23]/path"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://[fd00:ec2::23]/path",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "full-ipv6-loopback",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://[::1]/path"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://[::1]/path",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "http-public-rejected",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://192.0.2.1/path"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": true,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": "",
+    "requests": null
+  },
+  {
+    "name": "https-public",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://example.invalid/credentials"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "https://example.invalid/credentials",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "full-missing-host",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "/relative"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": true,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": "",
+    "requests": null
+  },
+  {
+    "name": "environment-token",
+    "env": {
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN": "env-token",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "env-token",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "file-overrides-env",
+    "env": {
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN": "env-token",
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "TOKEN_FILE",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": "file-token",
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "file-token",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "file-keeps-spaces",
+    "env": {
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "TOKEN_FILE",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": " file-token ",
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": " file-token ",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "file-empty-overrides-env",
+    "env": {
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN": "env-token",
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "TOKEN_FILE",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": "",
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "file-newline-rejected",
+    "env": {
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "TOKEN_FILE",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": "file-token\n",
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": "",
+    "requests": null
+  },
+  {
+    "name": "file-missing-rejected",
+    "env": {
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "TOKEN_FILE",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": "",
+    "requests": null
+  },
+  {
+    "name": "env-newline-rejected",
+    "env": {
+      "AWS_CONTAINER_AUTHORIZATION_TOKEN": "env-token\n",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": "",
+    "requests": null
+  },
+  {
+    "name": "static-no-expiry",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"static-key\",\"SecretAccessKey\":\"static-secret\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "static-key",
+    "token": "",
+    "expiration": "",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "null-expiry",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"static-key\",\"SecretAccessKey\":\"static-secret\",\"Expiration\":null}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "static-key",
+    "token": "",
+    "expiration": "",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "wrong-token-type",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"key\",\"SecretAccessKey\":\"secret\",\"Token\":123}",
+    "status": 200,
+    "load_error": false,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": "",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "invalid-expiry",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"invalid\"}",
+    "status": 200,
+    "load_error": false,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": "",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "case-null-duplicate",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"accesskeyid\":\"first\",\"ACCESSKEYID\":\"last\",\"AccessKeyId\":null,\"secretaccesskey\":\"secret\",\"TOKEN\":\"token\",\"Expiration\":null}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "last",
+    "token": "token",
+    "expiration": "",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "trailing-json-ignored",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"} {}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "created-status",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}",
+    "status": 201,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "2098-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "denied",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"code\":\"AccessDenied\",\"message\":\"private failure\"}",
+    "status": 403,
+    "load_error": false,
+    "error": true,
+    "key": "",
+    "token": "",
+    "expiration": "",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  },
+  {
+    "name": "already-expired-returned",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/fixture"
+    },
+    "token_file": null,
+    "response": "{\"AccessKeyId\":\"container-key\",\"SecretAccessKey\":\"container-secret\",\"Token\":\"container-token\",\"Expiration\":\"2000-01-01T00:00:00Z\"}",
+    "status": 200,
+    "load_error": false,
+    "error": false,
+    "key": "container-key",
+    "token": "container-token",
+    "expiration": "1999-12-31T23:55:00Z",
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      },
+      {
+        "method": "GET",
+        "url": "http://169.254.170.2/fixture",
+        "token": "",
+        "accept": "application/json"
+      }
+    ]
+  }
+]
