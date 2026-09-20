@@ -225,7 +225,7 @@ fn factor_lineage_tracks_selected_history_not_round_or_unused_owners() {
     use crate::metric_collector::MetricCacheLineage;
     use crate::metrics::Source;
     let mut state = State::default();
-    state.reader.complete_prom(BTreeMap::new());
+    state.complete_prom(BTreeMap::new());
     let first = state.result();
     let lineage = MetricCacheLineage(Arc::clone(&first.lineage));
     let replacement = State::default();
@@ -251,6 +251,21 @@ fn factor_lineage_tracks_selected_history_not_round_or_unused_owners() {
     assert!(
         !backend.same_history(&MetricCacheLineage(Arc::clone(&state.lineage))),
         "FACTOR_BACKEND_OWNER_COLD_START"
+    );
+    // Isolate the source transition from independent backend-owner rotations.
+    // A live election can rotate provenance between two observed snapshots,
+    // hiding a missing source reset from a comparison of those snapshots.
+    let backend = MetricCacheLineage(Arc::clone(&state.lineage));
+    state.complete_prom(BTreeMap::new());
+    let restored = MetricCacheLineage(Arc::clone(&state.lineage));
+    assert!(
+        !backend.same_history(&restored),
+        "FACTOR_SOURCE_ABA_NEW_LINEAGE"
+    );
+    state.complete_prom(BTreeMap::new());
+    assert!(
+        restored.same_history(&MetricCacheLineage(Arc::clone(&state.lineage))),
+        "FACTOR_PROM_SAME_SOURCE_CONTINUITY"
     );
 }
 

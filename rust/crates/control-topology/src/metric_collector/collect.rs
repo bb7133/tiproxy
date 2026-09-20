@@ -95,6 +95,12 @@ impl State {
         self.export = Arc::from([]);
         self.proofs.clear();
     }
+    fn complete_prom(&mut self, results: BTreeMap<QueryId, QueryResult>) {
+        if self.reader.source() != crate::metrics::Source::Prometheus {
+            self.lineage = Arc::new(());
+        }
+        self.reader.complete_prom(results);
+    }
     fn result(&self) -> ClusterResult {
         ClusterResult {
             queries: self.queries.clone(),
@@ -164,10 +170,7 @@ async fn round(
             if !capture.still_current() {
                 return Err(RoundError::Stale);
             }
-            if state.reader.source() != crate::metrics::Source::Prometheus {
-                state.lineage = Arc::new(());
-            }
-            state.reader.complete_prom(results);
+            state.complete_prom(results);
             if !shared.publish(capture, cluster, state.result(), None) {
                 return Err(RoundError::Stale);
             }
