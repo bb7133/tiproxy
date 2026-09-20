@@ -414,6 +414,9 @@ pub enum MeteringSamplerError {
     /// The durable dispatch owner disappeared before accepting the handoff.
     #[error("metering durable dispatch owner unavailable")]
     DispatchUnavailable,
+    /// The process-local durable consumer rejected a batch; WAL remains replayable.
+    #[error("native metering consumer rejected snapshots: {0}")]
+    NativeConsumer(#[from] control_meter::Error),
 }
 
 struct PreparedSample {
@@ -805,6 +808,134 @@ pub async fn run_metering_sampler(
     }
 }
 
+/// Samples directly into the native consumer, without a Go control session.
+///
+/// The supplied ledger is exclusively owned by this sampler. Replay completes
+/// before new samples; every trim follows a successful producer-qualified apply.
+/// Disk work runs on the blocking pool. Stop/join sessions, then this sampler,
+/// then the meter export worker, and only then retire the process owner.
+/// The WAL keeps its existing codec for Go-to-native migration and rollback;
+/// protocol types are translated here and never enter the control-meter crate.
+///
+/// # Errors
+/// Returns on source, WAL, native-consumer or blocking-task failure. Failed batches
+/// stay in the durable WAL; neither an unavailable consumer nor a failed ACK resets it.
+pub async fn run_native_metering_sampler<S: control_meter::export::ObjectStore + 'static>(
+    registry: MeteringSourceRegistry,
+    mut ledger: crate::control_commands::MeteringLedger,
+    meter: Arc<control_meter::runtime::Meter<S>>,
+    mut shutdown: watch::Receiver<bool>,
+    cadence: Duration,
+) -> Result<(), MeteringSamplerError> {
+    if cadence.is_zero() || registry.process_generation != ledger.process_generation() {
+        return Err(MeteringSamplerError::SourceInvariant);
+    }
+    let mut interval = tokio::time::interval(cadence);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let stopping = if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            true
+        } else {
+            tokio::select! {
+                _ = interval.tick() => false,
+                changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+            }
+        };
+        let sources = registry.clone();
+        let sink = Arc::clone(&meter);
+        let (returned, result) = tokio::task::spawn_blocking(move || {
+            let result = native_sample(&sources, &mut ledger, &sink);
+            (ledger, result)
+        })
+        .await
+        .map_err(|_| MeteringSamplerError::DispatchUnavailable)?;
+        ledger = returned;
+        result?;
+        if stopping {
+            return Ok(());
+        }
+    }
+}
+
+fn native_sample<S: control_meter::export::ObjectStore>(
+    registry: &MeteringSourceRegistry,
+    ledger: &mut crate::control_commands::MeteringLedger,
+    meter: &control_meter::runtime::Meter<S>,
+) -> Result<(), MeteringSamplerError> {
+    if registry.failed.load(Ordering::Acquire) {
+        return Err(MeteringSamplerError::SourceInvariant);
+    }
+    for batch in ledger.replay() {
+        native_deliver(ledger, meter, batch)?;
+    }
+    let sample = registry.prepare()?;
+    for snapshots in sample.snapshots.chunks(MAX_DELTAS_PER_BATCH) {
+        let finals = snapshots
+            .iter()
+            .filter(|source| source.r#final)
+            .map(|source| SourceKey {
+                connection_id: source.connection_id,
+                backend_generation: source.backend_generation,
+            })
+            .collect();
+        let batch = ledger
+            .record_snapshots(snapshots.to_vec())
+            .map_err(MeteringSamplerError::DispatchRejected)?
+            .ok_or(MeteringSamplerError::SourceInvariant)?;
+        // As on the bridge path, source retirement follows WAL ownership. If
+        // consumer ingestion fails, replay that exact sequence rather than
+        // publishing the same final source as a new, double-counted batch.
+        registry.commit(&PreparedSample {
+            snapshots: Vec::new(),
+            finals,
+        })?;
+        native_deliver(ledger, meter, batch)?;
+    }
+    Ok(())
+}
+
+fn native_deliver<S: control_meter::export::ObjectStore>(
+    ledger: &mut crate::control_commands::MeteringLedger,
+    meter: &control_meter::runtime::Meter<S>,
+    batch: MeteringBatch,
+) -> Result<(), MeteringSamplerError> {
+    let native = control_meter::Batch {
+        producer_id: batch.producer_id,
+        sequence: batch.sequence,
+        snapshots: batch
+            .snapshots
+            .into_iter()
+            .map(|source| control_meter::Snapshot {
+                key: control_meter::SourceKey {
+                    connection_id: source.connection_id,
+                    process_generation: source.process_generation,
+                    backend_generation: source.backend_generation,
+                },
+                baseline: control_meter::SourceBaseline {
+                    backend_id: source.backend_id,
+                    cluster_name: source.cluster_name,
+                    keyspace: source.keyspace,
+                    local: source.local,
+                    public_endpoint: source.public_endpoint,
+                    inbound_bytes: source.backend_inbound_bytes,
+                    outbound_bytes: source.backend_outbound_bytes,
+                    inbound_wrap_epoch: source.inbound_wrap_epoch,
+                    outbound_wrap_epoch: source.outbound_wrap_epoch,
+                },
+                final_sample: source.r#final,
+            })
+            .collect(),
+    };
+    meter.apply(&native)?;
+    if !ledger
+        .acknowledge(&native.producer_id, native.sequence)
+        .map_err(MeteringSamplerError::DispatchRejected)?
+    {
+        return Err(MeteringSamplerError::SourceInvariant);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -833,6 +964,180 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("create test directory");
         directory
+    }
+
+    struct NativeFixture {
+        dir: PathBuf,
+        owners: control_plane::ownership::OwnershipRegistry,
+        lease: Option<control_plane::ownership::OwnerLease>,
+    }
+
+    impl NativeFixture {
+        fn new() -> Self {
+            let owners = control_plane::ownership::OwnershipRegistry::new();
+            let lease = owners
+                .claim(
+                    control_plane::ownership::OwnerScope::Process,
+                    "native-meter",
+                )
+                .expect("owner");
+            Self {
+                dir: test_directory(),
+                owners,
+                lease: Some(lease),
+            }
+        }
+        fn meter(&self) -> Arc<control_meter::runtime::Meter<control_meter::LocalStore>> {
+            let owner = self.lease.as_ref().expect("lease").token();
+            let outbox = control_meter::Outbox::open(self.dir.join("outbox.json"), owner.clone())
+                .expect("outbox");
+            let consumer =
+                control_meter::Consumer::open(self.dir.join("consumer.json"), owner, outbox)
+                    .expect("consumer");
+            let store = control_meter::LocalStore::new(&self.dir.join("objects"), "", true, "0755")
+                .expect("local store");
+            control_meter::runtime::Meter::new(consumer, store, String::new())
+        }
+        fn outbox(&self) -> control_meter::Outbox {
+            control_meter::Outbox::open(
+                self.dir.join("outbox.json"),
+                self.lease.as_ref().expect("lease").token(),
+            )
+            .expect("outbox")
+        }
+    }
+    impl Drop for NativeFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn native_final_source(registry: &MeteringSourceRegistry) {
+        registry
+            .register(
+                MeteringAttribution {
+                    connection_id: 1,
+                    backend_generation: 1,
+                    backend_id: "backend-a".into(),
+                    cluster_name: "cluster".into(),
+                    keyspace: "ks".into(),
+                    local: false,
+                    public_endpoint: true,
+                },
+                Arc::new(ByteCounters::default()),
+            )
+            .expect("register");
+        registry.finalize(1, 1, 10, 20).expect("finalize");
+    }
+
+    #[tokio::test]
+    async fn native_sampler_delivers_final_batch_without_control_bridge() {
+        let f = NativeFixture::new();
+        let path = f.dir.join("producer.wal");
+        let ledger = MeteringLedger::open_persistent(path.clone()).expect("ledger");
+        let registry = MeteringSourceRegistry::new(ledger.process_generation()).expect("registry");
+        native_final_source(&registry);
+        let (_, shutdown) = tokio::sync::watch::channel(true);
+        super::run_native_metering_sampler(
+            registry.clone(),
+            ledger,
+            f.meter(),
+            shutdown,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("native final sample");
+        assert_eq!(registry.active_source_count().expect("count"), 0);
+        let restored = MeteringLedger::open_persistent(path).expect("reopen ledger");
+        assert_eq!(restored.unacked_len(), 0);
+        assert_eq!(restored.last_sequence(), 1);
+        let outbox = f.outbox();
+        assert_eq!(outbox.active()[0].public_response_bytes, 10);
+        assert_eq!(outbox.active()[0].cross_az_bytes, 30);
+    }
+
+    #[test]
+    fn native_consumer_failure_keeps_wal_and_replays_final_only_once() {
+        let mut f = NativeFixture::new();
+        let mut ledger =
+            MeteringLedger::open_persistent(f.dir.join("producer.wal")).expect("ledger");
+        let registry = MeteringSourceRegistry::new(ledger.process_generation()).expect("registry");
+        native_final_source(&registry);
+        let old = f.meter();
+        drop(f.lease.take());
+        assert!(super::native_sample(&registry, &mut ledger, &old).is_err());
+        assert_eq!(
+            ledger.unacked_len(),
+            1,
+            "no consumer success means no WAL ACK"
+        );
+        assert_eq!(
+            registry.active_source_count().expect("count"),
+            0,
+            "final moved durably to WAL"
+        );
+        f.lease = Some(
+            f.owners
+                .claim(
+                    control_plane::ownership::OwnerScope::Process,
+                    "native-meter",
+                )
+                .expect("replacement owner"),
+        );
+        super::native_sample(&registry, &mut ledger, &f.meter()).expect("replay");
+        assert_eq!(
+            ledger.last_sequence(),
+            1,
+            "final must not become a new sequence"
+        );
+        assert_eq!(ledger.unacked_len(), 0);
+        assert_eq!(f.outbox().active()[0].public_response_bytes, 10);
+    }
+
+    #[test]
+    fn native_ack_persistence_failure_replays_without_double_billing() {
+        let f = NativeFixture::new();
+        let wal_dir = f.dir.join("wal-state");
+        let path = wal_dir.join("producer.wal");
+        let mut ledger = MeteringLedger::open_persistent(path.clone()).expect("ledger");
+        let batch = ledger
+            .record_snapshots(vec![MeteringSourceSnapshot {
+                connection_id: 1,
+                process_generation: ledger.process_generation(),
+                backend_generation: 1,
+                backend_id: "backend-a".into(),
+                keyspace: "ks".into(),
+                backend_inbound_bytes: 10,
+                backend_outbound_bytes: 20,
+                r#final: true,
+                ..Default::default()
+            }])
+            .expect("record")
+            .expect("batch");
+        let disk = fs::read(&path).expect("wal bytes");
+        fs::remove_file(&path).expect("remove wal");
+        fs::remove_dir(&wal_dir).expect("remove parent");
+        fs::write(&wal_dir, b"block ACK persistence").expect("block parent");
+        let meter = f.meter();
+        assert!(super::native_deliver(&mut ledger, &meter, batch).is_err());
+        assert_eq!(ledger.unacked_len(), 1);
+        assert_eq!(
+            f.outbox().active()[0].private_response_bytes,
+            10,
+            "consumer committed before ACK failed"
+        );
+        fs::remove_file(&wal_dir).expect("unblock parent");
+        fs::create_dir(&wal_dir).expect("restore parent");
+        fs::write(&path, disk).expect("restore WAL");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure WAL");
+        drop(ledger);
+        let mut ledger = MeteringLedger::open_persistent(path).expect("restart");
+        let registry =
+            MeteringSourceRegistry::new(ledger.process_generation()).expect("new registry");
+        super::native_sample(&registry, &mut ledger, &meter).expect("deduplicated replay");
+        assert_eq!(ledger.unacked_len(), 0);
+        assert_eq!(ledger.last_sequence(), 1);
+        assert_eq!(f.outbox().active()[0].private_response_bytes, 10);
     }
 
     #[test]
