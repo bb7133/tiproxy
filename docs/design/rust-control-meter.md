@@ -1,7 +1,7 @@
 # Native metering implementation checkpoint
 
 The native consumer/outbox, gzip envelope, LocalFS exporter, export worker, and
-WAL sampler are implemented. The binary still selects the existing Go owner.
+WAL sampler and configured storage factory are implemented. The binary still selects the existing Go owner.
 CP-METER qualification remains pending until all storage/configuration and
 process-lifecycle paths have completed integration and independent review.
 
@@ -55,8 +55,7 @@ go run rust/crates/control-meter/testdata/azure-shared-key-go.go
 ```
 
 These are local protocol/authentication tests, not live cloud acceptance.
-Full default-credential/endpoint parity, storage factory selection and binary
-ownership handoff remain in progress. In particular, the pinned Rust identity
+Full default-credential/endpoint parity and binary ownership handoff remain in progress. In particular, the pinned Rust identity
 SDK does not implement Azure Arc, Azure ML, Cloud Shell or Service Fabric managed
 identity. Unsupported managed-identity construction stops authentication instead
 of falling through to a different identity. Those sources, managed-identity
@@ -67,6 +66,26 @@ This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would
 normalize their identity. Azure endpoint/SAS queries are preserved. These edges
 must be reconciled with Go before declaring the provider contract complete.
+
+## Factory and disabled billing
+
+`control-meter::service::Service` selects LocalFS/S3/OSS/COS/Azure from the typed,
+restart-pinned config. Empty type **or** empty bucket disables billing, including
+LocalFS, matching `NewMeter`. Disabled mode opens only the absolute consumer:
+baselines, diagnostics, deduplication and pending clearing still persist before
+WAL ACK, while any existing outbox remains untouched. Enabling later still checks
+the outbox checkpoint; it cannot silently reset an already advanced consumer.
+An absent LocalFS subsection retains the SDK's `create-dirs=true` default, while
+an explicitly present empty subsection retains false. Unsupported enabled
+providers fail before durable state creation.
+
+The native WAL sampler accepts a common in-process intake interface. Both enabled
+and disabled services preserve the same producer ACK contract. The process must
+stop sessions, join the sampler's final sample, stop/join the service, then retire
+ownership. Factory file opens and LocalFS directory setup run on the blocking pool.
+Actual Go/Rust observations cover fresh disabled intake and discarding preexisting
+Go pending deltas without changing its outbox. Native fault tests also cover final
+WAL ACK, shutdown rejection, corruption, retirement and enabled checkpoint mismatch.
 
 ## Dependency policy
 

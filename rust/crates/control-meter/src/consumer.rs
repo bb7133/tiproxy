@@ -287,7 +287,9 @@ impl<S: DurableSink> Consumer<S> {
     }
 
     fn validate_sink(&self) -> Result<(), Error> {
-        let sink = self.sink.checkpoint();
+        let Some(sink) = self.sink.checkpoint() else {
+            return Ok(());
+        };
         if !valid_checkpoint(&sink.producer_id, sink.sequence) {
             return Err(Error::Invalid("sink checkpoint inconsistent"));
         }

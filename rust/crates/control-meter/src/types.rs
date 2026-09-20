@@ -126,13 +126,41 @@ pub struct Delta {
 pub trait DurableSink {
     /// Whether persistence and exporting currently permit acknowledgments.
     fn healthy(&self) -> bool;
-    /// Last durably ingested batch.
-    fn checkpoint(&self) -> Checkpoint;
+    /// Last durably ingested batch, or `None` when billing is explicitly disabled.
+    /// An enabled sink must always return `Some`, including its initial zero checkpoint.
+    fn checkpoint(&self) -> Option<Checkpoint>;
     /// Persists a consecutive batch and its checkpoint in one atomic write.
     ///
     /// # Errors
     /// Returns an error for invalid attribution, overflow, gaps, or persistence failure.
     fn apply(&mut self, producer: &str, sequence: u64, deltas: &[Delta]) -> Result<(), Error>;
+}
+
+/// Disabled Go meter: retain consumer baselines and ACKs without opening an outbox.
+/// Pending consumer deltas are deliberately discarded, matching the Go nil sink.
+pub struct DisabledSink;
+
+impl DurableSink for DisabledSink {
+    fn healthy(&self) -> bool {
+        true
+    }
+
+    fn checkpoint(&self) -> Option<Checkpoint> {
+        None
+    }
+
+    fn apply(&mut self, _producer: &str, _sequence: u64, _deltas: &[Delta]) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Shared native sampler destination, independent of whether billing is enabled.
+pub trait Intake: Send + Sync {
+    /// Persists validated consumer state before authorizing a producer ACK.
+    ///
+    /// # Errors
+    /// Rejects invalid samples, unavailable ownership or persistence failures.
+    fn apply(&self, batch: &Batch) -> Result<bool, Error>;
 }
 
 pub(crate) fn valid_producer(value: &str) -> bool {

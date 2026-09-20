@@ -13,6 +13,9 @@ process-generation pruning/regression, and duplicate source rejection.
 The same run also switches Go→Rust and Rust→Go on existing real state, preserving
 producer identity, source baselines, tenant totals, outbox checkpoint, and self ID.
 A separate six-event sequence checks wrap, sink overflow, and pending restart.
+The same 13 events also run with billing disabled, comparing durable consumer
+state with no outbox. Switching a real Go overflow-pending state to disabled
+checks pending discard and a byte-unchanged existing outbox.
 The export comparison resumes the same sealed pending window in both owners,
 compares the object key and decompressed JSON (sorting tenant records), and checks
 pending clearing. A one-byte accounting mutation must fail comparison. Raw observations are kept
@@ -29,7 +32,8 @@ The native exporter now implements the Go single-part gzip envelope and object
 key, default shared pool, existing-object refusal, durable seal/commit, and
 LocalFS provider options. Go TiProxy uses the SDK default with pagination off.
 
-The cloud provider adapters, periodic runtime
-owner, sampler/WAL handoff, and removal of the Go sink remain follow-up work.
+Cloud adapters, the periodic exporter, native WAL sampler, and typed storage
+factory are implemented. Complete cloud identity/endpoint parity, binary owner
+selection and removal of the Go sink remain follow-up work.
 `CP-METER-001.rust_status` therefore remains pending and the existing production
 bridge is unchanged. Only one runtime may open these state files during handoff.

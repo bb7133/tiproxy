@@ -38,8 +38,8 @@ type event struct {
 }
 
 func run() error {
-	if len(os.Args) != 3 {
-		return fmt.Errorf("usage: go-observer STATE_DIR EVENTS_JSON")
+	if len(os.Args) != 3 && (len(os.Args) != 4 || os.Args[3] != "disabled") {
+		return fmt.Errorf("usage: go-observer STATE_DIR EVENTS_JSON [disabled]")
 	}
 	dir, err := filepath.Abs(os.Args[1])
 	if err != nil {
@@ -57,6 +57,9 @@ func run() error {
 	cfg.Workdir = dir
 	cfg.Metering.WithLocalFS(filepath.Join(dir, "objects"))
 	cfg.Metering.Bucket = "parity-test"
+	if len(os.Args) == 4 {
+		cfg.Metering.Bucket = ""
+	}
 	consumerPath := filepath.Join(dir, "consumer.json")
 	outboxPath := filepath.Join(dir, "run", "metering-outbox.json")
 	var previousSink *meter.Meter
@@ -75,6 +78,9 @@ func run() error {
 		}
 		// Never Start: no export loop is created. Closing an unstarted writer only releases resources.
 		previousSink = sink
+		if sink == nil {
+			return controlbridge.OpenMeteringConsumer(consumerPath, nil)
+		}
 		return controlbridge.OpenMeteringConsumer(consumerPath, sink)
 	}
 	consumer, err := open()
@@ -85,7 +91,7 @@ func run() error {
 	for _, e := range events {
 		var applied any
 		var applyErr error
-		if e.Export {
+		if e.Export && previousSink != nil {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			previousSink.Start(ctx)
@@ -111,6 +117,10 @@ func run() error {
 		state := map[string]any{"applied": applied, "error": applyErr != nil, "healthy": consumer.Healthy()}
 		for name, path := range map[string]string{"consumer": consumerPath, "outbox": outboxPath} {
 			value, err := os.ReadFile(path)
+			if os.IsNotExist(err) && name == "outbox" && previousSink == nil {
+				state[name] = nil
+				continue
+			}
 			if err != nil {
 				return err
 			}

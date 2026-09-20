@@ -32,7 +32,7 @@ const PRODUCER: &str = "0123456789abcdef0123456789abcdef";
 
 struct Fixture {
     dir: PathBuf,
-    _registry: OwnershipRegistry,
+    registry: OwnershipRegistry,
     lease: OwnerLease,
 }
 
@@ -48,7 +48,7 @@ impl Fixture {
         let lease = registry.claim(OwnerScope::Process, "meter-test").unwrap();
         Self {
             dir,
-            _registry: registry,
+            registry,
             lease,
         }
     }
@@ -131,7 +131,7 @@ fn absolute_dedup_restart_redirect_final_and_new_generation() {
     assert_eq!(c.sink().active()[0].private_response_bytes, 22);
     assert_eq!(c.sink().active()[0].public_response_bytes, 7);
     assert_eq!(c.sink().active()[0].cross_az_bytes, 43);
-    assert_eq!(c.sink().checkpoint().sequence, 4);
+    assert_eq!(c.sink().checkpoint().unwrap().sequence, 4);
 }
 
 #[test]
@@ -223,7 +223,7 @@ impl DurableSink for InterruptedSink {
     fn healthy(&self) -> bool {
         self.inner.healthy()
     }
-    fn checkpoint(&self) -> Checkpoint {
+    fn checkpoint(&self) -> Option<Checkpoint> {
         self.inner.checkpoint()
     }
     fn apply(&mut self, producer: &str, sequence: u64, deltas: &[Delta]) -> Result<(), Error> {
@@ -551,5 +551,224 @@ async fn runtime_failed_final_export_is_reported_and_remains_durable() {
         restored.pending().unwrap().data[0].private_response_bytes,
         10
     );
-    assert_eq!(restored.checkpoint().sequence, 1);
+    assert_eq!(restored.checkpoint().unwrap().sequence, 1);
+}
+
+#[tokio::test]
+async fn disabled_service_recovers_pending_without_touching_outbox() {
+    use control_meter::{Intake, service::Service};
+    let f = Fixture::new();
+    // Crash before sink ingestion leaves a durable consumer pending batch.
+    let mut interrupted = Consumer::open(
+        f.dir.join("consumer.json"),
+        f.owner(),
+        InterruptedSink {
+            inner: f.outbox(),
+            after_commit: false,
+        },
+    )
+    .unwrap();
+    assert!(interrupted.apply(&batch(1, 10, 5)).is_err());
+    drop(interrupted);
+    // Disabled startup must neither parse nor repair any preexisting outbox.
+    let outbox_path = f.dir.join("outbox.json");
+    fs::write(&outbox_path, b"unreadable-as-outbox sentinel").unwrap();
+    let config = control_config::MeteringConfig {
+        provider_type: "not-a-provider".into(),
+        endpoint: "invalid://do-not-open".into(),
+        ..Default::default()
+    };
+    let service = Service::open(
+        &config,
+        f.dir.join("consumer.json"),
+        outbox_path.clone(),
+        f.owner(),
+    )
+    .await
+    .unwrap();
+    assert!(service.healthy());
+    assert!(service.export_failures().is_none());
+    assert!(!service.apply(&batch(1, 10, 5)).unwrap());
+    assert!(service.apply(&batch(2, 20, 8)).unwrap());
+    assert_eq!(service.checkpoint().unwrap().sequence, 2);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.dir.join("consumer.json")).unwrap()).unwrap();
+    assert_eq!(state["pending"], serde_json::json!([]));
+    assert_eq!(
+        fs::read(&outbox_path).unwrap(),
+        b"unreadable-as-outbox sentinel"
+    );
+    drop(service);
+    let restored = Service::open(
+        &config,
+        f.dir.join("consumer.json"),
+        outbox_path.clone(),
+        f.owner(),
+    )
+    .await
+    .unwrap();
+    assert!(!restored.apply(&batch(2, 20, 8)).unwrap());
+    assert!(restored.apply(&batch(3, 21, 9)).unwrap());
+    let (_, shutdown) = tokio::sync::watch::channel(true);
+    restored.run(shutdown.clone()).await.unwrap();
+    assert!(!restored.healthy());
+    assert!(restored.apply(&batch(4, 22, 10)).is_err());
+    assert!(restored.run(shutdown).await.is_err());
+    assert_eq!(
+        fs::read(&outbox_path).unwrap(),
+        b"unreadable-as-outbox sentinel"
+    );
+}
+
+#[tokio::test]
+async fn service_factory_respects_disabled_predicate_and_rejects_checkpoint_reset() {
+    use control_config::{LocalFsMeteringConfig, MeteringConfig};
+    use control_meter::{Intake, service::Service};
+    let f = Fixture::new();
+    for (index, (kind, bucket)) in [("", "bucket"), ("localfs", ""), ("unsupported", "")]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = f.dir.join(index.to_string());
+        let config = MeteringConfig {
+            provider_type: kind.into(),
+            bucket: bucket.into(),
+            localfs: Some(LocalFsMeteringConfig {
+                base_path: dir.join("objects").to_string_lossy().into(),
+                create_dirs: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let service = Service::open(
+            &config,
+            dir.join("consumer.json"),
+            dir.join("outbox.json"),
+            f.owner(),
+        )
+        .await
+        .unwrap();
+        assert!(service.apply(&batch(1, 10, 5)).unwrap());
+        assert!(!dir.join("outbox.json").exists());
+        assert!(!dir.join("objects").exists());
+    }
+    let config = MeteringConfig {
+        provider_type: "localfs".into(),
+        bucket: "bucket".into(),
+        localfs: Some(LocalFsMeteringConfig {
+            base_path: f.dir.join("objects").to_string_lossy().into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // Enabling after acknowledged disabled traffic cannot silently reset billing.
+    assert!(
+        Service::open(
+            &config,
+            f.dir.join("0/consumer.json"),
+            f.dir.join("0/outbox.json"),
+            f.owner()
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn service_factory_keeps_localfs_options_and_recovers_pending_export() {
+    use control_config::{LocalFsMeteringConfig, MeteringConfig};
+    use control_meter::{Intake, service::Service};
+    let f = Fixture::new();
+    let root = f.dir.join("enabled");
+    let mut config = MeteringConfig {
+        provider_type: "gcs".into(),
+        bucket: "bucket".into(),
+        localfs: Some(LocalFsMeteringConfig {
+            base_path: root.join("objects").to_string_lossy().into(),
+            create_dirs: false,
+            permissions: "0700".into(),
+        }),
+        prefix: "prefix".into(),
+        ..Default::default()
+    };
+    assert!(
+        Service::open(
+            &config,
+            root.join("consumer.json"),
+            root.join("outbox.json"),
+            f.owner()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        !root.exists(),
+        "invalid enabled provider must not create durable files"
+    );
+    config.provider_type = "localfs".into();
+    let service = Service::open(
+        &config,
+        root.join("consumer.json"),
+        root.join("outbox.json"),
+        f.owner(),
+    )
+    .await
+    .unwrap();
+    assert!(!root.join("objects").exists(), "explicit false is retained");
+    service.apply(&batch(1, 10, 5)).unwrap();
+    let (_, shutdown) = tokio::sync::watch::channel(true);
+    assert!(
+        service.run(shutdown).await.is_err(),
+        "missing destination must retain export"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("outbox.json")).unwrap()).unwrap();
+    assert!(state["pending"].is_object());
+    drop(service);
+    config.localfs.as_mut().unwrap().create_dirs = true;
+    let service = Service::open(
+        &config,
+        root.join("consumer.json"),
+        root.join("outbox.json"),
+        f.owner(),
+    )
+    .await
+    .unwrap();
+    let (_, shutdown) = tokio::sync::watch::channel(true);
+    service.run(shutdown).await.unwrap();
+    assert!(root.join("objects/prefix/metering/ru").is_dir());
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("outbox.json")).unwrap()).unwrap();
+    assert!(state["pending"].is_null());
+}
+
+#[tokio::test]
+async fn disabled_service_still_rejects_corruption_and_retired_owner() {
+    use control_meter::{Intake, service::Service};
+    let mut f = Fixture::new();
+    let config = control_config::MeteringConfig::default();
+    let path = f.dir.join("consumer.json");
+    let outbox = f.dir.join("outbox.json");
+    let service = Service::open(&config, path.clone(), outbox.clone(), f.owner())
+        .await
+        .unwrap();
+    let retired = f.owner();
+    let otherregistry = OwnershipRegistry::new();
+    f.lease = otherregistry
+        .claim(OwnerScope::Process, "other-owner")
+        .unwrap();
+    assert!(!service.healthy());
+    assert!(service.apply(&batch(1, 10, 5)).is_err());
+    assert!(
+        Service::open(&config, path.clone(), outbox.clone(), retired)
+            .await
+            .is_err()
+    );
+    let replacement = f.registry.claim(OwnerScope::Process, "meter-test").unwrap();
+    fs::write(&path, b"corrupt consumer").unwrap();
+    assert!(
+        Service::open(&config, path, outbox, replacement.token())
+            .await
+            .is_err()
+    );
 }

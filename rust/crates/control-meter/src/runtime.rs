@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::export::{ObjectStore, encode_window};
-use crate::{Batch, Checkpoint, Consumer, Error, Outbox};
+use crate::{Batch, Checkpoint, Consumer, Error, Intake, Outbox};
 
 /// The Go meter's upload deadline, including shutdown's final attempt.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -183,6 +183,12 @@ impl<S: ObjectStore> Meter<S> {
 
     fn state(&self) -> Result<MutexGuard<'_, State>, Error> {
         self.state.lock().map_err(|_| Error::Unhealthy)
+    }
+}
+
+impl<S: ObjectStore> Intake for Meter<S> {
+    fn apply(&self, batch: &Batch) -> Result<bool, Error> {
+        Self::apply(self, batch)
     }
 }
 

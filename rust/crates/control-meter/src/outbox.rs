@@ -192,11 +192,11 @@ impl DurableSink for Outbox {
         self.persistence_healthy && self.writer_healthy && self.file.check_owner().is_ok()
     }
 
-    fn checkpoint(&self) -> Checkpoint {
-        Checkpoint {
+    fn checkpoint(&self) -> Option<Checkpoint> {
+        Some(Checkpoint {
             producer_id: self.state.producer_id.clone(),
             sequence: self.state.last_batch_sequence,
-        }
+        })
     }
 
     fn apply(&mut self, producer: &str, sequence: u64, deltas: &[Delta]) -> Result<(), Error> {

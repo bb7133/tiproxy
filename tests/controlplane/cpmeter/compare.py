@@ -10,11 +10,14 @@ import subprocess
 import tempfile
 
 
-def run(binary, directory, events, output):
+def run(binary, directory, events, output, disabled=False):
     request = output.with_suffix(".input.json")
     request.write_text(json.dumps(events))
     with output.open("w") as stream:
-        subprocess.run([str(binary), str(directory), str(request)], stdout=stream, check=True)
+        command = [str(binary), str(directory), str(request)]
+        if disabled:
+            command.append("disabled")
+        subprocess.run(command, stdout=stream, check=True)
     return json.loads(output.read_text())
 
 
@@ -79,6 +82,21 @@ def main():
         wrap_go = run(args.go, root / "wrap-go", wrap_events, args.output / "go-wrap.json")
         wrap_rust = run(args.rust, root / "wrap-rust", wrap_events, args.output / "rust-wrap.json")
         compare(wrap_go, wrap_rust)
+        # The Go nil sink keeps consumer checkpoints but never opens the outbox.
+        disabled_go = run(args.go, root / "disabled-go", events, args.output / "disabled-go.json", True)
+        disabled_rust = run(args.rust, root / "disabled-rust", events, args.output / "disabled-rust.json", True)
+        compare(disabled_go, disabled_rust)
+        assert all(event["outbox"] is None for event in disabled_rust)
+        # Switch to disabled with real Go pending deltas from the overflow case.
+        original_outbox = (root / "wrap-go/run/metering-outbox.json").read_bytes()
+        recovered = []
+        for name, binary in (("disabled-pending-go", args.go), ("disabled-pending-rust", args.rust)):
+            shutil.copytree(root / "wrap-go", root / name)
+            recovered.append(run(binary, root / name, wrap_events[-1:], args.output / f"{name}.json", True))
+            assert (root / name / "run/metering-outbox.json").read_bytes() == original_outbox
+        compare(*recovered)
+        assert recovered[0][-1]["consumer"]["pending"] == []
+        assert recovered[0][-1]["error"] is False
         mutated = copy.deepcopy(candidate)
         mutated[-1]["outbox"]["data"][0]["cross_az_bytes"] += 1
         try:
@@ -87,7 +105,7 @@ def main():
             pass
         else:
             raise AssertionError("lost-byte mutation survived")
-    print(f"PASS: {len(events)} Go/Rust observations, Go→Rust handoff, Rust→Go rollback, byte mutation rejected; Go SDK/native gzip object parity; 6 wrap/overflow/restart observations")
+    print(f"PASS: {len(events)} Go/Rust observations, Go→Rust handoff, Rust→Go rollback, byte mutation rejected; Go SDK/native gzip object parity; 6 wrap/overflow/restart observations; disabled consumer/pending recovery parity")
 
 
 if __name__ == "__main__":

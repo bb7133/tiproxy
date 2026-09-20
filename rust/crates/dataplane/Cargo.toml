@@ -24,6 +24,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+control-config.workspace = true
 control-plane.workspace = true
 control-topology.workspace = true
 rcgen.workspace = true

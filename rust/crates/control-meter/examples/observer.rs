@@ -18,7 +18,7 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-use control_meter::{Batch, Consumer, Outbox};
+use control_meter::{Batch, Checkpoint, Consumer, Delta, DisabledSink, DurableSink, Outbox};
 use control_plane::{OwnerScope, OwnershipRegistry};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -32,11 +32,42 @@ struct Event {
     batch: Option<Batch>,
 }
 
+enum Sink {
+    Enabled(Outbox),
+    Disabled(DisabledSink),
+}
+
+impl DurableSink for Sink {
+    fn healthy(&self) -> bool {
+        match self {
+            Self::Enabled(value) => value.healthy(),
+            Self::Disabled(value) => value.healthy(),
+        }
+    }
+    fn checkpoint(&self) -> Option<Checkpoint> {
+        match self {
+            Self::Enabled(value) => value.checkpoint(),
+            Self::Disabled(value) => value.checkpoint(),
+        }
+    }
+    fn apply(
+        &mut self,
+        producer: &str,
+        sequence: u64,
+        deltas: &[Delta],
+    ) -> Result<(), control_meter::Error> {
+        match self {
+            Self::Enabled(value) => value.apply(producer, sequence, deltas),
+            Self::Disabled(value) => value.apply(producer, sequence, deltas),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 3 {
-        return Err("usage: observer STATE_DIR EVENTS_JSON".into());
+    if args.len() != 3 && (args.len() != 4 || args[3] != "disabled") {
+        return Err("usage: observer STATE_DIR EVENTS_JSON [disabled]".into());
     }
     let dir = PathBuf::from(&args[1]);
     let events: Vec<Event> = serde_json::from_slice(&fs::read(&args[2])?)?;
@@ -48,7 +79,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Consumer::open(
             &consumer_path,
             lease.token(),
-            Outbox::open(&outbox_path, lease.token())?,
+            if args.len() == 4 {
+                Sink::Disabled(DisabledSink)
+            } else {
+                Sink::Enabled(Outbox::open(&outbox_path, lease.token())?)
+            },
         )
     };
     let mut consumer = open()?;
@@ -56,8 +91,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for event in events {
         let (applied, error) = if event.export {
             let store = control_meter::LocalStore::new(&dir.join("objects"), "", true, "")?;
+            let Sink::Enabled(outbox) = consumer.sink_mut() else {
+                return Err("disabled export event".into());
+            };
             let result = control_meter::export::flush(
-                consumer.sink_mut(),
+                outbox,
                 &store,
                 "",
                 60,
@@ -75,7 +113,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
         let consumer_state: Value = serde_json::from_slice(&fs::read(&consumer_path)?)?;
-        let outbox_state: Value = serde_json::from_slice(&fs::read(&outbox_path)?)?;
+        let outbox_state: Value = match fs::read(&outbox_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if args.len() == 4 && error.kind() == std::io::ErrorKind::NotFound => {
+                Value::Null
+            }
+            Err(error) => return Err(error.into()),
+        };
         observations.push(
             json!({"applied": applied, "error":error, "healthy":consumer.healthy(),
             "consumer":consumer_state, "outbox":outbox_state}),

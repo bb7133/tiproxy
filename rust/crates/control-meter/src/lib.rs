@@ -28,11 +28,13 @@ mod local_store;
 mod outbox;
 mod persistence;
 pub mod runtime;
+pub mod service;
 mod types;
 
 pub use consumer::Consumer;
 pub use local_store::LocalStore;
 pub use outbox::{ExportRecord, ExportWindow, Outbox};
 pub use types::{
-    Batch, Checkpoint, Delta, DurableSink, Error, Snapshot, SourceBaseline, SourceKey,
+    Batch, Checkpoint, Delta, DisabledSink, DurableSink, Error, Intake, Snapshot, SourceBaseline,
+    SourceKey,
 };
