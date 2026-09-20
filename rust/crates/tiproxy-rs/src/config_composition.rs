@@ -44,17 +44,38 @@ pub struct RustConfigComposer {
     topology: Option<TopologyModuleHandle>,
     generation: AtomicU64,
     drain_grace_override: Option<Duration>,
+    /// Highest CP-CFG source generation the SQL serving side has applied.
+    /// This is the config lineage (not the composer's own counter), so
+    /// CP-ADMIN can use it as the namespace-commit barrier.
+    applied_config: tokio::sync::watch::Sender<u64>,
 }
 
 impl RustConfigComposer {
     #[must_use]
-    pub const fn new(source: ConfigNamespaceStore, drain_grace_override: Option<Duration>) -> Self {
+    pub fn new(source: ConfigNamespaceStore, drain_grace_override: Option<Duration>) -> Self {
         Self {
             source,
             topology: None,
             generation: AtomicU64::new(1),
             drain_grace_override,
+            applied_config: tokio::sync::watch::channel(0).0,
         }
+    }
+
+    /// Observes the CP-CFG generations serving has applied.
+    pub fn applied_config_generation(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.applied_config.subscribe()
+    }
+
+    fn record_applied_config(&self, generation: u64) {
+        self.applied_config.send_if_modified(|current| {
+            if generation > *current {
+                *current = generation;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Installs the process-local CP-TOPO source used after
@@ -137,6 +158,9 @@ pub struct ConfigServingAdapter {
     drain_grace_override: Option<Duration>,
     composer: Arc<RustConfigComposer>,
     topology_updates: Option<TopologyUpdateObserver>,
+    /// CP-CFG generation of the latest snapshot handed to serving; recorded
+    /// as applied once `reload_composed` actually installs a snapshot.
+    pending_config_generation: u64,
 }
 
 impl ConfigServingAdapter {
@@ -162,6 +186,7 @@ impl ConfigServingAdapter {
             drain_grace_override,
             composer,
             topology_updates,
+            pending_config_generation: 0,
         }
     }
 
@@ -211,7 +236,11 @@ impl ConfigServingAdapter {
         }
     }
 
-    async fn apply_snapshot(&self, snapshot: &ConfigNamespaceSnapshot) -> Result<(), ModuleError> {
+    async fn apply_snapshot(
+        &mut self,
+        snapshot: &ConfigNamespaceSnapshot,
+    ) -> Result<(), ModuleError> {
+        self.pending_config_generation = snapshot.generation();
         self.composer.advance_generation()?;
         // `watch` deliberately coalesces bursts. CP-001's local config
         // lineage is immediate-successor-only, so advance that consumer
@@ -234,10 +263,17 @@ impl ConfigServingAdapter {
     }
 
     async fn reload_serving(&self) -> Result<(), ModuleError> {
-        self.serving
+        let installed = self
+            .serving
             .reload_composed(&self.snapshots, unix_time_now())
             .await
             .map_err(|_| module_error("serving_apply_rejected"))?;
+        if installed {
+            // The serving snapshot now reflects every CP-CFG generation up to
+            // the pending one (the composer reads the latest source state).
+            self.composer
+                .record_applied_config(self.pending_config_generation);
+        }
         Ok(())
     }
 }

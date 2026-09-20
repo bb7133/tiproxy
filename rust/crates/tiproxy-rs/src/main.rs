@@ -727,6 +727,8 @@ async fn run(options: Options) -> Result<(), String> {
         RustConfigComposer::new(config_owner.handle.source().clone(), options.drain_grace)
             .with_topology(topology_handle.clone()),
     );
+    // The namespace-commit barrier follows the CP-CFG lineage serving applied.
+    let applied_config_generation = composer.applied_config_generation();
     let (consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
         Arc::new(SystemMemoryProbe::new()),
         Arc::new(connection_handler),
@@ -829,6 +831,7 @@ async fn run(options: Options) -> Result<(), String> {
             &config_owner.handle,
             &serving,
             &metrics_registry,
+            applied_config_generation,
         ),
         admin_tls_source(config_owner.handle.source().clone()),
     )
@@ -1473,7 +1476,9 @@ async fn spawn_admin(
 /// serving side has composed the current config generation.
 struct OwnerConfigAdmin {
     handle: ConfigModuleHandle,
-    serving: DataplaneServingHandle,
+    /// CP-CFG generations the SQL serving side has applied (the config
+    /// lineage, not the composer's own counter).
+    applied_config: watch::Receiver<u64>,
 }
 
 /// Longest a namespace commit waits for the serving side to catch up.
@@ -1527,16 +1532,20 @@ impl control_admin::ConfigAdmin for OwnerConfigAdmin {
                 return Err(control_admin::CommitError::Missing);
             }
             // Namespaces become serving through the config watch; "commit"
-            // is complete once serving has composed this generation.
+            // is complete once serving has applied this CP-CFG generation.
             let target = snapshot.generation();
-            let deadline = tokio::time::Instant::now() + ADMIN_COMMIT_TIMEOUT;
-            while self.serving.status().composition_generation < target {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(control_admin::CommitError::Reload);
+            let mut applied = self.applied_config.clone();
+            let barrier = async {
+                while *applied.borrow_and_update() < target {
+                    if applied.changed().await.is_err() {
+                        return Err(control_admin::CommitError::Reload);
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Ok(())
+                Ok(())
+            };
+            tokio::time::timeout(ADMIN_COMMIT_TIMEOUT, barrier)
+                .await
+                .unwrap_or(Err(control_admin::CommitError::Reload))
         })
     }
 
@@ -1573,6 +1582,7 @@ fn admin_hooks(
     config: &ConfigModuleHandle,
     serving: &DataplaneServingHandle,
     registry: &Arc<MetricsRegistry>,
+    applied_config: watch::Receiver<u64>,
 ) -> control_admin::AdminHooks {
     let lifecycle = in_process.handle();
     let health_config = config.clone();
@@ -1581,7 +1591,7 @@ fn admin_hooks(
     let registry = Arc::clone(registry);
     let config_admin: control_admin::SharedConfigAdmin = Arc::new(OwnerConfigAdmin {
         handle: config.clone(),
-        serving: serving.clone(),
+        applied_config,
     });
     control_admin::AdminHooks {
         health_inputs: Arc::new(move || control_admin::HealthInputs {

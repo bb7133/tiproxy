@@ -41,7 +41,7 @@ use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use hyper_util::service::TowerToHyperService;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
@@ -195,6 +195,7 @@ async fn serve_io<I>(
         last: AtomicU64::new(0),
         active_requests: AtomicUsize::new(0),
         started,
+        settled: Notify::new(),
     });
     let io = IdleIo {
         inner: TokioIo::new(io),
@@ -214,8 +215,18 @@ async fn serve_io<I>(
     // it takes, so the watchdog fires only with zero active requests.
     let watchdog = async {
         loop {
+            if activity.active_requests.load(Ordering::Acquire) > 0 {
+                // A request is in flight: wait for it to settle instead of
+                // polling a deadline that already passed.
+                activity.settled.notified().await;
+                continue;
+            }
             let last = Duration::from_millis(activity.last.load(Ordering::Acquire));
-            tokio::time::sleep_until((started + last + idle_timeout).into()).await;
+            let deadline = started + last + idle_timeout;
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline.into()) => {}
+                () = activity.settled.notified() => continue,
+            }
             if activity.idle_for(idle_timeout) {
                 return;
             }
@@ -233,6 +244,8 @@ struct Activity {
     last: AtomicU64,
     active_requests: AtomicUsize,
     started: Instant,
+    /// Woken when a request settles so the watchdog re-arms its deadline.
+    settled: Notify,
 }
 
 impl Activity {
@@ -271,6 +284,7 @@ impl Drop for ActiveRequest {
     fn drop(&mut self) {
         self.0.active_requests.fetch_sub(1, Ordering::AcqRel);
         self.0.touch();
+        self.0.settled.notify_waiters();
     }
 }
 

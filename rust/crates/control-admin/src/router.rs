@@ -34,7 +34,7 @@ use http::header::CONTENT_TYPE;
 use http::{HeaderValue, StatusCode};
 use http_body_util::BodyExt;
 
-use crate::config::{CommitError, SharedConfigAdmin, go_json_body};
+use crate::config::{CommitError, NAMESPACE_SCHEMA, SharedConfigAdmin, go_json_body};
 use crate::health::{HealthInputs, HealthState, go_json_document, go_json_string};
 use control_config::NamespaceConfig;
 
@@ -502,14 +502,13 @@ async fn namespace_put(
 }
 
 /// Go pre-fills the namespace name from the path, binds the body over it and
-/// stores the value under the path name; the Rust owner requires key and
-/// value names to agree, so the path name (or, on the root route, the body
-/// name) is the stored name.
+/// stores the value under the resulting `namespace` field: a body name wins
+/// over the path, and an empty name is a store error (`500`).
 async fn namespace_upsert(app: Arc<AdminApp>, path_name: String, request: Request) -> Response {
     let Some(body) = read_body(request).await else {
         return json(StatusCode::BAD_REQUEST, "\"bad namespace json\"");
     };
-    let mut value = match go_json_body(&body) {
+    let mut value = match go_json_body(&body, NAMESPACE_SCHEMA) {
         Ok(None) => NamespaceConfig::default(),
         Ok(Some(value)) => match serde_json::from_value::<NamespaceConfig>(value) {
             Ok(value) => value,
@@ -517,8 +516,14 @@ async fn namespace_upsert(app: Arc<AdminApp>, path_name: String, request: Reques
         },
         Err(_) => return json(StatusCode::BAD_REQUEST, "\"bad namespace json\""),
     };
-    if !path_name.is_empty() {
+    if value.namespace.is_empty() {
         value.namespace = path_name;
+    }
+    if value.namespace.is_empty() {
+        return json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "\"can not update config\"",
+        );
     }
     match app.hooks.config.set_namespace(value).await {
         Ok(()) => json(StatusCode::OK, "\"\""),
@@ -559,48 +564,51 @@ async fn namespace_commit(State(app): State<Arc<AdminApp>>, request: Request) ->
 }
 
 /// Repeated query values for `key`, decoded like Go's `url.ParseQuery`
-/// (`+` is a space, `%XX` is a byte); malformed escapes keep their bytes.
+/// (`+` is a space, `%XX` is a byte); a pair with a malformed escape in its
+/// key or value is dropped, as `ParseQuery` skips it.
 fn query_values(query: &str, key: &str) -> Vec<String> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
         .filter_map(|pair| {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (url_decode(name) == key).then(|| url_decode(value))
+            let name = url_decode(name)?;
+            let value = url_decode(value)?;
+            (name == key).then_some(value)
         })
         .collect()
 }
 
-fn url_decode(text: &str) -> String {
+/// `None` for a malformed percent escape.
+fn url_decode(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
             b'+' => output.push(b' '),
-            b'%' if index + 2 < bytes.len() => {
-                if let Ok(byte) = u8::from_str_radix(&text[index + 1..index + 3], 16) {
-                    output.push(byte);
-                    index += 3;
-                    continue;
-                }
-                output.push(b'%');
+            b'%' => {
+                let hex = text.get(index + 1..index + 3)?;
+                output.push(u8::from_str_radix(hex, 16).ok()?);
+                index += 3;
+                continue;
             }
             byte => output.push(byte),
         }
         index += 1;
     }
-    String::from_utf8_lossy(&output).into_owned()
+    Some(String::from_utf8_lossy(&output).into_owned())
 }
 
 // ---- configuration (Go pkg/server/api/config.go) ----
 
 async fn config_get(State(app): State<Arc<AdminApp>>, request: Request) -> Response {
-    // TiDB Dashboard asks for JSON with `?format=json` (case-insensitive) or
-    // an exact `Accept: application/json`; tiproxyctl expects TOML.
+    // TiDB Dashboard asks for JSON with `?format=json` (case-insensitive,
+    // first value only like gin's `c.Query`) or an exact
+    // `Accept: application/json`; tiproxyctl expects TOML.
     let wants_json = query_values(request.uri().query().unwrap_or_default(), "format")
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case("json"))
+        .first()
+        .is_some_and(|value| value.eq_ignore_ascii_case("json"))
         || request
             .headers()
             .get(http::header::ACCEPT)
@@ -945,7 +953,7 @@ mod tests {
             request(
                 "PUT",
                 "/api/admin/namespace/dge",
-                "{\"Frontend\":{\"user\":\"<u>\"},\"namespace\":\"ignored\"} trailing",
+                "{\"Frontend\":{\"user\":\"<u>\"},\"namespace\":\"dge\"} trailing",
             ),
         )
         .await;
@@ -987,6 +995,31 @@ mod tests {
         .await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, "\"\""));
         assert!(store.get_namespace("root").is_some());
+        // The body name wins over the path and is the stored key (Go
+        // SetNamespace(nsc.Namespace)); an empty name is a store error.
+        let (status, _, _) = oneshot(
+            router.clone(),
+            request(
+                "PUT",
+                "/api/admin/namespace/path",
+                "{\"namespace\":\"body\"}",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(store.get_namespace("body").is_some() && store.get_namespace("path").is_none());
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request("PUT", "/api/admin/namespace/", "{}"),
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "\"can not update config\""
+            )
+        );
         let (status, _, body) = oneshot(
             router.clone(),
             request(
@@ -1109,6 +1142,11 @@ mod tests {
         );
         assert!(query_values("", "namespace").is_empty());
         assert_eq!(query_values("namespace", "namespace"), vec![String::new()]);
+        // A malformed escape drops that pair only (Go url.ParseQuery).
+        assert_eq!(
+            query_values("namespace=%GG&namespace=ok", "namespace"),
+            vec!["ok".to_owned()]
+        );
     }
 
     #[tokio::test]

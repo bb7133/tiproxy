@@ -202,28 +202,158 @@ impl ConfigAdmin for MemoryConfigAdmin {
     }
 }
 
+/// Field kinds of the Go structs a body decodes into, so decoding can apply
+/// `encoding/json` rules per member without a generic normalization pass.
+#[derive(Clone, Copy)]
+pub enum Schema {
+    /// Go `string`.
+    Str,
+    /// Go `bool`.
+    Bool,
+    /// Go integer.
+    Int,
+    /// Go `[]string`.
+    StrList,
+    /// Go struct with these lowercase JSON tags.
+    Object(&'static [(&'static str, Schema)]),
+}
+
+/// Go `config.TLSConfig` (all tags lowercase, `omitempty`).
+pub const TLS_SCHEMA: Schema = Schema::Object(&[
+    ("cert", Schema::Str),
+    ("key", Schema::Str),
+    ("ca", Schema::Str),
+    ("min-tls-version", Schema::Str),
+    ("cert-allowed-cn", Schema::StrList),
+    ("auto-certs", Schema::Bool),
+    ("rsa-key-size", Schema::Int),
+    ("autocert-expire-duration", Schema::Str),
+    ("skip-ca", Schema::Bool),
+]);
+
+/// Go `config.Namespace`.
+pub const NAMESPACE_SCHEMA: Schema = Schema::Object(&[
+    ("namespace", Schema::Str),
+    (
+        "frontend",
+        Schema::Object(&[("user", Schema::Str), ("security", TLS_SCHEMA)]),
+    ),
+    (
+        "backend",
+        Schema::Object(&[("instances", Schema::StrList), ("security", TLS_SCHEMA)]),
+    ),
+]);
+
 /// Decodes a request body the way gin's `ShouldBindJSON` (`json.Decoder`)
-/// does before serde sees it: one JSON value only (trailing bytes ignored),
-/// `null` is "leave the target unchanged", object keys match Go's
-/// case-insensitive rule, a `null` member leaves that field unchanged,
-/// unknown members are ignored by the caller's `serde(default)` types, and
-/// duplicate members are decoded in order — occurrences of different JSON
-/// kinds can never all decode into one field, which Go reports as an error,
-/// while same-kind duplicates let the last value win.
+/// does for a Go struct described by `schema`: one JSON value only
+/// (trailing bytes ignored); `null` leaves the target unchanged; object
+/// members match a field exactly or case-insensitively; unknown members
+/// are skipped whatever their value; every occurrence of a known member is
+/// decoded in order (a wrong type anywhere is an error, a `null` leaves the
+/// field unchanged, objects merge field by field, arrays and scalars are
+/// replaced by the later value).
 ///
-/// Returns `Ok(None)` for `null`.
+/// The result is a JSON object with lowercase keys that `serde(default)`
+/// types accept, or `None` for a top-level `null`.
 ///
 /// # Errors
 ///
-/// Returns the decode error for malformed JSON or duplicate members of
-/// conflicting kinds.
-pub fn go_json_body(bytes: &[u8]) -> Result<Option<Value>, serde_json::Error> {
+/// Returns the decode error for malformed JSON, a non-object top level, or
+/// a known member of the wrong kind.
+pub fn go_json_body(bytes: &[u8], schema: Schema) -> Result<Option<Value>, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let tree = serde::Deserialize::deserialize(&mut deserializer)?;
-    normalize(tree).map(|value| match value {
-        Value::Null => None,
-        other => Some(other),
-    })
+    let tree: Tree = serde::Deserialize::deserialize(&mut deserializer)?;
+    match tree {
+        Tree::Null => Ok(None),
+        Tree::Object(members) => {
+            let mut target = Value::Object(serde_json::Map::new());
+            apply_object(&mut target, members, schema)?;
+            Ok(Some(target))
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "cannot unmarshal {} into a struct",
+            kind(&other)
+        ))),
+    }
+}
+
+fn apply_object(
+    target: &mut Value,
+    members: Vec<(String, Tree)>,
+    schema: Schema,
+) -> Result<(), serde_json::Error> {
+    let Schema::Object(fields) = schema else {
+        return Err(serde::de::Error::custom("object into a non-struct field"));
+    };
+    let Value::Object(object) = target else {
+        return Err(serde::de::Error::custom("target is not an object"));
+    };
+    for (key, value) in members {
+        // Go prefers an exact tag match, then a case-insensitive one.
+        let Some((name, field_schema)) = fields
+            .iter()
+            .find(|(name, _)| *name == key)
+            .or_else(|| {
+                fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&key))
+            })
+            .copied()
+        else {
+            continue;
+        };
+        if matches!(value, Tree::Null) {
+            // Go: null unmarshals into a slice by setting it to nil; into a
+            // string/bool/int/struct it leaves the value unchanged.
+            if matches!(field_schema, Schema::StrList) {
+                object.insert(name.to_owned(), Value::Array(Vec::new()));
+            }
+            continue;
+        }
+        let slot = object.entry(name.to_owned()).or_insert(Value::Null);
+        apply_value(slot, value, field_schema, name)?;
+    }
+    Ok(())
+}
+
+fn apply_value(
+    slot: &mut Value,
+    value: Tree,
+    schema: Schema,
+    name: &str,
+) -> Result<(), serde_json::Error> {
+    let mismatch = |found: &Tree| {
+        serde::de::Error::custom(format!(
+            "cannot unmarshal {} into field {name}",
+            kind(found)
+        ))
+    };
+    match (schema, value) {
+        (Schema::Str, Tree::String(text)) => *slot = Value::String(text),
+        (Schema::Bool, Tree::Bool(flag)) => *slot = Value::Bool(flag),
+        (Schema::Int, Tree::Number(number)) if number.is_i64() || number.is_u64() => {
+            *slot = Value::Number(number);
+        }
+        (Schema::StrList, Tree::Array(items)) => {
+            let mut list = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Tree::String(text) => list.push(Value::String(text)),
+                    Tree::Null => list.push(Value::String(String::new())),
+                    other => return Err(mismatch(&other)),
+                }
+            }
+            *slot = Value::Array(list);
+        }
+        (Schema::Object(_), Tree::Object(members)) => {
+            if !slot.is_object() {
+                *slot = Value::Object(serde_json::Map::new());
+            }
+            apply_object(slot, members, schema)?;
+        }
+        (_, other) => return Err(mismatch(&other)),
+    }
+    Ok(())
 }
 
 /// JSON tree that keeps duplicate object members in order.
@@ -297,45 +427,6 @@ fn kind(tree: &Tree) -> &'static str {
     }
 }
 
-fn normalize(tree: Tree) -> Result<Value, serde_json::Error> {
-    Ok(match tree {
-        Tree::Null => Value::Null,
-        Tree::Bool(value) => Value::Bool(value),
-        Tree::Number(value) => Value::Number(value),
-        Tree::String(value) => Value::String(value),
-        Tree::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(normalize)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Tree::Object(members) => {
-            let mut object = serde_json::Map::new();
-            let mut kinds: std::collections::BTreeMap<String, &'static str> =
-                std::collections::BTreeMap::new();
-            for (key, value) in members {
-                // Go matches struct fields case-insensitively; every tag in
-                // the namespace/config shapes is lowercase.
-                let folded = key.to_ascii_lowercase();
-                if matches!(value, Tree::Null) {
-                    // A JSON null leaves the field unchanged.
-                    continue;
-                }
-                let value_kind = kind(&value);
-                if let Some(previous) = kinds.insert(folded.clone(), value_kind)
-                    && previous != value_kind
-                {
-                    return Err(serde::de::Error::custom(format!(
-                        "member {folded} decoded as {previous} and {value_kind}"
-                    )));
-                }
-                object.insert(folded, normalize(value)?);
-            }
-            Value::Object(object)
-        }
-    })
-}
-
 /// Shared handle type the router stores.
 pub type SharedConfigAdmin = Arc<dyn ConfigAdmin>;
 
@@ -346,21 +437,48 @@ mod tests {
 
     #[test]
     fn body_decoder_follows_go_rules() {
-        assert_eq!(go_json_body(b"null").unwrap(), None);
+        let decode = |text: &str| go_json_body(text.as_bytes(), NAMESPACE_SCHEMA);
+        assert_eq!(decode("null").unwrap(), None);
         assert_eq!(
-            go_json_body(b"{\"Namespace\":\"a\"} trailing").unwrap(),
+            decode("{\"Namespace\":\"a\"} trailing").unwrap(),
             Some(serde_json::json!({"namespace": "a"}))
         );
+        // Duplicate objects merge field by field like sequential decoding.
         assert_eq!(
-            go_json_body(b"{\"user\":null,\"USER\":\"x\",\"user\":\"y\"}").unwrap(),
-            Some(serde_json::json!({"user": "y"}))
+            decode("{\"frontend\":{\"user\":\"a\"},\"frontend\":{\"security\":{\"ca\":\"x\"}}}")
+                .unwrap(),
+            Some(serde_json::json!({"frontend": {"user": "a", "security": {"ca": "x"}}}))
         );
-        assert!(go_json_body(b"{\"user\":1,\"user\":\"y\"}").is_err());
-        assert!(go_json_body(b"").is_err());
-        assert!(go_json_body(b"{").is_err());
+        // Unknown members are ignored whatever their shapes.
         assert_eq!(
-            go_json_body(b"{\"backend\":{\"Instances\":[\"a\"],\"security\":null}}").unwrap(),
+            decode("{\"extra\":1,\"extra\":{\"x\":[]},\"namespace\":\"n\"}").unwrap(),
+            Some(serde_json::json!({"namespace": "n"}))
+        );
+        // Null members leave fields unchanged; later scalars win.
+        assert_eq!(
+            decode("{\"namespace\":\"a\",\"namespace\":null,\"NAMESPACE\":\"b\"}").unwrap(),
+            Some(serde_json::json!({"namespace": "b"}))
+        );
+        assert_eq!(
+            decode("{\"backend\":{\"Instances\":[\"a\"],\"security\":null}}").unwrap(),
             Some(serde_json::json!({"backend": {"instances": ["a"]}}))
         );
+        // A null slice member clears an earlier array (Go sets the slice to nil).
+        assert_eq!(
+            decode("{\"backend\":{\"instances\":[\"a\"],\"instances\":null}}").unwrap(),
+            Some(serde_json::json!({"backend": {"instances": []}}))
+        );
+        for bad in [
+            "",
+            "{",
+            "[]",
+            "\"x\"",
+            "{\"frontend\":5}",
+            "{\"frontend\":{\"user\":1,\"user\":\"x\"}}",
+            "{\"backend\":{\"instances\":[1]}}",
+            "{\"namespace\":true}",
+        ] {
+            assert!(decode(bad).is_err(), "{bad}");
+        }
     }
 }

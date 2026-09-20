@@ -67,10 +67,10 @@ bodies (`namespace.go`, `config.go`) over the owner-fenced config module:
 | --- | --- |
 | `GET /api/admin/namespace/` | name-sorted JSON array of namespaces; the JSON empty string `""` when there are none (Go's nil slice). |
 | `GET /api/admin/namespace/{name}` | the namespace, or `500 "can not get namespace"` (Go reports not-found through the same 500). |
-| `PUT /api/admin/namespace/{name}`, `PUT /api/admin/namespace/` | body decoded with `json.Decoder` semantics (one value, trailing bytes ignored, `null` = empty value, case-insensitive keys, null members unchanged, conflicting duplicate kinds `400 "bad namespace json"`); persisted below `/config/ns/<name>` through `ConfigModuleHandle::set_namespace`; `200 ""` or `500 "can not update config"`. |
+| `PUT /api/admin/namespace/{name}`, `PUT /api/admin/namespace/` | body decoded with `json.Decoder` semantics against the Go `config.Namespace` field schema (one value, trailing bytes ignored, `null` = empty value, case-insensitive keys, unknown members ignored whatever their shape, `null` leaves a scalar or struct unchanged but clears a slice, duplicate struct members merge field by field, later scalars and arrays win, a known member of the wrong kind is `400 "bad namespace json"`); the path only pre-fills the name and the body's `namespace` wins and is the stored key, exactly as Go's `SetNamespace(nsc.Namespace)`; an empty name is `500 "can not update config"`; persisted below `/config/ns/<name>` through `ConfigModuleHandle::set_namespace`; `200 ""` or `500 "can not update config"`. |
 | `DELETE /api/admin/namespace/{name}` | `ConfigModuleHandle::delete_namespace`; deleting an absent name succeeds like Go's B-tree; `200 ""` / `500`. |
-| `POST /api/admin/namespace/commit?namespace=a&namespace=b` | every named namespace must exist (`500 "failed to get namespace"`); the call returns once the SQL serving side has composed the current config generation, within 5 s (`500 "failed to reload namespaces"` otherwise). Namespaces reach serving through the config watch, so the commit is a barrier, not a second write. |
-| `GET /api/admin/config/` | TOML (`application/toml; charset=utf-8`), or JSON with `?format=json` (case-insensitive) or an exact `Accept: application/json`. |
+| `POST /api/admin/namespace/commit?namespace=a&namespace=b` | query values decoded like `url.ParseQuery` (a pair with a malformed escape is dropped); every named namespace must exist (`500 "failed to get namespace"`); the call returns once the SQL serving side has applied the current CP-CFG generation, within 5 s (`500 "failed to reload namespaces"` otherwise). The barrier follows the config lineage that serving actually installed (the composer records the CP-CFG generation after each successful `reload_composed`), never the composer's own counter, which also advances on topology wakes. Namespaces reach serving through the config watch, so the commit is a barrier, not a second write. |
+| `GET /api/admin/config/` | TOML (`application/toml; charset=utf-8`), or JSON with `?format=json` (case-insensitive, first value only like gin's `c.Query`) or an exact `Accept: application/json`. |
 | `PUT /api/admin/config/` | Go `SetTOMLConfig` through the config owner (`ConfigModuleHandle::apply_local_toml`): the partial document is merged onto this process's file base, validated as a whole, and published only when the encoded bytes change, so the health checksum moves exactly as Go's does. The mutation is instance-scoped like the Go API (labels and other per-instance fields stay per instance) and works without etcd; the persistent `/config` overlay still applies on top. |
 
 Namespaces therefore persist (etcd `/config/ns/*`, cluster-wide, owner-fenced)
@@ -93,9 +93,6 @@ handlers never touch a second store.
   TOML through go-toml v2 (single-quoted strings) and JSON with `omitempty`
   tags; the Rust renderer emits every field with its value. Consumers that
   decode (tiproxyctl, TiDB Dashboard) see the same configuration.
-- The namespace body name is overridden by the path name (Go stores the body
-  under the path name too, but keeps the body's `namespace` field inside the
-  value); on the root route the body name is the stored name.
 - The bare `/api/admin/namespace` and `/api/admin/config` paths are served
   directly instead of gin's `301` to the slash form.
 
