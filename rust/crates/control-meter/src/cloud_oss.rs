@@ -22,9 +22,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use control_config::CloudMeteringConfig;
 use http::{Request, request::Parts};
-use reqsign_aliyun_oss::{
-    Credential, DefaultCredentialProvider, RequestSigner, SigningVersion, StaticCredentialProvider,
-};
+use reqsign_aliyun_oss::{Credential, RequestSigner, SigningVersion, StaticCredentialProvider};
 use reqsign_core::hash::base64_hmac_sha1;
 use reqsign_core::time::Timestamp;
 use reqsign_core::{
@@ -68,7 +66,8 @@ impl OssSigner {
             }
             ProvideCredentialChain::new().push(provider)
         } else {
-            ProvideCredentialChain::new().push(DefaultCredentialProvider::new())
+            ProvideCredentialChain::new()
+                .push(crate::cloud_oss_identity::GoDefaultProvider::default())
         };
         Self {
             context,
@@ -243,7 +242,7 @@ fn query(params: &BTreeMap<&str, &str>) -> String {
         .join("&")
 }
 
-fn percent(value: &str) -> String {
+pub(crate) fn percent(value: &str) -> String {
     value
         .bytes()
         .map(|byte| {

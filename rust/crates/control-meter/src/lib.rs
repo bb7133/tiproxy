@@ -25,6 +25,7 @@ mod cloud_azure_managed;
 mod cloud_context;
 mod cloud_cos;
 mod cloud_oss;
+mod cloud_oss_identity;
 pub mod cloud_store;
 mod consumer;
 pub mod export;

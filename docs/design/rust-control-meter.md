@@ -69,6 +69,27 @@ Go omits. OSS refresh holds the cache lock through STS, matching Go's blocking
 lock scope; Rust rechecks under that lock and coalesces concurrent refreshes
 where Go may repeat them after reading an earlier snapshot.
 
+OSS default credentials use the pinned credentials-go chain: environment,
+OIDC, CLI profile, INI profile, ECS metadata, then credentials URI. Initial
+provider errors permit the next source; later calls use the last attempted
+source, including after every source initially fails. OSS environment aliases
+not recognized by Go are ignored. CLI AK/StsToken/OIDC/RamRoleArn/chainable
+roles/ECS/CloudSSO, named INI profiles and roles, and Go INI quoting,
+comments, continuation, multiline values and interpolation are handled natively.
+Temporary default-source credentials refresh within three minutes of expiration;
+that cache is separate from the explicit OSS role's fifteen-minute window and
+five-minute maintenance worker. Refresh errors do not select another identity.
+Present but empty temporary keys retain the chosen source and fail at signing.
+Thirty-three actual Go `NewCredential(nil)` cases compare identity, request
+method/endpoint/query/body/headers, and normalized HMAC signatures; all probe
+HTTP traffic is redirected to local fixtures. Additional tests cover concurrent
+acquisition, cache boundaries, token rotation and sticky initial failures.
+Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/oss-default-go.go
+```
+
 COS adapts the pinned Go SDK's source
 precedence (env, TKE, profile, CVM), caches the selected source, and provides its
 missing AssumeRole flow. The two-hour role refresh starts before expiration;

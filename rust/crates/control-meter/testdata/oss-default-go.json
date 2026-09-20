@@ -1,0 +1,833 @@
+[
+  {
+    "name": "env-before-cli",
+    "env": {
+      "ALIBABA_CLOUD_ACCESS_KEY_ID": "env-id",
+      "ALIBABA_CLOUD_ACCESS_KEY_SECRET": "env-secret",
+      "ALIBABA_CLOUD_SECURITY_TOKEN": "env-token"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"AK\",\"access_key_id\":\"cli-id\",\"access_key_secret\":\"cli-secret\"}]}"
+    },
+    "denied": "",
+    "key": "env-id",
+    "secret": "env-secret",
+    "token": "env-token",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "partial-env-cli",
+    "env": {
+      "ALIBABA_CLOUD_ACCESS_KEY_ID": "partial"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"AK\",\"access_key_id\":\"cli-id\",\"access_key_secret\":\"cli-secret\"}]}"
+    },
+    "denied": "",
+    "key": "cli-id",
+    "secret": "cli-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "legacy-alias-ignored",
+    "env": {
+      "OSS_ACCESS_KEY_ID": "wrong",
+      "OSS_ACCESS_KEY_SECRET": "wrong",
+      "OSS_SESSION_TOKEN": "wrong"
+    },
+    "files": {
+      "credentials": "[default]\ntype=access_key\naccess_key_id=ini-id\naccess_key_secret=ini-secret\n"
+    },
+    "denied": "",
+    "key": "ini-id",
+    "secret": "ini-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "cli-before-ini",
+    "env": null,
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"AK\",\"access_key_id\":\"cli-id\",\"access_key_secret\":\"cli-secret\"}]}",
+      "credentials": "[default]\ntype=access_key\naccess_key_id=ini-id\naccess_key_secret=ini-secret\n"
+    },
+    "denied": "",
+    "key": "cli-id",
+    "secret": "cli-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "cli-disabled",
+    "env": {
+      "ALIBABA_CLOUD_CLI_PROFILE_DISABLED": "TRUE"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"AK\",\"access_key_id\":\"cli-id\",\"access_key_secret\":\"cli-secret\"}]}",
+      "credentials": "[default]\ntype=access_key\naccess_key_id=ini-id\naccess_key_secret=ini-secret\n"
+    },
+    "denied": "",
+    "key": "ini-id",
+    "secret": "ini-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "cli-partial-fills-env",
+    "env": {
+      "ALIBABA_CLOUD_ACCESS_KEY_SECRET": "env-secret"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"AK\",\"access_key_id\":\"cli-id\"}]}"
+    },
+    "denied": "",
+    "key": "cli-id",
+    "secret": "env-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "cli-sts",
+    "env": null,
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"StsToken\",\"access_key_id\":\"cli-id\",\"access_key_secret\":\"cli-secret\",\"sts_token\":\"cli-token\"}]}"
+    },
+    "denied": "",
+    "key": "cli-id",
+    "secret": "cli-secret",
+    "token": "cli-token",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "bad-cli-falls-to-ini",
+    "env": null,
+    "files": {
+      "config": "invalid",
+      "credentials": "[default]\ntype=access_key\naccess_key_id=ini-id\naccess_key_secret=ini-secret\n"
+    },
+    "denied": "",
+    "key": "ini-id",
+    "secret": "ini-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "named-ini",
+    "env": {
+      "ALIBABA_CLOUD_PROFILE": "target"
+    },
+    "files": {
+      "credentials": "[target]\ntype=access_key\naccess_key_id=ini-id\naccess_key_secret=ini-secret\n"
+    },
+    "denied": "",
+    "key": "ini-id",
+    "secret": "ini-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "oidc-before-cli",
+    "env": {
+      "ALIBABA_CLOUD_OIDC_PROVIDER_ARN": "provider",
+      "ALIBABA_CLOUD_OIDC_TOKEN_FILE": "/fixture/token",
+      "ALIBABA_CLOUD_ROLE_ARN": "acs:ram::123:role/test",
+      "ALIBABA_CLOUD_ROLE_SESSION_NAME": "ignored-by-oidc",
+      "ALIBABA_CLOUD_STS_REGION": "cn-hangzhou",
+      "ALIBABA_CLOUD_VPC_ENDPOINT_ENABLED": "True"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"AK\",\"access_key_id\":\"cli-id\",\"access_key_secret\":\"cli-secret\"}]}",
+      "token": "fake token\n"
+    },
+    "denied": "",
+    "key": "oidc-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts-vpc.cn-hangzhou.aliyuncs.com/",
+        "query": {
+          "Action": "AssumeRoleWithOIDC",
+          "Format": "JSON",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "3600",
+          "OIDCProviderArn": "provider",
+          "OIDCToken": "fake token\n",
+          "RoleArn": "acs:ram::123:role/test",
+          "RoleSessionName": "fixture-session"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded"
+        }
+      }
+    ]
+  },
+  {
+    "name": "oidc-denied-falls-to-cli",
+    "env": {
+      "ALIBABA_CLOUD_OIDC_PROVIDER_ARN": "provider",
+      "ALIBABA_CLOUD_OIDC_TOKEN_FILE": "/fixture/token",
+      "ALIBABA_CLOUD_ROLE_ARN": "acs:ram::123:role/test",
+      "ALIBABA_CLOUD_ROLE_SESSION_NAME": "ignored-by-oidc",
+      "ALIBABA_CLOUD_STS_REGION": "cn-hangzhou",
+      "ALIBABA_CLOUD_VPC_ENDPOINT_ENABLED": "True"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"AK\",\"access_key_id\":\"cli-id\",\"access_key_secret\":\"cli-secret\"}]}",
+      "token": "fake token\n"
+    },
+    "denied": "sts",
+    "key": "cli-id",
+    "secret": "cli-secret",
+    "token": "",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts-vpc.cn-hangzhou.aliyuncs.com/",
+        "query": {
+          "Action": "AssumeRoleWithOIDC",
+          "Format": "JSON",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "3600",
+          "OIDCProviderArn": "provider",
+          "OIDCToken": "fake token\n",
+          "RoleArn": "acs:ram::123:role/test",
+          "RoleSessionName": "fixture-session"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded"
+        }
+      }
+    ]
+  },
+  {
+    "name": "oidc-file-missing-falls-to-ini",
+    "env": {
+      "ALIBABA_CLOUD_OIDC_PROVIDER_ARN": "provider",
+      "ALIBABA_CLOUD_OIDC_TOKEN_FILE": "/fixture/token",
+      "ALIBABA_CLOUD_ROLE_ARN": "acs:ram::123:role/test",
+      "ALIBABA_CLOUD_ROLE_SESSION_NAME": "ignored-by-oidc",
+      "ALIBABA_CLOUD_STS_REGION": "cn-hangzhou",
+      "ALIBABA_CLOUD_VPC_ENDPOINT_ENABLED": "True"
+    },
+    "files": {
+      "credentials": "[default]\ntype=access_key\naccess_key_id=ini-id\naccess_key_secret=ini-secret\n"
+    },
+    "denied": "",
+    "key": "ini-id",
+    "secret": "ini-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "cli-role",
+    "env": null,
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"RamRoleArn\",\"access_key_id\":\"base-id\",\"access_key_secret\":\"base-secret\",\"ram_role_arn\":\"acs:ram::123:role/test\",\"ram_session_name\":\"fixed\",\"expired_seconds\":1200,\"policy\":\"policy with space\",\"external_id\":\"external\"}]}"
+    },
+    "denied": "",
+    "key": "role-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.aliyuncs.com/",
+        "query": {
+          "AccessKeyId": "base-id",
+          "Action": "AssumeRole",
+          "Format": "JSON",
+          "Signature": "vyfOMTcjXlX8kGDo1W0Ix8wj1eo=",
+          "SignatureMethod": "HMAC-SHA1",
+          "SignatureNonce": "fixture-nonce",
+          "SignatureVersion": "1.0",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "1200",
+          "ExternalId": "external",
+          "Policy": "policy with space",
+          "RoleArn": "acs:ram::123:role/test",
+          "RoleSessionName": "fixed"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded",
+          "x-acs-credentials-provider": "static_ak"
+        }
+      }
+    ]
+  },
+  {
+    "name": "cli-role-generated-session",
+    "env": null,
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"RamRoleArn\",\"access_key_id\":\"base-id\",\"access_key_secret\":\"base-secret\",\"ram_role_arn\":\"acs:ram::123:role/test\",\"expired_seconds\":1200,\"policy\":\"policy with space\",\"external_id\":\"external\"}]}"
+    },
+    "denied": "",
+    "key": "role-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.aliyuncs.com/",
+        "query": {
+          "AccessKeyId": "base-id",
+          "Action": "AssumeRole",
+          "Format": "JSON",
+          "Signature": "sYFPGBTUi8Oa0VrVm27k49IrK+Q=",
+          "SignatureMethod": "HMAC-SHA1",
+          "SignatureNonce": "fixture-nonce",
+          "SignatureVersion": "1.0",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "1200",
+          "ExternalId": "external",
+          "Policy": "policy with space",
+          "RoleArn": "acs:ram::123:role/test",
+          "RoleSessionName": "fixture-session"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded",
+          "x-acs-credentials-provider": "static_ak"
+        }
+      }
+    ]
+  },
+  {
+    "name": "cli-role-env-session",
+    "env": {
+      "ALIBABA_CLOUD_ROLE_SESSION_NAME": "environment-session"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"RamRoleArn\",\"access_key_id\":\"base-id\",\"access_key_secret\":\"base-secret\",\"ram_role_arn\":\"acs:ram::123:role/test\",\"expired_seconds\":1200,\"policy\":\"policy with space\",\"external_id\":\"external\"}]}"
+    },
+    "denied": "",
+    "key": "role-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.aliyuncs.com/",
+        "query": {
+          "AccessKeyId": "base-id",
+          "Action": "AssumeRole",
+          "Format": "JSON",
+          "Signature": "81CtGrYaFaKoMIEmRdhYbNClOmU=",
+          "SignatureMethod": "HMAC-SHA1",
+          "SignatureNonce": "fixture-nonce",
+          "SignatureVersion": "1.0",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "1200",
+          "ExternalId": "external",
+          "Policy": "policy with space",
+          "RoleArn": "acs:ram::123:role/test",
+          "RoleSessionName": "environment-session"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded",
+          "x-acs-credentials-provider": "static_ak"
+        }
+      }
+    ]
+  },
+  {
+    "name": "cli-short-role-falls-to-ini",
+    "env": null,
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"RamRoleArn\",\"access_key_id\":\"base-id\",\"access_key_secret\":\"base-secret\",\"ram_role_arn\":\"acs:ram::123:role/test\",\"ram_session_name\":\"fixed\",\"expired_seconds\":899,\"policy\":\"policy with space\",\"external_id\":\"external\"}]}",
+      "credentials": "[default]\ntype=access_key\naccess_key_id=ini-id\naccess_key_secret=ini-secret\n"
+    },
+    "denied": "",
+    "key": "ini-id",
+    "secret": "ini-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "ini-role",
+    "env": null,
+    "files": {
+      "credentials": "[default]\ntype=ram_role_arn\naccess_key_id=base-id\naccess_key_secret=base-secret\nrole_arn=acs:ram::123:role/test\nrole_session_name=fixed\npolicy=policy with space\n"
+    },
+    "denied": "",
+    "key": "role-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.aliyuncs.com/",
+        "query": {
+          "AccessKeyId": "base-id",
+          "Action": "AssumeRole",
+          "Format": "JSON",
+          "Signature": "t+A/EvvwCzPLfbBJMmbn3z+lNJU=",
+          "SignatureMethod": "HMAC-SHA1",
+          "SignatureNonce": "fixture-nonce",
+          "SignatureVersion": "1.0",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "3600",
+          "Policy": "policy with space",
+          "RoleArn": "acs:ram::123:role/test",
+          "RoleSessionName": "fixed"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded",
+          "x-acs-credentials-provider": "static_ak"
+        }
+      }
+    ]
+  },
+  {
+    "name": "cli-chain-role",
+    "env": null,
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"ChainableRamRoleArn\",\"source_profile\":\"base\",\"ram_role_arn\":\"acs:ram::123:role/outer\",\"ram_session_name\":\"chain\"},{\"name\":\"base\",\"mode\":\"StsToken\",\"access_key_id\":\"base-id\",\"access_key_secret\":\"base-secret\",\"sts_token\":\"base-token\"}]}"
+    },
+    "denied": "",
+    "key": "role-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.aliyuncs.com/",
+        "query": {
+          "AccessKeyId": "base-id",
+          "Action": "AssumeRole",
+          "Format": "JSON",
+          "SecurityToken": "base-token",
+          "Signature": "gr/ptt+hOlwJIgsnShGehJZ76cc=",
+          "SignatureMethod": "HMAC-SHA1",
+          "SignatureNonce": "fixture-nonce",
+          "SignatureVersion": "1.0",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "3600",
+          "RoleArn": "acs:ram::123:role/outer",
+          "RoleSessionName": "chain"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded",
+          "x-acs-credentials-provider": "static_sts"
+        }
+      }
+    ]
+  },
+  {
+    "name": "uri-after-files",
+    "env": {
+      "ALIBABA_CLOUD_CREDENTIALS_URI": "http://fixture.invalid/credentials"
+    },
+    "files": null,
+    "denied": "",
+    "key": "uri-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "GET",
+        "url": "http://fixture.invalid/credentials",
+        "query": {},
+        "body": {},
+        "headers": {}
+      }
+    ]
+  },
+  {
+    "name": "ecs-before-uri",
+    "env": {
+      "ALIBABA_CLOUD_CREDENTIALS_URI": "http://fixture.invalid/credentials",
+      "ALIBABA_CLOUD_ECS_METADATA_DISABLED": "false"
+    },
+    "files": null,
+    "denied": "",
+    "key": "ecs-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://100.100.100.200/latest/api/token",
+        "query": {},
+        "body": {},
+        "headers": {
+          "x-aliyun-ecs-metadata-token-ttl-seconds": "21600"
+        }
+      },
+      {
+        "method": "GET",
+        "url": "http://100.100.100.200/latest/meta-data/ram/security-credentials/",
+        "query": {},
+        "body": {},
+        "headers": {
+          "x-aliyun-ecs-metadata-token": "metadata-token"
+        }
+      },
+      {
+        "method": "PUT",
+        "url": "http://100.100.100.200/latest/api/token",
+        "query": {},
+        "body": {},
+        "headers": {
+          "x-aliyun-ecs-metadata-token-ttl-seconds": "21600"
+        }
+      },
+      {
+        "method": "GET",
+        "url": "http://100.100.100.200/latest/meta-data/ram/security-credentials/role-name",
+        "query": {},
+        "body": {},
+        "headers": {
+          "x-aliyun-ecs-metadata-token": "metadata-token"
+        }
+      }
+    ]
+  },
+  {
+    "name": "ecs-v1-fallback",
+    "env": {
+      "ALIBABA_CLOUD_ECS_METADATA": "known",
+      "ALIBABA_CLOUD_ECS_METADATA_DISABLED": "false"
+    },
+    "files": null,
+    "denied": "metadata-token",
+    "key": "ecs-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://100.100.100.200/latest/api/token",
+        "query": {},
+        "body": {},
+        "headers": {
+          "x-aliyun-ecs-metadata-token-ttl-seconds": "21600"
+        }
+      },
+      {
+        "method": "GET",
+        "url": "http://100.100.100.200/latest/meta-data/ram/security-credentials/known",
+        "query": {},
+        "body": {},
+        "headers": {}
+      }
+    ]
+  },
+  {
+    "name": "ecs-v1-disabled-to-uri",
+    "env": {
+      "ALIBABA_CLOUD_CREDENTIALS_URI": "http://fixture.invalid/credentials",
+      "ALIBABA_CLOUD_ECS_METADATA_DISABLED": "false",
+      "ALIBABA_CLOUD_IMDSV1_DISABLED": "true"
+    },
+    "files": null,
+    "denied": "metadata-token",
+    "key": "uri-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://100.100.100.200/latest/api/token",
+        "query": {},
+        "body": {},
+        "headers": {
+          "x-aliyun-ecs-metadata-token-ttl-seconds": "21600"
+        }
+      },
+      {
+        "method": "GET",
+        "url": "http://fixture.invalid/credentials",
+        "query": {},
+        "body": {},
+        "headers": {}
+      }
+    ]
+  },
+  {
+    "name": "cli-sso",
+    "env": null,
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"CloudSSO\",\"cloud_sso_sign_in_url\":\"https://sso.invalid/sign-in\",\"cloud_sso_account_id\":\"account\",\"cloud_sso_access_config\":\"config\",\"access_token\":\"sso-access\",\"cloud_sso_access_token_expire\":4070908800}]}"
+    },
+    "denied": "",
+    "key": "sso-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sso.invalid/cloud-credentials",
+        "query": {},
+        "body": {
+          "AccessConfigurationId": "config",
+          "AccountId": "account"
+        },
+        "headers": {
+          "accept": "application/json",
+          "authorization": "Bearer sso-access",
+          "content-type": "application/json"
+        }
+      }
+    ]
+  },
+  {
+    "name": "cli-oidc",
+    "env": null,
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"OIDC\",\"oidc_token_file\":\"/fixture/token\",\"oidc_provider_arn\":\"provider\",\"ram_role_arn\":\"acs:ram::123:role/cli\",\"ram_session_name\":\"cli-session\",\"expired_seconds\":1800,\"policy\":\"space policy\",\"sts_region\":\"cn-hangzhou\"}]}",
+      "token": "cli-token\n"
+    },
+    "denied": "",
+    "key": "oidc-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.cn-hangzhou.aliyuncs.com/",
+        "query": {
+          "Action": "AssumeRoleWithOIDC",
+          "Format": "JSON",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "1800",
+          "OIDCProviderArn": "provider",
+          "OIDCToken": "cli-token\n",
+          "Policy": "space policy",
+          "RoleArn": "acs:ram::123:role/cli",
+          "RoleSessionName": "cli-session"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded"
+        }
+      }
+    ]
+  },
+  {
+    "name": "cli-ecs",
+    "env": {
+      "ALIBABA_CLOUD_ECS_METADATA_DISABLED": "false"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"EcsRamRole\",\"ram_role_name\":\"cli-role\"}]}"
+    },
+    "denied": "",
+    "key": "ecs-id",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "PUT",
+        "url": "http://100.100.100.200/latest/api/token",
+        "query": {},
+        "body": {},
+        "headers": {
+          "x-aliyun-ecs-metadata-token-ttl-seconds": "21600"
+        }
+      },
+      {
+        "method": "GET",
+        "url": "http://100.100.100.200/latest/meta-data/ram/security-credentials/cli-role",
+        "query": {},
+        "body": {},
+        "headers": {
+          "x-aliyun-ecs-metadata-token": "metadata-token"
+        }
+      }
+    ]
+  },
+  {
+    "name": "ini-empty-role-key-no-env-fill",
+    "env": {
+      "ALIBABA_CLOUD_ACCESS_KEY_ID": "env-id"
+    },
+    "files": {
+      "credentials": "[default]\ntype=ram_role_arn\naccess_key_id=\naccess_key_secret=base-secret\nrole_arn=acs:ram::123:role/test\nrole_session_name=fixed\n"
+    },
+    "denied": "",
+    "key": "",
+    "secret": "",
+    "token": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "ini-quotes-backslash-comment",
+    "env": null,
+    "files": {
+      "credentials": "[default]\ntype=access_key\naccess_key_id='quoted-id' ; comment\naccess_key_secret=\"quoted\\path\" # comment\n"
+    },
+    "denied": "",
+    "key": "quoted-id",
+    "secret": "quoted\\path",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "ini-duplicate-last-wins",
+    "env": null,
+    "files": {
+      "credentials": "[default]\ntype=access_key\naccess_key_id=ini-id\naccess_key_secret=ini-secret\naccess_key_id=last-id\n"
+    },
+    "denied": "",
+    "key": "last-id",
+    "secret": "ini-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "ini-backtick-multiline",
+    "env": {},
+    "files": {
+      "credentials": "[default]\ntype=access_key\naccess_key_id=`id;#raw`\naccess_key_secret=\"\"\"line1\nline2\"\"\"\n"
+    },
+    "denied": "",
+    "key": "id;#raw",
+    "secret": "line1\nline2",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "ini-continuation",
+    "env": {},
+    "files": {
+      "credentials": "[default]\ntype=access_key\naccess_key_id=id\\\n tail\naccess_key_secret=secret\n"
+    },
+    "denied": "",
+    "key": "idtail",
+    "secret": "secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "ini-interpolation-parent",
+    "env": {
+      "ALIBABA_CLOUD_PROFILE": "default.child"
+    },
+    "files": {
+      "credentials": "base=base-id\n[default]\ntype=access_key\naccess_key_id=%(base)s\naccess_key_secret=parent-secret\n[default.child]\naccess_key_id=child-%(base)s\n"
+    },
+    "denied": "",
+    "key": "child-base-id",
+    "secret": "parent-secret",
+    "token": "",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "oidc-empty-key-does-not-fall-through",
+    "env": {
+      "ALIBABA_CLOUD_OIDC_PROVIDER_ARN": "provider",
+      "ALIBABA_CLOUD_OIDC_TOKEN_FILE": "/fixture/token",
+      "ALIBABA_CLOUD_ROLE_ARN": "acs:ram::123:role/test",
+      "ALIBABA_CLOUD_ROLE_SESSION_NAME": "ignored-by-oidc",
+      "ALIBABA_CLOUD_STS_REGION": "cn-hangzhou",
+      "ALIBABA_CLOUD_VPC_ENDPOINT_ENABLED": "True"
+    },
+    "files": {
+      "config": "{\"current\":\"default\",\"profiles\":[{\"name\":\"default\",\"mode\":\"AK\",\"access_key_id\":\"cli-id\",\"access_key_secret\":\"cli-secret\"}]}",
+      "token": "fake"
+    },
+    "denied": "empty-sts-key",
+    "key": "",
+    "secret": "result-secret",
+    "token": "result-token",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts-vpc.cn-hangzhou.aliyuncs.com/",
+        "query": {
+          "Action": "AssumeRoleWithOIDC",
+          "Format": "JSON",
+          "Timestamp": "2026-09-20T00:00:00Z",
+          "Version": "2015-04-01"
+        },
+        "body": {
+          "DurationSeconds": "3600",
+          "OIDCProviderArn": "provider",
+          "OIDCToken": "fake",
+          "RoleArn": "acs:ram::123:role/test",
+          "RoleSessionName": "fixture-session"
+        },
+        "headers": {
+          "accept-encoding": "identity",
+          "content-type": "application/x-www-form-urlencoded"
+        }
+      }
+    ]
+  },
+  {
+    "name": "no-source",
+    "env": null,
+    "files": {},
+    "denied": "",
+    "key": "",
+    "secret": "",
+    "token": "",
+    "error": true,
+    "requests": null
+  }
+]
