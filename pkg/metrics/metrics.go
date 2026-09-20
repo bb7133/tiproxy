@@ -10,6 +10,7 @@ import (
 	"context"
 	"reflect"
 	"runtime"
+	"sort"
 	"time"
 
 	"github.com/pingcap/tiproxy/lib/util/systimemon"
@@ -187,4 +188,21 @@ func Collect(coll prometheus.Collector) ([]*dto.Metric, error) {
 		results = append(results, &metric)
 	}
 	return results, nil
+}
+
+// RegisteredCollectors returns every TiProxy collector the metrics manager
+// registers, in registration order (CP-ADMIN slice 5c inventory probe).
+func RegisteredCollectors() []prometheus.Collector {
+	return append([]prometheus.Collector(nil), colls...)
+}
+
+// RustFedMetricNames returns the fully qualified names of the series that
+// Rust metric batches feed into the Go exposition, sorted.
+func RustFedMetricNames() []string {
+	names := make([]string, 0, len(rustMetricSpecs))
+	for name := range rustMetricSpecs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
