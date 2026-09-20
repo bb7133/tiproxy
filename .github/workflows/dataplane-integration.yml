@@ -189,6 +189,15 @@ jobs:
             "$design_root/notes/tiproxy-223-design-final.md"
           make dataplane-t4-qualification 2>&1 | \
             tee "$DATAPLANE_T4_ARTIFACT_ROOT/qualification.log"
+      - name: Deduplicate test-tool binaries in the qualification evidence
+        # Packaging only: the harness still builds controldropper/faultproxy per
+        # cell; the byte-identical copies are replaced by sha256 sidecars so the
+        # artifact stays small and a failed matrix still uploads its evidence.
+        if: always()
+        run: |
+          python3 tests/dataplane/integration/dedup-evidence-binaries.py --self-test
+          python3 tests/dataplane/integration/dedup-evidence-binaries.py \
+            "$DATAPLANE_T4_ARTIFACT_ROOT"
       - name: Upload the immutable qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

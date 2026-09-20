@@ -25,7 +25,12 @@ sha256_file() {
 bash -n "$script_dir/run.sh" "$script_dir/qualify-route-owner.sh" \
 	"$script_dir/warm-tiup-components.sh"
 PYTHONPYCACHEPREFIX="$temp_dir/pycache" python3 -m py_compile \
-	"$script_dir/write-t4-row-receipt.py"
+	"$script_dir/write-t4-row-receipt.py" \
+	"$script_dir/dedup-evidence-binaries.py"
+# The evidence packaging step must keep proving its positive, idempotent and
+# tamper-detection cases without touching the harness or any product binary.
+PYTHONPYCACHEPREFIX="$temp_dir/pycache" TMPDIR="$temp_dir" \
+	python3 "$script_dir/dedup-evidence-binaries.py" --self-test >/dev/null
 qualification_plan=$("$script_dir/qualify-route-owner.sh" --print-plan)
 if [[ $(wc -l <<<"$qualification_plan" | tr -d ' ') != 48 ]]; then
 	echo "T4 qualification plan does not contain exactly 48 physical cells" >&2
@@ -64,12 +69,27 @@ for required_fragment in \
 	'"$design_root/notes/tiproxy-223-design-final.md"' \
 	'make dataplane-t4-qualification 2>&1 | \' \
 	'tee "$DATAPLANE_T4_ARTIFACT_ROOT/qualification.log"' \
+	'- name: Deduplicate test-tool binaries in the qualification evidence' \
+	'python3 tests/dataplane/integration/dedup-evidence-binaries.py --self-test' \
+	'python3 tests/dataplane/integration/dedup-evidence-binaries.py \' \
 	'path: ${{ runner.temp }}/t4-qualification-artifacts'; do
 	if ! grep -Fq -- "$required_fragment" "$qualification_workflow"; then
 		echo "T4 qualification workflow is missing: $required_fragment" >&2
 		exit 1
 	fi
 done
+# Packaging must run after the matrix is recorded and before the upload, and it
+# must still run when the matrix fails so a first-failure artifact stays small.
+dedup_line=$(grep -Fn -- '- name: Deduplicate test-tool binaries in the qualification evidence' "$qualification_workflow" | cut -d: -f1)
+record_line=$(grep -Fn -- '- name: Record the complete 36-logical / 48-physical matrix' "$qualification_workflow" | cut -d: -f1)
+upload_line=$(grep -Fn -- '- name: Upload the immutable qualification evidence' "$qualification_workflow" | cut -d: -f1)
+if [[ -z $dedup_line || -z $record_line || -z $upload_line ]] ||
+	((record_line >= dedup_line || dedup_line >= upload_line)) ||
+	[[ $(sed -n "${dedup_line},$((upload_line - 1))p" "$qualification_workflow" | grep -Fc -- 'if: always()') != 1 ]] ||
+	! sed -n "$((upload_line + 1))p" "$qualification_workflow" | grep -Fq -- 'if: always()'; then
+	echo "T4 evidence deduplication must sit between recording and upload and run on failure" >&2
+	exit 1
+fi
 if [[ $(grep -Fc -- '- name: Preinstall frozen TiUP components serially' "$qualification_workflow") != 2 ]] ||
 	[[ $(grep -Fc -- 'run: bash tests/dataplane/integration/warm-tiup-components.sh' "$qualification_workflow") != 2 ]]; then
 	echo "both integration jobs must prewarm the frozen TiUP components exactly once" >&2
