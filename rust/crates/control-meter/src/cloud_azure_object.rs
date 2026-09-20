@@ -464,7 +464,7 @@ mod tests {
     async fn retry_stream_blocks_and_results_match_real_go_provider() {
         let rows: Vec<Row> = serde_json::from_str(include_str!("../testdata/azure-object-go.json"))
             .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 235);
+        assert_eq!(rows.len(), 243);
         for row in rows {
             let io = Io::default();
             {

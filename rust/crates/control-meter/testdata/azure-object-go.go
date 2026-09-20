@@ -116,7 +116,7 @@ func main() {
 			"Sun Nov  6 08:49:37 1994", "Sunday, 06-Nov-94 08:49:37 GMT",
 			"Mon,02 Jan 2006 15:04:05 GMT", "Mon, 02Jan 2006 15:04:05 GMT",
 		}
-		for _, zone := range []string{"UTC", "PST", "CST", "FOO", "WITA", "ChST", "MeST", "CEST", "ABCET", "ABCD", "ABCDE", "ABCDEF", "UT", "Z", "gmt", "GMT+1", "GMT-23", "GMT+24", "GMT+0", "GMT+00001", "+01", "-00", "+1", "-24", "+0000", "+000000000000000000000001", "+999999999999999999999999999", "GMT+01:00"} {
+		for _, zone := range []string{"UTC", "PST", "CST", "FOO", "WITA", "ChST", "MeST", "CEST", "ABCET", "ABCD", "ABCDE", "ABCDEF", "UT", "Z", "gmt", "GMT+1", "GMT-23", "GMT+24", "GMT+0", "GMT+00001", "+01", "-00", "+1", "-24", "+0000", "+000000000000000000000001", "+999999999999999999999999999", "GMT+01:00", "GMTT", "GMTET", "UTCT", "UTCET"} {
 			dates = append(dates, "Mon, 02 Jan 2006 15:04:05 "+zone)
 		}
 		for i, date := range dates {

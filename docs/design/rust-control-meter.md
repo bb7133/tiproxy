@@ -585,8 +585,8 @@ valid leap dates and Go's named/signed-hour zone grammar. Only parse success is
 needed for this metadata; no zone offset is inferred. MD5/CRC64 metadata, SharedKey
 configuration and CAE claims share Go-compatible non-strict padded base64 decoding.
 
-The object fixture now has 235 actual production-provider cases: the original 95
-plus 108 date and 32 base64 metadata cases. Its 54 date inputs run through both
+The object fixture now has 243 actual production-provider cases: the original 95
+plus 116 date and 32 base64 metadata cases. Its 58 date inputs run through both
 HEAD and PUT, including accepted named zones and rejected date/time ranges. Old
 RFC7231 validation and strict base64 both fail the expanded fixture; corrected
 validation passes. Two extra fixed-time SharedKey signatures cover nonzero pad

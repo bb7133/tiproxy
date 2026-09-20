@@ -104,6 +104,11 @@ fn valid_zone(zone: &str) -> bool {
             && digits.bytes().all(|b| b.is_ascii_digit())
             && digits.parse::<u64>().is_ok_and(|n| n <= 23);
     }
+    // Go recognizes these prefixes before the generic abbreviation parser;
+    // trailing letters are left unconsumed and make the whole date invalid.
+    if zone.starts_with("GMT") || (zone.starts_with("UTC") && zone != "UTC") {
+        return false;
+    }
     zone.bytes().all(|b| b.is_ascii_uppercase())
         && (zone.len() == 3 || ((4..=5).contains(&zone.len()) && zone.ends_with('T')))
 }

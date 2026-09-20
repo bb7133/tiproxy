@@ -3649,6 +3649,150 @@
     "exists": false
   },
   {
+    "name": "metadata-date-54",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "Mon, 02 Jan 2006 15:04:05 GMTT"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "metadata-date-55",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "Mon, 02 Jan 2006 15:04:05 GMTET"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "metadata-date-56",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "Mon, 02 Jan 2006 15:04:05 UTCT"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "metadata-date-57",
+    "method": "HEAD",
+    "size": 0,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "Mon, 02 Jan 2006 15:04:05 UTCET"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "HEAD",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "blocks": null,
+        "content_type": "",
+        "blob_type": "",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
     "name": "metadata-base64-Content-MD5-0",
     "method": "HEAD",
     "size": 0,
@@ -7903,6 +8047,150 @@
         "body": "",
         "headers": {
           "Last-Modified": "Mon, 02 Jan 2006 15:04:05 GMT+01:00"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "metadata-date-54",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "Mon, 02 Jan 2006 15:04:05 GMTT"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "metadata-date-55",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "Mon, 02 Jan 2006 15:04:05 GMTET"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "metadata-date-56",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "Mon, 02 Jan 2006 15:04:05 UTCT"
+        },
+        "drop": false
+      }
+    ],
+    "attempts": [
+      {
+        "commit_body": "",
+        "method": "PUT",
+        "path": "/base/bucket/prefix%20space%2F%25text%2Fkey.json.gz",
+        "comp": "",
+        "length": 7,
+        "sha256": "6ce53691b126808d3745d72b9016384ef0a174004dc9d3ab151e3c82da186ba5",
+        "blocks": null,
+        "content_type": "application/octet-stream",
+        "blob_type": "BlockBlob",
+        "signed": true,
+        "request_id": -1,
+        "sas": false
+      }
+    ],
+    "error": true,
+    "exists": false
+  },
+  {
+    "name": "metadata-date-57",
+    "method": "PUT",
+    "size": 7,
+    "sas": false,
+    "failure_comp": "",
+    "responses": [
+      {
+        "status": 0,
+        "code": "",
+        "body": "",
+        "headers": {
+          "Last-Modified": "Mon, 02 Jan 2006 15:04:05 UTCET"
         },
         "drop": false
       }
