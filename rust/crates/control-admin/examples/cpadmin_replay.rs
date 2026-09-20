@@ -89,6 +89,8 @@ async fn main() {
     // to its stub drainer, so the HTTP mapping is compared one to one.
     let drainer = Arc::new(ScriptedDrainAdmin::default());
     let drain_enabled = Arc::new(AtomicBool::new(false));
+    let backend_metrics = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let backend_metrics_source = Arc::clone(&backend_metrics);
     let hooks = {
         let health = Arc::clone(&shared);
         let status = Arc::clone(&shared);
@@ -112,6 +114,7 @@ async fn main() {
             config: config_admin,
             drain: None,
             log_file: None,
+            backend_metrics: Arc::new(move |_| backend_metrics_source.lock().unwrap().clone()),
         }
     };
     let hooks_with_drain = AdminHooks {
@@ -130,6 +133,9 @@ async fn main() {
             if action.get("ready").and_then(Value::as_bool) == Some(true) {
                 app.mark_ready();
                 app_with_drain.mark_ready();
+            }
+            if let Some(data) = action.get("backend_metrics").and_then(Value::as_str) {
+                *backend_metrics.lock().unwrap() = data.as_bytes().to_vec();
             }
             if let Some(drain) = action.get("drainer") {
                 drain_enabled.store(true, Ordering::SeqCst);

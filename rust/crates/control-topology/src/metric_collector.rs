@@ -361,7 +361,19 @@ impl MetricSnapshot {
 pub struct MetricOverlayHandle {
     shared: Arc<Shared>,
 }
+/// Reads the Go `/api/backend/metrics` body for a cluster name from the
+/// live owner history: `Some` bytes (possibly empty, as Go answers a
+/// missing cluster) while this process serves, `None` otherwise.
+pub type BackendMetricsReader = Arc<dyn Fn(&str) -> Option<Arc<[u8]>> + Send + Sync>;
+
 impl MetricOverlayHandle {
+    /// A reader for the management plane's `GET /api/backend/metrics`: the
+    /// same bytes the owner endpoint serves, without a second owner.
+    #[must_use]
+    pub fn backend_metrics_reader(&self) -> BackendMetricsReader {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move |cluster: &str| service::snapshot_bytes(&shared, cluster))
+    }
     /// Registers an expression for a manually bound collector. Routing-bound
     /// collectors own their query set and ignore manual registration.
     pub fn add_query(&self, query: QueryId) {

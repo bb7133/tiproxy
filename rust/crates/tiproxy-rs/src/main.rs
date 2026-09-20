@@ -706,6 +706,8 @@ async fn run(options: Options) -> Result<(), String> {
     // path remains available only to compatibility tests.
     let route_config_source: Arc<dyn ConfigNamespaceSource> =
         Arc::new(config_owner.handle.source().clone());
+    // CP-ADMIN reads the owner history bytes through the same collector.
+    let backend_metrics = metric_overlay.backend_metrics_reader();
     let (route_plane, mut route_plane_handle) = RoutePlane::new(
         Arc::clone(&route_config_source),
         topology_handle.clone(),
@@ -851,6 +853,7 @@ async fn run(options: Options) -> Result<(), String> {
             &metrics_registry,
             admin_dispatch,
             options.log_file.clone(),
+            backend_metrics,
         ),
         admin_tls_source(config_owner.handle.source().clone()),
     )
@@ -1700,6 +1703,7 @@ fn admin_hooks(
     registry: &Arc<MetricsRegistry>,
     dispatch: dataplane::control_dispatch::ControlDispatchHandle,
     log_file: Option<PathBuf>,
+    backend_metrics: control_topology::BackendMetricsReader,
 ) -> control_admin::AdminHooks {
     let lifecycle = in_process.handle();
     let health_config = config.clone();
@@ -1726,6 +1730,9 @@ fn admin_hooks(
         config: config_admin,
         drain: Some(Arc::new(DispatchDrainAdmin { dispatch })),
         log_file,
+        backend_metrics: Arc::new(move |cluster| {
+            backend_metrics(cluster).map_or_else(Vec::new, |bytes| bytes.to_vec())
+        }),
     }
 }
 

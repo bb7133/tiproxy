@@ -97,6 +97,7 @@ async fn start(
         config: config_admin,
         drain: None,
         log_file: None,
+        backend_metrics: Arc::new(|_| Vec::new()),
     };
     let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
     app.mark_ready();

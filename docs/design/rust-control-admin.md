@@ -180,8 +180,7 @@ The differential script marks each of these and fails if one stops differing:
   directly; gin answers `301` to the slash form. Prometheus follows either.
 - `/api/debug/pprof/*` answers `404`. Go serves `net/http/pprof`. Profiling of
   the Rust process is a residual CP-ADMIN item, not closed by this slice.
-- `POST /api/debug/redirect` and `GET /api/backend/metrics` (slice 5) answer
-  `404` until their slice lands.
+- `POST /api/debug/redirect` (slice 5b) answers `404` until its slice lands.
 
 ### Evidence
 
@@ -331,5 +330,25 @@ certificate.
   silicon P-core frequency through IOKit, `mount(8)` does not print
   `MNT_MULTILABEL` so `opts` lacks `multilabel`, and `sysctl -a` live
   counters are compared by key only. Linux declares nothing.
-- **Slice 5** — `/api/backend/metrics`, `/api/debug/redirect`, retirement
-  bookkeeping for `metrics_batch`, and the profiling residual.
+- **Slice 5a (`GET /api/backend/metrics`)** — Go `BackendMetrics` answers
+  `200` with the bare `Content-Type: application/json` and the bytes of
+  `BackendReader.GetBackendMetricsByCluster(c.Query("cluster"))`: the first
+  decoded `cluster` value (Go `url.ParseQuery`, a pair with a malformed
+  escape dropped) selects the cluster, the empty name means the primary
+  cluster (exactly one configured), a missing cluster or no primary answers
+  an empty body, and the bytes are the owner's `marshalHistory`
+  (`map[rule]map[backend]{Step1History,Step2History}`, filtered to the
+  backends this owner read). The same endpoint is what members fetch from
+  the owner. The Rust process already serves it on the metric-owner listener
+  of `control-topology`'s `MetricCollector`; the management plane reads the
+  identical bytes through `MetricOverlayHandle::backend_metrics_reader` (the
+  served response's capture, liveness and ownership checks, taken once; no
+  second owner), so the answer is empty while this process is not serving.
+  HEAD and other methods are gin's `404`; the trailing-slash form is gin's
+  `301` (declared with the other trailing-slash redirects). Evidence: the
+  CP-ADMIN comparator fills the Go reader mock and the Rust hook from the
+  same script entry and compares the empty, filled, no-cluster, encoded and
+  bad-escape forms; router tests pin the query selection.
+- **Slice 5 (remaining)** — `/api/debug/redirect` (5b), then the Go API
+  retirement and final composition (5c, merged with the native metering
+  owner's startup and shutdown order); the profiling residual stays open.

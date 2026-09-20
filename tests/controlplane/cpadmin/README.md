@@ -15,8 +15,11 @@ observations exactly:
   `go_checksum` are compared for the default configuration, a partial TOML
   update, the identical update again (no change) and a namespace-only mutation.
 
-Every step compares `status`, `content_type` and `body` unless its entry lists
-`compare`. An entry with `declared` names a divergence the design document
+A step's `action` drives both sides before its request (`ready`,
+`namespaces_ready`, `preclose`, `drainer`, and `backend_metrics`, which fills
+the Go `BackendReader` mock and the Rust `backend_metrics` hook with the same
+history bytes for every cluster name). Every step compares `status`,
+`content_type` and `body` unless its entry lists `compare`. An entry with `declared` names a divergence the design document
 owns (`docs/design/rust-control-admin.md`); it is reported, and the comparison
 fails if such a step stops differing, so declarations cannot go stale.
 

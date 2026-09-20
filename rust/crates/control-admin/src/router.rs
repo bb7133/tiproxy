@@ -118,7 +118,15 @@ pub struct AdminHooks {
     /// The process log file the diagnostics `SearchLog` scans (Go's
     /// `log.log-file.filename`); `None` is Go's empty configuration.
     pub log_file: Option<std::path::PathBuf>,
+    /// Go `BackendReader.GetBackendMetricsByCluster`: the owner-filtered
+    /// metric history JSON for a cluster name (empty for a missing cluster,
+    /// for the empty name when there is not exactly one cluster, or when
+    /// this process is not serving the owner endpoint).
+    pub backend_metrics: BackendMetricsHook,
 }
+
+/// The `AdminHooks::backend_metrics` reader: history bytes for a cluster name.
+pub type BackendMetricsHook = Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
 
 /// uber-go/ratelimit "leaky bucket with slack", the algorithm behind the Go
 /// API's `ratelimit.New(DefAPILimit)`. `take` never rejects; it delays.
@@ -293,7 +301,8 @@ pub fn full_router(app: Arc<AdminApp>) -> Router {
         .route("/api/traffic/capture", post(traffic_disabled("capture")))
         .route("/api/traffic/replay", post(traffic_disabled("replay")))
         .route("/api/traffic/cancel", post(traffic_disabled("cancel")))
-        .route("/api/traffic/show", get(traffic_disabled("show")));
+        .route("/api/traffic/show", get(traffic_disabled("show")))
+        .route("/api/backend/metrics", get(backend_metrics).head(not_found));
     with_middleware(router, app)
 }
 
@@ -486,6 +495,26 @@ async fn metrics(State(app): State<Arc<AdminApp>>) -> Response {
 
 async fn dataplane_status(State(app): State<Arc<AdminApp>>) -> Response {
     json(StatusCode::OK, &(app.hooks.dataplane_status)().to_json())
+}
+
+// ---- backend metrics (Go pkg/server/api/backend.go) ----
+
+/// Go `BackendMetrics`: `c.Query("cluster")` (the first value, Go
+/// `url.ParseQuery` decoding) selects the cluster; the answer is always
+/// `200` with `Content-Type: application/json` and the reader's bytes, which
+/// are empty when Go's reader returns nil.
+async fn backend_metrics(State(app): State<Arc<AdminApp>>, request: Request) -> Response {
+    let cluster = query_values(request.uri().query().unwrap_or_default(), "cluster")
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let body = (app.hooks.backend_metrics)(&cluster);
+    let mut response = (StatusCode::OK, body).into_response();
+    // Go writes the bare media type here (no gin `c.JSON` charset).
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
 }
 
 // ---- operator drain (Go pkg/server/api/dataplane.go) ----
@@ -852,6 +881,7 @@ impl AdminHooks {
             config,
             drain: None,
             log_file: None,
+            backend_metrics: Arc::new(|_| Vec::new()),
         }
     }
 }
@@ -1498,5 +1528,101 @@ mod tests {
         assert_eq!(limiter.reserve(now), Duration::ZERO);
         assert_eq!(limiter.reserve(now), Duration::from_millis(10));
         assert_eq!(limiter.reserve(now), Duration::from_millis(20));
+    }
+
+    /// Go `BackendMetrics`: always `200 application/json`, the reader's bytes
+    /// (empty for nil), `c.Query("cluster")` = the first decoded value and a
+    /// pair with a bad escape dropped; other methods are gin's 404.
+    #[tokio::test]
+    async fn backend_metrics_follows_go_backend_handler() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&seen);
+        let mut hooks = AdminHooks::fixed(
+            HealthInputs {
+                closing: false,
+                namespaces_ready: true,
+                applied_generation: 1,
+                config_checksum: 7,
+            },
+            String::new(),
+            DataplaneStatus::default(),
+            Arc::new(crate::config::MemoryConfigAdmin::default()),
+        );
+        hooks.backend_metrics = Arc::new(move |cluster| {
+            recorder.lock().unwrap().push(cluster.to_owned());
+            if cluster == "missing" {
+                Vec::new()
+            } else {
+                b"{\"cpu\":{}}".to_vec()
+            }
+        });
+        let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
+        app.mark_ready();
+        for (path, status, content_type, body) in [
+            (
+                "/api/backend/metrics?cluster=a",
+                StatusCode::OK,
+                "application/json",
+                "{\"cpu\":{}}",
+            ),
+            (
+                "/api/backend/metrics?cluster=missing",
+                StatusCode::OK,
+                "application/json",
+                "",
+            ),
+            (
+                "/api/backend/metrics",
+                StatusCode::OK,
+                "application/json",
+                "{\"cpu\":{}}",
+            ),
+            (
+                "/api/backend/metrics?cluster=a%20b&cluster=c",
+                StatusCode::OK,
+                "application/json",
+                "{\"cpu\":{}}",
+            ),
+            (
+                "/api/backend/metrics?cluster=%zz",
+                StatusCode::OK,
+                "application/json",
+                "{\"cpu\":{}}",
+            ),
+            (
+                "/api/backend/metrics/",
+                StatusCode::NOT_FOUND,
+                "text/plain",
+                "404 page not found",
+            ),
+        ] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let (got_status, got_type, got_body) =
+                oneshot(full_router(Arc::clone(&app)), request).await;
+            assert_eq!(
+                (got_status, got_type.as_str(), got_body.as_str()),
+                (status, content_type, body),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["a", "missing", "", "a b", ""],
+            "the first decoded cluster value reaches the reader; a bad escape drops its pair"
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/backend/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = oneshot(full_router(app), request).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::NOT_FOUND, "404 page not found")
+        );
     }
 }

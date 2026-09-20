@@ -31,9 +31,10 @@ type cpadminStep struct {
 	Body    string            `json:"body"`
 	Headers map[string]string `json:"headers"`
 	Action  *struct {
-		Ready           *bool `json:"ready"`
-		NamespacesReady *bool `json:"namespaces_ready"`
-		PreClose        bool  `json:"preclose"`
+		Ready           *bool   `json:"ready"`
+		NamespacesReady *bool   `json:"namespaces_ready"`
+		PreClose        bool    `json:"preclose"`
+		BackendMetrics  *string `json:"backend_metrics"`
 		Drainer         *struct {
 			Start  string `json:"start"`
 			Status *struct {
@@ -136,6 +137,10 @@ func TestCPAdminCapture(t *testing.T) {
 			}
 			if step.Action.PreClose {
 				srv.PreClose()
+			}
+			if step.Action.BackendMetrics != nil {
+				// The reader mock answers the same history for every cluster name.
+				srv.mgr.BackendReader.(*mockBackendReader).data.Store(*step.Action.BackendMetrics)
 			}
 			if d := step.Action.Drainer; d != nil {
 				drainer, ok := srv.mgr.DataplaneDrainer.(*scriptedDrainer)
