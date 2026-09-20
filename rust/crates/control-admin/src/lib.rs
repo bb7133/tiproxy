@@ -23,7 +23,9 @@
 //! state and never logs request or response payloads.
 
 pub mod config;
+pub mod diagnostics;
 pub mod drain;
+pub mod grpc;
 pub mod health;
 pub mod router;
 pub mod serve;

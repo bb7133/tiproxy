@@ -332,19 +332,25 @@ name = "control-admin"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "control-config",
+ "control-external",
  "control-plane",
+ "flate2",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
  "rcgen",
+ "regex",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "tonic",
+ "tonic-prost",
  "tower",
 ]
 

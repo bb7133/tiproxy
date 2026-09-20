@@ -115,6 +115,9 @@ pub struct AdminHooks {
     pub config: SharedConfigAdmin,
     /// Local drain seam; `None` answers Go's `{"enabled":false}`.
     pub drain: Option<SharedDrainAdmin>,
+    /// The process log file the diagnostics `SearchLog` scans (Go's
+    /// `log.log-file.filename`); `None` is Go's empty configuration.
+    pub log_file: Option<std::path::PathBuf>,
 }
 
 /// uber-go/ratelimit "leaky bucket with slack", the algorithm behind the Go
@@ -205,17 +208,20 @@ pub struct AdminApp {
     health: HealthState,
     ready: AtomicBool,
     limiter: RateLimiter,
+    grpc: crate::grpc::SharedGrpc,
 }
 
 impl AdminApp {
     /// Creates the app; the readiness gate starts closed like Go's `ready`.
     #[must_use]
     pub fn new(hooks: AdminHooks, health: HealthState) -> Self {
+        let grpc = Arc::new(crate::grpc::DiagnosticsService::new(hooks.log_file.clone()).server());
         Self {
             hooks,
             health,
             ready: AtomicBool::new(false),
             limiter: RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SECOND),
+            grpc,
         }
     }
 
@@ -305,11 +311,29 @@ fn with_middleware(router: Router<Arc<AdminApp>>, app: Arc<AdminApp>) -> Router 
         .fallback(not_found)
         .method_not_allowed_fallback(not_found)
         // Layers run outermost-last: access log sees the final response,
-        // then the readiness gate, then the rate limit admits the request.
+        // then the rate limit admits the request, then the readiness gate,
+        // then (gin's `grpcServer`, after the gate) HTTP/2 `application/grpc`
+        // requests leave for the diagnostics service before any route.
+        .layer(middleware::from_fn_with_state(Arc::clone(&app), grpc_split))
         .layer(middleware::from_fn_with_state(Arc::clone(&app), ready_gate))
         .layer(middleware::from_fn_with_state(Arc::clone(&app), rate_limit))
         .layer(middleware::from_fn(access_log))
         .with_state(app)
+}
+
+/// gin `grpcServer`: an HTTP/2 request whose `Content-Type` starts with
+/// `application/grpc` is served by the gRPC server and never reaches the
+/// HTTP routes (or the access log, which gin attaches after this point).
+async fn grpc_split(State(app): State<Arc<AdminApp>>, request: Request, next: Next) -> Response {
+    if crate::grpc::is_grpc(&request) {
+        use tower::ServiceExt;
+        let service = (*app.grpc).clone();
+        return match service.oneshot(request).await {
+            Ok(response) => response.map(Body::new),
+            Err(never) => match never {},
+        };
+    }
+    next.run(request).await
 }
 
 async fn rate_limit(State(app): State<Arc<AdminApp>>, request: Request, next: Next) -> Response {
@@ -827,6 +851,7 @@ impl AdminHooks {
             dataplane_status: Arc::new(move || status.clone()),
             config,
             drain: None,
+            log_file: None,
         }
     }
 }

@@ -850,6 +850,7 @@ async fn run(options: Options) -> Result<(), String> {
             &serving,
             &metrics_registry,
             admin_dispatch,
+            options.log_file.clone(),
         ),
         admin_tls_source(config_owner.handle.source().clone()),
     )
@@ -1698,6 +1699,7 @@ fn admin_hooks(
     serving: &DataplaneServingHandle,
     registry: &Arc<MetricsRegistry>,
     dispatch: dataplane::control_dispatch::ControlDispatchHandle,
+    log_file: Option<PathBuf>,
 ) -> control_admin::AdminHooks {
     let lifecycle = in_process.handle();
     let health_config = config.clone();
@@ -1723,6 +1725,7 @@ fn admin_hooks(
         dataplane_status: Arc::new(move || dataplane_status(&status_serving.status())),
         config: config_admin,
         drain: Some(Arc::new(DispatchDrainAdmin { dispatch })),
+        log_file,
     }
 }
 

@@ -111,6 +111,7 @@ async fn main() {
             }),
             config: config_admin,
             drain: None,
+            log_file: None,
         }
     };
     let hooks_with_drain = AdminHooks {

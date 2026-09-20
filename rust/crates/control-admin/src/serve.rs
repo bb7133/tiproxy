@@ -767,4 +767,308 @@ mod tests {
             "socket must be closed when serve completes: {closed:?}"
         );
     }
+
+    // ---- diagnostics gRPC on the same listener (CP-ADMIN slice 4b) ----
+
+    use control_external::diagnostics::{
+        LogLevel, LogMessage, SearchLogRequest, SearchLogResponse, ServerInfoRequest,
+        ServerInfoResponse,
+    };
+    use http::uri::PathAndQuery;
+    use tonic_prost::ProstCodec;
+
+    fn app_with_log(log_file: Option<std::path::PathBuf>) -> Arc<AdminApp> {
+        let mut hooks = AdminHooks::fixed(
+            HealthInputs {
+                closing: false,
+                namespaces_ready: true,
+                applied_generation: 1,
+                config_checksum: 7,
+            },
+            "# metrics\n".to_owned(),
+            DataplaneStatus::default(),
+            Arc::new(crate::config::MemoryConfigAdmin::default()),
+        );
+        hooks.log_file = log_file;
+        let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
+        app.mark_ready();
+        app
+    }
+
+    async fn start_app(
+        app: Arc<AdminApp>,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let tls: TlsConfigSource = Arc::new(move || tls.clone());
+        let task = tokio::spawn(async move {
+            serve(
+                listener,
+                full_router(Arc::clone(&app)),
+                plaintext_router(app),
+                tls,
+                shutdown_rx,
+                ServeOptions {
+                    connection_timeout: Duration::from_secs(5),
+                    shutdown_grace: Duration::from_millis(200),
+                    ..ServeOptions::default()
+                },
+            )
+            .await;
+        });
+        (address, shutdown_tx, task)
+    }
+
+    fn log_fixture(lines: usize) -> std::path::PathBuf {
+        use std::fmt::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "tiproxy-cpdiag-grpc-{}-{lines}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut body = String::new();
+        for i in 0..lines {
+            let _ = writeln!(
+                body,
+                "[2019/08/26 06:19:{:02}.{:03} -04:00] [INFO] [p.go:1] [\"line {i}\"]",
+                (i / 1000) % 60,
+                i % 1000
+            );
+        }
+        std::fs::write(dir.join("tiproxy.log"), body).unwrap();
+        dir.join("tiproxy.log")
+    }
+
+    async fn plain_channel(address: SocketAddr) -> tonic::transport::Channel {
+        tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap()
+    }
+
+    async fn tls_channel(
+        address: SocketAddr,
+        cert: CertificateDer<'static>,
+    ) -> tonic::transport::Channel {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let service = tower::service_fn(move |_uri: http::Uri| {
+            let connector = connector.clone();
+            async move {
+                let stream = TcpStream::connect(address).await?;
+                let stream = connector
+                    .connect(ServerName::try_from("localhost").unwrap(), stream)
+                    .await?;
+                Ok::<_, io::Error>(TokioIo::new(stream))
+            }
+        });
+        // The connector performs TLS itself; tonic's own TLS feature is off,
+        // so the endpoint keeps the plain scheme.
+        tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect_with_connector(service)
+            .await
+            .unwrap()
+    }
+
+    async fn search(
+        channel: tonic::transport::Channel,
+        request: SearchLogRequest,
+    ) -> Result<Vec<Vec<LogMessage>>, tonic::Status> {
+        let mut client = tonic::client::Grpc::new(channel);
+        client
+            .ready()
+            .await
+            .map_err(|e| tonic::Status::unknown(e.to_string()))?;
+        let mut stream = client
+            .server_streaming(
+                tonic::Request::new(request),
+                PathAndQuery::from_static("/diagnosticspb.Diagnostics/search_log"),
+                ProstCodec::<SearchLogRequest, SearchLogResponse>::default(),
+            )
+            .await?
+            .into_inner();
+        let mut batches = Vec::new();
+        while let Some(response) = stream.message().await? {
+            batches.push(response.messages);
+        }
+        Ok(batches)
+    }
+
+    async fn server_info(
+        channel: tonic::transport::Channel,
+    ) -> Result<ServerInfoResponse, tonic::Status> {
+        let mut client = tonic::client::Grpc::new(channel);
+        client
+            .ready()
+            .await
+            .map_err(|e| tonic::Status::unknown(e.to_string()))?;
+        client
+            .unary(
+                tonic::Request::new(ServerInfoRequest { tp: 0 }),
+                PathAndQuery::from_static("/diagnosticspb.Diagnostics/server_info"),
+                ProstCodec::<ServerInfoRequest, ServerInfoResponse>::default(),
+            )
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// `SearchLog` over plaintext HTTP/2 (gin `UseH2C` + `grpcServer`):
+    /// batches of 1024 with a final partial batch, level and pattern
+    /// filters applied, and Go's fixed error text for a missing path as the
+    /// stream status.
+    #[tokio::test]
+    async fn grpc_over_h2c_streams_search_log_batches_and_reports_errors() {
+        let log = log_fixture(2049);
+        let (address, shutdown, task) = start_app(app_with_log(Some(log.clone())), None).await;
+        let all = search(
+            plain_channel(address).await,
+            SearchLogRequest {
+                start_time: 0,
+                end_time: 0,
+                levels: Vec::new(),
+                patterns: Vec::new(),
+                target: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            all.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1024, 1024, 1]
+        );
+        assert_eq!(all[0][0].message, "[p.go:1] [\"line 0\"]");
+        assert_eq!(all[0][0].level, LogLevel::Info as i32);
+        let filtered = search(
+            plain_channel(address).await,
+            SearchLogRequest {
+                start_time: 0,
+                end_time: 0,
+                levels: vec![LogLevel::Warn as i32],
+                patterns: vec!["line 7$".to_owned()],
+                target: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            filtered,
+            vec![Vec::<LogMessage>::new()],
+            "no WARN lines: one empty batch"
+        );
+        let (no_log_address, shutdown2, task2) = start_app(app_with_log(None), None).await;
+        let error = search(
+            plain_channel(no_log_address).await,
+            SearchLogRequest::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unknown);
+        assert_eq!(error.message(), "empty log file location configuration");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+        let _ = shutdown.send(true);
+        let _ = shutdown2.send(true);
+        let _ = task.await;
+        let _ = task2.await;
+    }
+
+    /// `ServerInfo` answers `UNIMPLEMENTED` until slice 4c (declared).
+    #[tokio::test]
+    async fn grpc_server_info_is_unimplemented_until_slice_4c() {
+        let (address, shutdown, task) = start_app(app_with_log(None), None).await;
+        let error = server_info(plain_channel(address).await).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        let _ = shutdown.send(true);
+        let _ = task.await;
+    }
+
+    /// gin's split needs `ProtoMajor == 2`: an HTTP/1.1 request with the
+    /// gRPC content type is an ordinary route lookup and gets gin's 404.
+    #[tokio::test]
+    async fn http1_grpc_content_type_is_not_split_off() {
+        let (address, shutdown, task) = start_app(app_with_log(None), None).await;
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                b"POST /diagnosticspb.Diagnostics/server_info HTTP/1.1\r\nHost: x\r\n\
+                  Content-Type: application/grpc\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+        assert!(response.ends_with("404 page not found"), "{response}");
+        let _ = shutdown.send(true);
+        let _ = task.await;
+    }
+
+    /// Under HTTP TLS the gRPC service sits behind the TLS branch of the
+    /// sniff (cmux `TLS()` → engine with `grpcServer`): an HTTP/2 gRPC call
+    /// over TLS reaches the service.
+    #[tokio::test]
+    async fn tls_h2_grpc_is_served_after_the_sniff() {
+        let (tls, cert) = certificate();
+        let log = log_fixture(3);
+        let (address, shutdown, task) = start_app(app_with_log(Some(log.clone())), Some(tls)).await;
+        let error = server_info(tls_channel(address, cert.clone()).await)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        let batches = search(
+            tls_channel(address, cert).await,
+            SearchLogRequest {
+                start_time: 0,
+                end_time: 0,
+                levels: Vec::new(),
+                patterns: Vec::new(),
+                target: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), vec![3]);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+        let _ = shutdown.send(true);
+        let _ = task.await;
+    }
+
+    /// The readiness gate precedes the gRPC split (gin: `readyState` then
+    /// `grpcServer`): before ready, a gRPC call gets the HTTP 500 answer.
+    #[tokio::test]
+    async fn grpc_waits_behind_the_readiness_gate() {
+        let hooks = AdminHooks::fixed(
+            HealthInputs {
+                closing: false,
+                namespaces_ready: true,
+                applied_generation: 1,
+                config_checksum: 7,
+            },
+            "# metrics\n".to_owned(),
+            DataplaneStatus::default(),
+            Arc::new(crate::config::MemoryConfigAdmin::default()),
+        );
+        let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
+        let (address, shutdown, task) = start_app(Arc::clone(&app), None).await;
+        let error = server_info(plain_channel(address).await).await.unwrap_err();
+        assert_ne!(error.code(), tonic::Code::Unimplemented, "{error:?}");
+        app.mark_ready();
+        let error = server_info(plain_channel(address).await).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        let _ = shutdown.send(true);
+        let _ = task.await;
+    }
 }

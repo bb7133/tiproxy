@@ -12,22 +12,28 @@ default = []
 
 [dependencies]
 axum.workspace = true
+chrono.workspace = true
 control-config.workspace = true
+control-external.workspace = true
 control-plane.workspace = true
+flate2.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+regex.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+tonic.workspace = true
 tower.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
 rustls-pki-types.workspace = true
+tonic-prost.workspace = true
 
 [lints]
 workspace = true

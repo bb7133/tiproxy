@@ -234,8 +234,54 @@ certificate.
   `[]` caller bracket); Rust lines carry no caller. Rotation, reload and the
   retention gate are unchanged (the header counts toward `max-size` like any
   other bytes).
-- **Slice 4 (remaining)** — diagnostics gRPC (`SearchLog` over the B0 log rotation,
-  `ServerInfo` with a pinned minimal host-information dependency after listing
-  the Go `sysutil` fields) and `tiproxyctl` compatibility.
+- **Slice 4b (diagnostics gRPC, `SearchLog`)** — done: the
+  `diagnosticspb.Diagnostics` service (the vendored kvproto binding in
+  `control-external`) is served on the admin listener exactly where gin's
+  `grpcServer` middleware sits: after the rate limit and the readiness gate,
+  before the routes, for HTTP/2 requests whose `Content-Type` starts with
+  `application/grpc` (an HTTP/1.1 request with that content type is an
+  ordinary 404); under HTTP TLS the service lives behind the TLS branch of the
+  sniff like the Go cmux `TLS()` branch. `SearchLog` is the Go `sysutil`
+  algorithm over the process log file (`--log-file`; Go: `log.log-file.filename`):
+  directory entries whose full path starts with the configured path minus its
+  extension and end with that extension or `<ext>.gz`, each probed for its
+  first valid line (ten attempts) and, unless compressed, its last valid line
+  (ten attempts, backward chunked reads; a compressed file's end is
+  unbounded), kept when it overlaps `[start_time, end_time]` (`end_time = 0`
+  is unbounded), sorted by first timestamp with only the last file starting
+  before the window retained; lines are `[2006/01/02 15:04:05.000 -07:00]
+  [LEVEL] message` located by the first `[`/`]` pairs, an unparseable line
+  after a valid item is a continuation carrying that item's time and level,
+  the scan stops at the first item past the window, items whose level is
+  `UNKNOWN` pass every level filter, every pattern must match the message, and
+  responses carry 1024 messages each with a final batch holding the remainder
+  or nothing. A stream the client drops stops the scan. `ServerInfo` answers
+  `UNIMPLEMENTED` until slice 4c (declared).
+  Evidence: `make controlplane-cpdiag-evidence` runs
+  `tests/controlplane/cpdiag/script.json` against the production Go API
+  server (h2c engine plus cmux TLS branch with auto certificates,
+  `pkg/server/api.TestCPDiagCapture`) and the Rust listener (plaintext and
+  TLS, `examples/cpdiag_replay.rs`) over a real gRPC wire and compares every
+  packet (rotated and gzip backups, inclusive windows, level bitmask with an
+  unknown level, all-patterns matching, invalid pattern, empty result, 1024
+  batching with the trailing partial and empty packet, client cancellation)
+  plus the HTTP/1.1 rejection; crate tests pin the sysutil fixtures
+  (`TestResolveFiles`, `TestLogIterator`, gzip), the batch loop, cancellation
+  and the gRPC split. **Declared differences:** Go error texts from the file
+  system and the regexp compiler are not reproduced (only Go's
+  `empty log file location configuration` is); files with an identical first
+  timestamp are ordered by name here while Go's `sort.Slice` order between
+  them is unspecified; the Go TLS branch does not advertise `h2` through ALPN
+  (the oracle runs grpc-go with `GRPC_ENFORCE_ALPN_ENABLED=false`); and Go
+  `regexp` versus the `regex` crate (both RE2-syntax families): `\d`, `\w`,
+  `\s` and `\b` are Unicode-aware here and ASCII-only in Go, Go's `\Q...\E`
+  literal quoting and `\C` are not supported here, a pattern over the crate's
+  compiled-size limit is rejected here while Go compiles it, and Go's `(?U)`
+  ungreedy flag and `[[:word:]]` classes behave the same.
+- **Slice 4 (remaining)** — `ServerInfo` (4c: fix the Go `sysutil` item
+  inventory first, then implement natively or evaluate a pinned
+  host-information dependency) and the `tiproxyctl` compatibility step (4d: the
+  real `tiproxyctl` binary against the Go and Rust ports in the CP-ADMIN
+  harness).
 - **Slice 5** — `/api/backend/metrics`, `/api/debug/redirect`, retirement
   bookkeeping for `metrics_batch`, and the profiling residual.

@@ -112,6 +112,8 @@ jobs:
         run: make controlplane-cplog-evidence
       - name: Check the admin API and config checksum against the Go server
         run: make controlplane-cpadmin-evidence
+      - name: Check the diagnostics gRPC service against the Go server
+        run: make controlplane-cpdiag-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests
