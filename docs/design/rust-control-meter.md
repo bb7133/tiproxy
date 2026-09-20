@@ -88,7 +88,9 @@ go run rust/crates/control-meter/testdata/aws-sso-go.go
 
 Container credentials now freeze the Go-selected endpoint and token-file path
 at construction: relative URI takes precedence over full URI; HTTP full-URI
-hosts must resolve exclusively to loopback or the known ECS/EKS addresses. The
+hosts must resolve exclusively to loopback or the known ECS/EKS addresses. DNS
+resolution is capped at ten seconds; Go uses net.LookupHost without an explicit
+timeout. The
 file overrides the environment token, including an empty file, is read again at
 refresh, and is never trimmed; newline tokens fail before a request. Successful
 responses may omit token/expiration for static credentials. The Go five-minute
@@ -103,6 +105,24 @@ Regenerate with:
 
 ```sh
 go run rust/crates/control-meter/testdata/aws-container-go.go
+```
+
+EC2 IMDS now uses a native adapter with the pinned Go client defaults: IPv4/IPv6
+and explicit endpoint selection from environment/shared config, disabled/v1
+fallback switches, 300-second token requests, server token TTL, case-insensitive
+success codes and first-line role selection with Go path cleaning. Metadata
+operations have the Go five-second deadline. Token 400 is terminal; 403/404/405
+retain v1 fallback when enabled, while other token failures may retry token
+acquisition for the next metadata operation. Valid credentials are capped at one
+hour. On refresh failure the same previously acquired identity is retained and,
+when needed, its expiry is extended by a random five to fifteen minutes, as in
+Go ec2rolecreds; no alternate credential source is selected. Thirty-one real Go
+captures compare requests, constructor failures, role paths, token fallback,
+cache calls and expiry ranges. The probe uses NopRetryer; HTTP retry/backoff
+policy is still a separate remaining increment. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-imds-go.go
 ```
 
 For a profile's `credential_source`, missing Environment keys fail during

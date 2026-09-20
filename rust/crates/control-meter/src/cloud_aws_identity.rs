@@ -17,9 +17,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use reqsign_aws_v4::{Credential, IMDSv2CredentialProvider};
+use reqsign_aws_v4::Credential;
 use reqsign_core::time::Timestamp;
-use reqsign_core::{Context, ProvideCredential, ProvideCredentialDyn, SigningCredential};
+use reqsign_core::{Context, ProvideCredential, SigningCredential};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::cloud_aws::{RoleOptions, assume_role};
@@ -110,7 +110,7 @@ impl GoDefaultProvider {
                     session_token: None,
                     expires_in: None,
                 })),
-                "Ec2InstanceMetadata" => Source::sdk(IMDSv2CredentialProvider::new()),
+                "Ec2InstanceMetadata" => Source::imds(ctx, &profile.props)?,
                 "EcsContainer" => Source::container(ctx).await?,
                 _ => return Err(failed()),
             }
@@ -149,7 +149,7 @@ impl GoDefaultProvider {
         {
             Source::container(ctx).await?
         } else {
-            Source::sdk(IMDSv2CredentialProvider::new())
+            Source::imds(ctx, &profile.props)?
         };
         if let Some(arn) = arn {
             if get("mfa_serial").is_some() {
@@ -196,7 +196,7 @@ enum Kind {
     Process(String),
     Container(crate::cloud_aws_container::Container),
     Sso(crate::cloud_aws_sso::Sso),
-    Sdk(Box<dyn ProvideCredentialDyn<Credential = Credential>>),
+    Imds(crate::cloud_aws_imds::Imds),
     Web(WebIdentity),
     Role {
         source: Box<Source>,
@@ -220,11 +220,11 @@ impl Source {
             cached: Mutex::new(None),
         }
     }
-    fn sdk(value: impl ProvideCredential<Credential = Credential>) -> Self {
-        Self {
-            kind: Kind::Sdk(Box::new(value)),
+    fn imds(ctx: &Context, props: &Properties) -> reqsign_core::Result<Self> {
+        Ok(Self {
+            kind: Kind::Imds(crate::cloud_aws_imds::Imds::new(ctx, props)?),
             cached: Mutex::new(None),
-        }
+        })
     }
     async fn get(&self, ctx: &Context) -> reqsign_core::Result<Credential> {
         let mut cached = self.cached.lock().await;
@@ -240,10 +240,7 @@ impl Source {
             Kind::Container(provider) => provider.retrieve(ctx).await?,
             Kind::Sso(provider) => provider.retrieve(ctx).await?,
             Kind::Web(web) => web.retrieve(ctx).await?,
-            Kind::Sdk(provider) => provider
-                .provide_credential_dyn(ctx)
-                .await?
-                .ok_or_else(failed)?,
+            Kind::Imds(provider) => provider.retrieve(ctx).await?,
             Kind::Role {
                 source,
                 arn,
@@ -378,6 +375,7 @@ pub(crate) async fn validate_profile(ctx: &Context) -> reqsign_core::Result<()> 
 }
 
 async fn load_profile(ctx: &Context) -> reqsign_core::Result<Profile> {
+    crate::cloud_aws_imds::validate_env(ctx)?;
     let profiles = read_profiles(ctx).await?;
     let name = env(ctx, "AWS_PROFILE").or_else(|| env(ctx, "AWS_DEFAULT_PROFILE"));
     if name
