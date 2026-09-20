@@ -909,6 +909,7 @@ mod tests {
 
     async fn server_info(
         channel: tonic::transport::Channel,
+        tp: i32,
     ) -> Result<ServerInfoResponse, tonic::Status> {
         let mut client = tonic::client::Grpc::new(channel);
         client
@@ -917,7 +918,7 @@ mod tests {
             .map_err(|e| tonic::Status::unknown(e.to_string()))?;
         client
             .unary(
-                tonic::Request::new(ServerInfoRequest { tp: 0 }),
+                tonic::Request::new(ServerInfoRequest { tp }),
                 PathAndQuery::from_static("/diagnosticspb.Diagnostics/server_info"),
                 ProstCodec::<ServerInfoRequest, ServerInfoResponse>::default(),
             )
@@ -984,12 +985,26 @@ mod tests {
         let _ = task2.await;
     }
 
-    /// `ServerInfo` answers `UNIMPLEMENTED` until slice 4c (declared).
+    /// `ServerInfo` answers the `sysutil` inventory over the wire, sorted by
+    /// type and name; an unknown type answers no items.
     #[tokio::test]
-    async fn grpc_server_info_is_unimplemented_until_slice_4c() {
+    async fn grpc_server_info_answers_the_sysutil_inventory() {
         let (address, shutdown, task) = start_app(app_with_log(None), None).await;
-        let error = server_info(plain_channel(address).await).await.unwrap_err();
-        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        let channel = plain_channel(address).await;
+        let load = server_info(channel.clone(), 3).await.unwrap().items;
+        let keys: Vec<(String, String)> = load
+            .iter()
+            .map(|item| (item.tp.clone(), item.name.clone()))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "sorted by type then name");
+        assert!(
+            keys.contains(&("cpu".to_owned(), "cpu".to_owned())),
+            "load average item present: {keys:?}"
+        );
+        let unknown = server_info(channel, 7).await.unwrap().items;
+        assert!(unknown.is_empty());
         let _ = shutdown.send(true);
         let _ = task.await;
     }
@@ -1024,10 +1039,8 @@ mod tests {
         let (tls, cert) = certificate();
         let log = log_fixture(3);
         let (address, shutdown, task) = start_app(app_with_log(Some(log.clone())), Some(tls)).await;
-        let error = server_info(tls_channel(address, cert.clone()).await)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        let answer = server_info(tls_channel(address, cert.clone()).await, 7).await;
+        assert!(answer.is_ok(), "served after the sniff: {answer:?}");
         let batches = search(
             tls_channel(address, cert).await,
             SearchLogRequest {
@@ -1063,11 +1076,15 @@ mod tests {
         );
         let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
         let (address, shutdown, task) = start_app(Arc::clone(&app), None).await;
-        let error = server_info(plain_channel(address).await).await.unwrap_err();
-        assert_ne!(error.code(), tonic::Code::Unimplemented, "{error:?}");
+        // gin's readiness gate answers HTTP 500 before the router; tonic maps
+        // that to a non-OK status without a gRPC trailer.
+        let error = server_info(plain_channel(address).await, 7)
+            .await
+            .unwrap_err();
+        assert_ne!(error.code(), tonic::Code::Ok, "{error:?}");
         app.mark_ready();
-        let error = server_info(plain_channel(address).await).await.unwrap_err();
-        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        let answer = server_info(plain_channel(address).await, 7).await;
+        assert!(answer.is_ok(), "served once ready: {answer:?}");
         let _ = shutdown.send(true);
         let _ = task.await;
     }

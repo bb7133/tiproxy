@@ -29,6 +29,7 @@ pub mod grpc;
 pub mod health;
 pub mod router;
 pub mod serve;
+pub mod server_info;
 
 pub use config::{AdminFuture, CommitError, ConfigAdmin, MemoryConfigAdmin, SharedConfigAdmin};
 pub use drain::{

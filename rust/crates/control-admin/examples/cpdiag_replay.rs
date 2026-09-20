@@ -197,6 +197,7 @@ async fn run_side(
     address: SocketAddr,
     tls: Option<Arc<rustls::ClientConfig>>,
     script: &Value,
+    tls_side: bool,
 ) -> Value {
     let mut searches = Vec::new();
     for search in script["searches"].as_array().unwrap() {
@@ -267,19 +268,55 @@ async fn run_side(
         };
         searches.push(json!({"name": search["name"], "packets": packets, "code": code}));
     }
-    let mut client = tonic::client::Grpc::new(channel(address, tls.clone()).await);
-    client.ready().await.unwrap();
-    let (server_info_code, server_info_items) = match client
-        .unary(
-            tonic::Request::new(ServerInfoRequest { tp: 3 }),
-            PathAndQuery::from_static("/diagnosticspb.Diagnostics/server_info"),
-            ProstCodec::<ServerInfoRequest, ServerInfoResponse>::default(),
-        )
-        .await
-    {
-        Ok(response) => ("OK".to_owned(), response.into_inner().items.len()),
-        Err(status) => (code_name(&status), 0),
-    };
+    // The full inventory on the plaintext side; the TLS side re-checks the
+    // types the script lists.
+    let mut names: Vec<String> = script["server_info_types"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    if tls_side {
+        names = script["server_info_tls_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect();
+    }
+    let mut server_info = serde_json::Map::new();
+    for name in names {
+        let tp = script["server_info_types"][&name].as_i64().unwrap() as i32;
+        let mut client = tonic::client::Grpc::new(channel(address, tls.clone()).await);
+        client.ready().await.unwrap();
+        let (code, items) = match client
+            .unary(
+                tonic::Request::new(ServerInfoRequest { tp }),
+                PathAndQuery::from_static("/diagnosticspb.Diagnostics/server_info"),
+                ProstCodec::<ServerInfoRequest, ServerInfoResponse>::default(),
+            )
+            .await
+        {
+            Ok(response) => (
+                "OK".to_owned(),
+                response
+                    .into_inner()
+                    .items
+                    .iter()
+                    .map(|item| {
+                        json!({
+                            "tp": item.tp,
+                            "name": item.name,
+                            "pairs": item.pairs.iter().map(|pair| json!({"key": pair.key, "value": pair.value})).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Err(status) => (code_name(&status), Vec::new()),
+        };
+        server_info.insert(name, json!({"code": code, "items": items}));
+    }
     let path = script["http1_probe_path"].as_str().unwrap();
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/grpc\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -310,10 +347,17 @@ async fn run_side(
         .unwrap_or(0);
     json!({
         "searches": searches,
-        "server_info_code": server_info_code,
-        "server_info_items": server_info_items,
+        "server_info": Value::Object(server_info),
         "http1_grpc_status": http1_status,
     })
+}
+
+/// Go `runtime.GOOS` for this build.
+fn go_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
 }
 
 #[tokio::main]
@@ -329,18 +373,19 @@ async fn main() {
     let log_file = dir.join("tiproxy.log");
 
     let (plain_address, plain_shutdown, plain_task) = start(log_file.clone(), None).await;
-    let plain = run_side(plain_address, None, &script).await;
+    let plain = run_side(plain_address, None, &script, false).await;
     let _ = plain_shutdown.send(true);
     let _ = plain_task.await;
 
     let (server_tls, cert) = certificate();
     let (tls_address, tls_shutdown, tls_task) = start(log_file, Some(server_tls)).await;
-    let tls = run_side(tls_address, Some(client_config(cert)), &script).await;
+    let tls = run_side(tls_address, Some(client_config(cert)), &script, true).await;
     let _ = tls_shutdown.send(true);
     let _ = tls_task.await;
     let _ = std::fs::remove_dir_all(&dir);
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({"plain": plain, "tls": tls})).unwrap()
+        serde_json::to_string_pretty(&json!({"goos": go_os(), "plain": plain, "tls": tls}))
+            .unwrap()
     );
 }

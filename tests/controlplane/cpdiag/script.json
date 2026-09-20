@@ -142,8 +142,57 @@
     }
   ],
   "http1_probe_path": "/diagnosticspb.Diagnostics/server_info",
-  "declared": {
-    "tls.server_info_code": "slice4c-server-info",
-    "plain.server_info_code": "slice4c-server-info"
+  "server_info_types": {
+    "all": 0,
+    "hardware": 1,
+    "system": 2,
+    "load": 3,
+    "unknown": 7
+  },
+  "server_info_tls_types": [
+    "load"
+  ],
+  "server_info_volatile_sysctl": [
+    "^fs\\.dentry-state$",
+    "^fs\\.inode-nr$",
+    "^fs\\.inode-state$",
+    "^fs\\.file-nr$",
+    "^kernel\\.ns_last_pid$",
+    "^kernel\\.random\\.(uuid|entropy_avail)$",
+    "^kernel\\.pty\\.nr$",
+    "^net\\.netfilter\\.nf_conntrack_count$",
+    "^dev\\.cdrom\\.info$",
+    "^fs\\.quota\\.syncs$"
+  ],
+  "server_info_declared": {
+    "darwin": [
+      {
+        "kind": "missing",
+        "item": "cpu/usage",
+        "owner": "macos-mach-cpu-ticks"
+      },
+      {
+        "kind": "missing",
+        "item": "net/disk*",
+        "owner": "macos-iokit-disk-io"
+      },
+      {
+        "kind": "value",
+        "item": "cpu/cpu",
+        "key": "cpu-frequency",
+        "owner": "macos-m1cpu-frequency"
+      },
+      {
+        "kind": "value",
+        "item": "disk/*",
+        "key": "opts",
+        "owner": "macos-mount-multilabel"
+      },
+      {
+        "kind": "sysctl-values",
+        "owner": "macos-sysctl-live-counters"
+      }
+    ],
+    "linux": []
   }
 }

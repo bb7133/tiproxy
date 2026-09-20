@@ -22,6 +22,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 regex.workspace = true
+rustix = { workspace = true, features = ["fs", "net", "param", "pipe", "process", "system"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

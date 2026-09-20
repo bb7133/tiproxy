@@ -34,7 +34,7 @@ use tonic::{Request, Response, Status};
 use crate::diagnostics;
 
 /// Go `sysutil.NewDiagnosticsServer(logFile)`: `SearchLog` scans the
-/// configured log file's directory; `ServerInfo` is slice 4c.
+/// configured log file's directory; `ServerInfo` is the `sysutil` host inventory.
 #[derive(Debug, Clone)]
 pub struct DiagnosticsService {
     /// The process log file; `None` mirrors Go's empty `log.log-file.filename`.
@@ -104,12 +104,15 @@ impl Diagnostics for DiagnosticsService {
 
     async fn server_info(
         &self,
-        _request: Request<ServerInfoRequest>,
+        request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
-        // Slice 4c: the Go item inventory is fixed first (declared).
-        Err(Status::unimplemented(
-            "server_info is not available on the Rust management plane yet",
-        ))
+        // The sysutil collectors sleep (1s CPU sample, 0.5s disk sample)
+        // and read the host; they run on the blocking pool.
+        let tp = request.into_inner().tp;
+        let items = tokio::task::spawn_blocking(move || crate::server_info::collect(tp))
+            .await
+            .map_err(|error| Status::unknown(error.to_string()))?;
+        Ok(Response::new(ServerInfoResponse { items }))
     }
 }
 

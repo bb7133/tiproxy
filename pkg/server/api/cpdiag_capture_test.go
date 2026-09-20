@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -50,9 +52,11 @@ type cpdiagSearch struct {
 }
 
 type cpdiagScript struct {
-	Files          []cpdiagFile   `json:"files"`
-	Searches       []cpdiagSearch `json:"searches"`
-	HTTP1ProbePath string         `json:"http1_probe_path"`
+	Files              []cpdiagFile     `json:"files"`
+	Searches           []cpdiagSearch   `json:"searches"`
+	HTTP1ProbePath     string           `json:"http1_probe_path"`
+	ServerInfoTypes    map[string]int32 `json:"server_info_types"`
+	ServerInfoTLSTypes []string         `json:"server_info_tls_types"`
 }
 
 type cpdiagMessage struct {
@@ -67,14 +71,30 @@ type cpdiagSearchResult struct {
 	Code    string            `json:"code"`
 }
 
+type cpdiagPair struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type cpdiagItem struct {
+	Tp    string       `json:"tp"`
+	Name  string       `json:"name"`
+	Pairs []cpdiagPair `json:"pairs"`
+}
+
+type cpdiagServerInfo struct {
+	Code  string       `json:"code"`
+	Items []cpdiagItem `json:"items"`
+}
+
 type cpdiagSide struct {
-	Searches        []cpdiagSearchResult `json:"searches"`
-	ServerInfoCode  string               `json:"server_info_code"`
-	ServerInfoItems int                  `json:"server_info_items"`
-	HTTP1GrpcStatus int                  `json:"http1_grpc_status"`
+	Searches        []cpdiagSearchResult        `json:"searches"`
+	ServerInfo      map[string]cpdiagServerInfo `json:"server_info"`
+	HTTP1GrpcStatus int                         `json:"http1_grpc_status"`
 }
 
 type cpdiagCapture struct {
+	GOOS  string     `json:"goos"`
 	Plain cpdiagSide `json:"plain"`
 	TLS   cpdiagSide `json:"tls"`
 }
@@ -111,7 +131,7 @@ func cpdiagWriteFixture(t *testing.T, dir string, files []cpdiagFile) {
 	}
 }
 
-func cpdiagRun(t *testing.T, cc *grpc.ClientConn, httpClient *http.Client, scheme, addr string, script *cpdiagScript) cpdiagSide {
+func cpdiagRun(t *testing.T, cc *grpc.ClientConn, httpClient *http.Client, scheme, addr string, script *cpdiagScript, tlsSide bool) cpdiagSide {
 	client := diagnosticspb.NewDiagnosticsClient(cc)
 	side := cpdiagSide{}
 	for _, search := range script.Searches {
@@ -152,10 +172,32 @@ func cpdiagRun(t *testing.T, cc *grpc.ClientConn, httpClient *http.Client, schem
 		cancel()
 		side.Searches = append(side.Searches, result)
 	}
-	info, err := client.ServerInfo(context.Background(), &diagnosticspb.ServerInfoRequest{Tp: diagnosticspb.ServerInfoType_LoadInfo})
-	side.ServerInfoCode = status.Code(err).String()
-	if err == nil {
-		side.ServerInfoItems = len(info.Items)
+	// The full inventory (all, hardware, system, load, an unknown type) on the
+	// plaintext side; the TLS side re-checks the types the script lists.
+	names := make([]string, 0, len(script.ServerInfoTypes))
+	for name := range script.ServerInfoTypes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if tlsSide {
+		names = script.ServerInfoTLSTypes
+	}
+	side.ServerInfo = map[string]cpdiagServerInfo{}
+	for _, name := range names {
+		tp, ok := script.ServerInfoTypes[name]
+		require.True(t, ok, "unknown server info type %q", name)
+		info, err := client.ServerInfo(context.Background(), &diagnosticspb.ServerInfoRequest{Tp: diagnosticspb.ServerInfoType(tp)})
+		entry := cpdiagServerInfo{Code: status.Code(err).String(), Items: []cpdiagItem{}}
+		if err == nil {
+			for _, item := range info.Items {
+				pairs := make([]cpdiagPair, 0, len(item.Pairs))
+				for _, pair := range item.Pairs {
+					pairs = append(pairs, cpdiagPair{Key: pair.Key, Value: pair.Value})
+				}
+				entry.Items = append(entry.Items, cpdiagItem{Tp: item.Tp, Name: item.Name, Pairs: pairs})
+			}
+		}
+		side.ServerInfo[name] = entry
 	}
 	req, err := http.NewRequest(http.MethodPost, scheme+"://"+addr+script.HTTP1ProbePath, strings.NewReader(""))
 	require.NoError(t, err)
@@ -181,14 +223,14 @@ func TestCPDiagCapture(t *testing.T) {
 	// Dotted keys: a table header would swallow the later security key.
 	logConfig := fmt.Sprintf("log.log-file.filename = %q\n", filepath.Join(dir, "tiproxy.log"))
 
-	capture := cpdiagCapture{}
+	capture := cpdiagCapture{GOOS: runtime.GOOS}
 	{
 		srv, _, _ := createServerWithConfig(t, logConfig)
 		addr := srv.listener.Addr().String()
 		cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		require.NoError(t, err)
 		httpClient := &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: false}}
-		capture.Plain = cpdiagRun(t, cc, httpClient, "http", addr, &script)
+		capture.Plain = cpdiagRun(t, cc, httpClient, "http", addr, &script, false)
 		require.NoError(t, cc.Close())
 	}
 	{
@@ -198,7 +240,7 @@ func TestCPDiagCapture(t *testing.T) {
 		cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 		require.NoError(t, err)
 		httpClient := &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: false, TLSClientConfig: tlsConfig}}
-		capture.TLS = cpdiagRun(t, cc, httpClient, "https", addr, &script)
+		capture.TLS = cpdiagRun(t, cc, httpClient, "https", addr, &script, true)
 		require.NoError(t, cc.Close())
 	}
 	encoded, err := json.MarshalIndent(capture, "", "  ")

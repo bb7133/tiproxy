@@ -14,8 +14,12 @@ both over a real gRPC wire, and compares:
   batching with the trailing partial or empty packet, and a client-cancelled
   stream (the client observes `Canceled`; the server stops scanning when the
   stream ends);
-- `ServerInfo` status and item count (declared: the Rust side answers
-  `Unimplemented` until slice 4c fixes the Go item inventory);
+- `ServerInfo` for every request type on the plaintext side and `LoadInfo`
+  under TLS: identical item inventory and pair keys, byte-identical static
+  values, live values in Go's exact format, `sysctl` keys in order with
+  values equal outside the script's volatile list; macOS-only gaps are
+  declared per Go `GOOS` in `script.json` and must still occur (the Go
+  inventory itself is printed by `serverinfo-probe`);
 - an HTTP/1.1 `POST` with `Content-Type: application/grpc`, which gin's
   `grpcServer` split ignores (`ProtoMajor != 2`) and answers `404`.
 

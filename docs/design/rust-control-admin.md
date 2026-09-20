@@ -257,8 +257,7 @@ certificate.
   the scan stops at the first item past the window, items whose level is
   `UNKNOWN` pass every level filter, every pattern must match the message, and
   responses carry 1024 messages each with a final batch holding the remainder
-  or nothing. A stream the client drops stops the scan. `ServerInfo` answers
-  `UNIMPLEMENTED` until slice 4c (declared).
+  or nothing. A stream the client drops stops the scan.
   Evidence: `make controlplane-cpdiag-evidence` runs
   `tests/controlplane/cpdiag/script.json` against the production Go API
   server (h2c engine plus cmux TLS branch with auto certificates,
@@ -295,8 +294,42 @@ certificate.
   including the CLI's `namespace list` failure on an empty set (the Go server
   answers `""`, which the CLI cannot decode as a namespace list, and the Rust
   server answers the same), matches byte for byte. No declared differences.
-- **Slice 4 (remaining)** — `ServerInfo` (4c: fix the Go `sysutil` item
-  inventory first, then implement natively or evaluate a pinned
-  host-information dependency).
+- **Slice 4c (`ServerInfo`)** — the Go `sysutil` inventory, fixed first with
+  a real probe (`tests/controlplane/cpdiag/serverinfo-probe`, run on macOS
+  and in a Linux container): `LoadInfo` = `cpu/cpu` (load1/5/15), `cpu/usage`
+  (ten tick ratios over a 1s sample), `memory/virtual` and `memory/swap`
+  (`NaN` percentages without swap), `net/<nic>` counters (Go's `bytes-ent`
+  key) and disk I/O rates over a 0.5s sample filed under type `net`;
+  `HardwareInfo` = `cpu/cpu` (arch, logical/physical cores, `%.2fMHz`,
+  cache), `memory/memory`, `disk/<dev>` per `/dev/` mount (fstype, opts,
+  path, sizes, percentages) and `net/<nic>` (mac, five flags, CIDR
+  addresses); `SystemInfo` = `system/sysctl` from a lexical `/proc/sys` walk
+  (or `sysctl -a` split on the first colon when the walk fails) plus
+  `system/kernel` transparent hugepage; `All` concatenates, an unknown type
+  answers nothing, and the answer is sorted by type then name (Go's unstable
+  sort leaves the order of equal `cpu/cpu` and `net/<nic>` pairs unspecified;
+  the port keeps collection order). Linux is read natively without unsafe
+  code from the files `gopsutil` reads (`/proc/loadavg`, `/proc/stat`,
+  `/proc/meminfo` with the `MemAvailable` fallbacks, `sysinfo(2)`,
+  `/proc/net/dev`, `/proc/diskstats`, `/proc/cpuinfo` with the `cpufreq`
+  override and the parse failures Go propagates, `sysfs` topology,
+  `/proc/1/mountinfo` with the `mounts` and `/proc/self` fallbacks, the
+  `/dev/mapper` and `/dev/root` resolutions and Go's `strconv.Unquote` of
+  mount points, `statfs(2)`, and the rtnetlink `RTM_GETLINK`/`RTM_GETADDR`
+  dumps Go's `net.Interfaces` performs, with its `IFA_LOCAL` rule). macOS
+  cannot make the Mach and IOKit calls `gopsutil` makes through cgo (the
+  workspace forbids unsafe code), so it uses the `sysctl`, `vm_stat`, `mount`
+  and `ifconfig` commands plus the same `netstat -ibdnW` parse Go uses.
+  Evidence: `make controlplane-cpdiag-evidence` now compares every request
+  type on the plaintext side and `LoadInfo` under TLS: the item inventory and
+  ordered pair keys must be identical, static values (hardware, mounts,
+  interfaces, kernel setting) byte-identical, live values in Go's exact
+  format on both sides, and `sysctl` keys identical with values equal
+  outside a listed volatile set. **Declared differences (macOS only, per Go
+  `GOOS`):** `cpu/usage` and the disk I/O rate items are not produced (Mach
+  ticks, IOKit), `cpu-frequency` is `0.00MHz` where Go reads the Apple
+  silicon P-core frequency through IOKit, `mount(8)` does not print
+  `MNT_MULTILABEL` so `opts` lacks `multilabel`, and `sysctl -a` live
+  counters are compared by key only. Linux declares nothing.
 - **Slice 5** — `/api/backend/metrics`, `/api/debug/redirect`, retirement
   bookkeeping for `metrics_batch`, and the profiling residual.
