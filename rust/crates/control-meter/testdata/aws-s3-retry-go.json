@@ -1,0 +1,2810 @@
+{
+  "requests": [
+    {
+      "name": "success",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "404-empty",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "404-malformed",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "\u003cbad",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "403-empty",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "429-empty",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 429,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "503-then-success",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "\u003cbad",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "500-exhaustion",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 500,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 3,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transport-then-success",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": true
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "SlowDown",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "lowercase-slowdown",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eslowdown\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeout",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeout\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NoSuchKey-status403",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "notfound-model-casefold",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003enotfound\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NotFound-in-message",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eDenied\u003c/Code\u003e\u003cMessage\u003eNotFound\u003c/Message\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrapped-not-an-s3-code",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cResponse\u003e\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e\u003c/Response\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clock-definite",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestExpired\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clock-persists-across-operations",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eAuthFailure\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600,
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "absent-final-date-preserves-client-skew",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "valid-final-date-heals-skew",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transport-resets-attempt-not-client",
+      "method": "HEAD",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": true
+            },
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eAuthFailure\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": true,
+          "exists": false,
+          "signed": [
+            600,
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "success",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "404-empty",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "404-malformed",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "\u003cbad",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "403-empty",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "429-empty",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 429,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "503-then-success",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "\u003cbad",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "500-exhaustion",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 500,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 3,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transport-then-success",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": true
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "SlowDown",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "lowercase-slowdown",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eslowdown\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeout",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeout\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NoSuchKey-status403",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "notfound-model-casefold",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003enotfound\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NotFound-in-message",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eDenied\u003c/Code\u003e\u003cMessage\u003eNotFound\u003c/Message\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrapped-not-an-s3-code",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cResponse\u003e\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e\u003c/Response\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clock-definite",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestExpired\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clock-persists-across-operations",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eAuthFailure\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600,
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "absent-final-date-preserves-client-skew",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "valid-final-date-heals-skew",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transport-resets-attempt-not-client",
+      "method": "PUT",
+      "new": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": true
+            },
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eAuthFailure\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": true,
+          "exists": false,
+          "signed": [
+            600,
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "success",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "404-empty",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "404-malformed",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "\u003cbad",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "403-empty",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "429-empty",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 429,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "503-then-success",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "\u003cbad",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "500-exhaustion",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 500,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 3,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transport-then-success",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": true
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "SlowDown",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "lowercase-slowdown",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eslowdown\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeout",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeout\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NoSuchKey-status403",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "notfound-model-casefold",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003enotfound\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NotFound-in-message",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eDenied\u003c/Code\u003e\u003cMessage\u003eNotFound\u003c/Message\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrapped-not-an-s3-code",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cResponse\u003e\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e\u003c/Response\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clock-definite",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestExpired\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0,
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clock-persists-across-operations",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eAuthFailure\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600,
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "absent-final-date-preserves-client-skew",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "valid-final-date-heals-skew",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transport-resets-attempt-not-client",
+      "method": "HEAD",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": true
+            },
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eAuthFailure\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": true,
+          "exists": false,
+          "signed": [
+            600,
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": true,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "success",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "404-empty",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "404-malformed",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "\u003cbad",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "403-empty",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "429-empty",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 429,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "503-then-success",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "\u003cbad",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "500-exhaustion",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 500,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 3,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transport-then-success",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": true
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "SlowDown",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "lowercase-slowdown",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eslowdown\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeout",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeout\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NoSuchKey-status403",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "notfound-model-casefold",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003enotfound\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NotFound-in-message",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eDenied\u003c/Code\u003e\u003cMessage\u003eNotFound\u003c/Message\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrapped-not-an-s3-code",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cResponse\u003e\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e\u003c/Response\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": true,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clock-definite",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestExpired\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0,
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clock-persists-across-operations",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eAuthFailure\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            },
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600,
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "absent-final-date-preserves-client-skew",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    },
+    {
+      "name": "valid-final-date-heals-skew",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "transport-resets-attempt-not-client",
+      "method": "PUT",
+      "new": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "http",
+              "offset": 600,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": true
+            },
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eAuthFailure\u003c/Code\u003e\u003c/Error\u003e",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 2,
+          "error": true,
+          "exists": false,
+          "signed": [
+            600,
+            0
+          ]
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "date": "",
+              "offset": 0,
+              "transport": false
+            }
+          ],
+          "calls": 1,
+          "error": false,
+          "exists": false,
+          "signed": [
+            600
+          ]
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "method": "HEAD",
+      "url": "https://s3.us-east-1.amazonaws.com/bucket/object",
+      "time": "20260615T120000Z",
+      "authorization": "AWS4-HMAC-SHA256 Credential=key/20260615/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=9a2f434cda769f84ac676530a535cf745bac794a60d28515e5f0035e323255ec"
+    },
+    {
+      "method": "PUT",
+      "url": "https://custom.example/prefix%20space/%25text/object",
+      "time": "20260614T235959Z",
+      "authorization": "AWS4-HMAC-SHA256 Credential=key/20260614/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=ebd35abf3d57ee8ff1b59aad1d8f12d71a262f3bcfd8d1d46ede58a167b0da51"
+    }
+  ]
+}

@@ -22,14 +22,29 @@ use reqsign_aws_core::signing::{
 use reqsign_aws_v4::Credential;
 use reqsign_core::hash::{hex_hmac_sha256, hex_sha256, hmac_sha256};
 use reqsign_core::{SigningRequest, time::Timestamp};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 #[derive(Default)]
-pub(crate) struct Skew(AtomicI64);
+pub(crate) struct Skew {
+    value: AtomicI64,
+    observed: AtomicBool,
+}
 impl Skew {
+    pub(crate) fn new(value: i64) -> Self {
+        Self {
+            value: AtomicI64::new(value),
+            observed: AtomicBool::new(false),
+        }
+    }
+    pub(crate) fn final_observed(&self) -> Option<i64> {
+        self.observed
+            .load(Ordering::Relaxed)
+            .then(|| self.value.load(Ordering::Relaxed))
+    }
     // Missing metadata (including a transport failure) resets the next attempt.
     pub(crate) fn take(&self) -> i64 {
-        self.0.swap(0, Ordering::Relaxed)
+        self.observed.store(false, Ordering::Relaxed);
+        self.value.swap(0, Ordering::Relaxed)
     }
     pub(crate) fn observe(&self, response: &Response<Bytes>) {
         let skew = response
@@ -37,7 +52,7 @@ impl Skew {
             .get("date")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_http_date)
-            .map_or(0, |server| {
+            .map(|server| {
                 let now = Timestamp::now();
                 let nanos = (i128::from(server.as_second()) - i128::from(now.as_second()))
                     * 1_000_000_000
@@ -45,7 +60,8 @@ impl Skew {
                     - i128::from(now.subsec_nanosecond());
                 i64::try_from(nanos).unwrap_or(if nanos < 0 { i64::MIN } else { i64::MAX })
             });
-        self.0.store(skew, Ordering::Relaxed);
+        self.observed.store(skew.is_some(), Ordering::Relaxed);
+        self.value.store(skew.unwrap_or(0), Ordering::Relaxed);
     }
 }
 
@@ -68,12 +84,22 @@ pub(crate) fn sign_at(
     region: &str,
     now: Timestamp,
 ) -> reqsign_core::Result<()> {
+    sign_service_at(parts, credential, region, "sts", now)
+}
+
+pub(crate) fn sign_service_at(
+    parts: &mut Parts,
+    credential: &Credential,
+    region: &str,
+    service: &str,
+    now: Timestamp,
+) -> reqsign_core::Result<()> {
     let mut request = SigningRequest::build(parts)?;
     canonicalize_headers(&mut request, credential, None, now)?;
     let query = canonicalize_query(&request, &[]);
     let canonical = canonical_request_string(&request, &query)?;
     let date = now.format_date();
-    let scope = format!("{date}/{region}/sts/aws4_request");
+    let scope = format!("{date}/{region}/{service}/aws4_request");
     let message = format!(
         "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
         now.format_iso8601(),
@@ -84,7 +110,7 @@ pub(crate) fn sign_at(
         date.as_bytes(),
     );
     let key = hmac_sha256(&key, region.as_bytes());
-    let key = hmac_sha256(&key, b"sts");
+    let key = hmac_sha256(&key, service.as_bytes());
     let key = hmac_sha256(&key, b"aws4_request");
     let signature = hex_hmac_sha256(&key, message.as_bytes());
     let mut auth = http::HeaderValue::from_str(&format!(
@@ -92,7 +118,7 @@ pub(crate) fn sign_at(
         credential.access_key_id,
         request.header_name_to_vec_sorted().join(";")
     ))
-    .map_err(|_| reqsign_core::Error::credential_invalid("AWS STS signing failed"))?;
+    .map_err(|_| reqsign_core::Error::credential_invalid("AWS signing failed"))?;
     auth.set_sensitive(true);
     request.headers.insert(http::header::AUTHORIZATION, auth);
     request.apply(parts)

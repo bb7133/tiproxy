@@ -56,6 +56,28 @@ only to the metering client; other clients' explicit CA trust stays unchanged.
 Errors expose fixed classes, not service URLs, headers, response bodies or keys.
 Credential file, HTTP response and command output reads have a 4 MiB bound.
 
+S3 HEAD and PUT each use the configured standard/adaptive retry policy and a
+shared S3-client quota, independent of STS credential quotas. Attempts re-sign
+and replay the same object URL and immutable payload. A retried PUT does not
+restart the successful existence check. S3 v1.105.1, unlike the pinned STS
+client, persists the final attempt's valid Date offset across operations;
+missing metadata resets the next attempt but leaves that client offset intact.
+
+S3 uses unwrapped XML error codes and status-text fallback for empty errors.
+Status 429 alone is terminal; the standard status/code retry rules and clock
+correction apply. The metering SDK's Exists result is reproduced from
+`NotFound`/`NoSuchKey` in decoded error code/message, including HeadObject's
+case-insensitive modeled NotFound; a malformed 404 response is an error. Eighty
+actual metering SDK Exists/Upload trajectories compare calls, results and
+signed timestamps for both retry modes, including persistent clock healing and
+transport failures. Two fixed-time S3 signatures compare authorization bytes.
+A real HTTP test exercises HEAD 503→404 and PUT 503→200 with identical object
+path/payload on retry. Regenerate the Go observations with:
+
+```sh
+rust/crates/control-meter/testdata/aws-s3-retry-go.sh
+```
+
 AWS and OSS use maintained reqsign source providers and signing primitives with
 native role/cache adapters. AWS uses the Go 900-second POST request and a stable
 `aws-go-sdk-{UnixNano}` session name, applies custom BaseEndpoint to STS, and caches
@@ -442,7 +464,7 @@ go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
 Full default-credential/endpoint edge parity remains in progress. Provider retry-policy and default-chain edge comparisons remain
-open, including cloud object HEAD/PUT retries and the declared HTTP date
+open, including OSS/COS/Azure object HEAD/PUT retries and the declared HTTP date
 local-zone edge. Export failure retains the pending window for the next metering
 attempt.
 

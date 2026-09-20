@@ -129,6 +129,23 @@ impl Failure {
         failure.retry_after = retry_after(response);
         failure
     }
+    pub(crate) fn s3(response: &http::Response<bytes::Bytes>, code: &str, skew: i64) -> Self {
+        let mut failure = Self::container(0, code);
+        failure.error = reqsign_core::Error::unexpected("AWS S3 request failed");
+        failure.status = Some(response.status().as_u16());
+        failure.retryable |= matches!(response.status().as_u16(), 500 | 502 | 503 | 504)
+            || matches!(
+                code,
+                "RequestExpired" | "RequestInTheFuture" | "RequestTimeTooSkewed"
+            )
+            || (skew > 240_000_000_000
+                && matches!(
+                    code,
+                    "InvalidSignatureException" | "SignatureDoesNotMatch" | "AuthFailure"
+                ));
+        failure.retry_after = retry_after(response);
+        failure
+    }
     pub(crate) fn status(&self) -> Option<u16> {
         self.status
     }
