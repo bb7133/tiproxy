@@ -746,6 +746,12 @@ impl EffectiveConfig {
         &self.log.online.level
     }
 
+    /// Returns restart-pinned metering settings without copying credentials.
+    #[must_use]
+    pub const fn metering(&self) -> &MeteringConfig {
+        &self.metering
+    }
+
     /// Returns the canonical effective work directory.
     #[must_use]
     pub fn workdir(&self) -> &str {
@@ -1841,21 +1847,33 @@ impl HaConfig {
     }
 }
 
+/// Restart-pinned metering storage configuration; debug output excludes credentials.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct MeteringConfig {
+pub struct MeteringConfig {
     #[serde(rename = "type")]
-    provider_type: String,
-    region: String,
-    bucket: String,
-    prefix: String,
-    endpoint: String,
-    aws: Option<AwsMeteringConfig>,
-    oss: Option<CloudMeteringConfig>,
-    cos: Option<CloudMeteringConfig>,
-    azure: Option<AzureMeteringConfig>,
-    localfs: Option<LocalFsMeteringConfig>,
-    shared_pool_id: String,
+    /// Provider spelling accepted by the Go SDK.
+    pub provider_type: String,
+    /// Cloud region.
+    pub region: String,
+    /// Bucket or Azure container name.
+    pub bucket: String,
+    /// Object key prefix.
+    pub prefix: String,
+    /// Optional provider service endpoint.
+    pub endpoint: String,
+    /// AWS settings.
+    pub aws: Option<AwsMeteringConfig>,
+    /// Alibaba OSS settings.
+    pub oss: Option<CloudMeteringConfig>,
+    /// Tencent COS settings.
+    pub cos: Option<CloudMeteringConfig>,
+    /// Azure settings.
+    pub azure: Option<AzureMeteringConfig>,
+    /// Local filesystem settings.
+    pub localfs: Option<LocalFsMeteringConfig>,
+    /// Shared metering pool identity.
+    pub shared_pool_id: String,
 }
 
 impl fmt::Debug for MeteringConfig {
@@ -1893,39 +1911,58 @@ impl MeteringConfig {
     }
 }
 
+/// AWS storage credentials and addressing policy. Never log credential fields.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct AwsMeteringConfig {
-    assume_role_arn: String,
-    s3_force_path_style: bool,
-    access_key: String,
-    secret_access_key: String,
-    session_token: String,
+pub struct AwsMeteringConfig {
+    /// Optional role to assume using the base credentials.
+    pub assume_role_arn: String,
+    /// Address the bucket in the path rather than the hostname.
+    pub s3_force_path_style: bool,
+    /// Static access key identifier.
+    pub access_key: String,
+    /// Static secret access key; sensitive.
+    pub secret_access_key: String,
+    /// Optional temporary credential token; sensitive.
+    pub session_token: String,
 }
 
+/// OSS/COS credential inputs. Never log credential fields.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct CloudMeteringConfig {
-    assume_role_arn: String,
-    access_key: String,
-    secret_access_key: String,
-    session_token: String,
+pub struct CloudMeteringConfig {
+    /// Optional role to assume using the base credentials.
+    pub assume_role_arn: String,
+    /// Static access key identifier.
+    pub access_key: String,
+    /// Static secret access key; sensitive.
+    pub secret_access_key: String,
+    /// Optional temporary credential token; sensitive.
+    pub session_token: String,
 }
 
+/// Azure storage credential inputs. Never log credential fields.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct AzureMeteringConfig {
-    account_name: String,
-    account_key: String,
-    sas_token: String,
+pub struct AzureMeteringConfig {
+    /// Azure storage account name.
+    pub account_name: String,
+    /// Azure shared account key; sensitive.
+    pub account_key: String,
+    /// Azure SAS query token; sensitive.
+    pub sas_token: String,
 }
 
+/// Local filesystem storage options.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct LocalFsMeteringConfig {
-    base_path: String,
-    create_dirs: bool,
-    permissions: String,
+pub struct LocalFsMeteringConfig {
+    /// Local storage base directory.
+    pub base_path: String,
+    /// Create missing directories.
+    pub create_dirs: bool,
+    /// Octal directory and file permission spelling.
+    pub permissions: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

@@ -11,10 +11,20 @@ repository.workspace = true
 default = []
 
 [dependencies]
+bytes.workspace = true
+http.workspace = true
+reqwest.workspace = true
+rustls-native-certs.workspace = true
+rust-ini.workspace = true
+reqsign-core.workspace = true
+reqsign-aws-v4.workspace = true
+reqsign-aliyun-oss.workspace = true
+reqsign-tencent-cos.workspace = true
+control-config.workspace = true
 control-plane.workspace = true
 getrandom.workspace = true
 flate2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

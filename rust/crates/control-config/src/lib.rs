@@ -21,11 +21,13 @@ pub mod module;
 pub mod source;
 
 pub use model::{
-    BackendClusterConfig, ClientTlsConfig, ConfigError, ConfigPersistence, EffectiveConfig,
-    HealthCheckConfig, LogOnlineConfig, NamespaceConfig, ProxyOnlineConfig, RoutingBalancePolicy,
-    RoutingConfig, RoutingConnectionFactorConfig, RoutingFactorConfig, RoutingNamespace,
-    RoutingRule, RoutingSelectionPolicy, ServingConfig, ServingKeepalive, ServingListener,
-    ServingNamespace, ServingTlsConfig, SourceRevision, TopologyConfig, TopologyRuntimeIdentity,
+    AwsMeteringConfig, AzureMeteringConfig, BackendClusterConfig, ClientTlsConfig,
+    CloudMeteringConfig, ConfigError, ConfigPersistence, EffectiveConfig, HealthCheckConfig,
+    LocalFsMeteringConfig, LogOnlineConfig, MeteringConfig, NamespaceConfig, ProxyOnlineConfig,
+    RoutingBalancePolicy, RoutingConfig, RoutingConnectionFactorConfig, RoutingFactorConfig,
+    RoutingNamespace, RoutingRule, RoutingSelectionPolicy, ServingConfig, ServingKeepalive,
+    ServingListener, ServingNamespace, ServingTlsConfig, SourceRevision, TopologyConfig,
+    TopologyRuntimeIdentity,
 };
 pub use module::{
     ConfigModule, ConfigModuleHandle, ConfigModuleOptions, ConfigMutationError,
