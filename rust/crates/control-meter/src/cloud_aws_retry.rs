@@ -551,6 +551,7 @@ mod tests {
             crate::cloud_aws_retry_config::Settings {
                 max_attempts: 1,
                 adaptive: true,
+                ..Default::default()
             },
         );
         assert!(
@@ -577,6 +578,7 @@ mod tests {
             crate::cloud_aws_retry_config::Settings {
                 max_attempts: 1,
                 adaptive: true,
+                ..Default::default()
             },
         );
         assert!(

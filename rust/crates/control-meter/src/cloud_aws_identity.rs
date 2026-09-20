@@ -679,7 +679,12 @@ async fn read_profiles(ctx: &Context) -> reqsign_core::Result<Profiles> {
             } else {
                 section.as_str()
             };
-            let values = values.clone();
+            let mut values = values.clone();
+            // The SDK reads this service option only from the config file;
+            // the credentials file does not override it.
+            if !config {
+                values.remove("request_checksum_calculation");
+            }
             let complete = values.contains_key("aws_access_key_id")
                 && values.contains_key("aws_secret_access_key");
             let partial = values.contains_key("aws_access_key_id")
@@ -901,6 +906,7 @@ mod tests {
                 let expected = Settings {
                     max_attempts: row.max,
                     adaptive: row.adaptive,
+                    ..Settings::default()
                 };
                 assert_eq!(
                     settings.unwrap_or_else(|e| unreachable!("{e}")),

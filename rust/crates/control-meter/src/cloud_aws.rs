@@ -44,6 +44,7 @@ pub(crate) struct AwsSigner {
     retry: Retry,
     object_retry: Retry,
     object_skew: std::sync::atomic::AtomicI64,
+    checksum_supported: bool,
 }
 
 #[derive(Default)]
@@ -84,6 +85,7 @@ impl AwsSigner {
             retry: Retry::configured(&context, settings),
             object_retry: Retry::configured(&context, settings),
             object_skew: std::sync::atomic::AtomicI64::new(0),
+            checksum_supported: settings.checksum_supported,
             context,
             base,
             region,
