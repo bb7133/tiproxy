@@ -62,6 +62,44 @@ impl std::fmt::Display for SearchError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cancelled;
 
+/// Why a scan stopped before its end: the consumer went away (polled where
+/// Go polls `ctx.Done()`), or the scan failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Interrupt {
+    /// The consumer stopped reading.
+    Cancelled,
+    /// The scan failed.
+    Failed(SearchError),
+}
+
+impl From<SearchError> for Interrupt {
+    fn from(error: SearchError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// How a search ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOutcome {
+    /// Every batch, including the final one, was handed to the consumer.
+    Completed,
+    /// The consumer went away before the scan finished.
+    Cancelled,
+}
+
+/// A cancellation probe: `true` once the consumer is gone. Go checks
+/// `ctx.Done()` per resolved file, per probed line, per backward chunk and
+/// per scanned line; the probe is polled at exactly those points.
+pub type CancelProbe<'a> = &'a dyn Fn() -> bool;
+
+fn check(cancelled: CancelProbe<'_>) -> Result<(), Interrupt> {
+    if cancelled() {
+        Err(Interrupt::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 /// One resolved log file, as Go's `logFile` (opened lazily here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFile {
@@ -77,8 +115,8 @@ pub struct ResolvedFile {
 
 /// Runs one search: every batch of up to [`BATCH_SIZE`] messages is handed to
 /// `emit`, and after the last batch a final (possibly empty) batch follows,
-/// exactly like the Go server's send loop. `emit` returning [`Cancelled`]
-/// stops the scan.
+/// exactly like the Go server's send loop. `emit` returning [`Cancelled`] or
+/// `cancelled` answering `true` stops the scan.
 ///
 /// # Errors
 ///
@@ -86,15 +124,20 @@ pub struct ResolvedFile {
 pub fn search(
     log_file: &Path,
     request: &SearchLogRequest,
+    cancelled: CancelProbe<'_>,
     emit: &mut dyn FnMut(Vec<LogMessage>) -> Result<(), Cancelled>,
-) -> Result<(), SearchError> {
+) -> Result<SearchOutcome, SearchError> {
     let begin = request.start_time;
     let end = if request.end_time == 0 {
         i64::MAX
     } else {
         request.end_time
     };
-    let files = resolve_files(log_file, begin, end)?;
+    let files = match resolve_files(log_file, begin, end, cancelled) {
+        Ok(files) => files,
+        Err(Interrupt::Cancelled) => return Ok(SearchOutcome::Cancelled),
+        Err(Interrupt::Failed(error)) => return Err(error),
+    };
     let mut level_flag: i64 = 0;
     for level in &request.levels {
         if (0..63).contains(level) {
@@ -114,46 +157,54 @@ pub fn search(
         file_index: 0,
         reader: None,
         previous: None,
+        cancelled,
     };
     loop {
         let mut messages = Vec::new();
         let mut drained = false;
         for _ in 0..BATCH_SIZE {
-            let Some(item) = iterator.next()? else {
-                drained = true;
-                break;
+            let item = match iterator.next() {
+                Ok(Some(item)) => item,
+                Ok(None) => {
+                    drained = true;
+                    break;
+                }
+                Err(Interrupt::Cancelled) => return Ok(SearchOutcome::Cancelled),
+                Err(Interrupt::Failed(error)) => return Err(error),
             };
             messages.push(item);
         }
         if emit(messages).is_err() {
-            return Ok(());
+            return Ok(SearchOutcome::Cancelled);
         }
         if drained {
-            return Ok(());
+            return Ok(SearchOutcome::Completed);
         }
     }
 }
 
 /// Go `resolveFiles`: every regular entry of the log directory whose full
-/// path starts with the configured path minus its extension and ends with
-/// that extension (optionally `.gz`), probed for its first and last valid
-/// line, kept when it overlaps `[begin, end]`, sorted by first timestamp,
-/// and trimmed to the last file that starts before `begin` plus everything
-/// after it.
+/// path (Go `filepath.Join`, so cleaned) starts with the configured path
+/// minus its extension and ends with that extension (optionally `.gz`),
+/// probed for its first and last valid line, kept when it overlaps
+/// `[begin, end]`, sorted by first timestamp, and trimmed to the last file
+/// that starts before `begin` plus everything after it. The directory is Go
+/// `filepath.Dir` of the configured path: a bare `tiproxy.log` scans the
+/// working directory (and, as in Go, a `./tiproxy.log` prefix matches no
+/// cleaned entry).
 ///
 /// # Errors
 ///
-/// An empty path or an unreadable directory.
+/// An empty path or an unreadable directory, or the consumer going away.
 pub fn resolve_files(
     log_file: &Path,
     begin: i64,
     end: i64,
-) -> Result<Vec<ResolvedFile>, SearchError> {
+    cancelled: CancelProbe<'_>,
+) -> Result<Vec<ResolvedFile>, Interrupt> {
     let log_path = log_file.to_string_lossy().into_owned();
     if log_path.is_empty() {
-        return Err(SearchError(
-            "empty log file location configuration".to_owned(),
-        ));
+        return Err(SearchError("empty log file location configuration".to_owned()).into());
     }
     let dir = go_dir(&log_path);
     let ext = go_ext(&log_path);
@@ -181,13 +232,18 @@ pub fn resolve_files(
         if !path.ends_with(&ext) && !path.ends_with(&format!("{ext}{COMPRESS_SUFFIX}")) {
             continue;
         }
+        check(cancelled)?;
         let Ok(mut file) = File::open(&path) else {
             continue;
         };
         let first = if compressed {
-            read_first_valid_log(&mut BufReader::new(MultiGzDecoder::new(&mut file)), 10)
+            read_first_valid_log(
+                &mut BufReader::new(MultiGzDecoder::new(&mut file)),
+                10,
+                cancelled,
+            )?
         } else {
-            read_first_valid_log(&mut BufReader::new(&mut file), 10)
+            read_first_valid_log(&mut BufReader::new(&mut file), 10, cancelled)?
         };
         let Some(first) = first else {
             continue;
@@ -195,7 +251,7 @@ pub fn resolve_files(
         let last = if compressed {
             i64::MAX
         } else {
-            match read_last_valid_log(&mut file, 10) {
+            match read_last_valid_log(&mut file, 10, cancelled)? {
                 Some(item) => item.time,
                 None => continue,
             }
@@ -222,16 +278,70 @@ pub fn resolve_files(
     Ok(files.split_off(index))
 }
 
-/// Go `filepath.Dir`: the path minus its last element, `.` for a bare name.
-fn go_dir(path: &str) -> String {
-    match path.rfind('/') {
-        Some(0) => "/".to_owned(),
-        Some(index) => path[..index].to_owned(),
-        None => ".".to_owned(),
+/// Go `filepath.Clean` (Unix rules): repeated separators, `.` elements and
+/// `..` elements are resolved lexically, a trailing separator is dropped,
+/// and the empty path becomes `.`.
+fn go_clean(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_owned();
     }
+    let bytes = path.as_bytes();
+    let n = bytes.len();
+    let rooted = bytes[0] == b'/';
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut r = 0;
+    let mut dotdot = 0;
+    if rooted {
+        out.push(b'/');
+        r = 1;
+        dotdot = 1;
+    }
+    while r < n {
+        if bytes[r] == b'/' || (bytes[r] == b'.' && (r + 1 == n || bytes[r + 1] == b'/')) {
+            // A separator or a `.` element.
+            r += 1;
+        } else if bytes[r] == b'.' && bytes[r + 1] == b'.' && (r + 2 == n || bytes[r + 2] == b'/') {
+            r += 2;
+            if out.len() > dotdot {
+                // Back up to the previous separator, which is dropped too.
+                out.pop();
+                while out.len() > dotdot && out.last() != Some(&b'/') {
+                    out.pop();
+                }
+                if out.len() > dotdot && out.last() == Some(&b'/') {
+                    out.pop();
+                }
+            } else if !rooted {
+                if !out.is_empty() {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(b"..");
+                dotdot = out.len();
+            }
+        } else {
+            if (rooted && out.len() != 1) || (!rooted && !out.is_empty()) {
+                out.push(b'/');
+            }
+            while r < n && bytes[r] != b'/' {
+                out.push(bytes[r]);
+                r += 1;
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(b'.');
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Go `filepath.Ext`: from the final dot of the last element, or empty.
+/// Go `filepath.Dir`: everything up to the last separator, cleaned (`.` for
+/// a bare name).
+fn go_dir(path: &str) -> String {
+    let end = path.rfind('/').map_or(0, |index| index + 1);
+    go_clean(&path[..end])
+}
+
+/// Go `filepath.Ext`: the suffix from the final dot of the last element.
 fn go_ext(path: &str) -> String {
     let base = path.rsplit('/').next().unwrap_or(path);
     match base.rfind('.') {
@@ -240,12 +350,17 @@ fn go_ext(path: &str) -> String {
     }
 }
 
-/// Go `filepath.Join(dir, name)` for a directory that came from `go_dir`.
+/// Go `filepath.Join` of two elements: empty elements are skipped and the
+/// result is cleaned.
 fn go_join(dir: &str, name: &str) -> String {
-    if dir == "/" {
-        format!("/{name}")
+    if dir.is_empty() {
+        if name.is_empty() {
+            String::new()
+        } else {
+            go_clean(name)
+        }
     } else {
-        format!("{dir}/{name}")
+        go_clean(&format!("{dir}/{name}"))
     }
 }
 
@@ -267,34 +382,47 @@ fn read_line(reader: &mut impl BufRead) -> Option<String> {
 }
 
 /// Go `readFirstValidLog`: the first parseable line within `try_lines`.
-fn read_first_valid_log(reader: &mut impl BufRead, try_lines: usize) -> Option<LogMessage> {
+fn read_first_valid_log(
+    reader: &mut impl BufRead,
+    try_lines: usize,
+    cancelled: CancelProbe<'_>,
+) -> Result<Option<LogMessage>, Interrupt> {
     let mut tried = 0;
     loop {
-        let line = read_line(reader)?;
+        let Some(line) = read_line(reader) else {
+            return Ok(None);
+        };
         if let Some(item) = parse_log_item(&line) {
-            return Some(item);
+            return Ok(Some(item));
         }
         tried += 1;
         if tried >= try_lines {
-            return None;
+            return Ok(None);
         }
+        check(cancelled)?;
     }
 }
 
 /// Go `readLastValidLog`: the last parseable line, reading backwards in
 /// growing chunks and scanning at most `try_lines` lines.
-fn read_last_valid_log(file: &mut File, try_lines: usize) -> Option<LogMessage> {
+fn read_last_valid_log(
+    file: &mut File,
+    try_lines: usize,
+    cancelled: CancelProbe<'_>,
+) -> Result<Option<LogMessage>, Interrupt> {
     let mut tried = 0;
     let mut end_cursor = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     loop {
-        let (lines, read_bytes) = read_last_lines(file, end_cursor)?;
+        let Some((lines, read_bytes)) = read_last_lines(file, end_cursor, cancelled)? else {
+            return Ok(None);
+        };
         if read_bytes == 0 {
             break;
         }
         end_cursor -= read_bytes as u64;
         for line in lines.iter().rev() {
             if let Some(item) = parse_log_item(line) {
-                return Some(item);
+                return Ok(Some(item));
             }
         }
         tried += lines.len();
@@ -302,13 +430,18 @@ fn read_last_valid_log(file: &mut File, try_lines: usize) -> Option<LogMessage> 
             break;
         }
     }
-    None
+    Ok(None)
 }
 
 /// Go `readLastLines`: reads backwards from `end_cursor` in doubling chunks
 /// until a line boundary precedes the collected bytes, and returns the lines
-/// after that boundary plus the byte count they cover.
-fn read_last_lines(file: &mut File, end_cursor: u64) -> Option<(Vec<String>, usize)> {
+/// after that boundary plus the byte count they cover. A seek or read
+/// failure yields nothing, as Go's nil error with no bytes does.
+fn read_last_lines(
+    file: &mut File,
+    end_cursor: u64,
+    cancelled: CancelProbe<'_>,
+) -> Result<Option<(Vec<String>, usize)>, Interrupt> {
     let mut lines: Vec<u8> = Vec::new();
     let mut first_non_newline_pos = 0usize;
     let mut cursor = end_cursor;
@@ -325,11 +458,18 @@ fn read_last_lines(file: &mut File, end_cursor: u64) -> Option<(Vec<String>, usi
             size = cursor;
         }
         cursor -= size;
-        file.seek(SeekFrom::Start(cursor)).ok()?;
-        let mut chars = vec![0_u8; usize::try_from(size).ok()?];
+        if file.seek(SeekFrom::Start(cursor)).is_err() {
+            return Ok(None);
+        }
+        let Ok(length) = usize::try_from(size) else {
+            return Ok(None);
+        };
+        let mut chars = vec![0_u8; length];
         // Go reads once and keeps whatever arrived (a short read leaves
         // zero bytes in the buffer); a regular file returns the full chunk.
-        file.read_exact(&mut chars).ok()?;
+        if file.read_exact(&mut chars).is_err() {
+            return Ok(None);
+        }
         let mut merged = chars.clone();
         merged.extend_from_slice(&lines);
         lines = merged;
@@ -345,6 +485,7 @@ fn read_last_lines(file: &mut File, end_cursor: u64) -> Option<(Vec<String>, usi
         if first_non_newline_pos > 0 {
             break;
         }
+        check(cancelled)?;
     }
     let final_str =
         String::from_utf8_lossy(&lines[first_non_newline_pos.min(lines.len())..]).into_owned();
@@ -354,7 +495,7 @@ fn read_last_lines(file: &mut File, end_cursor: u64) -> Option<(Vec<String>, usi
         .split('\n')
         .map(str::to_owned)
         .collect();
-    Some((split, count))
+    Ok(Some((split, count)))
 }
 
 /// Go `ParseLogLevel`: exact lower/upper spellings, anything else `UNKNOWN`.
@@ -453,7 +594,7 @@ impl LineReader {
 /// Go `logIterator`: walks the pending files in order, applies the time
 /// window, level bitmask and patterns, and turns unparseable lines that
 /// follow a valid item into continuation messages of that item.
-struct LogIterator {
+struct LogIterator<'a> {
     begin: i64,
     end: i64,
     level_flag: i64,
@@ -462,10 +603,11 @@ struct LogIterator {
     file_index: usize,
     reader: Option<LineReader>,
     previous: Option<LogMessage>,
+    cancelled: CancelProbe<'a>,
 }
 
-impl LogIterator {
-    fn next(&mut self) -> Result<Option<LogMessage>, SearchError> {
+impl LogIterator<'_> {
+    fn next(&mut self) -> Result<Option<LogMessage>, Interrupt> {
         if self.reader.is_none() {
             if self.pending.is_empty() {
                 return Ok(None);
@@ -473,6 +615,7 @@ impl LogIterator {
             self.reader = Some(LineReader::open(&self.pending[self.file_index])?);
         }
         'next_line: loop {
+            check(self.cancelled)?;
             let Some(reader) = self.reader.as_mut() else {
                 return Ok(None);
             };
@@ -574,7 +717,7 @@ mod tests {
 
     fn collect(dir: &Path, request: &SearchLogRequest) -> Vec<Vec<LogMessage>> {
         let mut batches = Vec::new();
-        search(&dir.join("tidb.log"), request, &mut |batch| {
+        search(&dir.join("tidb.log"), request, &|| false, &mut |batch| {
             batches.push(batch);
             Ok(())
         })
@@ -648,8 +791,8 @@ mod tests {
             &[&welcome("2019/08/26 06:22:14.011 -04:00", "INFO")],
         );
         let resolve = |start: &str, end: &str| -> Vec<(i64, i64)> {
-            resolve_files(&dir.join("tidb.log"), ts(start), ts(end))
-                .unwrap_or_else(|e| unreachable!("{e}"))
+            resolve_files(&dir.join("tidb.log"), ts(start), ts(end), &|| false)
+                .unwrap_or_else(|e| unreachable!("{e:?}"))
                 .iter()
                 .map(|file| (file.begin, file.end))
                 .collect()
@@ -937,12 +1080,13 @@ mod tests {
         let outcome = search(
             &dir.join("tidb.log"),
             &SearchLogRequest::default(),
+            &|| false,
             &mut |_| {
                 delivered += 1;
                 Err(Cancelled)
             },
         );
-        assert_eq!(outcome, Ok(()));
+        assert_eq!(outcome, Ok(SearchOutcome::Cancelled));
         assert_eq!(delivered, 1, "the scan stops at the first refused batch");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -951,7 +1095,12 @@ mod tests {
     #[test]
     fn errors_follow_go() {
         assert_eq!(
-            search(Path::new(""), &SearchLogRequest::default(), &mut |_| Ok(())),
+            search(
+                Path::new(""),
+                &SearchLogRequest::default(),
+                &|| false,
+                &mut |_| Ok(())
+            ),
             Err(SearchError(
                 "empty log file location configuration".to_owned()
             ))
@@ -960,6 +1109,7 @@ mod tests {
             search(
                 Path::new("/nonexistent-dir-xyz/tidb.log"),
                 &SearchLogRequest::default(),
+                &|| false,
                 &mut |_| Ok(())
             )
             .is_err()
@@ -974,7 +1124,7 @@ mod tests {
             patterns: vec!["(".to_owned()],
             ..SearchLogRequest::default()
         };
-        assert!(search(&dir.join("tidb.log"), &bad, &mut |_| Ok(())).is_err());
+        assert!(search(&dir.join("tidb.log"), &bad, &|| false, &mut |_| Ok(())).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -989,5 +1139,156 @@ mod tests {
         assert!(parse_timestamp("2019/08/26 06:19:13.011 +08:00").is_some());
         assert_eq!(parse_log_level("WARN"), LogLevel::Warn);
         assert_eq!(parse_log_level("Warn"), LogLevel::Unknown);
+    }
+
+    /// Go `path/filepath` `cleantests` (Unix rows) and the derived helpers.
+    #[test]
+    fn path_helpers_follow_go_filepath() {
+        for (input, expected) in [
+            ("abc", "abc"),
+            ("abc/def", "abc/def"),
+            ("a/b/c", "a/b/c"),
+            (".", "."),
+            ("..", ".."),
+            ("../..", "../.."),
+            ("../../abc", "../../abc"),
+            ("/abc", "/abc"),
+            ("/", "/"),
+            ("", "."),
+            ("abc/", "abc"),
+            ("abc/def/", "abc/def"),
+            ("a/b/c/", "a/b/c"),
+            ("./", "."),
+            ("../", ".."),
+            ("../../", "../.."),
+            ("/abc/", "/abc"),
+            ("abc//def//ghi", "abc/def/ghi"),
+            ("abc//", "abc"),
+            ("abc/./def", "abc/def"),
+            ("/./abc/def", "/abc/def"),
+            ("abc/.", "abc"),
+            ("abc/def/ghi/../jkl", "abc/def/jkl"),
+            ("abc/def/../ghi/../jkl", "abc/jkl"),
+            ("abc/def/..", "abc"),
+            ("abc/def/../..", "."),
+            ("/abc/def/../..", "/"),
+            ("abc/def/../../..", ".."),
+            ("/abc/def/../../..", "/"),
+            ("abc/def/../../../ghi/jkl/../../../mno", "../../mno"),
+            ("/../abc", "/abc"),
+            ("a/../b:/../../c", "../c"),
+        ] {
+            assert_eq!(go_clean(input), expected, "Clean({input:?})");
+        }
+        assert_eq!(go_join(".", "tiproxy.log"), "tiproxy.log");
+        assert_eq!(go_join("/var/log", "tiproxy.log"), "/var/log/tiproxy.log");
+        assert_eq!(go_join("/", "tiproxy.log"), "/tiproxy.log");
+        assert_eq!(go_join("logs//", "a.log"), "logs/a.log");
+        assert_eq!(go_join("", "a.log"), "a.log");
+        assert_eq!(go_join("", ""), "");
+        assert_eq!(go_dir("tiproxy.log"), ".");
+        assert_eq!(go_dir("./tiproxy.log"), ".");
+        assert_eq!(go_dir("/tiproxy.log"), "/");
+        assert_eq!(go_dir("/var/log/tiproxy.log"), "/var/log");
+        assert_eq!(go_dir("/var/log//tiproxy.log"), "/var/log");
+        assert_eq!(go_dir("logs/"), "logs");
+        assert_eq!(go_dir(""), ".");
+        assert_eq!(go_ext("tiproxy.log.gz"), ".gz");
+        assert_eq!(go_ext("dir.d/tiproxy"), "");
+    }
+
+    /// Reviewer reproduction: the same `tiproxy.log` answers one line for the
+    /// absolute path and for the bare relative name (Go `filepath.Join`
+    /// cleans `./tiproxy.log` to `tiproxy.log`, which carries the bare
+    /// prefix). A configured `./tiproxy.log` finds nothing on both sides:
+    /// its raw prefix `./tiproxy` never matches a cleaned entry.
+    #[test]
+    fn a_bare_relative_log_name_scans_the_working_directory() {
+        let dir = temp_dir();
+        write(
+            &dir,
+            "tiproxy.log",
+            &["[2019/08/26 06:19:13.011 -04:00] [INFO] [p.go:1] [\"one\"]"],
+        );
+        let previous = std::env::current_dir().unwrap_or_else(|e| unreachable!("{e}"));
+        std::env::set_current_dir(&dir).unwrap_or_else(|e| unreachable!("{e}"));
+        let absolute = resolve_files(&dir.join("tiproxy.log"), 0, i64::MAX, &|| false);
+        let relative = resolve_files(Path::new("tiproxy.log"), 0, i64::MAX, &|| false);
+        let dotted = resolve_files(Path::new("./tiproxy.log"), 0, i64::MAX, &|| false);
+        let mut relative_lines = 0;
+        let outcome = search(
+            Path::new("tiproxy.log"),
+            &SearchLogRequest::default(),
+            &|| false,
+            &mut |batch| {
+                relative_lines += batch.len();
+                Ok(())
+            },
+        );
+        std::env::set_current_dir(previous).unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(absolute.map(|files| files.len()), Ok(1));
+        assert_eq!(
+            relative.map(|files| files.into_iter().map(|file| file.path).collect::<Vec<_>>()),
+            Ok(vec![PathBuf::from("tiproxy.log")])
+        );
+        assert_eq!(dotted.map(|files| files.len()), Ok(0));
+        assert_eq!(outcome, Ok(SearchOutcome::Completed));
+        assert_eq!(relative_lines, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reviewer reproduction: a large log with no hit must stop scanning as
+    /// soon as the consumer is gone, not after the whole file (Go polls
+    /// `ctx.Done()` per scanned line and per resolved file).
+    #[test]
+    fn cancellation_is_polled_per_line_and_per_file() {
+        let dir = temp_dir();
+        let lines: Vec<String> = (0..20_000)
+            .map(|i| {
+                format!(
+                    "[2019/08/26 06:19:{:02}.{:03} -04:00] [INFO] [p.go:1] [\"{i}\"]",
+                    (i / 1000) % 60,
+                    i % 1000
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write(&dir, "tidb.log", &refs);
+        let request = SearchLogRequest {
+            patterns: vec!["never-matches".to_owned()],
+            ..SearchLogRequest::default()
+        };
+        let polls = std::cell::Cell::new(0_u32);
+        let probe = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 50
+        };
+        let mut emitted = 0;
+        let outcome = search(&dir.join("tidb.log"), &request, &probe, &mut |_| {
+            emitted += 1;
+            Ok(())
+        });
+        assert_eq!(outcome, Ok(SearchOutcome::Cancelled));
+        assert_eq!(emitted, 0, "no batch is produced after cancellation");
+        assert!(
+            polls.get() <= 60,
+            "the scan stopped at the probe, not at the end: {} polls",
+            polls.get()
+        );
+        // Resolution polls before opening each candidate file.
+        assert_eq!(
+            search(&dir.join("tidb.log"), &request, &|| true, &mut |_| Ok(())),
+            Ok(SearchOutcome::Cancelled)
+        );
+        let mut delivered = 0;
+        assert_eq!(
+            search(&dir.join("tidb.log"), &request, &|| false, &mut |_| {
+                delivered += 1;
+                Ok(())
+            }),
+            Ok(SearchOutcome::Completed)
+        );
+        assert_eq!(delivered, 1, "an empty final batch closes a hitless scan");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

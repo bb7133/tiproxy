@@ -242,7 +242,9 @@ certificate.
   `application/grpc` (an HTTP/1.1 request with that content type is an
   ordinary 404); under HTTP TLS the service lives behind the TLS branch of the
   sniff like the Go cmux `TLS()` branch. `SearchLog` is the Go `sysutil`
-  algorithm over the process log file (`--log-file`; Go: `log.log-file.filename`):
+  algorithm over the process log file (`--log-file`; Go: `log.log-file.filename`,
+  handled with Go's `filepath.Dir`/`Ext`/`Join` semantics, so a bare
+  `tiproxy.log` scans the working directory):
   directory entries whose full path starts with the configured path minus its
   extension and end with that extension or `<ext>.gz`, each probed for its
   first valid line (ten attempts) and, unless compressed, its last valid line
@@ -275,7 +277,7 @@ certificate.
   (the oracle runs grpc-go with `GRPC_ENFORCE_ALPN_ENABLED=false`); and Go
   `regexp` versus the `regex` crate (both RE2-syntax families): `\d`, `\w`,
   `\s` and `\b` are Unicode-aware here and ASCII-only in Go, Go's `\Q...\E`
-  literal quoting and `\C` are not supported here, a pattern over the crate's
+  literal quoting is not supported here (`\C` is rejected by both), a pattern over the crate's
   compiled-size limit is rejected here while Go compiles it, and Go's `(?U)`
   ungreedy flag and `[[:word:]]` classes behave the same.
 - **Slice 4d (`tiproxyctl` compatibility)** — the real `tiproxyctl` binary is

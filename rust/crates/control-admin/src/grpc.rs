@@ -84,7 +84,13 @@ impl Diagnostics for DiagnosticsService {
         // blocking pool; a bounded channel keeps its lead small.
         let (sender, receiver) = mpsc::channel(4);
         tokio::task::spawn_blocking(move || {
-            let outcome = diagnostics::search(&path, &request, &mut |messages| {
+            // The response stream is dropped when the client cancels; the
+            // scan polls that where Go polls `ctx.Done()`.
+            let probe = {
+                let sender = sender.clone();
+                move || sender.is_closed()
+            };
+            let outcome = diagnostics::search(&path, &request, &probe, &mut |messages| {
                 sender
                     .blocking_send(Ok(SearchLogResponse { messages }))
                     .map_err(|_| diagnostics::Cancelled)
