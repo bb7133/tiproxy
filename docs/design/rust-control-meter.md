@@ -77,6 +77,22 @@ COS's one-hour signature header does not require an additional whole hour of
 temporary credential validity. Malformed configured COS credentials stop the
 chain rather than silently changing identity. The pinned Go env provider ignores
 the token environment variable; explicit configured session tokens still work.
+TKE enters the chain only if its constructor inputs and token file are readable;
+a constructor failure permits the profile/CVM sources, while a later TKE STS or
+token-file failure stops resolution. The selected source determines the refresh
+margin (TKE 720 seconds, CVM 300 seconds), and TKE session names use the Go
+microsecond timestamp. Six production Go metering-provider uploads compare
+selected identity and normalized TKE requests. The capture retains all Go upload
+retry attempts; the Rust source test checks one acquisition against those
+identical attempts, without claiming upload retry parity. A separate regression
+covers a disappearing TKE token after an initial authentication failure.
+The native adapter rejects expired TKE/CVM credentials on refresh failure;
+the underlying Go credential getters can return their old expired strings.
+Regenerate the default-source fixture with:
+
+```sh
+go run rust/crates/control-meter/testdata/cos-default-go.go
+```
 
 Focused cloud tests exercise real local HTTP HEAD/PUT, key escaping,
 session tokens, existing/denied objects, AWS/OSS role replacement and caching,

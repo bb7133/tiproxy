@@ -1,0 +1,125 @@
+[
+  {
+    "name": "environment-ignores-token",
+    "env": {
+      "TENCENTCLOUD_SECRET_ID": "env-id",
+      "TENCENTCLOUD_SECRET_KEY": "env-secret",
+      "TENCENTCLOUD_TOKEN": "ignored-token"
+    },
+    "token_file": false,
+    "denied": false,
+    "credential": "env-id",
+    "security_token": "",
+    "error": false,
+    "sts": null
+  },
+  {
+    "name": "partial-env-allows-profile",
+    "env": {
+      "TENCENTCLOUD_SECRET_ID": "partial-id"
+    },
+    "token_file": false,
+    "denied": false,
+    "credential": "profile-id",
+    "security_token": "",
+    "error": false,
+    "sts": null
+  },
+  {
+    "name": "empty-env-stops-chain",
+    "env": {
+      "TENCENTCLOUD_SECRET_ID": "",
+      "TENCENTCLOUD_SECRET_KEY": "secret"
+    },
+    "token_file": false,
+    "denied": false,
+    "credential": "",
+    "security_token": "",
+    "error": true,
+    "sts": null
+  },
+  {
+    "name": "unreadable-tke-skipped",
+    "env": null,
+    "token_file": false,
+    "denied": false,
+    "credential": "profile-id",
+    "security_token": "",
+    "error": false,
+    "sts": null
+  },
+  {
+    "name": "tke-before-profile",
+    "env": null,
+    "token_file": true,
+    "denied": false,
+    "credential": "tke-id",
+    "security_token": "tke-token",
+    "error": false,
+    "sts": [
+      {
+        "authorization": "SKIP",
+        "body": {
+          "DurationSeconds": 7200,
+          "ProviderId": "provider-id",
+          "RoleArn": "qcs::cam::uin/123:roleName/test",
+          "RoleSessionName": "fixture-session",
+          "WebIdentityToken": "fake-token\n"
+        },
+        "method": "POST",
+        "region": "ap-guangzhou",
+        "url": "https://sts.tencentcloudapi.com/"
+      }
+    ]
+  },
+  {
+    "name": "tke-sts-denied-stops-chain",
+    "env": null,
+    "token_file": true,
+    "denied": true,
+    "credential": "",
+    "security_token": "",
+    "error": true,
+    "sts": [
+      {
+        "authorization": "SKIP",
+        "body": {
+          "DurationSeconds": 7200,
+          "ProviderId": "provider-id",
+          "RoleArn": "qcs::cam::uin/123:roleName/test",
+          "RoleSessionName": "fixture-session",
+          "WebIdentityToken": "fake-token\n"
+        },
+        "method": "POST",
+        "region": "ap-guangzhou",
+        "url": "https://sts.tencentcloudapi.com/"
+      },
+      {
+        "authorization": "SKIP",
+        "body": {
+          "DurationSeconds": 7200,
+          "ProviderId": "provider-id",
+          "RoleArn": "qcs::cam::uin/123:roleName/test",
+          "RoleSessionName": "fixture-session",
+          "WebIdentityToken": "fake-token\n"
+        },
+        "method": "POST",
+        "region": "ap-guangzhou",
+        "url": "https://sts.tencentcloudapi.com/"
+      },
+      {
+        "authorization": "SKIP",
+        "body": {
+          "DurationSeconds": 7200,
+          "ProviderId": "provider-id",
+          "RoleArn": "qcs::cam::uin/123:roleName/test",
+          "RoleSessionName": "fixture-session",
+          "WebIdentityToken": "fake-token\n"
+        },
+        "method": "POST",
+        "region": "ap-guangzhou",
+        "url": "https://sts.tencentcloudapi.com/"
+      }
+    ]
+  }
+]

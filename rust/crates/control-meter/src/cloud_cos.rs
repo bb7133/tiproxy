@@ -22,10 +22,10 @@ use control_config::CloudMeteringConfig;
 use http::{Request, request::Parts};
 use reqsign_core::hash::{hex_hmac_sha256, hex_sha256, hmac_sha256};
 use reqsign_core::time::Timestamp;
-use reqsign_core::{Context, ProvideCredential, ProvideCredentialChain, SignRequest};
-use reqsign_tencent_cos::{Credential, RequestSigner, StaticCredentialProvider};
+use reqsign_core::{Context, ProvideCredential, SignRequest};
+use reqsign_tencent_cos::{Credential, RequestSigner};
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 const ROLE_DURATION: u64 = 7200;
 const CVM_ROLE: &str = "http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/";
@@ -33,7 +33,7 @@ const STS: &str = "https://sts.tencentcloudapi.com/";
 
 pub(crate) struct CosSigner {
     context: Context,
-    base: ProvideCredentialChain<Credential>,
+    base: Base,
     role: String,
     state: Mutex<Option<CachedCredential>>,
 }
@@ -52,20 +52,15 @@ impl fmt::Debug for CosSigner {
 impl CosSigner {
     pub(crate) fn new(config: &CloudMeteringConfig, context: Context) -> Self {
         let base = if !config.access_key.is_empty() && !config.secret_access_key.is_empty() {
-            let provider = if config.session_token.is_empty() {
-                StaticCredentialProvider::new(&config.access_key, &config.secret_access_key)
-            } else {
-                StaticCredentialProvider::with_security_token(
-                    &config.access_key,
-                    &config.secret_access_key,
-                    &config.session_token,
-                )
-            };
-            ProvideCredentialChain::new().push(provider)
+            Base::Configured(Credential {
+                secret_id: config.access_key.clone(),
+                secret_key: config.secret_access_key.clone(),
+                security_token: (!config.session_token.is_empty())
+                    .then(|| config.session_token.clone()),
+                expires_in: None,
+            })
         } else {
-            // The Go SDK tries env, TKE OIDC, profile, then CVM. reqsign's
-            // default COS chain differs in environment/token and role duration rules.
-            ProvideCredentialChain::new().push(GoDefaultProvider::default())
+            Base::Default(GoDefaultProvider::default())
         };
         Self {
             context,
@@ -101,11 +96,7 @@ impl CosSigner {
             return Ok(cached.credential.clone());
         }
         let refreshed = async {
-            let base = self
-                .base
-                .provide_credential(&self.context)
-                .await?
-                .ok_or_else(failed)?;
+            let base = self.base.credential(&self.context).await?;
             if self.role.is_empty() {
                 Ok(base)
             } else {
@@ -121,20 +112,8 @@ impl CosSigner {
                 {
                     return Err(failed());
                 }
-                let tke = [
-                    "TKE_REGION",
-                    "TKE_PROVIDER_ID",
-                    "TKE_WEB_IDENTITY_TOKEN_FILE",
-                    "TKE_ROLE_ARN",
-                ]
-                .iter()
-                .all(|name| {
-                    self.context
-                        .env_var(name)
-                        .is_some_and(|value| !value.is_empty())
-                });
-                let margin = if self.role.is_empty() && !tke {
-                    300
+                let margin = if self.role.is_empty() {
+                    self.base.refresh_margin().await
                 } else {
                     ROLE_DURATION / 10
                 };
@@ -164,12 +143,36 @@ impl CosSigner {
     }
 }
 
+enum Base {
+    Configured(Credential),
+    Default(GoDefaultProvider),
+}
+impl Base {
+    async fn credential(&self, ctx: &Context) -> reqsign_core::Result<Credential> {
+        match self {
+            Self::Configured(value) => Ok(value.clone()),
+            Self::Default(provider) => provider.provide_credential(ctx).await?.ok_or_else(failed),
+        }
+    }
+    async fn refresh_margin(&self) -> u64 {
+        match self {
+            Self::Configured(_) => 0,
+            Self::Default(provider) => match provider.selected.lock().await.as_ref() {
+                Some(SelectedSource::Tke) => ROLE_DURATION / 10,
+                Some(SelectedSource::Cvm) => 300,
+                _ => 0,
+            },
+        }
+    }
+}
+
 fn failed() -> reqsign_core::Error {
     reqsign_core::Error::credential_invalid("Tencent cloud credential unavailable")
 }
 
 #[derive(Debug, Default)]
 struct GoDefaultProvider {
+    tke_available: OnceCell<bool>,
     selected: Mutex<Option<SelectedSource>>,
 }
 
@@ -196,7 +199,15 @@ impl ProvideCredential for GoDefaultProvider {
             *selected = Some(SelectedSource::Static(credential.clone()));
             return Ok(Some(credential));
         }
-        if let Some(credential) = TkeProvider.provide_credential(ctx).await? {
+        // Metering's Go chain includes TKE only if its constructor can read
+        // all inputs, including the token file. Once constructed, an STS or
+        // later token-file error is terminal and never falls through.
+        if *self
+            .tke_available
+            .get_or_init(|| TkeProvider::available(ctx))
+            .await
+            && let Some(credential) = TkeProvider.provide_credential(ctx).await?
+        {
             *selected = Some(SelectedSource::Tke);
             return Ok(Some(credential));
         }
@@ -238,6 +249,27 @@ impl ProvideCredential for EnvProvider {
 
 #[derive(Debug)]
 struct TkeProvider;
+impl TkeProvider {
+    async fn available(ctx: &Context) -> bool {
+        let complete = [
+            "TKE_REGION",
+            "TKE_PROVIDER_ID",
+            "TKE_WEB_IDENTITY_TOKEN_FILE",
+            "TKE_ROLE_ARN",
+        ]
+        .iter()
+        .all(|key| ctx.env_var(key).is_some_and(|value| !value.is_empty()));
+        if !complete {
+            return false;
+        }
+        ctx.file_read(
+            &ctx.env_var("TKE_WEB_IDENTITY_TOKEN_FILE")
+                .unwrap_or_default(),
+        )
+        .await
+        .is_ok()
+    }
+}
 impl ProvideCredential for TkeProvider {
     type Credential = Credential;
     async fn provide_credential(&self, ctx: &Context) -> reqsign_core::Result<Option<Credential>> {
@@ -259,7 +291,7 @@ impl ProvideCredential for TkeProvider {
         let now = Timestamp::now();
         let body = serde_json::to_vec(&serde_json::json!({
             "ProviderId": provider, "WebIdentityToken": token, "RoleArn": role,
-            "RoleSessionName": format!("tencentcloud-go-sdk-{}", now.as_second()), "DurationSeconds": ROLE_DURATION
+            "RoleSessionName": format!("tencentcloud-go-sdk-{}{:06}", now.as_second(), now.subsec_nanosecond() / 1000), "DurationSeconds": ROLE_DURATION
         })).map_err(|_| failed())?;
         let request = Request::post(STS)
             .header("content-type", "application/json")
@@ -529,7 +561,10 @@ mod tests {
     }
     impl FileRead for Fixture {
         async fn file_read(&self, path: &str) -> reqsign_core::Result<Vec<u8>> {
-            self.files.get(path).cloned().ok_or_else(failed)
+            self.files.get(path).cloned().ok_or_else(|| {
+                reqsign_core::Error::unexpected("fixture file missing")
+                    .with_source(std::io::Error::from(std::io::ErrorKind::NotFound))
+            })
         }
     }
     impl HttpSend for Fixture {
@@ -723,5 +758,165 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(requests[0].body()).unwrap_or_else(|e| unreachable!("{e}"));
         assert_eq!(body["DurationSeconds"], 7200);
+    }
+    #[tokio::test]
+    async fn default_cos_upload_identity_matches_actual_go() {
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../testdata/cos-default-go.json"))
+                .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(rows.len(), 6);
+        for row in rows {
+            let name = row["name"].as_str().unwrap_or_default();
+            let mut io = Fixture::new(if row["denied"] == true {
+                vec![(403, Vec::new())]
+            } else {
+                vec![(200, serde_json::to_vec(&serde_json::json!({"Response":{"Credentials":{"TmpSecretId":"tke-id","TmpSecretKey":"tke-secret","Token":"tke-token"},"ExpiredTime":4_070_908_800_i64}})).unwrap_or_else(|e| unreachable!("{e}")))]
+            });
+            io.files.insert(
+                "/fixture/credentials".into(),
+                b"[default]\nsecret_id=profile-id\nsecret_key=profile-secret\n".to_vec(),
+            );
+            if row["token_file"] == true {
+                io.files
+                    .insert("/fixture/token".into(), b"fake-token\n".to_vec());
+            }
+            let mut envs: HashMap<String, String> = row["env"]
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            envs.insert(
+                "TENCENTCLOUD_CREDENTIALS_FILE".into(),
+                "/fixture/credentials".into(),
+            );
+            if name.contains("tke") {
+                envs.extend(
+                    [
+                        ("TKE_REGION", "ap-singapore"),
+                        ("TKE_PROVIDER_ID", "provider-id"),
+                        ("TKE_WEB_IDENTITY_TOKEN_FILE", "/fixture/token"),
+                        ("TKE_ROLE_ARN", "qcs::cam::uin/123:roleName/test"),
+                    ]
+                    .map(|(k, v)| (k.into(), v.into())),
+                );
+            }
+            let signer = CosSigner::new(&CloudMeteringConfig::default(), io.context(envs));
+            let result = signer.credential().await;
+            assert_eq!(
+                result.is_err(),
+                row["error"].as_bool().unwrap_or_default(),
+                "{name}"
+            );
+            if let Ok(value) = result {
+                assert_eq!(value.secret_id, row["credential"], "{name}");
+                assert_eq!(
+                    value.security_token.unwrap_or_default(),
+                    row["security_token"],
+                    "{name}"
+                );
+            }
+            let requests = io.requests();
+            let expected = row["sts"].as_array().cloned().unwrap_or_default();
+            // The production Go Upload retries the whole operation on an
+            // authentication error. This test invokes one credential fetch;
+            // compare its source/request with every normalized Go attempt.
+            assert!(expected.windows(2).all(|pair| pair[0] == pair[1]));
+            assert_eq!(requests.len(), usize::from(!expected.is_empty()), "{name}");
+            for (actual, expected) in requests.iter().zip(expected.iter().take(1)) {
+                let mut body: serde_json::Value =
+                    serde_json::from_slice(actual.body()).unwrap_or_else(|e| unreachable!("{e}"));
+                let micros = body["RoleSessionName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .strip_prefix("tencentcloud-go-sdk-")
+                    .unwrap_or_default()
+                    .parse::<i64>()
+                    .unwrap_or_else(|e| unreachable!("{e}"));
+                assert!((Timestamp::now().as_second() - micros / 1_000_000).abs() <= 1);
+                body["RoleSessionName"] = "fixture-session".into();
+                assert_eq!(body, expected["body"], "{name}");
+                assert_eq!(actual.method().as_str(), expected["method"], "{name}");
+                assert_eq!(actual.uri().to_string(), expected["url"], "{name}");
+                assert_eq!(
+                    actual.headers()["x-tc-region"],
+                    expected["region"].as_str().unwrap_or_default()
+                );
+                assert_eq!(
+                    actual.headers()["authorization"],
+                    expected["authorization"].as_str().unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cvm_fallback_uses_its_actual_refresh_margin_despite_complete_tke_env() {
+        let now = Timestamp::now();
+        let io = Fixture::new(vec![(200,b"fixture-role".to_vec()),(200,serde_json::to_vec(&serde_json::json!({"Code":"Success","TmpSecretId":"cvm-id","TmpSecretKey":"cvm-secret","Token":"cvm-token","ExpiredTime":now.as_second()+7200})).unwrap_or_else(|e| unreachable!("{e}")))]);
+        let envs = [
+            ("TKE_REGION", "region"),
+            ("TKE_PROVIDER_ID", "provider"),
+            ("TKE_WEB_IDENTITY_TOKEN_FILE", "/missing"),
+            ("TKE_ROLE_ARN", "role"),
+        ]
+        .map(|(k, v)| (k.into(), v.into()))
+        .into_iter()
+        .collect();
+        let signer = CosSigner::new(&CloudMeteringConfig::default(), io.context(envs));
+        let value = signer
+            .credential()
+            .await
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(value.secret_id, "cvm-id");
+        let state = signer.state.lock().await;
+        let cached = state.as_ref().unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            cached.refresh_at,
+            value
+                .expires_in
+                .map(|expires| expires - Duration::from_secs(300))
+        );
+    }
+    #[tokio::test]
+    async fn constructed_tke_never_falls_through_after_token_file_disappears() {
+        let mut io = Fixture::new(vec![(403, Vec::new())]);
+        io.files
+            .insert("/fixture/token".into(), b"fake-token".to_vec());
+        io.files.insert(
+            "/fixture/credentials".into(),
+            b"[default]\nsecret_id=profile-id\nsecret_key=profile-secret\n".to_vec(),
+        );
+        let envs: HashMap<String, String> = [
+            ("TKE_REGION", "region"),
+            ("TKE_PROVIDER_ID", "provider"),
+            ("TKE_WEB_IDENTITY_TOKEN_FILE", "/fixture/token"),
+            ("TKE_ROLE_ARN", "role"),
+            ("TENCENTCLOUD_CREDENTIALS_FILE", "/fixture/credentials"),
+        ]
+        .map(|(key, value)| (key.into(), value.into()))
+        .into_iter()
+        .collect();
+        let provider = GoDefaultProvider::default();
+        assert!(
+            provider
+                .provide_credential(&io.context(envs.clone()))
+                .await
+                .is_err()
+        );
+        io.files.remove("/fixture/token");
+        assert!(
+            provider
+                .provide_credential(&io.context(envs))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            io.requests().len(),
+            1,
+            "file error stops before any new HTTP or profile fallback"
+        );
     }
 }
