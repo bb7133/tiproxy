@@ -24,14 +24,16 @@
 //! connection task is tracked, and shutdown stops accepting, lets in-flight
 //! requests finish within a grace period, then drops the rest.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::body::Body;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
@@ -42,6 +44,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
+use tower::Service;
 
 /// Reads the current `security.server-http-tls` server configuration for one
 /// accepted connection; `None` serves plaintext only. Reading per connection
@@ -188,25 +191,32 @@ async fn serve_io<I>(
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let started = Instant::now();
-    let last_activity = Arc::new(AtomicU64::new(0));
+    let activity = Arc::new(Activity {
+        last: AtomicU64::new(0),
+        active_requests: AtomicUsize::new(0),
+        started,
+    });
     let io = IdleIo {
         inner: TokioIo::new(io),
-        last_activity: Arc::clone(&last_activity),
-        started,
+        activity: Arc::clone(&activity),
+    };
+    let service = Tracked {
+        inner: router,
+        activity: Arc::clone(&activity),
     };
     let connection = builder
-        .serve_connection(io, TowerToHyperService::new(router))
+        .serve_connection(io, TowerToHyperService::new(service))
         .into_owned();
     let guarded = watcher.watch(connection);
     tokio::pin!(guarded);
+    // Go's IdleTimeout counts only the gap between requests: a request that
+    // is still being read or handled keeps the connection alive however long
+    // it takes, so the watchdog fires only with zero active requests.
     let watchdog = async {
         loop {
-            let last = Duration::from_millis(last_activity.load(Ordering::Acquire));
+            let last = Duration::from_millis(activity.last.load(Ordering::Acquire));
             tokio::time::sleep_until((started + last + idle_timeout).into()).await;
-            let idle = started
-                .elapsed()
-                .saturating_sub(Duration::from_millis(last_activity.load(Ordering::Acquire)));
-            if idle >= idle_timeout {
+            if activity.idle_for(idle_timeout) {
                 return;
             }
         }
@@ -217,17 +227,114 @@ async fn serve_io<I>(
     }
 }
 
+/// Per-connection liveness: last successful read/write/response instant and
+/// the number of requests currently being read or handled.
+struct Activity {
+    last: AtomicU64,
+    active_requests: AtomicUsize,
+    started: Instant,
+}
+
+impl Activity {
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last.store(elapsed, Ordering::Release);
+    }
+
+    /// True only when no request is in flight and nothing happened for
+    /// `timeout`.
+    fn idle_for(&self, timeout: Duration) -> bool {
+        if self.active_requests.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        let idle = self
+            .started
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.last.load(Ordering::Acquire)));
+        idle >= timeout
+    }
+}
+
+/// Counts a request as active from dispatch until its response body has
+/// been fully produced or dropped (a streaming body keeps the request
+/// active), then stamps the activity instant so the idle gap starts after
+/// the response.
+#[derive(Clone)]
+struct Tracked {
+    inner: Router,
+    activity: Arc<Activity>,
+}
+
+struct ActiveRequest(Arc<Activity>);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.active_requests.fetch_sub(1, Ordering::AcqRel);
+        self.0.touch();
+    }
+}
+
+impl Service<hyper::Request<hyper::body::Incoming>> for Tracked {
+    type Response = <Router as Service<hyper::Request<hyper::body::Incoming>>>::Response;
+    type Error = <Router as Service<hyper::Request<hyper::body::Incoming>>>::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        <Router as Service<hyper::Request<hyper::body::Incoming>>>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, request: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        self.activity.active_requests.fetch_add(1, Ordering::AcqRel);
+        let guard = ActiveRequest(Arc::clone(&self.activity));
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let response = future.await?;
+            Ok(response.map(|body| {
+                Body::new(GuardedBody {
+                    inner: body,
+                    _guard: guard,
+                })
+            }))
+        })
+    }
+}
+
+/// Response body that releases the active-request guard only when the body
+/// is exhausted or dropped.
+struct GuardedBody {
+    inner: Body,
+    _guard: ActiveRequest,
+}
+
+impl hyper::body::Body for GuardedBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// hyper I/O wrapper that stamps the last successful read or write.
 struct IdleIo<I> {
     inner: TokioIo<I>,
-    last_activity: Arc<AtomicU64>,
-    started: Instant,
+    activity: Arc<Activity>,
 }
 
 impl<I> IdleIo<I> {
     fn touch(&self) {
-        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_activity.store(elapsed, Ordering::Release);
+        self.activity.touch();
     }
 }
 
@@ -306,6 +413,7 @@ mod tests {
             },
             "# metrics\n".to_owned(),
             DataplaneStatus::default(),
+            Arc::new(crate::config::MemoryConfigAdmin::default()),
         );
         let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
         app.mark_ready();
@@ -503,6 +611,37 @@ mod tests {
             started.elapsed() >= Duration::from_millis(1500),
             "{:?}",
             started.elapsed()
+        );
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_flight_request_is_not_closed_as_idle() {
+        let (address, shutdown, task) = start(None).await;
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        // Headers of a PUT whose body arrives only after the idle timeout
+        // (2 s here): the request is active, so the watchdog must not fire.
+        stream
+            .write_all(
+                b"PUT /api/debug/health HTTP/1.1\r\nHost: x\r\nContent-Length: 16\r\nContent-Type: application/json\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        stream.write_all(b"{\"healthy\":true}").await.unwrap();
+        let mut buffer = vec![0_u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&buffer[..n]).starts_with("HTTP/1.1 200 OK"),
+            "{}",
+            String::from_utf8_lossy(&buffer[..n])
         );
         shutdown.send_replace(true);
         tokio::time::timeout(Duration::from_secs(5), task)

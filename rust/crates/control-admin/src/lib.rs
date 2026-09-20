@@ -22,11 +22,15 @@
 //! [`AdminHooks`]: the crate owns no dataplane, configuration or metrics
 //! state and never logs request or response payloads.
 
+pub mod config;
 pub mod health;
 pub mod router;
 pub mod serve;
 
-pub use health::{HealthInputs, HealthOverride, HealthResponse, HealthState};
+pub use config::{AdminFuture, CommitError, ConfigAdmin, MemoryConfigAdmin, SharedConfigAdmin};
+pub use health::{
+    HealthInputs, HealthOverride, HealthResponse, HealthState, go_json_document, go_json_string,
+};
 pub use router::{
     AdminApp, AdminHooks, DataplaneStatus, RateLimiter, full_router, plaintext_router,
 };

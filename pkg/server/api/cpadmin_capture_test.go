@@ -24,11 +24,12 @@ import (
 // cpadminStep is one entry of tests/controlplane/cpadmin/script.json, shared
 // with the Rust replay so both sides answer the identical request sequence.
 type cpadminStep struct {
-	Name   string `json:"name"`
-	Method string `json:"method"`
-	Path   string `json:"path"`
-	Body   string `json:"body"`
-	Action *struct {
+	Name    string            `json:"name"`
+	Method  string            `json:"method"`
+	Path    string            `json:"path"`
+	Body    string            `json:"body"`
+	Headers map[string]string `json:"headers"`
+	Action  *struct {
 		Ready           *bool `json:"ready"`
 		NamespacesReady *bool `json:"namespaces_ready"`
 		PreClose        bool  `json:"preclose"`
@@ -119,6 +120,9 @@ func TestCPAdminCapture(t *testing.T) {
 		}
 		req, err := http.NewRequest(step.Method, fmt.Sprintf("http://%s%s", addr, step.Path), body)
 		require.NoError(t, err, step.Name)
+		for key, value := range step.Headers {
+			req.Header.Set(key, value)
+		}
 		resp, err := client.Do(req)
 		require.NoError(t, err, step.Name)
 		payload, err := io.ReadAll(resp.Body)

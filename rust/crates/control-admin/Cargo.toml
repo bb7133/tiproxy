@@ -12,6 +12,7 @@ default = []
 
 [dependencies]
 axum.workspace = true
+control-config.workspace = true
 control-plane.workspace = true
 http.workspace = true
 http-body-util.workspace = true
@@ -25,7 +26,6 @@ tokio-rustls.workspace = true
 tower.workspace = true
 
 [dev-dependencies]
-control-config.workspace = true
 rcgen.workspace = true
 rustls-pki-types.workspace = true
 

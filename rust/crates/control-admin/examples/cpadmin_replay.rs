@@ -32,7 +32,8 @@ use axum::body::Body;
 use axum::extract::Request;
 use control_admin::router::oneshot;
 use control_admin::{
-    AdminApp, AdminHooks, DataplaneStatus, HealthInputs, HealthState, full_router,
+    AdminApp, AdminHooks, DataplaneStatus, HealthInputs, HealthState, MemoryConfigAdmin,
+    full_router,
 };
 use control_config::EffectiveConfig;
 use serde_json::{Value, json};
@@ -77,10 +78,17 @@ async fn main() {
         namespaces_ready: AtomicBool::new(true),
         dataplane: Mutex::new(None),
     });
-    let checksum = server_config.go_checksum();
+    // Go's per-process namespace store and SetTOMLConfig semantics, so the
+    // HTTP layer is compared on identical storage behaviour; the health
+    // checksum follows the store so a configuration PUT changes it like Go.
+    let config_admin = Arc::new(MemoryConfigAdmin::new(
+        server_config.clone(),
+        current_dir.clone(),
+    ));
     let hooks = {
         let health = Arc::clone(&shared);
         let status = Arc::clone(&shared);
+        let checksum_source = Arc::clone(&config_admin);
         AdminHooks {
             health_inputs: Arc::new(move || HealthInputs {
                 closing: health.closing.load(Ordering::SeqCst),
@@ -91,12 +99,13 @@ async fn main() {
                     .unwrap()
                     .as_ref()
                     .map_or(1, |status| status.applied_generation),
-                config_checksum: checksum,
+                config_checksum: checksum_source.go_checksum(),
             }),
             metrics_text: Arc::new(|| "# HELP tiproxy_server_connections x\n".to_owned()),
             dataplane_status: Arc::new(move || {
                 status.dataplane.lock().unwrap().clone().unwrap_or_default()
             }),
+            config: config_admin,
         }
     };
     let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
@@ -131,9 +140,15 @@ async fn main() {
                 });
             }
         }
-        let request = Request::builder()
+        let mut builder = Request::builder()
             .method(step["method"].as_str().unwrap_or("GET"))
-            .uri(step["path"].as_str().unwrap_or("/"))
+            .uri(step["path"].as_str().unwrap_or("/"));
+        if let Some(headers) = step.get("headers").and_then(Value::as_object) {
+            for (name, value) in headers {
+                builder = builder.header(name.as_str(), value.as_str().unwrap_or_default());
+            }
+        }
+        let request = builder
             .body(Body::from(
                 step["body"].as_str().unwrap_or_default().to_owned(),
             ))

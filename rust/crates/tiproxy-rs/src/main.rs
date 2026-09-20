@@ -878,10 +878,17 @@ async fn run(options: Options) -> Result<(), String> {
     // The management plane is supervised too: a listener failure must not
     // silently leave the process without its operator surface (Go only logs
     // that; the Rust owner fails closed and drains).
-    let mut admin_task = admin_task;
+    // The join handle is awaited at most once: the supervisor branch that
+    // observes its exit records that fact so the exit path does not poll a
+    // completed handle again.
+    let (mut admin_join, admin_shutdown) = match admin_task {
+        Some(AdminTask { task, shutdown }) => (Some(task), Some(shutdown)),
+        None => (None, None),
+    };
+    let mut admin_finished = false;
     let mut admin_exit = Box::pin(async {
-        match admin_task.as_mut() {
-            Some(admin) => (&mut admin.task).await,
+        match admin_join.as_mut() {
+            Some(task) => task.await,
             None => std::future::pending().await,
         }
     });
@@ -963,6 +970,7 @@ async fn run(options: Options) -> Result<(), String> {
             (control, sampler, serving_result, Ok(()))
         }
         admin = &mut admin_exit => {
+            admin_finished = true;
             let failure = match admin {
                 Ok(()) => "control admin server exited unexpectedly".to_owned(),
                 Err(_) => "control admin server panicked".to_owned(),
@@ -1031,8 +1039,17 @@ async fn run(options: Options) -> Result<(), String> {
         let _ = task.await;
     }
     drop(admin_exit);
-    if let Some(admin) = admin_task {
-        startup::Teardown::teardown(admin).await;
+    if let Some(shutdown) = admin_shutdown {
+        shutdown.send_replace(true);
+    }
+    if let Some(task) = admin_join.take()
+        && !admin_finished
+    {
+        startup::Teardown::teardown(AdminTask {
+            task,
+            shutdown: watch::channel(true).0,
+        })
+        .await;
     }
     metrics_exporter.shutdown();
     metrics_exporter.join().await;
@@ -1454,6 +1471,105 @@ async fn spawn_admin(
     Ok(Some((app, AdminTask { task, shutdown })))
 }
 
+/// `control_admin::ConfigAdmin` over the config owner: namespaces persist
+/// below `/config` through the owner-fenced handle, a configuration `PUT` is
+/// the owner's `SetTOMLConfig` equivalent, and a commit waits until the SQL
+/// serving side has composed the current config generation.
+struct OwnerConfigAdmin {
+    handle: ConfigModuleHandle,
+    serving: DataplaneServingHandle,
+}
+
+/// Longest a namespace commit waits for the serving side to catch up.
+const ADMIN_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl control_admin::ConfigAdmin for OwnerConfigAdmin {
+    fn list_namespaces(&self) -> Vec<NamespaceConfig> {
+        self.handle.source().current().namespaces().to_vec()
+    }
+
+    fn get_namespace(&self, name: &str) -> Option<NamespaceConfig> {
+        self.handle
+            .source()
+            .current()
+            .namespaces()
+            .iter()
+            .find(|namespace| namespace.namespace == name)
+            .cloned()
+    }
+
+    fn set_namespace(
+        &self,
+        value: NamespaceConfig,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_config::ConfigMutationError>> {
+        Box::pin(self.handle.set_namespace(value))
+    }
+
+    fn delete_namespace(
+        &self,
+        name: String,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_config::ConfigMutationError>> {
+        Box::pin(async move {
+            // Go's B-tree delete of an absent key is a no-op.
+            if self.get_namespace(&name).is_none() {
+                return Ok(());
+            }
+            self.handle.delete_namespace(name).await
+        })
+    }
+
+    fn commit_namespaces(
+        &self,
+        names: Vec<String>,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_admin::CommitError>> {
+        Box::pin(async move {
+            let snapshot = self.handle.source().current();
+            if names
+                .iter()
+                .any(|name| !snapshot.namespaces().iter().any(|ns| ns.namespace == *name))
+            {
+                return Err(control_admin::CommitError::Missing);
+            }
+            // Namespaces become serving through the config watch; "commit"
+            // is complete once serving has composed this generation.
+            let target = snapshot.generation();
+            let deadline = tokio::time::Instant::now() + ADMIN_COMMIT_TIMEOUT;
+            while self.serving.status().composition_generation < target {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(control_admin::CommitError::Reload);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(())
+        })
+    }
+
+    fn config_toml(&self) -> Option<String> {
+        self.handle
+            .source()
+            .current()
+            .effective()
+            .to_toml_string()
+            .ok()
+    }
+
+    fn config_json(&self) -> Option<String> {
+        self.handle
+            .source()
+            .current()
+            .effective()
+            .to_json_string()
+            .ok()
+    }
+
+    fn put_config_toml(
+        &self,
+        data: Vec<u8>,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_config::ConfigMutationError>> {
+        Box::pin(self.handle.apply_local_toml(data))
+    }
+}
+
 /// Process-state accessors behind the admin handlers. Every closure reads
 /// live state on each request; none retains a payload.
 fn admin_hooks(
@@ -1467,6 +1583,10 @@ fn admin_hooks(
     let health_serving = serving.clone();
     let status_serving = serving.clone();
     let registry = Arc::clone(registry);
+    let config_admin: control_admin::SharedConfigAdmin = Arc::new(OwnerConfigAdmin {
+        handle: config.clone(),
+        serving: serving.clone(),
+    });
     control_admin::AdminHooks {
         health_inputs: Arc::new(move || control_admin::HealthInputs {
             // Go `PreClose` sets closing when the drain begins.
@@ -1480,6 +1600,7 @@ fn admin_hooks(
         }),
         metrics_text: Arc::new(move || registry.render_prometheus_text()),
         dataplane_status: Arc::new(move || dataplane_status(&status_serving.status())),
+        config: config_admin,
     }
 }
 

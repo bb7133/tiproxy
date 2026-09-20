@@ -26,15 +26,17 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use http::header::CONTENT_TYPE;
 use http::{HeaderValue, StatusCode};
 use http_body_util::BodyExt;
 
-use crate::health::{HealthInputs, HealthState, go_json_string};
+use crate::config::{CommitError, SharedConfigAdmin, go_json_body};
+use crate::health::{HealthInputs, HealthState, go_json_document, go_json_string};
+use control_config::NamespaceConfig;
 
 /// Go `DefAPILimit`: requests per second admitted by the global limiter.
 pub const DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 100;
@@ -44,6 +46,8 @@ const RATE_LIMIT_SLACK: u32 = 10;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// gin's default JSON content type.
 const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+/// gin's `c.TOML` content type.
+const TOML_CONTENT_TYPE: &str = "application/toml; charset=utf-8";
 /// gin's `c.String` content type.
 const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 /// gin's built-in 404 body is written through `http.Error`-style plain text
@@ -104,6 +108,8 @@ pub struct AdminHooks {
     pub metrics_text: Arc<dyn Fn() -> String + Send + Sync>,
     /// Current dataplane generation status.
     pub dataplane_status: Arc<dyn Fn() -> DataplaneStatus + Send + Sync>,
+    /// Namespace and configuration storage.
+    pub config: SharedConfigAdmin,
 }
 
 /// uber-go/ratelimit "leaky bucket with slack", the algorithm behind the Go
@@ -239,18 +245,38 @@ pub fn full_router(app: Arc<AdminApp>) -> Router {
             "/api/dataplane/status",
             get(dataplane_status).head(not_found),
         )
+        // gin registers the group roots with a trailing slash and redirects
+        // the bare path; both forms are served directly here (declared).
         .route(
-            "/api/traffic/capture",
-            axum::routing::post(traffic_disabled("capture")),
+            "/api/admin/namespace/",
+            get(namespace_list).put(namespace_put_root).head(not_found),
         )
         .route(
-            "/api/traffic/replay",
-            axum::routing::post(traffic_disabled("replay")),
+            "/api/admin/namespace",
+            get(namespace_list).put(namespace_put_root).head(not_found),
         )
         .route(
-            "/api/traffic/cancel",
-            axum::routing::post(traffic_disabled("cancel")),
+            "/api/admin/namespace/commit",
+            post(namespace_commit).head(not_found),
         )
+        .route(
+            "/api/admin/namespace/{namespace}",
+            get(namespace_get)
+                .put(namespace_put)
+                .delete(namespace_delete)
+                .head(not_found),
+        )
+        .route(
+            "/api/admin/config/",
+            get(config_get).put(config_put).head(not_found),
+        )
+        .route(
+            "/api/admin/config",
+            get(config_get).put(config_put).head(not_found),
+        )
+        .route("/api/traffic/capture", post(traffic_disabled("capture")))
+        .route("/api/traffic/replay", post(traffic_disabled("replay")))
+        .route("/api/traffic/cancel", post(traffic_disabled("cancel")))
         .route("/api/traffic/show", get(traffic_disabled("show")));
     with_middleware(router, app)
 }
@@ -427,6 +453,185 @@ async fn dataplane_status(State(app): State<Arc<AdminApp>>) -> Response {
     json(StatusCode::OK, &(app.hooks.dataplane_status)().to_json())
 }
 
+// ---- namespaces (Go pkg/server/api/namespace.go) ----
+
+async fn namespace_list(State(app): State<Arc<AdminApp>>) -> Response {
+    let namespaces = app.hooks.config.list_namespaces();
+    if namespaces.is_empty() {
+        // Go answers the JSON empty string for an empty list.
+        return json(StatusCode::OK, "\"\"");
+    }
+    match serde_json::to_string(&namespaces) {
+        Ok(body) => json(StatusCode::OK, &go_json_document(&body)),
+        Err(_) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "\"failed to list namespaces\"",
+        ),
+    }
+}
+
+async fn namespace_get(State(app): State<Arc<AdminApp>>, Path(name): Path<String>) -> Response {
+    if name.is_empty() {
+        return json(StatusCode::BAD_REQUEST, "\"bad namespace parameter\"");
+    }
+    match app
+        .hooks
+        .config
+        .get_namespace(&name)
+        .and_then(|value| serde_json::to_string(&value).ok())
+    {
+        Some(body) => json(StatusCode::OK, &go_json_document(&body)),
+        // Go reports "not found" through the same 500 as a store failure.
+        None => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "\"can not get namespace\"",
+        ),
+    }
+}
+
+async fn namespace_put_root(State(app): State<Arc<AdminApp>>, request: Request) -> Response {
+    namespace_upsert(app, String::new(), request).await
+}
+
+async fn namespace_put(
+    State(app): State<Arc<AdminApp>>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    namespace_upsert(app, name, request).await
+}
+
+/// Go pre-fills the namespace name from the path, binds the body over it and
+/// stores the value under the path name; the Rust owner requires key and
+/// value names to agree, so the path name (or, on the root route, the body
+/// name) is the stored name.
+async fn namespace_upsert(app: Arc<AdminApp>, path_name: String, request: Request) -> Response {
+    let Some(body) = read_body(request).await else {
+        return json(StatusCode::BAD_REQUEST, "\"bad namespace json\"");
+    };
+    let mut value = match go_json_body(&body) {
+        Ok(None) => NamespaceConfig::default(),
+        Ok(Some(value)) => match serde_json::from_value::<NamespaceConfig>(value) {
+            Ok(value) => value,
+            Err(_) => return json(StatusCode::BAD_REQUEST, "\"bad namespace json\""),
+        },
+        Err(_) => return json(StatusCode::BAD_REQUEST, "\"bad namespace json\""),
+    };
+    if !path_name.is_empty() {
+        value.namespace = path_name;
+    }
+    match app.hooks.config.set_namespace(value).await {
+        Ok(()) => json(StatusCode::OK, "\"\""),
+        Err(_) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "\"can not update config\"",
+        ),
+    }
+}
+
+async fn namespace_delete(State(app): State<Arc<AdminApp>>, Path(name): Path<String>) -> Response {
+    if name.is_empty() {
+        return json(StatusCode::BAD_REQUEST, "\"bad namespace parameter\"");
+    }
+    match app.hooks.config.delete_namespace(name).await {
+        Ok(()) => json(StatusCode::OK, "\"\""),
+        Err(_) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "\"can not update config\"",
+        ),
+    }
+}
+
+async fn namespace_commit(State(app): State<Arc<AdminApp>>, request: Request) -> Response {
+    // gin `QueryArray("namespace")`: every repeated `namespace=` value.
+    let names = query_values(request.uri().query().unwrap_or_default(), "namespace");
+    match app.hooks.config.commit_namespaces(names).await {
+        Ok(()) => json(StatusCode::OK, "\"\""),
+        Err(CommitError::Missing) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "\"failed to get namespace\"",
+        ),
+        Err(CommitError::Reload) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "\"failed to reload namespaces\"",
+        ),
+    }
+}
+
+/// Repeated query values for `key`, decoded like Go's `url.ParseQuery`
+/// (`+` is a space, `%XX` is a byte); malformed escapes keep their bytes.
+fn query_values(query: &str, key: &str) -> Vec<String> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (url_decode(name) == key).then(|| url_decode(value))
+        })
+        .collect()
+}
+
+fn url_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => output.push(b' '),
+            b'%' if index + 2 < bytes.len() => {
+                if let Ok(byte) = u8::from_str_radix(&text[index + 1..index + 3], 16) {
+                    output.push(byte);
+                    index += 3;
+                    continue;
+                }
+                output.push(b'%');
+            }
+            byte => output.push(byte),
+        }
+        index += 1;
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+// ---- configuration (Go pkg/server/api/config.go) ----
+
+async fn config_get(State(app): State<Arc<AdminApp>>, request: Request) -> Response {
+    // TiDB Dashboard asks for JSON with `?format=json` (case-insensitive) or
+    // an exact `Accept: application/json`; tiproxyctl expects TOML.
+    let wants_json = query_values(request.uri().query().unwrap_or_default(), "format")
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case("json"))
+        || request
+            .headers()
+            .get(http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            == Some("application/json");
+    if wants_json {
+        match app.hooks.config.config_json() {
+            Some(body) => json(StatusCode::OK, &go_json_document(&body)),
+            None => json(StatusCode::INTERNAL_SERVER_ERROR, "\"can not get config\""),
+        }
+    } else {
+        match app.hooks.config.config_toml() {
+            Some(body) => with_content_type(StatusCode::OK, TOML_CONTENT_TYPE, body),
+            None => json(StatusCode::INTERNAL_SERVER_ERROR, "\"can not get config\""),
+        }
+    }
+}
+
+async fn config_put(State(app): State<Arc<AdminApp>>, request: Request) -> Response {
+    let Some(body) = read_body(request).await else {
+        return json(StatusCode::INTERNAL_SERVER_ERROR, "\"fail to read config\"");
+    };
+    match app.hooks.config.put_config_toml(body).await {
+        Ok(()) => json(StatusCode::OK, "\"\""),
+        Err(_) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "\"can not update config\"",
+        ),
+    }
+}
+
 fn traffic_disabled(
     verb: &'static str,
 ) -> impl Fn() -> std::future::Ready<Response> + Clone + Send + 'static {
@@ -464,13 +669,19 @@ fn with_content_type(status: StatusCode, content_type: &'static str, body: Strin
 }
 
 impl AdminHooks {
-    /// Hooks returning fixed values, for tests and the plaintext branch.
+    /// Hooks returning fixed values over `config`, for tests and the replay.
     #[must_use]
-    pub fn fixed(inputs: HealthInputs, metrics: String, status: DataplaneStatus) -> Self {
+    pub fn fixed(
+        inputs: HealthInputs,
+        metrics: String,
+        status: DataplaneStatus,
+        config: SharedConfigAdmin,
+    ) -> Self {
         Self {
             health_inputs: Arc::new(move || inputs.clone()),
             metrics_text: Arc::new(move || metrics.clone()),
             dataplane_status: Arc::new(move || status.clone()),
+            config,
         }
     }
 }
@@ -503,8 +714,22 @@ pub async fn oneshot(router: Router, request: Request<Body>) -> (StatusCode, Str
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::config::ConfigAdmin;
+
+    fn memory() -> Arc<crate::config::MemoryConfigAdmin> {
+        Arc::new(crate::config::MemoryConfigAdmin::new(
+            control_config::EffectiveConfig::default()
+                .validated(std::path::Path::new("/tmp"))
+                .unwrap(),
+            std::path::PathBuf::from("/tmp"),
+        ))
+    }
 
     fn app(ready: bool) -> Arc<AdminApp> {
+        app_with(ready, memory())
+    }
+
+    fn app_with(ready: bool, config: Arc<crate::config::MemoryConfigAdmin>) -> Arc<AdminApp> {
         let hooks = AdminHooks::fixed(
             HealthInputs {
                 closing: false,
@@ -523,6 +748,7 @@ mod tests {
                 detail: String::new(),
                 last_good_age_ms: 1500,
             },
+            config,
         );
         let app = Arc::new(AdminApp::new(hooks, HealthState::new()));
         if ready {
@@ -689,6 +915,200 @@ mod tests {
         ] {
             assert!(OverrideBody::decode(bad.as_bytes()).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn namespace_endpoints_match_go_bodies_and_codes() {
+        let store = memory();
+        let router = full_router(app_with(true, Arc::clone(&store)));
+        let (status, content_type, body) =
+            oneshot(router.clone(), request("GET", "/api/admin/namespace/", "")).await;
+        assert_eq!(
+            (status, content_type.as_str(), body.as_str()),
+            (StatusCode::OK, JSON_CONTENT_TYPE, "\"\"")
+        );
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request("GET", "/api/admin/namespace/dge", ""),
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "\"can not get namespace\""
+            )
+        );
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request(
+                "PUT",
+                "/api/admin/namespace/dge",
+                "{\"Frontend\":{\"user\":\"<u>\"},\"namespace\":\"ignored\"} trailing",
+            ),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "\"\""));
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request("GET", "/api/admin/namespace/dge", ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            "{\"namespace\":\"dge\",\"frontend\":{\"user\":\"\\u003cu\\u003e\",\"security\":{}},\"backend\":{\"instances\":[],\"security\":{}}}"
+        );
+        let (status, _, body) =
+            oneshot(router.clone(), request("GET", "/api/admin/namespace", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("[{\"namespace\":\"dge\""));
+        for bad in [
+            "{\"frontend\":5}",
+            "{\"frontend\":{\"user\":1,\"user\":\"x\"}}",
+            "not json",
+        ] {
+            let (status, _, body) = oneshot(
+                router.clone(),
+                request("PUT", "/api/admin/namespace/x", bad),
+            )
+            .await;
+            assert_eq!(
+                (status, body.as_str()),
+                (StatusCode::BAD_REQUEST, "\"bad namespace json\""),
+                "{bad}"
+            );
+        }
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request("PUT", "/api/admin/namespace/", "{\"namespace\":\"root\"}"),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "\"\""));
+        assert!(store.get_namespace("root").is_some());
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request(
+                "POST",
+                "/api/admin/namespace/commit?namespace=dge&namespace=missing",
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "\"failed to get namespace\""
+            )
+        );
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request(
+                "POST",
+                "/api/admin/namespace/commit?namespace=dge&namespace=root",
+                "",
+            ),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "\"\""));
+        assert_eq!(store.committed(), vec!["dge".to_owned(), "root".to_owned()]);
+        let (status, _, _) = oneshot(
+            router.clone(),
+            request("POST", "/api/admin/namespace/commit", ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(store.committed().is_empty());
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request("DELETE", "/api/admin/namespace/dge", ""),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "\"\""));
+        let (status, _, _) = oneshot(
+            router.clone(),
+            request("GET", "/api/admin/namespace/dge", ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (status, _, _) = oneshot(router, request("HEAD", "/api/admin/namespace/", "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn config_endpoints_render_toml_and_json_and_apply_partial_updates() {
+        let store = memory();
+        let router = full_router(app_with(true, Arc::clone(&store)));
+        let (status, content_type, body) =
+            oneshot(router.clone(), request("GET", "/api/admin/config/", "")).await;
+        assert_eq!(
+            (status, content_type.as_str()),
+            (StatusCode::OK, TOML_CONTENT_TYPE)
+        );
+        assert!(body.contains("max-connections = 0"), "{body}");
+        for (path, accept) in [
+            ("/api/admin/config/?format=JSON", None),
+            ("/api/admin/config", Some("application/json")),
+        ] {
+            let mut req = request("GET", path, "");
+            if let Some(accept) = accept {
+                req.headers_mut()
+                    .insert(http::header::ACCEPT, HeaderValue::from_static(accept));
+            }
+            let (status, content_type, body) = oneshot(router.clone(), req).await;
+            assert_eq!(
+                (status, content_type.as_str()),
+                (StatusCode::OK, JSON_CONTENT_TYPE)
+            );
+            assert!(body.contains("\"max-connections\":0"), "{body}");
+        }
+        let (status, _, body) = oneshot(
+            router.clone(),
+            request(
+                "PUT",
+                "/api/admin/config/",
+                "[proxy]\nmax-connections = 123\n",
+            ),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "\"\""));
+        let (_, _, body) = oneshot(
+            router.clone(),
+            request("GET", "/api/admin/config/?format=json", ""),
+        )
+        .await;
+        assert!(body.contains("\"max-connections\":123"), "{body}");
+        for bad in [
+            "[proxy]\naddr = \"0.0.0.0:6001\"\n",
+            "[proxy",
+            "[proxy]\nconn-buffer-size = 1\n",
+        ] {
+            let (status, _, body) =
+                oneshot(router.clone(), request("PUT", "/api/admin/config/", bad)).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "\"can not update config\""
+                ),
+                "{bad}"
+            );
+        }
+        let (_, _, body) =
+            oneshot(router, request("GET", "/api/admin/config/?format=json", "")).await;
+        assert!(body.contains("\"max-connections\":123"), "{body}");
+    }
+
+    #[test]
+    fn query_values_decode_like_go() {
+        assert_eq!(
+            query_values("namespace=a&namespace=b%2Bc&x=1&namespace=d+e", "namespace"),
+            vec!["a".to_owned(), "b+c".to_owned(), "d e".to_owned()]
+        );
+        assert!(query_values("", "namespace").is_empty());
+        assert_eq!(query_values("namespace", "namespace"), vec![String::new()]);
     }
 
     #[tokio::test]

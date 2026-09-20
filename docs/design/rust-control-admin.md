@@ -58,6 +58,47 @@ namespace-owner readiness is the config module's initial persistent view;
 generation while the metering consumer is unhealthy; that coupling moves to the
 native metering owner (#148) when it takes ownership.
 
+## Slice 2: namespaces and configuration
+
+`/api/admin/namespace/*` and `/api/admin/config/` keep the Go status codes and
+bodies (`namespace.go`, `config.go`) over the owner-fenced config module:
+
+| Endpoint | Behaviour |
+| --- | --- |
+| `GET /api/admin/namespace/` | name-sorted JSON array of namespaces; the JSON empty string `""` when there are none (Go's nil slice). |
+| `GET /api/admin/namespace/{name}` | the namespace, or `500 "can not get namespace"` (Go reports not-found through the same 500). |
+| `PUT /api/admin/namespace/{name}`, `PUT /api/admin/namespace/` | body decoded with `json.Decoder` semantics (one value, trailing bytes ignored, `null` = empty value, case-insensitive keys, null members unchanged, conflicting duplicate kinds `400 "bad namespace json"`); persisted below `/config/ns/<name>` through `ConfigModuleHandle::set_namespace`; `200 ""` or `500 "can not update config"`. |
+| `DELETE /api/admin/namespace/{name}` | `ConfigModuleHandle::delete_namespace`; deleting an absent name succeeds like Go's B-tree; `200 ""` / `500`. |
+| `POST /api/admin/namespace/commit?namespace=a&namespace=b` | every named namespace must exist (`500 "failed to get namespace"`); the call returns once the SQL serving side has composed the current config generation, within 5 s (`500 "failed to reload namespaces"` otherwise). Namespaces reach serving through the config watch, so the commit is a barrier, not a second write. |
+| `GET /api/admin/config/` | TOML (`application/toml; charset=utf-8`), or JSON with `?format=json` (case-insensitive) or an exact `Accept: application/json`. |
+| `PUT /api/admin/config/` | Go `SetTOMLConfig` through the config owner (`ConfigModuleHandle::apply_local_toml`): the partial document is merged onto this process's file base, validated as a whole, and published only when the encoded bytes change, so the health checksum moves exactly as Go's does. The mutation is instance-scoped like the Go API (labels and other per-instance fields stay per instance) and works without etcd; the persistent `/config` overlay still applies on top. |
+
+Namespaces therefore persist (etcd `/config/ns/*`, cluster-wide, owner-fenced)
+where Go keeps them in a per-process B-tree lost on restart. That is the
+intended upgrade of CP-CFG, not a compatibility slip, and it is why the
+handlers never touch a second store.
+
+### Declared divergences after slice 2
+
+- A `PUT /api/admin/config/` that changes a restart-required field (`workdir`,
+  `proxy.addr`, `proxy.advertise-addr`, `proxy.pd-addrs`, `proxy.port-range`,
+  `api.*`, `log.encoder`, `log.simple`, `ha.*`, `metering.*`,
+  `rust-dataplane.*`) is rejected as a whole with `500 "can not update
+  config"`, even when the document also carries dynamic changes; Go accepts it
+  in memory and the change silently has no effect until restart.
+- Namespace JSON renders an empty instance list as `[]`; Go renders a nil
+  slice as `null` and an empty slice as `[]` depending on what was PUT. The
+  differential compares those bodies by decoded value with nil ≡ empty.
+- Configuration TOML/JSON bodies are compared by decoded value: gin renders
+  TOML through go-toml v2 (single-quoted strings) and JSON with `omitempty`
+  tags; the Rust renderer emits every field with its value. Consumers that
+  decode (tiproxyctl, TiDB Dashboard) see the same configuration.
+- The namespace body name is overridden by the path name (Go stores the body
+  under the path name too, but keeps the body's `namespace` field inside the
+  value); on the root route the body name is the stored name.
+- The bare `/api/admin/namespace` and `/api/admin/config` paths are served
+  directly instead of gin's `301` to the slash form.
+
 ### Declared divergences after slice 1
 
 The differential script marks each of these and fails if one stops differing:
@@ -66,16 +107,18 @@ The differential script marks each of these and fails if one stops differing:
   directly; gin answers `301` to the slash form. Prometheus follows either.
 - `/api/debug/pprof/*` answers `404`. Go serves `net/http/pprof`. Profiling of
   the Rust process is a residual CP-ADMIN item, not closed by this slice.
-- `POST /api/debug/redirect` and `GET /api/backend/metrics` (slice 5),
-  `/api/admin/namespace/*` and `/api/admin/config/` (slice 2),
+- `POST /api/debug/redirect` and `GET /api/backend/metrics` (slice 5) and
   `/api/dataplane/drain*` (slice 3) answer `404` until their slice lands.
 
 ### Evidence
 
 `make controlplane-cpadmin-evidence` runs `tests/controlplane/cpadmin/run.sh`:
-the production gin engine (via the api package's capture test and its unit-test
-mocks) and the Rust router answer the same script; status, content type and
-body must match exactly outside the declared list, and the Go `ConfigManager`
+the production gin engine (via the api package's capture test, its unit-test
+mocks and the real `ConfigManager` for namespaces and configuration) and the
+Rust router over the in-memory `ConfigAdmin` (Go's per-process store
+semantics) answer the same script; status, content type and body must match
+exactly outside the declared list (configuration and nil-slice bodies by
+decoded value), and the Go `ConfigManager`
 checksum must equal the Rust `control-config` checksum for the default
 configuration, a partial update, the identical update again and a
 namespace-only mutation. The listener split, sniff timeout and graceful stop
@@ -84,12 +127,6 @@ certificate.
 
 ## Remaining slices
 
-- **Slice 2** — `/api/admin/namespace/*` and `/api/admin/config/` bound to the
-  owner-fenced `ConfigModuleHandle` (etcd `/config` persistence; Go keeps
-  namespaces in an in-process B-tree). A `PUT` is validated as a whole with
-  `check_reload_from`; a document touching restart-required fields is rejected
-  entirely, and `PersistenceDisabled`, `NotLeader` and `Unavailable` map to the
-  Go `500` answers.
 - **Slice 3** — local drain/status through a dispatch query, retiring
   `drain_command`/`drain_result` (proto, catalog and Go issuer in one change),
   M9 harness on the Rust port, and the first executable runner for

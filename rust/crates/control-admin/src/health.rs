@@ -121,8 +121,15 @@ fn natural_reason(inputs: &HealthInputs) -> Option<&'static str> {
 /// U+2028/U+2029 become `\u2028`/`\u2029`.
 #[must_use]
 pub fn go_json_string(value: &str) -> String {
-    serde_json::Value::String(value.to_owned())
-        .to_string()
+    go_json_document(&serde_json::Value::String(value.to_owned()).to_string())
+}
+
+/// Applies Go's HTML-safe escaping to an already serialized JSON document.
+/// The replaced characters can only occur inside JSON strings, so the
+/// document structure is untouched.
+#[must_use]
+pub fn go_json_document(serialized: &str) -> String {
+    serialized
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026")

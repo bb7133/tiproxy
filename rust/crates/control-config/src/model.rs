@@ -878,6 +878,26 @@ impl EffectiveConfig {
         Ok(normalized)
     }
 
+    /// Renders the configuration as a TOML document for
+    /// `GET /api/admin/config/`: the same document shape `SetTOMLConfig`
+    /// accepts. Bytes follow this crate's encoder, not gin's.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoder error for an unrepresentable value.
+    pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string(self)
+    }
+
+    /// Renders the configuration as JSON for `GET /api/admin/config/?format=json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoder error for an unrepresentable value.
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
     /// CRC32-IEEE over the Go-encoded TOML, the value Go's `ConfigManager`
     /// reports as the config checksum. CP-ADMIN serves it from `/api/debug/health`.
     #[must_use]

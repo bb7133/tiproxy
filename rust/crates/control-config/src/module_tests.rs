@@ -20,7 +20,7 @@ use super::{
     ConfigModule, ConfigModuleOptions, NAMESPACE_CONFIG_PREFIX, NamespaceUpdate, PROXY_CONFIG_KEY,
     RawCandidate, join_reader, persistent_candidate_rejection_log,
 };
-use crate::{ConfigNamespaceSource, NamespaceConfig, StoreError};
+use crate::{ConfigMutationError, ConfigNamespaceSource, NamespaceConfig, StoreError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -170,4 +170,67 @@ fn malformed_namespace_rejection_log_names_the_exact_key_without_value() {
     assert_eq!(parsed["key"], "/config/ns/rejected");
     assert_eq!(parsed["error_class"], "json_decode_failed");
     assert!(!log.contains("not-json"), "persisted values stay redacted");
+}
+
+#[tokio::test]
+async fn local_toml_mutation_follows_set_toml_config_semantics() -> TestResult {
+    let (mut module, handle) = ConfigModule::load(ConfigModuleOptions {
+        config_file: None,
+        advertise_addr: None,
+        current_dir: PathBuf::from("/tmp"),
+        etcd: None,
+        election: None,
+        persistence_factory: None,
+    })?;
+    let before = handle.source().current();
+    // A dynamic change publishes a new generation with a new checksum.
+    module.apply_local_toml(b"[proxy]\nmax-connections = 123\n")?;
+    let after = handle.source().current();
+    assert!(after.generation() > before.generation());
+    assert_ne!(after.config_checksum(), before.config_checksum());
+    // The identical document is accepted without publishing (Go compares the
+    // re-encoded bytes before notifying listeners).
+    module.apply_local_toml(b"[proxy]\nmax-connections = 123\n")?;
+    assert_eq!(handle.source().current().generation(), after.generation());
+    // Omitted fields keep their values: a later partial document does not
+    // reset max-connections.
+    module.apply_local_toml(b"[log]\nlevel = \"warn\"\n")?;
+    let merged = handle.source().current();
+    assert!(merged.generation() > after.generation());
+    assert_eq!(
+        merged.effective().go_checksum(),
+        crate::EffectiveConfig::default()
+            .patched_with_toml(
+                b"[proxy]\nmax-connections = 123\n[log]\nlevel = \"warn\"\n",
+                &PathBuf::from("/tmp")
+            )?
+            .go_checksum()
+    );
+    // A restart-required field rejects the whole document, even when it also
+    // carries a dynamic change, and publishes nothing.
+    assert!(matches!(
+        module.apply_local_toml(b"[proxy]\naddr = \"0.0.0.0:6001\"\nmax-connections = 5\n"),
+        Err(ConfigMutationError::RestartRequired)
+    ));
+    assert_eq!(handle.source().current().generation(), merged.generation());
+    assert_eq!(
+        handle.source().current().config_checksum(),
+        merged.config_checksum()
+    );
+    // Malformed or invalid documents are rejected without publishing.
+    assert!(matches!(
+        module.apply_local_toml(b"[proxy"),
+        Err(ConfigMutationError::Invalid)
+    ));
+    assert!(matches!(
+        module.apply_local_toml(b"[proxy]\nconn-buffer-size = 1\n"),
+        Err(ConfigMutationError::Invalid)
+    ));
+    assert_eq!(handle.source().current().generation(), merged.generation());
+    // Persistence is still required for the etcd-backed mutations.
+    assert!(matches!(
+        handle.set_namespace(NamespaceConfig::default()).await,
+        Err(ConfigMutationError::PersistenceDisabled)
+    ));
+    Ok(())
 }

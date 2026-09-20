@@ -11,6 +11,45 @@ import json
 import sys
 
 
+ZERO = (None, "", 0, 0.0, False, [], {})
+
+
+def zeroish(value):
+    """Go omitempty view: zero scalars, and containers whose members are all
+    zero (an omitted TOML table versus a rendered table of zero values)."""
+    if isinstance(value, dict):
+        return all(zeroish(member) for member in value.values())
+    if isinstance(value, list):
+        return len(value) == 0
+    return value in ZERO
+
+
+def semantic_equal(left, right) -> bool:
+    """Decoded-value equality with Go omitempty/nil rules: a key present on one
+    side only must be zero-valued there, null and [] (nil vs empty slice) are
+    the same, and nested values recurse."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        for key in set(left) | set(right):
+            if key in left and key in right:
+                if not semantic_equal(left[key], right[key]):
+                    return False
+            elif not zeroish(left.get(key, right.get(key))):
+                return False
+        return True
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(semantic_equal(a, b) for a, b in zip(left, right))
+    if zeroish(left) and zeroish(right):
+        return True
+    return left == right
+
+
+def decode(kind: str, text: str):
+    if kind == "json_semantic":
+        return json.loads(text)
+    import tomllib
+    return tomllib.loads(text)
+
+
 def main() -> int:
     script_path, go_path, rust_path = sys.argv[1:4]
     steps = json.load(open(script_path))
@@ -27,11 +66,19 @@ def main() -> int:
         if name not in go_rows or name not in rust_rows:
             failures.append(f"{name}: missing observation (go={name in go_rows}, rust={name in rust_rows})")
             continue
-        diffs = [
-            f"{field}: go={go_rows[name][field]!r} rust={rust_rows[name][field]!r}"
-            for field in fields
-            if go_rows[name][field] != rust_rows[name][field]
-        ]
+        diffs = []
+        for field in fields:
+            if field in ("json_semantic", "toml_semantic"):
+                try:
+                    equal = semantic_equal(decode(field, go_rows[name]["body"]), decode(field, rust_rows[name]["body"]))
+                except Exception as error:  # noqa: BLE001 - report as a diff
+                    equal = False
+                    diffs.append(f"{field}: undecodable body ({error})")
+                    continue
+                if not equal:
+                    diffs.append(f"{field}: go={go_rows[name]['body']!r} rust={rust_rows[name]['body']!r}")
+            elif go_rows[name][field] != rust_rows[name][field]:
+                diffs.append(f"{field}: go={go_rows[name][field]!r} rust={rust_rows[name][field]!r}")
         if not diffs:
             compared += 1
             if step.get("declared"):
