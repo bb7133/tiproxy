@@ -283,6 +283,13 @@ def causal(effects):
     return per_session
 
 
+# The accepted T3 contract records a bounded cooldown after the Rust ForceClose
+# FIFO refuses an issuance; the Go worker still retries on the next due tick.
+# The differential declares that divergence explicitly on the force_close_due
+# model path only; explicit effect expectations stay an exact comparison.
+RUST_FORCE_CLOSE_REFUSAL_COOLDOWN_NANOS = 3_000_000_000
+
+
 class PublicConnections:
     """One engine's public reservations and connections, never a getter/score tape.
 
@@ -290,7 +297,9 @@ class PublicConnections:
     reservation immediately, while the public assignment moves only on success.
     This separation matters for new selections during delayed callbacks.
     """
-    def __init__(self, config):
+    def __init__(self, config, engine=None):
+        self.engine = engine
+        self.force_close_refused_at = {}
         self.pending, self.assigned, self.redirects = {}, {}, {}
         self.closing, self.ordinals = set(), Counter()
         self.created, self.last_redirect, self.redirect_failed = {}, {}, {}
@@ -364,10 +373,14 @@ class PublicConnections:
         In-flight redirects retain their public source assignment until success.
         """
         refused = {self.logical_to_actual.get(sid, sid) for sid in event.get("refuse", [])}
+        now = event.get("at_nanos", 0)
         effects = []
         for sid, backend in self.assigned.items():
             if backend not in due or sid in self.closing:
                 continue
+            if self.engine == "rust" and sid in self.force_close_refused_at \
+                    and now < self.force_close_refused_at[sid] + RUST_FORCE_CLOSE_REFUSAL_COOLDOWN_NANOS:
+                continue  # T3: a refused close is not re-issued before the cooldown elapses
             scripted = sid in refused
             if not scripted and refuse_next:
                 scripted, refuse_next = True, refuse_next - 1
@@ -811,6 +824,8 @@ class PublicConnections:
                     "EFFECT_LEDGER", "non-monotonic effect operation")
             if effect["kind"] == "force_close" and effect["accepted"]:
                 self.closing.add(effect["session"])
+            elif effect["kind"] == "force_close":
+                self.force_close_refused_at[effect["session"]] = event.get("at_nanos", 0)
             if effect["kind"] == "redirect":
                 self.last_redirect[effect["session"]] = event.get("at_nanos", 0)
                 self.redirect_failed[effect["session"]] = not effect["accepted"]
@@ -835,7 +850,7 @@ def observe(trace, rows, engine):
     pending, ledger, previous, operations, settled = {}, {}, {}, {}, set()
     settled_by = {}
     excluded = {}
-    connections = PublicConnections(trace["config"])
+    connections = PublicConnections(trace["config"], engine=engine)
     for index, (event,row) in enumerate(zip(events,rows)):
         op, expect = event["op"], event["expect"]
         now = event.get("at_nanos", 0)

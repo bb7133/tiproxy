@@ -102,6 +102,46 @@ class RelativeCloseTests(unittest.TestCase):
         with self.assertRaisesRegex(derive.Refuse, "force_close effects"):
             derive.derive(trace, rows, None)
 
+    def test_rust_refusal_cooldown_is_declared_for_exactly_one_engine(self):
+        # T3 contract: after the Rust ForceClose FIFO refuses an issuance the
+        # session is not re-issued until 3s elapse; Go still retries next tick.
+        trace, go_rows = example(A)
+        rust_rows = copy.deepcopy(go_rows)
+        rust_rows[7]["effects"] = []
+        rust_rows[8]["effects"] = []
+        runner.observe(trace, go_rows, "go")
+        runner.observe(trace, rust_rows, "rust")
+        with self.assertRaisesRegex(runner.Difference, "EFFECTS: rust event 7"):
+            runner.observe(trace, go_rows, "rust")   # a Rust retry inside the cooldown
+        with self.assertRaisesRegex(runner.Difference, "EFFECTS: go event 7"):
+            runner.observe(trace, rust_rows, "go")   # a Go engine that stopped retrying
+        # Explicit effect expectations are not transformed: a Go recording's
+        # later operation numbers cannot be rewritten into Rust history.
+        explicit = copy.deepcopy(trace)
+        explicit["events"][7]["expect"] = {"outcome": "ok", "effects": [effect(A, 2, True)]}
+        explicit["events"][8]["expect"] = {"outcome": "ok", "effects": []}
+        runner.observe(explicit, go_rows, "go")
+        with self.assertRaisesRegex(runner.Difference, "EFFECTS: rust event 7"):
+            runner.observe(explicit, rust_rows, "rust")
+
+    def test_rust_refusal_cooldown_ends_exactly_at_three_seconds(self):
+        trace, rows = example(A)
+        boundary = copy.deepcopy(trace)
+        boundary["events"][7]["at_nanos"] = 1_000_000_000 + 3_000_000_000 - 1
+        boundary["events"][8]["at_nanos"] = 1_000_000_000 + 3_000_000_000
+        rust_rows = copy.deepcopy(rows)
+        rust_rows[7]["effects"] = []
+        rust_rows[8]["effects"] = [effect(A, 2, True)]
+        runner.observe(boundary, rust_rows, "rust")
+        early = copy.deepcopy(rust_rows)
+        early[7]["effects"], early[8]["effects"] = [effect(A, 2, True)], []
+        with self.assertRaisesRegex(runner.Difference, "EFFECTS: rust event 7"):
+            runner.observe(boundary, early, "rust")  # one nanosecond too early
+        late = copy.deepcopy(rust_rows)
+        late[8]["effects"] = []
+        with self.assertRaisesRegex(runner.Difference, "EFFECTS: rust event 8"):
+            runner.observe(boundary, late, "rust")   # eligible again at exactly 3s
+
     def test_accepted_close_survives_clear_and_reentry(self):
         live = runner.PublicConnections({"policy":"connection","selection":"random"})
         live.apply({"op":"rehydrate","session":"s"},

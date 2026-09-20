@@ -254,3 +254,16 @@ retry fixture also exercises busy-backend exclusion, full-cycle exhaustion befor
 preference, rate-cutoff equality, ratio updates and closing retained sessions.
 Direct regressions and derivation counterexamples cover these rules; recorded corpus
 qualification and the eight common comparator faults remain separate gates.
+
+## Declared engine difference: ForceClose refusal cooldown
+
+The accepted T3 contract makes the Rust ForceClose FIFO record a 3 second
+cooldown after it refuses an issuance (`control-router` ledger,
+`Duration::from_secs(3)`), so a refused close is not re-issued on the next due
+tick; the Go worker still retries immediately. `run.py` declares that
+difference for exactly one engine (`PublicConnections(engine="rust")`) on the
+`force_close_due` model path only: inside the cooldown a Rust retry and a Go
+non-retry are both reported as `EFFECTS` differences, and the session becomes
+eligible again at exactly 3 seconds. Explicit `effects` expectations remain an
+exact comparison; a Go recording's later operation numbers are not rewritten
+into Rust history. The oracle is not relaxed for either engine.
