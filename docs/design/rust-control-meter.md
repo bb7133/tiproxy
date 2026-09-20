@@ -580,7 +580,7 @@ challenge flow, and each replay preserves the body.
 
 Managed identity caches are keyed by resource. Nonempty CAE claims bypass the
 cached token and replace it on success; claims are not sent to the metadata
-endpoint, matching MSAL. Developer credentials cache tokens in the outer bearer
+endpoint, matching MSAL. Developer and OAuth credentials cache tokens in the outer bearer
 policy, which expires the cache on 401 even without a usable challenge. Refresh
 uses the five-minute window and 30-second retry backoff; a failed eager refresh
 retains the still-valid token. PowerShell has no inner token cache and accepts
@@ -603,18 +603,44 @@ Regenerate with:
 bash rust/crates/control-meter/testdata/azure-bearer-go.sh
 ```
 
-These increments qualify managed and developer credential challenges. The pinned
-Rust identity SDK has no claims option: environment/workload CAE forwarding and
-the password adapter's changed-resource support still require source adapters
-and currently fail without replaying an unchallenged cached token.
-The added regex and permissive base64 decoding dependencies reuse package
-versions already in Cargo.lock; only control-meter dependency edges are added.
+Environment secret, certificate and workload credentials now wrap fresh maintained
+SDK credential objects for actual OAuth fetches. Their scope-keyed cache reuses
+unchallenged tokens, bypasses cache for nonempty claims, and replaces an entry
+only after success. The username/password adapter follows the same cache and
+changed-resource behavior. OAuth requests append the pinned Go OIDC scopes and
+merge CP1 capabilities into claims. Invalid JSON or conflicting capability fields
+fail before a token request. The outer bearer policy handles the five-minute
+refresh window and 30-second fallback backoff for these sources too; managed
+identity retains its own `refresh_in` timing.
 
-Full default-credential/endpoint edge parity remains in progress. Azure environment/
-workload CAE forwarding, password scope handling and unusual RFC1123 named-zone
-metadata dates remain open. The declared general HTTP date,
-endpoint and platform transport edges remain open. Export failure retains the
-pending window for the next metering attempt.
+The OAuth fixture uses the exact production Go dependency graph and four real
+DefaultAzureCredential sources: secret, workload file, password and certificate.
+Each performs 13 credential steps plus four real Blob client operations. The
+native replay compares all 52 token results/errors, 28 normalized token POSTs,
+and authorization sequences/body preservation across 16 HEAD/PUT operations.
+Certificate assertions are signature-verified on both sides (Go PS256 and the
+maintained Rust SDK's RS256); randomized JWT bytes and discovery requests are
+not claimed equal. The Go constructor uses only a public custom transport:
+canonical authority requests are redirected to local TLS, and every other host
+is rejected before network access. Instance discovery remains enabled and the
+fixture serves its metadata. No SDK source or token-cache internals are patched.
+Regenerate with:
+
+```sh
+bash rust/crates/control-meter/testdata/azure-oauth-go.sh
+```
+
+These fixtures qualify token request fields, scope/claims/cache and object
+challenge behavior for the isolated managed authority. Native SDK instance and
+OpenID discovery, authority alias validation, federated password user realms,
+OAuth retry/error classification and refresh-token reuse are not covered by this
+increment and remain open. The regex and permissive base64 dependencies reuse
+package versions already in Cargo.lock; this OAuth increment adds no dependency.
+
+Full default-credential/endpoint edge parity remains in progress, including
+unusual RFC1123 named-zone metadata dates and the declared general HTTP date,
+endpoint and platform transport edges. Export failure retains the pending
+window for the next metering attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would

@@ -69,9 +69,9 @@ impl Bearer {
     ) -> Result<String, Error> {
         state.refreshed = Some(tokio::time::Instant::now());
         match self.source.access_token_for(&state.scope, claims).await {
-            Ok((value, developer)) => {
+            Ok((value, cache_in_bearer)) => {
                 let token = value.token.secret().to_owned();
-                state.cached = developer.then_some(value);
+                state.cached = cache_in_bearer.then_some(value);
                 Ok(token)
             }
             Err(error) => {

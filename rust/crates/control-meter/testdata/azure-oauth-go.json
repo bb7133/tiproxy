@@ -1,0 +1,1041 @@
+[
+  {
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://other.invalid/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"synthetic\":\"yes\"}}",
+        "error": false,
+        "token": "fake-3"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-3"
+      },
+      {
+        "scope": "https://other.invalid/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{}",
+        "error": false,
+        "token": "fake-4"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"xms_cc\":{}}}",
+        "error": false,
+        "token": "fake-5"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"xms_cc\":{\"values\":[\"CP2\"]}}}",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":7}",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "[]",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "invalid",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"id_token\":{\"synthetic\":true}}",
+        "error": false,
+        "token": "fake-6"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://other.invalid/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "synthetic": "yes",
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          },
+          "id_token": {
+            "synthetic": true
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://other.invalid/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "synthetic": "yes",
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": [
+      {
+        "method": "HEAD",
+        "challenge": "",
+        "tokens": [
+          "Bearer fake-6"
+        ],
+        "error": false
+      },
+      {
+        "method": "PUT",
+        "challenge": "Bearer resource_id=\"https://other.invalid\"",
+        "tokens": [
+          "Bearer fake-6",
+          "Bearer fake-2"
+        ],
+        "error": false
+      },
+      {
+        "method": "PUT",
+        "challenge": "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\"",
+        "tokens": [
+          "Bearer fake-2",
+          "Bearer fake-7"
+        ],
+        "error": false
+      },
+      {
+        "method": "HEAD",
+        "challenge": "Bearer resource_id=\"https://storage.azure.com\"",
+        "tokens": [
+          "Bearer fake-7",
+          "Bearer fake-6"
+        ],
+        "error": false
+      }
+    ]
+  },
+  {
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://other.invalid/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"synthetic\":\"yes\"}}",
+        "error": false,
+        "token": "fake-3"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-3"
+      },
+      {
+        "scope": "https://other.invalid/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{}",
+        "error": false,
+        "token": "fake-4"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"xms_cc\":{}}}",
+        "error": false,
+        "token": "fake-5"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"xms_cc\":{\"values\":[\"CP2\"]}}}",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":7}",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "[]",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "invalid",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"id_token\":{\"synthetic\":true}}",
+        "error": false,
+        "token": "fake-6"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://other.invalid/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "synthetic": "yes",
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          },
+          "id_token": {
+            "synthetic": true
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://other.invalid/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "synthetic": "yes",
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": [
+      {
+        "method": "HEAD",
+        "challenge": "",
+        "tokens": [
+          "Bearer fake-6"
+        ],
+        "error": false
+      },
+      {
+        "method": "PUT",
+        "challenge": "Bearer resource_id=\"https://other.invalid\"",
+        "tokens": [
+          "Bearer fake-6",
+          "Bearer fake-2"
+        ],
+        "error": false
+      },
+      {
+        "method": "PUT",
+        "challenge": "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\"",
+        "tokens": [
+          "Bearer fake-2",
+          "Bearer fake-7"
+        ],
+        "error": false
+      },
+      {
+        "method": "HEAD",
+        "challenge": "Bearer resource_id=\"https://storage.azure.com\"",
+        "tokens": [
+          "Bearer fake-7",
+          "Bearer fake-6"
+        ],
+        "error": false
+      }
+    ]
+  },
+  {
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://other.invalid/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"synthetic\":\"yes\"}}",
+        "error": false,
+        "token": "fake-3"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-3"
+      },
+      {
+        "scope": "https://other.invalid/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{}",
+        "error": false,
+        "token": "fake-4"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"xms_cc\":{}}}",
+        "error": false,
+        "token": "fake-5"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"xms_cc\":{\"values\":[\"CP2\"]}}}",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":7}",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "[]",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "invalid",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"id_token\":{\"synthetic\":true}}",
+        "error": false,
+        "token": "fake-6"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://other.invalid/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "synthetic": "yes",
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          },
+          "id_token": {
+            "synthetic": true
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://other.invalid/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "synthetic": "yes",
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance",
+      "userrealm",
+      "userrealm",
+      "userrealm",
+      "userrealm",
+      "userrealm",
+      "userrealm",
+      "userrealm",
+      "userrealm",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": [
+      {
+        "method": "HEAD",
+        "challenge": "",
+        "tokens": [
+          "Bearer fake-6"
+        ],
+        "error": false
+      },
+      {
+        "method": "PUT",
+        "challenge": "Bearer resource_id=\"https://other.invalid\"",
+        "tokens": [
+          "Bearer fake-6",
+          "Bearer fake-2"
+        ],
+        "error": false
+      },
+      {
+        "method": "PUT",
+        "challenge": "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\"",
+        "tokens": [
+          "Bearer fake-2",
+          "Bearer fake-7"
+        ],
+        "error": false
+      },
+      {
+        "method": "HEAD",
+        "challenge": "Bearer resource_id=\"https://storage.azure.com\"",
+        "tokens": [
+          "Bearer fake-7",
+          "Bearer fake-6"
+        ],
+        "error": false
+      }
+    ]
+  },
+  {
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://other.invalid/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"synthetic\":\"yes\"}}",
+        "error": false,
+        "token": "fake-3"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-3"
+      },
+      {
+        "scope": "https://other.invalid/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{}",
+        "error": false,
+        "token": "fake-4"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"xms_cc\":{}}}",
+        "error": false,
+        "token": "fake-5"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":{\"xms_cc\":{\"values\":[\"CP2\"]}}}",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"access_token\":7}",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "[]",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "invalid",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "{\"id_token\":{\"synthetic\":true}}",
+        "error": false,
+        "token": "fake-6"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://other.invalid/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "synthetic": "yes",
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          },
+          "id_token": {
+            "synthetic": true
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://other.invalid/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "synthetic": "yes",
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": [
+      {
+        "method": "HEAD",
+        "challenge": "",
+        "tokens": [
+          "Bearer fake-6"
+        ],
+        "error": false
+      },
+      {
+        "method": "PUT",
+        "challenge": "Bearer resource_id=\"https://other.invalid\"",
+        "tokens": [
+          "Bearer fake-6",
+          "Bearer fake-2"
+        ],
+        "error": false
+      },
+      {
+        "method": "PUT",
+        "challenge": "Bearer error=\"insufficient_claims\", claims=\"eyJhY2Nlc3NfdG9rZW4iOnsic3ludGhldGljIjoieWVzIn19\"",
+        "tokens": [
+          "Bearer fake-2",
+          "Bearer fake-7"
+        ],
+        "error": false
+      },
+      {
+        "method": "HEAD",
+        "challenge": "Bearer resource_id=\"https://storage.azure.com\"",
+        "tokens": [
+          "Bearer fake-7",
+          "Bearer fake-6"
+        ],
+        "error": false
+      }
+    ]
+  }
+]
