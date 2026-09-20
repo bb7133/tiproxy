@@ -136,6 +136,12 @@ impl CloudStore {
                 .await
                 .map_err(|_| Error::Export("S3 object request failed"));
         }
+        if let CloudSigner::Cos(signer) = &self.signer {
+            return signer
+                .request(method, url, body.into())
+                .await
+                .map_err(|_| Error::Export("COS object request failed"));
+        }
         let mut parts = Request::builder()
             .method(method)
             .uri(url.as_str())
@@ -151,7 +157,7 @@ impl CloudStore {
         match &self.signer {
             CloudSigner::S3(_) => return Err(Error::Export("invalid S3 signer dispatch")),
             CloudSigner::Oss(signer) => signer.sign(&mut parts).await,
-            CloudSigner::Cos(signer) => signer.sign(&mut parts).await,
+            CloudSigner::Cos(_) => return Err(Error::Export("invalid COS signer dispatch")),
             CloudSigner::Azure(_) => return Err(Error::Export("invalid Azure signer dispatch")),
         }
         .map_err(|_| Error::Export("cloud credential or signing failure"))?;
@@ -393,11 +399,19 @@ mod tests {
                 .read_exact(&mut body)
                 .await
                 .unwrap_or_else(|e| unreachable!("{e}"));
+            let crc = if head.starts_with("PUT ") {
+                format!(
+                    "x-cos-hash-crc64ecma: {}\r\n",
+                    crate::cloud_crc64::checksum(&body)
+                )
+            } else {
+                String::new()
+            };
             requests.push((head, body));
             stream
                 .write_all(
                     format!(
-                        "HTTP/1.1 {status} Result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 {status} Result\r\n{crc}Content-Length: 0\r\nConnection: close\r\n\r\n"
                     )
                     .as_bytes(),
                 )
@@ -492,22 +506,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_retries_each_operation_without_repeating_the_existence_check() {
-        let (store, server) = fixture("s3", vec![503, 404, 503, 200]).await;
-        store
-            .put_new("object", vec![1, 2, 3])
-            .await
-            .unwrap_or_else(|e| unreachable!("{e}"));
-        let requests = server.await.unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(requests.len(), 4);
-        for (index, (head, body)) in requests.iter().enumerate() {
-            let method = if index < 2 { "HEAD" } else { "PUT" };
-            assert!(head.starts_with(&format!("{method} /prefix%20space/%25text/object HTTP/1.1")));
-            assert_eq!(
-                body.as_slice(),
-                if index < 2 { &[] } else { &[1, 2, 3][..] }
-            );
-            assert!(head.contains("authorization: AWS4-HMAC-SHA256"));
+    async fn object_retries_do_not_repeat_the_existence_check() {
+        for provider in ["s3", "cos"] {
+            let (store, server) = fixture(provider, vec![503, 404, 503, 200]).await;
+            store
+                .put_new("object", vec![1, 2, 3])
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}"));
+            let requests = server.await.unwrap_or_else(|e| unreachable!("{e}"));
+            assert_eq!(requests.len(), 4);
+            for (index, (head, body)) in requests.iter().enumerate() {
+                let method = if index < 2 { "HEAD" } else { "PUT" };
+                assert!(
+                    head.starts_with(&format!("{method} /prefix%20space/%25text/object HTTP/1.1"))
+                );
+                assert_eq!(
+                    body.as_slice(),
+                    if index < 2 { &[] } else { &[1, 2, 3][..] }
+                );
+                assert!(head.contains("authorization:"));
+                if provider == "cos" {
+                    assert_eq!(head.contains("x-cos-sdk-retry: true"), index % 2 == 1);
+                }
+            }
         }
     }
 

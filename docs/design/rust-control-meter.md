@@ -78,6 +78,29 @@ path/payload on retry. Regenerate the Go observations with:
 rust/crates/control-meter/testdata/aws-s3-retry-go.sh
 ```
 
+The S3 retry probe injects a CustomConfig with checksum calculation unset;
+production LoadDefaultConfig enables WhenSupported. S3's default HTTPS PUT then
+uses aws-chunked encoding with a CRC32 trailer. That automatic request-checksum
+encoding remains a declared follow-up; the retry/clock observations do not
+claim complete request-header equivalence.
+
+COS HEAD and metering's seekable PUT payloads use the SDK's three immediate
+attempts: all HTTP statuses at or above 500 and transport/signing failures may
+retry; 401/408/429 and other statuses below 500 do not. Retries add
+`x-cos-sdk-retry: true` before signing and replay the same body. Only HTTP 404
+means absent, regardless of the XML code. Successful nonempty PUT also verifies
+the server's `x-cos-hash-crc64ecma` against the Go-compatible reflected
+CRC-64/ECMA checksum; a missing/bad checksum fails without retrying a 2xx
+response. The SDK skips this check for an empty `http.NoBody` upload.
+Thirty-six actual metering COS provider cases compare attempts, marker, signed
+requests, payload and Exists/Upload outcomes, including empty and Unicode
+payloads and checksum failures. A real HTTP HEAD/PUT retry sequence checks the
+production adapter. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/cos-object-go.go
+```
+
 AWS and OSS use maintained reqsign source providers and signing primitives with
 native role/cache adapters. AWS uses the Go 900-second POST request and a stable
 `aws-go-sdk-{UnixNano}` session name, applies custom BaseEndpoint to STS, and caches
@@ -464,7 +487,7 @@ go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
 Full default-credential/endpoint edge parity remains in progress. Provider retry-policy and default-chain edge comparisons remain
-open, including OSS/COS/Azure object HEAD/PUT retries and the declared HTTP date
+open, including OSS/Azure object HEAD/PUT retries and the declared HTTP date
 local-zone edge. Export failure retains the pending window for the next metering
 attempt.
 

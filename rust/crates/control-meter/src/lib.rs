@@ -32,6 +32,7 @@ mod cloud_azure_identity;
 mod cloud_azure_managed;
 mod cloud_context;
 mod cloud_cos;
+mod cloud_crc64;
 mod cloud_oss;
 mod cloud_oss_identity;
 pub mod cloud_store;
