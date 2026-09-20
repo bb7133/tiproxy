@@ -18,6 +18,7 @@
 //! the Go consumer and outbox during the staged ownership handoff.
 
 mod cloud_aws;
+mod cloud_aws_identity;
 mod cloud_azure;
 mod cloud_azure_identity;
 mod cloud_azure_managed;

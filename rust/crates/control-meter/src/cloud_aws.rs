@@ -20,9 +20,7 @@ use bytes::Bytes;
 use control_config::AwsMeteringConfig;
 use http::{Request, request::Parts};
 use reqsign_aws_core::assume_role::{AssumeRoleOperation, regional_sts_endpoint};
-use reqsign_aws_v4::{
-    AssumeRoleGrant, Credential, DefaultCredentialProvider, RequestSigner, StaticCredentialProvider,
-};
+use reqsign_aws_v4::{AssumeRoleGrant, Credential, RequestSigner, StaticCredentialProvider};
 use reqsign_core::hash::hex_sha256;
 use reqsign_core::time::Timestamp;
 use reqsign_core::{
@@ -68,7 +66,8 @@ impl AwsSigner {
             }
             ProvideCredentialChain::new().push(provider)
         } else {
-            ProvideCredentialChain::new().push(DefaultCredentialProvider::new())
+            ProvideCredentialChain::new()
+                .push(crate::cloud_aws_identity::GoDefaultProvider::new(&region))
         };
         Self {
             context,
@@ -124,45 +123,75 @@ impl AwsSigner {
                 now.subsec_nanosecond()
             )
         });
-        let grant = AssumeRoleGrant::new(&self.role, session.as_str());
-        let authority = regional_sts_endpoint(&self.region, &grant)?;
-        let endpoint = match &self.endpoint {
-            Some(endpoint) => endpoint.clone(),
-            None => Url::parse(&format!("https://{authority}/")).map_err(|_| failed())?,
+        let role = RoleOptions {
+            arn: &self.role,
+            session,
+            duration: 900,
+            external_id: None,
         };
-        let operation = AssumeRoleOperation::new(authority, &grant, Some(900))?;
-        // Keep the SDK's response parser and redacted errors, while using the
-        // pinned Go SDK's POST body and configured BaseEndpoint for STS too.
-        let mut source = base;
-        source.expires_in = None;
-        let request = role_request(&endpoint, &self.role, session)?;
-        let (mut parts, body) = request.into_parts();
-        RequestSigner::new("sts", &self.region)
-            .sign_request(&self.context, &mut parts, Some(&source), None)
-            .await?;
-        let credential = operation
-            .send(&self.context, Request::from_parts(parts, body))
-            .await?;
+        let credential = assume_role(
+            &self.context,
+            &self.region,
+            self.endpoint.as_ref(),
+            &role,
+            base,
+        )
+        .await?;
         state.role = Some(credential.clone());
         Ok(credential)
     }
 }
 
-fn role_request(endpoint: &Url, role: &str, session: &str) -> reqsign_core::Result<Request<Bytes>> {
-    let body = Url::parse_with_params(
-        "https://unused.invalid",
-        &[
-            ("Action", "AssumeRole"),
-            ("DurationSeconds", "900"),
-            ("RoleArn", role),
-            ("RoleSessionName", session),
-            ("Version", "2011-06-15"),
-        ],
-    )
-    .map_err(|_| failed())?
-    .query()
-    .ok_or_else(failed)?
-    .to_owned();
+pub(crate) struct RoleOptions<'a> {
+    pub(crate) arn: &'a str,
+    pub(crate) session: &'a str,
+    pub(crate) duration: u32,
+    pub(crate) external_id: Option<&'a str>,
+}
+
+pub(crate) async fn assume_role(
+    context: &Context,
+    region: &str,
+    endpoint: Option<&Url>,
+    role: &RoleOptions<'_>,
+    mut source: Credential,
+) -> reqsign_core::Result<Credential> {
+    let mut grant = AssumeRoleGrant::new(role.arn, role.session);
+    if let Some(external_id) = role.external_id {
+        grant = grant.with_external_id(external_id);
+    }
+    let authority = regional_sts_endpoint(region, &grant)?;
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint.clone(),
+        None => Url::parse(&format!("https://{authority}/")).map_err(|_| failed())?,
+    };
+    let operation = AssumeRoleOperation::new(authority, &grant, Some(role.duration))?;
+    source.expires_in = None;
+    let request = role_request(&endpoint, role)?;
+    let (mut parts, body) = request.into_parts();
+    RequestSigner::new("sts", region)
+        .sign_request(context, &mut parts, Some(&source), None)
+        .await?;
+    operation
+        .send(context, Request::from_parts(parts, body))
+        .await
+}
+
+fn role_request(endpoint: &Url, role: &RoleOptions<'_>) -> reqsign_core::Result<Request<Bytes>> {
+    let duration = role.duration.to_string();
+    let mut params = std::collections::BTreeMap::from([
+        ("Action", "AssumeRole"),
+        ("DurationSeconds", duration.as_str()),
+        ("RoleArn", role.arn),
+        ("RoleSessionName", role.session),
+        ("Version", "2011-06-15"),
+    ]);
+    if let Some(external_id) = role.external_id {
+        params.insert("ExternalId", external_id);
+    }
+    let mut encoded = Url::parse("https://unused.invalid").map_err(|_| failed())?;
+    encoded.query_pairs_mut().extend_pairs(params);
+    let body = encoded.query().ok_or_else(failed)?.to_owned();
     Request::post(endpoint.as_str())
         .header(
             http::header::CONTENT_TYPE,
@@ -227,8 +256,16 @@ mod tests {
             let values = values
                 .query_pairs()
                 .collect::<std::collections::BTreeMap<_, _>>();
-            let request = role_request(&endpoint, &values["RoleArn"], &values["RoleSessionName"])
-                .unwrap_or_else(|e| unreachable!("{e}"));
+            let request = role_request(
+                &endpoint,
+                &RoleOptions {
+                    arn: &values["RoleArn"],
+                    session: &values["RoleSessionName"],
+                    duration: 900,
+                    external_id: None,
+                },
+            )
+            .unwrap_or_else(|e| unreachable!("{e}"));
             assert_eq!(request.method().as_str(), row["method"]);
             assert_eq!(request.uri().to_string(), row["url"]);
             assert_eq!(

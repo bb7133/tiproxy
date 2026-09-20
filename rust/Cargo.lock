@@ -499,6 +499,7 @@ dependencies = [
  "getrandom 0.2.17",
  "http",
  "openssl",
+ "quick-xml",
  "reqsign-aliyun-oss",
  "reqsign-aws-core",
  "reqsign-aws-v4",

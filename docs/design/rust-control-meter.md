@@ -37,6 +37,38 @@ regenerating that fixture changes the recorded signature. Regenerate with:
 go run rust/crates/control-meter/testdata/assume-role-go.go
 ```
 
+AWS default selection now validates the active merged profile first, selects
+complete environment keys (including the Go legacy aliases), then environment
+Web Identity, then profile credentials. Source-profile roles preserve their
+signing identity, external ID and duration settings. Profile cycles without a
+credential source, conflicting source types and partial file keys are rejected;
+keys are not assembled across files. A successful resolution remains selected
+through refresh failures. The bounded INI reader uses Go's literal string,
+comment, continuation and ignored-line behavior for credential scalars.
+
+Web Identity uses unsigned POST, preserves the complete token-file bytes and
+regenerates the default numeric session name per retrieval. Go does not apply
+profile `duration_seconds` to Web Identity; regular profile roles use the Go
+integer-minute threshold before overriding the 900-second default. The new
+fixture compares 24 actual Go resolver outcomes and STS requests, including
+configuration validation even when environment credentials win, source-profile
+signatures, self-links, file precedence and failed process/Web Identity sources.
+The Go fixture disables retries to isolate source selection. A separate test
+covers concurrent acquisition, actual-expiry caching, failed refresh, profile
+changes and token rotation. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-default-go.go
+```
+
+Modern SSO session-token refresh, configured AWS service endpoint overrides,
+and detailed metadata/process retry/cache parity remain open. The current SDK
+SSO source supports legacy cached-token profiles. The extra signed
+`x-amz-content-sha256` header on AWS AssumeRole is accepted SigV4 metadata that
+Go omits. OSS refresh holds the cache lock through STS, matching Go's blocking
+lock scope; Rust rechecks under that lock and coalesces concurrent refreshes
+where Go may repeat them after reading an earlier snapshot.
+
 COS adapts the pinned Go SDK's source
 precedence (env, TKE, profile, CVM), caches the selected source, and provides its
 missing AssumeRole flow. The two-hour role refresh starts before expiration;

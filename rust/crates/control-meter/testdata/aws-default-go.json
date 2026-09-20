@@ -1,0 +1,380 @@
+[
+  {
+    "name": "environment-before-profile",
+    "env": {
+      "AWS_ACCESS_KEY_ID": "env-id",
+      "AWS_SECRET_ACCESS_KEY": "env-secret"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n"
+    },
+    "denied": false,
+    "credential": "env-id",
+    "secret": "env-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "legacy-environment-aliases",
+    "env": {
+      "AWS_ACCESS_KEY": "legacy-id",
+      "AWS_SECRET_KEY": "legacy-secret"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n"
+    },
+    "denied": false,
+    "credential": "legacy-id",
+    "secret": "legacy-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "partial-env-allows-profile",
+    "env": {
+      "AWS_ACCESS_KEY_ID": "partial-id"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n"
+    },
+    "denied": false,
+    "credential": "profile-id",
+    "secret": "profile-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "web-identity-before-profile",
+    "env": {
+      "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/web",
+      "AWS_ROLE_SESSION_NAME": "web-session",
+      "AWS_WEB_IDENTITY_TOKEN_FILE": "/fixture/token"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n",
+      "token": "fake-web-token\n"
+    },
+    "denied": false,
+    "credential": "ASIAWEBIDENTITY000000",
+    "secret": "fake-secret",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.us-east-1.amazonaws.com/",
+        "body": "Action=AssumeRoleWithWebIdentity\u0026RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fweb\u0026RoleSessionName=web-session\u0026Version=2011-06-15\u0026WebIdentityToken=fake-web-token%0A",
+        "signing_key": "",
+        "token": ""
+      }
+    ]
+  },
+  {
+    "name": "missing-web-token-never-falls-back",
+    "env": {
+      "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/web",
+      "AWS_WEB_IDENTITY_TOKEN_FILE": "/fixture/missing"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "denied-web-never-falls-back",
+    "env": {
+      "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/web",
+      "AWS_ROLE_SESSION_NAME": "web-session",
+      "AWS_WEB_IDENTITY_TOKEN_FILE": "/fixture/token"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n",
+      "token": "fake-web-token"
+    },
+    "denied": true,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.us-east-1.amazonaws.com/",
+        "body": "Action=AssumeRoleWithWebIdentity\u0026RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fweb\u0026RoleSessionName=web-session\u0026Version=2011-06-15\u0026WebIdentityToken=fake-web-token",
+        "signing_key": "",
+        "token": ""
+      }
+    ]
+  },
+  {
+    "name": "credentials-file-over-config",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n",
+      "credentials": "[default]\naws_access_key_id=file-id\naws_secret_access_key=file-secret\n"
+    },
+    "denied": false,
+    "credential": "file-id",
+    "secret": "file-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "named-source-profile-role",
+    "env": {
+      "AWS_PROFILE": "target"
+    },
+    "files": {
+      "config": "[profile target]\nrole_arn=arn:aws:iam::123456789012:role/profile\nsource_profile=base\nrole_session_name=profile-session\nduration_seconds=1200\nexternal_id=fixture-external\n[profile base]\naws_access_key_id=source-id\naws_secret_access_key=source-secret\naws_session_token=source-token\n"
+    },
+    "denied": false,
+    "credential": "ASIASOURCEROLE0000000",
+    "secret": "fake-secret",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.us-east-1.amazonaws.com/",
+        "body": "Action=AssumeRole\u0026DurationSeconds=1200\u0026ExternalId=fixture-external\u0026RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fprofile\u0026RoleSessionName=profile-session\u0026Version=2011-06-15",
+        "signing_key": "source-id",
+        "token": "source-token"
+      }
+    ]
+  },
+  {
+    "name": "profile-cycle-rejected",
+    "env": {
+      "AWS_PROFILE": "a"
+    },
+    "files": {
+      "config": "[profile a]\nrole_arn=arn:aws:iam::123456789012:role/a\nsource_profile=b\n[profile b]\nrole_arn=arn:aws:iam::123456789012:role/b\nsource_profile=a\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "failed-process-never-falls-back",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1/credentials"
+    },
+    "files": {
+      "config": "[default]\ncredential_process=false\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "env-still-validates-profile-conflict",
+    "env": {
+      "AWS_ACCESS_KEY_ID": "env-id",
+      "AWS_SECRET_ACCESS_KEY": "env-secret"
+    },
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/profile\nsource_profile=base\ncredential_process=false\n[profile base]\naws_access_key_id=base-id\naws_secret_access_key=base-secret\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "env-still-requires-named-profile",
+    "env": {
+      "AWS_ACCESS_KEY_ID": "env-id",
+      "AWS_PROFILE": "missing",
+      "AWS_SECRET_ACCESS_KEY": "env-secret"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "credential-source-requires-role",
+    "env": null,
+    "files": {
+      "config": "[default]\ncredential_source=Environment\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "partial-file-keys-cannot-merge",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=config-id\n",
+      "credentials": "[default]\naws_secret_access_key=file-secret\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "complete-file-overrides-partial-config",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=config-id\n",
+      "credentials": "[default]\naws_access_key_id=file-id\naws_secret_access_key=file-secret\n"
+    },
+    "denied": false,
+    "credential": "file-id",
+    "secret": "file-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "prefixed-credentials-section-ignored",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n",
+      "credentials": "[profile default]\naws_access_key_id=wrong-id\naws_secret_access_key=wrong-secret\n"
+    },
+    "denied": false,
+    "credential": "profile-id",
+    "secret": "profile-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "role-self-source-static",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\nrole_arn=arn:aws:iam::123456789012:role/self\nsource_profile=default\nrole_session_name=self-session\n"
+    },
+    "denied": false,
+    "credential": "ASIASOURCEROLE0000000",
+    "secret": "fake-secret",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.us-east-1.amazonaws.com/",
+        "body": "Action=AssumeRole\u0026DurationSeconds=900\u0026RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fself\u0026RoleSessionName=self-session\u0026Version=2011-06-15",
+        "signing_key": "profile-id",
+        "token": ""
+      }
+    ]
+  },
+  {
+    "name": "mfa-without-role-ignored",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\nmfa_serial=fixture-mfa\n"
+    },
+    "denied": false,
+    "credential": "profile-id",
+    "secret": "profile-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "unrecognized-ini-lines-ignored",
+    "env": {
+      "AWS_ACCESS_KEY_ID": "env-id",
+      "AWS_SECRET_ACCESS_KEY": "env-secret"
+    },
+    "files": {
+      "config": "[default\ninvalid"
+    },
+    "denied": false,
+    "credential": "env-id",
+    "secret": "env-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "profile-process-collision-rejected",
+    "env": null,
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/profile\ncredential_source=Environment\ncredential_process=false\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "name": "profile-web-ignores-duration",
+    "env": null,
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/web\nweb_identity_token_file=/fixture/token\nrole_session_name=web-session\nduration_seconds=1200\n",
+      "token": "profile-token\n"
+    },
+    "denied": false,
+    "credential": "ASIAWEBIDENTITY000000",
+    "secret": "fake-secret",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.us-east-1.amazonaws.com/",
+        "body": "Action=AssumeRoleWithWebIdentity\u0026RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fweb\u0026RoleSessionName=web-session\u0026Version=2011-06-15\u0026WebIdentityToken=profile-token%0A",
+        "signing_key": "",
+        "token": ""
+      }
+    ]
+  },
+  {
+    "name": "profile-role-short-duration-default",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\nrole_arn=arn:aws:iam::123456789012:role/short\nrole_session_name=short-session\nduration_seconds=959\n"
+    },
+    "denied": false,
+    "credential": "ASIASOURCEROLE0000000",
+    "secret": "fake-secret",
+    "error": false,
+    "requests": [
+      {
+        "method": "POST",
+        "url": "https://sts.us-east-1.amazonaws.com/",
+        "body": "Action=AssumeRole\u0026DurationSeconds=900\u0026RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fshort\u0026RoleSessionName=short-session\u0026Version=2011-06-15",
+        "signing_key": "profile-id",
+        "token": ""
+      }
+    ]
+  },
+  {
+    "name": "literal-ini-quotes-colon-comments",
+    "env": null,
+    "files": {
+      "config": "[ default ] ; profile comment\nAWS_ACCESS_KEY_ID : 'literal-id' # comment\n  AWS_SECRET_ACCESS_KEY = \"literal-secret\\path\" ; comment\n"
+    },
+    "denied": false,
+    "credential": "literal-id",
+    "secret": "\"literal-secret\\path\"",
+    "error": false,
+    "requests": null
+  },
+  {
+    "name": "prefixed-default-wins",
+    "env": null,
+    "files": {
+      "config": "[profile default]\naws_access_key_id=prefixed-id\naws_secret_access_key=prefixed-secret\n[default]\naws_access_key_id=plain-id\naws_secret_access_key=plain-secret\n"
+    },
+    "denied": false,
+    "credential": "prefixed-id",
+    "secret": "prefixed-secret",
+    "error": false,
+    "requests": null
+  }
+]
